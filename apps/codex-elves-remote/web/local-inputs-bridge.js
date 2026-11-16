@@ -1,6 +1,6 @@
 (() => {
   if (window.top !== window) return;
-  // 用户要求仅独立客户端支持本机文件/文件夹；浏览器和 Android 不注入此入口。
+  // 系统选择器和 CF_HDROP 只在独立客户端提供；浏览器拖放/粘贴另用本次操作授予的 File/目录对象。
   // 原生命令只处理系统选择器或 CF_HDROP，不接收任意本机路径、脚本或目标地址。
   Object.defineProperty(window, "__CODEX_ELVES_LOCAL_INPUTS__", {
     value: Object.freeze({

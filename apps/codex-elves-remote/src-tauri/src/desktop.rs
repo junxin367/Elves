@@ -973,6 +973,7 @@ fn create_client_window(
     .data_directory(directory.join("webview"))
     .initialization_script(include_str!("../../web/theme-bridge.js"))
     .initialization_script(include_str!("../../web/local-inputs-bridge.js"))
+    // 用户要求编辑框接收图片、文件和目录拖入；保留 HTML 拖放，不能让窗口级处理抢走 DOM 目录入口。
     .disable_drag_drop_handler()
     .on_navigation(move |url| {
         if url.as_str() == "about:blank" || main && settings::is_connection_page(url) {

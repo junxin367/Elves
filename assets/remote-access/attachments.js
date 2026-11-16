@@ -1,6 +1,7 @@
 import { remoteMediaCandidates, remoteMediaUrl } from "./channels.js";
 import { sha256Hex } from "./sha256.js";
 import { copyLocalInput, isLocalInput, localInputBridge, validateLocalInputs } from "./local-inputs.js";
+import { captureTransferInputs, hasTransferFiles, readTransferInputs } from "./transfer-inputs.js";
 import { icon } from "./ui/icons.js";
 
 // 用户要求 Codex/Claude 单条固定最多 8 张；添加、粘贴、拖拽与草稿/队列恢复共用此值，并与 Rust MAX_INPUT_IMAGE_COUNT 同步。
@@ -11,6 +12,19 @@ const MAX_IMAGE_DIMENSION = 16_384;
 const MAX_IMAGE_PIXELS = 100_000_000;
 const remoteImagePattern = /^\/api\/images\/[A-Za-z0-9_-]{20,128}$/u;
 const supportedMimes = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+// 用户要求增加图片格式；额外格式在客户端解码并转为 PNG，发送和恢复仍使用原生引擎支持的四种格式。
+const convertibleMimes = new Set(["image/bmp", "image/avif", "image/svg+xml", "image/x-icon"]);
+const imageFileExtensions = /\.(?:png|apng|jpe?g|jpe|jfif|jif|jfi|pjpeg|pjp|gif|webp|bmp|avif|svg|ico|cur)$/iu;
+function canonicalImageMime(value) {
+  const mime = String(value || "").toLowerCase().split(";", 1)[0].trim();
+  return ({ "image/jpg": "image/jpeg", "image/pjpeg": "image/jpeg", "image/jfif": "image/jpeg",
+    "image/apng": "image/png", "image/x-png": "image/png", "image/x-ms-bmp": "image/bmp",
+    "image/x-bmp": "image/bmp", "image/vnd.microsoft.icon": "image/x-icon" })[mime] || mime;
+}
+function imageInputFile(file) {
+  const mime = canonicalImageMime(file?.type);
+  return supportedMimes.has(mime) || convertibleMimes.has(mime) || imageFileExtensions.test(file?.name || "");
+}
 const remoteVideoPattern = /^\/api\/videos\/[a-f0-9]{64}$/u;
 const MEDIA_RECOVERY_TIMEOUT_MS = 15_000;
 
@@ -562,17 +576,27 @@ function detectImageMime(bytes) {
   if (bytes.length >= 6 && ["GIF87a", "GIF89a"].includes(text(6))) return "image/gif";
   if (bytes.length >= 12 && text(4) === "RIFF"
       && String.fromCharCode(...bytes.slice(8, 12)) === "WEBP") return "image/webp";
+  if (bytes.length >= 14 && text(2) === "BM") return "image/bmp";
+  if (bytes.length >= 6 && bytes[0] === 0 && bytes[1] === 0 && [1, 2].includes(bytes[2])
+      && bytes[3] === 0 && (bytes[4] || bytes[5])) return "image/x-icon";
+  if (bytes.length >= 16 && String.fromCharCode(...bytes.slice(4, 8)) === "ftyp") {
+    const size = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(0);
+    const brands = [String.fromCharCode(...bytes.slice(8, 12))];
+    for (let offset = 16; offset + 4 <= Math.min(size || bytes.length, bytes.length, 256); offset += 4)
+      brands.push(String.fromCharCode(...bytes.slice(offset, offset + 4)));
+    if (brands.some(brand => brand === "avif" || brand === "avis")) return "image/avif";
+  }
   return "";
 }
 
-function safeInlineSvgSource(source) {
-  if (typeof source !== "string" || source.length > Math.ceil(4 * 1024 * 1024 / 3) * 4 + 64) return null;
+function safeInlineSvgSource(source, maxBytes = 4 * 1024 * 1024) {
+  if (typeof source !== "string" || source.length > Math.ceil(maxBytes / 3) * 4 + 64) return null;
   const header = /^data:image\/svg\+xml;base64,/iu.exec(source);
   if (!header) return null;
   const encoded = source.slice(header[0].length);
   if (!encoded.length || encoded.length % 4 || !/^[A-Za-z0-9+/]+={0,2}$/u.test(encoded)) return null;
   const padding = encoded.endsWith("==") ? 2 : encoded.endsWith("=") ? 1 : 0;
-  if (encoded.length / 4 * 3 - padding > 4 * 1024 * 1024) return null;
+  if (encoded.length / 4 * 3 - padding > maxBytes) return null;
   try {
     const bytes = Uint8Array.from(atob(encoded), character => character.charCodeAt(0));
     const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
@@ -624,20 +648,58 @@ function dataUrl(blob, mime) {
   });
 }
 
-async function imageDimensions(blob) {
+async function decodeInputImage(blob) {
   if (typeof createImageBitmap === "function") {
-    const bitmap = await createImageBitmap(blob);
-    try { return { width: bitmap.width, height: bitmap.height }; }
-    finally { bitmap.close(); }
+    try {
+      const bitmap = await createImageBitmap(blob);
+      return { image: bitmap, width: bitmap.width, height: bitmap.height, close: () => bitmap.close() };
+    } catch {
+      // SVG 等格式在部分客户端不支持 createImageBitmap，继续通过图片元素解码；不插入 SVG/HTML 原文。
+    }
   }
+  if (typeof Image !== "function") throw new Error("当前客户端无法解码此图片格式，请转换为 PNG 或 JPEG");
   return await new Promise((resolve, reject) => {
     const image = new Image();
     image.onload = () => {
-      resolve({ width: image.naturalWidth, height: image.naturalHeight });
+      resolve({ image, width: image.naturalWidth, height: image.naturalHeight, close: () => { image.src = ""; } });
     };
-    image.onerror = () => reject(new Error("图片内容损坏或无法解码"));
+    image.onerror = () => reject(new Error("图片内容损坏，或当前客户端无法解码此格式，请转换为 PNG 或 JPEG"));
     void dataUrl(blob, blob.type || "image/png").then(source => { image.src = source; }, reject);
   });
+}
+
+function checkImageDimensions({ width, height }) {
+  if (!width || !height || width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION
+      || width * height > MAX_IMAGE_PIXELS)
+    throw new Error("图片尺寸过大，最大边不能超过 16384 像素");
+}
+
+async function imageDimensions(blob) {
+  const decoded = await decodeInputImage(blob);
+  try { checkImageDimensions(decoded); return { width: decoded.width, height: decoded.height }; }
+  finally { decoded.close(); }
+}
+
+async function convertInputImage(blob) {
+  const decoded = await decodeInputImage(blob);
+  let canvas;
+  try {
+    checkImageDimensions(decoded);
+    canvas = document.createElement("canvas");
+    canvas.width = decoded.width; canvas.height = decoded.height;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("当前客户端无法转换图片，请转换为 PNG 或 JPEG 后添加");
+    context.drawImage(decoded.image, 0, 0);
+    const output = await new Promise((resolve, reject) => canvas.toBlob(value =>
+      value ? resolve(value) : reject(new Error("图片转换失败，请转换为 PNG 或 JPEG 后添加")), "image/png"));
+    if (!output.size || output.size > MAX_IMAGE_BYTES) throw new Error("转换后的图片不能超过 5 MiB");
+    const header = new Uint8Array(await output.slice(0, 16).arrayBuffer());
+    if (detectImageMime(header) !== "image/png") throw new Error("图片转换未生成有效 PNG，未添加附件");
+    return { blob: output, width: decoded.width, height: decoded.height };
+  } finally {
+    decoded.close();
+    if (canvas) { canvas.width = 0; canvas.height = 0; }
+  }
 }
 
 async function readImageFile(file) {
@@ -645,22 +707,38 @@ async function readImageFile(file) {
   if (file.size <= 0) throw new Error("图片文件为空");
   if (file.size > MAX_IMAGE_BYTES) throw new Error("单张图片不能超过 5 MiB");
   const bytes = new Uint8Array(await file.arrayBuffer());
-  const mime = detectImageMime(bytes);
-  if (!supportedMimes.has(mime)) throw new Error("仅支持 PNG、JPEG、WebP 和 GIF 图片");
-  if (file.type && supportedMimes.has(file.type.toLowerCase()) && file.type.toLowerCase() !== mime)
+  const declared = canonicalImageMime(file.type);
+  let mime = detectImageMime(bytes);
+  if (!mime && (declared === "image/svg+xml" || /\.svg$/iu.test(file.name || ""))) mime = "image/svg+xml";
+  if (!supportedMimes.has(mime) && !convertibleMimes.has(mime))
+    throw new Error("支持 PNG、JPEG、GIF、WebP、BMP、AVIF、SVG、ICO/CUR，请将其他格式转换后添加");
+  if ((supportedMimes.has(declared) || convertibleMimes.has(declared)) && declared !== mime)
     throw new Error("图片扩展类型与实际内容不一致");
-  const blob = new Blob([bytes], { type: mime });
-  const dimensions = await imageDimensions(blob);
-  if (!dimensions.width || !dimensions.height
-      || dimensions.width > MAX_IMAGE_DIMENSION || dimensions.height > MAX_IMAGE_DIMENSION
-      || dimensions.width * dimensions.height > MAX_IMAGE_PIXELS)
-    throw new Error("图片尺寸过大，最大边不能超过 16384 像素");
+  let blob = new Blob([bytes], { type: mime }), dimensions;
+  if (mime === "image/svg+xml") {
+    const source = await dataUrl(blob, mime);
+    if (!safeInlineSvgSource(source, MAX_IMAGE_BYTES)) throw new Error("SVG 含不支持的脚本、动态内容或外部资源");
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    for (const match of text.matchAll(/\b(?:href|xlink:href|src)\s*=\s*(?:"([^"]*)"|'([^']*)')/giu)) {
+      const target = (match[1] ?? match[2]).trim();
+      if (!target.startsWith("#") && !safeInlineImageSource(target))
+        throw new Error("SVG 不能读取外部文件或网络资源");
+    }
+    for (const match of text.matchAll(/\burl\(\s*([^)]*)\)/giu))
+      if (!match[1].trim().replace(/^["']|["']$/gu, "").startsWith("#"))
+        throw new Error("SVG 不能读取外部文件或网络资源");
+  }
+  if (convertibleMimes.has(mime)) {
+    const converted = await convertInputImage(blob);
+    blob = converted.blob; mime = "image/png";
+    dimensions = { width: converted.width, height: converted.height };
+  } else dimensions = await imageDimensions(blob);
   return {
     kind: "inline",
     name: attachmentName(file.name, `图片.${mime.split("/")[1]}`),
     mime,
     dataUrl: await dataUrl(blob, mime),
-    size: file.size,
+    size: blob.size,
     ...dimensions
   };
 }
@@ -756,6 +834,7 @@ async function addFiles(files) {
       catch (error) { errors.push(`${attachmentName(file?.name)}：${error?.message || "无法添加图片"}`); }
       if (version !== attachmentVersion) return true;
     }
+    validateAttachmentBatch([], next);
     attachments.push(...next);
     renderComposerAttachments();
     changeListener();
@@ -790,7 +869,9 @@ export function mountComposerAttachments({ form, prompt, onChange, notice, onPre
   attachmentInput = document.createElement("input");
   attachmentInput.id = "composer-image-input";
   attachmentInput.type = "file";
-  attachmentInput.accept = "image/*";
+  // Android 原生有按 image/* 单一类型识别的有序图片选择器；保留兼容，桌面额外列出常被漏判的扩展名。
+  attachmentInput.accept = globalThis.window?.CodexElvesAndroid ? "image/*"
+    : "image/*,.apng,.jfif,.jpe,.avif,.bmp,.svg,.ico,.cur";
   attachmentInput.multiple = true;
   attachmentInput.hidden = true;
   attachmentInput.setAttribute("aria-hidden", "true");
@@ -798,27 +879,27 @@ export function mountComposerAttachments({ form, prompt, onChange, notice, onPre
   form.append(attachmentInput);
 
   form.addEventListener("dragover", event => {
-    if (![...event.dataTransfer?.items || []].some(item => item.kind === "file"
-        && supportedMimes.has(item.type.toLowerCase()))) return;
+    if (!hasTransferFiles(event.dataTransfer)) return;
     event.preventDefault();
-    form.classList.add("composer-image-dragover");
+    if (!disabled && !locked && !readingFiles) form.classList.add("composer-image-dragover");
   });
   form.addEventListener("dragleave", event => {
     if (!form.contains(event.relatedTarget)) form.classList.remove("composer-image-dragover");
   });
   form.addEventListener("drop", event => {
     form.classList.remove("composer-image-dragover");
-    const files = [...event.dataTransfer?.files || []];
-    if (!files.some(file => supportedMimes.has(file.type.toLowerCase()))) return;
+    if (!hasTransferFiles(event.dataTransfer)) return;
     event.preventDefault();
-    void addFiles(files);
+    // 用户要求拖入图片、文件及完整目录；在回调内取得入口，不能等异步操作后再读取受保护的 DataTransfer。
+    try { void addTransferredInputs(captureTransferInputs(event.dataTransfer)); }
+    catch (error) { showNotice(error?.message || "无法读取拖入的附件", true); }
   });
   renderComposerAttachments();
 }
 
 export function handleComposerImagePaste(event) {
   const files = [...event?.clipboardData?.files || []];
-  if (!files.some(file => supportedMimes.has(file.type.toLowerCase()))) return false;
+  if (!files.length || !files.every(imageInputFile)) return false;
   event.preventDefault();
   void addFiles(files);
   return true;
@@ -829,7 +910,7 @@ export function composerCanAddLocalInputs() {
   return composerLocalInputsSupported() && !disabled && !locked && !readingFiles;
 }
 
-async function addLocalInputs(read, fallback = null) {
+async function addLocalInputs(read, fallback = null, classifyImages = false) {
   if (!composerCanAddLocalInputs()) { showNotice("当前不能添加文件和文件夹", true); return; }
   const version = attachmentVersion;
   readingFiles = true; renderComposerAttachments(); changeListener();
@@ -837,8 +918,22 @@ async function addLocalInputs(read, fallback = null) {
     const next = await read();
     if (version !== attachmentVersion) return;
     if (next.length) {
-      validateLocalInputs([...attachments.filter(isLocalInput), ...next]);
-      attachments.push(...validateLocalInputs(next));
+      const checked = validateLocalInputs(next), images = [], inputs = [];
+      for (const entry of checked) {
+        if (classifyImages && entry.kind === "file" && imageFileExtensions.test(entry.name)) {
+          const bytes = Uint8Array.from(atob(entry.files[0].data), character => character.charCodeAt(0));
+          images.push(Object.assign(new Blob([bytes]), { name: entry.name }));
+        } else inputs.push(entry);
+      }
+      validateAttachmentBatch(inputs, images.map(file => ({ kind: "inline", size: file.size })));
+      const converted = [];
+      for (const file of images) {
+        converted.push(await readImageFile(file));
+        if (version !== attachmentVersion) return;
+        validateAttachmentBatch(inputs, converted);
+      }
+      validateAttachmentBatch(inputs, converted);
+      attachments.push(...inputs, ...converted);
     } else if (fallback) {
       // 截图/浏览器图片没有 CF_HDROP，继续使用现有图片粘贴；纯文字不转成路径或附件。
       readingFiles = false;
@@ -854,19 +949,71 @@ async function addLocalInputs(read, fallback = null) {
   }
 }
 
+function validateAttachmentBatch(inputs, images) {
+  validateLocalInputs([...attachments.filter(isLocalInput), ...inputs]);
+  if (attachments.filter(entry => !isLocalInput(entry)).length + images.length > MAX_IMAGE_COUNT)
+    throw new Error(`每条消息最多添加 ${MAX_IMAGE_COUNT} 张图片`);
+  const total = [...attachments, ...images].reduce((sum, entry) => sum + (entry.kind === "inline" ? entry.size : 0), 0);
+  if (total > MAX_TOTAL_BYTES) throw new Error("图片总大小不能超过 12 MiB");
+}
+
+async function addTransferredInputs(captured) {
+  if (disabled || locked || readingFiles) { showNotice("当前不能添加附件，请先完成读取或退出编辑", true); return; }
+  const version = attachmentVersion;
+  readingFiles = true; renderComposerAttachments(); changeListener();
+  try {
+    const batch = await readTransferInputs(captured, { isImageFile: imageInputFile,
+      isCurrent: () => version === attachmentVersion });
+    if (version !== attachmentVersion) return;
+    validateAttachmentBatch(batch.inputs, batch.images.map(file => ({ kind: "inline", size: file.size })));
+    const images = [];
+    for (const file of batch.images) {
+      images.push(await readImageFile(file));
+      if (version !== attachmentVersion) return;
+      validateAttachmentBatch(batch.inputs, images);
+    }
+    validateAttachmentBatch(batch.inputs, images);
+    attachments.push(...batch.inputs, ...images);
+  } catch (error) {
+    if (version === attachmentVersion)
+      showNotice(error?.message || "无法读取附件，请重新拖入或粘贴", true);
+  } finally {
+    if (version === attachmentVersion) {
+      readingFiles = false; renderComposerAttachments(); changeListener();
+      composerPrompt?.focus({ preventScroll: true });
+    }
+  }
+}
+
 export function chooseComposerLocalInputs(folders = false) {
   if (composerCanAddLocalInputs()) return addLocalInputs(() => localInputBridge().pick(folders));
 }
 
 export function handleComposerLocalPaste(event) {
   ++localPasteShortcut;
-  if (!composerLocalInputsSupported()) return false;
   const files = [...event.clipboardData?.files || []];
   const text = event.clipboardData?.getData("text/plain") || "";
+  const fileTransfer = hasTransferFiles(event.clipboardData);
+  let captured = [];
+  if (fileTransfer) {
+    try { captured = captureTransferInputs(event.clipboardData); }
+    catch (error) {
+      event.preventDefault(); showNotice(error?.message || "无法读取粘贴的附件", true); return true;
+    }
+  }
   // 文字及原有图片粘贴保持同步；只有文件型剪贴板（含目录）或无文本的原生文件剪贴板走客户端读取。
-  if (text && !files.length || files.length && files.every(file => supportedMimes.has(file.type.toLowerCase()))) return false;
+  const onlyImages = files.length && files.every(imageInputFile) && captured.every(candidate =>
+    !candidate.entry?.isDirectory && !candidate.handle && candidate.file && imageInputFile(candidate.file));
+  if (text && !fileTransfer || onlyImages) return false;
+  if (!composerLocalInputsSupported()) {
+    if (!hasTransferFiles(event.clipboardData)) return false;
+    event.preventDefault();
+    void addTransferredInputs(captured);
+    return true;
+  }
   event.preventDefault();
-  void addLocalInputs(() => localInputBridge().paste(), files.length ? () => addFiles(files) : null);
+  void addLocalInputs(() => localInputBridge().paste(),
+    captured.length ? () => addTransferredInputs(captured) : null, true);
   return true;
 }
 
@@ -878,7 +1025,7 @@ export function handleComposerLocalPasteShortcut(event) {
   // 文字、截图或文件已经产生 paste 时由上方处理，不能重复添加，也不截断浏览器的原有快捷键。
   setTimeout(() => {
     if (version === attachmentVersion && shortcut === localPasteShortcut)
-      void addLocalInputs(() => localInputBridge().paste());
+      void addLocalInputs(() => localInputBridge().paste(), null, true);
   }, 0);
 }
 

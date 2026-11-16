@@ -188,7 +188,7 @@ export function updateComposer() {
   const compactionSendReason = compacting && !goalMode && !editing ? compactionQueueSendReason() : "";
   const queueOnly = !isClaude() && compacting && !goalMode && !editing && !compactionSendReason;
   const unsupportedFiles = composerLocalInputsPayload().length > 0
-    && (session?.capabilities?.localFileInput !== true || !composerLocalInputsSupported());
+    && session?.capabilities?.localFileInput !== true;
   const unsupportedImages = !editing && composerAttachmentsPayload().length > 0 && !backendCapability("imageInput")
     || !!editingQueuedMessage?.imageEditing && composerAttachmentsPayload().length > 0
       && !queueCapability("queuedImageEditing");
@@ -208,7 +208,7 @@ export function updateComposer() {
   }
   if (attachmentNote) {
     attachmentNote.textContent = unsupportedFiles
-      ? "文件和文件夹仅可在支持此功能的独立远程客户端发送，请更新客户端及远程服务；附件已保留。"
+      ? "当前远程服务尚不支持文件和文件夹发送，请更新服务；附件已保留。"
       : unsupportedImages
       ? editingQueuedMessage
         ? "当前运行的服务尚不支持编辑队列图片，修改已保留，请更新程序后再发送。"
@@ -264,7 +264,7 @@ export function updateComposer() {
   send.setAttribute("aria-label", sendingLabel || (goalMode ? "创建目标" : action === "stop" ? stopLabel : queueOnly ? "发送到原生消息队列" : "发送消息"));
   send.title = sendingLabel || (editingQueuedMessage ? "发送消息" : editingMessage ? "请先完成消息编辑" : goalMode ? goalReason || "创建目标" : action === "stop" ? stopLabel : queueOnly ? "加入原生消息队列，压缩完成后执行" : compactionSendReason || (active ? "发送补充消息" : "发送消息"));
   if (unsupportedImages) send.title = "当前服务版本尚不支持图片发送，请先更新程序";
-  if (unsupportedFiles) send.title = "请在新版独立远程客户端及远程服务中发送文件和文件夹";
+  if (unsupportedFiles) send.title = "请更新远程服务后发送文件和文件夹";
   if (unsupportedProjectless) send.title = "当前服务版本尚不支持无项目会话，请先更新程序或选择已有项目";
   send.setAttribute("aria-busy", String(busy || stopping));
   const blockedBy = !sessionTypeEnabled && action !== "stop" ? "backend-disabled"
@@ -473,8 +473,9 @@ export async function sendMessage() {
   const prompt = composerPrompt(draft.text, draft.skills, goalMode);
   const images = composerAttachmentsPayload();
   const files = composerLocalInputsPayload();
-  if (files.length && (session.capabilities?.localFileInput !== true || !composerLocalInputsSupported())) {
-    notice("请更新独立远程客户端及远程服务后发送文件和文件夹，附件已保留。", true);
+  // 用户要求浏览器也能发送拖入/粘贴的文件；这里只检查服务能力，不再要求本机路径读取桥。
+  if (files.length && session.capabilities?.localFileInput !== true) {
+    notice("当前远程服务尚不支持文件和文件夹发送，请更新服务；附件已保留。", true);
     return;
   }
   if (images.length && !backendCapability("imageInput")) {

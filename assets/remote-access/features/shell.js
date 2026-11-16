@@ -547,7 +547,7 @@ export function shell() {
   };
   $("#prompt").onpaste = event => {
     if (threadReadOnly()) { event.preventDefault(); return; }
-    // 用户要求独立客户端 Ctrl+V 添加本机文件/文件夹；纯文字与截图继续走原有输入和图片处理。
+    // 用户要求图片、文件、目录可粘贴；独立客户端补读 CF_HDROP，网页只读取本次剪贴板授予的对象。
     if (handleComposerLocalPaste(event)) return;
     if (handleComposerImagePaste(event)) return;
     event.preventDefault();

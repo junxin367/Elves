@@ -1,4 +1,4 @@
-// 用户要求只在独立远程客户端添加本机文件/文件夹；不根据 __TAURI__ 的存在猜测新命令是否已安装。
+// 原生选择器和 CF_HDROP 仅由独立客户端提供；浏览器拖放/粘贴走用户授予的 File/目录对象，不猜测原生命令。
 export function localInputBridge() {
   let bridge = globalThis.window?.__CODEX_ELVES_LOCAL_INPUTS__;
   // PC 侧边会话沿用同来源主窗口的原生入口，草稿及迟到结果仍由侧边自己的附件代次约束。

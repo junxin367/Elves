@@ -9,6 +9,7 @@ import { mountInstancePermissions, permissionLabel, permissionModeKnown, permiss
 import { menuHorizontalLeft } from "../assets/remote-access/ui/position.js";
 import { localFileReference } from "../assets/remote-access/file-reference.js";
 import { copyLocalInput, isLocalInput, localInputBridge, validateLocalInputs } from "../assets/remote-access/local-inputs.js";
+import { captureTransferInputs, hasTransferFiles, readTransferInputs } from "../assets/remote-access/transfer-inputs.js";
 import { marked, Renderer } from "../assets/remote-access/vendor/marked.esm.js";
 import { defaultSharedSettings } from "../assets/remote-access/features/settings/shared-state.js";
 
@@ -791,8 +792,18 @@ async function localAttachmentHarness() {
   const source = await readFile(new URL("../assets/remote-access/attachments.js", import.meta.url), "utf8");
   const h = { notices: [], changes: 0, pasted: 0, picked: [], next: localInputFixtures(), timers: [] };
   const context = vm.createContext({
-    nativeConnectionVersion: 1, Blob, Uint8Array, TextEncoder, atob,
+    nativeConnectionVersion: 1, Blob, Uint8Array, TextEncoder, TextDecoder, atob,
     isLocalInput, copyLocalInput, validateLocalInputs,
+    captureTransferInputs, hasTransferFiles, readTransferInputs,
+    FileReader: class {
+      readAsDataURL(blob) {
+        void blob.arrayBuffer().then(bytes => {
+          this.result = `data:${blob.type};base64,${Buffer.from(bytes).toString("base64")}`;
+          this.onload();
+        });
+      }
+    },
+    createImageBitmap: async () => ({ width: 1, height: 1, close() {} }),
     setTimeout: callback => h.timers.push(callback), icon: () => ({}),
     localInputBridge: () => ({
       pick: async folders => { h.picked.push(folders); return h.next; },
@@ -806,6 +817,176 @@ async function localAttachmentHarness() {
   h.context = context;
   return h;
 }
+
+const attachmentTestFile = (name, content = "x", type = "") => Object.assign(new Blob([content], { type }), { name });
+const attachmentTestEntry = file => ({ name: file.name, isFile: true, isDirectory: false,
+  file(resolve) { queueMicrotask(() => resolve(file)); } });
+const attachmentTestDirectory = (name, pages = []) => ({ name, isFile: false, isDirectory: true,
+  createReader() { let index = 0; return { readEntries(resolve) { queueMicrotask(() => resolve(pages[index++] || [])); } }; } });
+
+test("拖放入口在事件内捕获，文件夹读取全部分页并保留空目录和图片分类", async () => {
+  const files = Array.from({ length: 123 }, (_, index) => attachmentTestEntry(attachmentTestFile(`${index}.txt`)));
+  const nested = attachmentTestDirectory("子目录", [[attachmentTestEntry(attachmentTestFile("说明.txt", "hi"))]]);
+  const directory = attachmentTestDirectory("素材", [files.slice(0, 100), [...files.slice(100), nested,
+    attachmentTestDirectory("空目录")]]);
+  const image = attachmentTestFile("截图.png", "fixture-image", "image/png");
+  let active = true;
+  const captured = captureTransferInputs({ items: [
+    { kind: "file", getAsFile: () => null, webkitGetAsEntry() { assert.equal(active, true); return directory; } },
+    { kind: "file", getAsFile: () => image },
+    { kind: "file", getAsFile: () => null, webkitGetAsEntry: () => attachmentTestDirectory("空文件夹") },
+  ] });
+  active = false;
+  const result = await readTransferInputs(captured, { isImageFile: file => file.type === "image/png" });
+  assert.equal(result.images[0], image);
+  assert.equal(result.inputs.length, 2);
+  assert.equal(result.inputs[0].files.length, 124);
+  assert.equal(result.inputs[0].size, 125);
+  assert.deepEqual(result.inputs[0].directories, ["子目录", "空目录"]);
+  assert.equal(result.inputs[0].files.at(-1).path, "子目录/说明.txt");
+  assert.equal(result.inputs[1].kind, "folder");
+  assert.deepEqual(result.inputs[1].files, []);
+  assert.deepEqual(result.inputs[1].directories, []);
+  assert.equal(hasTransferFiles({ types: ["Files"] }), true);
+  assert.equal(hasTransferFiles({ types: ["text/plain"], files: [], items: [{ kind: "string" }] }), false);
+});
+
+test("浏览器目录和文件读取拒绝超限、越界和迟到结果，不静默截断", async () => {
+  await assert.rejects(() => readTransferInputs(Array.from({ length: 17 }, () => ({
+    file: attachmentTestFile("a.txt"),
+  }))), /16/);
+  await assert.rejects(() => readTransferInputs(Array.from({ length: 9 }, () => ({
+    file: attachmentTestFile("a.png", "x", "image/png"),
+  })), { isImageFile: () => true }), /8/);
+  const many = attachmentTestDirectory("many", [Array.from({ length: 512 }, (_, i) =>
+    attachmentTestEntry(attachmentTestFile(`${i}.txt`)))]);
+  await assert.rejects(() => readTransferInputs([{ entry: many }]), /512/);
+  await assert.rejects(() => readTransferInputs([{ file: attachmentTestFile("../escape", "x") }]), /无效/);
+  await assert.rejects(() => readTransferInputs([{ file: attachmentTestFile("big.bin", new Uint8Array(12 * 1024 * 1024 + 1)) }]), /12 MiB/);
+  let deep = attachmentTestEntry(attachmentTestFile("a.txt"));
+  for (let index = 0; index < 33; index++) deep = attachmentTestDirectory(`d${index}`, [[deep]]);
+  await assert.rejects(() => readTransferInputs([{ entry: deep }]), /32/);
+  let current = true, finish, second = false;
+  const pending = readTransferInputs([
+    { entry: { name: "a.txt", isFile: true, file(resolve) { finish = resolve; } } },
+    { entry: { name: "b.txt", isFile: true, file() { second = true; } } },
+  ], { isCurrent: () => current });
+  current = false; finish(attachmentTestFile("a.txt"));
+  await assert.rejects(() => pending, { name: "AbortError" });
+  assert.equal(second, false);
+});
+
+test("现代目录 handle 同样保留目录，捕获拒绝不会降级为空文件", async () => {
+  const child = { kind: "file", name: "a.txt", getFile: async () => attachmentTestFile("a.txt", "hi") };
+  const empty = { kind: "directory", name: "空目录", async *values() {} };
+  const root = { kind: "directory", name: "handle目录", async *values() { yield child; yield empty; } };
+  const captured = captureTransferInputs({ items: [{ kind: "file", getAsFile: () => null,
+    getAsFileSystemHandle: () => Promise.resolve(root) }] });
+  const result = await readTransferInputs(captured);
+  assert.equal(result.inputs[0].size, 2);
+  assert.deepEqual(result.inputs[0].directories, ["空目录"]);
+  const denied = captureTransferInputs({ items: [{ kind: "file", getAsFile: () => null,
+    getAsFileSystemHandle: () => Promise.reject(new Error("denied")) }] });
+  await assert.rejects(() => readTransferInputs(denied), /未允许读取/);
+  await assert.rejects(() => readTransferInputs([]), /未提供/);
+});
+
+test("普通浏览器混合粘贴图片、文件和目录，不调用原生路径读取且纯文字不被拦截", async () => {
+  const h = await localAttachmentHarness(), c = h.context;
+  c.localInputBridge = () => null;
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==", "base64");
+  const image = attachmentTestFile("截图.png", png, "image/png"), file = attachmentTestFile("说明.txt", "abc");
+  const directory = attachmentTestDirectory("空文件夹");
+  let prevented = 0;
+  c.paste = { clipboardData: { files: [image, file], items: [
+    { kind: "file", getAsFile: () => image }, { kind: "file", getAsFile: () => file },
+    { kind: "file", getAsFile: () => null, webkitGetAsEntry: () => directory },
+  ], getData: () => "" }, preventDefault() { ++prevented; } };
+  assert.equal(c.handleComposerLocalPaste(c.paste), true);
+  while (c.composerAttachmentsLoading()) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(prevented, 1);
+  assert.equal(c.composerAttachmentsPayload().length, 1);
+  assert.equal(c.composerLocalInputsPayload().length, 2);
+  assert.equal(h.pasted, 0);
+  assert.deepEqual(h.notices, []);
+  assert.equal(c.handleComposerLocalPaste({ clipboardData: { files: [], getData: () => "C:\\文字路径.txt" },
+    preventDefault() { assert.fail("文字路径不能被当作文件读取"); } }), false);
+  c.setComposerAttachmentsDisabled(true);
+  c.paste.clipboardData.files = [file]; c.paste.clipboardData.items = [{ kind: "file", getAsFile: () => file }];
+  c.handleComposerLocalPaste(c.paste);
+  assert.equal(c.composerLocalInputsPayload().length, 2);
+  assert.match(h.notices.at(-1), /不能添加/);
+});
+
+test("原生剪贴板混合图片和目录时图片进入图像通道，目录内容和空目录保留", async () => {
+  const h = await localAttachmentHarness(), c = h.context;
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==", "base64");
+  h.next = [{ kind: "file", name: "剪贴图.png", size: png.length,
+    files: [{ path: "剪贴图.png", data: png.toString("base64") }], directories: [] }, ...localInputFixtures()];
+  assert.equal(c.handleComposerLocalPaste({ clipboardData: { files: [], getData: () => "" },
+    preventDefault() {} }), true);
+  while (c.composerAttachmentsLoading()) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.pasted, 1);
+  assert.equal(c.composerAttachmentsPayload().length, 1);
+  assert.equal(c.composerAttachmentsPayload()[0].name, "剪贴图.png");
+  assert.deepEqual(JSON.parse(JSON.stringify(c.composerLocalInputsPayload())), localInputFixtures());
+  assert.deepEqual(h.notices, []);
+});
+
+test("额外图片格式解码后转为 PNG，常见 JPEG 别名保留，危险 SVG 在解码前拒绝", async () => {
+  const h = await localAttachmentHarness(), c = h.context;
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==", "base64");
+  let draws = 0;
+  c.document = { createElement: tag => {
+    assert.equal(tag, "canvas");
+    return { getContext: () => ({ drawImage() { ++draws; } }),
+      toBlob: callback => callback(new Blob([png], { type: "image/png" })) };
+  } };
+  const bmp = Buffer.alloc(14); bmp.write("BM");
+  const avif = Buffer.alloc(24); avif.writeUInt32BE(24); avif.write("ftypavif", 4);
+  const icon = Uint8Array.from([0, 0, 1, 0, 1, 0]);
+  const cursor = Uint8Array.from([0, 0, 2, 0, 1, 0]);
+  for (const [name, content, type] of [
+    ["one.bmp", bmp, "image/x-ms-bmp"], ["one.avif", avif, "image/avif"],
+    ["one.ico", icon, "image/vnd.microsoft.icon"], ["one.cur", cursor, ""],
+    ["one.svg", '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><rect width="1" height="1"/></svg>', "image/svg+xml"],
+  ]) {
+    const result = await c.readImageFile(attachmentTestFile(name, content, type));
+    assert.equal(result.mime, "image/png");
+    assert.equal(result.size, png.length);
+    assert.equal(result.name, name);
+    assert.match(result.dataUrl, /^data:image\/png;base64,/);
+  }
+  assert.equal(draws, 5);
+  const jpeg = await c.readImageFile(attachmentTestFile("one.jfif", Uint8Array.from([255, 216, 255, 0]), "image/pjpeg"));
+  assert.equal(jpeg.mime, "image/jpeg");
+  for (const body of ['<svg><script>alert(1)</script></svg>', '<svg><image href="file:///secret"/></svg>',
+    '<svg><image href="/api/secret"/></svg>', '<svg><style>rect{fill:url(other.svg)}</style></svg>']) {
+    await assert.rejects(() => c.readImageFile(attachmentTestFile("blocked.svg", body, "image/svg+xml")), /SVG/);
+  }
+  assert.equal(draws, 5, "脚本或外部引用不能进入图片解码和转换");
+});
+
+test("图片转换后重新校验单张及合计大小，超限时保留已有附件", async () => {
+  const h = await localAttachmentHarness(), c = h.context;
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==", "base64");
+  c.setComposerAttachments([{ kind: "inline", name: "保留.png", mime: "image/png",
+    dataUrl: `data:image/png;base64,${png.toString("base64")}`, size: png.length, width: 1, height: 1 }]);
+  const before = JSON.stringify(c.composerAttachmentSnapshot());
+  let convertedSize = 5 * 1024 * 1024;
+  c.document = { createElement: () => ({
+    getContext: () => ({ drawImage() {} }),
+    toBlob: callback => callback(new Blob([png, new Uint8Array(convertedSize - png.length)], { type: "image/png" })),
+  }) };
+  const bmp = Buffer.alloc(14); bmp.write("BM");
+  await c.addFiles(Array.from({ length: 3 }, (_, i) => attachmentTestFile(`${i}.bmp`, bmp, "image/bmp")));
+  assert.match(h.notices.at(-1), /12 MiB/);
+  assert.equal(JSON.stringify(c.composerAttachmentSnapshot()), before);
+  convertedSize = 6 * 1024 * 1024;
+  await c.addFiles([attachmentTestFile("large.bmp", bmp, "image/bmp")]);
+  assert.match(h.notices.at(-1), /5 MiB/);
+  assert.equal(JSON.stringify(c.composerAttachmentSnapshot()), before);
+});
 
 test("本机文件及文件夹预览显示两种图标和下方名称，移除后同步草稿", async () => {
   const h = await localAttachmentHarness(), c = h.context;
@@ -10015,7 +10196,7 @@ test("纯文件和文件夹输入经过原可靠发送，成功前不显示正�
   const h = idleSendDisplayHarness(), c = h.context, files = localInputFixtures();
   h.prompt.value = "";
   c.session.capabilities.localFileInput = true;
-  c.composerLocalInputsSupported = () => true;
+  c.composerLocalInputsSupported = () => false;
   c.composerLocalInputsPayload = () => files;
   c.snapshotDraft = () => ({ text: "", skills: [], attachments: structuredClone(files), goalMode: null });
   const sending = c.sendMessage();
