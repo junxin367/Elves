@@ -1,0 +1,120 @@
+[
+  {
+    "backend": "codex", "section": "general", "id": "chronicle",
+    "path": ["features", "chronicle"], "kind": "boolean", "feature": "chronicle",
+    "group": "实验能力", "label": "Chronicle 实验功能",
+    "description": "控制所选实例的 Chronicle 原生实验开关；功能可用性取决于该实例的原生引擎。"
+  },
+  {
+    "backend": "codex", "section": "general", "id": "experimentalContextManagement",
+    "path": ["features", "context_management", "experimental_mode"], "kind": "boolean", "feature": "context_management",
+    "group": "实验能力", "label": "实验性上下文管理",
+    "description": "开启所选实例的实验性上下文管理，保留该实例已有的其他上下文配置。"
+  },
+  {
+    "backend": "codex", "section": "general", "id": "threadStoreCompression",
+    "path": ["features", "local_thread_store_compression"], "kind": "boolean", "feature": "local_thread_store_compression",
+    "group": "实验能力", "label": "本地会话存储压缩",
+    "description": "允许原生引擎压缩本地会话存储，不改变聊天正文和远程网页的传输方式。"
+  },
+  {
+    "backend": "codex", "section": "general", "id": "generateMemories",
+    "path": ["memories", "generate_memories"], "kind": "boolean",
+    "group": "记忆与子智能体", "label": "生成记忆",
+    "description": "需开启上方“记忆”；控制后续新建会话是否参与原生记忆生成，关闭后不删除已有记忆。"
+  },
+  {
+    "backend": "codex", "section": "general", "id": "useMemories",
+    "path": ["memories", "use_memories"], "kind": "boolean",
+    "group": "记忆与子智能体", "label": "使用记忆",
+    "description": "需开启上方“记忆”；控制是否向后续会话加入原生记忆使用指令，与是否生成记忆分别保存。"
+  },
+  {
+    "backend": "codex", "section": "general", "id": "maxConcurrentThreads",
+    "path": ["agents", "max_concurrent_threads_per_session"], "kind": "integer", "min": 1, "max": 2147483647,
+    "group": "记忆与子智能体", "label": "子智能体并发上限",
+    "description": "每个会话最多同时打开的原生子智能体数量；留空使用原生默认值。"
+  },
+  {
+    "backend": "codex", "section": "models", "id": "autoCompactTokenLimit",
+    "path": ["model_auto_compact_token_limit"], "kind": "integer", "min": 1, "max": 9007199254740991,
+    "group": "压缩与输出", "label": "自动压缩阈值",
+    "description": "达到此 Token 数时由原生引擎触发历史压缩；留空使用模型默认值，不改写模型上下文容量。"
+  },
+  {
+    "backend": "codex", "section": "models", "id": "reasoningSummary",
+    "path": ["model_reasoning_summary"], "kind": "enum",
+    "options": [{"value": "auto", "label": "自动"}, {"value": "concise", "label": "简洁"}, {"value": "detailed", "label": "详细"}, {"value": "none", "label": "不生成"}],
+    "group": "压缩与输出", "label": "思考摘要",
+    "description": "设置模型返回的思考摘要详细程度；实际支持情况由所选模型和上游决定。"
+  },
+  {
+    "backend": "codex", "section": "models", "id": "defaultServiceTier",
+    "path": ["service_tier"], "kind": "enum",
+    "options": [{"value": "default", "label": "标准"}, {"value": "priority", "label": "优先（Fast）"}, {"value": "flex", "label": "Flex"}],
+    "group": "压缩与输出", "label": "默认服务档位",
+    "description": "保存实例的原生默认请求档位，可用性由模型和上游决定；已有会话输入区的 Fast 选择仍按该会话实际配置生效。"
+  },
+  {
+    "backend": "codex", "section": "general", "id": "legacyJsRepl",
+    "path": ["features", "js_repl"], "kind": "boolean", "configuredOnly": true, "feature": "js_repl",
+    "group": "原生配置诊断", "label": "旧 JavaScript REPL 开关",
+    "readOnlyReason": "旧 JavaScript REPL 配置仅供诊断；保留原值，不根据此字段认定当前实例已提供 JavaScript 工具。"
+  },
+  {
+    "backend": "codex", "section": "models", "id": "legacyPersonality",
+    "path": ["personality"], "kind": "enum", "configuredOnly": true, "feature": "personality",
+    "options": [{"value": "friendly", "label": "友好"}, {"value": "pragmatic", "label": "务实"}],
+    "group": "原生配置诊断", "label": "旧回答风格",
+    "readOnlyReason": "旧回答风格配置仅供诊断；保留原值，不将其显示为仍可生效的风格设置。"
+  },
+  {
+    "backend": "claude", "section": "general", "id": "syncClaudeAiSkills",
+    "path": ["syncClaudeAiSkills"], "kind": "boolean",
+    "group": "同步与内置能力", "label": "同步 Claude.ai Skills",
+    "description": "保存所选实例的原生 Skills 同步开关，是否可同步仍取决于该实例的原生 CLI 和授权。"
+  },
+  {
+    "backend": "claude", "section": "general", "id": "syncClaudeAiPlugins",
+    "path": ["syncClaudeAiPlugins"], "kind": "boolean",
+    "group": "同步与内置能力", "label": "同步 Claude.ai 插件",
+    "description": "保存所选实例的原生插件同步开关，已有本地插件保持各自的原生配置。"
+  },
+  {
+    "backend": "claude", "section": "general", "id": "disableBundledSkills",
+    "path": ["disableBundledSkills"], "kind": "boolean",
+    "group": "同步与内置能力", "label": "禁用内置 Skills",
+    "description": "控制原生 CLI 的内置 Skills 禁用开关；与外部安装的 Skills 配置分开保存。"
+  },
+  {
+    "backend": "claude", "section": "general", "id": "skipDangerousModePermissionPrompt",
+    "path": ["skipDangerousModePermissionPrompt"], "kind": "boolean",
+    "group": "原生启动选项", "label": "跳过绕过权限确认",
+    "description": "只控制原生 CLI 启动时的绕过权限确认提示，不改变实例默认权限模式。"
+  },
+  {
+    "backend": "claude", "section": "general", "id": "switchModelsOnFlag",
+    "path": ["switchModelsOnFlag"], "kind": "boolean",
+    "group": "原生启动选项", "label": "跟随模型参数切换",
+    "description": "保存原生 switchModelsOnFlag 开关；新启动的 CLI 读取此配置，不切换已有远程会话的模型。"
+  },
+  {
+    "backend": "claude", "section": "general", "id": "nativePromptCacheTtl",
+    "path": ["env", "CLAUDE_CODE_PROMPT_CACHE_TTL"], "kind": "enum", "configuredOnly": true,
+    "options": [{"value": "5m", "label": "5 分钟"}, {"value": "1h", "label": "1 小时"}],
+    "group": "原生配置诊断", "label": "提示词缓存有效期",
+    "readOnlyReason": "此值来自实例已保存的环境配置；当前 CLI 未提供此变量的查询与能力说明，暂仅展示配置值，不认定实际缓存时长。"
+  },
+  {
+    "backend": "claude", "section": "general", "id": "nativeAutoCompactWindow",
+    "path": ["env", "CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "kind": "integerString", "configuredOnly": true, "min": 100000, "max": 1000000,
+    "group": "原生配置诊断", "label": "原生压缩窗口环境值",
+    "readOnlyReason": "当前 CLI 未确认此环境变量的作用；远程自动压缩窗口仍由上方唯一的“自动压缩窗口”设置通过原生 --autocompact 参数控制。"
+  },
+  {
+    "backend": "claude", "section": "general", "id": "nativeAutoCompactPercent",
+    "path": ["env", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], "kind": "integerString", "configuredOnly": true, "min": 1, "max": 100,
+    "group": "原生配置诊断", "label": "原生压缩比例环境值",
+    "readOnlyReason": "此值来自实例已保存的环境配置；当前 CLI 未提供此变量的查询与能力说明，暂仅展示配置值，不改写该变量。"
+  }
+]

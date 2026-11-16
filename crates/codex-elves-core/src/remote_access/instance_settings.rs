@@ -14,9 +14,23 @@ use tokio::sync::Mutex;
 use super::permissions::{self, ConfigFile};
 use super::{ApiError, RemoteAuthorization, WebState};
 
+#[path = "instance_settings_options.rs"]
+mod options;
+
 const PREFERENCES_FILE: &str = "remote-instance-preferences.json";
 type HelpCache = BTreeMap<String, (Instant, String)>;
 static CLAUDE_HELP: OnceLock<Mutex<HelpCache>> = OnceLock::new();
+type CapabilityCache = BTreeMap<String, (Instant, Value)>;
+static CLAUDE_OPTIONS: OnceLock<Mutex<CapabilityCache>> = OnceLock::new();
+
+// 用户要求核对真实 Claude 实例；与 WSL 配置写入程序的布尔键白名单保持一致，不探测任意用户键。
+const CLAUDE_BOOLEAN_OPTIONS: &[&str] = &[
+    "syncClaudeAiSkills",
+    "syncClaudeAiPlugins",
+    "disableBundledSkills",
+    "skipDangerousModePermissionPrompt",
+    "switchModelsOnFlag",
+];
 
 fn preferences(directory: &Path) -> Result<(Value, String), ApiError> {
     let (text, revision) = permissions::read_file(&directory.join(PREFERENCES_FILE))?;
@@ -180,6 +194,54 @@ async fn claude_help(config: &super::claude::WslConfig) -> Result<String, ApiErr
     Ok(text)
 }
 
+async fn claude_option_capabilities(config: &super::claude::WslConfig) -> Result<Value, ApiError> {
+    let key = format!("{}:{}", config.instance_id(), config.executable);
+    let cache = CLAUDE_OPTIONS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Some((at, value)) = cache.lock().await.get(&key)
+        && at.elapsed() < Duration::from_secs(60)
+    {
+        return Ok(value.clone());
+    }
+    config
+        .validate()
+        .map_err(|_| ApiError::new(400, "Claude 实例身份或 CLI 路径无效"))?;
+    let probe = CLAUDE_BOOLEAN_OPTIONS
+        .iter()
+        .map(|key| ((*key).to_owned(), json!("__codex_elves_type_probe__")))
+        .collect::<serde_json::Map<_, _>>();
+    let mut command = tokio::process::Command::new("wsl.exe");
+    command.args([
+        "--distribution",
+        &config.distribution,
+        "--user",
+        &config.user,
+        "--cd",
+        "~",
+    ]);
+    super::claude::Claude::wsl_login_exec(&mut command, &config.executable);
+    // doctor 只检查配置；临时命令行覆盖用于确认字段类型，不写用户配置、不创建模型请求或会话。
+    command.args([
+        "--settings",
+        &serde_json::to_string(&probe).unwrap(),
+        "doctor",
+    ]);
+    let output = String::from_utf8(super::preferences::output(command).await?)
+        .map_err(|_| ApiError::new(503, "Claude 配置能力检查返回格式无效"))?;
+    let mut value = json!({});
+    for field in CLAUDE_BOOLEAN_OPTIONS {
+        value[*field] = json!(output.lines().any(|line| {
+            line.contains(&format!("› {field}: Expected boolean"))
+                && line.contains("received string")
+        }));
+    }
+    // 不返回 doctor 原文；其中可能包含账号、路径、命令和其他原生配置。
+    cache
+        .lock()
+        .await
+        .insert(key, (Instant::now(), value.clone()));
+    Ok(value)
+}
+
 fn native_document(backend: &str, text: &str) -> Result<Value, ApiError> {
     if backend == "codex" {
         let value = toml::from_str::<toml::Value>(text)
@@ -298,6 +360,9 @@ fn updated_native(
             set_toml(document.as_item_mut(), &["model_reasoning_effort"], None)?;
         }
         for (key, value) in changes {
+            if options::apply_codex(&mut document, section, key, value)? {
+                continue;
+            }
             let path: &[&str] = match (section, key.as_str()) {
                 ("general", "todo") => &["tools", "update_plan", "enabled"],
                 ("general", "memories") => &["features", "memories"],
@@ -344,23 +409,25 @@ fn updated_native(
         let mut document = native_document(backend, text)?;
         let root = document.as_object_mut().unwrap();
         for (key, value) in changes {
-            match (section, key.as_str()) {
-                ("general", "awaySummaryEnabled") if value.is_boolean() => {}
-                ("general", "promptSuggestionEnabled") if value.is_null() || value.is_boolean() => {
+            if !options::claude_boolean(section, key, value) {
+                match (section, key.as_str()) {
+                    ("general", "awaySummaryEnabled") if value.is_boolean() => {}
+                    ("general", "promptSuggestionEnabled")
+                        if value.is_null() || value.is_boolean() => {}
+                    ("hooks", "enabled") if value.is_boolean() => {
+                        root.insert("disableAllHooks".into(), json!(!value.as_bool().unwrap()));
+                        continue;
+                    }
+                    // CLI 仅确认 model 是可持久化的原生设置；effortLevel 未获确认，不能写入后显示假成功。
+                    ("models", "model")
+                        if value.is_null()
+                            || value.as_str().is_some_and(|value| {
+                                !value.is_empty()
+                                    && value.len() <= 200
+                                    && !value.chars().any(char::is_control)
+                            }) => {}
+                    _ => return Err(ApiError::new(400, "不支持的 Claude 实例设置")),
                 }
-                ("hooks", "enabled") if value.is_boolean() => {
-                    root.insert("disableAllHooks".into(), json!(!value.as_bool().unwrap()));
-                    continue;
-                }
-                // CLI 仅确认 model 是可持久化的原生设置；effortLevel 未获确认，不能写入后显示假成功。
-                ("models", "model")
-                    if value.is_null()
-                        || value.as_str().is_some_and(|value| {
-                            !value.is_empty()
-                                && value.len() <= 200
-                                && !value.chars().any(char::is_control)
-                        }) => {}
-                _ => return Err(ApiError::new(400, "不支持的 Claude 实例设置")),
             }
             if value.is_null() {
                 root.remove(key);
@@ -702,6 +769,7 @@ pub(super) async fn settings(
         ));
     }
     let mut capabilities = json!({});
+    let mut native_features = json!({});
     let mut capability_error = String::new();
     if section == "general"
         && let Some(config) = &target.claude_config
@@ -718,6 +786,26 @@ pub(super) async fn settings(
             "promptSuggestions":help.contains("--prompt-suggestions"),
             "autoCompactWindow":help.contains("--autocompact")
         });
+        if help.contains("--settings") && help.contains("doctor") {
+            match claude_option_capabilities(config).await {
+                Ok(value) => capabilities["extraSettings"] = value,
+                Err(error) => {
+                    if !capability_error.is_empty() {
+                        capability_error.push(' ');
+                    }
+                    capability_error.push_str(&error.message);
+                }
+            }
+        }
+    }
+    if target.backend == "codex"
+        && instance == "codex:local"
+        && ["general", "models"].contains(&section)
+    {
+        match state.controller.harness.settings_features().await {
+            Ok(value) => native_features = value,
+            Err(_) => capability_error = "所选 Codex 原生引擎未成功返回特性目录，实验能力暂不可修改，原生诊断项保持只读，请重新读取。".into(),
+        }
     }
     let mut catalog = if section == "models" {
         Some(model_catalog(&state, instance, &authorization).await?)
@@ -737,6 +825,16 @@ pub(super) async fn settings(
             .as_object()
             .filter(|changes| !changes.is_empty())
             .ok_or_else(|| ApiError::new(400, "请选择需要保存的设置"))?;
+        options::validate_changes(
+            &target.backend,
+            section,
+            &payload["settings"],
+            if target.backend == "codex" {
+                &native_features
+            } else {
+                &capabilities["extraSettings"]
+            },
+        )?;
         if changes.contains_key("ultraReasoningEnabled") {
             if section != "models" || target.backend != "codex" || changes.len() != 1 {
                 return Err(ApiError::new(400, "Ultra 开关需要单独保存"));
@@ -799,7 +897,11 @@ pub(super) async fn settings(
             {
                 return Err(ApiError::new(409, "当前 Claude CLI 尚未确认支持输入建议"));
             }
-            if let Some(catalog) = &catalog {
+            if let Some(catalog) = &catalog
+                && !changes
+                    .keys()
+                    .all(|key| options::contains(&target.backend, section, key))
+            {
                 validate_models(
                     &target.backend,
                     &document,
@@ -842,6 +944,17 @@ pub(super) async fn settings(
         validate_compact(window)?;
         values["autoCompactWindow"] = window.clone();
     }
+    let extra_settings = options::append_view(
+        &target.backend,
+        section,
+        &document,
+        &mut values,
+        if target.backend == "codex" {
+            &native_features
+        } else {
+            &capabilities["extraSettings"]
+        },
+    );
     authorization
         .check()
         .await
@@ -850,6 +963,7 @@ pub(super) async fn settings(
         "ok":true,"instanceId":instance,"backend":target.backend,
         "path":target.display,"revision":revision,"preferenceRevision":preference_revision,
         "settings":values,"capabilities":capabilities,"capabilityError":capability_error,
+        "extraSettings":extra_settings,
         "readOnly":state.settings.read_only||adapter_read_only,
         "readOnlyReason":if adapter_read_only {
             "该 Codex 实例的独立执行适配器尚未接入，原生配置仅供查看。"
@@ -914,4 +1028,265 @@ pub(super) async fn settings(
         .await
         .map_err(super::authorization_error)?;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(response)).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn features() -> Value {
+        json!({
+            "chronicle":{"stage":"underDevelopment"},
+            "context_management":{"stage":"underDevelopment"},
+            "local_thread_store_compression":{"stage":"underDevelopment"}
+        })
+    }
+
+    #[test]
+    fn extra_codex_settings_preserve_unrelated_data_comments_and_encoding() {
+        let before = "\u{feff}# 保留配置\r\nmodel = \"fixture-model\" # 模型注释\r\n\
+            [mcp_servers.fixture]\r\nurl = \"https://fixture.invalid\"\r\n\
+            [mcp_servers.fixture.env]\r\nAPI_KEY = \"fixture-secret\"\r\n";
+        let first = updated_native(
+            "codex",
+            "general",
+            before,
+            &json!({"generateMemories":false,"useMemories":true,"maxConcurrentThreads":12}),
+        )
+        .unwrap();
+        let second = updated_native("codex", "general", &first,
+            &json!({"chronicle":false,"experimentalContextManagement":true,"threadStoreCompression":true})).unwrap();
+        let after = updated_native("codex", "models", &second,
+            &json!({"autoCompactTokenLimit":900000,"reasoningSummary":"detailed","defaultServiceTier":"priority"})).unwrap();
+        assert!(after.starts_with('\u{feff}'));
+        assert!(after.contains("# 模型注释\r\n"));
+        assert!(!after.replace("\r\n", "").contains('\n'));
+        let original = native_document("codex", before).unwrap();
+        let saved = native_document("codex", &after).unwrap();
+        assert_eq!(saved["model"], original["model"]);
+        assert_eq!(saved["mcp_servers"], original["mcp_servers"]);
+        assert_eq!(saved["agents"]["max_concurrent_threads_per_session"], 12);
+        assert_eq!(saved["memories"]["generate_memories"], false);
+        assert_eq!(
+            saved["features"]["context_management"]["experimental_mode"],
+            true
+        );
+        assert_eq!(saved["model_auto_compact_token_limit"], 900000);
+        assert_eq!(saved["model_reasoning_summary"], "detailed");
+        let reset = updated_native("codex", "general", &after,
+            &json!({"generateMemories":null,"maxConcurrentThreads":null,"experimentalContextManagement":null})).unwrap();
+        let reset = native_document("codex", &reset).unwrap();
+        assert!(reset["memories"]["generate_memories"].is_null());
+        assert!(reset["agents"]["max_concurrent_threads_per_session"].is_null());
+        assert!(reset["features"]["context_management"].is_null());
+        assert_eq!(reset["mcp_servers"], original["mcp_servers"]);
+    }
+
+    #[test]
+    fn extra_codex_context_accepts_boolean_and_empty_native_defaults() {
+        let before = "[features]\ncontext_management = true\nmemories = true\n";
+        let disabled = updated_native(
+            "codex",
+            "general",
+            before,
+            &json!({"experimentalContextManagement":false}),
+        )
+        .unwrap();
+        let document = native_document("codex", &disabled).unwrap();
+        assert_eq!(
+            document["features"]["context_management"]["experimental_mode"],
+            false
+        );
+        assert_eq!(document["features"]["memories"], true);
+        let reset = updated_native(
+            "codex",
+            "general",
+            before,
+            &json!({"experimentalContextManagement":null}),
+        )
+        .unwrap();
+        assert!(
+            native_document("codex", &reset).unwrap()["features"]["context_management"].is_null()
+        );
+        assert!(
+            updated_native(
+                "codex",
+                "general",
+                "",
+                &json!({"experimentalContextManagement":true})
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn extra_settings_validate_native_capabilities_sections_and_scalar_types() {
+        let legacy = json!({"service_tier":"fast"});
+        let mut values = json!({});
+        options::append_view("codex", "models", &legacy, &mut values, &json!({}));
+        assert_eq!(values["defaultServiceTier"], "priority");
+        assert_eq!(legacy["service_tier"], "fast");
+        let untouched = updated_native(
+            "codex",
+            "models",
+            "service_tier = \"fast\"\n",
+            &json!({"reasoningSummary":"detailed"}),
+        )
+        .unwrap();
+        assert_eq!(
+            native_document("codex", &untouched).unwrap()["service_tier"],
+            "fast"
+        );
+        for changes in [
+            json!({"chronicle":true}),
+            json!({"experimentalContextManagement":false}),
+            json!({"threadStoreCompression":null}),
+        ] {
+            assert!(options::validate_changes("codex", "general", &changes, &features()).is_ok());
+            assert!(options::validate_changes("codex", "general", &changes, &json!({})).is_err());
+        }
+        let removed = json!({"chronicle":{"stage":"removed"}});
+        assert!(
+            options::validate_changes("codex", "general", &json!({"chronicle":true}), &removed)
+                .is_err()
+        );
+        for changes in [
+            json!({"maxConcurrentThreads":0}),
+            json!({"maxConcurrentThreads":1.5}),
+            json!({"generateMemories":"true"}),
+            json!({"unknownSetting":true}),
+        ] {
+            assert!(updated_native("codex", "general", "", &changes).is_err());
+        }
+        assert!(
+            updated_native(
+                "codex",
+                "general",
+                "",
+                &json!({"reasoningSummary":"detailed"})
+            )
+            .is_err()
+        );
+        assert!(
+            updated_native(
+                "codex",
+                "models",
+                "",
+                &json!({"reasoningSummary":"invalid"})
+            )
+            .is_err()
+        );
+        assert!(
+            updated_native(
+                "codex",
+                "models",
+                "",
+                &json!({"autoCompactTokenLimit":9007199254740992_u64})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn extra_views_expose_only_safe_whitelisted_values_and_invalid_state() {
+        let document = json!({
+            "features":{"chronicle":"fixture-secret","js_repl":true},
+            "env":{"API_KEY":"fixture-secret"},
+            "mcp_servers":{"fixture":{"http_headers":{"Authorization":"fixture-secret"}}}
+        });
+        let mut values = general_view("codex", &document).unwrap();
+        let mut native = features();
+        native["js_repl"] = json!({"stage":"removed"});
+        let rows = options::append_view("codex", "general", &document, &mut values, &native);
+        let invalid = rows.iter().find(|row| row["id"] == "chronicle").unwrap();
+        assert_eq!(invalid["valueInvalid"], true);
+        assert_eq!(invalid["readOnly"], true);
+        let removed = rows.iter().find(|row| row["id"] == "legacyJsRepl").unwrap();
+        assert!(
+            removed["readOnlyReason"]
+                .as_str()
+                .unwrap()
+                .contains("已移除")
+        );
+        let serialized =
+            serde_json::to_string(&json!({"settings":values,"extraSettings":rows})).unwrap();
+        assert!(!serialized.contains("fixture-secret"));
+        assert!(!serialized.contains("Authorization"));
+        assert!(!serialized.contains("API_KEY"));
+    }
+
+    #[test]
+    fn claude_extra_booleans_roundtrip_without_rewriting_other_native_settings() {
+        let original = json!({"model":"opus","env":{"API_KEY":"fixture-secret"},
+            "permissions":{"deny":["fixture-command"]},"modelSettings":{"claude-fixture":{"effortLevel":"high"}}});
+        let mut text = format!(
+            "\u{feff}{}\r\n",
+            serde_json::to_string_pretty(&original)
+                .unwrap()
+                .replace('\n', "\r\n")
+        );
+        let capabilities = Value::Object(
+            CLAUDE_BOOLEAN_OPTIONS
+                .iter()
+                .map(|key| ((*key).into(), json!(true)))
+                .collect(),
+        );
+        for key in CLAUDE_BOOLEAN_OPTIONS {
+            let change = json!({*key:true});
+            assert!(options::validate_changes("claude", "general", &change, &capabilities).is_ok());
+            assert!(options::validate_changes("claude", "general", &change, &json!({})).is_err());
+            text = updated_native("claude", "general", &text, &change).unwrap();
+            assert_eq!(native_document("claude", &text).unwrap()[*key], true);
+            text = updated_native("claude", "general", &text, &json!({*key:null})).unwrap();
+            assert!(native_document("claude", &text).unwrap()[*key].is_null());
+            assert!(updated_native("claude", "general", &text, &json!({*key:1})).is_err());
+        }
+        assert!(text.starts_with('\u{feff}'));
+        assert!(!text.replace("\r\n", "").contains('\n'));
+        assert_eq!(native_document("claude", &text).unwrap(), original);
+    }
+
+    #[test]
+    fn diagnostic_environment_and_model_overrides_remain_readonly_and_redacted() {
+        let document = json!({"env":{"CLAUDE_CODE_PROMPT_CACHE_TTL":"1h",
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW":"600000","CLAUDE_AUTOCOMPACT_PCT_OVERRIDE":"95",
+            "ANTHROPIC_AUTH_TOKEN":"fixture-secret"},
+            "modelSettings":{"claude-fixture":{"effortLevel":"xhigh"},"invalid model":{"effortLevel":"fixture-secret"}}});
+        let mut values = general_view("claude", &document).unwrap();
+        let rows = options::append_view("claude", "general", &document, &mut values, &json!({}));
+        assert_eq!(values["nativePromptCacheTtl"], "1h");
+        for key in [
+            "nativePromptCacheTtl",
+            "nativeAutoCompactWindow",
+            "nativeAutoCompactPercent",
+        ] {
+            assert!(
+                rows.iter()
+                    .any(|row| row["id"] == key && row["readOnly"] == true)
+            );
+            assert!(updated_native("claude", "general", "{}", &json!({key:null})).is_err());
+            assert!(
+                options::validate_changes("claude", "general", &json!({key:null}), &json!({}))
+                    .is_err()
+            );
+        }
+        let models = options::append_view("claude", "models", &document, &mut values, &json!({}));
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0]["value"], "xhigh");
+        assert_eq!(models[0]["readOnly"], true);
+        assert!(
+            !serde_json::to_string(&json!({"values":values,"rows":rows,"models":models}))
+                .unwrap()
+                .contains("fixture-secret")
+        );
+        assert!(
+            updated_native(
+                "claude",
+                "models",
+                "{}",
+                &json!({"nativeModelEffort:claude-fixture":"max"})
+            )
+            .is_err()
+        );
+    }
 }

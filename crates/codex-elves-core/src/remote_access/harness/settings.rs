@@ -5,6 +5,53 @@ use super::{Harness, error};
 use crate::remote_access::{RemoteAuthorization, execution};
 
 impl Harness {
+    pub(in crate::remote_access) async fn settings_features(&self) -> anyhow::Result<Value> {
+        execution::Scope::service(self.audit.clone(), "settings-features", &json!({}), None)
+            .run(async {
+                let mut result = json!({});
+                let mut cursor = Value::Null;
+                let mut visited = std::collections::BTreeSet::new();
+                for _ in 0..4 {
+                    let page = self
+                        .runtime
+                        .request(
+                            "experimentalFeature/list",
+                            json!({"limit":100,"cursor":cursor}),
+                            None,
+                        )
+                        .await?;
+                    let rows = page["data"]
+                        .as_array()
+                        .ok_or_else(|| error(503, "原生特性目录格式无效"))?;
+                    for row in rows {
+                        let Some(name) = row["name"].as_str().filter(|name| {
+                            [
+                                "chronicle",
+                                "context_management",
+                                "local_thread_store_compression",
+                                "js_repl",
+                                "personality",
+                            ]
+                            .contains(name)
+                        }) else {
+                            continue;
+                        };
+                        // 用户要求按真实实例确认实验能力；移除、弃用和未知状态不能成为可写开关。
+                        result[name] = json!({"stage":row["stage"]});
+                    }
+                    let Some(next) = page["nextCursor"].as_str() else {
+                        return Ok(result);
+                    };
+                    if next.is_empty() || !visited.insert(next.to_owned()) {
+                        return Err(error(503, "原生特性目录分页无效"));
+                    }
+                    cursor = json!(next);
+                }
+                Err(error(503, "原生特性目录分页超过限制"))
+            })
+            .await
+    }
+
     pub(in crate::remote_access) async fn settings_skills(
         &self,
         home: &str,

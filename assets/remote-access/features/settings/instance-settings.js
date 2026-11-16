@@ -142,7 +142,11 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     control.id = `settings-${name}-${key}`; control.settingsUnsupported = unsupported;
     const suffix = value == null ? " 当前使用原生默认设置。" : "";
     row.append(fieldCopy(label, `${description || ""}${suffix}`), control);
-    control.onchange = () => void save({ [key]: control.checked });
+    const owner = record, ownerId = selected;
+    control.onchange = () => {
+      if (record === owner && selected === ownerId && control.isConnected)
+        void save({ [key]: control.checked });
+    };
     controls.add(control); card.append(row);
   }
   function addSelect(card, key, label, description, options, value, transform = apiValue, unsupported = false) {
@@ -151,7 +155,9 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
       options = [...options, { value, label: `${value}（当前配置）`, disabled: true }];
     const control = selectControl(`settings-${name}-${key}`, label, options, value);
     control.settingsUnsupported = unsupported;
+    const owner = record, ownerId = selected;
     control.onchange = () => {
+      if (record !== owner || selected !== ownerId || !control.isConnected) return;
       const settings = { [key]: transform(control.value) };
       if (name === "models" && key === "model" && record.backend === "codex") {
         // 切换 Codex 实例默认模型时恢复模型默认思考深度，避免把旧模型的专属等级带给新模型。
@@ -185,11 +191,15 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
         record.capabilities?.autoCompactWindow !== true);
       content.append(element("p", "appearance-hint",
         "回顾和输入建议保存在所选实例的原生配置；自动压缩窗口用于此实例后续新建的远程会话。"));
-      if (record.capabilities?.promptSuggestions !== true || record.capabilities?.autoCompactWindow !== true)
+      if (record.capabilities?.promptSuggestions !== true || record.capabilities?.autoCompactWindow !== true) {
+        const unsupported = [record.capabilities?.promptSuggestions !== true && "输入建议",
+          record.capabilities?.autoCompactWindow !== true && "自动压缩窗口"].filter(Boolean).join("、");
         content.append(element("p", "appearance-hint",
-          record.capabilityError
-            ? `无法核对当前 Claude CLI 能力：${record.capabilityError} 输入建议与压缩窗口暂不可修改。`
-            : "该实例的 Claude CLI 未提供部分设置参数，对应控件暂不可用。"));
+          `该实例的 Claude CLI 尚未确认支持${unsupported}，对应控件暂不可用。`));
+      }
+      // 兼容没有额外设置返回值的旧服务；新服务在下方统一展示实际失败原因，避免漏报 doctor 校验失败。
+      if (record.capabilityError && !record.extraSettings?.length)
+        content.append(element("p", "appearance-hint", `无法核对当前 Claude CLI 能力：${record.capabilityError}`));
     }
     content.append(element("p", "appearance-hint", "项目设置、启动参数和组织策略仍按原生优先级生效。"));
   }
@@ -256,12 +266,67 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
       card.append(row);
     }
   }
+  function renderExtraSettings() {
+    const rows = record.extraSettings || [];
+    if (!rows.length) return;
+    const groups = new Map();
+    if (record.capabilityError)
+      content.append(element("p", "appearance-hint", `部分原生设置能力核对失败：${record.capabilityError}`));
+    for (const option of rows) {
+      if (!groups.has(option.group)) groups.set(option.group, section(content, option.group));
+      const card = groups.get(option.group), value = record.settings[option.id];
+      // 用户要求额外配置也按真实实例保存；失效、能力未确认或只读诊断值只展示，不伪装成可用开关。
+      if (option.readOnly) {
+        const row = element("div", "appearance-field");
+        const label = option.options?.find(choice => choice.value === value)?.label;
+        const configured = label || (option.id.startsWith("nativeModelEffort:") ? effortLabels[value] : "") || String(value);
+        // 诊断项只说明文件中的值；不能把已移除或未确认的原生能力显示成“已开启”。
+        const text = option.valueInvalid ? "配置值无效" : value == null ? "使用原生默认" : `配置值：${configured}`;
+        row.append(fieldCopy(option.label, option.readOnlyReason || option.description),
+          element("span", "muted", text));
+        card.append(row); continue;
+      }
+      if (option.kind === "boolean") {
+        addSelect(card, option.id, option.label, option.description, booleanOptions, boolValue(value));
+      } else if (option.kind === "enum") {
+        addSelect(card, option.id, option.label, option.description,
+          [inherit, ...option.options], value || "", value => value || null);
+      } else if (option.kind === "integer") {
+        const row = element("label", "appearance-field");
+        const input = element("input");
+        input.type = "number"; input.step = "1";
+        input.id = `settings-${name}-${option.id}`; input.setAttribute("aria-label", option.label);
+        input.min = String(option.min); input.max = String(option.max);
+        input.placeholder = "使用原生默认"; input.value = value == null ? "" : String(value);
+        const owner = record, ownerId = selected;
+        input.onchange = () => {
+          // 数字控件失焦可能晚于切换实例或重新读取；旧控件不能借用新目标及新版本保存。
+          if (record !== owner || selected !== ownerId || !input.isConnected) return;
+          const raw = input.value.trim(), next = raw === "" ? null : Number(raw);
+          if (input.validity?.badInput || raw !== "" && (!Number.isSafeInteger(next) || next < option.min || next > option.max)) {
+            input.value = value == null ? "" : String(value);
+            input.setAttribute("aria-invalid", "true");
+            message = `${option.label}需要填写 ${option.min}～${option.max} 的整数，或留空使用原生默认。`;
+            sync(); return;
+          }
+          if (next !== value) void save({ [option.id]: next });
+        };
+        input.oninput = () => input.removeAttribute("aria-invalid");
+        input.onkeydown = event => { if (event.key === "Enter") { event.preventDefault(); input.blur(); } };
+        // 与现有数字设置共用容器：PC 输入宽 100px、手机 82px，保持同一行且说明按剩余宽度换行。
+        const box = element("span", "appearance-number"); box.append(input);
+        row.append(fieldCopy(option.label, option.description), box);
+        controls.add(input); card.append(row);
+      }
+    }
+  }
   function render() {
     content.replaceChildren(); controls.clear();
     if (record) {
       if (name === "general") renderGeneral();
       else if (name === "models") renderModels();
       else renderInventory();
+      renderExtraSettings();
       if (record.readOnly || session?.readOnly) message ||= record.readOnlyReason || "当前为只读访问";
     }
     sync();
@@ -273,6 +338,27 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
         || !result.settings || Array.isArray(result.settings) || typeof result.settings !== "object")
       throw new Error("实例设置返回结果无法确认，请重新读取。");
     const values = result.settings;
+    if (result.extraSettings != null && (!Array.isArray(result.extraSettings)
+        || result.extraSettings.length > 100 || result.extraSettings.some(option =>
+          !option || typeof option.id !== "string" || typeof option.label !== "string"
+          || typeof option.group !== "string" || typeof option.description !== "string"
+          || typeof option.readOnly !== "boolean" || !Object.hasOwn(values, option.id)
+          || option.valueInvalid != null && typeof option.valueInvalid !== "boolean"
+          || !["boolean", "integer", "integerString", "enum", "text"].includes(option.kind)
+          || !Array.isArray(option.options) || option.options.some(choice =>
+            !choice || typeof choice.value !== "string" || typeof choice.label !== "string")
+          || option.readOnly && typeof option.readOnlyReason !== "string"
+          || !option.readOnly && (option.kind === "boolean"
+            ? values[option.id] !== null && typeof values[option.id] !== "boolean"
+            : option.kind === "integer"
+              ? !Number.isSafeInteger(option.min) || !Number.isSafeInteger(option.max)
+                || option.min < 1 || option.max < option.min
+                || values[option.id] !== null && (!Number.isSafeInteger(values[option.id])
+                  || values[option.id] < option.min || values[option.id] > option.max)
+              : option.kind === "enum"
+                ? values[option.id] !== null && !option.options.some(choice => choice.value === values[option.id])
+                : true))))
+      throw new Error("实例额外设置字段无法确认，请重新读取。");
     if (name === "general") {
       const keys = result.backend === "codex" ? ["todo", "memories", "multiAgent", "goals"]
         : ["awaySummaryEnabled", "promptSuggestionEnabled"];

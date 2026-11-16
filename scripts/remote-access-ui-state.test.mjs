@@ -12,6 +12,115 @@ import { copyLocalInput, isLocalInput, localInputBridge, validateLocalInputs } f
 import { marked, Renderer } from "../assets/remote-access/vendor/marked.esm.js";
 import { defaultSharedSettings } from "../assets/remote-access/features/settings/shared-state.js";
 
+async function instanceOptionUiFixture(settings, extraSettings, backend = "codex", capabilityError = "") {
+  const module = await readFile(new URL("../assets/remote-access/features/settings/instance-settings.js", import.meta.url), "utf8");
+  const start = module.indexOf("  function renderExtraSettings()");
+  const end = module.indexOf("  function render()", start);
+  assert.ok(start >= 0 && end > start);
+  const element = (tag, className = "", text = "") => ({
+    tag, className, textContent: String(text), children: [], attributes: {}, isConnected: true,
+    append(...children) { this.children.push(...children); },
+    setAttribute(key, value) { this.attributes[key] = String(value); },
+    removeAttribute(key) { delete this.attributes[key]; },
+    blur() { this.blurred = true; },
+  });
+  const selections = [], saved = [];
+  const context = {
+    record: { backend, settings, extraSettings, capabilityError }, name: "general", selected: "codex:local",
+    element, content: element("div"), controls: new Set(), message: "",
+    inherit: { value: "", label: "使用原生默认" },
+    booleanOptions: [{ value: "", label: "使用原生默认" }, { value: "true", label: "开启" }, { value: "false", label: "关闭" }],
+    boolValue: value => value == null ? "" : String(value),
+    effortLabels: { xhigh: "极高" }, fieldCopy: (label, description) => ({ label, description }),
+    section(parent, label) { const card = element("section"); card.label = label; parent.append(card); return card; },
+    addSelect(card, key, label, description, options, value, transform) {
+      selections.push({ card, key, label, description, options, value, transform });
+    },
+    save: value => saved.push(JSON.parse(JSON.stringify(value))), sync() {},
+  };
+  rawVm.createContext(context);
+  rawVm.runInContext(module.slice(start, end), context);
+  context.renderExtraSettings();
+  return { context, selections, saved, module };
+}
+
+test("实例额外设置使用原生默认选项，只读诊断不创建可写控件", async () => {
+  const options = [
+    { id: "generateMemories", kind: "boolean", group: "记忆", label: "生成记忆", description: "测试", readOnly: false },
+    { id: "reasoningSummary", kind: "enum", group: "输出", label: "思考摘要", description: "测试",
+      readOnly: false, options: [{ value: "detailed", label: "详细" }] },
+    { id: "legacyJsRepl", kind: "boolean", group: "诊断", label: "旧开关", description: "", readOnly: true,
+      readOnlyReason: "原生已移除", options: [] },
+    { id: "invalidValue", kind: "enum", group: "诊断", label: "无效配置", description: "", readOnly: true,
+      valueInvalid: true, readOnlyReason: "配置值无效", options: [] },
+  ];
+  const fixture = await instanceOptionUiFixture(
+    { generateMemories: null, reasoningSummary: "detailed", legacyJsRepl: true, invalidValue: null },
+    options, "claude", "配置字段校验超时");
+  assert.ok(fixture.context.content.children.some(node => node.textContent.includes("配置字段校验超时")),
+    "即使旧功能能力可用，Claude 额外字段校验失败的实际原因仍须显示");
+  assert.equal(fixture.selections.length, 2);
+  assert.equal(fixture.selections[0].value, "");
+  assert.equal(fixture.selections[0].options[0].label, "使用原生默认");
+  assert.equal(fixture.selections[1].transform(""), null);
+  assert.equal(fixture.selections[1].transform("detailed"), "detailed");
+  const diagnostic = fixture.context.content.children.find(row => row.label === "诊断");
+  assert.equal(diagnostic.children[0].children[1].textContent, "配置值：true");
+  assert.equal(diagnostic.children[0].children[0].description, "原生已移除");
+  assert.equal(diagnostic.children[1].children[1].textContent, "配置值无效");
+  assert.equal(fixture.context.controls.size, 0);
+});
+
+test("实例额外数值设置拒绝非法输入和浏览器 badInput，留空才恢复原生默认", async () => {
+  const fixture = await instanceOptionUiFixture({ maxConcurrentThreads: 12 }, [
+    { id: "maxConcurrentThreads", kind: "integer", group: "并发", label: "子智能体并发上限", description: "测试",
+      readOnly: false, min: 1, max: 2147483647 },
+  ]);
+  const input = [...fixture.context.controls][0];
+  assert.equal(input.value, "12");
+  for (const value of ["0", "1.5", "2147483648"]) {
+    input.value = value; input.onchange();
+    assert.equal(input.value, "12");
+  }
+  input.validity = { badInput: true }; input.value = ""; input.onchange();
+  assert.equal(fixture.saved.length, 0, "浏览器将非法数字显示为空时不能删除已有配置");
+  assert.equal(input.attributes["aria-invalid"], "true");
+  input.oninput(); assert.equal(input.attributes["aria-invalid"], undefined);
+  input.validity.badInput = false; input.value = "24"; input.onchange();
+  assert.deepEqual(fixture.saved, [{ maxConcurrentThreads: 24 }]);
+  input.value = ""; input.onchange();
+  assert.deepEqual(fixture.saved[1], { maxConcurrentThreads: null });
+  fixture.context.selected = "codex:other"; input.value = "48"; input.onchange();
+  assert.equal(fixture.saved.length, 2, "旧控件的迟到失焦不能保存到新实例");
+  fixture.context.selected = "codex:local"; fixture.context.record = { ...fixture.context.record };
+  input.value = "48"; input.onchange();
+  assert.equal(fixture.saved.length, 2, "重新读取后不能借用新记录的版本保存旧控件");
+  assert.equal(fixture.context.content.children[0].children[0].children[1].className, "appearance-number");
+});
+
+test("实例额外设置拒绝无法确认的返回类型，并兼容未提供额外字段的旧服务", async () => {
+  const fixture = await instanceOptionUiFixture({}, []);
+  const start = fixture.module.indexOf("  function checkedResult(");
+  const end = fixture.module.indexOf("  async function read()", start);
+  const context = { name: "general", currentInstance: () => ({ backend: "claude" }) };
+  rawVm.createContext(context);
+  rawVm.runInContext(fixture.module.slice(start, end), context);
+  const result = {
+    ok: true, instanceId: "claude-fixture", backend: "claude", revision: "r", preferenceRevision: "p",
+    readOnly: false, settings: { awaySummaryEnabled: null, promptSuggestionEnabled: null, autoCompactWindow: null,
+      syncClaudeAiSkills: true },
+  };
+  assert.equal(context.checkedResult(result, "claude-fixture"), result);
+  result.extraSettings = [{ id: "syncClaudeAiSkills", kind: "boolean", label: "同步 Skills",
+    description: "测试", group: "同步", readOnly: false, options: [] }];
+  assert.equal(context.checkedResult(result, "claude-fixture"), result);
+  result.settings.syncClaudeAiSkills = "true";
+  assert.throws(() => context.checkedResult(result, "claude-fixture"), /额外设置字段无法确认/);
+  result.settings.syncClaudeAiSkills = true;
+  result.extraSettings[0].readOnly = true;
+  assert.throws(() => context.checkedResult(result, "claude-fixture"), /额外设置字段无法确认/);
+});
+
 function storage() {
   const records = new Map();
   return {

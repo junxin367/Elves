@@ -9,6 +9,11 @@ import tempfile
 
 MAX_BYTES = 2 * 1024 * 1024
 MODES = {"", "default", "manual", "acceptEdits", "plan", "bypassPermissions", "dontAsk", "auto"}
+# 用户要求为所属 CLI 已确认的额外布尔项提供设置；与 instance_settings 的能力探测和固定定义同步。
+EXTRA_BOOLEAN_SETTINGS = {
+    "syncClaudeAiSkills", "syncClaudeAiPlugins", "disableBundledSkills",
+    "skipDangerousModePermissionPrompt", "switchModelsOnFlag",
+}
 
 
 class ConfigError(Exception):
@@ -49,12 +54,12 @@ def update(path, changes, expected):
     elif set(changes) == {"permissionMode"}:
         if not isinstance(changes["permissionMode"], str) or changes["permissionMode"] not in MODES:
             raise ConfigError(400, "Claude 权限模式无效")
-    elif set(changes) <= {"awaySummaryEnabled", "promptSuggestionEnabled", "disableAllHooks", "model"}:
+    elif set(changes) <= {"awaySummaryEnabled", "promptSuggestionEnabled", "disableAllHooks", "model"} | EXTRA_BOOLEAN_SETTINGS:
         # 用户要求常规设置按所属实例保存；原生配置仅开放已核对的键，不能接收任意 JSON 配置写入。
         for key, value in changes.items():
             if key == "awaySummaryEnabled":
                 valid = type(value) is bool
-            elif key in ("promptSuggestionEnabled", "disableAllHooks"):
+            elif key in {"promptSuggestionEnabled", "disableAllHooks"} | EXTRA_BOOLEAN_SETTINGS:
                 valid = value is None or type(value) is bool
             else:
                 valid = value is None or (isinstance(value, str) and 0 < len(value) <= 200
