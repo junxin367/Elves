@@ -1303,7 +1303,7 @@ impl RemoteAccessController {
             && !instance_settings::ultra_enabled(&self.state_dir, &creation_instance)?
         {
             return Err(
-                ApiError::new(409, "当前实例未开放 Ultra 思考等级，请先在设置中开启").into(),
+                ApiError::new(409, "当前实例未开放 Ultra 思考深度，请先在设置中开启").into(),
             );
         }
         let detail_id = (action == "thread")

@@ -6211,7 +6211,7 @@ test("队列编辑保存只持久化一次最新草稿，再提交可靠写入",
   assert.equal(context.busy, false);
 });
 
-test("取回队列消息重新发送只更新输入，不携带另选的模型和思考等级", async () => {
+test("取回队列消息重新发送只更新输入，不携带另选的模型和思考深度", async () => {
   const { context, submissions } = queuedEditPersistenceHarness();
   context.selectedModel = "gpt-6.1-other";
   context.selectedEffort = "high";
@@ -7015,16 +7015,16 @@ test("Claude 模型和等级变化沿用 Codex 变更行，纯等级调整不显
   const effort = render({ id: "effort", type: "modelChanged", source: "claude",
     fromModel: "claude-opus-5-5", toModel: "claude-opus-5-5", fromEffort: "max", toEffort: "xhigh" });
   assert.match(effort.className, /transcript-event.*model-change/);
-  assert.match(effort.textContent, /思考等级已从 Max 更改为 极高/);
+  assert.match(effort.textContent, /思考深度已从 Max 更改为 极高/);
   assert.doesNotMatch(effort.textContent, /模型已从|command-name|local-command-stdout/);
   assert.match(effort.attributes["aria-label"], /原生实际请求确认/);
   const partial = render({ id: "partial", type: "modelChanged", source: "claude",
     fromModel: null, toModel: "model-b", fromEffort: "high", toEffort: "max" });
-  assert.match(partial.textContent, /思考等级已从 高 更改为 Max/);
+  assert.match(partial.textContent, /思考深度已从 高 更改为 Max/);
   assert.doesNotMatch(partial.textContent, /模型已从|未知模型/, "缺失旧型号不能猜造型号切换");
   const both = render({ id: "both", type: "modelChanged", source: "claude",
     fromModel: "model-a", toModel: "model-b", fromEffort: "high", toEffort: "max" });
-  assert.match(both.textContent, /模型已从 model-a 更改为 model-b，思考等级从 高 更改为 Max/);
+  assert.match(both.textContent, /模型已从 model-a 更改为 model-b，思考深度从 高 更改为 Max/);
   const codex = render({ id: "codex", type: "modelChanged", fromModel: "model-a", toModel: "model-b" });
   assert.equal(codex.textContent, "模型已从 model-a 更改为 model-b");
   assert.match(codex.attributes["aria-label"], /模型切换可能触发上下文压缩/);
@@ -9727,7 +9727,7 @@ test("远程新建首条携带草稿 Fast 布尔值，开启时明确默认模�
   }
 });
 
-test("Codex 新建将已解析的模型、思考等级和权限一并送达，读取期间换项目则取消发送", async () => {
+test("Codex 新建将已解析的模型、思考深度和权限一并送达，读取期间换项目则取消发送", async () => {
   for (const changeProject of [false, true]) {
     const h = sendRecoveryHarness(), c = h.context, defaults = deferred();
     Object.assign(c, { creating: true, selectedId: null, isClaude: () => false,
@@ -13391,7 +13391,7 @@ function claudeNewChatPreferenceHarness(disk = storage(), instanceId = "claude:w
   return { ...h, disk };
 }
 
-test("Claude 新建记住模型和思考等级，重复新建及刷新后继续使用 Max", () => {
+test("Claude 新建记住模型和思考深度，重复新建及刷新后继续使用 Max", () => {
   const h = claudeNewChatPreferenceHarness(), c = h.context;
   c.renderModelMenu();
   h.choices("effort-options").find(node => node.dataset.choiceKey === "effort:max").onclick();
@@ -13490,7 +13490,7 @@ test("Claude 权限按钮恢复新建记忆，已有会话切换权限不覆盖�
   assert.equal(later.button.value, "plan", "已有会话的权限选择不能覆盖新建默认值");
 });
 
-test("Codex 新建按模型记住思考等级，刷新和再次新建不恢复全局 xhigh", () => {
+test("Codex 新建按模型记住思考深度，刷新和再次新建不恢复全局 xhigh", () => {
   const h = codexDefaultModelHarness();
   h.context.renderModelMenu();
   h.choices("effort-options").find(node => node.dataset.choiceKey === "effort:high").onclick();
@@ -13604,7 +13604,7 @@ test("队列编辑中选择模型和深度仅更新后续选择，不改写队�
   assert.deepEqual(Object.keys(h.context.editingQueuedMessage), ["state"]);
 });
 
-test("Claude 完整模型 ID 匹配原生别名，重选和切换模型保留受支持的思考等级", () => {
+test("Claude 完整模型 ID 匹配原生别名，重选和切换模型保留受支持的思考深度", () => {
   const h = claudeAliasModelMenuHarness();
   h.context.renderModelMenu();
   assert.equal(h.context.currentModel(), h.context.models[0]);
@@ -13740,7 +13740,7 @@ test("Claude 新建默认等级与记住的完整模型 ID 复用同一别名目
   assert.equal(h.context.currentEffort(), "high");
 });
 
-test("历史当前模型不进入共用目录，点击选择器时读取完整模型和思考等级", async () => {
+test("历史当前模型不进入共用目录，点击选择器时读取完整模型和思考深度", async () => {
   const h = claudeHistoryModelMenuHarness();
   const history = h.context.loadModels();
   assert.equal(h.reads[0].payload.includeAvailable, false, "单纯显示历史不能触发能力初始化");
@@ -14886,7 +14886,7 @@ test("Claude 压缩与发送消息一样触发所选模型切换，选择未变�
   assert.equal(context.selectedEffort, "");
   // 选择与会话当前设置相同：不发切换，也不清除选择。
   assert.deepEqual({ ...await run({ selectedModel: "claude-opus-5-5", selectedEffort: "xhigh" }) }, { threadId: "claude-thread" });
-  // 只改思考等级。
+  // 只改思考深度。
   assert.deepEqual({ ...await run({ selectedEffort: "max" }) }, { threadId: "claude-thread", reasoningEffort: "max" });
   // 换模型时深度一并带上，即使数值恰好与旧模型当前深度相同，避免服务端按“换模型即清空深度”处理。
   assert.deepEqual({ ...await run({ selectedModel: "claude-haiku-5-5", selectedEffort: "xhigh" }) },

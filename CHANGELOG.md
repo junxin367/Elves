@@ -42,7 +42,7 @@
 
 ## 0.2.6 - 2026-07-11
 
-- GPT-5.6 Sol 新增 `ultra` 思考等级，覆盖供应商前缀和快照模型，并在 Responses、Chat Completions 与模型目录链路中保持一致。
+- GPT-5.6 Sol 新增 `ultra` 思考深度，覆盖供应商前缀和快照模型，并在 Responses、Chat Completions 与模型目录链路中保持一致。
 - `ultra` 严格限制为 Sol 专属能力；GPT-5.6 Terra、Luna、普通别名及自定义变体继续保持最高 `max`。
 - 同步 Codex App 注入 fallback、配置解析和打包模型目录，并补充协议代理与模型目录回归测试。
 - 更新 Fast 不支持提示文案，并将 Rust workspace、npm、Tauri 与前端版本元数据升级到 `0.2.6`。

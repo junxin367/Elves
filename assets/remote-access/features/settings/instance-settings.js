@@ -27,6 +27,7 @@ export const settingsNavigation = [
   { id: "agents", label: "智能体", items: [
     { id: "types", label: "会话实例", icon: "allSessions" },
     { id: "models", label: "模型与思考", icon: "model" },
+    // 用户要求该设置入口统一称“会话命名”，与页面标题、提示及产品规范保持一致。
     { id: "naming", label: "会话命名", icon: "edit" },
     { id: "permissions", label: "权限", icon: "shield" },
     { id: "instructions", label: "自定义指令", icon: "edit" }
@@ -43,7 +44,7 @@ export const settingsNavigation = [
 ];
 export const instanceSettingPages = [
   { id: "types", label: "会话实例", section: "general", description: "按实例管理常规能力和原生配置。" },
-  { id: "models", label: "模型与思考", section: "models", description: "设置所选实例的默认模型与默认思考等级。" },
+  { id: "models", label: "模型与思考", section: "models", description: "设置所选实例的默认模型与默认思考深度。" },
   { id: "skills", label: "Skills", section: "skills", description: "查看和管理所选实例的 Skills。" },
   { id: "mcp", label: "MCP", section: "mcp", description: "查看和管理所选实例的 MCP 服务。" },
   { id: "hooks", label: "钩子", section: "hooks", description: "查看和管理所选实例的原生钩子。" }
@@ -153,7 +154,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     control.onchange = () => {
       const settings = { [key]: transform(control.value) };
       if (name === "models" && key === "model" && record.backend === "codex") {
-        // 切换 Codex 实例默认模型时恢复模型默认思考等级，避免把旧模型的专属等级带给新模型。
+        // 切换 Codex 实例默认模型时恢复模型默认思考深度，避免把旧模型的专属等级带给新模型。
         settings.reasoningEffort = null;
       }
       void save(settings);
@@ -196,7 +197,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     const values = record.settings;
     const card = section(content, "实例默认值");
     const models = record.models || [];
-    addSelect(card, "model", "默认模型", record.backend === "codex" ? "切换默认模型后，默认思考等级恢复为“使用模型默认”。" : "",
+    addSelect(card, "model", "默认模型", record.backend === "codex" ? "切换默认模型后，默认思考深度恢复为“使用模型默认”。" : "",
       [inherit,
         ...models.map(model => ({ value: model.model, label: model.displayName || model.model }))],
       values.model || "", value => value === "" ? null : value);
@@ -206,20 +207,20 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     const efforts = (model?.supportedReasoningEfforts || [])
       .filter(effort => effort.reasoningEffort !== "ultra" || values.ultraReasoningEnabled === true);
     if (record.backend === "codex") addSelect(card, "reasoningEffort",
-        "默认思考等级", "可用等级由当前模型能力决定。",
+        "默认思考深度", "可选深度由当前模型能力决定。",
         [{ value: "", label: "使用模型默认" }, ...efforts.map(effort =>
           ({ value: effort.reasoningEffort, label: effortLabels[effort.reasoningEffort] || effort.reasoningEffort }))],
         values.reasoningEffort || "", apiValue, !model);
     else content.append(element("p", "appearance-hint",
-      "尚未确认当前 Claude CLI 的默认思考等级配置，请在会话输入区选择。"));
+      "尚未确认当前 Claude CLI 的默认思考深度配置，请在会话输入区选择。"));
     if (!model) content.append(element("p", "appearance-hint",
       "当前模型未出现在实例目录中，请选择可用模型或选择“使用原生默认”。"));
     // 实例默认值与输入区记住的选择是不同来源；明确既有优先级，不能把此处描述为覆盖全部新会话选择。
     content.append(element("p", "appearance-hint",
-      "新会话优先使用输入区已记住且仍可用的模型与思考等级，没有可用选择时使用实例默认值。已有会话保留各自设置。"));
+      "新会话优先使用输入区已记住且仍可用的模型与思考深度，没有可用选择时使用实例默认值。已有会话保留各自设置。"));
     if (record.backend === "codex") {
-      const reasoning = section(content, "思考等级");
-      addSwitch(reasoning, "ultraReasoningEnabled", "开放 Ultra 思考等级",
+      const reasoning = section(content, "思考深度");
+      addSwitch(reasoning, "ultraReasoningEnabled", "开放 Ultra 思考深度",
         "默认关闭；开启后，仅在支持的 Codex 模型中显示 Ultra。", values.ultraReasoningEnabled);
     }
   }

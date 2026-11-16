@@ -40,7 +40,7 @@ pub(super) fn ultra_enabled(directory: &Path, instance: &str) -> Result<bool, Ap
         Value::Bool(enabled) => Ok(*enabled),
         _ => Err(ApiError::new(
             422,
-            "Ultra 思考等级配置无效，请重新读取实例设置",
+            "Ultra 思考深度配置无效，请重新读取实例设置",
         )),
     }
 }
@@ -325,7 +325,7 @@ fn updated_native(
                                 && value.len() <= 200
                                 && !value.chars().any(char::is_control)
                         })
-                        .ok_or_else(|| ApiError::new(400, "模型或思考等级无效"))?,
+                        .ok_or_else(|| ApiError::new(400, "模型或思考深度无效"))?,
                 ))
             };
             // 用户要求 Todo、记忆、子智能体和目标模式按实例控制；保留原文件注释及所有其他配置。
@@ -577,7 +577,7 @@ fn validate_models(
     if backend == "claude" && changes.get("effortLevel").is_some() {
         return Err(ApiError::new(
             409,
-            "尚未确认当前 Claude CLI 的默认思考等级配置，请在会话输入区选择。",
+            "尚未确认当前 Claude CLI 的默认思考深度配置，请在会话输入区选择。",
         ));
     }
     let model = changes
@@ -594,7 +594,7 @@ fn validate_models(
     if changes["model"].is_null() && changes.get("model").is_some() && effort.is_some() {
         return Err(ApiError::new(
             400,
-            "默认模型选择“使用原生默认”时，默认思考等级需选择“使用模型默认”。",
+            "默认模型选择“使用原生默认”时，默认思考深度需选择“使用模型默认”。",
         ));
     }
     let selected = model.and_then(|model| {
@@ -609,7 +609,7 @@ fn validate_models(
     }
     if let Some(effort) = effort {
         if effort == "ultra" && (backend != "codex" || !ultra) {
-            return Err(ApiError::new(409, "当前实例未开放 Ultra 思考等级"));
+            return Err(ApiError::new(409, "当前实例未开放 Ultra 思考深度"));
         }
         if !selected.is_some_and(|model| {
             model["supportedReasoningEfforts"]
@@ -620,7 +620,7 @@ fn validate_models(
                         .any(|value| value["reasoningEffort"] == effort)
                 })
         }) {
-            return Err(ApiError::new(409, "当前模型不支持该思考等级，请重新选择"));
+            return Err(ApiError::new(409, "当前模型不支持该思考深度，请重新选择"));
         }
     }
     Ok(())

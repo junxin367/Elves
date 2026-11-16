@@ -4,6 +4,7 @@ import { $, element } from "../../ui/dom.js";
 import { goalComposerIcon, selectedSkills, setSelectedSkills } from "./skill-catalog.js";
 import { selectedGoal, setSelectedGoal } from "../goal/state.js";
 
+// 用户要求统一称“思考深度”；设置、输入区、提示词优化与模型切换提示共用此选项名称映射。
 export const effortLabels = { none: "无", minimal: "最低", low: "轻度", medium: "中", high: "高", xhigh: "极高", max: "Max", ultra: "Ultra" };
 export const skillIdentity = skill => `${skill.name}\0${skill.path}`;
 export const sameSkills = (left, right) => JSON.stringify(left.map(skillIdentity)) === JSON.stringify(right.map(skillIdentity));
