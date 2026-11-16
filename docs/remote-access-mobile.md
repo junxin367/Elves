@@ -91,7 +91,7 @@
 | --- | --- |
 | 手机浏览器 | 打开所选主入口的固定地址，输入网页访问密钥 |
 | PWA | 在支持安装的浏览器中打开 HTTPS 地址，通过浏览器菜单安装或添加到主屏幕；普通 HTTP 不支持 Service Worker/PWA 离线安装 |
-| Android | 从 [GitHub Releases](https://github.com/junxin367/CodexElves/releases) 的 `android-v<版本>` 发布下载 `CodexElves-<版本>-android.apk`；首次填写服务域名和网页访问密钥。要求 Android 8.0（API 26）及以上 |
+| Android | 从 [GitHub Releases](https://github.com/junxin367/Elves/releases) 的 `android-v<版本>` 发布下载 `CodexElves-<版本>-android.apk`；首次填写服务域名和网页访问密钥。要求 Android 8.0（API 26）及以上 |
 
 三个入口共用电脑端会话和权限，均需电脑服务在线。Android APK 独立发布；没有正式 APK 时可先使用浏览器或 PWA。
 

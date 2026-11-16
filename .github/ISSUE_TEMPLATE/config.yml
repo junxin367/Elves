@@ -1,6 +1,7 @@
 blank_issues_enabled: false
 contact_links:
   - name: 使用问题 / 讨论
-    url: https://github.com/junxin367/CodexElves/discussions
+    # 用户要求反馈入口迁移至 Elves，与管理器和注入菜单使用同一仓库。
+    url: https://github.com/junxin367/Elves/discussions
     about: 不确定是不是 Bug 时，优先在这里讨论。
 

@@ -22,7 +22,8 @@ import java.util.regex.Pattern;
 
 /** The release and APK contract, kept independent of Android UI and PackageManager. */
 final class AppUpdatePolicy {
-    static final String REPOSITORY = "junxin367/CodexElves";
+    // 用户要求更新来源迁移至 Elves；与桌面 update.rs、发布脚本同步，应用 ID 和签名保持不变。
+    static final String REPOSITORY = "junxin367/Elves";
     static final String APPLICATION_ID = "com.junxin367.codexelves";
     static final String API_ROOT = "https://api.github.com/repos/" + REPOSITORY;
     static final String DOWNLOAD_ROOT = "https://github.com/" + REPOSITORY + "/releases/download/";

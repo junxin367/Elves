@@ -11,14 +11,14 @@
 </p>
 
 <p align="center">
-  <img alt="Release" src="https://img.shields.io/github/v/release/junxin367/CodexElves">
-  <img alt="Stars" src="https://img.shields.io/github/stars/junxin367/CodexElves">
-  <img alt="License" src="https://img.shields.io/github/license/junxin367/CodexElves">
+  <img alt="Release" src="https://img.shields.io/github/v/release/junxin367/Elves">
+  <img alt="Stars" src="https://img.shields.io/github/stars/junxin367/Elves">
+  <img alt="License" src="https://img.shields.io/github/license/junxin367/Elves">
 </p>
 
 CodexElves 是 Codex 桌面工作区的增强工具，提供多供应商模型配置、本地协议代理、请求日志、会话管理和手机远程会话。支持带 Codex 工作区的 ChatGPT 桌面应用及 Codex App，通过独立启动器和管理工具使用。
 
-**[下载安装](https://github.com/junxin367/CodexElves/releases) · [效果展示](#效果展示) · [手机远程会话](docs/remote-access-mobile.md)**
+**[下载安装](https://github.com/junxin367/Elves/releases) · [效果展示](#效果展示) · [手机远程会话](docs/remote-access-mobile.md)**
 
 ## 主要功能
 
@@ -37,7 +37,7 @@ CodexElves 是 Codex 桌面工作区的增强工具，提供多供应商模型�
 
 ## 安装与开始使用
 
-先安装可正常打开 Codex 工作区的桌面应用，再从 [GitHub Releases](https://github.com/junxin367/CodexElves/releases) 下载适合的平台安装包：
+先安装可正常打开 Codex 工作区的桌面应用，再从 [GitHub Releases](https://github.com/junxin367/Elves/releases) 下载适合的平台安装包：
 
 | 平台 | 安装包 |
 | --- | --- |

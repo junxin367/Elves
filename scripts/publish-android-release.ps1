@@ -1,15 +1,16 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$Tag,
-    [string]$Repository = "junxin367/CodexElves",
+    # 用户要求迁移至 Elves；此默认值及下方校验须与客户端更新来源同步。
+    [string]$Repository = "junxin367/Elves",
     [string]$RepositoryRoot = (Split-Path -Parent $PSScriptRoot),
     [switch]$ValidateOnly
 )
 
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "android-build-common.ps1")
-if ($Repository -cne "junxin367/CodexElves") {
-    throw "Android 正式发布仓库必须是 junxin367/CodexElves。"
+if ($Repository -cne "junxin367/Elves") {
+    throw "Android 正式发布仓库必须是 junxin367/Elves。"
 }
 $version = Get-AndroidVersion -RepositoryRoot $RepositoryRoot
 if ($Tag -cne $version.Tag) {

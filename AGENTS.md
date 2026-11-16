@@ -40,13 +40,15 @@
 必须保持以下命名：
 
 - 产品名：`CodexElves`
-- GitHub 仓库：`https://github.com/junxin367/CodexElves`
+- GitHub 仓库：`https://github.com/junxin367/Elves`
 - Rust crate / workspace 包名：`codex-elves-*`
 - launcher 产物：`codex-elves.exe`
 - manager 产物：`codex-elves-manager.exe`
 - Windows 安装包：`dist/windows/CodexElves-<version>-windows-x64-setup.exe`
 - Windows 独立远程客户端：`dist/windows/CodexElves-Remote-<version>-windows-x64.exe`
 - 管理器包名：`codex-elves-manager`
+
+用户要求仅将 GitHub 仓库迁移至 `Elves`，产品名、crate、应用 ID 和产物名继续保持上述命名。历史发布说明和验收记录保留当时的仓库归属，不代表新仓库已有对应 Release 或 Secrets。
 
 禁止把任何运行时代码、构建配置、安装脚本、README、用户可见 UI 改回：
 

@@ -30,7 +30,7 @@ Debug APK 的 `updateSupported` 为 `false`。旧 APK 没有回复时，网页�
 
 ## Android Release 与更新清单
 
-应用更新只读取 `junxin367/CodexElves` 中已公开、非草稿且非预发布的 `android-v<versionName>` Release。它不使用桌面 Release 的 `latest.json`，也不会更改桌面 GitHub Latest 标记。
+应用更新只读取 `junxin367/Elves` 中已公开、非草稿且非预发布的 `android-v<versionName>` Release。它不使用桌面 Release 的 `latest.json`，也不会更改桌面 GitHub Latest 标记。
 
 每个 Android Release 必须包含：
 

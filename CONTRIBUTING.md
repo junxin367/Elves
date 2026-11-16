@@ -6,8 +6,8 @@ Thank you for your interest in contributing to CodexElves!
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/junxin367/CodexElves.git
-   cd CodexElves
+   git clone https://github.com/junxin367/Elves.git
+   cd Elves
    ```
 
 2. **Install Rust toolchain**
@@ -30,7 +30,7 @@ Thank you for your interest in contributing to CodexElves!
 ## Project Structure
 
 ```
-CodexElves/
+Elves/
 ├── crates/
 │   ├── codex-elves-data/    # Data handling and provider sync
 │   └── codex-elves-core/    # Core CodexElves logic

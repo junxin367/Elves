@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const DEFAULT_REPOSITORY: &str = "junxin367/CodexElves";
+// 用户要求更新来源迁移至 Elves；与 Android 的 AppUpdatePolicy 和发布脚本保持一致。
+pub const DEFAULT_REPOSITORY: &str = "junxin367/Elves";
 pub const DEFAULT_LATEST_JSON_URL: &str =
-    "https://github.com/junxin367/CodexElves/releases/latest/download/latest.json";
+    "https://github.com/junxin367/Elves/releases/latest/download/latest.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleaseAsset {

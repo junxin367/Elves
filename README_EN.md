@@ -9,9 +9,9 @@
 </p>
 
 <p align="center">
-  <img alt="Release" src="https://img.shields.io/github/v/release/junxin367/CodexElves">
-  <img alt="Stars" src="https://img.shields.io/github/stars/junxin367/CodexElves">
-  <img alt="License" src="https://img.shields.io/github/license/junxin367/CodexElves">
+  <img alt="Release" src="https://img.shields.io/github/v/release/junxin367/Elves">
+  <img alt="Stars" src="https://img.shields.io/github/stars/junxin367/Elves">
+  <img alt="License" src="https://img.shields.io/github/license/junxin367/Elves">
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.85%2B-orange">
   <img alt="Tauri" src="https://img.shields.io/badge/tauri-2.x-24C8DB">
 </p>
@@ -27,7 +27,7 @@ Desktop rename compatibility:
 
 ## Quick Start
 
-Download the latest installer from [GitHub Releases](https://github.com/junxin367/CodexElves/releases):
+Download the latest installer from [GitHub Releases](https://github.com/junxin367/Elves/releases):
 
 - Windows: `CodexElves-*-windows-x64-setup.exe`
 - macOS Intel: `CodexElves-*-macos-x64.dmg`

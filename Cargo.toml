@@ -13,7 +13,8 @@ members = [
 version = "0.7.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/junxin367/CodexElves"
+# 用户要求 GitHub 仓库迁移至 Elves，crate 和产品产物仍沿用 CodexElves 命名。
+repository = "https://github.com/junxin367/Elves"
 
 [workspace.dependencies]
 aes-gcm = "0.10"

@@ -7384,6 +7384,8 @@ function AboutScreen({
   diagnostics: DiagnosticsResult | null;
   actions: Actions;
 }) {
+  // 用户要求 GitHub 仓库迁移至 Elves；展示、主页和反馈共用此地址，产品名仍为 CodexElves。
+  const projectRepositoryUrl = "https://github.com/junxin367/Elves";
   return (
     <>
       <Panel>
@@ -7396,16 +7398,16 @@ function AboutScreen({
             </div>
             <div className="about-project-block">
               <div className="metric-list about-project-metric">
-                <Metric label="项目地址" value="github.com/junxin367/CodexElves" />
+                <Metric label="项目地址" value={projectRepositoryUrl.replace("https://", "")} />
               </div>
             </div>
           </div>
           <Toolbar>
-            <Button onClick={() => void actions.openExternalUrl("https://github.com/junxin367/CodexElves")} variant="secondary">
+            <Button onClick={() => void actions.openExternalUrl(projectRepositoryUrl)} variant="secondary">
               <ExternalLink className="h-4 w-4" />
               打开项目主页
             </Button>
-            <Button onClick={() => void actions.openExternalUrl("https://github.com/junxin367/CodexElves/issues")} variant="secondary">
+            <Button onClick={() => void actions.openExternalUrl(`${projectRepositoryUrl}/issues`)} variant="secondary">
               <ExternalLink className="h-4 w-4" />
               反馈问题
             </Button>
