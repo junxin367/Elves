@@ -9,8 +9,8 @@ members = [
 ]
 
 [workspace.package]
-# 桌面统一发布为 0.7.0；npm、Tauri 与预览元数据同步，Android 保持独立版本。
-version = "0.7.0"
+# 用户要求桌面版本统一为 0.8.0；npm、Tauri 与预览元数据同步，Android 保持独立版本。
+version = "0.8.0"
 edition = "2024"
 license = "MIT"
 # 用户要求 GitHub 仓库迁移至 Elves，crate 和产品产物仍沿用 CodexElves 命名。
