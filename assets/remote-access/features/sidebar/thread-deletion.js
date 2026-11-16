@@ -111,7 +111,7 @@ function deletionMessage(message) {
     "送达状态未知，请在会话中确认，勿重复发送"].includes(message)
     ? "删除结果尚未确认，请在原生客户端核对，勿重复删除。" : message;
 }
-export async function deleteSidebarThread(item) {
+export async function deleteSidebarThread(item, { confirmed: alreadyConfirmed = false, propagate = false } = {}) {
   if (!session || session.readOnly || !connected || threadDeletionConflict(item.id)) return;
   const deviceId = session.device.id, key = threadDeletionKey(item.id, deviceId);
   if (threadDeletions.has(key)) return;
@@ -119,7 +119,8 @@ export async function deleteSidebarThread(item) {
   threadDeletions.set(key, record);
   try {
     const claude = claudeThreadId(item.id);
-    const confirmed = await confirmAction(claude ? "移除 Claude 会话" : "删除会话",
+    // 管理页已经确认当前批次时复用同一删除事务，禁止回到原管理器的桌面删除通道。
+    const confirmed = alreadyConfirmed || await confirmAction(claude ? "移除 Claude 会话" : "删除会话",
       claude ? `将从远程列表移除“${record.title}”。Claude 原生会话历史仍保留，项目文件不受影响。`
         // 用户要求全部侧边空闲才允许删除；确认文案同时说明自动关闭侧边及执行中限制。
         : `将永久删除“${record.title}”、其会话记录及原生子智能体会话，并关闭所属临时侧边会话，项目文件不受影响。此操作不可恢复。主会话或任一侧边会话执行中的任务需先停止，其他客户端占用的会话需在对应客户端处理。确定删除吗？`,
@@ -138,6 +139,7 @@ export async function deleteSidebarThread(item) {
         result.status === "partial");
       void loadSidebar(null, { fresh: true }).catch(() => {});
     }
+    return result;
   } catch (error) {
     if (!threadDeleted(item.id, deviceId)) {
       if (error.outcomeUnknown || ["pending", "unknown"].includes(error.operationState))
@@ -145,6 +147,7 @@ export async function deleteSidebarThread(item) {
       else setThreadDeletion(key, null);
     }
     if (session?.device.id === deviceId && !threadDeleted(item.id, deviceId)) notice(deletionMessage(error.message), true);
+    if (propagate) throw error;
   } finally {
     if (threadDeletions.get(key)?.state === "confirming") threadDeletions.delete(key);
     if (session?.device.id === deviceId) { renderSidebar(); updateComposer(); }

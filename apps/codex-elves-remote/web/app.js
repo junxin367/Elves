@@ -1,6 +1,7 @@
 const form = document.querySelector("#connection-form");
 const server = document.querySelector("#server-url");
 const connect = document.querySelector("#connect");
+const local = document.querySelector("#start-local");
 const status = document.querySelector("#status");
 const invoke = (command, payload = {}) => window.__TAURI__.core.invoke(command, payload);
 let connecting = false;
@@ -11,6 +12,7 @@ async function openConnection() {
   if (connecting || !server.value.trim()) return;
   connecting = true;
   connect.disabled = true;
+  if (local) local.disabled = true;
   status.textContent = "正在打开远程服务…";
   status.classList.remove("error");
   try {
@@ -23,12 +25,30 @@ async function openConnection() {
   } finally {
     connecting = false;
     connect.disabled = false;
+    if (local) local.disabled = false;
   }
 }
 form.addEventListener("submit", event => {
   event.preventDefault();
   void openConnection();
 });
+async function startLocalConnection() {
+  if (connecting) return;
+  connecting = true;
+  if (local) local.disabled = true; connect.disabled = true;
+  status.textContent = "正在启动本机服务…"; status.classList.remove("error");
+  let started = false;
+  try {
+    server.value = await invoke("remote_start_local_service");
+    edited = true; started = true;
+  } catch (error) {
+    status.textContent = `本机服务启动失败：${error}`; status.classList.add("error");
+  } finally {
+    connecting = false; if (local) local.disabled = false; connect.disabled = false;
+  }
+  if (started) await openConnection();
+}
+local?.addEventListener("click", () => void startLocalConnection());
 
 try {
   const settings = await invoke("remote_client_state");
@@ -47,7 +67,10 @@ try {
     server.select();
   }
   // 用户要求独立程序直接打开会话；仅首次启动自动恢复已成功连接的地址。
-  if (!edited && !settings.error && settings.autoConnect && settings.serverUrl) void openConnection();
+  if (!edited && !settings.error && settings.autoConnect && settings.serverUrl) {
+    if (settings.localService) void startLocalConnection();
+    else void openConnection();
+  }
 } catch (error) {
   status.textContent = `读取设置失败：${error}`;
   status.classList.add("error");

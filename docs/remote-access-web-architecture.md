@@ -1,6 +1,6 @@
 # 远程会话网页架构
 
-远程会话网页位于 `assets/remote-access/`，是不经构建步骤直接运行的原生 ES module。同一份文件同时用于：本机远程服务（Rust 构建期内嵌）、浏览器 PWA（Service Worker 按版本清单缓存）、Android APK 内置网页包和热更新、Windows 独立远程客户端内置网页包。
+远程会话网页位于 `assets/remote-access/`。会话工作区使用直接运行的原生 ES module；迁入的管理页面由 React/Vite 构建至 `management/`。同一资源目录同时用于本机远程服务（Rust 构建期内嵌）、浏览器 PWA、Android APK 内置网页包和热更新，以及 Windows 独立远程客户端内置网页包。
 
 原入口 `app.js` 约 1.8 万行，现拆分为 90 行的入口和 `ui/`、`core/`、`features/` 下的 102 个模块（最大模块约 1100 行）。拆分分两步：先按领域拆出模块，再按用户要求完成完整分层重构、消除模块间的循环依赖（2026-11-15）。两步都只移动代码、改写模块间的状态写入与上层调用方式，不改变页面行为；原有注释（含用户需求注释）全部随所属声明迁移。
 
@@ -53,6 +53,14 @@
 - 不能对导入的绑定直接赋值（ES module 导入为只读，运行时抛 `TypeError`）。
 - 多个功能共用的会话级状态放在 `core/state.js`：`session`、`sidebar`、`selectedId`、`thread`、`turns`、`connected`、`selectionVersion`、`busy`、`creating`、`stopping`、`pageLeaving`、`nativeConnectionVersion`、`selectionToken`。
 - 只在一个领域内共享的状态放在该领域的状态模块（见上一节），由视图与流程模块导入；页面骨架创建的会话菜单、会话工具等共享引用由 `shell()` 写入 `features/shell-state.js`，其他模块只读取。
+
+## 统一导航与共享管理页面
+
+`features/main-navigation.js` 创建固定 52px 主导航，切换时隐藏而不销毁会话 DOM；`features/management-frame.js` 保留单个管理 iframe，负责页面切换、主题同步、配置更新事件和会话删除回传。因旧容器会为缓存文档返回禁止嵌入响应头，父页读取固定同源 `/management/index.html` 后写入 `srcdoc`；脚本与样式均使用 `/management/` 绝对资源路径，API 沿用当前服务 Cookie。消息须同时检查 Origin、frame 窗口及当前设备，授权变化卸载整个管理页。
+
+管理前端源码位于 `apps/codex-elves-manager/src/ManagementApp.tsx`，已有页面组件在 `management-screens.tsx` 中复用；`src-tauri` 仅保留共享 Rust 命令库，不再生成管理器二进制。前端修改后先运行 `npm --prefix apps/codex-elves-manager run check` 和 `run vite:build`，提交源码和生成的 `assets/remote-access/management/`，再构建内嵌网页的客户端。
+
+管理 API 固定为 `POST /api/management/{command}`。命令必须登记在白名单，服务执行前复核设备授权；只读远程设备不能通过管理页读取凭据。真实回环中的本机管理授权来自私有管理端点签发的一次性证明，可管理服务以解除只读。配置 revision 覆盖设置及当前 Codex Home 的配置/认证文件，过期版本保存返回 409；事件通知与 15 秒轮询补齐更新，有草稿时提示合并。
 
 ## 通用 UI 组件
 

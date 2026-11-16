@@ -794,11 +794,16 @@ mod tests {
         let old = json!({"plan":[{"step":"旧任务","status":"pending"}],
             "_claudeTasks":[{"id":"1","subject":"旧任务","status":"pending"}]});
         let mut cleared = json!({"_claudeTaskSeed":carried_tasks(&old),"items":[]});
-        observe_plan_call(&mut cleared, &json!({"id":"clear","name":"TodoWrite","input":{"todos":[]}}));
+        observe_plan_call(
+            &mut cleared,
+            &json!({"id":"clear","name":"TodoWrite","input":{"todos":[]}}),
+        );
         assert_eq!(carried_tasks(&cleared), Some(json!([])));
         let mut next = json!({"_claudeTaskSeed":carried_tasks(&cleared),"items":[]});
-        observe_plan_call(&mut next,
-            &json!({"id":"update","name":"TaskUpdate","input":{"taskId":"1","status":"completed"}}));
+        observe_plan_call(
+            &mut next,
+            &json!({"id":"update","name":"TaskUpdate","input":{"taskId":"1","status":"completed"}}),
+        );
         assert_eq!(next["plan"], json!([]));
         assert_eq!(session_plan(&[old.clone(), cleared, next]), json!([]));
         let mut history = vec![old.clone()];

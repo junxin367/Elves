@@ -129,6 +129,10 @@ export function receive(event) {
   if (handleRemoteChannelEvent(event)) return;
   const rawParams = event.params || {};
   if (event.method === "remote/settingsChanged") { receiveSharedSettings(rawParams); return; }
+  if (event.method === "remote/managementChanged") {
+    window.dispatchEvent(new CustomEvent("codex-elves-management-updated"));
+    return;
+  }
   if (event.method === "remote/conversationNaming") {
     receiveConversationNaming(rawParams);
     if (rawParams.state === "completed") {

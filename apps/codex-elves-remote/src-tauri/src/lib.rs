@@ -1,4 +1,6 @@
 pub mod appearance;
+#[cfg(windows)]
+pub mod bundled_tools;
 pub mod connection;
 pub mod discovery;
 mod local_inputs;

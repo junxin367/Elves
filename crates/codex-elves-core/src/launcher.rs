@@ -549,6 +549,16 @@ impl DefaultLaunchHooks {
         helper_port: u16,
         bind_host: &'static str,
     ) -> anyhow::Result<()> {
+        self.start_helper_on_host_scoped(helper_port, bind_host, false)
+            .await
+    }
+
+    async fn start_helper_on_host_scoped(
+        &self,
+        helper_port: u16,
+        bind_host: &'static str,
+        protocol_only: bool,
+    ) -> anyhow::Result<()> {
         let listener = tokio::net::TcpListener::bind((bind_host, helper_port))
             .await
             .with_context(|| {
@@ -575,7 +585,7 @@ impl DefaultLaunchHooks {
                                 Ok(permit) => {
                                     tokio::spawn(async move {
                                         let _permit = permit;
-                                        let _ = handle_helper_connection(stream, Some(addr)).await;
+                                        let _ = handle_helper_connection_scoped(stream, Some(addr), protocol_only).await;
                                     });
                                 }
                                 Err(_) => {
@@ -612,6 +622,33 @@ impl DefaultLaunchHooks {
             task,
         });
         Ok(())
+    }
+}
+
+/// 单客户端后台仅复用协议 HTTP 处理，不初始化或接管任何 Codex App 连接、注入或管理器通道。
+pub async fn start_local_proxy_only(
+    settings: &BackendSettings,
+) -> anyhow::Result<LocalProxyRuntime> {
+    let hooks = DefaultLaunchHooks::default();
+    hooks
+        .start_helper_on_host_scoped(
+            crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+            crate::lan_proxy::helper_bind_host(settings.lan_proxy_enabled),
+            true,
+        )
+        .await?;
+    let runtime = hooks.helper.lock().await.take().context("代理监听未创建")?;
+    Ok(LocalProxyRuntime { runtime })
+}
+
+pub struct LocalProxyRuntime {
+    runtime: HelperRuntime,
+}
+
+impl LocalProxyRuntime {
+    pub async fn shutdown(self) {
+        let _ = self.runtime.shutdown.send(());
+        let _ = self.runtime.task.await;
     }
 }
 
@@ -1255,9 +1292,18 @@ async fn wait_for_windows_codex_exit_with(
     Ok(())
 }
 
+#[cfg(test)]
 async fn handle_helper_connection(
+    stream: tokio::net::TcpStream,
+    remote_addr: Option<SocketAddr>,
+) -> anyhow::Result<()> {
+    handle_helper_connection_scoped(stream, remote_addr, false).await
+}
+
+async fn handle_helper_connection_scoped(
     mut stream: tokio::net::TcpStream,
     remote_addr: Option<SocketAddr>,
+    protocol_only: bool,
 ) -> anyhow::Result<()> {
     let request_bytes = read_http_request(&mut stream).await?;
     let request = String::from_utf8_lossy(&request_bytes);
@@ -1267,6 +1313,22 @@ async fn handle_helper_connection(
     let raw_path = parts.next().unwrap_or_default();
     let path = raw_path.split('?').next().unwrap_or(raw_path).to_string();
     drop(request);
+
+    // 单客户端安装只开放现有三种模型协议端点，不能把旧本地增强或管理路由一并暴露出去。
+    if protocol_only
+        && !(crate::protocol_proxy::is_responses_proxy_path(&path)
+            || crate::protocol_proxy::is_chat_completions_proxy_path(&path)
+            || crate::protocol_proxy::is_models_proxy_path(&path))
+    {
+        write_http_response(
+            &mut stream,
+            "404 Not Found",
+            "application/json",
+            br#"{"error":{"message":"Unknown proxy endpoint"}}"#,
+        )
+        .await?;
+        return Ok(());
+    }
 
     if remote_addr.is_some_and(|address| !address.ip().is_loopback()) {
         let settings = SettingsStore::default().load().unwrap_or_default();

@@ -347,15 +347,18 @@ fn renderer_features_delete_is_permanent_without_undo_ui() {
         .parent()
         .and_then(std::path::Path::parent)
         .expect("core crate should live under crates/codex-elves-core");
-    let manager_source =
-        std::fs::read_to_string(repo.join("apps/codex-elves-manager/src/App.tsx")).unwrap();
+    let management_source =
+        std::fs::read_to_string(repo.join("assets/remote-access/features/management-frame.js"))
+            .unwrap();
 
     assert!(!script.contains("postJson(\"/undo\""));
     assert!(!script.contains("result.undo_token"));
     assert!(!script.contains("undo.textContent = \"撤销\""));
     assert!(script.contains("async function deleteSessionWithCodex(ref)"));
     assert!(!script.contains("postJson(\"/delete\", ref)"));
-    assert!(manager_source.contains("deleteStatus === \"partial\""));
+    assert!(management_source.contains("deleteSidebarThread("));
+    assert!(management_source.contains("if (!result?.deleted) throw new Error"));
+    assert!(!management_source.contains("/api/local-delete"));
 }
 
 #[test]
@@ -627,7 +630,7 @@ assert.equal(create(id, true)(row, stable), stable);
 }
 
 #[test]
-fn obsolete_session_backup_cleanup_only_spawns_before_migration_completes() {
+fn obsolete_session_backup_cleanup_stays_in_launcher_and_management_is_a_library() {
     let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
@@ -640,7 +643,9 @@ fn obsolete_session_backup_cleanup_only_spawns_before_migration_completes() {
     let guard = "if codex_elves_core::paths::obsolete_session_backup_cleanup_needed()";
 
     assert!(launcher.contains(guard));
-    assert!(manager.contains(guard));
+    assert!(manager.contains("pub fn register_management()"));
+    assert!(!manager.contains("tauri::Builder"));
+    assert!(!manager.contains("generate_context!"));
 }
 
 #[test]
@@ -7792,89 +7797,95 @@ fn injection_script_rebuilds_upstream_options_for_each_project_branch_menu() {
 }
 
 #[test]
-fn manager_ui_exposes_pure_api_relay_mode_button() {
+fn remote_management_retains_pure_api_and_provider_switching() {
     let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
         .expect("core crate should live under crates/codex-elves-core");
     let source =
-        std::fs::read_to_string(repo.join("apps/codex-elves-manager/src/App.tsx")).unwrap();
+        std::fs::read_to_string(repo.join("apps/codex-elves-manager/src/management-screens.tsx"))
+            .unwrap();
     let commands =
         std::fs::read_to_string(repo.join("apps/codex-elves-manager/src-tauri/src/lib.rs"))
             .unwrap();
 
     assert!(source.contains("官方混入 API Key"));
     assert!(source.contains("纯 API"));
-    assert!(source.contains("apply_pure_api_injection"));
-    assert!(commands.contains("commands::apply_pure_api_injection"));
+    assert!(source.contains("localProxyEnabled"));
+    assert!(commands.contains("commands::switch_relay_profile"));
+    assert!(!commands.contains("commands::apply_pure_api_injection"));
 }
 
 #[test]
-fn manager_ui_exposes_default_enabled_task_board_page_enhancement() {
+fn remote_installer_only_deploys_the_unified_client() {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("core crate should live under crates/codex-elves-core");
+    let installer =
+        std::fs::read_to_string(repo.join("scripts/installer/windows/CodexElves.nsi")).unwrap();
+    let package =
+        std::fs::read_to_string(repo.join("apps/codex-elves-manager/src-tauri/Cargo.toml"))
+            .unwrap();
+    let deployed = installer
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("File ") && line.contains("dist\\windows\\app\\"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        deployed.len(),
+        2,
+        "正式程序与临时退出 helper 必须来自同一个客户端"
+    );
+    assert!(
+        deployed
+            .iter()
+            .all(|line| line.contains("codex-elves-remote.exe"))
+    );
+    assert!(installer.contains("MUI_FINISHPAGE_RUN \"$INSTDIR\\codex-elves-remote.exe\""));
+    assert!(package.contains("autobins = false"));
+    assert!(!repo.join("apps/codex-elves-manager/src/App.tsx").exists());
+    assert!(
+        !repo
+            .join("apps/codex-elves-manager/src-tauri/src/task_board_main.rs")
+            .exists()
+    );
+}
+
+#[test]
+fn remote_workspace_open_in_keeps_the_independent_service_route() {
     let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
         .expect("core crate should live under crates/codex-elves-core");
     let source =
-        std::fs::read_to_string(repo.join("apps/codex-elves-manager/src/App.tsx")).unwrap();
-
-    assert!(source.contains("codexAppTaskBoard: boolean"));
-    assert!(source.contains("codexAppTaskBoard: true"));
-    assert!(source.contains("title=\"任务看板\""));
-    assert!(source.contains("checked={form.codexAppTaskBoard}"));
-    assert!(source.contains("setEnhanceFlag(\"codexAppTaskBoard\", value)"));
+        std::fs::read_to_string(repo.join("assets/remote-access/features/session/open-in.js"))
+            .unwrap();
+    assert!(source.contains("api(\"/api/workspace/open-in\""));
+    assert!(source.contains("session?.capabilities?.workspaceOpenIn"));
+    assert!(!source.contains("commands::"));
 }
 
 #[test]
-fn manager_ui_exposes_default_enabled_open_in_quick_access_page_enhancement() {
+fn remote_management_exposes_only_migrated_pages_and_commands() {
     let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
         .expect("core crate should live under crates/codex-elves-core");
     let source =
-        std::fs::read_to_string(repo.join("apps/codex-elves-manager/src/App.tsx")).unwrap();
-
-    assert!(source.contains("codexAppOpenInQuickAccess: boolean"));
-    assert!(source.contains("codexAppOpenInQuickAccess: true"));
-    assert!(source.contains("title=\"快速打开工作区\""));
-    assert!(source.contains("checked={form.codexAppOpenInQuickAccess}"));
-    assert!(source.contains("setEnhanceFlag(\"codexAppOpenInQuickAccess\", value)"));
-}
-
-#[test]
-fn manager_ui_exposes_remote_plugin_marketplace_controls() {
-    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("core crate should live under crates/codex-elves-core");
-    let source =
-        std::fs::read_to_string(repo.join("apps/codex-elves-manager/src/App.tsx")).unwrap();
+        std::fs::read_to_string(repo.join("apps/codex-elves-manager/src/ManagementApp.tsx"))
+            .unwrap();
     let commands =
         std::fs::read_to_string(repo.join("apps/codex-elves-manager/src-tauri/src/lib.rs"))
             .unwrap();
-    let permissions = std::fs::read_to_string(
-        repo.join("apps/codex-elves-manager/src-tauri/permissions/default.toml"),
-    )
-    .unwrap();
-
-    assert!(source.contains("官方远端插件缓存"));
-    assert!(source.contains("释放并注册内置缓存"));
-    assert!(source.contains("官方远端插件缓存未释放"));
-    assert!(source.contains("官方远端插件缓存候选项"));
-    assert!(source.contains("read_remote_context_options"));
-    assert!(source.contains("checkRemotePluginMarketplacePrompt"));
-    assert!(source.contains("refreshRemoteContextOptions"));
-    assert!(source.contains("RemotePluginMarketplacePromptDialog"));
-    assert!(source.contains("repair_remote_plugin_marketplace"));
-    assert!(!source.contains("codexAppPluginAutoExpand"));
-    assert!(!source.contains("插件列表全量展示"));
-    assert!(!source.contains("界面背景主题已升级为"));
-    assert!(commands.contains("commands::remote_plugin_marketplace_status"));
-    assert!(commands.contains("commands::repair_remote_plugin_marketplace"));
-    assert!(commands.contains("commands::read_remote_context_options"));
-    assert!(permissions.contains("\"remote_plugin_marketplace_status\""));
-    assert!(permissions.contains("\"repair_remote_plugin_marketplace\""));
-    assert!(permissions.contains("\"read_remote_context_options\""));
+    assert!(source.contains("<RelayScreen"));
+    assert!(source.contains("<LocalProxyScreen"));
+    assert!(source.contains("<SessionsScreen"));
+    assert!(source.contains("<RemoteAccessScreen"));
+    assert!(!source.contains("RemotePluginMarketplacePromptDialog"));
+    assert!(!commands.contains("commands::repair_remote_plugin_marketplace"));
+    assert!(!commands.contains("commands::read_remote_context_options"));
+    assert!(commands.contains("不支持的管理命令"));
 }
 
 #[test]

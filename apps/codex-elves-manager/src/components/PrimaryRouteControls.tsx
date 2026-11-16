@@ -222,7 +222,7 @@ export function PrimaryRouteControls({
             : "切换公网地址后，远程设备需用新地址重新登录。")}
         </p>}<div className="remote-primary-buttons">
           {editing === "frp" ? <Button type="button" variant="secondary" size="sm" disabled={openingDirectory}
-            onClick={() => void openProgramDirectory()}><FolderOpen className="h-4 w-4" />{openingDirectory ? "正在打开…" : "打开程序目录"}</Button> : null}
+            onClick={() => void openProgramDirectory()}><FolderOpen className="h-4 w-4" />{openingDirectory ? "正在打开…" : "打开服务端目录"}</Button> : null}
           <Button variant="secondary" size="sm" disabled={pending || !enabled && editing !== "frp"} onClick={() => void execute("test")}>{downloading ? "下载中…" : operation === "test" ? "正在处理…" : enabled ? "保存并测试" : "保存配置"}</Button>
           <Button size="sm" disabled={pending || !serviceReady || currentApplied || (editing === "frp" && !publicOrigin)}
             onClick={() => void execute("apply")}>{operation === "apply" ? "正在切换…" : currentApplied ? "当前主链路" : enabled ? "应用为主链路" : "保存为主链路"}</Button>

@@ -23,6 +23,8 @@ import {
 } from "../core/actions.js";
 import { app, connected, creating, nativeConnectionVersion, selectedId, session, sidebar } from "../core/state.js";
 import { api } from "./api.js";
+import { disposeMainNavigation, mountMainNavigation } from "./main-navigation.js";
+import { createManagementPages } from "./management-frame.js";
 import { openAppearance } from "./appearance/dialog.js";
 import { setApprovalSignature } from "./approval-state.js";
 import { fitClaudeUsageTip, mountClaudeUsage, resetClaudeUsage } from "./composer/claude-usage.js";
@@ -90,6 +92,7 @@ import { renderSessionFilter } from "./sidebar/filters.js";
 import { setSearch } from "./sidebar/list-state.js";
 
 export function shell() {
+  disposeMainNavigation();
   loginPageCleanup?.();
   closePopup();
   sessionMenu?.dispose(); setSessionMenu(null);
@@ -109,7 +112,6 @@ export function shell() {
       <div class="sidebar-header"><strong>✦ CodexElves</strong><div class="sidebar-header-actions"><button id="sidebar-type-filter" class="icon-button sidebar-type-filter" type="button" title="筛选会话实例" aria-label="筛选会话实例" aria-haspopup="menu"></button><button id="sidebar-view-toggle" class="icon-button sidebar-view-toggle" type="button" aria-label="切换会话视图" disabled></button><button id="sidebar-search-toggle" class="icon-button sidebar-search-toggle" type="button" title="搜索会话与项目" aria-label="搜索会话与项目" aria-controls="sidebar-search" aria-expanded="false" aria-pressed="false"></button></div></div>
       <div class="sidebar-action"><button id="new-chat" class="new-chat" type="button">＋ 新建会话</button><input id="sidebar-search" class="search" type="search" placeholder="搜索会话与项目" aria-label="搜索会话与项目" autocomplete="off" hidden></div>
       <div id="sidebar-content" class="sidebar-content"></div>
-      <div class="sidebar-footer"><div class="footer-actions"><button id="appearance-button" class="footer-button" type="button" aria-label="设置"></button><button id="logout" class="footer-button" type="button"></button></div></div>
     </aside>
     <main class="conversation">
       <header class="conversation-header"><button id="open-sidebar" class="icon-button" type="button" aria-label="打开侧边栏" aria-controls="session-sidebar"></button><div class="thread-heading"><div class="thread-title-line"><span id="thread-backend-icon" class="thread-backend-icon" aria-hidden="true" hidden></span><strong id="thread-title">远程会话</strong></div><span id="thread-path" class="muted"></span></div><button id="connection-state" class="connection-state pending" type="button" aria-live="polite" title="${connectionRttDescription}" aria-label="连接中…。${connectionRttDescription}">连接中…</button><button id="open-session-tools" class="icon-button session-tools-trigger" type="button" title="会话菜单" aria-label="会话菜单" aria-haspopup="menu" aria-expanded="false"></button><span id="related-session-model" class="related-session-model muted" hidden></span><button id="related-session-back" class="text-button" type="button" aria-label="返回主会话" hidden>返回</button></header>
@@ -272,9 +274,6 @@ export function shell() {
   // 用户指定入口位于分支右侧，仅新建时可选；已有会话不渲染后端切换入口。
   projectPicker.append(projectControl, branchBadge, backendSelect);
   $("#send").append(icon("arrowUp"));
-  $("#logout").append(icon("logout"), element("span", "", "退出"));
-  $("#appearance-button").append(icon("settings"), element("span", "", "设置"));
-  $("#appearance-button").title = "设置";
   const workspace = $(".workspace"), sidebarPanel = $("#session-sidebar");
   const compactSidebarMedia = matchMedia("(max-width: 760px)");
   const sidebarBackdrop = $(".sidebar-backdrop");
@@ -384,10 +383,11 @@ export function shell() {
     event.preventDefault(); event.stopPropagation(); setSidebarSearchOpen(false);
   };
   $("#new-chat").onclick = () => startNewChat();
-  $("#logout").onclick = async () => {
+  const logout = async () => {
     const deviceId = session.device.id;
     if (!await confirmAction("退出", "将撤销当前浏览器的访问授权；再次进入需要重新输入访问密钥。", "退出", true) || session?.device.id !== deviceId) return;
-    $("#logout").disabled = true;
+    const settingsButton = $("#appearance-button");
+    settingsButton.disabled = true;
     try {
       await api("/api/logout", {});
       disconnect(); savePending(null);
@@ -397,8 +397,9 @@ export function shell() {
       postPlatformMessage("logged-out");
       showLogin();
     }
-    catch (error) { notice(error.message, true); if ($("#logout")) $("#logout").disabled = false; }
+    catch (error) { notice(error.message, true); if (settingsButton.isConnected) settingsButton.disabled = false; }
   };
+  mountMainNavigation({ workspace, openSettings: openAppearance, logout, openPage: createManagementPages() });
   $("#connection-state").onclick = refreshConnectionFromIndicator;
   const toolsTrigger = $("#open-session-tools");
   toolsTrigger.append(icon("tools"));
@@ -459,7 +460,6 @@ export function shell() {
   }));
   restoreRelatedOperations();
   syncRelatedSessionLayout();
-  $("#appearance-button").onclick = openAppearance;
   $("#sidebar-view-toggle").onclick = () => void changeSidebar({
     target: "grouping", mode: "updated_at",
     grouping: (sidebarFilters.mode ?? sidebar.preferences.mode) === "project" ? "list" : "project"

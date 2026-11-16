@@ -852,16 +852,22 @@ impl Claude {
         selected: Option<WslConfig>,
         paths: Vec<PathBuf>,
     ) -> anyhow::Result<Vec<String>> {
-        if paths.is_empty() { return Ok(Vec::new()); }
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
         // 用户要求上传本机文件后原生 CLI 可读取；路径按目标会话的发行版、用户映射，不能借用默认 WSL。
         let config = if let Some(id) = thread_id {
             self.conversation(id).await?.config
         } else {
-            match selected { Some(config) => config, None => self.config()? }
+            match selected {
+                Some(config) => config,
+                None => self.config()?,
+            }
         };
         let mut result = Vec::new();
         for path in paths {
-            result.push(Self::linux_cwd(&config, path.to_str().context("附件路径编码无效")?).await?);
+            result
+                .push(Self::linux_cwd(&config, path.to_str().context("附件路径编码无效")?).await?);
         }
         Ok(result)
     }
@@ -1415,13 +1421,24 @@ impl Claude {
     pub async fn naming_context(&self, id: &str, initial: bool) -> anyhow::Result<Value> {
         anyhow::ensure!(!Self::is_subagent_id(id), "子智能体会话不参与自动命名");
         let c = self.conversation(id).await?;
-        let turns = if initial { &c.turns[..c.turns.len().min(1)] }
-            else { &c.turns[c.turns.len().saturating_sub(8)..] };
+        let turns = if initial {
+            &c.turns[..c.turns.len().min(1)]
+        } else {
+            &c.turns[c.turns.len().saturating_sub(8)..]
+        };
         let messages = super::conversation_naming::messages(turns);
         let first = super::conversation_naming::messages(&c.turns[..c.turns.len().min(1)]);
-        let fallback = first.iter().find(|message| message["role"] == "user")
-            .and_then(|message| message["text"].as_str()).unwrap_or("")
-            .split_whitespace().collect::<Vec<_>>().join(" ").chars().take(30).collect::<String>();
+        let fallback = first
+            .iter()
+            .find(|message| message["role"] == "user")
+            .and_then(|message| message["text"].as_str())
+            .unwrap_or("")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(30)
+            .collect::<String>();
         Ok(json!({"title":c.title,"expectedName":c.title,
             "eligible":c.native_title.is_empty() && (c.title.is_empty() || c.title == fallback),
             "messages":messages}))
@@ -2862,8 +2879,8 @@ impl Claude {
                     || job_id.len() == 8 && job_id.bytes().all(|byte| byte.is_ascii_hexdigit())),
             "Claude 原生会话身份无效"
         );
-        let (thread, turns, turn_ids, session_plan, completed, usage_changed, changed, reverted) = self
-            .change(|saved| {
+        let (thread, turns, turn_ids, session_plan, completed, usage_changed, changed, reverted) =
+            self.change(|saved| {
                 let c = saved
                     .conversations
                     .get_mut(id)
@@ -4906,21 +4923,49 @@ mod tests {
     #[tokio::test]
     async fn claude_history_returns_session_plan_outside_page_and_after_revert() {
         let (_directory, service, mut c) = fixture();
-        c.turns = (0..25).map(|index| json!({"id":format!("turn-{index}"),
-            "_nativeUserId":format!("native-{index}"),"status":"completed","items":[]})).collect();
+        c.turns = (0..25)
+            .map(|index| {
+                json!({"id":format!("turn-{index}"),
+            "_nativeUserId":format!("native-{index}"),"status":"completed","items":[]})
+            })
+            .collect();
         c.turns[0]["plan"] = json!([{"step":"跨页任务","status":"pending"}]);
-        service.saved.lock().await.conversations.insert(c.id.clone(), c.clone());
+        service
+            .saved
+            .lock()
+            .await
+            .conversations
+            .insert(c.id.clone(), c.clone());
         for cursor in [Value::Null, json!("10")] {
-            let history = service.history(&json!({"threadId":c.id,"cursor":cursor})).await.unwrap();
+            let history = service
+                .history(&json!({"threadId":c.id,"cursor":cursor}))
+                .await
+                .unwrap();
             assert_eq!(history["sessionPlan"], c.turns[0]["plan"]);
             assert!(history["data"].as_array().unwrap().len() <= 10);
         }
         c.turns[24]["plan"] = json!([]);
-        service.saved.lock().await.conversations.insert(c.id.clone(), c.clone());
-        assert_eq!(service.history(&json!({"threadId":c.id})).await.unwrap()["sessionPlan"], json!([]));
+        service
+            .saved
+            .lock()
+            .await
+            .conversations
+            .insert(c.id.clone(), c.clone());
+        assert_eq!(
+            service.history(&json!({"threadId":c.id})).await.unwrap()["sessionPlan"],
+            json!([])
+        );
         c.turns.truncate(1);
-        service.saved.lock().await.conversations.insert(c.id.clone(), c.clone());
-        assert_eq!(service.history(&json!({"threadId":c.id})).await.unwrap()["sessionPlan"], c.turns[0]["plan"]);
+        service
+            .saved
+            .lock()
+            .await
+            .conversations
+            .insert(c.id.clone(), c.clone());
+        assert_eq!(
+            service.history(&json!({"threadId":c.id})).await.unwrap()["sessionPlan"],
+            c.turns[0]["plan"]
+        );
     }
 
     #[tokio::test]

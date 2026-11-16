@@ -4,34 +4,24 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+# 用户要求移除独立管理器；此包仅保留迁入远程服务的共享命令，不再生成应用或 Tauri 上下文。
+autobins = false
+build = false
 
 [lib]
 name = "codex_elves_manager_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
-
-[[bin]]
-name = "codex-elves-manager"
-path = "src/main.rs"
-
-[[bin]]
-name = "codex-elves-task-board"
-path = "src/task_board_main.rs"
+crate-type = ["rlib"]
 
 [dependencies]
 anyhow.workspace = true
-async-trait = "0.1"
 codex-elves-core = { path = "../../../crates/codex-elves-core" }
 codex-elves-data = { path = "../../../crates/codex-elves-data" }
 directories.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tauri = { version = "2", features = ["custom-protocol", "image-png", "protocol-asset", "tray-icon"] }
-tauri-plugin-dialog = "2"
+sha2.workspace = true
 tokio.workspace = true
 uuid.workspace = true
-
-[build-dependencies]
-tauri-build = { version = "2", features = [] }
 
 [dev-dependencies]
 rusqlite.workspace = true

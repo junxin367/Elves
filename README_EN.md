@@ -1,217 +1,58 @@
 # CodexElves
 
-<p align="center">
-  <img src="docs/images/icon.png" alt="CodexElves icon" width="160">
-</p>
+<p align="center"><img src="docs/images/icon.png" alt="CodexElves icon" width="128"></p>
+<p align="center"><a href="README.md">中文</a> | English</p>
 
-<p align="center">
-  <a href="README.md">中文</a> | English
-</p>
+CodexElves brings Codex and Claude conversations, providers, a local protocol proxy, and remote access management into one workspace. The Windows client can start its own local backend or connect to another computer. Browsers, PWAs, and Android use the same interface. Codex runs through an independent app-server, and Claude uses the selected instance's native CLI.
 
-<p align="center">
-  <img alt="Release" src="https://img.shields.io/github/v/release/junxin367/Elves">
-  <img alt="Stars" src="https://img.shields.io/github/stars/junxin367/Elves">
-  <img alt="License" src="https://img.shields.io/github/license/junxin367/Elves">
-  <img alt="Rust" src="https://img.shields.io/badge/rust-1.85%2B-orange">
-  <img alt="Tauri" src="https://img.shields.io/badge/tauri-2.x-24C8DB">
-</p>
+[Downloads](https://github.com/junxin367/Elves/releases) · [Windows client](docs/windows-remote-client.md) · [Mobile guide](docs/remote-access-mobile.md)
 
-CodexElves is an enhancement launcher and manager for the Codex workspace in the new ChatGPT desktop app, while remaining compatible with the legacy Codex App. It launches ChatGPT/Codex externally and injects interface enhancements through the Chromium DevTools Protocol. Some compatibility features also update runtime files: on supported Windows versions, API Key browser compatibility backs up and adapts the browser service script.
+## Navigation
 
-Desktop rename compatibility:
+The 52px left rail uses 36px icon buttons with 8px on each side. Hover displays each name. Existing project, Codex, and Claude icons remain in use.
 
-- Windows: supports the new `ChatGPT.exe` and the legacy `Codex.exe`; the current Microsoft Store package identity remains `OpenAI.Codex`.
-- macOS: supports the new `ChatGPT.app` and legacy names such as `Codex.app` and `OpenAI Codex.app`.
-- The watcher only takes over desktop apps with a Codex runtime; it does not treat ChatGPT Classic or the bundled `resources\codex.exe` CLI as the desktop process.
-- Codex CLI, the `~/.codex` data directory, protocol fields, and session data keep their existing Codex names.
+| Page | Features |
+| --- | --- |
+| Conversations | Existing conversation list, projects, and chat workspace; switching pages preserves the current conversation and draft |
+| Proxy settings | Provider and model configuration, protocol selection, local proxy status, request logs, and details |
+| Conversation management | Browse and filter local sessions; delete individual sessions or a filtered batch; historical repair and compression settings are removed |
+| Remote sessions | Web service, public routes, access keys, login lock, and device authorization |
+| Bottom settings | General, appearance, instances, models, reasoning depth, session naming, permissions, Skills, MCP, and hooks |
 
-## Quick Start
+On Windows, the bottom settings button opens settings directly. Other clients show only Settings and Log out. Appearance is stored per client; other preferences are shared through the same service. Stale saves are rejected, preserving unsaved input for review.
 
-Download the latest installer from [GitHub Releases](https://github.com/junxin367/Elves/releases):
+## Install and connect
 
-- Windows: `CodexElves-*-windows-x64-setup.exe`
-- macOS Intel: `CodexElves-*-macos-x64.dmg`
-- macOS Apple Silicon: `CodexElves-*-macos-arm64.dmg`
+Download `CodexElves-<version>-windows-x64-setup.exe` or the portable `CodexElves-Remote-<version>-windows-x64.exe`. Microsoft Edge WebView2 Runtime is required. The server needs a configured Codex CLI or Claude instance.
 
-After installation, two entry points are available:
+The installer installs only the remote client, plus its uninstaller. Upgrades remove the previous manager, launcher, task-board application, and their shortcuts while preserving user data.
 
-- `CodexElves`: a silent launcher. It does not show the manager UI and only starts ChatGPT/Codex with CodexElves injection.
-- `CodexElves Manager`: a Tauri control panel for launch, diagnostics, repair, updates, relay injection, enhancements, and user scripts.
+1. Open **CodexElves Remote**. Choose **Start local service** to use this computer, or enter an HTTP/HTTPS address to connect elsewhere.
+2. The client starts its embedded local backend and pairs using a short-lived, single-use local proof. Other devices pair with an access key.
+3. Configure providers and models in **Proxy settings**. Enable the local proxy explicitly when needed; its default port remains `45221`.
+4. Return to **Conversations**. Configure public access and device authorization in **Remote sessions** to connect from another device.
 
-The Windows installer creates desktop and Start Menu shortcuts. The macOS DMG installs `/Applications/CodexElves.app` and `/Applications/CodexElves 管理工具.app`.
+Closing the main window minimizes it to the tray and keeps the local backend running. Exiting from the tray safely shuts down the backend owned by this client. Exiting a client connected to another computer does not stop that server.
 
-## Highlights
+## Data and updates
 
-- Rust backend and silent launcher with no extra runtime requirement.
-- Tauri + React manager with dark/light theme support.
-- External CDP injection for interface enhancements, with separate runtime compatibility handling where required.
-- Relay injection mode with multiple relay profiles, `CodexElves` provider configuration, and a one-click switch back to official ChatGPT login mode.
-- Traditional enhancement mode with plugin entry unlock, forced plugin install, session delete, Markdown export, project move, and more.
-- Workspace Checkpoints: save an external shadow-Git snapshot before each AI turn, undo the latest file changes, restore the matching state when editing an earlier message, or restore any checkpoint. It honors `.gitignore` and never writes to the project's Git history or index.
-- Independent user script management with startup injection.
-- Provider Sync to keep historical sessions visible after switching providers.
-- Remote sessions through a browser, PWA, or Android app, with native desktop operations preferred and limited service fallback for reads and main-session text sends.
-- Upstream worktree creation: create new worktrees from `upstream/<base-branch>` after fetching the remote branch, reducing conflicts caused by stale local HEAD state.
-- GitHub Release updates. Both the manager and silent launcher can detect available updates.
-- Windows single instance, no console window, administrator manifest, and system Desktop path detection.
-- Separate macOS x64 and arm64 DMGs. The silent launcher hides its Dock icon.
+Shared settings, credentials, authorization, and logs remain under `~/.codex-session-delete/`. Client connection settings, window state, and WebView2 login data use `%LOCALAPPDATA%\com.codexelves.remote\`. Uninstalling preserves these directories.
 
-## Remote Sessions
+The client embeds web resources and verifies updates with SHA-256. Complete updates take effect on the next navigation. Native upgrades use the Windows installer and briefly close the client and its backend; the former manager-only hot-update procedure does not support this installation structure.
 
-Enable remote sessions in CodexElves Manager, save an access key, and connect through the configured zrok or FRP address. The computer and remote backend must remain online; full native interaction also requires the desktop app to be ready.
-
-The session menu lists Changes, Files, and Browser, followed by Subagents and Side Chats. Workspace views are read-only and scoped to the selected session or local project. Browser requires an authorized FRP route and a compatible Android native bridge. Subagents are read-only; side chats use their own native model settings and lifecycle.
-
-Native injection failure limits individual capabilities. Supported reads and restricted text sends to an idle, persistent local main session can use the service fallback. Creation, images, goals, stop, approvals, questions, editing, queues, and side-chat management still require their native capabilities. A send can fall back only when native dispatch is proven not to have occurred. After dispatch, an unknown outcome is checked through the original receipt and is never automatically resent.
-
-See the [mobile guide](docs/remote-access-mobile.md), [remote access guide](docs/remote-access.md), and [current session tools and routing](docs/remote-session-tools.md) for connection steps and capability limits. These guides are in Simplified Chinese.
-
-## Screenshots
-
-### Full Feature Set
-![Full feature set](image.png)
-
-### Local Proxy
-
-- The local proxy improves protocol translation for non-GPT models, so Codex built-in tools such as `web_search` and `tool_search` can be used.
-- Custom models and context window sizes can be configured manually.
-
-![Local proxy](image-4.png)
-
-### Local Proxy And Request Logs
-![Local proxy and request logs](image-1.png)
-
-### Batch Session Deletion
-![Batch session deletion](image-2.png)
-
-## Relay Injection
-
-Relay injection is for users who are already logged in with an official ChatGPT account in Codex/ChatGPT and want model requests to go through a custom compatible API.
-
-The boundary of this hybrid mode is:
-
-- The official ChatGPT/Codex login state still owns the desktop app account features and the plugin entry.
-- The relay profile only controls the Base URL, key, and model names used for model requests.
-- The compatible API provider is not tied to any specific vendor; it only needs to match the selected upstream protocol and Codex configuration.
-- Clearing API mode should return Codex to the official login mode so the official account and plugins keep working.
-
-Before applying relay injection, run a minimal preflight:
-
-1. Make sure Codex has detected the ChatGPT login state and the plugin entry is available.
-2. Confirm the custom Base URL is reachable and supports the selected upstream protocol, such as a Responses-compatible endpoint.
-3. Test the target key with the smallest useful auth probe, such as a model-list request or a short message request.
-4. Only record whether the key exists and whether auth passed. Do not paste real keys into logs, screenshots, or issues.
-5. Make sure `~/.codex/config.toml` has a backup so clearing API mode can safely roll back.
-
-In the manager's Relay Injection page:
-
-1. Make sure ChatGPT login status is detected.
-2. Add one or more relay profiles with Base URL and Key.
-3. Select the active profile and apply relay injection.
-4. Launch `CodexElves`.
-
-CodexElves writes configuration similar to this into `~/.codex/config.toml`:
-
-```toml
-model_provider = "CodexElves"
-
-[model_providers.CodexElves]
-name = "CodexElves"
-wire_api = "responses"
-requires_openai_auth = true
-base_url = "https://example.com/v1"
-experimental_bearer_token = "sk-..."
-```
-
-To return to the official login mode, use the clear API mode button in the Relay Injection page. This removes `OPENAI_API_KEY` related configuration and switches Codex back to official ChatGPT authentication.
-
-## Enhancements
-
-Enhancements are controlled in the manager. Enhancement injection is enabled by default. When disabled, CodexElves will not inject its menu or scripts.
-
-When relay injection mode is active, plugin entry unlock and forced plugin install are unnecessary, and the UI will say so. Other enhancements, including session delete, export, move, and user scripts, can still be used.
-
-## Updates and Packages
-
-CodexElves publishes installers through GitHub Releases. Windows builds an NSIS installer, while macOS builds separate Intel x64 and Apple Silicon arm64 DMGs.
-
-The manager's About page can check and start updates. When the silent launcher finds a new version, it opens the manager directly on the update prompt.
-
-## Data Locations
-
-- Codex config: `~/.codex/config.toml`
-- Codex auth state: `~/.codex/auth.json`
-- Codex local database: prefers `~/.codex/sqlite/*.db`, falls back to legacy `~/.codex/state_5.sqlite`
-- CodexElves state and logs: `~/.codex-session-delete/`
-- Provider Sync backups: `~/.codex/backups_state/provider-sync`
-
-## FAQ
-
-### The CodexElves menu does not appear
-
-Make sure ChatGPT/Codex was launched from the `CodexElves` entry instead of opening the original desktop app directly. You can also inspect the Diagnostics and Logs pages in the manager.
-
-### The plugin says the backend is disconnected
-
-First test the helper endpoint:
-
-```powershell
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:45221/backend/status -Body "{}" -ContentType "application/json"
-```
-
-If the endpoint works but the plugin still times out, it is usually a Codex page CDP bridge or script cache issue. Restart CodexElves, or check manager logs for `renderer.script_loaded`, `bridge.request`, and `bridge.response`.
-
-### How is Upstream worktree different from Codex native creation?
-
-CodexElves updates the remote branch first, then creates the worktree as if you ran:
-
-```bash
-git worktree add -b <new-branch> <worktree-path> upstream/<base-branch>
-```
-
-The new worktree starts from the fresh remote tracking branch instead of the local HEAD used by the current session. If CodexElves cannot safely recognize the current Codex version's native worktree form, use the CodexElves menu entry and enter the repository path, branch name, worktree path, remote, and base branch manually.
-
-### macOS says the app cannot be opened or is damaged
-
-Unsigned and unnotarized builds may be blocked by Gatekeeper. Allow the app in System Settings -> Privacy & Security. For formal distribution, configure Apple Developer ID signing and notarization.
-
-### Does it support Intel Macs?
-
-Yes. Releases provide both `macos-x64.dmg` and `macos-arm64.dmg`. Intel Macs should use the x64 package, while Apple Silicon Macs should use the arm64 package.
+Responses API requests use their configured upstream directly. Chat Completions and Anthropic conversions remain available. Model access and reasoning depth depend on the selected instance and provider. Session deletion is permanent and retains native execution and pending-write protections.
 
 ## Development
 
-```bash
-# Frontend checks
-cd apps/codex-elves-manager
-npm install
-npm run check
-npm run vite:build
-
-# Rust checks
-cd ../..
-cargo fmt --check
-cargo test
-cargo build --release
+```powershell
+npm --prefix apps/codex-elves-manager ci
+npm --prefix apps/codex-elves-manager run check
+npm --prefix apps/codex-elves-manager run vite:build
+cargo fmt --all -- --check
+cargo check --workspace
+.\scripts\build-windows-installer.ps1
 ```
 
-Project structure:
+The `codex-elves-manager` directory now contains shared web management components and a Rust command library; it no longer builds a desktop manager. Commit generated `assets/remote-access/management/` alongside its source. The Windows build does not build Android. Android versions and signed releases remain independent.
 
-```text
-apps/
-  codex-elves-launcher/          Silent launcher
-  codex-elves-manager/           Tauri manager
-assets/inject/
-  renderer-inject.js            Lightweight bootstrap injected into Codex
-  renderer-features.js          Full enhancement runtime installed on demand
-crates/
-  codex-elves-core/              Launch, injection, config, update, install, bridge
-  codex-elves-data/              Session data, export, Provider Sync
-scripts/installer/
-  windows/CodexElves.nsi     Windows NSIS installer
-  macos/package-dmg.sh          macOS DMG packager
-```
-
-## Notes
-
-Desktop updates can change page structure and runtime contracts, requiring updates to injection or compatibility handling. Runtime compatibility changes use their own backup and validation path; see the manager settings and diagnostics for the enabled features.
+See the [product standards](docs/product-standards.md), [web architecture](docs/remote-access-web-architecture.md), and [release documentation](docs/android-release.md) for the detailed contracts.

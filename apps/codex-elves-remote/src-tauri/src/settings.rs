@@ -31,6 +31,8 @@ impl Default for WindowState {
 #[serde(default, rename_all = "camelCase")]
 pub struct Settings {
     pub server_url: String,
+    // 连接资料仅属于本客户端；业务配置仍由服务统一保存，用于恢复明确选择过的本机后台。
+    pub local_service: bool,
     pub window: WindowState,
 }
 

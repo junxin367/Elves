@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -11,6 +12,11 @@ use tokio::process::Command;
 const TOOL_MANIFEST: &str = "tool-manifest.json";
 const RG_TOOL_ID: &str = "rg";
 const NODE_REPL_TOOL_ID: &str = "node_repl";
+static BUNDLED_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn register_bundled_root(path: PathBuf) {
+    let _ = BUNDLED_ROOT.set(path);
+}
 
 #[derive(Debug, Clone)]
 pub struct ToolRuntimeInfo {
@@ -134,6 +140,9 @@ fn tool_root_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(value) = env::var_os("CODEX_ELVES_TOOL_DIR") {
         candidates.push(PathBuf::from(value));
+    }
+    if let Some(root) = BUNDLED_ROOT.get() {
+        candidates.push(root.clone());
     }
     if let Ok(executable) = env::current_exe() {
         let mut current = executable.parent().map(Path::to_path_buf);
@@ -352,9 +361,11 @@ mod tests {
             let output = {
                 apply_to_command_with(
                     &mut probe,
-                    vec![PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                        .join("../..")
-                        .join("tools")],
+                    vec![
+                        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                            .join("../..")
+                            .join("tools"),
+                    ],
                     Some(OsString::from(r"C:\codex-elves-test-empty-path")),
                 );
                 probe.output().await.unwrap()

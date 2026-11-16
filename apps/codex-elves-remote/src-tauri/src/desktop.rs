@@ -64,6 +64,8 @@ struct ClientState {
     auto_connect: AtomicBool,
     exiting: AtomicBool,
     connection: Mutex<Connection>,
+    local_login: Mutex<Option<(url::Origin, String)>>,
+    local_target: Mutex<Option<url::Origin>>,
     titlebar_theme: Mutex<HashMap<String, ThemeSnapshot>>,
     unread_badge: Mutex<Option<u32>>,
     session_windows: Mutex<HashMap<String, SessionWindow>>,
@@ -123,6 +125,7 @@ struct ClientInfo {
     version: &'static str,
     error: Option<String>,
     detected: bool,
+    local_service: bool,
 }
 
 fn trusted_connection_page(webview: &tauri::Webview) -> Result<(), String> {
@@ -143,7 +146,7 @@ async fn remote_client_state(
 ) -> Result<ClientInfo, String> {
     trusted_connection_page(&webview)?;
     let saved = state.settings.lock().unwrap().server_url.clone();
-    let (draft, error) = {
+    let (draft, mut error) = {
         let connection = state.connection.lock().unwrap();
         (connection.draft_url.clone(), connection.error.clone())
     };
@@ -161,12 +164,24 @@ async fn remote_client_state(
             }
         }
     }
+    let local_service = state.settings.lock().unwrap().local_service;
+    let mut auto_connect = state.auto_connect.swap(false, Ordering::SeqCst);
+    if local_service {
+        match codex_elves_core::settings::SettingsStore::default().load() {
+            Ok(saved) => auto_connect &= saved.remote_access.enabled,
+            Err(failure) => {
+                auto_connect = false;
+                error = Some(format!("本机服务配置读取失败：{failure}"));
+            }
+        }
+    }
     Ok(ClientInfo {
         server_url,
-        auto_connect: state.auto_connect.swap(false, Ordering::SeqCst),
+        auto_connect,
         version: env!("CARGO_PKG_VERSION"),
         error,
         detected,
+        local_service,
     })
 }
 
@@ -178,6 +193,15 @@ async fn connect_remote(
 ) -> Result<(), String> {
     trusted_connection_page(&webview)?;
     let url = settings::normalize_server_url(&server_url).map_err(|error| error.to_string())?;
+    if state
+        .local_login
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|(origin, _)| *origin != url.origin())
+    {
+        state.local_login.lock().unwrap().take();
+    }
     state.connection.lock().unwrap().begin(url.clone());
     let previously_connected = Url::parse(&state.settings.lock().unwrap().server_url)
         .is_ok_and(|saved| saved.origin() == url.origin());
@@ -191,6 +215,63 @@ async fn connect_remote(
         return Err(format!("打开远程服务失败：{error}"));
     }
     Ok(())
+}
+
+#[tauri::command]
+async fn remote_start_local_service(
+    webview: tauri::Webview,
+    state: tauri::State<'_, ClientState>,
+) -> Result<String, String> {
+    trusted_connection_page(&webview)?;
+    // 用户要求单客户端安装：只有本机内置连接页的明确操作可启用本机后台，远程网页没有此权限。
+    let url = tokio::task::spawn_blocking(|| -> anyhow::Result<_> {
+        let store = codex_elves_core::settings::SettingsStore::default();
+        let mut saved = store.load()?;
+        let directory = codex_elves_core::paths::default_app_state_dir();
+        let credentials = codex_elves_core::remote_access::access_credentials_status(&directory)?;
+        if credentials["accessKeyConfigured"] != true {
+            let key = format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            );
+            codex_elves_core::remote_access::configure_access_key(&directory, &key)?;
+        }
+        if !saved.remote_access.enabled {
+            saved.remote_access.enabled = true;
+            store.save(&saved)?;
+        }
+        let url = Url::parse(&format!("http://127.0.0.1:{}/", saved.remote_access.port))?;
+        Ok(url)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())?;
+    codex_elves_core::remote_access::ensure_service_running()
+        .await
+        .map_err(|error| format!("{error:#}"))?;
+    let status =
+        codex_elves_core::remote_access::service_admin_request("apply", serde_json::json!({}))
+            .await;
+    if status["running"] != true {
+        return Err(status["error"]
+            .as_str()
+            .or(status["message"].as_str())
+            .unwrap_or("本机服务未能启动，请检查监听地址和端口。")
+            .to_owned());
+    }
+    let bootstrap = codex_elves_core::remote_access::service_admin_request(
+        "localBootstrap",
+        serde_json::json!({}),
+    )
+    .await;
+    let proof = bootstrap["proof"]
+        .as_str()
+        .ok_or_else(|| "本机管理授权未能建立，请重新连接本机服务。".to_owned())?;
+    trusted_connection_page(&webview)?;
+    *state.local_login.lock().unwrap() = Some((url.origin(), proof.to_owned()));
+    *state.local_target.lock().unwrap() = Some(url.origin());
+    Ok(url.to_string())
 }
 
 fn trusted_service_page(webview: &tauri::Webview, state: &ClientState) -> Result<Url, String> {
@@ -569,13 +650,32 @@ unsafe fn register_navigation_recovery(
                 match completion {
                     Some(Completion::Connected(url)) => {
                         let mut saved = state.settings.lock().unwrap();
-                        if saved.server_url != url.as_str() {
+                        let local_service = state.local_target.lock().unwrap().as_ref() == Some(&url.origin());
+                        if saved.server_url != url.as_str() || saved.local_service != local_service {
                             saved.server_url = url.to_string();
+                            saved.local_service = local_service;
                             if settings::save(&state.directory.join("settings.json"), &saved)
                                 .is_err()
                             {
                                 state.connection.lock().unwrap().error =
                                     Some("已连接，但客户端设置暂时无法保存。".into());
+                            }
+                        }
+                        drop(saved);
+                        let key = {
+                            let mut pending = state.local_login.lock().unwrap();
+                            if pending.as_ref().is_some_and(|(origin, _)| *origin == url.origin()) {
+                                pending.take().map(|(_, key)| key)
+                            } else { None }
+                        };
+                        if let Some(key) = key {
+                            // 本机明确启动后仅向已验证的本机服务提交一次配对；不写 URL、客户端配置或日志。
+                            let body = serde_json::to_string(&serde_json::json!({"localProof":key})).unwrap();
+                            if let Some(view) = app.get_webview(CONTENT_LABEL) {
+                                let script = format!(
+                                    "(async()=>{{try{{const r=await fetch('/api/connect',{{method:'POST',credentials:'same-origin',headers:{{'Content-Type':'application/json'}},body:{body:?}}});if(!r.ok)throw Error();location.reload();}}catch{{import('/ui/notice.js').then(m=>m.notice('本机管理授权未能确认，请在连接页重新连接本机服务。',true));}}}})();"
+                                );
+                                let _ = view.eval(script);
                             }
                         }
                     }
@@ -837,11 +937,30 @@ fn handle_menu_event(app: &tauri::AppHandle, event: MenuEvent) {
         }
         "quit" => {
             let state = app.state::<ClientState>();
-            state.exiting.store(true, Ordering::SeqCst);
+            if state.exiting.swap(true, Ordering::SeqCst) {
+                return;
+            }
             if let Some(window) = app.get_window(WINDOW_LABEL) {
                 remember_window(&window, true);
             }
-            app.exit(0);
+            if codex_elves_core::remote_access::owns_service() {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    // 只回收本客户端启动的本机后台；连接其他服务的客户端退出不停止服务器。
+                    let result =
+                        codex_elves_core::remote_access::prepare_service_shutdown("client_exit")
+                            .await;
+                    if let Err(error) = result {
+                        let _ = codex_elves_core::diagnostic_log::append_diagnostic_log(
+                            "remote_access.client_exit_pending",
+                            serde_json::json!({"message":format!("{error:#}")}),
+                        );
+                    }
+                    app.exit(0);
+                });
+            } else {
+                app.exit(0);
+            }
         }
         _ => {}
     }
@@ -1082,6 +1201,7 @@ pub fn run() -> anyhow::Result<()> {
         .invoke_handler(tauri::generate_handler![
             remote_client_state,
             connect_remote,
+            remote_start_local_service,
             remote_titlebar_theme,
             remote_unread_badge,
             remote_cache_status,
@@ -1114,6 +1234,14 @@ pub fn run() -> anyhow::Result<()> {
                 auto_connect: AtomicBool::new(!settings.server_url.is_empty()),
                 exiting: AtomicBool::new(false),
                 connection: Mutex::new(Connection::default()),
+                local_login: Mutex::new(None),
+                local_target: Mutex::new(if settings.local_service {
+                    Url::parse(&settings.server_url)
+                        .ok()
+                        .map(|url| url.origin())
+                } else {
+                    None
+                }),
                 titlebar_theme: Mutex::new(HashMap::new()),
                 unread_badge: Mutex::new(None),
                 session_windows: Mutex::new(HashMap::new()),

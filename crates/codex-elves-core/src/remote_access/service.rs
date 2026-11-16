@@ -17,13 +17,33 @@ use serde_json::{Value, json};
 
 const ENDPOINT_FILE: &str = "remote-access-service.json";
 const LOCK_FILE: &str = "remote-access-service.lock";
-// 协议 8 增加本机受控退出；仍仅支持独立服务，不能复用具有桌面 IPC 路由的旧进程。
-const PROTOCOL_VERSION: u32 = 8;
+// 协议 9 将统一管理和代理后台迁入远程客户端，不再复用旧管理器后台。
+const PROTOCOL_VERSION: u32 = 9;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(windows)]
 static OWNED_SERVICE_JOB: OnceLock<Mutex<Option<std::os::windows::io::OwnedHandle>>> =
     OnceLock::new();
+static SERVICE_EXECUTABLE: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+pub fn set_service_executable(path: std::path::PathBuf) {
+    let _ = SERVICE_EXECUTABLE.set(path);
+}
+
+pub fn owns_service() -> bool {
+    #[cfg(windows)]
+    {
+        OWNED_SERVICE_JOB.get().is_some_and(|job| {
+            job.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_some()
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -150,8 +170,15 @@ pub async fn ensure_running() -> anyhow::Result<()> {
     let available = acquire_service_lock(&directory)?;
     let mut child = if available.is_some() {
         drop(available);
-        let program = crate::install::companion_binary_path(crate::install::MANAGER_BINARY);
-        anyhow::ensure!(program.is_file(), "未找到管理器程序，无法启动远程访问后台");
+        // 用户要求单客户端安装，独立后台由客户端自身承载，不再依赖管理器程序。
+        let program = SERVICE_EXECUTABLE
+            .get()
+            .cloned()
+            .unwrap_or_else(|| crate::install::companion_binary_path("codex-elves-remote"));
+        anyhow::ensure!(
+            program.is_file(),
+            "未找到远程客户端程序，无法启动远程访问后台"
+        );
         let mut command = Command::new(program);
         command
             .arg("--remote-access-service")
@@ -204,6 +231,7 @@ fn supported_action(action: &str) -> bool {
     matches!(
         action,
         "status"
+            | "localBootstrap"
             | "prepareShutdown"
             | "apply"
             | "revoke"
@@ -386,7 +414,9 @@ pub async fn run() -> anyhow::Result<()> {
         &serde_json::to_vec(&endpoint)?,
     )?;
     let monitor = super::start_monitor()?;
+    let proxy_monitor = crate::local_proxy_service::start_monitor();
     let result = server.await;
+    proxy_monitor.shutdown().await;
     let shutdown = tokio::time::timeout(SHUTDOWN_TIMEOUT, monitor.shutdown()).await;
     std::fs::remove_file(directory.join(ENDPOINT_FILE))
         .context("无法清理已停止的远程访问后台状态")?;

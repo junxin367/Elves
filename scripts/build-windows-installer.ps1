@@ -105,8 +105,6 @@ $RepoRoot = Resolve-RepoRoot
 $ResolvedVersion = Resolve-WorkspaceVersion -RepoRoot $RepoRoot
 $ManagerDir = Join-Path $RepoRoot "apps\codex-elves-manager"
 $DistAppDir = Join-Path $RepoRoot "dist\windows\app"
-$ToolsSourceDir = Join-Path $RepoRoot "tools"
-$DistToolsDir = Join-Path $DistAppDir "tools"
 $InstallerScriptDir = Join-Path $RepoRoot "scripts\installer\windows"
 $InstallerScript = Join-Path $InstallerScriptDir "CodexElves.nsi"
 $InstallerPath = Join-Path $RepoRoot "dist\windows\CodexElves-$ResolvedVersion-windows-x64-setup.exe"
@@ -125,8 +123,6 @@ else {
 }
 $ReleaseDir = Join-Path $CargoTargetDir "release-fast"
 $ReleaseMirrorDir = Join-Path $CargoTargetDir "release"
-$ReleaseToolsDir = Join-Path $ReleaseDir "tools"
-$ReleaseMirrorToolsDir = Join-Path $ReleaseMirrorDir "tools"
 
 $NpmPath = Resolve-ToolPath -Name "npm.cmd" -ExplicitPath "" -FallbackPaths @()
 $NodePath = Resolve-ToolPath -Name "node.exe" -ExplicitPath "" -FallbackPaths @()
@@ -156,13 +152,23 @@ Invoke-Checked -FilePath $NodePath -Arguments @($BuildInputVerifier, $RepoRoot, 
 
 New-Item -ItemType Directory -Path $DistAppDir -Force | Out-Null
 New-Item -ItemType Directory -Path $ReleaseMirrorDir -Force | Out-Null
-$LauncherExe = Join-Path $ReleaseDir "codex-elves.exe"
-$ManagerExe = Join-Path $ReleaseDir "codex-elves-manager.exe"
-$TaskBoardExe = Join-Path $ReleaseDir "codex-elves-task-board.exe"
 $RemoteClientExe = Join-Path $ReleaseDir "codex-elves-remote.exe"
 
-# 用户要求安装包同时包含独立远程客户端，必须与其他程序一起复制到安装输入目录及 release 镜像。
-foreach ($artifact in @($LauncherExe, $ManagerExe, $TaskBoardExe, $RemoteClientExe)) {
+# 用户要求安装程序只安装远程客户端；后台与管理功能已内置该 EXE，不再构建或打包独立管理器。
+foreach ($obsoleteName in @("codex-elves.exe", "codex-elves-manager.exe", "codex-elves-task-board.exe")) {
+    Remove-Item -LiteralPath (Join-Path $DistAppDir $obsoleteName) -Force -ErrorAction SilentlyContinue
+}
+# 旧版构建目录可能留下分散工具；它们已内嵌客户端，安装输入只保留单个程序。
+$obsoleteTools = Join-Path $DistAppDir "tools"
+if (Test-Path -LiteralPath $obsoleteTools) {
+    $resolvedTools = (Resolve-Path -LiteralPath $obsoleteTools).Path
+    $resolvedApp = (Resolve-Path -LiteralPath $DistAppDir).Path.TrimEnd('\') + '\'
+    if (-not $resolvedTools.StartsWith($resolvedApp, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "旧工具目录不在安装输入目录内：$resolvedTools"
+    }
+    Remove-Item -LiteralPath $resolvedTools -Recurse -Force
+}
+foreach ($artifact in @($RemoteClientExe)) {
     if (!(Test-Path -LiteralPath $artifact)) {
         throw "Expected release artifact not found: $artifact"
     }
@@ -173,13 +179,9 @@ foreach ($artifact in @($LauncherExe, $ManagerExe, $TaskBoardExe, $RemoteClientE
     Copy-Item -LiteralPath $artifact -Destination $DistAppDir -Force
 }
 
-# 用户要求服务模式不依赖 Codex App；工具必须与实际 release-fast 可执行文件、安装输入和兼容镜像同时存在。
-foreach ($toolsDestination in @($ReleaseToolsDir, $DistToolsDir, $ReleaseMirrorToolsDir)) {
-    New-Item -ItemType Directory -Path $toolsDestination -Force | Out-Null
-    Copy-Item -Path (Join-Path $ToolsSourceDir "*") -Destination $toolsDestination -Recurse -Force
-}
-Invoke-Checked -FilePath $NodePath -Arguments @($ToolRuntimeVerifier, $RepoRoot, $ReleaseDir) -WorkingDirectory $RepoRoot
-Invoke-Checked -FilePath $NodePath -Arguments @($ToolRuntimeVerifier, $RepoRoot, $DistAppDir) -WorkingDirectory $RepoRoot
+# 单客户端须自带本机后台的工具，安装输入不再附带独立工具程序。
+Invoke-Checked -FilePath $NodePath -Arguments @($ToolRuntimeVerifier, $RepoRoot, "--embedded", $RemoteClientExe) -WorkingDirectory $RepoRoot
+Invoke-Checked -FilePath $NodePath -Arguments @($ToolRuntimeVerifier, $RepoRoot, "--embedded", (Join-Path $DistAppDir "codex-elves-remote.exe")) -WorkingDirectory $RepoRoot
 Invoke-Checked -FilePath $NodePath -Arguments @($BuildInputVerifier, $RepoRoot, $DistAppDir) -WorkingDirectory $RepoRoot
 
 # 校验独立客户端为 x64 GUI 程序，并保留单独交付的便携 EXE；安装包同时嵌入上述同一份客户端。

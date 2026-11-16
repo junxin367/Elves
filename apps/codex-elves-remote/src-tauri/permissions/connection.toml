@@ -1,7 +1,7 @@
 [[permission]]
 identifier = "remote-connection"
 description = "内置连接页可以读取远程客户端设置并连接指定服务。"
-commands.allow = ["remote_client_state", "connect_remote"]
+commands.allow = ["remote_client_state", "connect_remote", "remote_start_local_service"]
 
 [[permission]]
 identifier = "remote-appearance"

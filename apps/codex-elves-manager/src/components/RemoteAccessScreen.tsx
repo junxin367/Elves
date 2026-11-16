@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { copyToClipboard } from "@/lib/utils";
 import { Copy, ExternalLink, Eye, EyeOff, Smartphone, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -128,7 +129,7 @@ export function RemoteAccessScreen({
     finally { if (mounted.current) setBusy(false); }
   };
   const copy = async (value: string) => {
-    try { await navigator.clipboard.writeText(value); setMessage("已复制到剪贴板"); }
+    try { await copyToClipboard(value); setMessage("已复制到剪贴板"); }
     catch { setMessage("复制失败，请手动选择文本复制"); }
   };
   const zrok = status?.zrok;
@@ -240,7 +241,7 @@ export function RemoteAccessScreen({
       const latest = await command<RemoteAccessStatus>("status");
       if (!mounted.current) return;
       setStatus(latest);
-      if (latest.status !== "ok") throw new Error(latest.message || "无法确认桌面连接，请稍后重试。");
+      if (latest.status !== "ok") throw new Error(latest.message || "无法确认远程服务状态，请稍后重试。");
       if (!latest.enabled || !latest.running) throw new Error("请先启用上方「远程会话网页」。");
     }
     if (zrokInput) await saveZrokSetupValue(zrokInput);

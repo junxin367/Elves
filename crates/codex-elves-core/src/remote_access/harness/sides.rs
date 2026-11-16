@@ -455,7 +455,11 @@ impl SideThread {
             }
             "thread/status/changed" => self.metadata["status"] = params["status"].clone(),
             "turn/plan/updated" => {
-                if let Some(turn) = self.turns.iter_mut().find(|turn| turn["id"] == params["turnId"]) {
+                if let Some(turn) = self
+                    .turns
+                    .iter_mut()
+                    .find(|turn| turn["id"] == params["turnId"])
+                {
                     // 侧边只保留自身收到的计划；过期后随只读正文保留，主动关闭时一起释放。
                     for field in ["plan", "remotePlanEpoch", "remotePlanRevision"] {
                         if let Some(value) = params.get(field) {

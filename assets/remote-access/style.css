@@ -21,6 +21,21 @@ html.theme-transition{transition:--bg 300ms linear,--composer-bg 300ms linear,--
 :root{--control-icon-size:32px;--control-inline-size:28px;--control-toolbar-size:32px;--control-menu-height:36px;--prompt-editor-max-height:180px;--popup-max-height:80dvh}
 /* 用户要求输入框发送/停止共用按钮固定为 28px；桌面、手机共用此值，独立于工具栏的 32px/36px 尺寸。 */
 :root{--composer-send-size:28px}
+/* 用户要求统一主导航为 52px：36px 按钮加左右各 8px；四个入口固定排序，设置始终贴底。 */
+.remote-shell{display:grid;grid-template-columns:52px minmax(0,1fr);height:100dvh;min-width:0;overflow:hidden}
+.remote-shell>.workspace{height:100%;min-width:0}
+.main-navigation{display:flex;flex-direction:column;align-items:center;justify-content:space-between;min-height:0;padding:12px 8px max(12px,env(safe-area-inset-bottom));background:var(--side);box-shadow:inset -1px 0 var(--line);z-index:21}
+.main-navigation-pages,.main-navigation-settings{display:flex;flex-direction:column;gap:8px;align-items:center}
+.main-navigation-button{display:grid;place-items:center;width:36px;height:36px;min-width:36px;min-height:36px;padding:0;border:0;border-radius:10px;background:transparent;color:var(--muted);flex-shrink:0}
+.main-navigation-button .ui-icon{width:20px;height:20px}
+.main-navigation-button:hover,.main-navigation-button:focus-visible{background:var(--hover);color:var(--text)}
+.main-navigation-button.selected{background:var(--hover);color:var(--text)}
+.management-workspace{min-width:0;min-height:0;overflow:hidden;background:var(--bg)}
+.management-frame{display:block;width:100%;height:100%;border:0;background:var(--bg)}
+.management-unavailable{padding:24px;color:var(--muted);line-height:1.7}
+.remote-shell:has(>.workspace.related-session-view){grid-template-columns:minmax(0,1fr)}
+.remote-shell:has(>.workspace.related-session-view)>.main-navigation{display:none}
+@media(max-width:760px){.remote-shell>.workspace>.sidebar{left:52px;width:min(80vw,calc(100vw - 52px))}.remote-shell>.workspace>.sidebar-backdrop{left:52px}.main-navigation{padding-top:max(12px,env(safe-area-inset-top))}}
 .workspace.related-session-view{--sidebar-layout-width:0px;grid-template-columns:minmax(0,1fr)}
 .workspace.related-session-view>.sidebar,.workspace.related-session-view>.sidebar-backdrop{display:none!important}
 .workspace.related-session-view>.conversation{grid-column:1;min-width:0;width:100%;background:var(--bg);position:relative;z-index:calc(var(--layer-menu,200) + 1);animation:related-session-enter .17s ease-out}

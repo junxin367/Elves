@@ -356,8 +356,7 @@ impl Harness {
             );
         }
         turns.reverse();
-        let history =
-            json!({"ok":true,"scope":"turns","threadId":id,"data":turns,"nextCursor":null,
+        let history = json!({"ok":true,"scope":"turns","threadId":id,"data":turns,"nextCursor":null,
             "turnOrder":"desc","itemOrder":"asc","turnsComplete":true,"turnsPageComplete":true,
             "itemsPaginationByTurnId":pagination,"transcriptEvents":[],"nativeBridge":"harness"});
         Ok(self.projection.lock().await.history(id, history, true))

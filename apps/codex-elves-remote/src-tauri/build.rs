@@ -11,6 +11,7 @@ fn main() {
             .app_manifest(tauri_build::AppManifest::new().commands(&[
                 "remote_client_state",
                 "connect_remote",
+                "remote_start_local_service",
                 "remote_titlebar_theme",
                 "remote_unread_badge",
                 "remote_cache_status",

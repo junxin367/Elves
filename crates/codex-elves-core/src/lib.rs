@@ -20,6 +20,7 @@ pub mod install;
 pub mod lan_proxy;
 pub mod launcher;
 pub mod layered_compaction;
+pub mod local_proxy_service;
 mod log_limits;
 pub mod model_capabilities;
 pub mod model_catalog;

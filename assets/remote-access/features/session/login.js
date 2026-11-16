@@ -13,6 +13,7 @@ import {
 import { randomId } from "../../core/util.js";
 import { api } from "../api.js";
 import { openAppearance } from "../appearance/dialog.js";
+import { disposeMainNavigation } from "../main-navigation.js";
 import { setApprovalSignature } from "../approval-state.js";
 import { resetNewChatBranch, setCreationProject } from "../composer/creation-state.js";
 import { clearPrivateInputs } from "../composer/draft-restore.js";
@@ -54,6 +55,7 @@ import {
 } from "../sidebar/list-state.js";
 
 export function showLogin() {
+  disposeMainNavigation();
   loginPageCleanup?.();
   resetNewChatBranch();
   resetRelatedSessions();
@@ -113,7 +115,7 @@ export function showLogin() {
   setKeyVisible(false);
   field.append(key, reveal);
   const invalidKeyMessage = "访问密钥错误，请重试。";
-  const loginLockedMessage = "访问密钥连续输错超过3次，登录已锁定。请在本机管理器重新生成并保存密钥后再登录。";
+  const loginLockedMessage = "访问密钥连续输错超过3次，登录已锁定。请在本机客户端的远程会话页重新生成并保存密钥后再登录。";
   const hint = element("p", "pair-hint"); hint.id = "pair-key-hint"; hint.hidden = true;
   hint.setAttribute("aria-live", "polite"); hint.setAttribute("aria-atomic", "true");
   const submit = element("button", "primary pair-submit"); submit.type = "submit"; submit.id = "pair-submit";

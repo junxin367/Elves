@@ -76,7 +76,18 @@ for (const toolId of toolIds) {
   probeTool(toolId, path, spec, `源码 ${toolId}`);
 }
 
-if (mode !== "--source-only") {
+if (mode === "--embedded") {
+  const executable = resolve(process.argv[4] || "");
+  const bytes = readFileSync(executable);
+  for (const toolId of toolIds) {
+    const path = resolveToolPath(sourceTools, specs[toolId].path);
+    if (!bytes.includes(readFileSync(path))) throw new Error(`客户端没有内嵌已校验的 ${toolId}`);
+    for (const license of specs[toolId].licenses || [])
+      if (!bytes.includes(readFileSync(resolveToolPath(sourceTools, license))))
+        throw new Error(`客户端没有内嵌 ${toolId} 的许可证`);
+  }
+  console.log(`客户端内嵌工具核对通过：${toolIds.join(", ")}，完整工具字节和许可证均一致`);
+} else if (mode !== "--source-only") {
   const installedTools = resolve(mode, "tools");
   for (const toolId of toolIds) {
     const spec = specs[toolId];

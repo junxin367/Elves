@@ -2,11 +2,11 @@
 
 ## 适用范围
 
-本文件适用于整个仓库，覆盖协议代理、管理器 UI、远程会话、安装包构建、GitHub 发版及发布验收。
+本文件适用于整个仓库，覆盖协议代理、统一远程工作区、安装包构建、GitHub 发版及发布验收。
 
 ## 核心原则
 
-保留 CodexElves 的产品形态、项目命名、本地代理和管理器交互。
+保留 CodexElves 项目命名、本地代理及统一远程工作区。管理功能从远程会话主导航进入，不恢复独立管理器窗口或安装入口。
 
 ## 需求提交与推送
 
@@ -49,11 +49,10 @@
 - 产品名：`CodexElves`
 - GitHub 仓库：`https://github.com/junxin367/Elves`
 - Rust crate / workspace 包名：`codex-elves-*`
-- launcher 产物：`codex-elves.exe`
-- manager 产物：`codex-elves-manager.exe`
+- Windows 客户端程序：`codex-elves-remote.exe`
 - Windows 安装包：`dist/windows/CodexElves-<version>-windows-x64-setup.exe`
 - Windows 独立远程客户端：`dist/windows/CodexElves-Remote-<version>-windows-x64.exe`
-- 管理器包名：`codex-elves-manager`
+- 共享管理前端及后台库包名：`codex-elves-manager`（保留目录与库名，不生成管理器应用）
 
 用户要求仅将 GitHub 仓库迁移至 `Elves`，产品名、crate、应用 ID 和产物名继续保持上述命名。历史发布说明和验收记录保留当时的仓库归属，不代表新仓库已有对应 Release 或 Secrets。
 
@@ -80,15 +79,14 @@
 
 开发和维护时必须保持以下行为：
 
-- 桌面端及管理器版本号以根 `Cargo.toml` 的 `workspace.package.version` 为准。Android 版本独立维护于 `apps/codex-elves-android/version.properties`，不随管理器版本号同步。普通编译不调整 Android 版本；管理端发版需要同步发布 Android 时，按下方发布规则递增 Android 独立版本和 `versionCode`，并保持现有正式签名证书。
+- Windows 客户端及共享管理库版本号以根 `Cargo.toml` 的 `workspace.package.version` 为准。Android 版本独立维护于 `apps/codex-elves-android/version.properties`，不随 Windows 版本号同步。普通编译不调整 Android 版本；桌面发版需要同步发布 Android 时，按下方发布规则递增 Android 独立版本和 `versionCode`，并保持现有正式签名证书。
 - 默认本地协议代理端口保持 `45221`。
-- 管理器关闭按钮默认最小化到托盘；再次打开 manager 时如果在托盘中，必须显示主窗口。
-- manager 打开时保持上一次窗口位置，不能跨显示器跳回旧位置。
-- 设置页不提供“界面主题”入口；保留顶部主题切换入口及底层主题功能。
-- 工具与插件页背景高度必须随内容撑开，不能固定高度导致内容溢出。
-- 会话管理页同步目标和删除提示文案保留当前间距优化。
+- Windows 客户端关闭主窗口时收进托盘，再次启动唤回原窗口，并保持上次窗口大小、位置及显示器。
+- 远程主导航固定为会话、代理设置、会话管理、远程会话；宽 52px，按钮 36px，左右各 8px，设置固定底部。
+- 会话管理只保留浏览、筛选及单个/批量删除，不恢复历史会话修复和上下文压缩入口。
+- Windows 客户端点击底部设置直接打开设置；网页、PWA、Android 仅显示设置与退出两项菜单。
 - 快捷入口中文不能乱码；NSIS 编译必须使用 `/INPUTCHARSET UTF8`。
-- manager 左上角 logo 和 ico 使用当前项目 icon 资源。
+- 项目标识、Codex 与 Claude 实例图标继续使用当前资源。
 
 ## 协议代理和模型配置约束
 
@@ -141,19 +139,18 @@
 
 ### 正式远程服务更新
 
-用户要求“热更新正式远程服务”或更新正式远程入口时，先阅读 `docs/remote-service-update.md`，
-优先使用 `scripts/update-remote-service.ps1` 的 Prepare / Apply / Verify / Rollback 流程。
+用户要求更新正式远程入口时，先阅读 `docs/remote-service-update.md`。
 网页资源有变化时递增 `assets/remote-access/resource-revision.txt`，只做与改动相关的检查；
 独立预览更新不能代替正式入口更新，非必要不主动构建安装包。
 
-当前网页资源内嵌在程序中，Apply 需要短暂切换远程服务。
-必须保留正在运行的管理器、launcher 和本地代理，通过原 launcher 的本机管理接口启动新后台，
-并保留设置、密钥及原有设备授权。脚本默认只准备；用户明确要求更新正式服务时再应用。
-仅编写脚本、文档或读取状态的任务，不执行 Apply / Rollback。
+统一客户端结构的后台内嵌于 `codex-elves-remote.exe`，更新采用新的 Windows 安装包。
+旧 `scripts/update-remote-service.ps1` 仅保留旧安装结构的事务核验与恢复，不得用于部署统一客户端，
+也不得为复用旧更新脚本恢复管理器或 launcher。未实现客户端保持运行的原位服务替换前，
+明确说明升级需要短暂关闭客户端和后台；仅修改源码或编译时不安装、不切换正式服务。
 
 ### Windows 安装包编译
 
-用户仅要求“编译”或“编译安装包”时，默认只编译 Windows 管理端安装包，执行：
+用户仅要求“编译”或“编译安装包”时，默认只编译 Windows 客户端安装包，执行：
 
 ```powershell
 .\scripts\build-windows-installer.ps1
@@ -161,29 +158,25 @@
 
 该脚本必须完整生成：
 
-- `target/release/codex-elves.exe`
-- `target/release/codex-elves-manager.exe`
 - `target/release/codex-elves-remote.exe`
-- `dist/windows/app/codex-elves.exe`
-- `dist/windows/app/codex-elves-manager.exe`
 - `dist/windows/app/codex-elves-remote.exe`
 - `dist/windows/CodexElves-<version>-windows-x64-setup.exe`（`<version>` 取自根 `Cargo.toml` 的 `workspace.package.version`）
 - `dist/windows/CodexElves-Remote-<version>-windows-x64.exe`（另行提供的便携客户端）
 
-安装包必须同时安装 `codex-elves-remote.exe`，并在桌面和开始菜单的 CodexElves 分组创建“CodexElves 远程会话”快捷方式，直接启动客户端自身。卸载时清理对应程序和快捷方式，保留独立用户数据目录内的设置与登录缓存。安装完成页沿用管理器运行选项，不自动启动远程客户端。
+安装包只安装 `codex-elves-remote.exe`（另含卸载程序），不打包 launcher、管理器或独立工具 EXE。后台与固定工具内嵌客户端，工具按需释放到用户状态目录。桌面和开始菜单只创建“CodexElves 远程会话”程序快捷方式；完成页运行选项指向该客户端。升级清理旧程序及旧快捷方式，卸载保留设置、密钥、授权和登录缓存。
 
 不要改回手工 NSIS 命令作为默认流程。根 `build.ps1` 当前会自动调用 Android 同步构建；普通 Windows 编译使用上述专用入口，不能默认调用根 `build.ps1` 或 `scripts/sync-android-build.ps1`，以免附带构建 Android。需要修改构建流程时，优先更新 `build.ps1` 和 `scripts/build-windows-installer.ps1`。
 
 ### Windows 独立远程客户端
 
 - 用户只要求编译远程客户端时，执行 `.\scripts\build-windows-remote.ps1`，只生成独立 EXE 和对应构建信息，不附带管理器或 Android 构建。
-- 客户端使用独立配置与 WebView2 登录缓存，只连接用户填写的远程服务，不启动本机 launcher、管理器或远程后台。
+- 客户端使用独立配置与 WebView2 登录缓存，支持连接其他服务及从内置连接页明确启动本机后台；只有恢复已保存的本机连接时自动恢复后台。不启动 launcher、管理器或 Codex App。
 - 独立程序最顶部使用 Rust / Win32 实现的原生应用顶栏，显示程序标题，固定为 36 个逻辑像素，随 DPI 缩放。背景、文字和分隔线逐帧跟随会话页实际配色及渐变，不在原生端另启一套动画。保留窗口拖动、缩放、最小化、最大化及还原，主窗口关闭收进托盘，独立会话窗口关闭自身，再次启动唤回原窗口。不预设程序菜单，不恢复“连接”“窗口”菜单栏，连接设置、刷新及退出入口保留在托盘。
-- 应用顶栏不创建 WebView，窗口操作仅由原生控件处理；远程内容仅允许同步经过校验的 RGB 配色、任务栏未读数字以及管理公开网页资源缓存，连接设置仍仅授权内置连接页，不能扩大其他原生命令权限。保留 `remote_titlebar_theme` 命令名以兼容既有网页缓存，但不得恢复本地标题栏网页及其窗口控制授权。
+- 应用顶栏不创建 WebView，窗口操作仅由原生控件处理；远程内容仅使用已登记的配色、未读角标、公开资源缓存、独立会话及本机拖贴接口。本机后台启动与连接设置仅授权内置连接页，不向管理 iframe 扩大原生命令权限。保留 `remote_titlebar_theme` 命令名以兼容既有网页缓存，不恢复标题栏网页及其窗口控制授权。
 - Windows 任务栏角标按当前启用实例的未读主会话 ID 去重，置顶、最近和项目中重复出现只算一次；侧边子会话、子代理、归档会话不单独计数。搜索、折叠和快捷筛选不改变总数，读完后减少、为零时清除，超过 99 仅在图标上显示 `99+`。只由主窗口上报，不按窗口累加；后台沿用实时事件并以 15 秒只读查询补齐，发送不等待角标结果，更换授权或连接地址时清除旧计数。
 - 地址输入错误或网络加载失败后返回可编辑连接页并保留本次输入；只有成功加载的地址才能保存为下次自动连接目标。远程网页不得获得本机连接设置命令权限。
 - 客户端内置公开网页包，按服务 Origin 保存经过清单及 SHA-256 校验的当前/上一版资源；完整更新只在下次导航启用，不在使用中混换资源或自动刷新。缓存不能拦截 API、上传、鉴权或原生注入脚本。接管 Service Worker 时不得清除 Cookie、localStorage 或 IndexedDB；前台会话请求优先于资源更新。
-- 启动优先自动打开上次成功连接地址并复用有效登录授权。无已保存地址时，只读取当前用户管理器监听配置并探测回环地址与默认端口，清单验证成功后预填；不得扫描其他端口、读取访问密钥或覆盖用户正在编辑的地址。连接页不恢复已移除的窗口操作说明。
+- 启动优先自动打开上次成功连接地址并复用有效登录授权。无已保存地址时，只读取当前用户服务监听配置并探测回环地址与默认端口，清单验证成功后预填；不得扫描其他端口或覆盖用户正在编辑的地址。本机管理使用私有端点取得的一次性证明，只限真实回环，不把访问密钥写入 URL、客户端设置或日志。
 
 ### Android 显式编译
 
@@ -225,6 +218,6 @@
 - 发布后确认对应 Android Release 已公开，包含 `CodexElves-<versionName>-android.apk` 和 `android-update.json`；下载两项附件，核对版本、`versionCode`、APK 大小和 SHA-256 与更新清单及本次正式构建一致，并确认桌面 Latest 标记和 `latest.json` 未被 Android 发布覆盖。
 - 最终分别报告桌面和 Android 状态：`已发布`、`已构建未发布`、`进行中`、`失败/受阻` 或 `跳过（附依据）`，并提供对应运行记录、Release 或产物位置。只要求检查、诊断或本地编译时，不得擅自创建、推送发布标签或触发远程发布；发现未发布应明确列为待完成项。
 
-## 管理器前端检查入口
+## 共享管理前端检查入口
 
-在仓库根目录执行管理器前端检查时，使用 `npm --prefix apps/codex-elves-manager run check`。
+在仓库根目录执行共享管理前端检查时，使用 `npm --prefix apps/codex-elves-manager run check`；构建使用 `npm --prefix apps/codex-elves-manager run vite:build`，输出为 `assets/remote-access/management/`，由统一远程服务提供。

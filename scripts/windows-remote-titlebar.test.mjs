@@ -140,7 +140,7 @@ test("原生应用顶栏不向任何网页授予窗口控制权限，连接设�
     readFile(new URL("src-tauri/tauri.conf.json", base), "utf8").then(JSON.parse),
   ]);
   assert.deepEqual(appearance.webviews, ["remote-content", "remote-content-session-*"]);
-  assert.deepEqual(appearance.permissions, ["remote-appearance", "remote-resource-cache", "remote-session-window", "remote-taskbar-badge"]);
+  assert.deepEqual(appearance.permissions, ["remote-appearance", "remote-resource-cache", "remote-session-window", "remote-taskbar-badge", "remote-local-inputs"]);
   assert.ok(appearance.remote.urls.every(url => /^https?:/.test(url)));
   assert.equal(connection.local, true);
   assert.equal(connection.remote, undefined);

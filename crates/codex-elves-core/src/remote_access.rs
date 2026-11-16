@@ -48,6 +48,7 @@ mod image_preview;
 mod input_files;
 mod instance_settings;
 mod instances;
+mod management;
 mod ngrok_tunnel;
 mod open_in;
 mod permissions;
@@ -64,9 +65,13 @@ mod zrok_tunnel;
 use credentials::{AccessKey, AccessKeyStore, lock_access_key_store};
 pub use credentials::{access_credentials_status, configure_access_key};
 pub use frp_tunnel::program_directory as frp_program_directory;
+pub use management::{
+    ManagementConflict, ManagementFuture, publish_updated as publish_management_updated,
+    register_handler as register_management_handler,
+};
 pub use service::{
-    ensure_running as ensure_service_running, prepare_shutdown as prepare_service_shutdown,
-    run as run_service,
+    ensure_running as ensure_service_running, owns_service,
+    prepare_shutdown as prepare_service_shutdown, run as run_service, set_service_executable,
 };
 use zrok_tunnel::ZrokTunnelService;
 
@@ -516,7 +521,9 @@ impl RemoteAccessController {
         });
         harness.attach(Arc::downgrade(&controller));
         claude.attach(Arc::downgrade(&controller));
-        controller.conversation_naming.attach(Arc::downgrade(&controller));
+        controller
+            .conversation_naming
+            .attach(Arc::downgrade(&controller));
         Ok(controller)
     }
 
@@ -1014,6 +1021,7 @@ impl RemoteAccessController {
             return Ok(self.admin_status(&settings).await);
         }
         match action {
+            "localBootstrap" => Ok(management::issue_local_proof(&self.state_dir)),
             "saveFrp" | "testPrimaryRoute" | "applyPrimaryRoute" => {
                 self.primary_command(action, payload).await
             }
@@ -1157,7 +1165,10 @@ impl RemoteAccessController {
             let id = payload["threadId"].as_str().unwrap_or("");
             let lock = self.conversation_naming.rename_lock(id).await;
             let guard = lock.lock_owned().await;
-            authorization.prepare_dispatch().await?.commit(|| self.conversation_naming.manual(id))?;
+            authorization
+                .prepare_dispatch()
+                .await?
+                .commit(|| self.conversation_naming.manual(id))?;
             Some(guard)
         } else {
             None
@@ -1313,7 +1324,8 @@ impl RemoteAccessController {
             .then(|| json!({"threadId":payload["threadId"],"prompt":payload["prompt"]}));
         let mut value = self.call_backend(action, payload, authorization).await?;
         if let Some(input) = naming_input {
-            self.conversation_naming.accepted(action, &input, &value, &authorization.device.id);
+            self.conversation_naming
+                .accepted(action, &input, &value, &authorization.device.id);
         }
         if codex_request && action == "models" {
             instance_settings::filter_models(
@@ -1449,11 +1461,23 @@ impl RemoteAccessController {
                         Some(id) => Some(self.claude_instance_config(id).await?),
                         None => None,
                     }
-                } else { None };
-                self.claude.local_input_paths(thread_id, config, paths).await
-                    .map_err(|error| ApiError::new(409, format!("附件无法映射到目标 WSL，消息尚未发送：{error}")))?
+                } else {
+                    None
+                };
+                self.claude
+                    .local_input_paths(thread_id, config, paths)
+                    .await
+                    .map_err(|error| {
+                        ApiError::new(
+                            409,
+                            format!("附件无法映射到目标 WSL，消息尚未发送：{error}"),
+                        )
+                    })?
             } else {
-                paths.into_iter().map(|path| path.to_string_lossy().into_owned()).collect()
+                paths
+                    .into_iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect()
             };
             input_files::append_paths(&mut payload, paths);
         }
@@ -2418,6 +2442,11 @@ pub fn web_router(
         .route("/api/channels", get(channels::discover))
         .route("/api/channel-events", get(channels::catch_up))
         .route("/api/logout", post(logout))
+        // 供应商配置包含完整 TOML/JSON 与模型表；同一授权校验下允许最多 4 MiB，避免沿用普通 API 的 256 KiB 上限。
+        .route(
+            "/api/management/{command}",
+            post(management::command).layer(DefaultBodyLimit::max(4 * 1024 * 1024)),
+        )
         .route(
             "/api/diagnostics",
             post(diagnostics::upload).layer(DefaultBodyLimit::max(diagnostics::MAX_BODY_BYTES)),
@@ -2433,7 +2462,10 @@ pub fn web_router(
         )
         .route("/api/settings/permissions", post(permissions::settings))
         .route("/api/settings/instance", post(instance_settings::settings))
-        .route("/api/settings/conversation-naming", get(conversation_naming::status))
+        .route(
+            "/api/settings/conversation-naming",
+            get(conversation_naming::status),
+        )
         .route(
             "/api/settings/shared",
             get(shared_settings::read).post(shared_settings::write),
@@ -2946,11 +2978,12 @@ async fn authorized(state: &WebState, headers: &HeaderMap) -> Result<Device, Api
 struct LoginClient {
     id_hash: Option<String>,
     android_app: bool,
+    local_owner: bool,
 }
 
 async fn connect(
     State(state): State<WebState>,
-    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Extension(trust): Extension<RequestTrustContext>,
     headers: HeaderMap,
     Json(payload): Json<Value>,
@@ -2958,9 +2991,11 @@ async fn connect(
     if !state.controller.accepting_requests() {
         return Err(ApiError::new(503, "服务已关闭"));
     }
+    let local_owner = management::consume_local_proof(&state, &headers, trust, peer, &payload)?;
     let key_value = payload["key"].as_str().unwrap_or("").trim();
-    if !(8..=256).contains(&key_value.len())
-        || !key_value.bytes().all(|byte| byte.is_ascii_graphic())
+    if !local_owner
+        && (!(8..=256).contains(&key_value.len())
+            || !key_value.bytes().all(|byte| byte.is_ascii_graphic()))
     {
         return Err(ApiError::new(
             400,
@@ -2979,22 +3014,25 @@ async fn connect(
             _ => return Err(ApiError::new(400, "客户端标识格式无效")),
         },
         android_app: payload["clientKind"] == "android-app",
+        local_owner,
     };
     let key = {
         let mut auth = state.controller.auth.lock().await;
-        let (_store, key, locked) = state
-            .controller
-            .access_key_snapshot()
-            .await
-            .map_err(|_| ApiError::new(503, "访问密钥无法读取，请在本机管理器检查"))?;
+        let (_store, key, locked) =
+            state.controller.access_key_snapshot().await.map_err(|_| {
+                ApiError::new(503, "访问密钥无法读取，请在本机客户端的远程会话页检查")
+            })?;
         state.controller.sync_access_key(&mut auth, key, locked);
-        if auth.login_locked {
+        if auth.login_locked && !local_owner {
             return Err(login_locked_error());
         }
         auth.access_key
             .clone()
             .ok_or_else(|| ApiError::new(503, "本机尚未设置访问密钥"))?
     };
+    if local_owner {
+        return complete_login(state, key, true, headers, trust, client).await;
+    }
     let candidate = key_value.to_string();
     let checked_key = key.clone();
     let permit = state
@@ -3020,7 +3058,7 @@ async fn connect(
 fn login_locked_error() -> ApiError {
     ApiError::new(
         423,
-        "访问密钥连续输错超过 3 次，登录已锁定，请在本机管理器重新生成并保存新密钥",
+        "访问密钥连续输错超过 3 次，登录已锁定，请在本机客户端的远程会话页重新生成并保存新密钥",
     )
 }
 
@@ -3030,7 +3068,7 @@ async fn login_status(State(state): State<WebState>) -> Result<Json<Value>, ApiE
         .controller
         .access_key_snapshot()
         .await
-        .map_err(|_| ApiError::new(503, "登录状态无法读取，请在本机管理器检查"))?;
+        .map_err(|_| ApiError::new(503, "登录状态无法读取，请在本机客户端的远程会话页检查"))?;
     state.controller.sync_access_key(&mut auth, key, locked);
     Ok(Json(json!({"ok":true,"loginLocked":auth.login_locked})))
 }
@@ -3062,7 +3100,7 @@ async fn complete_login(
         .controller
         .access_key_snapshot()
         .await
-        .map_err(|_| ApiError::new(503, "访问密钥无法读取，请在本机管理器检查"))?;
+        .map_err(|_| ApiError::new(503, "访问密钥无法读取，请在本机客户端的远程会话页检查"))?;
     state.controller.sync_access_key(&mut auth, key, locked);
     let key = auth
         .access_key
@@ -3072,7 +3110,7 @@ async fn complete_login(
     if !state.controller.accepting_requests() {
         return Err(ApiError::new(503, "服务已关闭"));
     }
-    if auth.login_locked {
+    if auth.login_locked && !client.local_owner {
         return Err(login_locked_error());
     }
     if !valid {
@@ -3082,7 +3120,7 @@ async fn complete_login(
             auth.login_storage_failed_for = Some(key_id);
             ApiError::new(
                 503,
-                "登录状态保存失败，已拒绝新登录，请在本机管理器重新生成密钥",
+                "登录状态保存失败，已拒绝新登录，请在本机客户端的远程会话页重新生成密钥",
             )
         })?;
         auth.login_locked = key.login_locked();
@@ -3118,7 +3156,7 @@ async fn complete_login(
     });
     // 用户要求旧客户端凭有效 Cookie 迁移时保留设备 ID、草稿和队列；丢失 Cookie 后仍须验证密钥才可复用有效客户端。
     // 仅新授权检查既有 32 条上限；过期、换密钥和已撤销记录不参与匹配，不能恢复其旧 ID 或凭据。
-    let existing = cookie_index.or_else(|| {
+    let mut existing = cookie_index.or_else(|| {
         client.id_hash.as_ref().and_then(|digest| {
             auth.devices.iter().position(|device| {
                 device.public_origin == public_origin
@@ -3126,7 +3164,14 @@ async fn complete_login(
             })
         })
     });
-    if existing.is_none() && auth.devices.len() >= MAX_DEVICES {
+    if client.local_owner && existing.is_none() {
+        // 本机证明可以轮换仍有效的本机管理设备，不能通过残留记录复活已撤销的设备。
+        existing = auth
+            .devices
+            .iter()
+            .position(|device| management::local_owner(&state.controller.state_dir, device));
+    }
+    if existing.is_none() && auth.devices.len() >= MAX_DEVICES && !client.local_owner {
         return Err(ApiError::new(409, "授权设备已达上限，请撤销旧设备"));
     }
     let token = if cookie_index.is_some() {
@@ -3165,6 +3210,9 @@ async fn complete_login(
     if name != "网页设备" || device.name.is_empty() {
         device.name = name.into();
     }
+    if client.local_owner {
+        device.name = "本机客户端（管理）".into();
+    }
     if let Some(index) = existing {
         auth.devices[index] = device.clone();
     } else {
@@ -3174,22 +3222,32 @@ async fn complete_login(
         auth.devices = previous_devices;
         return Err(ApiError::new(503, "设备授权保存失败"));
     }
-    let key_id = key.id.clone();
-    let (_store, key) = match persist_login_result(store, key, true).await {
-        Ok(result) => result,
-        Err(_) => {
+    if client.local_owner {
+        if management::remember_local_owner(&state.controller.state_dir, &device, &auth.devices)
+            .is_err()
+        {
             auth.devices = previous_devices;
             let _ = state.controller.save_devices(&auth).await;
-            auth.login_locked = true;
-            auth.login_storage_failed_for = Some(key_id);
-            return Err(ApiError::new(
-                503,
-                "登录状态保存失败，已拒绝新登录，请在本机管理器重新生成密钥",
-            ));
+            return Err(ApiError::new(503, "本机管理授权保存失败"));
         }
-    };
-    auth.access_key = Some(key);
-    auth.login_locked = false;
+    } else {
+        let key_id = key.id.clone();
+        let (_store, key) = match persist_login_result(store, key, true).await {
+            Ok(result) => result,
+            Err(_) => {
+                auth.devices = previous_devices;
+                let _ = state.controller.save_devices(&auth).await;
+                auth.login_locked = true;
+                auth.login_storage_failed_for = Some(key_id);
+                return Err(ApiError::new(
+                    503,
+                    "登录状态保存失败，已拒绝新登录，请在本机客户端的远程会话页重新生成密钥",
+                ));
+            }
+        };
+        auth.access_key = Some(key);
+        auth.login_locked = false;
+    }
     let secure = trust.external_https;
     let cookie = format!(
         "{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age_seconds}{}",
@@ -3216,7 +3274,7 @@ async fn session(
     let service_connected = state.controller.harness_connected.load(Ordering::SeqCst);
     let native_write_available = service_connected;
     let shared_settings = state.controller.shared_settings.snapshot().await?;
-    Ok(Json(json!({"ok":true,"device":device.public(),
+    let mut response = json!({"ok":true,"device":device.public(),
         "sharedSettings":shared_settings,
         "serviceConnected":service_connected,
         // 用户要求服务模式自带 rg 并可诊断实际来源；状态仅向已授权会话返回，不修改用户 PATH。
@@ -3237,7 +3295,9 @@ async fn session(
         "sendText":native_write_available || service_connected,
         "sideThreads":true,"serviceSideThreads":true,"subagents":true,"serviceSubagents":true,
         "sessionMetrics":true,"workspaceOpenIn":cfg!(windows),
-        "claudeSessions":true,"claudeProjectTrust":true,"claudeSubscriptionUsage":true}})))
+        "claudeSessions":true,"claudeProjectTrust":true,"claudeSubscriptionUsage":true}});
+    response["capabilities"]["management"] = json!(management::available());
+    Ok(Json(response))
 }
 
 async fn logout(
@@ -3902,7 +3962,10 @@ fn validate_goal_composer_payload(action: &str, payload: &Value) -> Result<(), A
         .get("images")
         .and_then(Value::as_array)
         .is_some_and(|images| !images.is_empty())
-        || object.get("files").and_then(Value::as_array).is_some_and(|files| !files.is_empty());
+        || object
+            .get("files")
+            .and_then(Value::as_array)
+            .is_some_and(|files| !files.is_empty());
     if object
         .get("prompt")
         .and_then(Value::as_str)
@@ -4290,8 +4353,12 @@ fn validate_queued_action_payload(action: &str, payload: &Value) -> Result<(), A
                     format!("每条消息最多保留或新增 {MAX_INPUT_IMAGE_COUNT} 张图片"),
                 ));
             }
-            if prompt.trim().is_empty() && retained_count + added_count == 0
-                && !payload["files"].as_array().is_some_and(|files| !files.is_empty()) {
+            if prompt.trim().is_empty()
+                && retained_count + added_count == 0
+                && !payload["files"]
+                    .as_array()
+                    .is_some_and(|files| !files.is_empty())
+            {
                 return Err(ApiError::new(400, "消息不能为空或超过 128 KiB"));
             }
         } else if prompt.trim().is_empty() {
@@ -4378,7 +4445,9 @@ async fn action(
         && (payload["images"]
             .as_array()
             .is_some_and(|images| !images.is_empty())
-            || payload["files"].as_array().is_some_and(|files| !files.is_empty()));
+            || payload["files"]
+                .as_array()
+                .is_some_and(|files| !files.is_empty()));
     if matches!(action.as_str(), "send" | "create" | "editMessage")
         && payload["prompt"].as_str().is_none_or(|text| {
             text.len() > 128 * 1024 || text.trim().is_empty() && !has_input_images
@@ -4407,7 +4476,10 @@ async fn action(
     if matches!(action.as_str(), "send" | "create") && payload["goalMode"] != true {
         validate_input_images(&payload)?;
     }
-    if matches!(action.as_str(), "send" | "create" | "setGoal" | "editQueued") {
+    if matches!(
+        action.as_str(),
+        "send" | "create" | "setGoal" | "editQueued"
+    ) {
         input_files::validate(&payload)?;
     } else if payload.get("files").is_some() {
         return Err(ApiError::new(400, "当前操作不接受文件和文件夹附件"));
@@ -13772,6 +13844,110 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
             .next()
             .unwrap()
             .to_string()
+    }
+
+    #[tokio::test]
+    async fn management_local_proof_is_single_use_and_read_only_exception_stays_on_loopback() {
+        let (directory, mut state) = login_lock_test_state();
+        let proof = management::issue_local_proof(directory.path());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::HOST,
+            HeaderValue::from_str(&format!("127.0.0.1:{}", state.settings.port)).unwrap(),
+        );
+        let payload = json!({"localProof": proof["proof"]});
+        for (peer, trust) in [
+            ("192.0.2.1:1000", RequestTrustContext::default()),
+            (
+                "127.0.0.1:1000",
+                RequestTrustContext {
+                    external_public: true,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            assert_eq!(
+                management::consume_local_proof(
+                    &state,
+                    &headers,
+                    trust,
+                    peer.parse().unwrap(),
+                    &payload
+                )
+                .unwrap_err()
+                .code,
+                403
+            );
+        }
+        let response = connect(
+            State(state.clone()),
+            ConnectInfo("127.0.0.1:1000".parse().unwrap()),
+            Extension(RequestTrustContext::default()),
+            headers.clone(),
+            Json(payload.clone()),
+        )
+        .await
+        .unwrap();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&login_cookie(&response)).unwrap(),
+        );
+        assert_eq!(
+            management::consume_local_proof(
+                &state,
+                &headers,
+                RequestTrustContext::default(),
+                "127.0.0.1:1000".parse().unwrap(),
+                &payload
+            )
+            .unwrap_err()
+            .code,
+            401
+        );
+        let device = authorized(&state, &headers).await.unwrap();
+        assert!(management::local_owner(directory.path(), &device));
+        let mut replaced = device.clone();
+        replaced.token_hash = hash("another-token");
+        assert!(!management::local_owner(directory.path(), &replaced));
+        state.settings.enabled = true;
+        state.settings.read_only = true;
+        state.controller.publish_access_policy(&state.settings);
+        // 本机管理例外只绕过只读策略；当前测试没有登记管理实现，随后应明确返回 503。
+        let local = management::command(
+            State(state.clone()),
+            Path("load_settings".to_owned()),
+            ConnectInfo("127.0.0.1:1000".parse().unwrap()),
+            Extension(RequestTrustContext::default()),
+            headers.clone(),
+            Json(json!({})),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(local.code, 503);
+        let remote = management::command(
+            State(state.clone()),
+            Path("load_settings".to_owned()),
+            ConnectInfo("192.0.2.1:1000".parse().unwrap()),
+            Extension(RequestTrustContext::default()),
+            headers.clone(),
+            Json(json!({})),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(remote.code, 403);
+        let mut wrong_host = headers;
+        wrong_host.insert(header::HOST, HeaderValue::from_static("localhost"));
+        let rejected = management::command(
+            State(state),
+            Path("load_settings".to_owned()),
+            ConnectInfo("127.0.0.1:1000".parse().unwrap()),
+            Extension(RequestTrustContext::default()),
+            wrong_host,
+            Json(json!({})),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(rejected.code, 403);
     }
 
     #[tokio::test]

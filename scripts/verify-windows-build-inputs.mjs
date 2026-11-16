@@ -66,15 +66,8 @@ const runtimeContract = verifyRemoteRuntimeSources({
 
 // 用户要求更新后远程功能可用；共享 Cargo 产物可能被另一工作树覆盖，
 // 打包前须按完整资源字节核对，不能仅凭相同的产品版本号判断代码一致。
-const rendererSources = [
-  "assets/inject/renderer-features.js",
-  "assets/inject/composer-fast.js",
-  "assets/inject/statsig-cache.js",
-];
 const programs = [
-  ["codex-elves.exe", rendererSources],
-  ["codex-elves-manager.exe", [...rendererSources, ...remoteWebSources]],
-  // 用户要求独立客户端内置网页缓存；打包时也核对其内置资源，不能把旧网页包随新 EXE 一起交付。
+  // 用户要求只交付远程客户端；内置会话和管理页面都必须与本次源码一致。
   ["codex-elves-remote.exe", remoteWebSources, false],
 ];
 const failures = [];
@@ -92,5 +85,5 @@ if (failures.length) {
 } else {
   console.log(sourceOnly
     ? `Windows 源码基线核对通过：后台协议 ${runtimeContract.protocol}，服务模式和分支信息读取完整。`
-    : `Windows 构建输入核对通过：${buildId}，远程页面和桌面注入均与当前源码一致。`);
+    : `Windows 构建输入核对通过：${buildId}，远程客户端内置页面与当前源码一致。`);
 }

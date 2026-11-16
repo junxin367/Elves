@@ -4,6 +4,11 @@ import path from "node:path";
 import { defineConfig } from "vite";
 
 export default defineConfig({
+  base: "/management/",
+  build: {
+    outDir: "../../assets/remote-access/management",
+    emptyOutDir: true,
+  },
   plugins: [react(), tailwindcss()],
   resolve: {
     alias: {

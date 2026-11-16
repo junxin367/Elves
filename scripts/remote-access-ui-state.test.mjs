@@ -13,6 +13,81 @@ import { captureTransferInputs, hasTransferFiles, readTransferInputs } from "../
 import { marked, Renderer } from "../assets/remote-access/vendor/marked.esm.js";
 import { defaultSharedSettings } from "../assets/remote-access/features/settings/shared-state.js";
 
+async function navigationFixture(native = false) {
+  const source = await loadRemoteAppSource();
+  const node = (tag, className = "") => ({
+    tag, className, children: [], attributes: {}, dataset: {}, hidden: false, isConnected: true,
+    classList: {
+      values: new Set(),
+      add(value) { this.values.add(value); },
+      toggle(value, enabled) { enabled ? this.values.add(value) : this.values.delete(value); },
+    },
+    setAttribute(name, value) { this.attributes[name] = value; },
+    removeAttribute(name) { delete this.attributes[name]; },
+    append(...children) { this.children.push(...children); },
+    before(value) { this.insertedBefore = value; },
+  });
+  const messages = { scrollTop: 320, isConnected: true };
+  const workspace = node("div", "workspace");
+  workspace.querySelector = selector => selector === "#messages" ? messages : null;
+  workspace.draft = "保留当前输入";
+  const opened = [], visibility = [], animation = [], callbacks = { settings: 0, logout: 0, disposed: 0 };
+  const openPage = page => opened.push(page);
+  openPage.setVisible = value => visibility.push(value);
+  openPage.dispose = () => callbacks.disposed++;
+  const context = {
+    workspace, openPage, element: node, icon: name => ({ name }),
+    button: (text, label, action, className) => Object.assign(node("button", className), { label, action }),
+    closePopup() {}, togglePopup: control => { context.popup = control; }, openPopup() {},
+    requestAnimationFrame: callback => animation.push(callback),
+    openSettings: () => callbacks.settings++, logout: () => callbacks.logout++,
+    ...(native ? { __CODEX_ELVES_SESSION_WINDOWS__: { open() {} } } : {}),
+  };
+  rawVm.createContext(context);
+  rawVm.runInContext(source.moduleText("features/main-navigation.js")
+    + "\nglobalThis.navigation = mountMainNavigation({ workspace, openPage, openSettings, logout });", context);
+  const [navigation] = context.navigation.shell.children;
+  return { context, workspace, messages, callbacks, opened, visibility, animation,
+    buttons: navigation.children[0].children, settings: navigation.children[1].children[0] };
+}
+
+test("统一主导航固定排序，切换后保留当前会话草稿、节点与阅读位置", async () => {
+  const fixture = await navigationFixture();
+  assert.deepEqual(Array.from(fixture.buttons, button => button.label), ["会话", "代理设置", "会话管理", "远程会话"]);
+  fixture.buttons[1].action();
+  assert.equal(fixture.workspace.hidden, true);
+  assert.equal(fixture.workspace.inert, true);
+  fixture.buttons[2].action();
+  assert.deepEqual(fixture.opened, ["proxy", "sessions"]);
+  assert.equal(fixture.buttons[2].attributes["aria-current"], "page");
+  fixture.messages.scrollTop = 0;
+  fixture.buttons[0].action();
+  fixture.animation.forEach(callback => callback());
+  assert.equal(fixture.workspace.hidden, false);
+  assert.equal(fixture.workspace.inert, false);
+  assert.equal(fixture.workspace.draft, "保留当前输入");
+  assert.equal(fixture.messages.scrollTop, 320);
+  assert.equal(fixture.context.navigation.shell.children[1], fixture.workspace);
+  assert.deepEqual(fixture.visibility, [true, true, false]);
+  rawVm.runInContext("disposeMainNavigation(); disposeMainNavigation();", fixture.context);
+  assert.equal(fixture.callbacks.disposed, 1);
+});
+
+test("导航底部设置按客户端区分：Windows 直接打开，网页仅有设置和退出", async () => {
+  const web = await navigationFixture();
+  web.settings.action();
+  assert.equal(web.context.popup, web.settings);
+  assert.deepEqual(Array.from(web.settings.menuOptions, entry => entry.label), ["设置", "退出"]);
+  web.settings.menuOptions[0].action();
+  web.settings.menuOptions[1].action();
+  assert.deepEqual(web.callbacks, { settings: 1, logout: 1, disposed: 0 });
+  const native = await navigationFixture(true);
+  native.settings.action();
+  assert.equal(native.callbacks.settings, 1);
+  assert.equal(native.settings.menuOptions, undefined);
+  assert.equal(native.context.popup, undefined);
+});
+
 async function instanceOptionUiFixture(settings, extraSettings, backend = "codex", capabilityError = "") {
   const module = await readFile(new URL("../assets/remote-access/features/settings/instance-settings.js", import.meta.url), "utf8");
   const start = module.indexOf("  function renderExtraSettings()");

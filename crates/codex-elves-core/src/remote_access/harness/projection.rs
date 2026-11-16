@@ -275,7 +275,9 @@ impl Projection {
     }
 
     fn decorate_turn_plan(&self, id: &str, turn: &mut Value) {
-        let Some(turn_id) = turn["id"].as_str() else { return };
+        let Some(turn_id) = turn["id"].as_str() else {
+            return;
+        };
         let plan = self.plans.get(&(id.to_owned(), turn_id.to_owned()));
         turn["remotePlanEpoch"] = json!(self.epoch);
         if let Some(plan) = plan {
@@ -372,13 +374,17 @@ impl Projection {
         let mut turns = history["data"].as_array().cloned().unwrap_or_default();
         // 原生轮次尚未进入历史页时，已收到的真实计划仍可展示；仅补当前执行轮次，
         // 不根据旧清单制造已完成轮次，也不改变原生分页游标。
-        if latest && item_turn.is_none()
+        if latest
+            && item_turn.is_none()
             && let Some(turn_id) = self.active.get(id)
             && self.plans.contains_key(&(id.to_owned(), turn_id.clone()))
             && !turns.iter().any(|turn| turn["id"] == turn_id.as_str())
         {
-            turns.insert(0, json!({"id":turn_id,"status":"inProgress","items":[],
-                "itemsView":"summary","itemsComplete":false,"itemsPageComplete":false}));
+            turns.insert(
+                0,
+                json!({"id":turn_id,"status":"inProgress","items":[],
+                "itemsView":"summary","itemsComplete":false,"itemsPageComplete":false}),
+            );
         }
         let oldest = turns.iter().filter_map(turn_started_ms).min().unwrap_or(0);
         for record in self
@@ -929,9 +935,16 @@ mod tests {
         assert_eq!(early["data"][0]["plan"], plan);
         assert_eq!(early["data"][0]["id"], "turn");
         assert_eq!(early["data"][0]["itemsComplete"], false);
-        assert!(projection.history("other", page.clone(), true)["data"][0].get("plan").is_none());
-        let items = projection.history("main",
-            json!({"scope":"items","turnId":"turn","data":[],"itemsNextCursor":"items"}), false);
+        assert!(
+            projection.history("other", page.clone(), true)["data"][0]
+                .get("plan")
+                .is_none()
+        );
+        let items = projection.history(
+            "main",
+            json!({"scope":"items","turnId":"turn","data":[],"itemsNextCursor":"items"}),
+            false,
+        );
         assert_eq!(items["plan"], plan);
         assert_eq!(items["itemsNextCursor"], "items");
 
@@ -939,7 +952,10 @@ mod tests {
             "threadId":"main","turnId":"turn","plan":[]}}));
         projection.ingest(json!({"method":"turn/plan/updated","params":{
             "threadId":"main","turnId":"turn"}}));
-        assert_eq!(projection.history("main", page, true)["data"][0]["plan"], json!([]));
+        assert_eq!(
+            projection.history("main", page, true)["data"][0]["plan"],
+            json!([])
+        );
     }
 
     #[test]
@@ -958,14 +974,19 @@ mod tests {
         assert!(history["data"][1].get("plan").is_none());
 
         let previous_epoch = projection.epoch.clone();
-        projection.ingest(json!({"method":"harness/connected","_generation":"new","_generationIndex":1}));
-        projection.ingest(json!({"method":"turn/plan/updated","_generation":"old","params":{
-            "threadId":"main","turnId":"kept","plan":[{"step":"旧引擎","status":"pending"}]}}));
+        projection
+            .ingest(json!({"method":"harness/connected","_generation":"new","_generationIndex":1}));
+        projection.ingest(
+            json!({"method":"turn/plan/updated","_generation":"old","params":{
+            "threadId":"main","turnId":"kept","plan":[{"step":"旧引擎","status":"pending"}]}}),
+        );
         let history = projection.history("main", page, true);
         assert_ne!(history["data"][0]["remotePlanEpoch"], previous_epoch);
         assert!(history["data"][0].get("plan").is_none());
-        projection.ingest(json!({"method":"turn/plan/updated","_generation":"new","params":{
-            "threadId":"main","turnId":"new-turn","plan":[]}}));
+        projection.ingest(
+            json!({"method":"turn/plan/updated","_generation":"new","params":{
+            "threadId":"main","turnId":"new-turn","plan":[]}}),
+        );
         projection.forget_deleted_thread("main");
         assert!(projection.plans.is_empty());
     }

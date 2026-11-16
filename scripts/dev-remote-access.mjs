@@ -149,7 +149,7 @@ function allowedApi(method, path) {
       "/api/settings/instance", "/api/settings/claude-recap",
       "/api/settings/shared",
       "/api/settings/prompt-optimization"].includes(path)
-      || /^\/api\/(?:read|action)\/[a-zA-Z][a-zA-Z0-9_-]*$/.test(path));
+      || /^\/api\/(?:read|action|management)\/[a-zA-Z][a-zA-Z0-9_-]*$/.test(path));
 }
 function mappedCookie(req) {
   const token = String(req.headers.cookie || "").split(";").map(value => value.trim())

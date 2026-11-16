@@ -1,10 +1,10 @@
 #requires -Version 7.0
 <#
 .SYNOPSIS
-准备、应用、核验或回滚 Windows 正式远程服务更新。
+核验或恢复旧版 Windows 远程服务更新事务。
 .DESCRIPTION
-默认只准备程序和更新计划。Apply / Rollback 仅切换已核对的远程服务，
-通过原 launcher 的本机管理接口拉起后台，保留管理器、本地代理和授权。
+统一客户端使用 Windows 安装包升级，本脚本不支持创建该结构的更新计划。
+旧版 Apply / Rollback 仅切换原计划中已核对的服务，不用于部署新客户端。
 用法及中断恢复见 docs/remote-service-update.md。点源加载只定义函数，供隔离检查使用。
 #>
 [CmdletBinding()]
@@ -462,6 +462,11 @@ function Restore-RemoteUpdatePrevious($Plan, $Previous, [string]$Program, [strin
 
 function New-RemoteUpdatePlan([string]$Path, [string]$Repository, [string]$Directory, [int]$Port,
     [string]$Candidate, [switch]$ReuseBuild) {
+    # 用户要求删除独立管理器；不能为复用旧热更新流程恢复管理器或把新客户端当作旧服务宿主。
+    $sharedPackage = Join-Path $Repository "apps/codex-elves-manager/src-tauri/Cargo.toml"
+    if ((Get-Content -LiteralPath $sharedPackage -Raw) -match '(?m)^\s*autobins\s*=\s*false\s*$') {
+        throw "统一客户端不支持旧管理器热更新计划。请运行 scripts/build-windows-installer.ps1 构建并使用新安装包升级；升级会短暂关闭客户端和本机后台。"
+    }
     if (Test-Path -LiteralPath $Path) { throw "更新计划已存在，请指定新的 -PlanPath。" }
     $live = Get-RemoteUpdateLive $Directory
     $service = $live.service
