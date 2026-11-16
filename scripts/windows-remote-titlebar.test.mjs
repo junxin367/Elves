@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 import vm from "node:vm";
 import { setImmediate as nextTurn } from "node:timers/promises";
 
-const base = new URL("../apps/codex-elves-remote/", import.meta.url);
+const base = new URL("../apps/elves/", import.meta.url);
 const bridge = await readFile(new URL("web/theme-bridge.js", base), "utf8");
 
 test("独立窗口复用主 WebView2 环境且不重复清理共享 profile", async () => {
@@ -19,7 +19,7 @@ test("独立窗口复用主 WebView2 环境且不重复清理共享 profile", as
 test("独立窗口及原生顶栏只在主界面线程创建，异步命令不直接创建 Win32 子窗口", async () => {
   const desktop = await readFile(new URL("src-tauri/src/desktop.rs", base), "utf8");
   const appBar = await readFile(new URL("src-tauri/src/app_bar.rs", base), "utf8");
-  const command = desktop.slice(desktop.indexOf("async fn remote_open_session_window"),
+  const command = desktop.slice(desktop.indexOf("async fn client_open_session_window"),
     desktop.indexOf("fn open_session_window("));
   // 工作线程创建顶栏会让主线程调整尺寸时跨线程 SendMessage 永久阻塞（2026-11 实测 Cross-thread 挂起）。
   assert.match(command, /app\.run_on_main_thread\(move \|\| \{\s*let _ = sender\.send\(open_session_window\(/);
@@ -42,7 +42,7 @@ test("独立窗口的原生标题跟随页面标题，主窗口保持程序标�
 });
 
 test("会话窗口页面标题同步顶部会话标题，重命名、切换和重建界面后继续有效", async () => {
-  const pageSource = await readFile(new URL("../assets/remote-access/features/session/side-panel.js", import.meta.url), "utf8");
+  const pageSource = await readFile(new URL("../assets/harness/features/session/side-panel.js", import.meta.url), "utf8");
   const start = pageSource.indexOf("export function installSessionWindowTitleSync()");
   const body = pageSource.slice(start, pageSource.indexOf("let workspaceSidePanelStateSignature", start)).replace(/^export /, "");
   assert.ok(start > 0 && body.includes("function installSessionWindowTitleSync"));
@@ -56,7 +56,7 @@ test("会话窗口页面标题同步顶部会话标题，重命名、切换和�
     const host = {};
     let current = heading;
     const document = {
-      title: "CodexElves · 远程会话",
+      title: "Elves · 远程会话",
       documentElement: { dataset: sessionWindow ? { sessionWindow: "true" } : {} },
       getElementById: id => id === "app" ? host : id === "thread-title" ? current : null,
     };
@@ -67,27 +67,27 @@ test("会话窗口页面标题同步顶部会话标题，重命名、切换和�
 
   // 普通网页或 PC 主页面不是独立会话窗口，不改页面标题。
   const normal = run({ sessionWindow: false, heading: { textContent: "不应显示" } });
-  assert.equal(normal.document.title, "CodexElves · 远程会话");
+  assert.equal(normal.document.title, "Elves · 远程会话");
 
   const heading = { textContent: "远程会话" };
   const page = run({ sessionWindow: true, heading });
-  assert.equal(page.document.title, "CodexElves · 远程会话", "默认标题保留页面原标题");
+  assert.equal(page.document.title, "Elves · 远程会话", "默认标题保留页面原标题");
   heading.textContent = "  修复登录 ";
   page.fire(heading);
-  assert.equal(page.document.title, "修复登录 · CodexElves");
+  assert.equal(page.document.title, "修复登录 · Elves");
   heading.textContent = "重命名后的会话";
   page.fire(heading);
-  assert.equal(page.document.title, "重命名后的会话 · CodexElves");
+  assert.equal(page.document.title, "重命名后的会话 · Elves");
   // shell() 重建 #app 后重新绑定新的标题元素，旧元素的变化不再影响页面标题。
   const rebuilt = { textContent: "另一会话" };
   page.replace(rebuilt);
-  assert.equal(page.document.title, "另一会话 · CodexElves");
+  assert.equal(page.document.title, "另一会话 · Elves");
   heading.textContent = "旧元素";
   page.fire(heading);
-  assert.equal(page.document.title, "另一会话 · CodexElves");
+  assert.equal(page.document.title, "另一会话 · Elves");
   // 退出登录或标题元素消失时回到页面原标题。
   page.replace(null);
-  assert.equal(page.document.title, "CodexElves · 远程会话");
+  assert.equal(page.document.title, "Elves · 远程会话");
 });
 
 test("外观连续变化合并为最新颜色并串行同步，模式来自实际页面", async () => {
@@ -114,7 +114,7 @@ test("外观连续变化合并为最新颜色并串行同步，模式来自实�
   vm.runInContext(bridge, context);
   frames.shift()();
   assert.equal(requests.length, 1);
-  assert.equal(requests[0].command, "remote_titlebar_theme");
+  assert.equal(requests[0].command, "client_titlebar_theme");
   assert.equal(requests[0].payload.theme.dark, true, "页面深色优先于系统浅色偏好");
   assert.deepEqual(Array.from(requests[0].payload.theme.background), [24, 24, 24]);
   variables.set("--bg", "#cde"); root.dataset.theme = "light";
@@ -139,12 +139,12 @@ test("原生应用顶栏不向任何网页授予窗口控制权限，连接设�
     capability("content-appearance"), capability("connection-page"),
     readFile(new URL("src-tauri/tauri.conf.json", base), "utf8").then(JSON.parse),
   ]);
-  assert.deepEqual(appearance.webviews, ["remote-content", "remote-content-session-*"]);
+  assert.deepEqual(appearance.webviews, ["elves-content", "elves-content-session-*"]);
   assert.deepEqual(appearance.permissions, ["remote-appearance", "remote-resource-cache", "remote-session-window", "remote-taskbar-badge", "remote-local-inputs"]);
   assert.ok(appearance.remote.urls.every(url => /^https?:/.test(url)));
   assert.equal(connection.local, true);
   assert.equal(connection.remote, undefined);
-  assert.deepEqual(connection.webviews, ["remote-content"]);
+  assert.deepEqual(connection.webviews, ["elves-content"]);
   assert.deepEqual(connection.permissions, ["remote-connection"]);
   assert.deepEqual(configuration.app.security.capabilities, ["connection-page", "content-appearance"]);
   for (const value of [appearance, connection]) {
@@ -245,7 +245,7 @@ test("任务栏角标桥串行同步并合并连续数字，读完后能清零�
   const badge = host.__CODEX_ELVES_UNREAD_BADGE__;
   badge.setCount(1); badge.setCount(2); badge.setCount(3);
   assert.equal(requests.length, 1);
-  assert.equal(requests[0].command, "remote_unread_badge");
+  assert.equal(requests[0].command, "client_unread_badge");
   completions.shift()(); await nextTurn();
   assert.equal(requests[1].payload.count, 3, "不积压过期的中间计数");
   badge.setCount(0);

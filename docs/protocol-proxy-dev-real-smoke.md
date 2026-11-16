@@ -16,7 +16,7 @@
 默认从当前用户环境复制：
 
 - Codex 配置：`$env:CODEX_HOME`，不存在时使用 `%USERPROFILE%\.codex`
-- CodexElves 设置：`%APPDATA%\CodexElves\settings.json`
+- Elves / Harness 设置：`%USERPROFILE%\.codex-session-delete\settings.json`，显式设置 `ELVES_STATE_DIR` 时使用该目录。
 
 ```powershell
 .\scripts\dev-codex-real-smoke.ps1
@@ -40,7 +40,7 @@
 - `-ExtraScenarioJson '<json>'`：从命令行临时追加测试场景。
 - `-ListScenarios`：列出最终可用场景，不启动 helper，也不发起真实调用。
 - `-SourceCodexHome <path>`：显式指定要复制的 Codex 配置目录。
-- `-SourceSettingsPath <path>`：显式指定要复制的 CodexElves `settings.json`。
+- `-SourceSettingsPath <path>`：显式指定要复制的 Elves `settings.json`。
 
 脚本会拒绝使用 `-ReservedProxyPorts` 中的端口，并在临时 `config.toml` 或复制出的 `settings.json` 中发现 `127.0.0.1:<reserved>`、`localhost:<reserved>` 或 `[::1]:<reserved>` 时直接失败。
 
@@ -141,7 +141,7 @@ temp/dev-codex-smoke-run/<timestamp>/
 - `codex-*.last.txt`：最终回答。
 - `helper-diagnostic.log`：协议代理诊断日志。
 - `codex-home/config.toml`：临时 Codex 配置，应该指向 `http://127.0.0.1:<port>/v1`。
-- `settings/settings.json`：复制出来的真实 CodexElves 配置。
+- `settings/settings.json`：复制出来的真实 Elves 配置。
 
 判断通过的关键点：
 
@@ -156,8 +156,8 @@ temp/dev-codex-smoke-run/<timestamp>/
 
 ```powershell
 cargo fmt
-cargo test -p codex-elves-core --test protocol_proxy -- --test-threads=1
-cargo test -p codex-elves-core --test launcher
+cargo test -p elves-core --test protocol_proxy -- --test-threads=1
+cargo test -p elves-core --test launcher
 git diff --check
 ```
 

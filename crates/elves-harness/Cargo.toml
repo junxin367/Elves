@@ -1,0 +1,63 @@
+[package]
+name = "elves-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+elves-core = { path = "../elves-core" }
+elves-data = { path = "../elves-data" }
+aes-gcm.workspace = true
+anyhow.workspace = true
+async-trait = "0.1"
+axum = { version = "0.8", features = ["json", "tokio", "http1", "ws"], default-features = false }
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"], default-features = false }
+base64.workspace = true
+calamine = { version = "0.38", default-features = false }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+csv = "1"
+directories.workspace = true
+flate2.workspace = true
+futures-util = "0.3"
+fs2.workspace = true
+if-addrs.workspace = true
+image.workspace = true
+pdf-extract = "0.12"
+reqwest.workspace = true
+ring = "0.17"
+roxmltree = "0.21"
+rustls = { version = "0.23", features = ["ring", "std"], default-features = false }
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tar.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "net"] }
+tokio-tungstenite.workspace = true
+toml.workspace = true
+toml_edit.workspace = true
+uuid.workspace = true
+zip.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_Networking_WinSock",
+  "Win32_Security_Cryptography",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Com",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_JobObjects",
+  "Win32_System_Registry",
+  "Win32_System_Threading",
+  "Win32_UI_Shell",
+  "Win32_UI_Shell_Common",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true

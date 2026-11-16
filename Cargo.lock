@@ -706,120 +706,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "codex-elves-core"
-version = "0.8.0"
-dependencies = [
- "aes-gcm",
- "anyhow",
- "async-trait",
- "axum",
- "axum-server",
- "base64 0.22.1",
- "calamine",
- "chrono",
- "csv",
- "directories",
- "flate2",
- "fs2",
- "futures-util",
- "if-addrs",
- "image",
- "pdf-extract",
- "reqwest 0.12.28",
- "ring",
- "roxmltree",
- "rusqlite",
- "rustls",
- "serde",
- "serde_json",
- "sha2",
- "tar",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-tungstenite 0.26.2",
- "toml 0.8.2",
- "toml_edit 0.22.27",
- "uuid",
- "windows 0.58.0",
- "zip 2.4.2",
-]
-
-[[package]]
-name = "codex-elves-data"
-version = "0.8.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "chrono",
- "codex-elves-core",
- "fs2",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "uuid",
-]
-
-[[package]]
-name = "codex-elves-launcher"
-version = "0.8.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "codex-elves-core",
- "codex-elves-data",
- "directories",
- "serde_json",
- "tokio",
- "winresource",
-]
-
-[[package]]
-name = "codex-elves-manager"
-version = "0.8.0"
-dependencies = [
- "anyhow",
- "codex-elves-core",
- "codex-elves-data",
- "directories",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "codex-elves-remote"
-version = "0.8.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "codex-elves-core",
- "codex-elves-manager",
- "directories",
- "flate2",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha2",
- "tauri",
- "tauri-build",
- "tauri-plugin-single-instance",
- "tempfile",
- "tokio",
- "url",
- "uuid",
- "webview2-com",
- "windows 0.61.3",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "color_quant"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1306,6 +1192,131 @@ name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
+
+[[package]]
+name = "elves"
+version = "0.8.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "directories",
+ "elves-core",
+ "elves-harness",
+ "flate2",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-single-instance",
+ "tempfile",
+ "tokio",
+ "url",
+ "uuid",
+ "webview2-com",
+ "windows 0.61.3",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "elves-core"
+version = "0.8.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "async-trait",
+ "axum",
+ "axum-server",
+ "base64 0.22.1",
+ "calamine",
+ "chrono",
+ "csv",
+ "directories",
+ "flate2",
+ "fs2",
+ "futures-util",
+ "if-addrs",
+ "image",
+ "pdf-extract",
+ "reqwest 0.12.28",
+ "ring",
+ "roxmltree",
+ "rusqlite",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "toml 0.8.2",
+ "toml_edit 0.22.27",
+ "uuid",
+ "windows 0.58.0",
+ "zip 2.4.2",
+]
+
+[[package]]
+name = "elves-data"
+version = "0.8.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "elves-core",
+ "fs2",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
+name = "elves-harness"
+version = "0.8.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "async-trait",
+ "axum",
+ "axum-server",
+ "base64 0.22.1",
+ "calamine",
+ "chrono",
+ "csv",
+ "directories",
+ "elves-core",
+ "elves-data",
+ "flate2",
+ "fs2",
+ "futures-util",
+ "if-addrs",
+ "image",
+ "pdf-extract",
+ "reqwest 0.12.28",
+ "ring",
+ "roxmltree",
+ "rusqlite",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "toml 0.8.2",
+ "toml_edit 0.22.27",
+ "uuid",
+ "windows 0.58.0",
+ "zip 2.4.2",
+]
 
 [[package]]
 name = "embed-resource"
@@ -6227,16 +6238,6 @@ checksum = "cb5a765337c50e9ec252c2069be9bf91c7df47afb103b642ba3a53bf8101be97"
 dependencies = [
  "cfg-if",
  "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "winresource"
-version = "0.1.31"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0986a8b1d586b7d3e4fe3d9ea39fb451ae22869dcea4aa109d287a374d866087"
-dependencies = [
- "toml 1.1.2+spec-1.1.0",
- "version_check",
 ]
 
 [[package]]

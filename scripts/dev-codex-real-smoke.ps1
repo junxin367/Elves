@@ -141,13 +141,9 @@ function Resolve-DefaultSettingsPath {
     if (-not [string]::IsNullOrWhiteSpace($SourceSettingsPath)) {
         return $SourceSettingsPath
     }
-    if (-not [string]::IsNullOrWhiteSpace($env:APPDATA)) {
-        $candidate = Join-Path $env:APPDATA "CodexElves\settings.json"
-        if (Test-Path -LiteralPath $candidate) {
-            return $candidate
-        }
-    }
-    return Join-Path $env:USERPROFILE "AppData\Roaming\CodexElves\settings.json"
+    # 更名后继续使用 Harness 的既有状态目录，不因品牌变化读取不存在的新配置。
+    $stateDirectory = if ($env:ELVES_STATE_DIR) { $env:ELVES_STATE_DIR } else { Join-Path $env:USERPROFILE ".codex-session-delete" }
+    return Join-Path $stateDirectory "settings.json"
 }
 
 function Copy-PathIfExists {
@@ -253,11 +249,11 @@ function Write-HelperProject {
 
     $srcDir = Join-Path $HelperDir "src"
     New-Item -ItemType Directory -Force -Path $srcDir | Out-Null
-    $corePath = (Resolve-Path -LiteralPath (Join-Path $RepoRoot "crates\codex-elves-core")).Path
+    $corePath = (Resolve-Path -LiteralPath (Join-Path $RepoRoot "crates\elves-core")).Path
     $corePath = $corePath.Replace("\", "/")
     @"
 [package]
-name = "codex-elves-dev-helper-smoke"
+name = "elves-dev-helper-smoke"
 version = "0.1.0"
 edition = "2024"
 
@@ -265,14 +261,14 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
-codex-elves-core = { path = "$corePath" }
+elves-core = { path = "$corePath" }
 tokio = { version = "1", features = ["full"] }
 "@ | Set-Content -LiteralPath (Join-Path $HelperDir "Cargo.toml") -Encoding UTF8
 
     @'
 use std::path::PathBuf;
 
-use codex_elves_core::launcher::LaunchHooks;
+use elves_core::settings::SettingsStore;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -290,11 +286,11 @@ async fn main() -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("missing diagnostic log path"))?,
     );
 
-    codex_elves_core::paths::set_settings_path_for_tests(Some(settings_path));
-    codex_elves_core::diagnostic_log::set_diagnostic_log_path_for_tests(Some(diagnostic_log_path));
+    elves_core::paths::set_settings_path_for_tests(Some(settings_path));
+    elves_core::diagnostic_log::set_diagnostic_log_path_for_tests(Some(diagnostic_log_path));
 
-    let hooks = codex_elves_core::launcher::DefaultLaunchHooks::default();
-    hooks.start_helper(port).await?;
+    let settings = SettingsStore::default().load()?;
+    let _runtime = elves_core::protocol_server::start_on_port(&settings, port).await?;
     println!("dev helper listening http://127.0.0.1:{port}/v1");
     std::future::pending::<()>().await;
     Ok(())
@@ -638,7 +634,7 @@ if (-not $SkipBuild) {
     }
 }
 
-$helperExe = Join-Path $helperDir "target\debug\codex-elves-dev-helper-smoke.exe"
+$helperExe = Join-Path $helperDir "target\debug\elves-dev-helper-smoke.exe"
 if (-not (Test-Path -LiteralPath $helperExe)) {
     throw "helper executable not found: $helperExe"
 }

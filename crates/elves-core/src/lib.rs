@@ -1,0 +1,69 @@
+mod anthropic_images;
+pub mod app_paths;
+pub mod assets;
+pub mod ccs_import;
+pub mod cli_wrapper;
+pub mod codex_home;
+pub mod codex_sqlite;
+mod compaction_cache;
+pub mod continue_thinking;
+pub mod diagnostic_log;
+pub mod env_conflicts;
+pub mod http_client;
+mod image_generation;
+pub mod lan_proxy;
+pub mod layered_compaction;
+pub mod local_proxy_service;
+mod log_limits;
+pub mod model_capabilities;
+pub mod model_catalog;
+pub mod models;
+pub mod paths;
+pub mod plugin_marketplace;
+pub mod ports;
+pub mod process;
+pub mod prompt_optimize;
+pub mod protocol_proxy;
+pub mod protocol_server;
+pub mod proxy;
+pub mod proxy_log;
+pub mod relay_config;
+pub mod relay_rotation;
+pub mod relay_switch;
+pub mod remote_ssh;
+pub mod request_headers;
+pub mod responses_websocket;
+pub mod responses_websocket_bridge;
+mod responses_websocket_checkpoint;
+pub mod session_transport;
+pub mod settings;
+pub mod tool_runtime;
+pub mod upstream_worktree;
+pub mod version;
+#[cfg(windows)]
+pub mod windows_integration;
+
+#[cfg(windows)]
+pub fn windows_create_no_window() -> u32 {
+    windows_integration::CREATE_NO_WINDOW
+}
+
+#[cfg(windows)]
+pub fn windows_create_hidden_process() -> u32 {
+    windows_integration::HIDDEN_PROCESS_FLAGS
+}
+
+#[cfg(not(windows))]
+pub fn windows_create_hidden_process() -> u32 {
+    0
+}
+
+#[cfg(windows)]
+pub fn windows_open_url(url: &str) -> anyhow::Result<()> {
+    windows_integration::open_url(url)
+}
+
+#[cfg(windows)]
+pub fn windows_activate_process_window(process_id: u32) -> bool {
+    windows_integration::activate_process_window(process_id)
+}

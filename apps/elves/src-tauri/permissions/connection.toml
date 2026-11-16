@@ -1,0 +1,29 @@
+[[permission]]
+identifier = "remote-connection"
+description = "Elves 内置启动页可读取状态并重试本机 Harness。"
+commands.allow = ["client_startup_state", "client_retry_startup"]
+
+[[permission]]
+identifier = "remote-appearance"
+description = "当前服务仅可同步经过校验的原生应用顶栏 RGB 配色，不可操作窗口或修改连接设置。"
+commands.allow = ["client_titlebar_theme"]
+
+[[permission]]
+identifier = "remote-taskbar-badge"
+description = "当前服务的主窗口仅可同步未读会话数字角标，不可操作窗口或修改连接设置。"
+commands.allow = ["client_unread_badge"]
+
+[[permission]]
+identifier = "remote-resource-cache"
+description = "当前服务只可查看/检查公开网页资源缓存并告知前台忙碌状态，不可改变服务地址或读取设备凭据。"
+commands.allow = ["client_cache_status", "client_cache_refresh", "client_cache_activity"]
+
+[[permission]]
+identifier = "remote-session-window"
+description = "当前服务可打开同来源的会话或文件预览窗口，不可指定任意地址、读取本机文件或控制其他窗口。"
+commands.allow = ["client_open_session_window"]
+
+[[permission]]
+identifier = "remote-local-inputs"
+description = "当前前台会话可读取系统选择器选中的文件/文件夹或文件剪贴板，不接受网页提供本机路径。"
+commands.allow = ["client_choose_inputs", "client_paste_inputs"]

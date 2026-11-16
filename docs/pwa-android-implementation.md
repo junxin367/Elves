@@ -10,7 +10,7 @@
 | --- | --- |
 | `schemaVersion` | 清单结构版本，目前为 `1` |
 | `minShellVersion` | 加载这些资源所需的最低原生 Shell 版本 |
-| `revision` | 服务端网页资源修订号，来自 `assets/remote-access/resource-revision.txt` |
+| `revision` | 服务端网页资源修订号，来自 `assets/harness/resource-revision.txt` |
 | `version` | 根据有序资源条目的路径、Content-Type、大小和 SHA-256 计算的整体摘要 |
 | `files` | 按路径排序的静态网页文件清单，含路径、Content-Type、字节数和 SHA-256 |
 
@@ -45,11 +45,11 @@ Android 容器不注册网页 Service Worker，以免原生快照和网页缓存
 
 ## 代码位置
 
-- 服务端资源清单、静态资源路由和资源修订号：`crates/codex-elves-core/src/remote_access.rs`、`assets/remote-access/resource-revision.txt`
-- Android 内置资源清单和资源路径表：`apps/codex-elves-android/app/build.gradle`
-- Android 快照验证、下载、缓存和回退：`apps/codex-elves-android/app/src/main/java/com/junxin367/codexelves/ResourceManifest.java`、`ResourceStore.java`、`ResourceStatePolicy.java`
-- Android WebView 静态路径拦截：`apps/codex-elves-android/app/src/main/java/com/junxin367/codexelves/MainActivity.java`
-- 普通网页 Service Worker 与 PWA 行为：`assets/remote-access/pwa.js`、`assets/remote-access/sw.js`
+- 服务端资源清单、静态资源路由和资源修订号：`crates/elves-harness/src/lib.rs`、`assets/harness/resource-revision.txt`
+- Android 内置资源清单和资源路径表：`apps/elves-android/app/build.gradle`
+- Android 快照验证、下载、缓存和回退：`apps/elves-android/app/src/main/java/com/junxin367/codexelves/ResourceManifest.java`、`ResourceStore.java`、`ResourceStatePolicy.java`
+- Android WebView 静态路径拦截：`apps/elves-android/app/src/main/java/com/junxin367/codexelves/MainActivity.java`
+- 普通网页 Service Worker 与 PWA 行为：`assets/harness/pwa.js`、`assets/harness/sw.js`
 
 ## 历史验证
 

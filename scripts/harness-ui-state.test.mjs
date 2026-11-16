@@ -1,0 +1,15212 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import rawVm from "node:vm";
+import { loadHarnessAppSource } from "./harness-source.mjs";
+import { createSidebarPreferenceStore } from "../assets/harness/recovery-store.js";
+import { createSelectComponent } from "../assets/harness/ui/select.js";
+import { mountInstancePermissions, permissionLabel, permissionModeKnown, permissionOptions } from "../assets/harness/permissions.js";
+import { menuHorizontalLeft } from "../assets/harness/ui/position.js";
+import { localFileReference } from "../assets/harness/file-reference.js";
+import { copyLocalInput, isLocalInput, localInputBridge, validateLocalInputs } from "../assets/harness/local-inputs.js";
+import { captureTransferInputs, hasTransferFiles, readTransferInputs } from "../assets/harness/transfer-inputs.js";
+import { marked, Renderer } from "../assets/harness/vendor/marked.esm.js";
+import { defaultSharedSettings } from "../assets/harness/features/settings/shared-state.js";
+
+async function navigationFixture(native = false) {
+  const source = await loadHarnessAppSource();
+  const node = (tag, className = "") => ({
+    tag, className, children: [], attributes: {}, dataset: {}, hidden: false, isConnected: true,
+    classList: {
+      values: new Set(),
+      add(value) { this.values.add(value); },
+      toggle(value, enabled) { enabled ? this.values.add(value) : this.values.delete(value); },
+    },
+    setAttribute(name, value) { this.attributes[name] = value; },
+    removeAttribute(name) { delete this.attributes[name]; },
+    append(...children) { this.children.push(...children); },
+    before(value) { this.insertedBefore = value; },
+  });
+  const messages = { scrollTop: 320, isConnected: true };
+  const workspace = node("div", "workspace");
+  workspace.querySelector = selector => selector === "#messages" ? messages : null;
+  workspace.draft = "保留当前输入";
+  const opened = [], visibility = [], animation = [], callbacks = { settings: 0, logout: 0, disposed: 0 };
+  const openPage = page => opened.push(page);
+  openPage.setVisible = value => visibility.push(value);
+  openPage.dispose = () => callbacks.disposed++;
+  const context = {
+    workspace, openPage, element: node, icon: name => ({ name }),
+    button: (text, label, action, className) => Object.assign(node("button", className), { label, action }),
+    closePopup() {}, togglePopup: control => { context.popup = control; }, openPopup() {},
+    requestAnimationFrame: callback => animation.push(callback),
+    openSettings: () => callbacks.settings++, logout: () => callbacks.logout++,
+    ...(native ? { __ELVES_CLIENT__: { open() {} } } : {}),
+  };
+  rawVm.createContext(context);
+  rawVm.runInContext(source.moduleText("features/main-navigation.js")
+    + "\nglobalThis.navigation = mountMainNavigation({ workspace, openPage, openSettings, logout });", context);
+  const [navigation] = context.navigation.shell.children;
+  return { context, workspace, messages, callbacks, opened, visibility, animation,
+    buttons: navigation.children[0].children, settings: navigation.children[1].children[0] };
+}
+
+test("统一主导航固定排序，切换后保留当前会话草稿、节点与阅读位置", async () => {
+  const fixture = await navigationFixture();
+  assert.deepEqual(Array.from(fixture.buttons, button => button.label), ["会话", "代理设置", "会话管理", "远程会话"]);
+  fixture.buttons[1].action();
+  assert.equal(fixture.workspace.hidden, true);
+  assert.equal(fixture.workspace.inert, true);
+  fixture.buttons[2].action();
+  assert.deepEqual(fixture.opened, ["proxy", "sessions"]);
+  assert.equal(fixture.buttons[2].attributes["aria-current"], "page");
+  fixture.messages.scrollTop = 0;
+  fixture.buttons[0].action();
+  fixture.animation.forEach(callback => callback());
+  assert.equal(fixture.workspace.hidden, false);
+  assert.equal(fixture.workspace.inert, false);
+  assert.equal(fixture.workspace.draft, "保留当前输入");
+  assert.equal(fixture.messages.scrollTop, 320);
+  assert.equal(fixture.context.navigation.shell.children[1], fixture.workspace);
+  assert.deepEqual(fixture.visibility, [true, true, false]);
+  rawVm.runInContext("disposeMainNavigation(); disposeMainNavigation();", fixture.context);
+  assert.equal(fixture.callbacks.disposed, 1);
+});
+
+test("导航底部设置按客户端区分：Windows 直接打开，网页仅有设置和退出", async () => {
+  const web = await navigationFixture();
+  web.settings.action();
+  assert.equal(web.context.popup, web.settings);
+  assert.deepEqual(Array.from(web.settings.menuOptions, entry => entry.label), ["设置", "退出"]);
+  web.settings.menuOptions[0].action();
+  web.settings.menuOptions[1].action();
+  assert.deepEqual(web.callbacks, { settings: 1, logout: 1, disposed: 0 });
+  const native = await navigationFixture(true);
+  native.settings.action();
+  assert.equal(native.callbacks.settings, 1);
+  assert.equal(native.settings.menuOptions, undefined);
+  assert.equal(native.context.popup, undefined);
+});
+
+async function instanceOptionUiFixture(settings, extraSettings, backend = "codex", capabilityError = "") {
+  const module = await readFile(new URL("../assets/harness/features/settings/instance-settings.js", import.meta.url), "utf8");
+  const start = module.indexOf("  function renderExtraSettings()");
+  const end = module.indexOf("  function render()", start);
+  assert.ok(start >= 0 && end > start);
+  const element = (tag, className = "", text = "") => ({
+    tag, className, textContent: String(text), children: [], attributes: {}, isConnected: true,
+    append(...children) { this.children.push(...children); },
+    setAttribute(key, value) { this.attributes[key] = String(value); },
+    removeAttribute(key) { delete this.attributes[key]; },
+    blur() { this.blurred = true; },
+  });
+  const selections = [], saved = [];
+  const context = {
+    record: { backend, settings, extraSettings, capabilityError }, name: "general", selected: "codex:local",
+    element, content: element("div"), controls: new Set(), message: "",
+    inherit: { value: "", label: "使用原生默认" },
+    booleanOptions: [{ value: "", label: "使用原生默认" }, { value: "true", label: "开启" }, { value: "false", label: "关闭" }],
+    boolValue: value => value == null ? "" : String(value),
+    effortLabels: { xhigh: "极高" }, fieldCopy: (label, description) => ({ label, description }),
+    section(parent, label) { const card = element("section"); card.label = label; parent.append(card); return card; },
+    addSelect(card, key, label, description, options, value, transform) {
+      selections.push({ card, key, label, description, options, value, transform });
+    },
+    save: value => saved.push(JSON.parse(JSON.stringify(value))), sync() {},
+  };
+  rawVm.createContext(context);
+  rawVm.runInContext(module.slice(start, end), context);
+  context.renderExtraSettings();
+  return { context, selections, saved, module };
+}
+
+test("实例额外设置使用原生默认选项，只读诊断不创建可写控件", async () => {
+  const options = [
+    { id: "generateMemories", kind: "boolean", group: "记忆", label: "生成记忆", description: "测试", readOnly: false },
+    { id: "reasoningSummary", kind: "enum", group: "输出", label: "思考摘要", description: "测试",
+      readOnly: false, options: [{ value: "detailed", label: "详细" }] },
+    { id: "legacyJsRepl", kind: "boolean", group: "诊断", label: "旧开关", description: "", readOnly: true,
+      readOnlyReason: "原生已移除", options: [] },
+    { id: "invalidValue", kind: "enum", group: "诊断", label: "无效配置", description: "", readOnly: true,
+      valueInvalid: true, readOnlyReason: "配置值无效", options: [] },
+  ];
+  const fixture = await instanceOptionUiFixture(
+    { generateMemories: null, reasoningSummary: "detailed", legacyJsRepl: true, invalidValue: null },
+    options, "claude", "配置字段校验超时");
+  assert.ok(fixture.context.content.children.some(node => node.textContent.includes("配置字段校验超时")),
+    "即使旧功能能力可用，Claude 额外字段校验失败的实际原因仍须显示");
+  assert.equal(fixture.selections.length, 2);
+  assert.equal(fixture.selections[0].value, "");
+  assert.equal(fixture.selections[0].options[0].label, "使用原生默认");
+  assert.equal(fixture.selections[1].transform(""), null);
+  assert.equal(fixture.selections[1].transform("detailed"), "detailed");
+  const diagnostic = fixture.context.content.children.find(row => row.label === "诊断");
+  assert.equal(diagnostic.children[0].children[1].textContent, "配置值：true");
+  assert.equal(diagnostic.children[0].children[0].description, "原生已移除");
+  assert.equal(diagnostic.children[1].children[1].textContent, "配置值无效");
+  assert.equal(fixture.context.controls.size, 0);
+});
+
+test("实例额外数值设置拒绝非法输入和浏览器 badInput，留空才恢复原生默认", async () => {
+  const fixture = await instanceOptionUiFixture({ maxConcurrentThreads: 12 }, [
+    { id: "maxConcurrentThreads", kind: "integer", group: "并发", label: "子智能体并发上限", description: "测试",
+      readOnly: false, min: 1, max: 2147483647 },
+  ]);
+  const input = [...fixture.context.controls][0];
+  assert.equal(input.value, "12");
+  for (const value of ["0", "1.5", "2147483648"]) {
+    input.value = value; input.onchange();
+    assert.equal(input.value, "12");
+  }
+  input.validity = { badInput: true }; input.value = ""; input.onchange();
+  assert.equal(fixture.saved.length, 0, "浏览器将非法数字显示为空时不能删除已有配置");
+  assert.equal(input.attributes["aria-invalid"], "true");
+  input.oninput(); assert.equal(input.attributes["aria-invalid"], undefined);
+  input.validity.badInput = false; input.value = "24"; input.onchange();
+  assert.deepEqual(fixture.saved, [{ maxConcurrentThreads: 24 }]);
+  input.value = ""; input.onchange();
+  assert.deepEqual(fixture.saved[1], { maxConcurrentThreads: null });
+  fixture.context.selected = "codex:other"; input.value = "48"; input.onchange();
+  assert.equal(fixture.saved.length, 2, "旧控件的迟到失焦不能保存到新实例");
+  fixture.context.selected = "codex:local"; fixture.context.record = { ...fixture.context.record };
+  input.value = "48"; input.onchange();
+  assert.equal(fixture.saved.length, 2, "重新读取后不能借用新记录的版本保存旧控件");
+  assert.equal(fixture.context.content.children[0].children[0].children[1].className, "appearance-number");
+});
+
+test("实例额外设置拒绝无法确认的返回类型，并兼容未提供额外字段的旧服务", async () => {
+  const fixture = await instanceOptionUiFixture({}, []);
+  const start = fixture.module.indexOf("  function checkedResult(");
+  const end = fixture.module.indexOf("  async function read()", start);
+  const context = { name: "general", currentInstance: () => ({ backend: "claude" }) };
+  rawVm.createContext(context);
+  rawVm.runInContext(fixture.module.slice(start, end), context);
+  const result = {
+    ok: true, instanceId: "claude-fixture", backend: "claude", revision: "r", preferenceRevision: "p",
+    readOnly: false, settings: { awaySummaryEnabled: null, promptSuggestionEnabled: null, autoCompactWindow: null,
+      syncClaudeAiSkills: true },
+  };
+  assert.equal(context.checkedResult(result, "claude-fixture"), result);
+  result.extraSettings = [{ id: "syncClaudeAiSkills", kind: "boolean", label: "同步 Skills",
+    description: "测试", group: "同步", readOnly: false, options: [] }];
+  assert.equal(context.checkedResult(result, "claude-fixture"), result);
+  result.settings.syncClaudeAiSkills = "true";
+  assert.throws(() => context.checkedResult(result, "claude-fixture"), /额外设置字段无法确认/);
+  result.settings.syncClaudeAiSkills = true;
+  result.extraSettings[0].readOnly = true;
+  assert.throws(() => context.checkedResult(result, "claude-fixture"), /额外设置字段无法确认/);
+});
+
+function storage() {
+  const records = new Map();
+  return {
+    records,
+    getItem: key => records.get(key) ?? null,
+    setItem: (key, value) => records.set(key, value),
+  };
+}
+
+test("侧栏选择在重建客户端后恢复，并按设备授权隔离", () => {
+  const disk = storage(), first = createSidebarPreferenceStore({ storage: disk });
+  first.write('["device-a",1]', { mode: "project", chats: "manual" });
+  first.write('["device-b",1]', { mode: "list" });
+  const reopened = createSidebarPreferenceStore({ storage: disk });
+  assert.deepEqual(reopened.read('["device-a",1]'), { mode: "project", chats: "manual" });
+  assert.deepEqual(reopened.read('["device-b",1]'), { mode: "list" });
+  assert.deepEqual(reopened.read('["device-a",2]'), {});
+});
+
+test("两个独立客户端的选择不会通过共享桌面配置互相覆盖", () => {
+  const a = createSidebarPreferenceStore({ storage: storage() });
+  const b = createSidebarPreferenceStore({ storage: storage() });
+  a.write("same-desktop", { mode: "project", pinned: "manual" });
+  b.write("same-desktop", { mode: "list", pinned: "updated_at" });
+  assert.deepEqual(a.read("same-desktop"), { mode: "project", pinned: "manual" });
+  assert.deepEqual(b.read("same-desktop"), { mode: "list", pinned: "updated_at" });
+});
+
+test("同一客户端的多页局部修改保留其它已保存选项", () => {
+  const disk = storage();
+  const a = createSidebarPreferenceStore({ storage: disk });
+  const b = createSidebarPreferenceStore({ storage: disk });
+  a.write("device", { mode: "project" });
+  b.write("device", { chats: "manual" });
+  a.write("device", { pinned: "updated_at" });
+  assert.deepEqual(b.read("device"), { mode: "project", chats: "manual", pinned: "updated_at" });
+});
+
+test("损坏或未来版本偏好不会当成有效数据，未知字段不进入保存结果", () => {
+  const disk = storage(), store = createSidebarPreferenceStore({ storage: disk });
+  store.write("device", { mode: "list", unknown: "not-a-preference", projects: "invalid" });
+  assert.deepEqual(store.read("device"), { mode: "list" });
+  const key = [...disk.records.keys()][0];
+  disk.records.set(key, "{broken");
+  assert.deepEqual(store.read("device"), {});
+  disk.records.set(key, JSON.stringify({ version: 999, preferences: { mode: "project" } }));
+  assert.deepEqual(store.read("device"), {});
+  assert.throws(() => store.write("", { mode: "project" }), /授权范围/);
+});
+
+test("存储事件只匹配当前授权范围", () => {
+  const disk = storage(), store = createSidebarPreferenceStore({ storage: disk });
+  store.write("device-a", { mode: "project" });
+  const key = [...disk.records.keys()][0];
+  assert.equal(store.ownsStorageEvent("device-a", { key }), true);
+  assert.equal(store.ownsStorageEvent("device-b", { key }), false);
+  assert.equal(store.ownsStorageEvent(null, { key }), false);
+});
+
+test("最近置顶分组显隐保存布尔值，与排序和设备授权分别隔离", () => {
+  const disk = storage(), store = createSidebarPreferenceStore({ storage: disk });
+  store.write("device-a", { showPinned: true, pinned: "manual" });
+  store.write("device-a", { mode: "list" });
+  assert.deepEqual(store.read("device-a"), { mode: "list", pinned: "manual", showPinned: true });
+  assert.deepEqual(store.read("device-b"), {});
+  store.write("device-a", { showPinned: false });
+  assert.deepEqual(createSidebarPreferenceStore({ storage: disk }).read("device-a"),
+    { mode: "list", pinned: "manual", showPinned: false });
+  store.write("device-a", { showPinned: "true" });
+  assert.equal(store.read("device-a").showPinned, false, "字符串不能被误当作已勾选");
+});
+
+// 远程网页已拆分为 app.js 入口与 ui/core/features 模块；app 为全部模块的合并文本，仅用于整体检索。
+const remoteSource = await loadHarnessAppSource();
+const sharedFixtureServers = new WeakMap();
+function sharedFixtureServer(context) {
+  const key = context.localStorage || context.sharedServer || context.sidebarPreferenceStore || context;
+  const created = !sharedFixtureServers.has(key);
+  if (created) sharedFixtureServers.set(key, defaultSharedSettings());
+  const settings = sharedFixtureServers.get(key);
+  const scope = context.privateInputScope?.(context.session);
+  if (!context.sharedFixtureMigrated) {
+    context.sharedFixtureMigrated = true;
+    if (created) Object.assign(settings.sidebar, context.sidebarFilters || {}, context.sidebarPreferenceStore?.read(scope) || {});
+  }
+  // 新建页用例模拟服务端首次迁移旧记录，后续通过同一个模拟服务共享，不再向浏览器写偏好。
+  if (context.localStorage?.records) for (const [name, text] of context.localStorage.records) {
+    const prefix = `codex-elves-new-chat-settings:${scope}`, modelPrefix = `codex-elves-new-chat-model:${scope}`;
+    if (name.startsWith(prefix)) {
+      const id = name.slice(prefix.length).replace(/^:/, "") || "codex:local";
+      try { const value = JSON.parse(text); if (value?.version === 1) settings.newChat[id] ??= {
+        model: value.model || "", reasoningEffort: value.reasoningEffort || "", permissionMode: value.permissionMode || "" }; } catch {}
+    } else if (name.startsWith(modelPrefix)) {
+      const id = name.slice(modelPrefix.length).replace(/^:/, "") || "codex:local";
+      settings.newChat[id] ??= { model: text };
+    }
+  }
+  return settings;
+}
+function installSharedFixture(context, code) {
+  if (!/\bsharedSettingsState\b|\bsaveSharedSettings\(/.test(code)) return;
+  context.sharedSettingsState ??= {
+    ready: true, saving: false,
+    get scope() { return context.privateInputScope?.(context.session); },
+    get settings() { return sharedFixtureServer(context); }
+  };
+  context.saveSharedSettings ??= patch => {
+    if (context.sharedSaveError || context.session?.readOnly || context.connected === false)
+      return Promise.reject(new Error(context.sharedSaveError || "共享设置需要联网且可写的授权。"));
+    const settings = sharedFixtureServer(context);
+    function merge(target, patch) {
+      for (const [key, value] of Object.entries(patch)) {
+        if (value && typeof value === "object" && !Array.isArray(value)) {
+          if (!target[key] || typeof target[key] !== "object") target[key] = {};
+          merge(target[key], value);
+        } else target[key] = value;
+      }
+    }
+    merge(settings, patch);
+    if (context.appearance) for (const key of ["conversationWidth", "projectThreadLimit", "sessionTypes", "sessionInstances", "sessionFilter"])
+      if (Object.hasOwn(patch, key)) context.appearance[key] = structuredClone(settings[key]);
+    if (patch.sidebar) {
+      context.sidebarPreferenceScope = null;
+      context.restoreSidebarPreferences?.();
+    }
+    context.renderSidebar?.();
+    return Promise.resolve({ settings });
+  };
+}
+const nodeVm = remoteSource.wireVm({
+  ...rawVm,
+  runInContext(code, context, options) {
+    installSharedFixture(context, String(code));
+    return rawVm.runInContext(code, context, options);
+  },
+});
+const app = remoteSource.corpus;
+const currentModelCatalogCacheVersion = Number(app.match(/const modelCatalogCacheVersion = (\d+)/)[1]);
+const channels = await readFile(new URL("../assets/harness/channels.js", import.meta.url), "utf8");
+const diagnostics = await readFile(new URL("../assets/harness/diagnostics.js", import.meta.url), "utf8");
+const platform = await readFile(new URL("../assets/harness/platform.js", import.meta.url), "utf8");
+const eventsClient = await readFile(new URL("../assets/harness/events-client.js", import.meta.url), "utf8");
+const sessionTools = await readFile(new URL("../assets/harness/session-tools.js", import.meta.url), "utf8");
+const sessionFiles = await readFile(new URL("../assets/harness/session-files.js", import.meta.url), "utf8");
+const sessionMenuSource = await readFile(new URL("../assets/harness/session-menu.js", import.meta.url), "utf8");
+const workspaceOpenInSource = await readFile(new URL("../assets/harness/features/session/open-in.js", import.meta.url), "utf8");
+const popupSource = await readFile(new URL("../assets/harness/ui/popup.js", import.meta.url), "utf8");
+const markdownRendererSource = await readFile(new URL("../assets/harness/markdown-renderer.js", import.meta.url), "utf8");
+const devServerSource = await readFile(new URL("./dev-harness.mjs", import.meta.url), "utf8");
+const markdownSource = await readFile(new URL("../assets/harness/markdown.js", import.meta.url), "utf8");
+
+test("正文文件引用接受相对和绝对路径，纯文件名及文件名行号保持普通内容", () => {
+  for (const value of ["README.md", "app.ts", "app.ts:12", "README.md#L10", "LICENSE", "README%2Emd"])
+    assert.equal(localFileReference(value, true), null, value);
+  for (const [value, path, line] of [
+    ["src/app.ts", "src/app.ts", null], ["./README.md", "./README.md", null],
+    ["src\\app.ts:12:3", "src/app.ts", 12], [".\\README.md", "./README.md", null],
+    ["E:\\repo\\app.ts#L9", "E:/repo/app.ts", 9], ["/home/junes/repo/app.ts", "/home/junes/repo/app.ts", null],
+    ["file:///E:/repo/app.ts", "E:/repo/app.ts", null], ["src%2Fapp.ts", "src/app.ts", null]
+  ]) assert.deepEqual(localFileReference(value), { path, name: path.split("/").at(-1), line });
+  for (const value of ["https://example.com/app.ts", "javascript:alert(1)", "file://other-host/app.ts"])
+    assert.equal(localFileReference(value, true), null, value);
+});
+
+test("正文 Markdown 只给有路径的文字、代码和链接添加文件操作，纯文件名无文件菜单元数据", () => {
+  const context = rawVm.createContext({ localFileReference, videoPreviewMarkup: () => "",
+    dependencies: { marked, Renderer, createDOMPurify: () => ({ addHook() {}, sanitize: html => html }) } });
+  rawVm.runInContext(markdownRendererSource.replace(/^import .*;$/gm, "").replace(/^export /gm, "")
+    + "\nglobalThis.fixture = createMarkdownRenderer(dependencies);", context);
+  const plain = context.fixture.markdown("README.md `app.ts:12` [README.md](README.md)");
+  assert.doesNotMatch(plain, /data-local-file-path|local-file-reference/);
+  assert.match(plain, /README\.md/); assert.match(plain, /<code>app\.ts:12<\/code>/);
+  const files = context.fixture.markdown("src/app.ts `./README.md` [app.ts](src/app.ts#L12)");
+  assert.equal((files.match(/data-local-file-path=/g) || []).length, 3);
+  assert.match(files, /data-local-file-path="src\/app\.ts" data-local-file-line="12"/);
+  assert.match(context.fixture.markdown("[README.md](README.md)", [], { fileDocument: true }),
+    /data-local-file-path="README\.md"/, "文件预览文档仍保留其相对文档链接");
+});
+
+test("文件引用绑定忽略旧缓存中的纯文件名，只给真实路径绑定右键和长按", () => {
+  const link = path => ({ dataset: { localFilePath: path }, events: new Map(),
+    addEventListener(name, action) { this.events.set(name, action); } });
+  const links = [link("README.md"), link("app.ts:12"), link("src/app.ts"), link("./README.md")];
+  const context = rawVm.createContext({ localFileReference });
+  rawVm.runInContext(markdownSource.slice(markdownSource.indexOf("export function bindLocalFileReferences("),
+    markdownSource.indexOf('\ndocument.addEventListener("click"')).replace(/^export /, ""), context);
+  context.bindLocalFileReferences({ querySelectorAll: () => links });
+  assert.equal(links[0].events.size, 0); assert.equal(links[1].events.size, 0);
+  for (const value of links.slice(2)) {
+    assert.ok(value.events.has("contextmenu")); assert.ok(value.events.has("pointerdown"));
+  }
+});
+
+test("正文文件菜单固定四项，相对路径预览基于会话 cwd，旧会话不能借用当前身份", () => {
+  const opened = [], copied = [], native = [];
+  const context = nodeVm.createContext({ pageLeaving: false, selectedId: "main",
+    localFileReference,
+    session: { device: { id: "device" } }, thread: { id: "main", cwd: "E:\\repo\\packages\\client", instanceId: "codex:local" },
+    privateInputScope: value => value?.device.id,
+    currentFileBrowserThreadId: () => context.selectedId, copyText: value => copied.push(value),
+    fileOpenInMenu: (path, { getItem }) => ({ disabled: !getItem(), submenu: [],
+      openTarget: target => { if (getItem()) native.push([path, target.target]); } }) });
+  nodeVm.runInContext(sourceSection("function localFileMenuOwner("), context);
+  const actions = context.localFileReferenceActions({ openFile: (...value) => opened.push(value) });
+  const options = actions.getMenuOptions("src/app.ts", 12);
+  assert.deepEqual(Array.from(options, option => option.label), [
+    "打开文件", "在 File Explorer 打开", "打开方式", "复制路径"
+  ]);
+  options[0].action(); options[1].action(); options[3].action();
+  assert.deepEqual(opened, [["E:/repo/packages/client/src/app.ts", 12]]);
+  assert.deepEqual(native, [["src/app.ts", "fileManager"]]); assert.deepEqual(copied, ["src/app.ts"]);
+  actions.openFile("./README.md", null);
+  assert.deepEqual(opened.at(-1), ["E:/repo/packages/client/README.md", null]);
+  actions.openFile("E:\\repo\\packages\\client\\src\\absolute.ts", 4);
+  assert.deepEqual(opened.at(-1), ["E:/repo/packages/client/src/absolute.ts", 4]);
+  context.selectedId = "other";
+  options[0].action(); options[1].action(); options[3].action();
+  assert.equal(opened.length, 3); assert.equal(native.length, 1); assert.equal(copied.length, 1);
+});
+
+function localFileBrowserHarness({ android = false, desktop = true, nativeClient = false } = {}) {
+  const opened = [], requests = [], notices = [];
+  const context = nodeVm.createContext({ nativeConnectionVersion: 1,
+    URL, location: new URL("http://127.0.0.1:45222/#thread=thread-1"),
+    selectedId: "thread-1", relatedSessionView: null, creating: false, workspaceSidePanel: false,
+    isAndroidContainer: () => android, matchMedia: () => ({ matches: desktop }),
+    window: { ...(nativeClient ? { __TAURI__: { core: { invoke() {} } } } : {}),
+      open: (...args) => { opened.push(["web", ...args]); return {}; } },
+    openAndroidBrowser: async url => { opened.push(["android", url]); },
+    api: async (path, payload) => { requests.push([path, JSON.parse(JSON.stringify(payload))]); return { ok: true }; },
+    notice: (...args) => notices.push(args),
+  });
+  nodeVm.runInContext(sourceSection("function currentFileBrowserThreadId(", "function installLocalFileOpenListener("), context);
+  return { context, opened, requests, notices };
+}
+
+test("PC 文件浏览器菜单调用本机默认浏览器接口，不构造 HTTP 预览地址或打开内置窗口", async () => {
+  const h = localFileBrowserHarness();
+  await h.context.openLocalFileInBrowser("docs/文件 #1.html");
+  assert.deepEqual(h.requests, [["/api/workspace/open-browser", {
+    threadId: "thread-1", path: "docs/文件 #1.html"
+  }]]);
+  assert.deepEqual(h.opened, []);
+  assert.deepEqual(h.notices, []);
+});
+
+test("窄版 Windows 客户端和 PC 侧边会话仍调用系统默认浏览器，侧边使用原项目身份", async () => {
+  const h = localFileBrowserHarness({ desktop: false, nativeClient: true });
+  await h.context.openLocalFileInBrowser("AGENTS.md");
+  assert.equal(h.requests.length, 1);
+  const side = localFileBrowserHarness({ desktop: false });
+  side.context.workspaceSidePanel = true;
+  side.context.relatedSessionView = { kind: "side", openedFromThreadId: "parent-thread" };
+  await side.context.openLocalFileInBrowser("README.md");
+  assert.equal(side.requests[0][1].threadId, "parent-thread");
+  assert.deepEqual(side.opened, []);
+});
+
+test("Android 与手机网页保留原文件打开方式，不请求电脑端默认浏览器", async () => {
+  for (const android of [true, false]) {
+    const h = localFileBrowserHarness({ android, desktop: false });
+    await h.context.openLocalFileInBrowser("docs/index.html");
+    assert.deepEqual(h.requests, []);
+    assert.equal(h.opened[0][0], android ? "android" : "web");
+    assert.equal(new URL(h.opened[0][1]).pathname, "/api/workspace/view/thread-1/docs/index.html");
+    assert.deepEqual(h.notices, []);
+  }
+});
+
+test("PC 原生文件打开失败只提示实际错误，不回退到 HTTP 预览或自动重复打开", async () => {
+  const h = localFileBrowserHarness();
+  h.context.api = async () => { throw new Error("文件不存在或已被删除"); };
+  await h.context.openLocalFileInBrowser("removed.md");
+  assert.deepEqual(h.opened, []);
+  assert.deepEqual(h.notices, [["文件不存在或已被删除", true]]);
+  h.context.selectedId = null;
+  await h.context.openLocalFileInBrowser("AGENTS.md");
+  assert.equal(h.notices.at(-1)[0], "当前会话没有可用的工作区文件");
+});
+
+function clientUnreadBadgeHarness() {
+  const counts = [], requests = [], intervals = [];
+  const context = nodeVm.createContext({ nativeConnectionVersion: 1,
+    AbortController, workspaceSidePanel: false, pageLeaving: false, initialAuthenticationRequired: false,
+    document: { hidden: true }, navigator: { onLine: true },
+    window: { __CODEX_ELVES_UNREAD_BADGE__: { setCount: count => counts.push(count) } },
+    session: { device: { id: "device-a" } }, sidebar: null,
+    privateInputScope: value => value?.device?.id,
+    enabledInstanceIds: () => ["codex:local", "claude:wsl:test"],
+    filterDeletedSidebar() {}, filterSideThreadSidebar() {}, mergeIncompleteSidebar: (_, value) => value,
+    setInterval: (callback, delay) => { intervals.push({ callback, delay }); return intervals.length; },
+    clearInterval() {},
+    api: async (path, payload, _, signal, options) => {
+      assert.equal(path, "/api/read/sidebar");
+      assert.equal(options.resourcePriority, "background");
+      const request = { ...deferred(), payload, signal };
+      requests.push(request);
+      return request.promise;
+    },
+  });
+  nodeVm.runInContext((sourceSection("let clientUn", "function set") + "\n" + sourceSection("function clientUnreadBad", "async function l")
+    + "\n" + sourceSection("function sidebarThreadActive(", "function sidebarTimestamp(")
+    + "\n" + sourceSection("function sidebarAttentionState(")), context);
+  return { context, counts, requests, intervals };
+}
+
+test("独立客户端角标按未读主会话去重，最近/项目/置顶重复与子会话不增加数字", () => {
+  const { context } = clientUnreadBadgeHarness();
+  const main = { id: "codex-a", hasUnreadTurn: true };
+  const value = {
+    recent: [main, { id: "claude-b", hasUnreadTurn: true },
+      { id: "side", hasUnreadTurn: true }, { id: "agent", threadSource: "subagent", hasUnreadTurn: true },
+      { id: "child", parentThreadId: "codex-a", hasUnreadTurn: true },
+      { id: "archived", archived: true, hasUnreadTurn: true },
+      { id: "read", hasUnreadTurn: false, priority: { attentionState: "unread" } }],
+    pinnedThreads: [main],
+    projects: [{ threads: [main, { id: "only-project", hasUnreadTurn: true }] }],
+    sideThreadIds: ["side"],
+  };
+  assert.equal(context.clientUnreadThreadCount(value), 3);
+  value.recent[1].hasUnreadTurn = false;
+  assert.equal(context.clientUnreadThreadCount(value), 2);
+  assert.equal(context.clientUnreadThreadCount(null), 0);
+});
+
+test("任务栏角标按会话栏未读状态计数并排除执行中会话", () => {
+  const { context } = clientUnreadBadgeHarness();
+  const value = { pinnedThreads: [], projects: [], recent: [
+    { id: "idle-unread", hasUnreadTurn: true },
+    { id: "priority-running", hasUnreadTurn: true, priority: { attentionState: "unread", active: true } },
+    { id: "status-running", hasUnreadTurn: true, status: { type: "inProgress" } },
+    { id: "waiting-reply", hasUnreadTurn: true, status: { type: "waiting" } },
+    { id: "side-running", hasUnreadTurn: true, sideThreadAttention: { active: true } },
+    { id: "explicit-idle", hasUnreadTurn: true, status: { type: "active" },
+      priority: { attentionState: "unread", active: false } },
+  ] };
+  assert.equal(context.clientUnreadThreadCount(value), 2, "执行中会话不计入，明确的 idle 优先于旧 status");
+  value.recent[0].priority = { attentionState: "unread", active: true };
+  assert.equal(context.clientUnreadThreadCount(value), 1, "未读会话开始执行后立即减少角标");
+  value.recent[0].priority.active = false;
+  assert.equal(context.clientUnreadThreadCount(value), 2, "执行结束后仍按原未读标记恢复计数");
+});
+
+test("后台角标读取共享请求并合并后续刷新，不更新聊天正文或侧栏对象", async () => {
+  const { context, counts, requests } = clientUnreadBadgeHarness();
+  const original = { recent: [], projects: [], pinnedThreads: [] };
+  context.sidebar = original;
+  const first = context.refreshClientUnreadBadge(), second = context.refreshClientUnreadBadge();
+  assert.equal(requests.length, 1);
+  requests[0].resolve({ recent: [{ id: "a", hasUnreadTurn: true }], pinnedThreads: [], projects: [] });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(requests.length, 2);
+  requests[1].resolve({ recent: [], pinnedThreads: [], projects: [] });
+  await Promise.all([first, second]);
+  assert.deepEqual(counts, [1, 0]);
+  assert.equal(context.sidebar, original);
+});
+
+test("角标授权切换和回到前台拒绝旧结果，网络错误不伪造清零", async () => {
+  for (const reason of ["authorization", "visible", "network"]) {
+    const { context, counts, requests } = clientUnreadBadgeHarness();
+    const operation = context.refreshClientUnreadBadge();
+    if (reason === "authorization") context.session = { device: { id: "device-b" } };
+    if (reason === "visible") context.document.hidden = false;
+    if (reason === "network") requests[0].reject(new Error("暂时离线"));
+    else requests[0].resolve({ recent: [{ id: "stale", hasUnreadTurn: true }] });
+    await operation;
+    assert.deepEqual(counts, [], reason);
+  }
+});
+
+test("仅独立客户端后台保留十五秒角标轮询，停止后清零且迟到读取不能恢复旧数字", async () => {
+  const { context, counts, requests, intervals } = clientUnreadBadgeHarness();
+  context.startClientUnreadBadgePolling();
+  assert.equal(intervals[0].delay, 15000);
+  assert.equal(requests.length, 1);
+  context.stopClientUnreadBadgePolling(true);
+  assert.equal(requests[0].signal.aborted, true);
+  requests[0].resolve({ recent: [{ id: "late", hasUnreadTurn: true }] });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(counts, [0]);
+  delete context.window.__CODEX_ELVES_UNREAD_BADGE__;
+  await context.refreshClientUnreadBadge();
+  context.startClientUnreadBadgePolling();
+  assert.equal(requests.length, 1, "普通网页没有新增后台查询");
+  assert.equal(intervals.length, 1);
+});
+
+function claudeHistoryEditHarness() {
+  const id = "claude-11111111-2222-4333-8444-555555555555";
+  const first = { id: "first-message", type: "userMessage", text: "较早的问题",
+    messageMetadata: { turnId: "first-turn", messageId: "first-message", editable: true } };
+  const second = { id: "second-message", type: "userMessage",
+    messageMetadata: { turnId: "second-turn", messageId: "second-message", editable: true } };
+  const context = nodeVm.createContext({ nativeConnectionVersion: 1,
+    selectedId: id, thread: { id, editableMessage: null, editHistoryHead: "native-head", messageEditReady: true,
+      capabilities: { messageEdit: true, messageEditHistory: true } },
+    turns: new Map([["first-turn", { id: "first-turn", items: [first] }],
+      ["second-turn", { id: "second-turn", items: [second] }]]),
+    claudeThreadId: value => value === id, threadReadOnly: () => false, relatedViewForThread: () => null,
+    connected: true, busy: false, stopping: false, pending: null, editingMessage: null, editingQueuedMessage: null,
+    compactionLocked: () => false, isActiveThread: () => false, rememberDraft() {},
+    messageCopyText: item => item.text, randomId: () => "edit-client", closeComposerMenus() {},
+    updateComposer() {}, renderMessages() {},
+  });
+  nodeVm.runInContext(sourceSection("function threadS")
+    + sourceSection("function beginMessageEdit(", "function updateMessageEditor(")
+    + sourceSection("function syncEdi", "let queueVer"), context);
+  return { context, id, first };
+}
+
+test("Claude 历史编辑保留每条原生消息的编辑能力，并能选择较早问题", () => {
+  const { context, id, first } = claudeHistoryEditHarness();
+  context.syncEditableMessageMetadata();
+  assert.equal(first.messageMetadata.editable, true);
+  context.beginMessageEdit(id, first);
+  assert.equal(context.editingMessage.turnId, "first-turn");
+  assert.equal(context.editingMessage.historyHead, "native-head");
+  assert.equal(context.editingMessage.clientUserMessageId, "edit-client");
+  context.thread.messageEditReady = false;
+  assert.equal(context.threadSentMessageEditAllowed(id), false, "未知/执行中状态不能开放编辑");
+  context.thread.messageEditReady = true;
+  context.editingMessage = null; context.isActiveThread = () => true;
+  context.beginMessageEdit(id, first);
+  assert.equal(context.editingMessage, null);
+});
+
+test("Claude 历史编辑核对原生历史头与具体节点，Codex 保留原有最后一条校验", () => {
+  const { context, first } = claudeHistoryEditHarness();
+  const edit = { turnId: "first-turn", messageId: "first-message", historyHead: "native-head" };
+  assert.equal(context.messageEditStale(edit), false);
+  context.thread.editHistoryHead = "new-native-head";
+  assert.equal(context.messageEditStale(edit), true);
+  context.thread.editHistoryHead = edit.historyHead;
+  first.messageMetadata.editable = false;
+  assert.equal(context.messageEditStale(edit), true);
+  context.thread.capabilities = {};
+  context.thread.editableMessage = { turnId: "second-turn", messageId: "second-message" };
+  assert.equal(context.messageEditStale(edit), true);
+  assert.equal(context.messageEditStale(context.thread.editableMessage), false);
+});
+
+test("Claude 历史编辑的未知回执只核对同一新消息，排队证据不能确认编辑成功", async () => {
+  const id = "claude-11111111-2222-4333-8444-555555555555", calls = [];
+  let state = "queued";
+  const context = nodeVm.createContext({ nativeConnectionVersion: 1,
+    selectedId: id, session: { device: { id: "device" }, capabilities: { queueSendRecovery: true } },
+    turns: new Map(), pendingSendRequest: null, claudeThreadId: value => value === id,
+    acceptedSendItem: () => null,
+    api: async (path, payload) => {
+      calls.push(path);
+      assert.equal(path, "/api/read/sendState");
+      return { confirmed: true, threadId: id, clientUserMessageId: payload.clientUserMessageId, deliveryState: state };
+    },
+  });
+  nodeVm.runInContext(sourceSection("async function confi"), context);
+  const current = { action: "editMessage", deviceId: "device",
+    payload: { threadId: id, clientUserMessageId: "edit-client" } };
+  assert.equal(await context.confirmPendingSend(current), null);
+  state = "accepted";
+  assert.equal((await context.confirmPendingSend(current)).deliveryState, "accepted");
+  assert.equal(calls.length, 2);
+});
+
+test("设置 Select 的调试代理只放行固定设置接口，不扩大到任意路径", () => {
+  const context = nodeVm.createContext();
+  nodeVm.runInContext(devServerSource.slice(devServerSource.indexOf("function allowedApi("),
+    devServerSource.indexOf("function mappedCookie(")), context);
+  for (const path of ["/api/settings/environments", "/api/settings/instructions", "/api/settings/prompt-optimization"])
+    assert.equal(context.allowedApi("POST", path), true);
+  for (const [method, path] of [["GET", "/api/settings/instructions"], ["POST", "/api/settings/other"],
+    ["POST", "/api/settings/instructions/extra"], ["DELETE", "/api/settings/instructions"], ["POST", "/settings/instructions"]])
+    assert.equal(context.allowedApi(method, path), false);
+});
+// 旧回归用例只加载待测函数；补齐来自真实页面源码的后端上下文，默认仍使用 Codex。
+const backendHelpers = ((sourceSection("function ava", "function new") + "\n" + sourceSection("function applySe")) + (sourceSection("function rememberPer", "let modelQue") + "\n" + sourceSection("async function loadI"))
+  + (sourceSection("function claudeThrea", "function pri") + "\n" + sourceSection("function claudeC", "function thr") + "\n" + sourceSection("function newChatBack")) + sourceSection("function newDraftKey(", "function snapshotDraft(")
+  + sourceSection("function modelContext(", "function syncBackendModels("))
+  + (sourceSection("function conversationBackend(", "function privateInputScope(") + sourceSection("function sessionFilterValue("));
+const vm = {
+  ...nodeVm,
+  createContext(context = {}, options) {
+    for (const [key, value] of Object.entries({
+      creating: false, creationBackend: "codex", creationProject: "", selectedId: null, thread: null,
+      creationInstanceId: "codex:local", sessionInstanceRequest: null,
+      sessionTypes: [{ id: "codex", label: "Codex" }, { id: "claude", label: "Claude" }],
+      sessionInstances: [{ id: "codex:local", backend: "codex", label: "Codex · 本机", ready: true, legacyDefault: true },
+        { id: "claude:wsl:test", backend: "claude", label: "Claude · WSL · test", ready: true, legacyDefault: true }],
+      drafts: new Map(), attachmentDrafts: new Map(), retiredSendPayloads: new WeakSet(),
+      session: null, stream: null, EventSource: { OPEN: 1 }, modelsScope: "codex", modelLoadError: "",
+      modelDefaults: {}, modelChoiceVersion: 0, goalVersion: 0, notifiedGoal: null,
+      renderClaudeControlNotices() {},
+      selectionVersion: 0, modelChoiceVersion: 0,
+      claudePendingSetting: () => null,
+      selectedDraftFast: false, remoteFastState: null, remoteFastWriting: null, fastModeVersion: 0,
+      remoteFastWrites: new Map(),
+      draftPermissionChoices: new Map(), permissionSelections: new Map(), permissionWrites: new Map(),
+      instancePermissionCatalogs: new Map(), instancePermissionReads: new Map(),
+      permissionLabel, permissionModeKnown, permissionOptions, $: () => null,
+      rememberedNewChatSettings: () => ({}), newClaudePermissionMode: () => "",
+      remoteFastKey: () => "", updateRemoteFast() {}, rememberRemoteFastPreference() {},
+      reconcileRemoteFastPreference: value => value,
+      messageImageMediaReads: new WeakMap(), messageImageRefreshes: new Map(), messageImageReadSequence: 0,
+      syncBackendModels() {}, setConnection() {},
+      claudeUsageState: null, resetClaudeUsage() {}, syncClaudeUsage() {}, fitClaudeUsageTip() {},
+      resetComposerMetrics() {}, syncComposerMetrics() {}, fitComposerMetrics() {}, normalizeComposerMetrics: () => null,
+      syncClientUnreadBadge() {}, startClientUnreadBadgePolling() {}, stopClientUnreadBadgePolling() {},
+      promptOptimizationSettingsDialog: null,
+      syncWorkspaceSidePanelState() {},
+      workspaceSidePanel: false,
+      appearance: { sessionTypes: { codex: true, claude: false }, sessionFilter: "all" },
+      transcriptEvents: new Map(), claudeHistoryOrder: null, sessionPlan: null, turnFieldVersions: new Map(),
+    })) if (!Object.hasOwn(context, key)) context[key] = value;
+    context.appearance.sessionTypes ??= { codex: true, claude: false };
+    context.appearance.sessionFilter ??= "all";
+    const result = nodeVm.createContext(context, options);
+    nodeVm.runInContext(backendHelpers, result);
+    nodeVm.runInContext(sourceSection("function compactionInProgress(", "function compactionQueueSendReason("), result);
+    nodeVm.runInContext((sourceSection("function retireC", "function pru") + "\n" + sourceSection("function orderCl", "function mer")), result);
+    return result;
+  },
+};
+
+
+test("服务模式秒级会话时间按毫秒进入今天分组，并与 Claude 毫秒时间正确排序", () => {
+  const context = vm.createContext({ nativeConnectionVersion: 1,});
+  vm.runInContext(sourceSection("function sidebarTimestamp(", "function markSidebarThreadReadLocally("), context);
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const now = Date.now();
+  // 旧后台或旧缓存仍可能给出 app-server 的 Unix 秒，不能因此全部落入“历史”。
+  assert.ok(context.sidebarUpdatedAt({ updatedAt: Math.floor(now / 1000) }) >= today.getTime());
+  assert.equal(context.sidebarUpdatedAt({ updatedAt: 1792320819000 }), 1792320819000, "毫秒保持不变");
+  assert.equal(context.sidebarUpdatedAt({ updatedAt: null, recencyAt: 1792320819 }), 1792320819000);
+  assert.equal(context.sidebarUpdatedAt({}), 0);
+  const codex = { updatedAt: Math.floor(now / 1000) }, claude = { updatedAt: now - 60_000 };
+  assert.ok(context.sidebarUpdatedAt(codex) > context.sidebarUpdatedAt(claude), "较新的 Codex 会话排在较早的 Claude 会话前");
+});
+
+test("最近会话按原生活动时间排序，桌面仅打开和已读更新不改变顺序或日期分组", () => {
+  const context = vm.createContext({ nativeConnectionVersion: 1 });
+  vm.runInContext(sourceSection("function sidebarTimestamp(", "function markSidebarThreadReadLocally("), context);
+  const now = new Date(2026, 10, 15, 20, 45).getTime();
+  const yesterday = new Date(2026, 10, 14, 18).getTime();
+  const oldActivity = new Date(2026, 9, 22, 18).getTime();
+  const current = { id: "current", recencyAt: now - 60_000, updatedAt: now - 60_000 };
+  const recent = { id: "recent", recencyAt: yesterday, updatedAt: yesterday };
+  const old = { id: "old", recencyAt: oldActivity, updatedAt: oldActivity };
+  const rows = [old, recent, current];
+  const order = () => [...rows].sort((left, right) =>
+    context.sidebarUpdatedAt(right) - context.sidebarUpdatedAt(left)).map(item => item.id);
+  assert.deepEqual(order(), ["current", "recent", "old"]);
+  for (const row of [recent, old]) {
+    // Codex App 打开旧会话会更新元数据；相同活动时间下的只读变化不能把它推到最近。
+    row.updatedAt = now + 1_000;
+    row.hasUnreadTurn = false;
+    row.status = { type: "idle" };
+  }
+  assert.deepEqual(order(), ["current", "recent", "old"]);
+  const groups = context.sidebarRecentDateGroups(rows, now);
+  assert.deepEqual(Array.from(groups.find(group => group.key === "today").items, item => item.id), ["current"]);
+  assert.deepEqual(Array.from(groups.find(group => group.key === "yesterday").items, item => item.id), ["recent"]);
+  assert.deepEqual(Array.from(groups.find(group => group.key === "history").items, item => item.id), ["old"]);
+});
+
+test("最近会话在桌面真实执行和新建后更新，并兼容缺少活动时间的旧数据及 Claude", () => {
+  const context = vm.createContext({ nativeConnectionVersion: 1 });
+  vm.runInContext(sourceSection("function sidebarTimestamp(", "function markSidebarThreadReadLocally("), context);
+  const now = new Date(2026, 10, 15, 20, 45).getTime();
+  const current = { id: "current", recencyAt: now - 60_000, updatedAt: now - 60_000 };
+  const old = { id: "old", recencyAt: now - 86_400_000, updatedAt: now };
+  assert.ok(context.sidebarUpdatedAt(old) < context.sidebarUpdatedAt(current));
+  old.recencyAt = now;
+  assert.ok(context.sidebarUpdatedAt(old) > context.sidebarUpdatedAt(current), "真实执行推进原生活动时间后必须重排");
+  assert.equal(context.sidebarUpdatedAt({ createdAt: now }), now, "新建会话仍可按创建时间进入最近列表");
+  for (const recencyAt of [undefined, null, 0, -1, NaN, "unknown"]) {
+    assert.equal(context.sidebarUpdatedAt({ recencyAt, updatedAt: now }), now, "旧数据缺少有效活动时间时回退到更新时间");
+  }
+  assert.equal(context.sidebarUpdatedAt({ recencyAt: Math.floor(now / 1000), updatedAt: now + 60_000 }), now,
+    "旧缓存秒级活动时间仍应优先于毫秒元数据时间");
+  assert.equal(context.sidebarUpdatedAt({ backend: "claude", recencyAt: now, updatedAt: now }), now);
+});
+
+test("最近会话按今天、昨天、前天、近四个星期日历日和历史分组", () => {
+  const context = vm.createContext({ nativeConnectionVersion: 1 });
+  vm.runInContext(sourceSection("function sidebarTimestamp(", "function markSidebarThreadReadLocally("), context);
+  const now = new Date(2026, 10, 15, 12, 0, 0);
+  const items = Array.from({ length: 8 }, (_, offset) => {
+    const date = new Date(now);
+    date.setDate(date.getDate() - offset);
+    return { id: `day-${offset}`, updatedAt: date.getTime() };
+  });
+  const old = new Date(now);
+  old.setDate(old.getDate() - 10);
+  items.push({ id: "history", updatedAt: old.getTime() });
+  const groups = context.sidebarRecentDateGroups(items, now.getTime());
+  assert.deepEqual(Array.from(groups, group => group.label),
+    ["今天", "昨天", "前天", "星期四", "星期三", "星期二", "星期一", "历史"]);
+  assert.deepEqual(Array.from(groups, group => Array.from(group.items, item => item.id)),
+    [["day-0"], ["day-1"], ["day-2"], ["day-3"], ["day-4"], ["day-5"], ["day-6"], ["day-7", "history"]]);
+});
+
+test("单会话重同步只补对应正文与列表，不重复刷新整个连接", () => {
+  let reloads = 0, sidebars = 0, connections = 0;
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    selectedId: "selected", handleRemoteChannelEvent: () => false, scheduleRelatedMenuRefresh() {},
+    sidebarReadRefreshSuppressions: new Set(),
+    scheduleReload: () => reloads++, scheduleSidebarRefresh: () => sidebars++,
+    withRecoveryErrorSilence: async run => run(), refreshConnectedSession: async () => connections++,
+  });
+  vm.runInContext(`${sourceSection("function receive(event) {", "  const params = { ...event.params || {} };")}\n}`, context);
+  context.receive({ method: "remote/resync", params: { threadId: "background" } });
+  assert.equal(reloads, 0); assert.equal(sidebars, 1); assert.equal(connections, 0);
+  context.receive({ method: "remote/resync", params: { threadId: "selected" } });
+  assert.equal(reloads, 1); assert.equal(sidebars, 2); assert.equal(connections, 0);
+  context.receive({ method: "remote/resync", params: {} });
+  assert.equal(connections, 1);
+});
+
+function localInputFixtures() {
+  return [
+    { kind: "file", name: "需求说明.txt", size: 3, files: [{ path: "需求说明.txt", data: "YWJj" }], directories: [] },
+    { kind: "folder", name: "素材", size: 2, files: [{ path: "子目录/a.txt", data: "aGk=" }],
+      directories: ["子目录", "空目录"] },
+    { kind: "folder", name: "空文件夹", size: 0, files: [], directories: [] }
+  ];
+}
+
+test("本地附件验证保留文件、嵌套目录和空目录，拒绝越界、同名冲突及错误大小", () => {
+  const inputs = localInputFixtures(), copied = validateLocalInputs(inputs);
+  assert.deepEqual(copied, inputs);
+  copied[1].directories.push("另一个目录");
+  assert.equal(inputs[1].directories.length, 2);
+  for (const change of [
+    input => { input.name = "../escape"; },
+    input => { input.files[0].path = "C:/escape"; },
+    input => { input.files[0].path = "../escape"; },
+    input => { input.files[0].data = "bad"; },
+    input => { input.size += 1; },
+    input => { input.directories.push("子目录/A.TXT"); },
+    input => { input.files.push({ path: "子目录/a.txt/child", data: "" }); },
+  ]) {
+    const candidate = structuredClone(inputs[1]); change(candidate);
+    assert.throws(() => validateLocalInputs([candidate]), /无效|大小|越界|冲突/);
+  }
+  assert.throws(() => validateLocalInputs(Array.from({ length: 17 }, () => inputs[0])), /16/);
+  const large = { kind: "folder", name: "too-large", size: 12 * 1024 * 1024 + 1,
+    files: [{ path: "one", data: Buffer.alloc(6 * 1024 * 1024).toString("base64") },
+      { path: "two", data: Buffer.alloc(6 * 1024 * 1024 + 1).toString("base64") }], directories: [] };
+  assert.throws(() => validateLocalInputs([large]), /12 MiB/);
+});
+
+test("普通浏览器没有本机文件入口，同源客户端侧边页可复用原生入口", () => {
+  const previous = globalThis.window;
+  try {
+    globalThis.window = { __TAURI__: { core: { invoke() {} } } };
+    assert.equal(localInputBridge(), null);
+    const bridge = { pick() {}, paste() {} };
+    globalThis.window = { parent: { __CODEX_ELVES_LOCAL_INPUTS__: bridge } };
+    assert.equal(localInputBridge(), bridge);
+  } finally {
+    if (previous === undefined) delete globalThis.window;
+    else globalThis.window = previous;
+  }
+});
+
+async function localAttachmentHarness() {
+  const source = await readFile(new URL("../assets/harness/attachments.js", import.meta.url), "utf8");
+  const h = { notices: [], changes: 0, pasted: 0, picked: [], next: localInputFixtures(), timers: [] };
+  const context = vm.createContext({
+    nativeConnectionVersion: 1, Blob, Uint8Array, TextEncoder, TextDecoder, atob,
+    isLocalInput, copyLocalInput, validateLocalInputs,
+    captureTransferInputs, hasTransferFiles, readTransferInputs,
+    FileReader: class {
+      readAsDataURL(blob) {
+        void blob.arrayBuffer().then(bytes => {
+          this.result = `data:${blob.type};base64,${Buffer.from(bytes).toString("base64")}`;
+          this.onload();
+        });
+      }
+    },
+    createImageBitmap: async () => ({ width: 1, height: 1, close() {} }),
+    setTimeout: callback => h.timers.push(callback), icon: () => ({}),
+    localInputBridge: () => ({
+      pick: async folders => { h.picked.push(folders); return h.next; },
+      paste: async () => { ++h.pasted; return h.next; },
+    }),
+  });
+  vm.runInContext(source.replace(/^import .*;\r?\n/gm, "").replace(/^export /gm, ""), context);
+  context.report = message => h.notices.push(message);
+  context.changed = () => { ++h.changes; };
+  vm.runInContext("showNotice = report; changeListener = changed", context);
+  h.context = context;
+  return h;
+}
+
+const attachmentTestFile = (name, content = "x", type = "") => Object.assign(new Blob([content], { type }), { name });
+const attachmentTestEntry = file => ({ name: file.name, isFile: true, isDirectory: false,
+  file(resolve) { queueMicrotask(() => resolve(file)); } });
+const attachmentTestDirectory = (name, pages = []) => ({ name, isFile: false, isDirectory: true,
+  createReader() { let index = 0; return { readEntries(resolve) { queueMicrotask(() => resolve(pages[index++] || [])); } }; } });
+
+test("拖放入口在事件内捕获，文件夹读取全部分页并保留空目录和图片分类", async () => {
+  const files = Array.from({ length: 123 }, (_, index) => attachmentTestEntry(attachmentTestFile(`${index}.txt`)));
+  const nested = attachmentTestDirectory("子目录", [[attachmentTestEntry(attachmentTestFile("说明.txt", "hi"))]]);
+  const directory = attachmentTestDirectory("素材", [files.slice(0, 100), [...files.slice(100), nested,
+    attachmentTestDirectory("空目录")]]);
+  const image = attachmentTestFile("截图.png", "fixture-image", "image/png");
+  let active = true;
+  const captured = captureTransferInputs({ items: [
+    { kind: "file", getAsFile: () => null, webkitGetAsEntry() { assert.equal(active, true); return directory; } },
+    { kind: "file", getAsFile: () => image },
+    { kind: "file", getAsFile: () => null, webkitGetAsEntry: () => attachmentTestDirectory("空文件夹") },
+  ] });
+  active = false;
+  const result = await readTransferInputs(captured, { isImageFile: file => file.type === "image/png" });
+  assert.equal(result.images[0], image);
+  assert.equal(result.inputs.length, 2);
+  assert.equal(result.inputs[0].files.length, 124);
+  assert.equal(result.inputs[0].size, 125);
+  assert.deepEqual(result.inputs[0].directories, ["子目录", "空目录"]);
+  assert.equal(result.inputs[0].files.at(-1).path, "子目录/说明.txt");
+  assert.equal(result.inputs[1].kind, "folder");
+  assert.deepEqual(result.inputs[1].files, []);
+  assert.deepEqual(result.inputs[1].directories, []);
+  assert.equal(hasTransferFiles({ types: ["Files"] }), true);
+  assert.equal(hasTransferFiles({ types: ["text/plain"], files: [], items: [{ kind: "string" }] }), false);
+});
+
+test("浏览器目录和文件读取拒绝超限、越界和迟到结果，不静默截断", async () => {
+  await assert.rejects(() => readTransferInputs(Array.from({ length: 17 }, () => ({
+    file: attachmentTestFile("a.txt"),
+  }))), /16/);
+  await assert.rejects(() => readTransferInputs(Array.from({ length: 9 }, () => ({
+    file: attachmentTestFile("a.png", "x", "image/png"),
+  })), { isImageFile: () => true }), /8/);
+  const many = attachmentTestDirectory("many", [Array.from({ length: 512 }, (_, i) =>
+    attachmentTestEntry(attachmentTestFile(`${i}.txt`)))]);
+  await assert.rejects(() => readTransferInputs([{ entry: many }]), /512/);
+  await assert.rejects(() => readTransferInputs([{ file: attachmentTestFile("../escape", "x") }]), /无效/);
+  await assert.rejects(() => readTransferInputs([{ file: attachmentTestFile("big.bin", new Uint8Array(12 * 1024 * 1024 + 1)) }]), /12 MiB/);
+  let deep = attachmentTestEntry(attachmentTestFile("a.txt"));
+  for (let index = 0; index < 33; index++) deep = attachmentTestDirectory(`d${index}`, [[deep]]);
+  await assert.rejects(() => readTransferInputs([{ entry: deep }]), /32/);
+  let current = true, finish, second = false;
+  const pending = readTransferInputs([
+    { entry: { name: "a.txt", isFile: true, file(resolve) { finish = resolve; } } },
+    { entry: { name: "b.txt", isFile: true, file() { second = true; } } },
+  ], { isCurrent: () => current });
+  current = false; finish(attachmentTestFile("a.txt"));
+  await assert.rejects(() => pending, { name: "AbortError" });
+  assert.equal(second, false);
+});
+
+test("现代目录 handle 同样保留目录，捕获拒绝不会降级为空文件", async () => {
+  const child = { kind: "file", name: "a.txt", getFile: async () => attachmentTestFile("a.txt", "hi") };
+  const empty = { kind: "directory", name: "空目录", async *values() {} };
+  const root = { kind: "directory", name: "handle目录", async *values() { yield child; yield empty; } };
+  const captured = captureTransferInputs({ items: [{ kind: "file", getAsFile: () => null,
+    getAsFileSystemHandle: () => Promise.resolve(root) }] });
+  const result = await readTransferInputs(captured);
+  assert.equal(result.inputs[0].size, 2);
+  assert.deepEqual(result.inputs[0].directories, ["空目录"]);
+  const denied = captureTransferInputs({ items: [{ kind: "file", getAsFile: () => null,
+    getAsFileSystemHandle: () => Promise.reject(new Error("denied")) }] });
+  await assert.rejects(() => readTransferInputs(denied), /未允许读取/);
+  await assert.rejects(() => readTransferInputs([]), /未提供/);
+});
+
+test("普通浏览器混合粘贴图片、文件和目录，不调用原生路径读取且纯文字不被拦截", async () => {
+  const h = await localAttachmentHarness(), c = h.context;
+  c.localInputBridge = () => null;
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==", "base64");
+  const image = attachmentTestFile("截图.png", png, "image/png"), file = attachmentTestFile("说明.txt", "abc");
+  const directory = attachmentTestDirectory("空文件夹");
+  let prevented = 0;
+  c.paste = { clipboardData: { files: [image, file], items: [
+    { kind: "file", getAsFile: () => image }, { kind: "file", getAsFile: () => file },
+    { kind: "file", getAsFile: () => null, webkitGetAsEntry: () => directory },
+  ], getData: () => "" }, preventDefault() { ++prevented; } };
+  assert.equal(c.handleComposerLocalPaste(c.paste), true);
+  while (c.composerAttachmentsLoading()) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(prevented, 1);
+  assert.equal(c.composerAttachmentsPayload().length, 1);
+  assert.equal(c.composerLocalInputsPayload().length, 2);
+  assert.equal(h.pasted, 0);
+  assert.deepEqual(h.notices, []);
+  assert.equal(c.handleComposerLocalPaste({ clipboardData: { files: [], getData: () => "C:\\文字路径.txt" },
+    preventDefault() { assert.fail("文字路径不能被当作文件读取"); } }), false);
+  c.setComposerAttachmentsDisabled(true);
+  c.paste.clipboardData.files = [file]; c.paste.clipboardData.items = [{ kind: "file", getAsFile: () => file }];
+  c.handleComposerLocalPaste(c.paste);
+  assert.equal(c.composerLocalInputsPayload().length, 2);
+  assert.match(h.notices.at(-1), /不能添加/);
+});
+
+test("原生剪贴板混合图片和目录时图片进入图像通道，目录内容和空目录保留", async () => {
+  const h = await localAttachmentHarness(), c = h.context;
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==", "base64");
+  h.next = [{ kind: "file", name: "剪贴图.png", size: png.length,
+    files: [{ path: "剪贴图.png", data: png.toString("base64") }], directories: [] }, ...localInputFixtures()];
+  assert.equal(c.handleComposerLocalPaste({ clipboardData: { files: [], getData: () => "" },
+    preventDefault() {} }), true);
+  while (c.composerAttachmentsLoading()) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.pasted, 1);
+  assert.equal(c.composerAttachmentsPayload().length, 1);
+  assert.equal(c.composerAttachmentsPayload()[0].name, "剪贴图.png");
+  assert.deepEqual(JSON.parse(JSON.stringify(c.composerLocalInputsPayload())), localInputFixtures());
+  assert.deepEqual(h.notices, []);
+});
+
+test("额外图片格式解码后转为 PNG，常见 JPEG 别名保留，危险 SVG 在解码前拒绝", async () => {
+  const h = await localAttachmentHarness(), c = h.context;
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==", "base64");
+  let draws = 0;
+  c.document = { createElement: tag => {
+    assert.equal(tag, "canvas");
+    return { getContext: () => ({ drawImage() { ++draws; } }),
+      toBlob: callback => callback(new Blob([png], { type: "image/png" })) };
+  } };
+  const bmp = Buffer.alloc(14); bmp.write("BM");
+  const avif = Buffer.alloc(24); avif.writeUInt32BE(24); avif.write("ftypavif", 4);
+  const icon = Uint8Array.from([0, 0, 1, 0, 1, 0]);
+  const cursor = Uint8Array.from([0, 0, 2, 0, 1, 0]);
+  for (const [name, content, type] of [
+    ["one.bmp", bmp, "image/x-ms-bmp"], ["one.avif", avif, "image/avif"],
+    ["one.ico", icon, "image/vnd.microsoft.icon"], ["one.cur", cursor, ""],
+    ["one.svg", '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><rect width="1" height="1"/></svg>', "image/svg+xml"],
+  ]) {
+    const result = await c.readImageFile(attachmentTestFile(name, content, type));
+    assert.equal(result.mime, "image/png");
+    assert.equal(result.size, png.length);
+    assert.equal(result.name, name);
+    assert.match(result.dataUrl, /^data:image\/png;base64,/);
+  }
+  assert.equal(draws, 5);
+  const jpeg = await c.readImageFile(attachmentTestFile("one.jfif", Uint8Array.from([255, 216, 255, 0]), "image/pjpeg"));
+  assert.equal(jpeg.mime, "image/jpeg");
+  for (const body of ['<svg><script>alert(1)</script></svg>', '<svg><image href="file:///secret"/></svg>',
+    '<svg><image href="/api/secret"/></svg>', '<svg><style>rect{fill:url(other.svg)}</style></svg>']) {
+    await assert.rejects(() => c.readImageFile(attachmentTestFile("blocked.svg", body, "image/svg+xml")), /SVG/);
+  }
+  assert.equal(draws, 5, "脚本或外部引用不能进入图片解码和转换");
+});
+
+test("图片转换后重新校验单张及合计大小，超限时保留已有附件", async () => {
+  const h = await localAttachmentHarness(), c = h.context;
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==", "base64");
+  c.setComposerAttachments([{ kind: "inline", name: "保留.png", mime: "image/png",
+    dataUrl: `data:image/png;base64,${png.toString("base64")}`, size: png.length, width: 1, height: 1 }]);
+  const before = JSON.stringify(c.composerAttachmentSnapshot());
+  let convertedSize = 5 * 1024 * 1024;
+  c.document = { createElement: () => ({
+    getContext: () => ({ drawImage() {} }),
+    toBlob: callback => callback(new Blob([png, new Uint8Array(convertedSize - png.length)], { type: "image/png" })),
+  }) };
+  const bmp = Buffer.alloc(14); bmp.write("BM");
+  await c.addFiles(Array.from({ length: 3 }, (_, i) => attachmentTestFile(`${i}.bmp`, bmp, "image/bmp")));
+  assert.match(h.notices.at(-1), /12 MiB/);
+  assert.equal(JSON.stringify(c.composerAttachmentSnapshot()), before);
+  convertedSize = 6 * 1024 * 1024;
+  await c.addFiles([attachmentTestFile("large.bmp", bmp, "image/bmp")]);
+  assert.match(h.notices.at(-1), /5 MiB/);
+  assert.equal(JSON.stringify(c.composerAttachmentSnapshot()), before);
+});
+
+test("本机文件及文件夹预览显示两种图标和下方名称，移除后同步草稿", async () => {
+  const h = await localAttachmentHarness(), c = h.context;
+  const create = tag => {
+    const node = { tag, children: [], attributes: {}, classes: new Set(),
+      append(...children) { this.children.push(...children); },
+      replaceChildren(...children) { this.children = children; },
+      setAttribute(name, value) { this.attributes[name] = value; } };
+    node.classList = { add: name => node.classes.add(name), toggle: (name, value) =>
+      value ? node.classes.add(name) : node.classes.delete(name) };
+    return node;
+  };
+  c.document = { createElement: create };
+  c.icon = name => ({ icon: name });
+  c.root = create("div");
+  c.entries = localInputFixtures();
+  vm.runInContext("attachmentRoot = root; setComposerAttachments(entries)", c);
+  assert.equal(c.root.children.length, 3);
+  const [file, folder] = c.root.children;
+  assert.equal(file.children[0].children[0].icon, "document");
+  assert.equal(folder.children[0].children[0].icon, "folderClosed");
+  assert.equal(file.children[1].tag, "figcaption");
+  assert.equal(file.children[1].textContent, "需求说明.txt");
+  assert.equal(file.children[1].title, "需求说明.txt");
+  const changes = h.changes;
+  file.children[2].onclick();
+  assert.equal(c.root.children.length, 2);
+  assert.equal(h.changes, changes + 1);
+  const css = await readFile(new URL("../assets/harness/style.css", import.meta.url), "utf8");
+  assert.match(css, /\.composer-attachment-preview\{[^}]*width:40px;height:40px/);
+  assert.match(css, /\.composer-local-attachment>figcaption\{[^}]*display:block[^}]*text-overflow:ellipsis/);
+});
+
+test("本机文件选取及恢复保留全部内容，纯附件草稿可移除且迟到结果不串会话", async () => {
+  const h = await localAttachmentHarness(), c = h.context;
+  await vm.runInContext("chooseComposerLocalInputs(true)", c);
+  assert.deepEqual(h.picked, [true]);
+  assert.deepEqual(JSON.parse(JSON.stringify(vm.runInContext("composerLocalInputsPayload()", c))), h.next);
+  vm.runInContext("setComposerAttachments(composerAttachmentSnapshot())", c);
+  assert.equal(vm.runInContext("composerHasAttachments()", c), true);
+  assert.equal(vm.runInContext("composerAttachmentsPayload().length", c), 0);
+  let finish;
+  c.delayed = () => new Promise(resolve => { finish = resolve; });
+  const reading = vm.runInContext("addLocalInputs(delayed)", c);
+  assert.equal(vm.runInContext("composerAttachmentsLoading()", c), true);
+  vm.runInContext("setComposerAttachments([])", c);
+  finish(h.next); await reading;
+  assert.equal(vm.runInContext("composerHasAttachments()", c), false);
+  assert.deepEqual(h.notices, []);
+});
+
+test("Ctrl+V 粘贴本机文件及目录只添加一次，纯文字和图片继续走原有粘贴", async () => {
+  const h = await localAttachmentHarness(), c = h.context;
+  c.event = { key: "v", ctrlKey: true };
+  vm.runInContext("handleComposerLocalPasteShortcut(event)", c);
+  c.paste = { clipboardData: { files: [], getData: () => "" }, preventDefault() {} };
+  assert.equal(vm.runInContext("handleComposerLocalPaste(paste)", c), true);
+  await new Promise(resolve => setImmediate(resolve));
+  h.timers.forEach(callback => callback());
+  assert.equal(h.pasted, 1);
+  assert.equal(vm.runInContext("composerLocalInputsPayload().length", c), 3);
+  for (const clipboardData of [
+    { files: [], getData: () => "C:\\普通文字路径.txt" },
+    { files: [{ type: "image/png" }], getData: () => "" },
+  ]) {
+    c.paste = { clipboardData, preventDefault() { assert.fail("普通文字和原有图片不由本机文件粘贴拦截"); } };
+    assert.equal(vm.runInContext("handleComposerLocalPaste(paste)", c), false);
+  }
+  vm.runInContext("setComposerAttachments([]); handleComposerLocalPasteShortcut(event)", c);
+  h.timers.at(-1)();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.pasted, 2, "仅目录剪贴板没有 DOM paste 时仍应从原生 CF_HDROP 恢复");
+});
+
+test("Codex/Claude 图片添加和草稿/队列恢复完整保留八张，第九张拒绝且不丢原图", async () => {
+  const source = await readFile(new URL("../assets/harness/attachments.js", import.meta.url), "utf8");
+  const notices = [];
+  class Reader {
+    readAsDataURL(blob) {
+      void blob.arrayBuffer().then(bytes => {
+        this.result = `data:${blob.type};base64,${Buffer.from(bytes).toString("base64")}`;
+        this.onload();
+      });
+    }
+  }
+  const context = vm.createContext({ nativeConnectionVersion: 1, Blob, FileReader: Reader, Uint8Array,
+    createImageBitmap: async () => ({ width: 1, height: 1, close() {} }),
+    atob, sha256Hex: async () => "test-hash", isLocalInput, copyLocalInput, validateLocalInputs });
+  vm.runInContext(source.replace(/^import .*;\r?\n/gm, "").replace(/^export /gm, ""), context);
+  context.report = message => notices.push(message);
+  vm.runInContext("showNotice = report", context);
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==", "base64");
+  for (const backend of ["codex", "claude"]) {
+    context.backend = backend;
+    context.files = Array.from({ length: 8 }, (_, i) => Object.assign(new Blob([png], { type: "image/png" }), { name: `${i}.png` }));
+    vm.runInContext("clearComposerAttachments()", context);
+    await vm.runInContext("addFiles(files)", context);
+    const payload = vm.runInContext("composerAttachmentsPayload()", context);
+    assert.equal(payload.length, 8, `${backend} 发送不能截为四张`);
+    assert.equal(vm.runInContext("setComposerAttachments(composerAttachmentSnapshot()); composerAttachmentsPayload().length", context), 8);
+    await vm.runInContext("addFiles([files[0]])", context);
+    assert.match(notices.at(-1), /最多添加 8 张图片/);
+    assert.deepEqual(vm.runInContext("composerAttachmentsPayload()", context), payload);
+    context.queued = { context: { imageAttachments: payload.map(image => ({ src: image.dataUrl, filename: image.name })) } };
+    await vm.runInContext("attachmentsFromQueuedMessage(queued).then(images => setComposerAttachments(images, {readOnly:true,removableRemote:true}))", context);
+    assert.equal(vm.runInContext("composerAttachmentSnapshot().length", context), 8);
+    assert.equal(vm.runInContext("composerRemoteAttachmentSources().length", context), 8);
+  }
+  assert.match(source, /attachmentInput\.onchange[^\n]*addFiles/);
+  assert.match(source, /addEventListener\("drop"[\s\S]*?addFiles\(files\)/);
+  assert.match(source, /function handleComposerImagePaste[\s\S]*?addFiles\(files\)/);
+});
+
+async function mediaPreviewDismissHarness(width, height) {
+  const source = await readFile(new URL("../assets/harness/attachments.js", import.meta.url), "utf8");
+  const rect = (left, top, width, height) => ({ left, top, width, height, right: left + width, bottom: top + height });
+  const listeners = new Map(), events = [];
+  let closes = 0, picture = rect((width - 200) / 2, (height - 100) / 2, 200, 100);
+  const viewport = { getBoundingClientRect: () => rect(0, 0, width, height), closest: () => null };
+  const media = { naturalWidth: 200, naturalHeight: 100, getBoundingClientRect: () => picture };
+  const dialog = { addEventListener: (name, handler) => listeners.set(name, handler),
+    removeEventListener: name => listeners.delete(name), close: () => closes++ };
+  const context = vm.createContext({ nativeConnectionVersion: 1, getComputedStyle: () => ({ objectFit: "contain" }) });
+  vm.runInContext(source.slice(source.indexOf("export function mediaPreviewContainsPoint("),
+    source.indexOf("export function openVideoPreview(")).replace(/^export /gm, ""), context);
+  const dispose = context.bindMediaPreviewDismiss(dialog, media, viewport);
+  const fire = (type, x, y, options = {}) => {
+    const event = { target: viewport, pointerId: 1, button: 0, isPrimary: true, clientX: x, clientY: y,
+      preventDefault: () => events.push("preventDefault"), stopPropagation: () => events.push("stopPropagation"), ...options };
+    listeners.get(type)?.(event);
+  };
+  const tap = (x, y, options) => { fire("pointerdown", x, y, options); fire("pointerup", x, y, options); fire("click", x, y, options); };
+  return { fire, tap, dispose, listeners, events, closes: () => closes,
+    picture: box => { picture = rect(...box); } };
+}
+
+test("PC/手机图片预览仅点击实际内容周围空白关闭，放大覆盖区域及按钮不误关", async () => {
+  for (const [width, height] of [[1280, 800], [390, 844]]) {
+    const h = await mediaPreviewDismissHarness(width, height);
+    h.tap(width / 2, height / 2);
+    assert.equal(h.closes(), 0, "点击原始图片不关闭");
+    h.tap(16, 16, { target: { closest: () => ({ tagName: "BUTTON" }) } });
+    assert.equal(h.closes(), 0, "关闭以外的操作控件由自身处理");
+    h.tap(16, 16);
+    assert.equal(h.closes(), 1, "透明内容容器中的空白与遮罩均可关闭");
+    assert.deepEqual(h.events, ["preventDefault", "stopPropagation"], "关闭时消费完整单击，避免穿透");
+    const scaledWidth = Math.max(width, height) * 4;
+    h.picture([-scaledWidth / 4, -scaledWidth / 8, scaledWidth, scaledWidth / 2]);
+    h.tap(16, 16);
+    assert.equal(h.closes(), 1, "图片放大覆盖了原空白区域，即使事件被视口捕获也不能关闭");
+    h.dispose();
+    assert.equal(h.listeners.size, 0);
+  }
+});
+
+test("PC/手机图片拖动、双指缩放和取消手势结束时不会关闭预览", async () => {
+  for (const [width, height] of [[1280, 800], [390, 844]]) {
+    const h = await mediaPreviewDismissHarness(width, height);
+    h.fire("pointerdown", width / 2, height / 2);
+    h.fire("pointermove", 16, 16);
+    h.fire("pointerup", 16, 16);
+    h.fire("click", 16, 16);
+    assert.equal(h.closes(), 0, "从图片拖动到空白不能关闭");
+    h.fire("pointerdown", 16, 16);
+    h.fire("pointermove", 30, 16);
+    h.fire("pointermove", 16, 16);
+    h.fire("pointerup", 16, 16);
+    h.fire("click", 16, 16);
+    assert.equal(h.closes(), 0, "拖动回到原处也不能视为单击");
+    h.fire("pointerdown", 16, 16);
+    h.fire("pointerdown", 30, 30, { pointerId: 2, isPrimary: false });
+    h.fire("pointerup", 30, 30, { pointerId: 2, isPrimary: false });
+    h.fire("pointerup", 16, 16);
+    h.fire("click", 16, 16);
+    assert.equal(h.closes(), 0, "双指手势不能被最后一个 click 关闭");
+    h.fire("pointerdown", 16, 16);
+    h.fire("pointercancel", 16, 16);
+    h.fire("click", 16, 16);
+    h.tap(16, 16, { button: 2 });
+    assert.equal(h.closes(), 0, "取消及右键不能关闭");
+    h.tap(16, 16);
+    assert.equal(h.closes(), 1, "手势结束后下一次普通点击仍可关闭");
+  }
+});
+
+test("媒体 contain 留白按实际图像尺寸判断，按下或抬起落入图像均不关闭", async () => {
+  const h = await mediaPreviewDismissHarness(400, 800);
+  h.picture([0, 0, 400, 800]);
+  h.tap(200, 400);
+  assert.equal(h.closes(), 0);
+  h.fire("pointerdown", 200, 16);
+  h.picture([0, -400, 1600, 1600]);
+  h.fire("pointerup", 200, 16);
+  h.fire("click", 200, 16);
+  assert.equal(h.closes(), 0, "按下后图片覆盖了空白也不能关闭");
+  h.picture([0, 0, 400, 800]);
+  h.tap(200, 16);
+  assert.equal(h.closes(), 1, "contain 产生的上下留白可关闭");
+});
+
+function remoteFastHarness() {
+  const attributes = new Map(), reads = [], writes = [], notices = [], refreshes = [];
+  const control = { disabled: true, hidden: true, setAttribute: (key, value) => attributes.set(key, value) };
+  const context = nodeVm.createContext({ nativeConnectionVersion: 1,
+    session: { device: { id: "fast-device" }, capabilities: { fastMode: true, serviceFastMode: true }, runtime: { revision: 1 } },
+    selectedId: "thread-fast-a", creating: false, selectionVersion: 1, connected: true,
+    busy: false, stopping: false, pending: null, editingMessage: null, editingQueuedMessage: null,
+    selectedDraftFast: false, remoteFastState: null, remoteFastWriting: null, fastModeVersion: 0,
+    remoteFastWrites: new Map(), composerTooltips: null, threadDisplays: new Map(), thread: null,
+    modelsScope: "codex", modelsLoadedAt: 1000, modelLoadError: "",
+    models: [
+      { model: "gpt-6.1-sol", serviceTiers: [{ id: "priority" }] },
+      { model: "gpt-6.1-other", serviceTiers: [{ id: "fast" }] },
+      { model: "gpt-6.1-unsupported", serviceTiers: [] },
+      { model: "gpt-6.1-denied", serviceTiers: [{ id: "priority" }], fastModeSupported: false },
+      { model: "claude-opus", serviceTiers: [{ id: "priority" }] },
+      { model: "sol-alias", serviceTiers: [{ id: "priority" }], fastModeSupported: true },
+    ],
+    modelDefaults: { fastModeAvailability: { available: true },
+      fastModeOwner: JSON.stringify(["fast-device", "codex:local", 1]) },
+    now: 1000, Date: { now: () => context.now },
+    model: "gpt-6.1-sol", instanceId: "codex:local", claude: false, readOnly: false,
+    $: selector => selector === "#fast-button" ? control : null,
+    privateInputScope: value => value.device.id,
+    activeInstanceId: () => context.instanceId,
+    modelContextKey: () => context.instanceId === "codex:local" ? "codex" : context.instanceId,
+    currentModelId: () => context.model,
+    currentModel: () => context.models.find(model => model.model === context.model) || null,
+    catalogUsable: ({ loadedAt }) => context.now - loadedAt < 604800000,
+    draftKey: () => context.selectedId || "$new:project",
+    modelContext: () => ({ ...(context.selectedId ? { threadId: context.selectedId } : { projectId: "project" }) }),
+    isClaude: () => context.claude,
+    validRelatedThreadId: id => typeof id === "string" && id.startsWith("thread-fast-"),
+    threadDeleted: () => false, claudeThreadId: () => false, threadEphemeralState: () => false,
+    contextUsage: () => null, normalizeComposerMetrics: () => null, cacheDisplayData() {},
+    threadReadOnly: () => context.readOnly, threadDeletionLocked: () => false, sessionInstanceEnabled: () => true,
+    api: (path, payload) => { const result = deferred(); reads.push({ path, payload, ...result }); return result.promise; },
+    mutate: (action, payload) => { const result = deferred(); writes.push({ action, payload, ...result }); return result.promise; },
+    loadModels: async () => refreshes.push("models"), reloadThread: async () => refreshes.push("thread"),
+    notice: message => notices.push(message),
+  });
+  nodeVm.runInContext((sourceSection("function threadDispl", "function own") + "\n" + sourceSection("function syncRelatedMode", "function rememberBac")), context);
+  nodeVm.runInContext((sourceSection("function remoteF") + "\n" + sourceSection("function rememberRem") + "\n" + sourceSection("async function t")), context);
+  for (const id of ["thread-fast-a", "thread-fast-b"])
+    context.rememberThreadDisplay({ id, model: "gpt-6.1-sol", fastMode: false });
+  context.updateComposer = () => context.updateRemoteFast();
+  const flush = () => new Promise(resolve => setImmediate(resolve));
+  return { context, control, attributes, reads, writes, notices, refreshes, flush };
+}
+
+test("服务模式 Fast 明确声明独立能力后可在执行中直接提交开关，不中断任务", async () => {
+  const { context, control, attributes, writes } = remoteFastHarness();
+  delete context.session.capabilities.serviceFastMode;
+
+  context.thread = { id: context.selectedId, model: context.model, status: { type: "active" } };
+  context.updateRemoteFast();
+  assert.equal(control.hidden, true, "未声明独立 Fast 能力的服务保持隐藏");
+  context.session.capabilities.serviceFastMode = true;
+  context.updateRemoteFast();
+  assert.equal(control.hidden, false);
+  assert.equal(control.disabled, false, "执行中不锁定未来轮次的 Fast 偏好");
+  const operation = context.toggleRemoteFast();
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].action, "setFast");
+  writes[0].resolve({ threadId: context.selectedId, model: context.model,
+    supported: true, enabled: true, effectiveFrom: "nextTurn" });
+  await operation;
+  assert.equal(attributes.get("aria-pressed"), "true");
+  assert.match(control.title, /本会话 Fast 已开启/);
+  assert.equal(context.thread.status.type, "active");
+});
+
+test("消息编辑和队列草稿都可直接切换 Fast，实际提交和回执待确认仍锁定", async () => {
+  for (const kind of ["message", "queue"]) {
+    const { context, control, writes } = remoteFastHarness();
+
+    context.session.capabilities.serviceFastMode = true;
+    context.thread = { id: context.selectedId, model: context.model, status: { type: "active" } };
+    context[kind === "queue" ? "editingQueuedMessage" : "editingMessage"] = { state: "editing" };
+    context.updateRemoteFast();
+    assert.equal(control.disabled, false, `${kind} 编辑标记不能禁用 Fast`);
+    const saved = context.toggleRemoteFast();
+    assert.equal(writes.length, 1);
+    writes[0].resolve({ threadId: context.selectedId, model: context.model, supported: true, enabled: true });
+    await saved;
+    for (const state of [{ busy: true }, { pending: { action: "editQueued" } }, { connected: false }]) {
+      Object.assign(context, { busy: false, pending: null, connected: true }, state);
+      context.updateRemoteFast();
+      assert.equal(control.disabled, true);
+    }
+  }
+});
+
+test("模型按钮允许编辑消息及队列草稿时选择，仅在编辑提交或回执待确认时锁定", () => {
+  const control = {};
+  const context = nodeVm.createContext({ nativeConnectionVersion: 1, $: () => control, sessionTypeEnabled: true,
+    threadReadOnly: () => false, deleting: false, serviceSideThread: () => false, active: true,
+    editingMessage: null, editingQueuedMessage: null, busy: false, stopping: false, pending: null, connected: true });
+  const gate = sourceSection('  $("#model-button").disabled =', '  $("#sidebar-view-toggle").disabled =');
+  for (const kind of ["none", "message", "queue", "side", "side-queue"]) {
+    context.serviceSideThread = () => kind.startsWith("side");
+    context.editingMessage = kind === "message" ? {} : null;
+    context.editingQueuedMessage = ["queue", "side-queue"].includes(kind) ? { state: "editing" } : null;
+    nodeVm.runInContext(gate, context);
+    assert.equal(control.disabled, false, `${kind} 状态仍可选择后续模型`);
+    if (["message", "queue", "side-queue"].includes(kind)) {
+      context.busy = true;
+      nodeVm.runInContext(gate, context);
+      assert.equal(control.disabled, true);
+      context.busy = false;
+    }
+  }
+});
+
+test("API 服务模式按实际 GPT 模型开放 Fast，缺失档位或旧否定标记不拦截，别名不向非 GPT 泄漏", () => {
+  const { context, control, attributes } = remoteFastHarness();
+
+  context.session.capabilities.serviceFastMode = true;
+  const allowed = [
+    { model: "gpt-6.1-sol" },
+    { model: "gpt-6.1-without-tiers", serviceTiers: [] },
+    { model: "gpt-6.1-old-denial", serviceTiers: [], fastModeSupported: false },
+    { model: "sol-alias", requestModel: "openai/GPT-6.1-sol", serviceTiers: [] },
+    { model: "sol-visible-name", id: "gpt-6.1-catalog-id", requestModel: "gpt-6.1-sol" },
+  ];
+  const denied = [
+    { model: "gpt-6.1-claude-alias", requestModel: "claude-opus", fastModeSupported: true },
+    { model: "unknown-alias", fastModeSupported: true, serviceTiers: [{ id: "priority" }] },
+    { model: "claude-opus", serviceTiers: [{ id: "priority" }] },
+  ];
+  context.models = [...allowed, ...denied];
+  context.modelDefaults.fastModelAliases = {
+    "API别名": "gpt-6.1-sol", "gpt-6.1-missing-alias": "claude-opus",
+  };
+  for (const model of allowed) {
+    context.model = model.model;
+    context.updateRemoteFast();
+    assert.equal(control.hidden, false);
+    assert.equal(control.disabled, false, model.model);
+    assert.equal(attributes.get("aria-pressed"), "false");
+  }
+  for (const name of ["gpt-6.1-catalog-id", "gpt-6.1-unlisted", "API别名"]) {
+    context.model = name;
+    context.updateRemoteFast();
+    assert.equal(control.disabled, false, "目录 ID、实际 GPT 名称和显式 GPT 别名均可使用");
+  }
+  context.rememberRemoteFastPreference(context.selectedId, true);
+  for (const name of [...denied.map(model => model.model), "gpt-6.1-missing-alias"]) {
+    context.model = name;
+    context.updateRemoteFast();
+    assert.equal(context.remoteFastState.supported, false, name);
+    assert.equal(control.hidden, true, "实际请求模型不支持时，即使保存过 Fast 偏好也隐藏按钮");
+    assert.equal(attributes.get("aria-pressed"), "false");
+    assert.match(control.title, /不是 GPT/);
+  }
+  context.model = allowed[0].model;
+  context.modelDefaults.fastModeAvailability = { available: false, reason: "管理员关闭 Fast" };
+  context.rememberRemoteFastPreference(context.selectedId, false);
+  context.updateRemoteFast();
+  assert.equal(control.disabled, true);
+  assert.match(control.title, /管理员/);
+});
+
+
+test("服务模式 Fast 被管理员禁用后仍可关闭旧偏好，不能再次开启", async () => {
+  const { context, control, writes } = remoteFastHarness();
+
+  context.session.capabilities.serviceFastMode = true;
+  context.rememberRemoteFastPreference(context.selectedId, true);
+  context.modelDefaults.fastModeAvailability = { available: false, reason: "管理员关闭 Fast" };
+  context.updateRemoteFast();
+  assert.equal(context.remoteFastState.supported, false);
+  assert.equal(control.disabled, false);
+  assert.match(control.title, /点击关闭本会话 Fast/);
+  const operation = context.toggleRemoteFast();
+  assert.equal(writes[0].payload.enabled, false, "只允许清除已保存偏好");
+  writes[0].resolve({ threadId: context.selectedId, model: context.model, supported: true, enabled: false });
+  await operation;
+  assert.equal(control.disabled, true);
+  await context.toggleRemoteFast();
+  assert.equal(writes.length, 1);
+});
+
+test("远程 Fast 只在保存确认后点亮，防止连点且迟到写入不改变新会话", async () => {
+  const h = remoteFastHarness(), { context, attributes, control, reads, writes } = h;
+  context.updateRemoteFast();
+  const first = context.toggleRemoteFast();
+  await context.toggleRemoteFast();
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].action, "setFast");
+  assert.equal(writes[0].payload.threadId, "thread-fast-a");
+  assert.equal(writes[0].payload.enabled, true);
+  assert.equal(attributes.get("aria-pressed"), "false", "请求开始不能冒充保存成功");
+  assert.equal(control.disabled, true);
+  context.selectedId = "thread-fast-b"; ++context.selectionVersion; context.updateRemoteFast();
+  writes[0].resolve({ threadId: "thread-fast-a", model: "gpt-6.1-sol", supported: true, enabled: true });
+  await first;
+  assert.equal(attributes.get("aria-pressed"), "false");
+  assert.equal(control.disabled, false);
+  const second = context.toggleRemoteFast();
+  writes[1].resolve({ threadId: "thread-fast-b", model: "gpt-6.1-sol", supported: true, enabled: true });
+  await second;
+  assert.equal(attributes.get("aria-pressed"), "true");
+  context.readOnly = true; context.updateRemoteFast();
+  assert.equal(control.disabled, true);
+  assert.equal(reads.length, 0);
+});
+
+test("远程新会话 Fast 默认关闭，草稿开关不修改其他原生会话或提前提交", async () => {
+  const h = remoteFastHarness(), { context, attributes, reads, writes } = h;
+  context.rememberRemoteFastPreference("thread-fast-a", true);
+  context.selectedId = null; context.creating = true; context.updateRemoteFast();
+  assert.equal(attributes.get("aria-pressed"), "false", "旧会话状态不能开启新草稿");
+  await context.toggleRemoteFast();
+  assert.equal(attributes.get("aria-pressed"), "true");
+  assert.equal(context.selectedDraftFast, true);
+  assert.equal(writes.length, 0);
+  await context.toggleRemoteFast();
+  assert.equal(attributes.get("aria-pressed"), "false");
+  assert.equal(reads.length, 0);
+});
+
+test("Fast 随原有会话展示复用，A→B→A 和新草稿均不重复读取模型能力", () => {
+  const h = remoteFastHarness(), { context, reads, attributes } = h;
+  context.rememberRemoteFastPreference("thread-fast-a", true);
+  context.updateRemoteFast();
+  context.selectedId = "thread-fast-b"; ++context.selectionVersion; context.updateRemoteFast();
+  context.selectedId = "thread-fast-a"; ++context.selectionVersion;
+  context.remoteFastState = null; context.updateRemoteFast();
+  assert.equal(reads.length, 0);
+  assert.equal(attributes.get("aria-pressed"), "true");
+  context.selectedId = null; context.creating = true; ++context.selectionVersion; context.updateRemoteFast();
+  assert.equal(reads.length, 0);
+  assert.equal(attributes.get("aria-pressed"), "false");
+});
+
+test("Fast 换模型只读取同一目录，非支持模型不能改写真实会话开关", async () => {
+  const h = remoteFastHarness(), { context, reads, writes, attributes } = h;
+  context.rememberRemoteFastPreference("thread-fast-a", true);
+  context.updateRemoteFast();
+  // 当前服务按真实 GPT 身份开放 Fast；不支持场景使用非 GPT，不能再用“缺少档位的 GPT”代替。
+  context.model = "claude-opus"; context.updateRemoteFast();
+  assert.equal(attributes.get("aria-pressed"), "false");
+  context.model = "gpt-6.1-sol"; context.updateRemoteFast();
+  assert.equal(attributes.get("aria-pressed"), "true");
+  context.model = "gpt-6.1-other"; context.updateRemoteFast();
+  const save = context.toggleRemoteFast();
+  writes[0].resolve({ threadId: context.selectedId, model: "gpt-6.1-other", supported: true, enabled: false });
+  await save;
+  context.model = "gpt-6.1-sol"; context.updateRemoteFast();
+  assert.equal(attributes.get("aria-pressed"), "false", "同一会话切回旧模型也使用最新关闭状态");
+  assert.equal(reads.length, 0);
+});
+
+test("Fast 不支持模型隐藏按钮且不能触发隐藏操作，切回后恢复会话及草稿偏好", async () => {
+  {
+    const { context, control, attributes, writes, reads } = remoteFastHarness();
+    context.rememberRemoteFastPreference(context.selectedId, true);
+    context.updateRemoteFast();
+    assert.equal(control.hidden, false);
+    assert.equal(attributes.get("aria-pressed"), "true");
+    context.model = "claude-opus"; context.updateRemoteFast();
+    assert.equal(control.hidden, true);
+    await context.toggleRemoteFast();
+    assert.equal(writes.length, 0, "隐藏按钮不能借用清除旧偏好的能力提交操作");
+    context.model = "gpt-6.1-sol"; context.updateRemoteFast();
+    assert.equal(control.hidden, false);
+    assert.equal(attributes.get("aria-pressed"), "true", "隐藏不改写当前会话保存的 Fast 偏好");
+    context.creating = true; context.selectedId = null; context.selectedDraftFast = true;
+    context.model = "claude-opus"; context.updateRemoteFast();
+    assert.equal(control.hidden, true);
+    await context.toggleRemoteFast();
+    assert.equal(context.selectedDraftFast, true);
+    context.model = "gpt-6.1-sol"; context.updateRemoteFast();
+    assert.equal(control.hidden, false);
+    assert.equal(attributes.get("aria-pressed"), "true", "草稿切回支持模型后恢复原选择");
+    assert.equal(reads.length, 0);
+    assert.equal(writes.length, 0);
+  }
+});
+
+test("Fast 复用目录的有效期，不另设更短的 TTL；会话详情未到时不猜测开关", () => {
+  const h = remoteFastHarness(), { context, reads, control, attributes } = h;
+  context.rememberRemoteFastPreference("thread-fast-a", true);
+  context.updateRemoteFast();
+  context.now += 300001; context.updateRemoteFast();
+  assert.equal(reads.length, 0);
+  assert.equal(control.disabled, false);
+  assert.equal(attributes.get("aria-pressed"), "true");
+  assert.equal(attributes.get("aria-busy"), "false");
+  assert.doesNotMatch(control.title, /正在读取/);
+  context.selectedId = "thread-fast-new"; context.updateRemoteFast();
+  assert.equal(control.disabled, true); assert.match(control.title, /正在读取会话设置/);
+  context.rememberThreadDisplay({ id: context.selectedId, fastMode: false });
+  context.updateRemoteFast();
+  assert.equal(control.disabled, false);
+  assert.equal(reads.length, 0);
+});
+
+test("Fast 保存中切走再切回仍等待同一写入，成功后更新会话详情", async () => {
+  const h = remoteFastHarness(), { context, reads, writes, control, attributes } = h;
+  context.updateRemoteFast();
+  const operation = context.toggleRemoteFast();
+  context.selectedId = "thread-fast-b"; ++context.selectionVersion; context.updateRemoteFast();
+  assert.equal(control.disabled, false);
+  context.selectedId = "thread-fast-a"; ++context.selectionVersion; context.remoteFastState = null;
+  context.updateRemoteFast();
+  assert.equal(control.disabled, true);
+  assert.match(control.title, /正在保存/);
+  assert.equal(reads.length, 0);
+  writes[0].resolve({ threadId: "thread-fast-a", model: "gpt-6.1-sol", supported: true, enabled: true });
+  await operation;
+  assert.equal(control.disabled, false);
+  assert.equal(attributes.get("aria-pressed"), "true");
+  assert.equal(reads.length, 0);
+  assert.equal(context.currentThreadDisplay().fastMode, true);
+});
+
+test("Fast 目录不跨授权、实例或运行模式，迟到保存也不能串用", async () => {
+  for (const change of ["device", "runtime", "instance"]) {
+    const h = remoteFastHarness(), { context, reads, control } = h;
+    context.updateRemoteFast();
+    const operation = context.toggleRemoteFast();
+    if (change === "device") context.session.device.id = "other-device";
+    else if (change === "runtime") ++context.nativeConnectionVersion;
+    else context.instanceId = "codex:wsl:test";
+    context.updateRemoteFast();
+    assert.equal(control.disabled, true);
+    h.writes[0].resolve({ threadId: "thread-fast-a", model: "gpt-6.1-sol", supported: true, enabled: true });
+    await operation;
+    assert.equal(control.disabled, true);
+    assert.equal(reads.length, 0);
+  }
+  const h = remoteFastHarness(), { context, writes, attributes } = h;
+  context.updateRemoteFast();
+  const readVersion = context.fastModeVersion;
+  const operation = context.toggleRemoteFast();
+  writes[0].resolve({ threadId: context.selectedId, model: "gpt-6.1-sol", supported: true, enabled: true });
+  await operation;
+  const delayed = context.reconcileRemoteFastPreference({ id: context.selectedId, fastMode: false }, readVersion);
+  context.rememberThreadDisplay(delayed); context.updateRemoteFast();
+  assert.equal(attributes.get("aria-pressed"), "true");
+  context.updateRemoteFast();
+  assert.equal(h.control.hidden, false, "同一实例支持的模型继续显示已确认 Fast 的关闭入口");
+});
+
+test("Fast 保存失败保留已确认开关，通过原模型目录和会话详情核对", async () => {
+  const h = remoteFastHarness(), { context, writes, attributes } = h;
+  context.updateRemoteFast();
+  const operation = context.toggleRemoteFast();
+  writes[0].reject(new Error("管理员已关闭 Fast"));
+  await operation; await h.flush();
+  assert.equal(attributes.get("aria-pressed"), "false");
+  assert.deepEqual(h.refreshes, ["models", "thread"]);
+  assert.deepEqual(h.notices, ["管理员已关闭 Fast"]);
+  assert.equal(h.reads.length, 0);
+});
+test("Claude 完整历史同步移除旧摘要轮次，迟到的历史响应不能复活摘要", async () => {
+  const id = "claude-00000000-0000-4000-8000-000000000001", summary = { id: "compact", _nativeUserId: "summary-native", items: [{ id: "summary-item" }] };
+  const turns = new Map([[summary.id, summary], ["real", { id: "real", _nativeUserId: "native-real", items: [] }], ["pending", { id: "pending", items: [] }]]);
+  const context = vm.createContext({ nativeConnectionVersion: 1, selectedId: id, turns, thread: { id }, messageVersion: 0, statusVersion: 0, queueVersion: 0,
+    notifiedStatus: null, notifiedQueue: null, notifiedQueueEdits: [],
+    turnVersions: new Map(), itemVersions: new Map(), partialItems: new Map(),
+    normalizeDisplayedTurnItems: value => value, enrichTurnTranscriptEvents: value => value,
+    reconcileSentMessageDisplays() {}, rememberThreadDisplay() {}, rememberTranscript() {}, updateComposer() {},
+    scheduleMessages() {}, scheduleSidebarRefresh() {}, markVisibleThreadRead: async () => {} });
+  let respond;
+  Object.assign(context, { document: { hidden: false }, performance, AbortController,
+    pageLeaving: false, foregroundReadGeneration: 0, selectionVersion: 1, historyCursor: null,
+    threadDeleted: () => false, transcriptChecking: false, historyInitialized: true,
+    syncHistoryButtons() {}, recordDiagnostic() {}, mergeTranscriptEvents() {},
+    syncEditableMessageMetadata() {}, renderMessages() {}, sideThreadExpired: () => false,
+    mergeHistoryTurn: value => turns.get(value.id) || value,
+    threadEphemeralState: () => false, isMissingThreadError: () => false, recoveryErrorSilenceDepth: 0,
+    api: () => new Promise(resolve => { respond = resolve; }), notice: message => assert.fail(message) });
+  vm.runInContext((sourceSection("async function readH", "function pru") + "\n" + sourceSection("function orderCl", "function mer")), context);
+  const oldRead = context.readHistoryPage(false, 1);
+  vm.runInContext(sourceSection("function receiveClaudeHistory(", "function receive(event)"), context);
+  context.params = { threadId: id, thread: { id, queuedMessages: [] }, turnIds: ["real"],
+    sessionPlan: [],
+    turns: [{ id: "real", _nativeUserId: "native-real", _nativeDone: true, items: [{ id: "reply", type: "agentMessage", text: "完成" }] }] };
+  vm.runInContext("receiveClaudeHistory(params)", context);
+  assert.equal(turns.has("compact"), false);
+  assert.equal(turns.has("pending"), true);
+  assert.equal(turns.get("real")._nativeDone, true);
+  assert.equal(context.turnVersions.get("compact"), 1, "删除版本保留，防止较早的历史请求复活摘要");
+  respond({ data: [summary, { id: "real", items: [] }], nextCursor: null,
+    sessionPlan: [{ step: "回退前的旧任务", status: "pending" }] });
+  await oldRead;
+  assert.equal(context.turns.has("compact"), false, "已删除摘要不能被通知之前发起的旧读取复活");
+  assert.equal(context.recentHistoryPage.turns.some(turn => turn.id === "compact"), false);
+  assert.deepEqual(Array.from(context.sessionPlan), [], "迟到历史不能复活正式快照已经清空的任务");
+});
+
+function claudeUsageHarness() {
+  const requests = [], timers = new Map(), nodes = [], visibility = [];
+  let tick = Date.parse("2026-11-12T08:00:00Z"), timerId = 0;
+  const makeElement = (tag, className = "", textContent = "") => ({
+    tag, className, textContent, dataset: {}, style: {}, attributes: {}, children: [], hidden: false, isConnected: true,
+    append(...values) { this.children.push(...values); },
+    replaceChildren(...values) { this.children = values; },
+    setAttribute(name, value) { this.attributes[name] = value; },
+    removeAttribute(name) { delete this.attributes[name]; },
+    hasAttribute(name) { return Object.hasOwn(this.attributes, name); },
+    remove() { this.isConnected = false; },
+  });
+  const trigger = makeElement("button");
+  let triggerHidden = trigger.hidden;
+  Object.defineProperty(trigger, "hidden", { get: () => triggerHidden,
+    set: value => { triggerHidden = value; visibility.push(value); } });
+  const context = nodeVm.createContext({ nativeConnectionVersion: 1,
+    claudeUsageState: null, connected: true, creating: false, selectedId: "claude-session",
+    thread: { id: "claude-session" }, session: { device: { id: "device-a", createdAtMs: 1 },
+      capabilities: { claudeSubscriptionUsage: true } },
+    instance: "claude:wsl:a", backend: "claude", enabled: true, pageLeaving: false, sidebar: null, displays: new Map(),
+    document: { hidden: false, activeElement: null, documentElement: { dataset: { inputModality: "pointer" } },
+      body: { append: node => nodes.push(node) } },
+    Date: class extends Date { static now() { return tick; } }, AbortController,
+    privateInputScope: value => JSON.stringify([value?.device?.id, value?.device?.createdAtMs]),
+    activeInstanceId: () => context.instance, isClaude: () => context.backend === "claude",
+    currentThreadDisplay: () => context.displays.get(context.selectedId) || null,
+    sessionInstanceEnabled: () => context.enabled,
+    $: selector => selector === "#claude-usage" ? trigger : null, element: makeElement,
+    icon: name => makeElement("span", `ui-icon ${name}`),
+    closePopup() {}, closeComposerMenus() {},
+    setTimeout(callback, delay) { const id = ++timerId; timers.set(id, { callback, delay }); return id; },
+    clearTimeout(id) { timers.delete(id); },
+    api(path, payload, id, signal, options) {
+      let resolve, reject;
+      const promise = new Promise((done, fail) => { resolve = done; reject = fail; });
+      requests.push({ path, payload, signal, options, resolve, reject });
+      return promise;
+    },
+  });
+  nodeVm.runInContext((sourceSection("function claudeUsageContext(") + (sourceSection("function composerMet", "function tok") + "\n" + sourceSection("function syncCom"))), context);
+  context.fitClaudeUsageTip = () => {};
+  const usage = (percent = 24) => ({ source: "claude-native-usage", observedAtMs: tick, subscriptionType: "max",
+    fiveHour: { usedPercentage: percent, resetsAt: new Date(tick + 2 * 3600000 + 18 * 60000).toISOString() },
+    sevenDay: { usedPercentage: 52, resetsAt: (tick + 3 * 86400000 + 6 * 3600000) / 1000 } });
+  return { context, trigger, timers, requests, nodes, visibility, usage, advance: milliseconds => { tick += milliseconds; } };
+}
+
+test("Claude 额度区分缺失、真实 0%、非法和过期窗口，秒数与 ISO 重置时间一致", () => {
+  const { context, usage, advance } = claudeUsageHarness();
+  assert.equal(context.claudeUsageWindows(null).length, 0);
+  let windows = context.claudeUsageWindows(usage(0));
+  assert.equal(windows.length, 2);
+  assert.equal(windows[0].used, 0);
+  assert.equal(windows[0].remaining, 100);
+  assert.equal(context.claudeUsageResetText(windows[0].resetAt), "2小时后");
+  assert.equal(context.claudeUsageResetText(windows[1].resetAt), "3天后");
+  for (const invalid of [-1, 101, NaN, Infinity, true, "24", null]) {
+    const value = usage();
+    value.fiveHour.usedPercentage = invalid;
+    assert.equal(context.claudeUsageWindows(value).length, 1);
+  }
+  for (const invalid of ["not-a-date", true, 1]) {
+    const value = usage(); value.fiveHour.resetsAt = invalid;
+    assert.equal(context.claudeUsageWindows(value).length, 1);
+  }
+  const value = usage(); value.fiveHour.resetsAt = null;
+  assert.equal(context.claudeUsageWindows(value).length, 2);
+  assert.equal(context.claudeUsageResetText(null), "时间未知");
+  const stale = usage();
+  advance(72 * 60 * 60 * 1000 + 1);
+  assert.equal(context.claudeUsageWindows(stale).length, 0, "后台停留超过 72 小时不能继续显示旧额度");
+  const expired = usage();
+  expired.fiveHour.resetsAt = "2026-11-12T08:00:00Z";
+  assert.equal(context.claudeUsageWindows(expired).length, 1, "窗口到期不能自动推断已用 0%");
+});
+
+test("Claude 首次读取前按满额显示，真实额度返回后立即替换", async () => {
+  const h = claudeUsageHarness(), flush = () => new Promise(resolve => setImmediate(resolve));
+  h.context.mountClaudeUsage(); h.context.syncClaudeUsage();
+  assert.equal(h.trigger.hidden, false);
+  assert.equal(h.trigger.children[1].children[1].textContent, "100%");
+  assert.match(h.trigger.attributes["aria-label"], /当前按满额显示/);
+  h.requests[0].resolve({ ok: true, backend: "claude", instanceId: h.context.instance, usage: h.usage() });
+  await flush();
+  assert.equal(h.trigger.children[1].children[1].textContent, "76%");
+  assert.doesNotMatch(h.trigger.attributes["aria-label"], /当前按满额显示/);
+});
+
+test("Claude 打开会话先显示电脑端保留额度，后台刷新时 5 秒复查，新数据到达后恢复一分钟周期", async () => {
+  const h = claudeUsageHarness(), flush = () => new Promise(resolve => setImmediate(resolve));
+  const retained = h.usage(40);
+  h.advance(2 * 3600000);
+  h.context.mountClaudeUsage(); h.context.syncClaudeUsage();
+  h.requests[0].resolve({ ok: true, backend: "claude", instanceId: h.context.instance, usage: retained, refreshing: true });
+  await flush();
+  assert.equal(h.trigger.children[1].children[1].textContent, "60%", "打开会话立即显示保留结果，不等待 CLI");
+  assert.equal(h.context.claudeUsageState.value.observedAtMs, retained.observedAtMs, "保留结果沿用原采集时间");
+  assert.ok([...h.timers.values()].some(timer => timer.delay === 5005), "电脑端后台刷新期间 5 秒后复查");
+  h.advance(4000); h.context.syncClaudeUsage();
+  assert.equal(h.requests.length, 1, "复查间隔内不重复读取");
+  h.advance(1000); h.context.syncClaudeUsage();
+  assert.equal(h.requests.length, 2);
+  h.requests[1].resolve({ ok: true, backend: "claude", instanceId: h.context.instance, usage: h.usage(30) });
+  await flush();
+  assert.equal(h.trigger.children[1].children[1].textContent, "70%", "复查拿到新数据后立即替换");
+  assert.ok([...h.timers.values()].some(timer => timer.delay === 60005), "新数据到达后恢复一分钟刷新周期");
+  h.advance(5000); h.context.syncClaudeUsage();
+  assert.equal(h.requests.length, 2, "未标记刷新时不提前读取");
+  h.advance(55000); h.context.syncClaudeUsage();
+  h.requests[2].reject(new Error("临时网络失败")); await flush();
+  assert.equal(h.context.claudeUsageState.refreshing, false, "请求失败不按刷新在途提前复查");
+});
+
+test("Claude 额度按授权和实例隔离，切换后拒绝迟到响应，停用或后台页面不读取", async () => {
+  const { context, trigger, requests, timers, usage } = claudeUsageHarness();
+  const flush = () => new Promise(resolve => setImmediate(resolve));
+  context.syncClaudeUsage();
+  for (let index = 0; index < 5; index++) context.syncClaudeUsage();
+  assert.equal(requests.length, 1, "输入框反复更新不重复读取");
+  assert.equal(requests[0].path, "/api/read/claudeUsage");
+  assert.equal(requests[0].payload.instanceId, "claude:wsl:a");
+  assert.equal(requests[0].options.resourcePriority, "background");
+  context.instance = "claude:wsl:b";
+  context.syncClaudeUsage();
+  assert.equal(requests[0].signal.aborted, true);
+  requests[1].resolve({ ok: true, backend: "claude", instanceId: "claude:wsl:b", usage: usage(52) });
+  await flush();
+  requests[0].resolve({ ok: true, backend: "claude", instanceId: "claude:wsl:a", usage: usage(99) });
+  await flush();
+  assert.equal(context.claudeUsageState.value.fiveHour.usedPercentage, 52);
+  assert.equal(trigger.hidden, false);
+  assert.equal(timers.size, 1);
+  context.session.device.createdAtMs = 2;
+  context.syncClaudeUsage();
+  assert.equal(trigger.hidden, false, "重新授权先按满额占位，不能沿用旧账号快照");
+  assert.equal(requests.length, 3);
+  context.document.hidden = true;
+  context.syncClaudeUsage();
+  assert.equal(requests[2].signal.aborted, true);
+  assert.equal(timers.size, 0);
+  assert.equal(context.claudeUsageState, null);
+  context.document.hidden = false;
+  context.backend = "codex";
+  context.syncClaudeUsage();
+  assert.equal(requests.length, 3);
+  context.backend = "claude"; context.enabled = false;
+  context.syncClaudeUsage();
+  assert.equal(requests.length, 3);
+});
+
+test("Claude 额度详情仅点击开关，悬停和聚焦不展开，数据失效时关闭浮层", async () => {
+  const { context, trigger, requests, nodes, usage, advance } = claudeUsageHarness();
+  context.mountClaudeUsage();
+  context.syncClaudeUsage();
+  requests[0].resolve({ ok: true, backend: "claude", instanceId: "claude:wsl:a", usage: usage() });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(trigger.attributes["aria-label"], /5 小时剩余 76%.*7 天剩余 48%/);
+  assert.equal(trigger.children[0].textContent, "剩余");
+  assert.equal(trigger.children[1].children[1].textContent, "76%");
+  assert.equal(trigger.children[3].children[1].textContent, "48%");
+  trigger.onpointerenter?.({ pointerType: "touch" });
+  assert.equal(nodes.length, 0);
+  trigger.onpointerenter?.({ pointerType: "mouse" });
+  context.document.documentElement.dataset.inputModality = "keyboard";
+  trigger.onfocus?.();
+  assert.equal(nodes.length, 0, "悬停和键盘聚焦均不展开额度详情");
+  assert.equal(requests.length, 1, "未点击前不读取本地统计");
+  trigger.onclick();
+  assert.equal(nodes.length, 1);
+  assert.equal(trigger.attributes["aria-expanded"], "true");
+  assert.equal(nodes[0].children[0].children[0].textContent, "账号信息");
+  assert.equal(nodes[0].children[0].children[1].textContent, "Max");
+  const first = nodes[0].children[1];
+  assert.equal(first.children[0].children[1].textContent, "剩余 76%");
+  assert.equal(first.children[1].children[0].style.width, "76%");
+  assert.equal(first.children[2].children[1].textContent, "2小时后");
+  assert.equal(requests[1].payload.includeLocal, true, "仅打开弹窗时加载本地统计");
+  trigger.onpointerleave?.();
+  nodes[0].onpointerleave?.();
+  trigger.onblur?.();
+  assert.equal(context.claudeUsageState.tip.node, nodes[0], "鼠标离开和失焦不关闭已点击展开的弹层");
+  trigger.onclick();
+  assert.equal(trigger.attributes["aria-expanded"], "false");
+  assert.equal(requests[1].signal.aborted, true, "关闭弹窗取消客户端读取");
+  assert.equal(nodes[0].isConnected, false);
+  trigger.onclick();
+  advance(72 * 60 * 60 * 1000 + 1);
+  context.renderClaudeUsage();
+  assert.equal(trigger.hidden, true);
+  assert.equal(context.claudeUsageState.tip, null);
+});
+
+test("Claude 额度弹层的重置时间使用目标 WSL 时区，不退回浏览器本地时区", async () => {
+  const h = claudeUsageHarness(), value = h.usage();
+  value.timeZone = "America/Los_Angeles";
+  h.context.mountClaudeUsage(); h.context.syncClaudeUsage();
+  h.requests[0].resolve({ ok: true, backend: "claude", instanceId: h.context.instance, usage: value });
+  await new Promise(resolve => setImmediate(resolve));
+  h.trigger.onclick();
+  for (const section of h.nodes[0].children.slice(1, 3)) {
+    const reset = section.children[2].children[1];
+    assert.match(reset.title, /America\/Los_Angeles/);
+    assert.match(reset.title, /\d{4}\/\d{2}\/\d{2}/, "hover 必须显示完整年月日");
+    assert.match(reset.title, /\d{2}:\d{2}/, "5 小时和 7 天窗口都必须显示具体时分");
+    assert.match(reset.attributes["aria-label"], /重置时间：/);
+  }
+
+  const invalidHarness = claudeUsageHarness(), invalid = invalidHarness.usage();
+  invalid.timeZone = "PST8PDT";
+  invalidHarness.context.mountClaudeUsage(); invalidHarness.context.syncClaudeUsage();
+  invalidHarness.requests[0].resolve({
+    ok: true, backend: "claude", instanceId: invalidHarness.context.instance, usage: invalid
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  invalidHarness.trigger.onclick();
+  assert.equal(invalidHarness.nodes[0].children[1].children[2].children[1].title, "目标 WSL 时区未知");
+});
+
+test("Claude 本地详情独立加载，不替换原生百分比，并按窗口校验金额和预估总额度", async () => {
+  const { context, trigger, requests, nodes, usage, advance } = claudeUsageHarness();
+  const flush = () => new Promise(resolve => setImmediate(resolve));
+  context.mountClaudeUsage(); context.syncClaudeUsage();
+  requests[0].resolve({ ok: true, backend: "claude", instanceId: context.instance, usage: usage() });
+  await flush();
+  assert.equal(requests.length, 1, "默认入口不扫描日志");
+  trigger.onclick();
+  const response = usage(99), reset = Date.parse(response.fiveHour.resetsAt);
+  response.fiveHour.metrics = { source: "claude-wsl-local-journal", observedAtMs: context.Date.now(),
+    windowStartMs: reset - 18000000, windowEndMs: reset,
+    // 兼容旧后台仍返回时间预测的情况：页面必须忽略它，按原生 24% 反推总额度。
+    usedCostUsd: 12.84, usedTokens: 684200, forecastCostUsd: 18.60, forecastTokens: 991100 };
+  requests[1].resolve({ ok: true, backend: "claude", instanceId: context.instance, usage: response });
+  await flush();
+  assert.equal(context.claudeUsageState.value.fiveHour.usedPercentage, 24);
+  const metric = nodes[0].children[1].children[2].children[0].children;
+  assert.equal(metric[0].children[1].textContent, "$12.84");
+  assert.equal(metric[0].children[3].textContent, "684.2k");
+  assert.equal(metric[1].children[1].textContent, "$53.50");
+  assert.equal(metric[1].children[3].textContent, "2.85M");
+  assert.match(metric[1].title, /预估总额度/);
+  assert.match(metric[1].attributes["aria-label"], /预估总额度/);
+  const windows = context.claudeUsageWindows(context.claudeUsageState.value);
+  assert.equal(context.claudeUsageMetrics(windows[0]).usedTokens, 684200);
+  context.claudeUsageState.details.value.fiveHour.windowEndMs++;
+  assert.equal(context.claudeUsageMetrics(windows[0]), null, "不能复用上一额度窗口的数字");
+  context.claudeUsageState.details.value.fiveHour.windowEndMs--;
+  advance(72 * 60 * 60 * 1000 + 1);
+  assert.equal(context.claudeUsageMetrics(windows[0]), null, "不显示过期本地数据");
+  for (const invalid of [null, undefined, NaN, Infinity, -1, true, "100", 1e20])
+    assert.equal(context.claudeUsageCompact(invalid), "—");
+  assert.equal(context.claudeUsageCompact(0, true), "$0.00");
+  assert.equal(context.claudeUsageCompact(7900000), "7.90M");
+  assert.equal(context.claudeUsageResetText(context.Date.now() + 25 * 60000), "25分钟后");
+});
+
+test("Claude 预估总额度按未取整的原生已用比例反推，零值和缺失比例保持未知", () => {
+  const { context, usage } = claudeUsageHarness();
+  const estimate = context.claudeUsageEstimatedTotal, format = context.claudeUsageCompact;
+  assert.equal(format(estimate(28.34, 12), true), "$236.17");
+  assert.equal(format(estimate(42530000, 12)), "354.42M");
+  const [window] = context.claudeUsageWindows(usage(12.4));
+  assert.equal(window.used, 12);
+  assert.equal(window.usedPercentage, 12.4);
+  assert.equal(format(estimate(28.34, window.usedPercentage), true), "$228.55");
+  assert.equal(format(estimate(42530000, window.usedPercentage)), "342.98M");
+  assert.equal(estimate(28.34, 100), 28.34);
+  assert.equal(estimate(0, 12), 0);
+  for (const percent of [0, null, undefined, -1, 101, NaN, Infinity, true, "12"])
+    assert.equal(estimate(28.34, percent), null);
+  for (const used of [null, undefined, -1, NaN, Infinity, true, "28.34"])
+    assert.equal(estimate(used, 12), null);
+  assert.equal(estimate(Number.MAX_SAFE_INTEGER, .01), null);
+});
+
+test("Claude 详情关闭、实例和授权切换时忽略迟到结果，失败只影响本地数字", async () => {
+  const { context, trigger, requests, usage } = claudeUsageHarness();
+  const flush = () => new Promise(resolve => setImmediate(resolve));
+  context.mountClaudeUsage(); context.syncClaudeUsage();
+  requests[0].resolve({ ok: true, backend: "claude", instanceId: context.instance, usage: usage() });
+  await flush();
+  trigger.onclick(); trigger.onclick();
+  requests[1].resolve({ ok: true, backend: "claude", instanceId: context.instance, usage: usage() });
+  await flush();
+  assert.equal(context.claudeUsageState.details, null, "已关闭的弹窗不接受迟到数字");
+  assert.equal(trigger.hidden, false);
+  trigger.onclick();
+  requests[2].resolve({ ok: false });
+  await flush();
+  assert.equal(context.claudeUsageState.value.fiveHour.usedPercentage, 24);
+  assert.equal(context.claudeUsageState.details, null);
+  trigger.onclick(); trigger.onclick();
+  assert.equal(requests.length, 3, "详情失败同样缓存一分钟，反复点击不重复扫描");
+  context.instance = "claude:wsl:other";
+  context.syncClaudeUsage();
+  assert.equal(context.claudeUsageState.details, null);
+  assert.equal(trigger.hidden, false, "切换到新实例时先显示满额占位");
+  assert.equal(context.claudeUsageState.value, null);
+});
+
+function claudeUsageWithMetrics(h, value = h.usage(), tokens = 684200) {
+  return { ...value, ...Object.fromEntries(["fiveHour", "sevenDay"].map(key => {
+    const window = value[key], end = typeof window.resetsAt === "string" ? Date.parse(window.resetsAt)
+      : window.resetsAt * (window.resetsAt < 1e12 ? 1000 : 1);
+    return [key, { ...window, metrics: { source: "claude-wsl-local-journal", observedAtMs: h.context.Date.now(),
+      windowStartMs: end - (key === "fiveHour" ? 18000000 : 604800000), windowEndMs: end,
+      usedCostUsd: 12.84, usedTokens: tokens } }];
+  })) };
+}
+
+test("Claude 额度弹窗首帧显示普通读取携带的缓存详情，新鲜数据不额外扫描", async () => {
+  const h = claudeUsageHarness();
+  h.context.mountClaudeUsage(); h.context.syncClaudeUsage();
+  h.requests[0].resolve({ ok: true, backend: "claude", instanceId: h.context.instance, usage: claudeUsageWithMetrics(h) });
+  await new Promise(resolve => setImmediate(resolve));
+  h.trigger.onclick();
+  const metric = h.nodes[0].children[1].children[2].children[0].children[0].children;
+  assert.equal(metric[1].textContent, "$12.84", "打开时即显示缓存金额，无需等待详情响应");
+  assert.equal(metric[3].textContent, "684.2k");
+  const forecast = h.nodes[0].children[1].children[2].children[0].children[1].children;
+  assert.equal(forecast[1].textContent, "$53.50", "预测也直接使用缓存数字与原生比例计算");
+  assert.equal(forecast[3].textContent, "2.85M");
+  assert.equal(h.requests.length, 1, "普通读取已携带新鲜详情时不再发起本地扫描");
+});
+
+test("Claude 底部按原生剩余比例取整，零和满额仍显示真实值，预测继续采用原生已用比例", async () => {
+  for (const [used, remaining] of [[0, 100], [100, 0], [24.5, 76], [99.9, 0], [12.4, 88]]) {
+    const h = claudeUsageHarness();
+    h.context.syncClaudeUsage();
+    h.requests[0].resolve({ ok: true, backend: "claude", instanceId: h.context.instance, usage: h.usage(used) });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.trigger.hidden, false);
+    assert.equal(h.trigger.children[0].textContent, "剩余");
+    assert.equal(h.trigger.children[1].children[1].textContent, `${remaining}%`);
+    assert.equal(h.context.claudeUsageWindows(h.context.claudeUsageState.value)[0].usedPercentage, used);
+  }
+});
+
+test("Claude 切换实例会话在详情未到时直接渲染各自缓存，不经过隐藏和占位也不提前扫描", async () => {
+  const h = claudeUsageHarness(), c = h.context, flush = () => new Promise(resolve => setImmediate(resolve));
+  c.mountClaudeUsage(); c.syncClaudeUsage();
+  h.requests[0].resolve({ ok: true, backend: "claude", instanceId: c.instance, usage: claudeUsageWithMetrics(h) });
+  await flush();
+  c.selectedId = "claude-b"; c.thread = { id: c.selectedId }; c.instance = "claude:wsl:b";
+  c.syncClaudeUsage();
+  h.requests[1].resolve({ ok: true, backend: "claude", instanceId: c.instance,
+    usage: claudeUsageWithMetrics(h, h.usage(52), 900000) });
+  await flush();
+  for (const [id, instanceId, remaining, tokens] of [
+    ["claude-a", "claude:wsl:a", "76%", "684.2k"], ["claude-b", "claude:wsl:b", "48%", "900.0k"],
+  ]) {
+    c.selectedId = id; c.thread = null;
+    c.displays.set(id, { id, backend: "claude", instanceId });
+    h.visibility.length = 0;
+    c.syncClaudeUsage();
+    assert.equal(h.trigger.hidden, false);
+    assert.equal(h.visibility.includes(true), false, "目标有缓存时不能先隐藏控件");
+    assert.equal(h.trigger.children[1].children[1].textContent, remaining);
+    h.trigger.onclick();
+    const content = h.nodes.at(-1);
+    assert.equal(content.children[0].children[0].textContent, "账号信息");
+    assert.equal(content.children[1].children[2].children[0].children[0].children[3].textContent, tokens);
+    assert.doesNotMatch(content.children[1].children[2].children[0].children[1].attributes["aria-label"], /—/);
+    assert.equal(h.requests.length, 2, "会话详情未就绪时只展示目标缓存，不启动额度或日志读取");
+    h.trigger.onclick();
+  }
+  c.displays.clear();
+  c.sidebar = { projects: [{ threads: [{ id: "claude-a", backend: "claude", instanceId: "claude:wsl:a" }] }] };
+  c.selectedId = "claude-a"; c.backend = "codex"; c.instance = "codex:local";
+  h.visibility.length = 0; c.syncClaudeUsage();
+  assert.equal(h.trigger.children[1].children[1].textContent, "76%", "侧栏已确认的目标身份也可恢复缓存");
+  assert.equal(h.visibility.includes(true), false);
+  c.selectedId = "claude-no-identity"; c.syncClaudeUsage();
+  assert.equal(h.trigger.hidden, true, "没有明确实例身份时不能借用上一会话或默认实例缓存");
+});
+
+test("Claude 缓存展示在连接暂停时保留，旧请求取消后迟到不能覆盖重连结果", async () => {
+  const h = claudeUsageHarness(), c = h.context, flush = () => new Promise(resolve => setImmediate(resolve));
+  c.syncClaudeUsage();
+  const cached = claudeUsageWithMetrics(h);
+  h.requests[0].resolve({ ok: true, backend: "claude", instanceId: c.instance, usage: cached }); await flush();
+  h.advance(61000); c.syncClaudeUsage();
+  c.connected = false; h.visibility.length = 0; c.syncClaudeUsage();
+  assert.equal(h.requests[1].signal.aborted, true);
+  assert.equal(h.visibility.includes(true), false);
+  assert.equal(h.trigger.children[1].children[1].textContent, "76%");
+  c.connected = true; c.syncClaudeUsage();
+  assert.equal(h.requests.length, 3, "恢复连接后只补一次后台读取");
+  h.requests[1].resolve({ ok: true, backend: "claude", instanceId: c.instance, usage: h.usage(99) }); await flush();
+  assert.equal(h.trigger.children[1].children[1].textContent, "76%", "已取消的旧请求不能改写缓存");
+  h.requests[2].resolve({ ok: true, backend: "claude", instanceId: c.instance,
+    usage: { ...cached, observedAtMs: c.Date.now(), fiveHour: { ...cached.fiveHour, usedPercentage: 30 } } }); await flush();
+  assert.equal(h.trigger.children[1].children[1].textContent, "70%");
+});
+
+test("Claude 空额度响应保留仍有效缓存且不刷新采集时间，过期后不会复活", async () => {
+  const h = claudeUsageHarness(), c = h.context, flush = () => new Promise(resolve => setImmediate(resolve));
+  c.mountClaudeUsage(); c.syncClaudeUsage();
+  h.requests[0].resolve({ ok: true, backend: "claude", instanceId: c.instance, usage: claudeUsageWithMetrics(h) }); await flush();
+  const observed = c.claudeUsageState.value.observedAtMs;
+  h.advance(61000); c.syncClaudeUsage();
+  h.requests[1].resolve({ ok: true, backend: "claude", instanceId: c.instance, usage: null }); await flush();
+  assert.equal(h.trigger.hidden, false);
+  assert.equal(c.claudeUsageState.value.observedAtMs, observed);
+  h.trigger.onclick();
+  assert.equal(h.nodes.at(-1).children[1].children[2].children[0].children[0].children[3].textContent, "684.2k");
+  h.advance(72 * 60 * 60 * 1000 + 1); c.renderClaudeUsage();
+  assert.equal(h.trigger.hidden, true);
+  assert.equal(c.claudeUsageState.tip, null);
+});
+
+test("Claude 使用和预测单项先保留缓存，部分新数据不抹除金额", async () => {
+  const h = claudeUsageHarness(), c = h.context, flush = () => new Promise(resolve => setImmediate(resolve));
+  const initial = claudeUsageWithMetrics(h), oldAt = c.Date.now();
+  c.mountClaudeUsage(); c.syncClaudeUsage();
+  h.requests[0].resolve({ ok: true, backend: "claude", instanceId: c.instance, usage: initial }); await flush();
+  h.advance(61000); c.syncClaudeUsage();
+  const partial = claudeUsageWithMetrics(h, { ...initial, observedAtMs: c.Date.now() }, 700000);
+  partial.fiveHour.metrics.usedCostUsd = null;
+  h.requests[1].resolve({ ok: true, backend: "claude", instanceId: c.instance, usage: partial }); await flush();
+  h.trigger.onclick();
+  const stats = h.nodes.at(-1).children[1].children[2].children[0].children;
+  assert.equal(stats[0].children[1].textContent, "$12.84");
+  assert.equal(stats[0].children[3].textContent, "700.0k");
+  assert.equal(stats[1].children[1].textContent, "$53.50");
+  assert.equal(stats[1].children[3].textContent, "2.92M");
+  assert.equal(c.claudeUsageState.details.value.fiveHour.costObservedAtMs, oldAt);
+  assert.equal(c.claudeUsageState.details.value.fiveHour.tokensObservedAtMs, c.Date.now());
+  h.advance(120001);
+  const window = c.claudeUsageWindows(c.claudeUsageState.value)[0], metrics = c.claudeUsageMetrics(window);
+  assert.equal(metrics.usedCostUsd, 12.84, "72 小时缓存内保留旧金额");
+  assert.equal(metrics.usedTokens, 700000);
+});
+
+test("Claude 缓存到期时刷新仍在等待则显示满额占位，不因在途请求延长旧快照", async () => {
+  const h = claudeUsageHarness(), c = h.context;
+  c.syncClaudeUsage();
+  h.requests[0].resolve({ ok: true, backend: "claude", instanceId: c.instance, usage: claudeUsageWithMetrics(h) });
+  await new Promise(resolve => setImmediate(resolve));
+  h.advance(150000); c.syncClaudeUsage();
+  assert.equal(c.claudeUsageState.pending, true);
+  const resetDelay = 2 * 60 * 60 * 1000 + 18 * 60 * 1000 - 150000 + 5;
+  assert.ok([...h.timers.values()].some(timer => timer.delay === resetDelay),
+    "后台刷新期间仍须保留窗口重置计时");
+  h.advance(72 * 60 * 60 * 1000 - 150000 + 1);
+  c.renderClaudeUsage();
+  assert.equal(h.trigger.hidden, false);
+  assert.equal(h.trigger.children[1].children[1].textContent, "100%");
+  assert.equal(h.requests.length, 2, "失效检查不能在旧请求等待时另起并发查询");
+});
+
+test("Claude 订阅等级按效果图紧随标题，缺失和非法值不渲染任何占位或额外说明", async () => {
+  for (const [type, label] of [["max", "Max"], ["pro", "Pro"], ["team", "Team"], ["enterprise", "Enterprise"],
+    ["max_5x", "Max_5x"], [null, null], [undefined, null], ["", null], ["<b>max</b>", null], ["x".repeat(65), null]]) {
+    const h = claudeUsageHarness(), value = h.usage();
+    if (type === undefined) delete value.subscriptionType;
+    else value.subscriptionType = type;
+    h.context.mountClaudeUsage(); h.context.syncClaudeUsage();
+    h.requests[0].resolve({ ok: true, backend: "claude", instanceId: h.context.instance, usage: value });
+    await new Promise(resolve => setImmediate(resolve));
+    h.trigger.onclick();
+    const header = h.nodes[0].children[0];
+    assert.equal(header.children[0].textContent, "账号信息");
+    assert.equal(header.children.length, label ? 2 : 1);
+    if (label) {
+      assert.equal(header.children[1].className, "claude-usage-subscription");
+      assert.equal(header.children[1].textContent, label);
+      assert.equal(header.children[1].attributes["aria-label"], `订阅等级：${label}`);
+    }
+    assert.equal(h.nodes[0].children.length, 3, "只保留标题及两个额度窗口，缺少等级时不添加提示块");
+    assert.equal(h.nodes[0].children[1].children[0].children[1].textContent, "剩余 76%");
+  }
+});
+
+test("Claude 额度弹窗顶部显示当前实例的登录邮箱", async () => {
+  const h = claudeUsageHarness(), value = h.usage();
+  value.accountEmail = "sarahconnor@meiguoup.com";
+  h.context.mountClaudeUsage(); h.context.syncClaudeUsage();
+  h.requests[0].resolve({ ok: true, backend: "claude", instanceId: h.context.instance, usage: value });
+  await new Promise(resolve => setImmediate(resolve));
+  h.trigger.onclick();
+  const header = h.nodes[0].children[0];
+  assert.deepEqual(header.children.map(node => node.className),
+    ["claude-usage-title-text", "claude-usage-account-toggle", "claude-usage-subscription"]);
+  assert.equal(header.children[0].textContent, "sar***@meiguoup.com");
+  assert.equal(header.children[0].title, "sar***@meiguoup.com");
+  assert.match(h.trigger.attributes["aria-label"], /登录账号 sar\*\*\*@meiguoup\.com/);
+  assert.doesNotMatch(h.trigger.attributes["aria-label"], /sarahconnor/);
+  assert.equal(h.context.claudeUsageMaskAccount("ab@example.com"), "ab***@example.com");
+  const reveal = header.children[1];
+  const css = await readFile(new URL("../assets/harness/style.css", import.meta.url), "utf8");
+  assert.match(css, /\.claude-usage-title-text\{[^}]*flex:0 1 auto/);
+  assert.match(css, /\.claude-usage-subscription\{[^}]*margin-left:auto/);
+  assert.equal(reveal.className, "claude-usage-account-toggle");
+  assert.equal(reveal.children[0].className, "ui-icon eye");
+  assert.equal(reveal.attributes["aria-label"], "显示完整邮箱");
+  assert.equal(reveal.attributes["aria-pressed"], "false");
+  reveal.onclick();
+  assert.equal(header.children[0].textContent, "sarahconnor@meiguoup.com");
+  assert.equal(header.children[0].title, "sarahconnor@meiguoup.com");
+  assert.equal(reveal.children[0].className, "ui-icon eyeOff");
+  assert.equal(reveal.attributes["aria-label"], "隐藏完整邮箱");
+  assert.equal(reveal.attributes["aria-pressed"], "true");
+  reveal.onclick();
+  assert.equal(header.children[0].textContent, "sar***@meiguoup.com");
+  h.trigger.onclick(); h.trigger.onclick();
+  assert.equal(h.nodes.at(-1).children[0].children[0].textContent, "sar***@meiguoup.com",
+    "关闭再打开必须恢复默认脱敏");
+
+  const invalidHarness = claudeUsageHarness(), invalid = invalidHarness.usage();
+  invalid.accountEmail = "<b>invalid</b>";
+  invalidHarness.context.mountClaudeUsage(); invalidHarness.context.syncClaudeUsage();
+  invalidHarness.requests[0].resolve({ ok: true, backend: "claude", instanceId: invalidHarness.context.instance, usage: invalid });
+  await new Promise(resolve => setImmediate(resolve));
+  invalidHarness.trigger.onclick();
+  assert.equal(invalidHarness.nodes.at(-1).children[0].children[0].textContent, "账号信息",
+    "异常邮箱不能直接进入标题");
+  assert.equal(invalidHarness.nodes.at(-1).children[0].children.some(child => child.className === "claude-usage-account-toggle"), false);
+});
+
+test("Claude 等级随实例缓存恢复并跟随新响应更新，未返回时不沿用旧等级", async () => {
+  const h = claudeUsageHarness(), flush = () => new Promise(resolve => setImmediate(resolve));
+  const respond = (index, type) => h.requests[index].resolve({ ok: true, backend: "claude", instanceId: h.context.instance,
+    usage: { ...claudeUsageWithMetrics(h), subscriptionType: type } });
+  h.context.mountClaudeUsage(); h.context.syncClaudeUsage(); respond(0, "max"); await flush();
+  h.context.resetClaudeUsage(); h.context.syncClaudeUsage(); h.trigger.onclick();
+  assert.equal(h.nodes.at(-1).children[0].children[1].textContent, "Max");
+  assert.equal(h.requests.length, 1, "等级随真实额度快照缓存，不另启查询");
+  h.advance(61000); h.context.syncClaudeUsage(); respond(1, "pro"); await flush();
+  assert.equal(h.nodes.at(-1).children[0].children[1].textContent, "Pro");
+  h.advance(61000); h.context.syncClaudeUsage(); respond(2, null); await flush();
+  assert.equal(h.nodes.at(-1).children[0].children.length, 1, "新结果没有等级就隐藏，不能继续显示旧 Max/Pro");
+  assert.equal(h.trigger.hidden, false, "等级缺失不影响有效额度");
+  h.context.instance = "claude:wsl:another"; h.context.syncClaudeUsage();
+  assert.equal(h.context.claudeUsageState.value, null, "另一实例不能显示旧等级缓存");
+});
+
+test("Claude 额度缓存跨同实例会话、前后台和实例往返复用，重新授权立即隔离", async () => {
+  const h = claudeUsageHarness(), flush = () => new Promise(resolve => setImmediate(resolve));
+  h.context.mountClaudeUsage(); h.context.syncClaudeUsage();
+  h.requests[0].resolve({ ok: true, backend: "claude", instanceId: h.context.instance, usage: claudeUsageWithMetrics(h) });
+  await flush();
+  h.context.resetClaudeUsage();
+  h.context.selectedId = "another-claude-session"; h.context.thread.id = h.context.selectedId;
+  h.context.syncClaudeUsage(); h.trigger.onclick();
+  assert.equal(h.context.claudeUsageState.value.fiveHour.usedPercentage, 24);
+  assert.equal(h.requests.length, 1, "切换同实例会话不丢失账号缓存");
+  h.context.document.hidden = true; h.context.syncClaudeUsage();
+  assert.equal(h.context.claudeUsageState, null);
+  h.context.document.hidden = false; h.context.syncClaudeUsage(); h.trigger.onclick();
+  assert.equal(h.context.claudeUsageMetrics(h.context.claudeUsageWindows(h.context.claudeUsageState.value)[0]).usedTokens, 684200);
+  assert.equal(h.requests.length, 1, "回到前台先使用缓存，不重复请求");
+  h.context.instance = "claude:wsl:b"; h.context.syncClaudeUsage();
+  assert.equal(h.trigger.hidden, false, "另一实例先按满额占位，不能显示旧实例缓存");
+  h.context.instance = "claude:wsl:a"; h.context.syncClaudeUsage(); h.trigger.onclick();
+  assert.equal(h.requests[1].signal.aborted, true);
+  assert.equal(h.context.claudeUsageState.details.value.fiveHour.usedTokens, 684200);
+  assert.equal(h.requests.length, 2, "切回实例立即恢复已缓存详情");
+  h.context.session.device.createdAtMs = 2; h.context.syncClaudeUsage();
+  assert.equal(h.trigger.hidden, false, "重新授权先按满额占位，不能恢复旧账号缓存");
+  assert.equal(h.context.claudeUsageState.details, null, "重新授权不能恢复上一授权的数字");
+});
+
+test("Claude 额度刷新期间与失败后保留有效缓存，并按原采集时间失效和退避", async () => {
+  const h = claudeUsageHarness(), flush = () => new Promise(resolve => setImmediate(resolve));
+  h.context.mountClaudeUsage(); h.context.syncClaudeUsage();
+  h.requests[0].resolve({ ok: true, backend: "claude", instanceId: h.context.instance, usage: claudeUsageWithMetrics(h) });
+  await flush();
+  h.advance(61000); h.trigger.onclick();
+  assert.equal(h.requests.length, 2, "缓存到期后后台刷新原生额度");
+  assert.equal(h.nodes[0].children[1].children[2].children[0].children[0].children[3].textContent, "684.2k");
+  h.requests[1].reject(new Error("临时网络失败")); await flush();
+  assert.equal(h.trigger.hidden, false, "网络失败不能清空仍有效的百分比");
+  assert.equal(h.context.claudeUsageState.details.value.fiveHour.usedTokens, 684200);
+  assert.equal(h.requests.length, 3, "展开后的详情独立刷新");
+  h.requests[2].reject(new Error("本地详情暂不可用")); await flush();
+  assert.equal(h.context.claudeUsageState.details.value.fiveHour.usedTokens, 684200, "详情失败不覆盖有效数字");
+  h.trigger.onclick(); h.trigger.onclick();
+  assert.equal(h.requests.length, 3, "失败后重复开关仍按一分钟退避");
+  h.advance(89000);
+  h.context.claudeUsageState.checkedAt = h.context.Date.now();
+  h.context.scheduleClaudeUsageUpdate();
+  assert.ok([...h.timers.values()].some(timer => timer.delay === 60005),
+    "失败后仍按一分钟刷新周期重试");
+  h.advance(72 * 60 * 60 * 1000 - 150000 + 1);
+  h.context.renderClaudeUsage();
+  assert.equal(h.trigger.hidden, true, "72 小时后不能把失败后的旧缓存继续当作有效数据");
+  assert.equal(h.context.claudeUsageState.tip, null);
+  h.context.resetClaudeUsage(); h.context.syncClaudeUsage();
+  assert.equal(h.context.claudeUsageState.value, null, "过期缓存不能在切回会话时复活");
+});
+
+test("Claude 额度窗口重置、权限拒绝和清理授权均不会复用旧详情", async () => {
+  const h = claudeUsageHarness(), flush = () => new Promise(resolve => setImmediate(resolve));
+  h.context.mountClaudeUsage(); h.context.syncClaudeUsage();
+  h.requests[0].resolve({ ok: true, backend: "claude", instanceId: h.context.instance, usage: claudeUsageWithMetrics(h) });
+  await flush();
+  h.advance(61000); h.context.syncClaudeUsage();
+  const next = h.usage();
+  h.requests[1].resolve({ ok: true, backend: "claude", instanceId: h.context.instance, usage: next }); await flush();
+  assert.equal(h.context.claudeUsageState.details, null, "新窗口不能显示旧窗口金额或 Token");
+  h.trigger.onclick();
+  h.requests[2].reject(Object.assign(new Error("已无读取权限"), { code: 403 })); await flush();
+  assert.equal(h.trigger.hidden, true, "权限失效不能继续展示缓存");
+  h.context.resetClaudeUsage({ clearCache: true }); h.context.syncClaudeUsage();
+  assert.equal(h.context.claudeUsageState.value, null);
+});
+
+test("Claude 额度迟到的较旧详情不回退新数字，部分缓存不阻止补齐缺失窗口", async () => {
+  const h = claudeUsageHarness(), flush = () => new Promise(resolve => setImmediate(resolve));
+  const cached = claudeUsageWithMetrics(h), earlier = cached.fiveHour.metrics.observedAtMs;
+  delete cached.sevenDay.metrics;
+  h.context.mountClaudeUsage(); h.context.syncClaudeUsage();
+  h.requests[0].resolve({ ok: true, backend: "claude", instanceId: h.context.instance, usage: cached }); await flush();
+  h.trigger.onclick();
+  assert.equal(h.nodes[0].children[1].children[2].children[0].children[0].children[3].textContent, "684.2k");
+  assert.equal(h.requests.length, 2, "部分缓存先展示，未缓存窗口仍可补读");
+  h.advance(1000);
+  const newer = claudeUsageWithMetrics(h, cached, 700000);
+  h.context.rememberClaudeUsageDetails(h.context.claudeUsageState, newer, h.context.claudeUsageWindows(h.context.claudeUsageState.value));
+  const delayed = claudeUsageWithMetrics(h, cached, 600000);
+  delayed.fiveHour.metrics.observedAtMs = earlier;
+  delayed.sevenDay.metrics.observedAtMs = earlier;
+  h.requests[1].resolve({ ok: true, backend: "claude", instanceId: h.context.instance, usage: delayed }); await flush();
+  assert.equal(h.context.claudeUsageState.details.value.fiveHour.usedTokens, 700000);
+});
+
+test("上下文容量缺失时显示真实最后请求用量，不伪造百分比", () => {
+  let info = { modelContextWindow: null, last: { totalTokens: 1300 } };
+  const context = vm.createContext({ nativeConnectionVersion: 1, currentThreadDisplay: () => ({ tokenUsage: info }) });
+  vm.runInContext(sourceSection("function tokenCount(", "function closeContextUsageTip("), context);
+  let text = vm.runInContext("contextUsageText()", context);
+  assert.match(text.value, /1\.3k Token，容量尚未提供/);
+  assert.doesNotMatch(text.value, /%/);
+  info = { modelContextWindow: 10000, last: { totalTokens: 1300 } };
+  assert.match(vm.runInContext("contextUsageText().value", context), /13%/);
+  info = null;
+  assert.match(vm.runInContext("contextUsageText().value", context), /上下文信息尚未提供/);
+  const cache = threadDisplayCacheHarness();
+  cache.context.rememberThreadDisplay({ id: "main", tokenUsage: { modelContextWindow: null, last: { totalTokens: 1300 } } });
+  assert.equal(cache.persisted.at(-1).value.tokenUsage.last.totalTokens, 1300);
+  assert.equal(cache.context.currentThreadDisplay().tokenUsage.modelContextWindow, null);
+});
+
+test("模型容量优先于配置窗口，百分比和重连缓存沿用 Codex 原有规则", () => {
+  const { context, persisted } = threadDisplayCacheHarness();
+  vm.runInContext(sourceSection("function tokenCount(", "function closeContextUsageTip("), context);
+  const usage = { modelContextWindow: 1000000, usedPercentage: 21.6, model: "claude-opus-5-5",
+    modelContextWindowSource: { kind: "native", key: "context_window.context_window_size", model: "claude-opus-5-5" },
+    compaction: { windowTokens: 600000, triggerPercent: 90 }, last: { totalTokens: 215496 } };
+  context.rememberThreadDisplay({ id: "main", model: "gpt-6.1-sol", tokenUsage: usage });
+  const text = context.contextUsageText();
+  assert.equal(text.value, "215.5k / 22%，1000k");
+  assert.doesNotMatch(text.value, /600k|36%|配置容量/);
+  assert.doesNotMatch(text.description, /原生报告|配置压缩|提前压缩/);
+  assert.equal(Object.hasOwn(text, "compaction"), false);
+  assert.deepEqual(persisted.at(-1).value.tokenUsage.modelContextWindowSource, usage.modelContextWindowSource);
+  assert.equal(persisted.at(-1).value.tokenUsage.model, usage.model);
+  assert.equal(Object.hasOwn(persisted.at(-1).value.tokenUsage, "usedPercentage"), false);
+  assert.deepEqual(persisted.at(-1).value.tokenUsage.compaction, usage.compaction);
+  context.rememberThreadDisplay({ id: "main", model: "other-model", tokenUsage: { modelContextWindow: null, model: "other-model", last: { totalTokens: 500 } } });
+  assert.match(context.contextUsageText().value, /容量尚未提供/);
+  assert.equal(context.currentThreadDisplay().tokenUsage.modelContextWindowSource, undefined, "新模型的明确未知值不能复用旧容量来源");
+});
+
+test("配置窗口补齐缺失容量，Codex原生475k保持优先，提前压缩比例不改变分母", () => {
+  let info = { modelContextWindow: 600000, modelContextWindowSource: { kind: "configuration" },
+    last: { totalTokens: 215496 }, compaction: { windowTokens: 600000, triggerPercent: 90 } };
+  const context = vm.createContext({ nativeConnectionVersion: 1, currentThreadDisplay: () => ({ tokenUsage: info }) });
+  vm.runInContext(sourceSection("function tokenCount(", "function closeContextUsageTip("), context);
+  assert.equal(context.contextUsageText().value, "215.5k / 36%，600k");
+  assert.equal(Object.hasOwn(context.contextUsageText(), "compaction"), false);
+  for (const modelWindow of [null, undefined, 0, -1, NaN, Infinity, "1000000"]) {
+    info.modelContextWindow = modelWindow;
+    info.usedPercentage = 95;
+    for (const triggerPercent of [1, 50, 95, 100]) {
+      info.compaction.triggerPercent = triggerPercent;
+      assert.equal(context.contextUsageText().value, "215.5k / 36%，600k");
+    }
+  }
+  for (const invalidWindow of [undefined, 0, -1, NaN, Infinity, "600000"]) {
+    info.compaction.windowTokens = invalidWindow;
+    assert.match(context.contextUsageText().value, /容量尚未提供/);
+  }
+  info = { modelContextWindow: 475000, last: { totalTokens: 194100 }, compaction: { windowTokens: 900000 } };
+  assert.equal(context.contextUsageText().value, "194.1k / 41%，475k");
+  for (const reported of [NaN, Infinity, -1, 101, "50", 50, 21.6, 95]) {
+    info.usedPercentage = reported;
+    assert.equal(context.contextUsageText().value, "194.1k / 41%，475k");
+  }
+  const cache = threadDisplayCacheHarness();
+  vm.runInContext(sourceSection("function tokenCount(", "function closeContextUsageTip("), cache.context);
+  cache.context.rememberThreadDisplay({ id: "main", tokenUsage: {
+    modelContextWindow: null, usedPercentage: 95, model: "claude-opus-5-5",
+    compaction: { windowTokens: 600000, triggerPercent: 95 }, last: { totalTokens: 215496 },
+  } });
+  const stored = cache.persisted.at(-1).value.tokenUsage;
+  assert.equal(stored.modelContextWindow, 600000);
+  assert.equal(Object.hasOwn(stored, "usedPercentage"), false);
+  cache.context.rememberThreadDisplay({ id: "main", tokenUsage: stored });
+  assert.equal(cache.context.contextUsageText().value, "215.5k / 36%，600k", "重连后不能恢复旧百分比");
+});
+
+test("Claude 与 Codex 共用单行容量弹层，不显示配置、比例或来源说明", () => {
+  let info = { modelContextWindow: null, last: { totalTokens: 215496 },
+    compaction: { windowTokens: 600000, triggerPercent: 95 } };
+  const attributes = {}, nodes = [];
+  const ring = { textContent: "", style: { setProperty(name, data) { this[name] = data; } } };
+  const trigger = { isConnected: true, setAttribute(name, data) { attributes[name] = data; } };
+  const element = (tag, className = "", textContent = "") => ({
+    tag, className, textContent, children: [], attributes: {},
+    get firstElementChild() { return this.children[0]; },
+    append(...children) { this.children.push(...children); },
+    setAttribute(name, data) { this.attributes[name] = data; },
+    hasAttribute(name) { return Object.hasOwn(this.attributes, name); },
+  });
+  const context = vm.createContext({ nativeConnectionVersion: 1, currentThreadDisplay: () => ({ tokenUsage: info }),
+    $: selector => selector === "#context-info" ? trigger : ring,
+    contextUsageTip: null, fitContextUsageTip() {}, element,
+    closePopup() {}, closeComposerMenus() {}, closeContextUsageTip() {}, clearTimeout() {},
+    scheduleContextUsageTipClose() {}, document: { body: { append: node => nodes.push(node) } } });
+  vm.runInContext(sourceSection("function tokenCount(", "function closeContextUsageTip(")
+    + sourceSection("function updateContextUsage()", "function scheduleContextUsageTipClose("), context);
+  context.showContextUsageTip(true);
+  const node = nodes[0];
+  assert.equal(node.children.length, 1, "实际弹层只创建一行");
+  assert.equal(node.firstElementChild.className, "context-usage-value", "用量使用正文色，不能再次套用 muted");
+  assert.equal(node.firstElementChild.textContent, "215.5k / 36%，600k");
+  assert.equal(ring.textContent, "36%");
+  assert.doesNotMatch(attributes["aria-label"], /配置压缩|提前压缩|原生报告|实际触发/);
+  info = { modelContextWindow: 475000, last: { totalTokens: 395300 } };
+  context.updateContextUsage();
+  assert.equal(node.firstElementChild.textContent, "395.3k / 83%，475k");
+  assert.equal(ring.textContent, "83%");
+  info = { modelContextWindow: 1000000, usedPercentage: 21.6, last: { totalTokens: 215496 } };
+  context.updateContextUsage();
+  assert.equal(ring.textContent, "22%");
+  assert.equal(node.children.length, 1);
+  assert.equal(node.firstElementChild.textContent, "215.5k / 22%，1000k");
+  info = { modelContextWindow: null, last: { totalTokens: 215496 } };
+  context.updateContextUsage();
+  assert.equal(ring.textContent, "—");
+  assert.match(node.firstElementChild.textContent, /容量尚未提供/);
+  assert.equal(node.children.length, 1);
+});
+
+function richFileHarness() {
+  const node = (tag, className = "", textContent = "") => ({
+    tag, className, text: textContent, children: [], attributes: {},
+    get textContent() { return this.text + this.children.map(child => child.textContent).join(""); },
+    set textContent(value) { this.text = value; this.children = []; },
+    style: { setProperty(name, value) { this[name] = value; } }, disabled: false,
+    append(...children) { this.children.push(...children); },
+    replaceChildren(...children) { this.text = ""; this.children = children; },
+    setAttribute(name, value) { this.attributes[name] = value; },
+  });
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    node, displayWorkspaceName: value => value,
+    control: (label, click) => Object.assign(node("button", "", label), { click }),
+  });
+  const from = sessionFiles.indexOf("export function validRichFilePreview(");
+  const to = sessionFiles.indexOf("const bytesLabel =", from);
+  vm.runInContext(sessionFiles.slice(from, to).replace(/^export /gm, ""), context);
+  const all = root => [root, ...root.children.flatMap(all)];
+  return { context, all };
+}
+
+test("表格文档预览验证结构与总量，拒绝错误行号、越界列和未知内容块", () => {
+  const h = richFileHarness();
+  const value = { kind: "spreadsheet", sheets: [{
+    name: "中文表", columnCount: 2, truncated: false,
+    rows: [{ number: 1, cells: ["号码", "说明"] }, { number: 1048576, cells: ["00123", "<script>"] }],
+  }] };
+  assert.equal(h.context.validRichFilePreview(value), true);
+  for (const change of [
+    value => value.sheets[0].rows[1].number = 1,
+    value => value.sheets[0].rows[1].number = -1,
+    value => value.sheets[0].columnCount = 101,
+    value => value.sheets[0].rows[1].cells = [1],
+    value => value.sheets[0].rows[1].cells = ["x".repeat(16385)],
+    value => value.sheets = Array.from({ length: 21 }, () => value.sheets[0]),
+  ]) {
+    const invalid = structuredClone(value); change(invalid);
+    assert.equal(h.context.validRichFilePreview(invalid), false);
+  }
+  const document = { kind: "document", sections: [{ title: "第 1 页", blocks: [
+    { kind: "heading", text: "标题" }, { kind: "paragraph", text: "正文" },
+    { kind: "table", rows: [["单元格"]] },
+  ] }] };
+  assert.equal(h.context.validRichFilePreview(document), true);
+  document.sections[0].blocks.push({ kind: "html", text: "<script>" });
+  assert.equal(h.context.validRichFilePreview(document), false);
+});
+
+test("CSV、TSV、ODS 的空布局数组可预览，缺省列宽与完整列宽兼容，残缺列宽仍拒绝", () => {
+  const h = richFileHarness();
+  // 对齐 SheetBuilder::finish 实际序列化：无原始列宽时返回 []，不能只测省略字段的手写响应。
+  const value = { kind: "spreadsheet", sheets: [{
+    name: "工作表", columnCount: 3, truncated: false, merges: [], columnWidths: [], styles: [],
+    rows: [{ number: 1, cells: ["名称", "号码", "说明"] },
+      { number: 2, cells: ["示例", "001234", "换行\n逗号,引号"] }, { number: 3, cells: ["短行"] }],
+  }] };
+  assert.equal(h.context.validRichFilePreview(value), true);
+  const root = h.context.renderRichFilePreview(value, { layout: "original" }), nodes = h.all(root);
+  assert.equal(nodes.find(node => node.tag === "table").style.width, "calc(360px + var(--sheet-row-number-width,44px))");
+  assert.deepEqual(nodes.filter(node => node.tag === "col").map(node => node.style.width),
+    ["var(--sheet-row-number-width,44px)", "120px", "120px", "120px"]);
+  assert.equal(nodes.some(node => node.tag === "td" && node.textContent === "001234"), true);
+  assert.equal(nodes.some(node => node.tag === "td" && node.textContent === "换行\n逗号,引号"), true);
+  for (const columnWidths of [undefined, null, [], [1, 32, 480], [54, 120, 180]]) {
+    const compatible = structuredClone(value);
+    compatible.sheets[0].columnWidths = columnWidths;
+    assert.equal(h.context.validRichFilePreview(compatible), true);
+  }
+  for (const columnWidths of [[120], [120, 120, 120, 120], [120, 0, 120],
+    [120, 481, 120], [120, 120.5, 120], ["120", 120, 120], ""]) {
+    const invalid = structuredClone(value);
+    invalid.sheets[0].columnWidths = columnWidths;
+    assert.equal(h.context.validRichFilePreview(invalid), false);
+  }
+});
+
+test("Excel 多表切换和每页100行保留页码，空表与稀疏行号可以阅读", () => {
+  const h = richFileHarness(), state = {};
+  const value = { kind: "spreadsheet", sheets: [
+    { name: "数据", columnCount: 2, truncated: false,
+      rows: Array.from({ length: 215 }, (_, index) => ({ number: index + 1000, cells: [`row-${index}`, "00123"] })) },
+    { name: "空表", columnCount: 0, truncated: false, rows: [] },
+  ] };
+  let changes = 0;
+  const root = h.context.renderRichFilePreview(value, state, () => changes++);
+  const find = predicate => h.all(root).filter(predicate);
+  assert.equal(find(node => node.tag === "td").length, 200);
+  assert.equal(find(node => node.tag === "th" && node.scope === "row")[0].textContent, "1000");
+  find(node => node.tag === "button" && node.attributes["aria-label"] === "下一页")[0].click();
+  assert.equal(state.page, 1);
+  assert.equal(find(node => node.tag === "td")[0].textContent, "row-100");
+  const restored = h.context.renderRichFilePreview(value, { ...state });
+  assert.equal(h.all(restored).find(node => node.tag === "td").textContent, "row-100");
+  find(node => node.attributes.role === "tab" && node.textContent === "空表")[0].click();
+  assert.equal(state.sheet, 1);
+  assert.equal(state.page, 0);
+  assert.equal(find(node => node.tag === "p" && node.textContent === "此表格为空").length, 1);
+  assert.equal(changes, 2);
+  assert.equal(h.context.spreadsheetColumn(26), "AA");
+});
+
+test("文档正文和表格中的HTML只作为文字，不创建脚本、图片或外链", () => {
+  const h = richFileHarness();
+  const source = '<img src="https://example.invalid" onerror="alert(1)"><script>bad()</script>';
+  const value = { kind: "document", sections: [{ title: "文档", blocks: [
+    { kind: "paragraph", text: source }, { kind: "table", rows: [[source, "00123"]] },
+  ] }] };
+  const root = h.context.renderRichFilePreview(value), nodes = h.all(root);
+  assert.equal(nodes.filter(node => ["img", "script", "iframe", "a"].includes(node.tag)).length, 0);
+  assert.equal(nodes.filter(node => node.textContent === source).length, 2);
+  assert.equal(nodes.some(node => node.tag === "td" && node.textContent === "00123"), true);
+});
+
+test("Excel 合并范围保留横纵跨度、固定列宽和跨页左上角内容，不复制被覆盖的空格", () => {
+  const h = richFileHarness(), rows = Array.from({ length: 105 }, (_, index) => ({
+    number: index + 1, cells: index === 0 ? ["横向标题", "", "第三列"]
+      : index === 98 ? ["纵向合并", "", "值"] : ["", "", `row-${index + 1}`],
+  }));
+  const sheet = { name: "合并表", columnCount: 3, truncated: false,
+    columnWidths: [54, 96, 130], rows, merges: [
+      { startRow: 1, endRow: 1, startColumn: 0, endColumn: 1 },
+      { startRow: 99, endRow: 103, startColumn: 0, endColumn: 1 },
+    ] };
+  const value = { kind: "spreadsheet", sheets: [sheet] };
+  assert.equal(h.context.validRichFilePreview(value), true);
+  const root = h.context.renderRichFilePreview(value, { layout: "original" });
+  let cells = h.all(root).filter(node => node.tag === "td");
+  const heading = cells.find(node => node.textContent === "横向标题");
+  assert.equal(heading.colSpan, 2); assert.equal(heading.rowSpan, 1);
+  assert.equal(cells.filter(node => node.attributes["data-row"] === "1").length, 2);
+  const merged = cells.find(node => node.textContent === "纵向合并");
+  assert.equal(merged.rowSpan, 2); assert.equal(merged.colSpan, 2);
+  assert.equal(h.all(root).find(node => node.tag === "table").style.width, "calc(280px + var(--sheet-row-number-width,44px))");
+  assert.deepEqual(h.all(root).filter(node => node.tag === "col").map(node => node.style.width),
+    ["var(--sheet-row-number-width,44px)", "54px", "96px", "130px"]);
+  h.all(root).find(node => node.tag === "button" && node.attributes["aria-label"] === "下一页").click();
+  cells = h.all(root).filter(node => node.tag === "td");
+  const continued = cells.find(node => node.textContent === "纵向合并");
+  assert.equal(continued.rowSpan, 3);
+  assert.equal(continued.attributes["data-row"], "101");
+  assert.equal(cells.filter(node => node.attributes["data-row"] === "102").length, 1);
+  assert.equal(sheet.rows[100].cells[0], "", "分页渲染不能改写原始数据");
+  for (const change of [
+    sheet => sheet.merges.push({ ...sheet.merges[0] }),
+    sheet => sheet.merges[0].endColumn = 3,
+    sheet => sheet.merges[0].endRow = 10000,
+    sheet => sheet.columnWidths[0] = -1,
+    sheet => sheet.rows = sheet.rows.filter(row => row.number !== 100),
+  ]) {
+    const invalid = structuredClone(value); change(invalid.sheets[0]);
+    assert.equal(h.context.validRichFilePreview(invalid), false);
+  }
+});
+
+test("Excel 原始背景字号和文字效果按样式索引应用，行数交给文件大小信息行", () => {
+  const h = richFileHarness(), style = {
+    background: "#17365D", color: "#FFFFFF", fontSize: 16,
+    bold: true, italic: true, underline: true, strike: false,
+    horizontal: "center", vertical: "middle", wrap: true,
+  };
+  const value = { kind: "spreadsheet", sheets: [{ name: "样式", columnCount: 2, truncated: false,
+    rows: [{ number: 1, cells: ["标题", ""], styleIds: [0, 0] }],
+    styles: [style], merges: [{ startRow: 1, endRow: 1, startColumn: 0, endColumn: 1 }],
+  }] };
+  assert.equal(h.context.validRichFilePreview(value), true);
+  let range;
+  const root = h.context.renderRichFilePreview(value, {}, null, { onRange: value => { range = value; } });
+  const cell = h.all(root).find(node => node.tag === "td");
+  assert.equal(cell.style.backgroundColor, "#17365D");
+  assert.equal(cell.style.color, "#FFFFFF");
+  assert.match(cell.style.fontSize, /file-reading-font-size/);
+  assert.equal(cell.style.fontWeight, "700");
+  assert.equal(cell.style.fontStyle, "italic");
+  assert.equal(cell.style.textAlign, "center");
+  assert.equal(cell.style.verticalAlign, "middle");
+  assert.equal(h.all(range).some(node => node.textContent === "1–1 / 1 行"), true);
+  assert.equal(h.all(root).some(node => node.textContent === "1–1 / 1 行"), false);
+  for (const change of [
+    value => value.sheets[0].styles[0].background = "url(https://example.invalid)",
+    value => value.sheets[0].styles[0].fontSize = 1000,
+    value => value.sheets[0].rows[0].styleIds = [10, 0],
+  ]) {
+    const invalid = structuredClone(value); change(invalid);
+    assert.equal(h.context.validRichFilePreview(invalid), false);
+  }
+});
+
+test("原始布局使用文件行高，自动换行允许增高，紧凑布局解除文件固定高度", () => {
+  const h = richFileHarness(), value = { kind: "spreadsheet", sheets: [{
+    name: "尺寸", columnCount: 2, columnWidths: [480, 200], defaultRowHeight: 24, truncated: false,
+    rows: [{ number: 1, height: 80, cells: ["短", "一行\n第二行"] }, { number: 2, cells: ["末行", "值"] }],
+  }] };
+  assert.equal(h.context.validRichFilePreview(value), true);
+  const fixed = h.context.renderRichFilePreview(value, { layout: "original", wrap: false });
+  const fixedCells = h.all(fixed).filter(node => node.className === "session-files-cell-content");
+  assert.equal(fixedCells[0].style.height, "79px");
+  assert.equal(fixedCells[2].style.height, "23px");
+  assert.equal(h.all(fixed).find(node => node.tag === "td").style.whiteSpace, "pre");
+  const wrapped = h.context.renderRichFilePreview(value, { layout: "original", wrap: true });
+  assert.equal(h.all(wrapped).find(node => node.className === "session-files-cell-content").style.minHeight, "79px");
+  assert.equal(h.all(wrapped).find(node => node.tag === "td").style.whiteSpace, "pre-wrap");
+  const compact = h.context.renderRichFilePreview(value, { layout: "compact", wrap: true });
+  assert.equal(h.all(compact).find(node => node.className === "session-files-cell-content").style.height, undefined);
+  assert.equal(h.all(compact).find(node => node.className === "session-files-cell-content").style.minHeight, undefined);
+  assert.equal(h.all(compact).find(node => node.tag === "table").attributes["data-layout"], "compact");
+  assert.equal(h.all(compact).filter(node => node.tag === "col")[1].style.width.startsWith("clamp(48px,"), true);
+  for (const change of [
+    value => value.sheets[0].rows[0].height = 0,
+    value => value.sheets[0].rows[0].height = Infinity,
+    value => value.sheets[0].rows[0].height = "80",
+    value => value.sheets[0].defaultRowHeight = 2049,
+    value => value.sheets[0].defaultRowHeight = -1,
+  ]) {
+    const invalid = structuredClone(value); change(invalid);
+    assert.equal(h.context.validRichFilePreview(invalid), false);
+  }
+});
+
+test("紧凑列宽测量整张表且有上限，合并标题分摊宽度，翻页不跳变", () => {
+  const h = richFileHarness(), measure = text => text.length * 10;
+  const rows = [{ number: 1, cells: ["合并标题".repeat(10), "", "短"] },
+    { number: 2, cells: ["A", "B", "多".repeat(100)] }];
+  const widths = h.context.compactSpreadsheetWidths(rows, 3, [],
+    [{ startRow: 1, endRow: 1, startColumn: 0, endColumn: 1 }], measure);
+  assert.equal(widths[0], widths[1], "合并标题不能只撑宽 A 列");
+  assert.match(widths[0], /^clamp\(48px,calc\(/);
+  assert.match(widths[2], /,480px\)$/);
+  const value = { kind: "spreadsheet", sheets: [{
+    name: "跨页", columnCount: 1, columnWidths: [480], truncated: false,
+    rows: Array.from({ length: 105 }, (_, index) => ({ number: index + 1, cells: [index === 104 ? "很长的末页内容".repeat(30) : "短"] })),
+  }] }, state = { layout: "compact", wrap: false };
+  const root = h.context.renderRichFilePreview(value, state);
+  const firstWidth = h.all(root).find(node => node.tag === "table").style.width;
+  h.all(root).find(node => node.attributes["aria-label"] === "下一页").click();
+  assert.equal(h.all(root).find(node => node.tag === "table").style.width, firstWidth);
+  assert.equal(state.layout, "compact");
+  assert.equal(state.wrap, false);
+  assert.equal(state.page, 1);
+});
+
+test("服务子智能体按独立能力启用，旧后台保持禁用且子会话始终只读", () => {
+  const context = { session: { readOnly: false, capabilities: {} },
+    selectedId: "child", thread: { id: "child", viewKind: "subagent", readOnly: true },
+    relatedThreadViews: new Map(), relatedSessionView: null, normalizeRelatedView: value => value };
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  vm.runInContext(sourceSection("function subagentsEnabled(", "function threadReadOnlyMessage("), context);
+  assert.equal(context.subagentsEnabled(), false);
+  context.session.capabilities.serviceSubagents = true;
+  assert.equal(context.subagentsEnabled(), true);
+  assert.equal(context.sideThreadsEnabled(), false);
+  context.session.capabilities.serviceSideThreads = true;
+  assert.equal(context.sideThreadsEnabled(), true);
+  assert.equal(context.threadReadOnly(), true);
+  assert.equal(context.threadReadOnly("main"), false);
+  delete context.session.capabilities.serviceSubagents;
+  assert.equal(context.subagentsEnabled(), false);
+});
+
+test("会话菜单分离子智能体读取和侧边写入，并按连接代次退役旧请求", () => {
+  let current = { deviceId: "device", cacheScope: "scope", threadId: "parent", connected: true,
+    subagentsEnabled: true, sideThreadsEnabled: false, relatedScope: "service:1" };
+  const context = vm.createContext({ nativeConnectionVersion: 1, getContext: () => current, nonempty: value => typeof value === "string" && !!value });
+  vm.runInContext(sessionMenuSource.slice(sessionMenuSource.indexOf("  function readContext("),
+    sessionMenuSource.indexOf("  function syncContext(")) + sessionMenuSource.slice(
+      sessionMenuSource.indexOf("  const canRead ="), sessionMenuSource.indexOf("  function entryFor("))
+      + "\nglobalThis.permissions = value => [canRead(value), canMutate(value)];", context);
+  const service = context.readContext();
+  assert.deepEqual(Array.from(context.permissions(service)), [true, false]);
+  current = { ...current, sideThreadsEnabled: true, relatedScope: "service:2" };
+  const reconnected = context.readContext();
+  assert.deepEqual(Array.from(context.permissions(reconnected)), [true, true]);
+  assert.notEqual(reconnected.owner, service.owner);
+  current = { ...current, subagentsEnabled: false, sideThreadsEnabled: false };
+  assert.deepEqual(Array.from(context.permissions(context.readContext())), [false, false]);
+});
+
+test("会话列表右键菜单固定六项顺序，复制子菜单使用工作路径和带 WSL 名称的原生会话 ID", () => {
+  const copied = [], context = nodeVm.createContext({
+    copyText: value => copied.push(value),
+  });
+  nodeVm.runInContext(sourceSection("function threadMenuOptions(", "function syncClientUnreadBadge("), context);
+  const callbacks = {
+    openWindow() {}, togglePinned() {}, rename() {}, deleteThread() {},
+  };
+  const options = context.threadMenuOptions({
+    id: "claude-01234567-89ab-4cde-8fab-0123456789ab",
+    nativeId: "native-session-id", instanceId: "claude:wsl:fixture", wslDistribution: "claude-us",
+    cliCommand: "wsl.exe --distribution claude-us --user junes claude attach 1234",
+    cwd: "E:\\workspace\\Elves",
+  }, { ...callbacks, independentWindow: true, openIn: { submenu: [], disabled: false } });
+  assert.deepEqual(Array.from(options, option => option.label), [
+    "重命名", "置顶", "独立窗口打开", "复制", "打开方式", "删除会话"
+  ]);
+  assert.equal(options[2].disabled, false);
+  assert.equal(options[4].disabled, false);
+  assert.deepEqual(Array.from(options[3].submenu, option => option.label), ["复制工作路径", "复制会话 ID"]);
+  options[3].submenu[0].action(); options[3].submenu[1].action();
+  assert.deepEqual(copied, [
+    "E:\\workspace\\Elves",
+    "claude-us native-session-id",
+  ]);
+  const local = context.threadMenuOptions({ id: "local-id", instanceId: "codex:local",
+    cwd: "\\\\wsl.localhost\\claude-us\\home\\junes" }, { ...callbacks, pinned: true });
+  assert.equal(local[1].label, "取消置顶");
+  assert.equal(local[2].disabled, true);
+  assert.equal(local[4].disabled, true);
+  local[3].submenu[1].action();
+  assert.equal(copied.at(-1), "local-id", "WSL 目录不能将本机会话改成 WSL 实例");
+  const missing = context.threadMenuOptions({ id: "wsl-id", instanceId: "claude:wsl:fixture" }, callbacks);
+  assert.ok(missing[3].submenu.every(option => option.disabled), "缺少路径或 WSL 名称时保留禁用项");
+  const pending = context.threadMenuOptions({ id: "local-id" }, { ...callbacks, deletion: { state: "confirming" },
+    independentWindow: true, openIn: { submenu: [], disabled: false } });
+  assert.ok([0, 1, 2, 4, 5].every(index => pending[index].disabled));
+  assert.equal(options.some(option => option.label === "复制会话命令" || option.label === "打开会话"), false);
+});
+
+test("Claude 原生子代理身份走本类型路由，读取能力独立于侧边会话且详情保持只读", () => {
+  const parent = "claude-00000000-0000-4000-8000-000000000001";
+  const child = "claude-agent-00000000-0000-4000-8000-000000000001-agent_fixture";
+  const context = vm.createContext({ nativeConnectionVersion: 1, selectedId: child,
+    session: { capabilities: { serviceSubagents: true } },
+    thread: { id: child, backend: "claude", viewKind: "subagent", readOnly: true, capabilities: {} },
+    relatedThreadViews: new Map(), relatedSessionView: null, normalizeRelatedView: value => value });
+  vm.runInContext(sourceSection("function subagentsEnabled(", "function threadReadOnlyMessage("), context);
+  assert.equal(context.claudeThreadId(child), true);
+  assert.equal(context.conversationBackend({ id: child }), "claude");
+  assert.equal(context.claudeThreadId("claude-agent-invalid-parent-agent_fixture"), false);
+  assert.equal(context.subagentsEnabled(), false, "Codex 的能力不能替代 Claude 自己的能力声明");
+  context.thread.capabilities.subagents = true;
+  assert.equal(context.subagentsEnabled(), true);
+  assert.equal(context.sideThreadsEnabled(), false);
+  assert.equal(context.threadReadOnly(), true);
+  context.thread = { id: parent, backend: "claude", capabilities: { subagents: true } };
+  context.selectedId = parent;
+  assert.equal(context.threadReadOnly(), false);
+  assert.equal(context.subagentsEnabled(), true);
+});
+
+test("Claude 子代理每两秒只读补齐，离开后旧请求不继续刷新", async () => {
+  const timers = [], reads = [];
+  const child = "claude-agent-00000000-0000-4000-8000-000000000001-agent_fixture";
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    relatedSessionCheckTimer: null, relatedSessionView: { kind: "subagent", threadId: child },
+    selectedId: child, selectionVersion: 1, thread: { backend: "claude" },
+    session: { }, document: { hidden: false }, connected: true,
+    privateInputScope: () => "scope", subagentsEnabled: () => true, normalizeRelatedView: value => value,
+    clearTimeout() {}, setTimeout: (callback, delay) => { timers.push({ callback, delay }); return timers.length; },
+    reloadThread: async () => reads.push(context.selectedId),
+  });
+  vm.runInContext(sourceSection("function scheduleRelatedSessionCheck(", "function isMissingThreadError("), context);
+  context.scheduleRelatedSessionCheck();
+  assert.equal(timers[0].delay, 2000);
+  await timers[0].callback();
+  assert.deepEqual(reads, [child]);
+  context.selectedId = "parent"; context.selectionVersion++; context.relatedSessionView = null;
+  await timers[1].callback();
+  assert.deepEqual(reads, [child]);
+});
+
+test("服务子智能体刷新失败保留旧列表并明确标记未同步", async () => {
+  const previous = { loadedAtMs: 1, data: { threadId: "parent", subagentsComplete: true,
+    subagents: [{ id: "child", status: "active" }], completedSubagents: [], completedSubagentCount: 0 } };
+  const entry = { snapshot: previous, dirty: true, revision: 1, request: null, again: false };
+  const value = { threadId: "parent", owner: "owner", connected: true };
+  let applied;
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    disposed: false, opened: true, cached: previous, context: value, message: "", refreshAgeMs: 30000,
+    syncContext: () => value, entryFor: () => entry, restore() {}, updatePermissions() {}, render() {},
+    accepts: () => true, owns: () => true,
+    load: async () => { throw new Error("引擎暂时不可用"); },
+    applySnapshot: (_entry, snapshot) => { applied = snapshot; },
+    report: () => assert.fail("后台刷新不弹出重复通知"),
+  });
+  vm.runInContext(sessionMenuSource.slice(sessionMenuSource.indexOf("  function refresh("),
+    sessionMenuSource.indexOf("  function open(")), context);
+  await context.refresh({ background: true });
+  assert.equal(applied.data.subagents[0].id, "child");
+  assert.equal(applied.data.subagentsComplete, false);
+  assert.equal(applied.data.subagentsStale, true);
+  assert.equal(applied.data.subagentsError, "引擎暂时不可用");
+  assert.equal(entry.dirty, true);
+  assert.equal(entry.request, null);
+});
+
+test("服务子智能体补读只在当前可见只读页运行，返回主会话后旧定时器不再读取", async () => {
+  const timers = [], reads = [];
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    relatedSessionCheckTimer: null, relatedSessionView: { kind: "subagent", threadId: "child" },
+    selectedId: "child", selectionVersion: 1, session: { },
+    document: { hidden: false }, connected: true, privateInputScope: () => "scope",
+    subagentsEnabled: () => true, normalizeRelatedView: value => value,
+    clearTimeout() {}, setTimeout: (callback, delay) => { timers.push({ callback, delay }); return timers.length; },
+    reloadThread: async () => { reads.push(context.selectedId); },
+  });
+  vm.runInContext(sourceSection("function scheduleRelatedSessionCheck(", "function isMissingThreadError("), context);
+  context.scheduleRelatedSessionCheck();
+  assert.equal(timers[0].delay, 2000);
+  await timers[0].callback();
+  assert.deepEqual(reads, ["child"]);
+  context.selectedId = "main"; context.selectionVersion++;
+  await timers[1].callback();
+  assert.deepEqual(reads, ["child"]);
+  context.selectedId = "child"; context.document.hidden = true;
+  context.scheduleRelatedSessionCheck();
+  assert.equal(timers.length, 2);
+});
+
+test("服务菜单实际展示子智能体并继续禁用侧边会话，旧侧边缓存不渲染", () => {
+  class MenuNode {
+    constructor(text = "") {
+      this.textContent = text; this.children = []; this.dataset = {}; this.attributes = new Map();
+      const classes = new Set();
+      this.classList = { add: (...values) => values.forEach(value => classes.add(value)),
+        toggle: (value, enabled) => enabled ? classes.add(value) : classes.delete(value) };
+    }
+    append(...nodes) { this.children.push(...nodes); }
+    replaceChildren(...nodes) { this.children = [...nodes]; }
+    contains() { return false; }
+    setAttribute(name, value) { this.attributes.set(name, value); }
+    addEventListener() {}
+    querySelector() { return this.header; }
+    get childElementCount() { return this.children.length; }
+  }
+  const groups = new Map(), buttons = [], mutationButtons = new Map(), menu = new MenuNode();
+  const element = (_tag, _className, text = "") => new MenuNode(text);
+  const itemButton = (label, callback, _args, kind) => {
+    const button = new MenuNode(label); button.disabled = typeof callback !== "function";
+    if (kind) mutationButtons.set(button, kind);
+    buttons.push(button); return button;
+  };
+  const section = (label, action) => {
+    const node = new MenuNode(label); node.header = new MenuNode(label);
+    node.append(node.header); if (action) node.header.append(action);
+    groups.set(label, node); menu.append(node); return node;
+  };
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    menu, groups, mutationButtons, element, itemButton, section, times: [], document: { activeElement: null },
+    layer: { classList: { toggle() {} } }, pinned: () => false, desktop: () => false,
+    context: { subagentsEnabled: true, sideThreadsEnabled: false, connected: true, threadId: "parent" },
+    cached: { loadedAtMs: 1, data: { subagents: [{ id: "child", name: "工作中的子智能体", status: "active" }],
+      completedSubagentCount: 1, completedSubagents: [{ id: "done", name: "已结束子智能体", outcome: "failed" }],
+      sideThreads: [{ id: "old-side", title: "旧侧边缓存" }], canCreateSideThread: false, subagentsComplete: true } },
+    entries: new Map([["owner", { subagentsExpanded: true, completedSubagentsExpanded: true }]]),
+    owner: "owner", id: "menu", opened: false, message: "",
+    closeAction: new MenuNode(), createSideThread() {}, closeSideThread() {}, openSideThread() {}, openSubagent() {},
+    openChanges() {}, openFiles() {}, openBrowser() {}, renderSubagentIcon: () => null,
+    nonempty: value => typeof value === "string" && !!value,
+    cancelPress() {}, hideContext() {}, fit() {}, updateTimes() {}, canRead: () => true,
+    canMutate: value => value.sideThreadsEnabled && value.connected && !value.readOnly,
+  });
+  vm.runInContext(sessionMenuSource.slice(sessionMenuSource.indexOf("  function updatePermissions("),
+    sessionMenuSource.indexOf("  function updateTimes("))
+    + sessionMenuSource.slice(sessionMenuSource.indexOf("  function render()"), sessionMenuSource.indexOf("  function viewport(")), context);
+  context.render();
+  assert.ok(buttons.some(button => button.textContent === "工作中的子智能体" && !button.disabled));
+  assert.ok(buttons.some(button => button.textContent === "已结束子智能体" && !button.disabled));
+  assert.equal(buttons.some(button => button.textContent === "旧侧边缓存"), false);
+  assert.equal(groups.get("侧边会话").attributes.get("aria-disabled"), "true");
+  assert.equal(groups.get("子智能体").attributes.has("aria-disabled"), false);
+  assert.ok([...mutationButtons.keys()].every(button => button.disabled));
+  context.context.sideThreadsEnabled = true;
+  context.cached.data.canCreateSideThread = true;
+  context.cached.data.sideThreads = [{ id: "service-side", title: "服务侧边会话" }];
+  buttons.length = 0;
+  context.render();
+  assert.ok(buttons.some(button => button.textContent === "服务侧边会话" && !button.disabled));
+  assert.ok([...mutationButtons.keys()].every(button => !button.disabled));
+});
+
+test("手机侧栏遮罩100ms后接受独立点击，早期触摸和跨区域手势仍不会误关", () => {
+  const classes = new Set(), nodes = new Map();
+  for (const selector of [".workspace", "#session-sidebar", ".sidebar-backdrop", ".conversation", "#open-sidebar"]) {
+    nodes.set(selector, {
+      inert: false, setAttribute() {}, focus() {}, querySelector() { return this; },
+      classList: {
+        contains: name => classes.has(name),
+        remove: name => classes.delete(name),
+        toggle: (name, enabled) => enabled ? classes.add(name) : classes.delete(name)
+      }
+    });
+  }
+  let now = 1000;
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    $: selector => nodes.get(selector), performance: { now: () => now },
+    matchMedia: () => ({ matches: true, addEventListener() {}, removeEventListener() {} }),
+    desktopSidebarOpen: true, relatedSessionView: null,
+    closePopup() {}, closeComposerMenus() {}, renderSidebar() {}
+  });
+  vm.runInContext(sourceSection('  const workspace = $(".workspace"), sidebarPanel = $("#session-sidebar");',
+    '  const searchInput = $("#sidebar-search")'), context);
+  const backdrop = nodes.get(".sidebar-backdrop");
+  const event = (timeStamp, target = backdrop) => ({
+    timeStamp, target, pointerId: 1, button: 0, isPrimary: true,
+    preventDefault() {}, stopPropagation() {}
+  });
+  const open = () => nodes.get("#open-sidebar").onclick();
+  const click = (down, up = down) => {
+    backdrop.onpointerdown(down); backdrop.onpointerup(up); backdrop.onclick(up);
+  };
+  open();
+  click(event(1099), event(1101));
+  assert.equal(classes.has("sidebar-open"), true, "保护期内开始的触摸不能因晚松手而关闭");
+  click(event(1100));
+  assert.equal(classes.has("sidebar-open"), false, "100ms时独立点击即可关闭，不需等待300ms");
+  now = 2000; open();
+  backdrop.onclick(event(2200));
+  assert.equal(classes.has("sidebar-open"), true, "没有独立按下和松开记录时不能关闭");
+  click(event(2200), event(2201, nodes.get("#session-sidebar")));
+  assert.equal(classes.has("sidebar-open"), true);
+  backdrop.onpointerdown(event(2200)); backdrop.onpointercancel();
+  backdrop.onpointerup(event(2201)); backdrop.onclick(event(2201));
+  assert.equal(classes.has("sidebar-open"), true);
+  click(event(2202));
+  assert.equal(classes.has("sidebar-open"), false);
+});
+
+test("文件阅读字号默认12，旧配置和新设置都限制在6至14且独立于全局字号", () => {
+  const disk = storage();
+  const context = vm.createContext({ nativeConnectionVersion: 1, localStorage: disk, matchMedia: () => ({ matches: false }) });
+  vm.runInContext((sourceSection("const appearancePresets =", "let ambientLightStatus =") + sourceSection("function conversationBackend(", "function privateInputScope(") + sourceSection("function sessionFilterValue(")), context);
+  for (const [saved, expected] of [[undefined, 12], [null, 12], [6, 6], [12, 12], [14, 14], [16, 14], [5, 6], ["8", 12]]) {
+    disk.setItem("codex-elves-web-appearance", JSON.stringify({ fontSize: 20, fileReadingFontSize: saved }));
+    context.appearance = context.readAppearance();
+    assert.equal(context.currentFileReadingFontSize(), expected);
+    assert.equal(context.appearance.fontSize, 20);
+  }
+  assert.equal(context.defaultAppearance().fileReadingFontSize, 12);
+});
+
+test("新会话设置默认仅 Codex、正文950和系统14px字体，兼容旧颜色及隔离两套主题", () => {
+  const disk = storage();
+  const context = vm.createContext({ nativeConnectionVersion: 1, localStorage: disk, matchMedia: () => ({ matches: false }) });
+  vm.runInContext((sourceSection("const appearancePresets =", "let ambientLightStatus =") + sourceSection("function conversationBackend(", "function privateInputScope(") + sourceSection("function sessionFilterValue(")), context);
+  const defaults = context.readAppearance();
+  assert.deepEqual(JSON.parse(JSON.stringify(defaults.sessionTypes)), { codex: true, claude: false });
+  assert.equal(defaults.conversationWidth, 950);
+  assert.equal(defaults.fontSize, 14); assert.equal(defaults.codeFontSize, 14);
+  assert.equal(defaults.uiFont, ""); assert.equal(defaults.codeFont, "");
+  disk.setItem("codex-elves-web-appearance", JSON.stringify({ fontSize: 17, conversationWidth: 100000,
+    uiFont: "Consolas;url(invalid)", colors: { dark: { background: "#232323" } } }));
+  const migrated = context.readAppearance();
+  assert.equal(migrated.fontSize, 17); assert.equal(migrated.conversationWidth, 950);
+  assert.equal(migrated.uiFont, "");
+  assert.equal(migrated.colors.dark.background, "#232323");
+  assert.equal(migrated.palettes["vscode-plus"].dark.background, "#1f1f1f");
+  migrated.palettes["vscode-plus"].dark.background = "#123456";
+  assert.equal(migrated.palettes.chatgpt.dark.background, "#232323");
+});
+
+function appearanceResetHarness() {
+  const confirmation = deferred(), deletion = deferred(), calls = [];
+  const control = {}, dialog = { open: true, isConnected: true };
+  const original = { theme: "dark", fontSize: 18, themePreset: "custom" };
+  const background = { dataUrl: "data:image/png;base64,fixture", name: "custom.png" };
+  const defaults = { theme: "dark", fontSize: 14, themePreset: "chatgpt" };
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    dialog, session: { device: { id: "appearance-device", createdAtMs: 1 } },
+    appearance: original, remoteBackground: background, remoteBackgroundBusy: false,
+    remoteBackgroundError: "", remoteBackgroundOperation: 3, creating: true,
+    privateInputScope: value => JSON.stringify([value?.device?.id, value?.device?.createdAtMs]),
+    $: selector => selector === "#appearance-reset" ? control : null,
+    confirmAction: (...values) => { calls.push(["confirm", ...values]); return confirmation.promise; },
+    deleteRemoteBackground: () => { calls.push(["deleteBackground"]); return deletion.promise; },
+    defaultAppearance: theme => { calls.push(["defaults", theme]); return defaults; },
+    setCreationBackend: backend => calls.push(["backend", backend]),
+    applyAppearance: persist => calls.push(["apply", persist]),
+    projectVisibleThreadCounts: new Map([["project-a", 20]]),
+    renderSidebar: () => calls.push(["renderSidebar"]),
+    updateComposer: () => calls.push(["updateComposer"]),
+    sessionMenu: { close: () => calls.push(["closeMenu"]) },
+    loadSidebar: async (cursor, options) => { calls.push(["loadSidebar", cursor, options.fresh]); },
+    notice: message => calls.push(["notice", message]),
+    sync: () => calls.push(["sync"]),
+    syncAppearanceThemeControls: () => calls.push(["syncControls"]),
+  });
+  vm.runInContext(sourceSection('  $("#appearance-reset").onclick = async () => {',
+    '  $("#appearance-close").onclick ='), context);
+  return { context, control, dialog, original, background, defaults, calls, confirmation, deletion,
+    flush: () => new Promise(resolve => setImmediate(resolve)) };
+}
+
+test("外观恢复默认先说明范围并等待二次确认，取消不修改设置或背景", async () => {
+  const h = appearanceResetHarness(), operation = h.control.onclick();
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls[0][0], "confirm");
+  assert.equal(h.calls[0][1], "恢复默认外观");
+  assert.match(h.calls[0][2], /当前客户端.*配色.*字体.*字号.*背景图片/);
+  assert.doesNotMatch(h.calls[0][2], /会话宽度|项目会话数|会话筛选|实例开关/);
+  assert.equal(h.calls[0][3], "恢复默认外观");
+  assert.equal(h.context.remoteBackgroundBusy, false, "等待确认不启动背景删除");
+  assert.equal(h.context.appearance, h.original);
+  assert.equal(h.context.remoteBackground, h.background);
+  h.confirmation.resolve(false); await operation;
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.context.remoteBackgroundOperation, 3);
+  assert.equal(h.context.appearance, h.original);
+  assert.equal(h.context.remoteBackground, h.background);
+  assert.equal(h.context.projectVisibleThreadCounts.get("project-a"), 20);
+});
+
+test("外观恢复默认仅在确认后删除背景并保存默认设置，完成后保留设置窗口", async () => {
+  const h = appearanceResetHarness(), operation = h.control.onclick();
+  h.confirmation.resolve(true); await h.flush();
+  assert.equal(h.context.remoteBackgroundBusy, true);
+  assert.equal(h.context.remoteBackgroundOperation, 4);
+  assert.deepEqual(h.calls.map(call => call[0]), ["confirm", "sync", "deleteBackground"]);
+  assert.equal(h.context.appearance, h.original, "背景删除完成前不提前覆盖原设置");
+  h.deletion.resolve(); await operation;
+  assert.equal(h.context.appearance.fontSize, h.defaults.fontSize);
+  assert.equal(h.context.appearance.themePreset, h.defaults.themePreset);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.context.remoteBackground)), { dataUrl: "", name: "" });
+  assert.equal(h.context.projectVisibleThreadCounts.size, 0);
+  assert.deepEqual(h.calls.slice(3), [
+    ["defaults", "dark"], ["apply", true], ["renderSidebar"],
+    ["updateComposer"], ["closeMenu"], ["loadSidebar", null, true], ["syncControls"]
+  ]);
+  assert.equal(h.context.remoteBackgroundBusy, false);
+  assert.equal(h.dialog.open, true);
+});
+
+test("外观恢复默认在关闭设置、更换授权或背景操作进行中时不执行，删除失败保留原设置", async () => {
+  for (const change of ["closed", "removed", "device", "reauthorize", "busy"]) {
+    const h = appearanceResetHarness(), operation = h.control.onclick();
+    if (change === "closed") h.dialog.open = false;
+    else if (change === "removed") h.dialog.isConnected = false;
+    else if (change === "device") h.context.session.device.id = "another-device";
+    else if (change === "reauthorize") h.context.session.device.createdAtMs = 2;
+    else h.context.remoteBackgroundBusy = true;
+    h.confirmation.resolve(true); await operation;
+    assert.equal(h.calls.length, 1, change);
+    assert.equal(h.context.appearance, h.original);
+    assert.equal(h.context.remoteBackground, h.background);
+    assert.equal(h.context.remoteBackgroundOperation, 3);
+  }
+  const busy = appearanceResetHarness(); busy.context.remoteBackgroundBusy = true;
+  await busy.control.onclick();
+  assert.equal(busy.calls.length, 0, "已有背景操作时不弹出多余确认");
+  const failed = appearanceResetHarness(), operation = failed.control.onclick();
+  failed.confirmation.resolve(true); await failed.flush();
+  failed.deletion.reject(new Error("无法删除背景图片")); await operation;
+  assert.equal(failed.context.appearance, failed.original);
+  assert.equal(failed.context.remoteBackground, failed.background);
+  assert.equal(failed.context.remoteBackgroundBusy, false);
+  assert.equal(failed.context.remoteBackgroundError, "无法删除背景图片");
+  assert.equal(failed.calls.some(call => call[0] === "apply"), false);
+});
+
+test("连续取色的 HSV 与 HEX 往返保留原色，灰阶和色相边界保持有效", () => {
+  const context = vm.createContext();
+  vm.runInContext(sourceSection("function appearanceHexToHsv(", "function openAppearanceColorPicker("), context);
+  for (const color of ["#000000", "#ffffff", "#808080", "#ff0000", "#00ff00", "#0000ff", "#007acc", "#a561df", "#fe0010"]) {
+    const hsv = context.appearanceHexToHsv(color);
+    assert.ok(hsv.h >= 0 && hsv.h < 360 && hsv.s >= 0 && hsv.s <= 1 && hsv.v >= 0 && hsv.v <= 1);
+    assert.equal(context.appearanceHsvToHex(hsv), color);
+  }
+  assert.equal(context.appearanceHexToHsv("#bad"), null);
+  assert.equal(context.appearanceHexToHsv("not-a-color"), null);
+  assert.equal(context.appearanceHsvToHex({ h: 360, s: 1, v: 1 }), "#ff0000");
+});
+
+test("字体 Select 提供系统选项及设备可用字体，并保留已保存的自定义字体", () => {
+  const metrics = { font: "", measureText() {
+    return { width: /Segoe UI|Consolas/.test(this.font) ? 120 : 100 };
+  } };
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    localStorage: storage(), matchMedia: () => ({ matches: false }),
+    document: { createElement: () => ({ getContext: () => metrics }) },
+  });
+  vm.runInContext((sourceSection("const appearancePresets =", "let ambientLightStatus =") + sourceSection("function conversationBackend(", "function privateInputScope(") + sourceSection("function sessionFilterValue(")), context);
+  vm.runInContext(sourceSection("const appearanceFontFamilies =", "function appearanceHexToHsv("), context);
+  assert.deepEqual(Array.from(context.appearanceFontOptions("Custom Font"), option => option.value),
+    ["", "Consolas", "Custom Font", "Segoe UI"]);
+  assert.equal(context.appearanceFontOptions("")[0].label, "系统");
+  assert.equal(context.appearanceFontOptions("bad;font").some(option => option.value === "bad;font"), false);
+});
+
+test("浅色与深色预览选择沿用 manual 存储，自动选择仍由自动主题决定", async () => {
+  const h = await themeDiagnosticsHarness();
+  h.context.setAppearanceThemeMode("manual", { theme: "dark" });
+  assert.equal(h.appearance.themeMode, "manual");
+  assert.equal(h.appearance.theme, "dark");
+  h.context.setAppearanceThemeMode("manual", { theme: "light" });
+  assert.equal(h.appearance.theme, "light");
+  h.hour(21);
+  h.context.setAppearanceThemeMode("auto");
+  assert.equal(h.appearance.themeMode, "auto");
+  assert.equal(h.appearance.theme, "dark");
+});
+
+test("会话类型筛选与启用开关取交集，原生 Claude ID 也按同一规则过滤", () => {
+  const context = vm.createContext();
+  vm.runInContext((sourceSection("function conversationBackend(", "function privateInputScope(") + sourceSection("function sessionFilterValue(")), context);
+  const codex = { id: "codex-thread" }, claude = { id: "claude-12345678-1234-1234-1234-123456789abc" };
+  for (const [enabled, filter, expected] of [
+    [{ codex: true, claude: false }, "all", [true, false]],
+    [{ codex: true, claude: true }, "all", [true, true]],
+    [{ codex: true, claude: true }, "codex", [true, false]],
+    [{ codex: true, claude: true }, "claude", [false, true]],
+    [{ codex: true, claude: false }, "claude", [false, false]],
+  ]) {
+    const preferences = { sessionTypes: enabled, sessionFilter: filter };
+    assert.deepEqual([context.sessionTypeVisible(codex, preferences), context.sessionTypeVisible(claude, preferences)], expected);
+  }
+});
+
+test("项目筛选保留 Codex App 空项目和置顶项目，关闭实例及 Claude 筛选仍按各自范围显示", () => {
+  const context = vm.createContext();
+  vm.runInContext(sourceSection("function projectTypeVisible("), context);
+  const empty = { id: "app-empty", backend: "codex", instanceId: "codex:local", threads: [] };
+  const pinned = { ...empty, id: "app-pinned", pinned: true };
+  const shared = { ...empty, id: "shared", threads: [
+    { id: "claude-thread", backend: "claude", instanceId: "claude:wsl:test" }
+  ] };
+  for (const filter of ["all", ["codex:local"], ["codex:local", "claude:wsl:test"]]) {
+    const preferences = { sessionTypes: { codex: true, claude: true }, sessionFilter: filter };
+    assert.equal(context.projectTypeVisible(empty, preferences), true);
+    assert.equal(context.projectTypeVisible(pinned, preferences), true);
+  }
+  const claudeOnly = { sessionTypes: { codex: true, claude: true }, sessionFilter: ["claude:wsl:test"] };
+  assert.equal(context.projectTypeVisible(empty, claudeOnly), false);
+  assert.equal(context.projectTypeVisible(shared, claudeOnly), true);
+  const codexDisabled = { sessionTypes: { codex: false, claude: true }, sessionFilter: "all" };
+  assert.equal(context.projectTypeVisible(pinned, codexDisabled), false);
+  assert.equal(context.projectTypeVisible(shared, codexDisabled), true);
+  assert.match(app, /if \(!projectTypeVisible\(project\)\) return null/);
+  assert.doesNotMatch(app, /filter !== "all" && !project\.threads\.some\(typeMatches\)/);
+});
+
+test("会话实例筛选分别显示同类型 WSL 选项，精确匹配实例并遵循各自启用开关", () => {
+  const instances = [
+    { id: "codex:local", backend: "codex", label: "Codex", legacyDefault: true },
+    { id: "claude:wsl:a", backend: "claude", label: "Claude · Ubuntu", distribution: "Ubuntu", legacyDefault: true },
+    { id: "claude:wsl:b", backend: "claude", label: "Claude · Debian", distribution: "Debian" },
+  ];
+  const appearance = { sessionFilter: "claude:wsl:b",
+    sessionInstances: { "codex:local": true, "claude:wsl:a": true, "claude:wsl:b": true } };
+  const context = vm.createContext({ nativeConnectionVersion: 1, sessionInstances: instances, appearance });
+  const rows = [{ id: "codex", instanceId: "codex:local" },
+    { id: "a", backend: "claude", instanceId: "claude:wsl:a" },
+    { id: "b", backend: "claude", instanceId: "claude:wsl:b" },
+    { id: "legacy-b", backend: "claude", wslDistribution: "Debian" }];
+  assert.deepEqual(Array.from(context.sessionFilterOptions(), option => [option.value, option.label]), [
+    ["all", "全部会话"], ["codex:local", "Codex"],
+    ["claude:wsl:a", "Claude · Ubuntu"], ["claude:wsl:b", "Claude · Debian"],
+  ]);
+  assert.deepEqual(rows.map(row => context.sessionTypeVisible(row)), [false, false, true, true]);
+  appearance.sessionInstances["claude:wsl:b"] = false;
+  assert.deepEqual(rows.map(row => context.sessionTypeVisible(row)), [false, false, false, false]);
+  assert.equal(context.sessionFilterOptions().some(option => option.value === "claude:wsl:b"), false,
+    "未开启的实例直接隐藏，不能只置灰");
+  appearance.sessionFilter = ["codex:local", "claude:wsl:a"];
+  assert.deepEqual(rows.map(row => context.sessionTypeVisible(row)), [true, true, false, false]);
+  appearance.sessionFilter = "all";
+  assert.deepEqual(rows.map(row => context.sessionTypeVisible(row)), [true, true, false, false]);
+  assert.equal(rows.length, 4, "筛选不能改写原列表快照");
+});
+
+test("实例筛选可持久保存，旧类型选择迁到启用的默认实例且不扩大到其他类型", () => {
+  const disk = storage(), instances = [
+    { id: "codex:local", backend: "codex", label: "Codex", legacyDefault: true },
+    { id: "claude:wsl:a", backend: "claude", label: "Claude · Ubuntu", legacyDefault: true },
+    { id: "claude:wsl:b", backend: "claude", label: "Claude · Debian" },
+  ];
+  const context = vm.createContext({ nativeConnectionVersion: 1, localStorage: disk, sessionInstances: instances,
+    matchMedia: () => ({ matches: false }) });
+  vm.runInContext((sourceSection("const appearancePresets =", "let ambientLightStatus =") + sourceSection("function conversationBackend(", "function privateInputScope(") + sourceSection("function sessionFilterValue(")), context);
+  disk.setItem("codex-elves-web-appearance", JSON.stringify({ sessionFilter: "claude:wsl:b",
+    sessionInstances: { "codex:local": true, "claude:wsl:a": true, "claude:wsl:b": true } }));
+  const preferences = { ...context.readAppearance(), ...context.legacySharedAppearance() };
+  assert.deepEqual(Array.from(preferences.sessionFilter), ["claude:wsl:b"]);
+  preferences.sessionFilter = "claude";
+  assert.deepEqual(Array.from(context.sessionFilterValue(preferences)), ["claude:wsl:a"]);
+  preferences.sessionInstances["claude:wsl:a"] = false;
+  assert.deepEqual(Array.from(context.sessionFilterValue(preferences)), ["claude:wsl:b"]);
+  preferences.sessionInstances["claude:wsl:b"] = false;
+  assert.deepEqual(Array.from(context.sessionFilterValue(preferences)), ["claude:wsl:a"]);
+  assert.equal(context.sessionTypeVisible({ instanceId: "codex:local" }, preferences), false);
+});
+
+test("侧栏刷新保留同一个右键菜单并按新行位置修正锚点", () => {
+  const trigger = (left, top) => ({
+    disabled: false, attributes: new Map(),
+    setAttribute(name, value) { this.attributes.set(name, String(value)); },
+    removeAttribute(name) { this.attributes.delete(name); },
+    getBoundingClientRect: () => ({ left, top }),
+  });
+  const oldTrigger = trigger(200, 400), newTrigger = trigger(220, 460);
+  const popup = { trigger: oldTrigger, node: { id: "active-popup" }, position: { x: 260, y: 425 } };
+  let renders = 0, closes = 0, opens = 0;
+  const context = nodeVm.createContext({
+    activePopup: popup, document: { getElementById: () => newTrigger },
+    renderPopup() { ++renders; }, closePopup() { ++closes; }, openPopup() { ++opens; },
+  });
+  nodeVm.runInContext(sourceSection("function captureSidebarPopup(", "function restoreSidebarPopup(")
+    + sourceSection("function restoreSidebarPopup(", "function renderSidebar("), context);
+  const state = context.captureSidebarPopup({ contains: node => node === oldTrigger });
+  assert.equal(state.popup, popup);
+  assert.deepEqual([state.position.x, state.position.y], [60, 25], "刷新前保存行内偏移而非旧屏幕坐标");
+  context.restoreSidebarPopup(state);
+  assert.equal(context.activePopup, popup, "侧栏刷新不能销毁并重新创建弹层");
+  assert.equal(popup.trigger, newTrigger);
+  assert.deepEqual([popup.position.x, popup.position.y], [280, 485], "按新行位置恢复同一右键锚点");
+  assert.equal(renders, 1, "只更新当前弹层内容");
+  assert.equal(opens, 0, "不能再次执行打开动画和 showPopover");
+  assert.equal(closes, 0);
+  assert.equal(newTrigger.attributes.get("aria-expanded"), "true");
+  assert.equal(newTrigger.attributes.get("aria-controls"), "active-popup");
+  context.document.getElementById = () => null;
+  context.restoreSidebarPopup(state);
+  assert.equal(closes, 1, "原会话行消失时关闭旧菜单，不能重绑到其他会话");
+  assert.equal(opens, 0);
+});
+
+function sessionFilterPopupHarness({ enabled = ["codex:local", "claude:wsl:a", "claude:wsl:b"], filter = "all" } = {}) {
+  const listeners = new Map(), saved = [], nodes = new Map();
+  let document;
+  class PopupNode {
+    constructor(tag, className = "", text = "") {
+      this.tag = tag; this.className = className; this.textContent = text; this.children = [];
+      this.dataset = {}; this.attributes = new Map(); this.style = {}; this.disabled = false; this.isConnected = true;
+      this.classList = { toggle() {}, add() {}, remove() {} };
+    }
+    append(...children) { for (const child of children) { child.parentElement = this; this.children.push(child); } }
+    prepend(...children) { for (const child of children) child.parentElement = this; this.children.unshift(...children); }
+    replaceChildren(...children) {
+      for (const child of this.children) child.parentElement = null;
+      this.children = []; this.append(...children);
+    }
+    contains(node) { return this === node || this.children.some(child => child.contains(node)); }
+    setAttribute(name, value) { this.attributes.set(name, String(value)); }
+    getAttribute(name) { return this.attributes.get(name) ?? null; }
+    removeAttribute(name) { this.attributes.delete(name); }
+    hasAttribute(name) { return this.attributes.has(name); }
+    closest() { return null; }
+    focus() { document.activeElement = this; this.onfocus?.(); }
+    click() { if (!this.disabled) this.onclick?.(); }
+    scrollIntoView() {}
+    getBoundingClientRect() { return this.rect || { left: 100, top: 100, right: 324, bottom: 420, width: 224, height: 320 }; }
+    remove() {
+      if (this.parentElement) this.parentElement.children = this.parentElement.children.filter(child => child !== this);
+      this.parentElement = null; this.isConnected = false;
+    }
+    querySelectorAll(selector) {
+      const descendants = [];
+      const visit = node => { for (const child of node.children) { descendants.push(child); visit(child); } };
+      visit(this);
+      return descendants.filter(node => selector.split(",").some(part => {
+        if (part.startsWith("button") && node.tag !== "button") return false;
+        if (part.includes(":not(:disabled)") && node.disabled) return false;
+        const checked = part.match(/\[(aria-selected|aria-checked)="true"\]/);
+        return !checked || node.getAttribute(checked[1]) === "true";
+      }));
+    }
+    querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+  }
+  const element = (tag, className, text) => new PopupNode(tag, className, text);
+  document = { activeElement: null, body: element("body"), documentElement: { dataset: {} },
+    addEventListener: (name, callback) => listeners.set(name, callback) };
+  const trigger = element("button"); nodes.set("#sidebar-type-filter", trigger);
+  const instances = [
+    { id: "codex:local", backend: "codex", label: "Codex", ready: true, legacyDefault: true },
+    { id: "claude:wsl:a", backend: "claude", label: "Claude · A", ready: true, legacyDefault: true },
+    { id: "claude:wsl:b", backend: "claude", label: "Claude · B", ready: true },
+    { id: "claude:wsl:off", backend: "claude", label: "Claude · 未开启", ready: true },
+  ];
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    AbortController, setTimeout, clearTimeout, window: { innerWidth: 1200, innerHeight: 800 },
+    document, element, icon: name => element("span", "ui-icon", name),
+    $: selector => nodes.get(selector) || null,
+    button(text, label, callback, className) {
+      const node = element("button", className, text); node.title = label; node.onclick = callback; return node;
+    },
+    sessionInstances: instances, appearance: { sessionFilter: filter,
+      sessionInstances: Object.fromEntries(instances.map(instance => [instance.id, enabled.includes(instance.id)])) },
+    activePopup: null, contextUsageTip: null, recentLimit: 100, projectVisibleThreadCounts: new Map(),
+    fitPopup() {}, closeComposerMenus() {}, closeContextUsageTip() {}, closeModelMenu() {},
+    applyAppearance(save) { assert.equal(save, true); saved.push(JSON.parse(JSON.stringify(context.appearance))); },
+    saveSharedSettings(patch) {
+      Object.assign(context.appearance, patch);
+      saved.push(JSON.parse(JSON.stringify(patch))); context.renderSidebar();
+      return Promise.resolve();
+    },
+    renderSidebar: () => context.renderSessionFilter(), updateComposer() {}, notice() {}, loadSidebar: async () => {},
+  });
+  vm.runInContext(sourceSection("function closePopup(", "function fitPopup("), context);
+  vm.runInContext(sourceSection("function closePopupSubmenu("), context);
+  vm.runInContext(sourceSection('  const typeFilter = $("#sidebar-type-filter");', "  const setSidebarSearchOpen =")
+    + sourceSection('document.addEventListener("pointerdown", event => {', 'document.addEventListener("focusout"'), context);
+  const options = () => context.activePopup?.list.querySelectorAll("button") || [];
+  const find = value => options().find(node => node.dataset.value === value);
+  return { context, trigger, instances, saved, nodes, element, options, find,
+    open: () => trigger.onclick(),
+    click(value) { const node = find(value); assert.ok(node, `菜单缺少 ${value}`); node.focus(); node.click(); },
+    checked: () => options().filter(node => node.getAttribute("aria-checked") === "true").map(node => node.dataset.value),
+    outside: () => listeners.get("pointerdown")({ target: element("button") }),
+    focusOutside: () => listeners.get("focusin")({ target: element("input") }),
+  };
+}
+
+test("二级菜单支持键盘进入返回，父菜单刷新保留子弹层且旧父项不能再触发", () => {
+  const h = sessionFilterPopupHarness(), copied = [];
+  h.trigger.menuOptions = [{ value: "copy", label: "复制", submenuKey: "same",
+    submenu: [{ value: "id", label: "复制会话 ID", action: () => copied.push("id") }] }];
+  h.context.openPopup(h.trigger);
+  const popup = h.context.activePopup, source = popup.list.querySelector("button");
+  const key = (target, value) => ({ target, key: value, preventDefault() {}, stopPropagation() {} });
+  popup.node.onkeydown(key(source, "ArrowRight"));
+  const submenu = popup.submenu, child = submenu.list.querySelector("button");
+  assert.equal(h.context.document.activeElement, child);
+  assert.equal(popup.node.contains(child), true, "子菜单仍属于同一菜单，点击不会被全局外部点击处理抢先关闭");
+  h.context.renderPopup();
+  assert.equal(popup.submenu, submenu);
+  assert.equal(submenu.list.querySelector("button"), child, "刷新不重建子菜单或丢失焦点");
+  assert.notEqual(submenu.source, source);
+  source.click();
+  assert.equal(popup.submenu, submenu, "旧父项点击无效");
+  submenu.node.onkeydown(key(child, "Escape"));
+  assert.equal(popup.submenu, null);
+  assert.equal(h.context.activePopup, popup);
+  assert.equal(h.context.document.activeElement, popup.list.querySelector("button"));
+  popup.list.querySelector("button").click();
+  popup.submenu.list.querySelector("button").click();
+  assert.deepEqual(copied, ["id"]);
+  assert.equal(h.context.activePopup, null);
+});
+
+test("异步子菜单关闭后取消读取，迟到应用列表不能污染新菜单", async () => {
+  const h = sessionFilterPopupHarness();
+  let finish, signal;
+  h.trigger.menuOptions = [{ value: "openIn", label: "打开方式", submenuKey: "old",
+    submenu: input => { signal = input.signal; return new Promise(resolve => { finish = resolve; }); } }];
+  h.context.openPopup(h.trigger);
+  h.context.activePopup.list.querySelector("button").click();
+  assert.equal(h.context.activePopup.submenu.node.getAttribute("aria-busy"), "true");
+  h.context.closePopup();
+  assert.equal(signal.aborted, true);
+  h.trigger.menuOptions = [{ value: "rename", label: "重命名", action() {} }];
+  h.context.openPopup(h.trigger);
+  const current = h.context.activePopup;
+  finish([{ value: "vscode", label: "VS Code", action() {} }]);
+  await Promise.resolve(); await Promise.resolve();
+  assert.equal(h.context.activePopup, current);
+  assert.equal(current.submenu, undefined);
+  assert.deepEqual(current.list.querySelectorAll("button").map(node => node.dataset.value), ["rename"]);
+});
+
+test("异步子菜单读取失败原地重试，父项失效后释放子菜单", async () => {
+  const h = sessionFilterPopupHarness();
+  let reads = 0;
+  h.trigger.menuOptions = [{ value: "openIn", label: "打开方式", submenuKey: "same",
+    submenu: async () => { if (++reads === 1) throw new Error("读取失败");
+      return [{ value: "powershell", label: "PowerShell", action() {} }]; } }];
+  h.context.openPopup(h.trigger); h.context.activePopup.list.querySelector("button").click();
+  await new Promise(setImmediate);
+  const popup = h.context.activePopup, submenu = popup.submenu;
+  assert.equal(submenu.list.querySelector("button").title, "重新加载打开方式");
+  submenu.list.querySelector("button").click();
+  await new Promise(setImmediate);
+  assert.equal(popup.submenu, submenu);
+  assert.equal(submenu.list.querySelector("button").dataset.value, "powershell");
+  h.trigger.menuOptions[0].disabled = true; h.context.renderPopup();
+  assert.equal(popup.submenu, null);
+});
+
+test("二级菜单按实际视口向右或向左避让，窄屏提供返回并保留八像素边距", () => {
+  const h = sessionFilterPopupHarness();
+  h.trigger.menuOptions = [{ value: "copy", label: "复制", submenuWidth: 200,
+    submenu: [{ value: "id", label: "复制会话 ID", action() {} }] }];
+  h.context.openPopup(h.trigger); h.context.activePopup.list.querySelector("button").click();
+  const popup = h.context.activePopup, submenu = popup.submenu;
+  assert.equal(submenu.node.dataset.direction, "right");
+  assert.equal(submenu.node.style.left, "327px");
+  popup.node.rect = { left: 960, right: 1184, top: 100, bottom: 420, width: 224, height: 320 };
+  submenu.source.rect = { left: 965, right: 1179, top: 230, bottom: 266 };
+  h.context.fitPopupSubmenu();
+  assert.equal(submenu.node.dataset.direction, "left");
+  assert.equal(submenu.node.style.left, "757px");
+  assert.equal(submenu.back.hidden, true);
+  h.context.window.visualViewport = { offsetLeft: 50, offsetTop: 30, width: 360, height: 700 };
+  popup.node.rect = { left: 100, right: 324, top: 100, bottom: 710 };
+  submenu.source.rect = { left: 105, right: 319, top: 660, bottom: 696 };
+  h.context.fitPopupSubmenu();
+  assert.equal(submenu.node.dataset.direction, "overlap");
+  assert.equal(submenu.back.hidden, false);
+  assert.ok(Number.parseFloat(submenu.node.style.left) >= 58);
+  assert.ok(Number.parseFloat(submenu.node.style.left) + 200 <= 402);
+  assert.ok(Number.parseFloat(submenu.node.style.top) >= 38);
+  assert.ok(Number.parseFloat(submenu.node.style.top) + 320 <= 722);
+  submenu.source.rect = { left: 105, right: 319, top: 0, bottom: 36 };
+  h.context.fitPopupSubmenu();
+  assert.equal(popup.submenu, null, "父项滚出菜单后关闭子菜单");
+});
+
+test("实例多选菜单连续选择并显示勾选，全部会话同步清除其它项且迟到旧节点不覆盖", () => {
+  const h = sessionFilterPopupHarness(); h.open();
+  assert.deepEqual(h.options().map(node => node.dataset.value),
+    ["all", "codex:local", "claude:wsl:a", "claude:wsl:b"]);
+  assert.ok(h.options().every(node => node.getAttribute("role") === "menuitemcheckbox"));
+  assert.deepEqual(h.checked(), ["all"]);
+  const popup = h.context.activePopup.node;
+  const originalOption = h.find("codex:local");
+  h.context.renderSidebar();
+  assert.equal(h.find("codex:local"), originalOption, "普通会话刷新不能替换正被点击的菜单项");
+  h.click("codex:local"); h.click("claude:wsl:a");
+  assert.equal(h.context.activePopup.node, popup);
+  assert.deepEqual(h.checked(), ["codex:local", "claude:wsl:a"]);
+  assert.match(h.trigger.getAttribute("aria-label"), /已选 2 个会话实例/);
+  const stale = h.find("claude:wsl:b"), writes = h.saved.length;
+  h.click("all");
+  assert.equal(h.context.appearance.sessionFilter, "all");
+  assert.deepEqual(h.checked(), ["all"]);
+  stale.onclick();
+  assert.equal(h.saved.length, writes + 1, "重绘前节点的迟到点击必须忽略");
+  assert.deepEqual(h.checked(), ["all"]);
+  h.click("claude:wsl:b");
+  assert.deepEqual(h.checked(), ["claude:wsl:b"], "从全部切换具体实例时不能恢复之前的多选");
+  h.click("claude:wsl:b");
+  assert.deepEqual(h.checked(), ["all"], "取消最后一个实例后恢复全部");
+  h.outside(); assert.equal(h.context.activePopup, null);
+});
+
+test("优先事项菜单连续切换置顶并显示用户指定的√，不关闭或改动实际会话置顶", () => {
+  const h = sessionFilterPopupHarness();
+  vm.runInContext(sourceSection("function recentPriorityMenuOptions(", "function renderSidebar("), h.context);
+  let selected = false;
+  const update = () => {
+    h.trigger.menuOptions = h.context.recentPriorityMenuOptions(selected, () => {
+      selected = !selected; update(); h.context.renderPopup();
+    });
+  };
+  update(); h.context.openPopup(h.trigger);
+  const popup = h.context.activePopup, before = popup.list.querySelector("button");
+  assert.equal(before.dataset.value, "pinned");
+  assert.equal(before.getAttribute("role"), "menuitemcheckbox");
+  assert.equal(before.getAttribute("aria-checked"), "false");
+  before.click();
+  const checked = popup.list.querySelector("button");
+  assert.equal(h.context.activePopup, popup);
+  assert.equal(checked.getAttribute("aria-checked"), "true");
+  assert.equal(checked.children.find(node => node.className === "choice-check").textContent, "√");
+  before.click();
+  assert.equal(selected, true, "重绘前选项的迟到点击不重复切换");
+  checked.click();
+  assert.equal(selected, false);
+  assert.equal(popup.list.querySelector("button").getAttribute("aria-checked"), "false");
+  assert.equal(popup.list.querySelector("button").children.find(node => node.className === "choice-check").textContent, "");
+});
+
+test("只有一个已开启实例时点击关闭菜单，多个实例时留到点击或聚焦外部再关闭", () => {
+  for (const enabled of [[], ["claude:wsl:a"], ["codex:local", "claude:wsl:a"]]) {
+    for (const choice of ["all", enabled[0]].filter(Boolean)) {
+      const h = sessionFilterPopupHarness({ enabled }); h.open(); h.click(choice);
+      assert.equal(!!h.context.activePopup, enabled.length > 1);
+      if (h.context.activePopup) { h.focusOutside(); assert.equal(h.context.activePopup, null); }
+    }
+  }
+});
+
+test("实例开关变化保留其余多选，菜单立即隐藏关闭的实例并更新选择后的收起规则", () => {
+  const h = sessionFilterPopupHarness({ filter: ["claude:wsl:a", "claude:wsl:b"] });
+  const root = h.element("div"); h.nodes.set("#appearance-session-instances", root);
+  h.context.renderSessionInstances(); h.open();
+  const controls = root.querySelectorAll("input");
+  const disable = id => {
+    const control = controls.find(node => node.dataset.instanceId === id);
+    assert.ok(control); control.checked = false; control.onchange();
+  };
+  disable("claude:wsl:a");
+  assert.deepEqual(h.checked(), ["claude:wsl:b"]);
+  assert.equal(h.find("claude:wsl:a"), undefined);
+  assert.equal(h.context.toggleSessionFilter("claude:wsl:a"), false, "已关闭的旧目标不能被迟到事件重新选中");
+  disable("claude:wsl:b");
+  assert.deepEqual(h.options().map(node => node.dataset.value), ["all", "codex:local"]);
+  assert.deepEqual(h.checked(), ["all"]);
+  h.click("codex:local"); assert.equal(h.context.activePopup, null);
+});
+
+test("实例目录的迟到读取使用当前多选状态，不能在选择全部后恢复旧筛选", () => {
+  const h = sessionFilterPopupHarness(); h.open(); h.click("codex:local"); h.click("claude:wsl:a");
+  const result = { instances: h.instances, types: [{ id: "codex", label: "Codex" }, { id: "claude", label: "Claude" }] };
+  h.click("all"); h.context.applySessionCatalog(result); h.context.renderSessionFilter();
+  assert.deepEqual(h.checked(), ["all"]);
+  h.click("claude:wsl:b"); h.context.applySessionCatalog(result); h.context.renderSessionFilter();
+  assert.deepEqual(h.checked(), ["claude:wsl:b"]);
+  assert.equal(h.context.sessionTypeVisible({ instanceId: "codex:local" }), false);
+  assert.equal(h.context.sessionTypeVisible({ instanceId: "claude:wsl:b" }), true);
+});
+
+test("多选筛选持久恢复时去重，混入全部项时以全部为准，损坏项不能进入筛选", () => {
+  const disk = storage(), context = vm.createContext({ nativeConnectionVersion: 1, localStorage: disk, matchMedia: () => ({ matches: false }) });
+  vm.runInContext((sourceSection("const appearancePresets =", "let ambientLightStatus =") + sourceSection("function conversationBackend(", "function privateInputScope(") + sourceSection("function sessionFilterValue(")), context);
+  for (const [saved, expected] of [
+    [["codex:local", "claude:wsl:test", "codex:local"], ["codex:local", "claude:wsl:test"]],
+    [["codex:local", "all", "claude:wsl:test"], "all"],
+    [[{}, null, 1, "../other", "claude:wsl:test"], ["claude:wsl:test"]],
+    [[], "all"],
+  ]) {
+    disk.setItem("codex-elves-web-appearance", JSON.stringify({ sessionFilter: saved }));
+    const filter = context.legacySharedAppearance().sessionFilter || "all";
+    assert.deepEqual(Array.isArray(filter) ? Array.from(filter) : filter, expected);
+  }
+});
+
+test("手机和 PC 会话菜单的普通操作保持展开，图标切换及生命周期清理可关闭", async () => {
+  for (const desktop of [true, false]) {
+    const context = vm.createContext({ nativeConnectionVersion: 1,
+      opened: true, suspended: false, ticker: null, cached: null,
+      desktop: () => desktop, clearInterval() {}, cancelPress() {}, hideContext() {}, stopPositionTracking() {},
+      trigger: { isConnected: true, disabled: false, setAttribute() {}, focus() {} },
+      layer: { hidden: false, hasAttribute: () => false, classList: { remove() {} } },
+      open: async () => { context.opened = true; context.layer.hidden = false; },
+    });
+    vm.runInContext(sessionMenuSource.slice(sessionMenuSource.indexOf("  const pinned ="),
+      sessionMenuSource.indexOf("\n\n  function listen("))
+      + sessionMenuSource.slice(sessionMenuSource.indexOf("  function close("),
+      sessionMenuSource.indexOf("  function suspend(")) + sessionMenuSource.slice(
+      sessionMenuSource.indexOf("  function toggle()"), sessionMenuSource.indexOf('  listen(trigger, "click"')), context);
+    context.close(true);
+    assert.equal(context.opened, true, "普通关闭入口不得让菜单功能点击或返回自动隐藏菜单");
+    context.opened = true; context.layer.hidden = false;
+    await context.toggle();
+    assert.equal(context.opened, false, "再次点击图标必须关闭");
+    await context.toggle();
+    assert.equal(context.opened, true, "点击图标重新打开");
+    context.close(false, true);
+    assert.equal(context.opened, false, "授权变化或销毁必须清理菜单");
+  }
+});
+
+test("手机点击普通页面隐藏会话菜单，侧边会话页面及菜单内部点击保持展开", () => {
+  for (const desktop of [true, false]) {
+    for (const sideThreadView of [true, false]) {
+      for (const target of ["page", "menu", "trigger"]) {
+        let closed = false;
+        const context = vm.createContext({ nativeConnectionVersion: 1,
+          opened: true, suspended: false, desktop: () => desktop,
+          readContext: () => ({ sideThreadView }),
+          layer: { contains: value => value === "menu" },
+          trigger: { contains: value => value === "trigger" },
+          close: (_restoreFocus, force) => { assert.equal(force, true); closed = true; },
+        });
+        vm.runInContext(sessionMenuSource.slice(sessionMenuSource.indexOf("  function dismissForPageClick("),
+          sessionMenuSource.indexOf("  function suspend(")), context);
+        context.dismissForPageClick({ target });
+        assert.equal(closed, !desktop && !sideThreadView && target === "page",
+          JSON.stringify({ desktop, sideThreadView, target }));
+      }
+    }
+  }
+});
+
+test("Open in 前端接受独立服务的全部目标，IDEA、WSL 和 PowerShell 不被二次过滤", async () => {
+  const server = await readFile(new URL("../crates/elves-harness/src/open_in.rs", import.meta.url), "utf8");
+  const table = server.slice(server.indexOf("const TARGETS:"), server.indexOf("\n];", server.indexOf("const TARGETS:")));
+  const targets = [...table.matchAll(/\("([^"]+)", "([^"]+)"\)/g)]
+    .map(([, target, label]) => ({ target, label, available: true }));
+  assert.ok(targets.length >= 11);
+  const context = rawVm.createContext({ input: { ok: true, root: "E:\\项目", targets } });
+  rawVm.runInContext(
+    workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("const applicationIds ="),
+      workspaceOpenInSource.indexOf("const applicationPaths ="))
+      + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function normalizeTargets("),
+        workspaceOpenInSource.indexOf("function preferenceKey(")), context);
+  const accepted = Array.from(context.normalizeTargets(context.input, { wslInstance: true }).targets, target => target.target);
+  assert.deepEqual(accepted, targets.map(target => target.target));
+  for (const target of ["intellij", "wsl", "powershell"]) assert.ok(accepted.includes(target));
+  assert.equal(context.normalizeTargets(context.input, { wslInstance: false }).targets
+    .some(target => target.target === "wsl"), false, "本机实例不能被旧后台的 WSL 项误启用");
+});
+
+test("Open in 的 Git Bash 和 WSL 使用安装程序图标，无效图片回退终端图标", () => {
+  const element = (tag, className = "", text = "") => ({
+    tag, className, textContent: text, children: [], attributes: {}, events: {},
+    setAttribute(name, value) { this.attributes[name] = String(value); },
+    append(...children) { this.children.push(...children); },
+    replaceChildren(...children) { this.children = children; },
+    addEventListener(name, callback) { this.events[name] = callback; },
+  });
+  const context = rawVm.createContext({ element, icon: name => element("span", `ui-icon ${name}`) });
+  rawVm.runInContext(workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("const applicationIds ="),
+    workspaceOpenInSource.indexOf("const applicationPaths ="))
+    + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("const applicationPaths ="),
+      workspaceOpenInSource.indexOf("export function clientOpenInContext("))
+    + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function applicationIcon("),
+      workspaceOpenInSource.indexOf("function preferenceKey(")), context);
+  const icon = "data:image/png;base64,iVBORw0KGgo=";
+  const result = context.normalizeTargets({ ok: true, root: "E:\\项目", targets: [
+    { target: "gitBash", label: "Git Bash", available: true, icon },
+    { target: "wsl", label: "WSL", available: true, icon },
+    { target: "vscode", label: "VS Code", available: true, icon: "https://example.com/icon.png" },
+  ] }, { wslInstance: true });
+  assert.equal(result.targets[0].icon, icon);
+  assert.equal(result.targets[1].icon, icon);
+  assert.equal(result.targets[2].icon, undefined, "非 PNG 数据不能进入图片地址");
+  for (const target of result.targets.slice(0, 2)) {
+    const node = context.applicationIcon(target), image = node.children[0];
+    assert.equal(image.tag, "img", `${target.target} 必须渲染安装程序图片`);
+    assert.equal(image.src, icon);
+    image.events.error();
+    assert.equal(node.children.at(-1).className, "ui-icon terminal", "加载失败保留原终端图标");
+  }
+});
+
+test("Open in 按执行实例显示 WSL，Windows 挂载目录保留 WSL 身份且更换用户使旧请求失效", () => {
+  const context = rawVm.createContext({
+    window: { __TAURI__: { core: { invoke() {} } } }, pageLeaving: false, creating: false,
+    selectedId: "main", nativeConnectionVersion: 1, session: { capabilities: { workspaceOpenIn: true } },
+    thread: { id: "main", instanceId: "claude:wsl:fixture", wslDistribution: "claude-test",
+      wslUser: "junes", cwd: "E:\\code" },
+    threadReadOnly: () => false, relatedSessionView: null, workspaceSidePanel: false,
+    privateInputScope: () => "scope",
+  });
+  rawVm.runInContext(workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("export function clientOpenInContext("),
+    workspaceOpenInSource.indexOf("function applicationIcon(")).replace(/^export /, ""), context);
+  const first = context.clientOpenInContext();
+  assert.equal(first.wslInstance, true);
+  context.thread.wslUser = "other";
+  assert.notEqual(context.clientOpenInContext().key, first.key);
+  context.thread.instanceId = "codex:local";
+  context.thread.cwd = "\\\\wsl.localhost\\claude-test\\home\\junes";
+  assert.equal(context.clientOpenInContext().wslInstance, false, "WSL 目录不能让本机实例获得入口");
+});
+
+test("Open in 前台未确认时只提示，保留成功回执与首选应用且不重复启动", async () => {
+  for (const warning of ["已打开，但未能确认窗口已切到前台", ""]) {
+    const requests = [], notices = [], selected = [];
+    const disk = storage(), preferences = storage();
+    disk.removeItem = key => disk.records.delete(key);
+    const current = { key: "current", scope: "scope", threadId: "main" };
+    const context = rawVm.createContext({
+      current: () => current, owns: value => value.key === current.key,
+      opening: false, disposed: false, close() {}, syncDisabled() {},
+      readTargets: async () => ({ root: "E:\\项目", targets: [{ target: "powershell", label: "PowerShell" }] }),
+      api: async (...args) => { requests.push(args); return { state: "completed",
+        result: { target: "powershell", root: "E:\\项目", foreground: !warning, warning } }; },
+      validateRemoteReceipt: value => value,
+      setPrimary: value => selected.push(value.target), notice: message => notices.push(message),
+      sessionStorage: disk, localStorage: preferences, randomId: () => "request-one",
+      AbortController, setTimeout: () => 1, clearTimeout() {},
+    });
+    rawVm.runInContext(
+      workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function preferenceKey("),
+        workspaceOpenInSource.indexOf("export function mountWorkspaceOpenIn("))
+        + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("  async function activate("),
+          workspaceOpenInSource.indexOf("  function updateContext(")), context);
+    await context.activate();
+    assert.equal(requests.length, 1);
+    assert.deepEqual(selected, ["powershell"]);
+    assert.equal(disk.records.size, 0, "已完成的请求不能保留成待重试");
+    assert.deepEqual([...preferences.records.values()], ["powershell"]);
+    assert.deepEqual(notices, warning ? [warning] : []);
+    assert.equal(context.opening, false);
+  }
+});
+
+test("会话右键打开方式按该行读取并启动，切换当前聊天不借用其他会话", async () => {
+  const requests = [], copied = storage(), preferences = storage();
+  copied.removeItem = key => copied.records.delete(key);
+  const item = { id: "right-clicked", instanceId: "claude:wsl:fixture",
+    wslDistribution: "claude-us", wslUser: "junes", cwd: "E:\\项目" };
+  const context = rawVm.createContext({ nativeConnectionVersion: 1, pageLeaving: false,
+    selectedId: "another-session", sidebar: { recent: [item] },
+    session: { device: { id: "device", createdAtMs: 1 }, capabilities: { workspaceOpenIn: true } },
+    privateInputScope: value => JSON.stringify(value.device), threadReadOnly: () => false,
+    sessionStorage: copied, localStorage: preferences, randomId: () => "fixture-request",
+    AbortController, setTimeout, clearTimeout, notice() {},
+    api: async (path, payload, idempotency) => {
+      requests.push({ path, payload: JSON.parse(JSON.stringify(payload)), idempotency });
+      return path.endsWith("targets") ? { ok: true, root: item.cwd, targets: [
+        { target: "powershell", label: "PowerShell", available: true },
+        { target: "wsl", label: "WSL", available: true }
+      ] } : { state: "completed", result: { target: payload.target, root: item.cwd } };
+    }, validateRemoteReceipt: value => value });
+  rawVm.runInContext(
+    workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("const applicationIds ="),
+      workspaceOpenInSource.indexOf("const applicationPaths ="))
+    + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function normalizeTargets("),
+      workspaceOpenInSource.indexOf("export function mountWorkspaceOpenIn("))
+    + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function sidebarOpenInContext("))
+      .replace(/^export /gm, ""), context);
+  const menu = context.threadOpenInMenu(item);
+  const targets = await menu.submenu({ signal: new AbortController().signal });
+  assert.deepEqual(Array.from(targets, target => target.value), ["powershell", "wsl"]);
+  await targets[0].action();
+  assert.equal(requests.length, 3, "展开、点击前复核和原生启动分别只请求一次");
+  assert.ok(requests.every(request => request.payload.threadId === item.id));
+  assert.equal(requests[2].payload.target, "powershell");
+  assert.equal(requests[2].idempotency, "fixture-request");
+  assert.equal(context.selectedId, "another-session");
+  assert.equal(copied.records.size, 0, "成功后清除待确认请求");
+});
+
+test("会话右键打开方式在异步准备后复核授权和删除状态，不派发过期点击", async () => {
+  for (const change of ["authorization", "deletion", "instance"]) {
+    const item = { id: "right-clicked", cwd: "E:\\项目", instanceId: "codex:local" };
+    let available = true, writes = 0;
+    const context = rawVm.createContext({ nativeConnectionVersion: 1, pageLeaving: false,
+      sidebar: { recent: [item] }, session: { device: { id: "device" }, capabilities: { workspaceOpenIn: true } },
+      privateInputScope: value => value.device.id, threadReadOnly: () => false,
+      notice() {}, performWorkspaceOpenIn: async () => { ++writes; },
+      api: async () => ({ ok: true, root: item.cwd, targets: [
+        { target: "powershell", label: "PowerShell", available: true }
+      ] }) });
+    rawVm.runInContext(
+      workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("const applicationIds ="),
+        workspaceOpenInSource.indexOf("const applicationPaths ="))
+      + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function normalizeTargets("),
+        workspaceOpenInSource.indexOf("function preferenceKey("))
+      + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function sidebarOpenInContext("))
+        .replace(/^export /gm, ""), context);
+    const targets = await context.threadOpenInMenu(item, { isAvailable: () => available }).submenu({});
+    context.api = async () => {
+      if (change === "authorization") context.session.device.id = "other-device";
+      else if (change === "deletion") available = false;
+      else item.instanceId = "claude:wsl:other";
+      return { ok: true, root: item.cwd, targets: [
+        { target: "powershell", label: "PowerShell", available: true }
+      ] };
+    };
+    await targets[0].action();
+    assert.equal(writes, 0, change);
+  }
+});
+
+test("正文文件打开方式携带所点相对路径，保留图标列表且不改写工作区首选程序", async () => {
+  const requests = [], disk = storage(), preferences = storage();
+  disk.removeItem = key => disk.records.delete(key);
+  preferences.setItem("existing-workspace-preference", "vscode");
+  const item = { id: "main", cwd: "E:\\repo\\packages\\client", instanceId: "codex:local" };
+  const context = rawVm.createContext({ nativeConnectionVersion: 1, pageLeaving: false,
+    session: { device: { id: "device" }, capabilities: { workspaceOpenIn: true } },
+    privateInputScope: value => value.device.id, threadReadOnly: () => false,
+    AbortController, setTimeout, clearTimeout, notice() {}, sessionStorage: disk, localStorage: preferences,
+    randomId: () => "file-request", validateRemoteReceipt: value => value,
+    api: async (path, payload, requestId) => {
+      requests.push({ path, payload: JSON.parse(JSON.stringify(payload)), requestId });
+      return path.endsWith("targets") ? { ok: true, root: item.cwd, path: payload.path, targets: [
+        { target: "vscode", label: "VS Code", available: true },
+        { target: "fileManager", label: "File Explorer", available: true }
+      ] } : { state: "completed", result: { target: payload.target, root: item.cwd, path: payload.path } };
+    } });
+  rawVm.runInContext(workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("const applicationIds ="),
+    workspaceOpenInSource.indexOf("const applicationPaths ="))
+    + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function normalizeTargets("),
+      workspaceOpenInSource.indexOf("export function mountWorkspaceOpenIn("))
+    + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function sidebarOpenInContext("))
+      .replace(/^export /gm, ""), context);
+  const menu = context.fileOpenInMenu("src/app.ts", { getItem: () => item });
+  const targets = await menu.submenu({});
+  assert.deepEqual(Array.from(targets, target => target.value), ["vscode", "fileManager"]);
+  await targets[0].action();
+  assert.equal(requests.length, 3);
+  assert.ok(requests.every(request => request.payload.threadId === item.id && request.payload.path === "src/app.ts"));
+  assert.equal(requests[2].payload.target, "vscode");
+  assert.equal(preferences.records.size, 1); assert.equal(disk.records.size, 0);
+  context.api = async () => ({ ok: true, root: item.cwd, path: "other/file.ts", targets: [] });
+  await assert.rejects(menu.submenu({}), /所选文件不一致/);
+});
+
+test("正文不同文件的打开回执分别保留，结果未知不自动重发或打开工作区兜底", async () => {
+  const disk = storage(), writes = [], notices = [];
+  disk.removeItem = key => disk.records.delete(key);
+  const item = { id: "main", cwd: "E:\\repo", instanceId: "codex:local" };
+  let sequence = 0;
+  const context = rawVm.createContext({ nativeConnectionVersion: 1, pageLeaving: false,
+    session: { device: { id: "device" }, capabilities: { workspaceOpenIn: true } },
+    privateInputScope: value => value.device.id, threadReadOnly: () => false,
+    AbortController, setTimeout, clearTimeout, notice: value => notices.push(value), sessionStorage: disk,
+    localStorage: storage(), randomId: () => `file-request-${++sequence}`, validateRemoteReceipt: value => value,
+    api: async (path, payload, requestId) => {
+      if (path.endsWith("targets")) return { ok: true, root: item.cwd, path: payload.path,
+        targets: [{ target: "fileManager", label: "File Explorer", available: true }] };
+      writes.push([payload.path, requestId]); return { state: "accepted" };
+    } });
+  rawVm.runInContext(workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("const applicationIds ="),
+    workspaceOpenInSource.indexOf("const applicationPaths ="))
+    + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function normalizeTargets("),
+      workspaceOpenInSource.indexOf("export function mountWorkspaceOpenIn("))
+    + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function sidebarOpenInContext("))
+      .replace(/^export /gm, ""), context);
+  for (const path of ["src/first.ts", "./README.md"])
+    await context.fileOpenInMenu(path, { getItem: () => item }).openTarget({ target: "fileManager" });
+  assert.deepEqual(writes, [["src/first.ts", "file-request-1"], ["./README.md", "file-request-2"]]);
+  assert.equal(disk.records.size, 2);
+  assert.ok(notices.every(value => value.includes("未能确认应用启动结果")));
+});
+
+function workspaceOpenInPositionHarness() {
+  let anchor = { left: 577, top: 20, width: 46, height: 28 };
+  const rectangle = box => ({ ...box, right: box.left + box.width, bottom: box.top + box.height });
+  const control = className => ({ isConnected: true, hidden: false, disabled: false,
+    setAttribute() {}, append() {}, closest: () => null,
+    getBoundingClientRect: () => rectangle(className === "workspace-open-in-arrow"
+      ? { left: anchor.left + 31, top: anchor.top + 1, width: 14, height: 26 } : anchor),
+  });
+  const context = rawVm.createContext({
+    element: (_tag, className) => control(className),
+    button: (_text, _label, _action, className) => control(className), icon: () => ({}),
+    window: { innerWidth: 1200, innerHeight: 800 }, menuHorizontalLeft,
+    current: () => ({}), close() { context.activePopup = null; },
+    closePopup() { context.activePopup = null; },
+  });
+  const mountStart = workspaceOpenInSource.indexOf("export function mountWorkspaceOpenIn(");
+  const mountEnd = workspaceOpenInSource.indexOf("\n  let contextKey", mountStart);
+  rawVm.runInContext(
+    workspaceOpenInSource.slice(mountStart, mountEnd).replace(/^export /, "")
+      + "\n  return { group, arrow };\n}\n"
+      + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("  function fitMenu("),
+        workspaceOpenInSource.indexOf("  function decorateMenu("))
+      + popupSource.slice(popupSource.indexOf("export function fitPopup(")).replace(/^export /, ""), context);
+  const controls = context.mountWorkspaceOpenIn({ anchor: { before() {} } });
+  context.group = controls.group; context.group.hidden = false;
+  context.ownsPopup = () => context.activePopup?.trigger === controls.arrow;
+  const popup = { style: {}, dataset: {},
+    getBoundingClientRect() { return { width: parseFloat(this.style.width) || 178, height: 100 }; } };
+  context.activePopup = { trigger: controls.arrow, node: popup };
+  return { context, popup, controls, control, move(box) { anchor = { ...anchor, ...box }; } };
+}
+
+test("Open in 固定向左，首次打开、列表刷新与全局重定位沿用同一按钮组锚点", () => {
+  const h = workspaceOpenInPositionHarness(), { context, popup } = h;
+  for (const [left, expectedLeft] of [[577, 445], [756, 624], [757, 625], [758, 626],
+    [1000, 868], [20, 8], [1150, 1014]]) {
+    h.move({ left });
+    context.fitMenu();
+    assert.equal(popup.style.left, `${expectedLeft}px`);
+    context.fitPopup(); context.fitPopup();
+    assert.equal(popup.style.left, `${expectedLeft}px`, "通用重定位不得改回 65% 分界或改用箭头边缘");
+    assert.equal(popup.style.width, "178px");
+    assert.equal(popup.style.top, "54px", "保持按钮组下方 6px 间隔");
+  }
+});
+
+test("Open in 保留偏移视口的 8px 边缘留白、上下避让和失效入口清理", () => {
+  const h = workspaceOpenInPositionHarness(), { context, popup } = h;
+  context.window.visualViewport = { offsetLeft: 100, offsetTop: 40, width: 700, height: 400 };
+  for (const [left, top, expectedLeft, expectedTop] of [
+    [531, 50, 399, 84], [532, 50, 400, 84], [104, 50, 108, 84],
+    [740, 50, 608, 84], [531, 400, 399, 294],
+  ]) {
+    h.move({ left, top }); context.fitPopup();
+    assert.equal(popup.style.left, `${expectedLeft}px`);
+    assert.equal(popup.style.top, `${expectedTop}px`);
+    assert.equal(popup.style.width, "178px");
+  }
+  h.controls.arrow.disabled = true; context.fitPopup();
+  assert.equal(context.activePopup, null, "入口失效时仍清理菜单");
+});
+
+test("未注册专用定位的普通菜单继续使用 65% 分界和原有垂直间隔", () => {
+  const h = workspaceOpenInPositionHarness(), { context, popup } = h;
+  context.activePopup.trigger = h.control("ordinary");
+  context.activePopup.trigger.popupWidth = 178;
+  for (const [left, expectedLeft] of [[577, 577], [756, 756], [757, 625], [758, 626]]) {
+    h.move({ left }); context.fitPopup();
+    assert.equal(popup.style.left, `${expectedLeft}px`);
+    assert.equal(popup.style.top, "52px", "普通菜单继续保持 4px 垂直间隔");
+  }
+});
+
+function sessionMenuPositionHarness({ width = 1200, height = 800, related = false } = {}) {
+  let anchor = { left: width - 62, top: 20, width: 32, height: 32 }, frameId = 0;
+  let conversation = { left: width > 760 && !related ? 280 : 0, top: 0, height };
+  conversation.width = width - conversation.left;
+  let header = { ...conversation, height: 64 };
+  const frames = new Map(), listeners = new Map(), writes = [], attributes = new Map();
+  const rectangle = box => ({ ...box, right: box.left + box.width, bottom: box.top + box.height });
+  const menu = { style: new Proxy({}, { set(target, name, value) {
+    writes.push([name, value]); target[name] = value; return true;
+  } }) };
+  const context = nodeVm.createContext({ nativeConnectionVersion: 1,
+    opened: true, suspended: false, disposed: false, ticker: null, cached: null,
+    positionFrame: null, positionSignature: "", contextSource: null, contextItem: null, contextPosition: null,
+    menu, menuHorizontalLeft, context: {}, owns: () => true, canMutate: () => true, closeSideThread() {},
+    pinned: () => true, desktop: () => width > 760,
+    clearInterval() {}, cancelPress() {}, focusEdge() {},
+    document: { hidden: false, body: { append() {} } },
+    window: { innerWidth: width, innerHeight: height,
+      requestAnimationFrame(callback) { frames.set(++frameId, callback); return frameId; },
+      cancelAnimationFrame(id) { frames.delete(id); } },
+    trigger: { isConnected: true, disabled: false, hidden: false,
+      getBoundingClientRect: () => rectangle(anchor),
+      closest: selector => selector === ".conversation" ? { getBoundingClientRect: () => rectangle(conversation) }
+        : selector === ".conversation-header" ? { getBoundingClientRect: () => rectangle(header) }
+        : related && selector === ".related-session-view" ? {} : null,
+      setAttribute: (name, value) => attributes.set(name, value), focus() {} },
+    layer: { hidden: false, hasAttribute: () => false, classList: { add() {}, remove() {} } },
+    actionMenu: { hidden: true, style: {}, getBoundingClientRect: () => ({ width: 180, height: 40 }) },
+    closeAction: { disabled: false, focus() {} },
+    listen(_target, name, handler) { listeners.set(name, handler); },
+  });
+  const visibilityStart = sessionMenuSource.indexOf('  listen(document, "visibilitychange"');
+  nodeVm.runInContext(sessionMenuSource.slice(sessionMenuSource.indexOf("  function hideContext("),
+    sessionMenuSource.indexOf("  function updatePermissions("))
+    + sessionMenuSource.slice(sessionMenuSource.indexOf("  function stopPositionTracking("),
+      sessionMenuSource.indexOf("  function bindSideThread("))
+    + sessionMenuSource.slice(visibilityStart, sessionMenuSource.indexOf("  syncContext();", visibilityStart)), context);
+  return { context, frames, writes, attributes,
+    move(box) { anchor = { ...anchor, ...box }; },
+    moveConversation(box) { conversation = { ...conversation, ...box }; },
+    moveHeader(box) { header = { ...header, ...box }; },
+    frame() { const pending = [...frames.values()]; frames.clear(); for (const callback of pending) callback(); },
+    visibility(hidden) { context.document.hidden = hidden; listeners.get("visibilitychange")(); },
+  };
+}
+
+test("会话菜单始终距主会话标题栏和右边缘各 20px，分栏和标题变化无 resize 也更新", () => {
+  for (const related of [false, true]) {
+    const h = sessionMenuPositionHarness({ related }), { context, frames, writes } = h;
+    context.fit(); context.startPositionTracking(); context.startPositionTracking();
+    assert.equal(context.menu.style.left, "880px");
+    assert.equal(context.menu.style.top, "84px");
+    assert.equal(frames.size, 1, "重复启动不能累积跟踪任务");
+    const initialWrites = writes.length;
+    h.frame();
+    assert.equal(writes.length, initialWrites, "布局不变时只读锚点，不反复写样式");
+    for (const [left, top] of [[1000, 24], [500, 28], [584, 28], [763, 28], [850, 28], [1138, 20]]) {
+      h.move({ left, top }); h.frame();
+      assert.equal(context.menu.style.left, "880px", "按钮和标签开关的相对位置不能改变区域内间距");
+      assert.equal(context.menu.style.top, "84px");
+      assert.equal(frames.size, 1, "没有 resize 或 scroll 事件也持续跟随");
+    }
+    h.move({ left: 650 });
+    for (const [left, width, expectedLeft] of [[280, 440, 400], [0, 720, 400],
+      [280, 680, 640], [0, 1200, 880]]) {
+      h.moveConversation({ left, width }); h.frame();
+      assert.equal(context.menu.style.left, `${expectedLeft}px`, "只改变主会话边界、按钮不动时也必须跟随");
+      assert.equal(context.menu.style.top, "84px");
+    }
+    h.moveHeader({ height: 80 }); h.frame();
+    assert.equal(context.menu.style.top, "100px");
+    h.moveHeader({ top: 10 }); h.frame();
+    assert.equal(context.menu.style.top, "110px", "标题栏移动与高度变化均保持底部 20px");
+    context.close(false, true);
+    assert.equal(frames.size, 0);
+  }
+});
+
+test("会话菜单保持 PC 短窗口宽度、手机比例及可视视口边界", () => {
+  const desktop = sessionMenuPositionHarness({ height: 500 });
+  desktop.context.fit();
+  assert.equal(desktop.context.menu.style.width, "300px");
+  const phone = sessionMenuPositionHarness({ width: 390, height: 844 });
+  phone.context.fit();
+  assert.equal(phone.context.menu.style.width, "253.5px");
+  assert.equal(phone.context.menu.style.left, "116.5px");
+  phone.move({ left: 230 }); phone.context.fit();
+  assert.equal(phone.context.menu.style.left, "116.5px", "手机按钮移动不改变距会话右侧 20px 的规则");
+  assert.equal(phone.context.menu.style.width, "253.5px", "区域定位不改变手机默认菜单宽度");
+  const h = sessionMenuPositionHarness(), { context } = h;
+  context.fit(); context.startPositionTracking();
+  context.window.visualViewport = { offsetLeft: 100, offsetTop: 40, width: 700, height: 400 };
+  h.move({ left: 780, top: 50 }); h.frame();
+  assert.equal(context.menu.style.left, "480px", "可见主会话右侧保留 20px");
+  assert.equal(context.menu.style.top, "84px");
+  assert.equal(context.menu.style.maxHeight, "320px");
+  h.move({ left: 538, top: 50 }); h.frame();
+  assert.equal(context.menu.style.left, "480px", "带偏移视口仍使用可见主会话边界");
+  h.move({ left: 539, top: 50 }); h.frame();
+  assert.equal(context.menu.style.left, "480px", "跨过 65% 分界不改变位置");
+  h.move({ left: 104, top: 400 }); h.frame();
+  assert.equal(context.menu.style.left, "480px");
+  assert.equal(context.menu.style.top, "84px", "按钮下移不能覆盖主会话顶部定位");
+  h.moveConversation({ left: 650, width: 550 }); h.frame();
+  assert.equal(context.menu.style.width, "110px", "区域变窄时缩小菜单，左右各保留 20px");
+  assert.equal(context.menu.style.left, "670px");
+  h.moveHeader({ height: 430 }); h.frame();
+  assert.equal(context.menu.style.top, "450px");
+  assert.equal(context.menu.style.maxHeight, "0px", "底边空间不足时不溢出视口");
+  context.close(false, true);
+});
+
+test("会话菜单挂起、后台和强制关闭会取消跟踪，恢复后重新对齐", () => {
+  const h = sessionMenuPositionHarness(), { context, frames } = h;
+  context.fit(); context.startPositionTracking();
+  context.close();
+  assert.equal(frames.size, 1, "PC 普通关闭仍保留菜单及跟踪");
+  context.suspend();
+  assert.equal(frames.size, 0);
+  h.move({ left: 900 }); h.moveConversation({ width: 700 });
+  context.resume(); h.frame();
+  assert.equal(context.menu.style.left, "660px");
+  assert.equal(frames.size, 1);
+  h.visibility(true);
+  assert.equal(context.opened, true, "PC 菜单在后台保留打开状态");
+  assert.equal(frames.size, 0);
+  h.move({ left: 800 }); h.moveConversation({ width: 600 });
+  h.visibility(false);
+  assert.equal(context.menu.style.left, "560px");
+  assert.equal(frames.size, 1);
+  context.close(false, true);
+  assert.equal(frames.size, 0);
+  assert.equal(context.layer.hidden, true);
+});
+
+test("会话菜单锚点隐藏、移除、禁用或移出视口时，即使 PC 固定显示也会清理", () => {
+  for (const invalidate of [
+    h => { h.context.trigger.hidden = true; },
+    h => { h.context.trigger.isConnected = false; },
+    h => { h.context.trigger.disabled = true; },
+    h => h.move({ left: 0, top: 0, width: 0, height: 0 }),
+    h => h.move({ left: -40 }),
+    h => h.move({ top: 800 }),
+  ]) {
+    const h = sessionMenuPositionHarness(), { context, frames } = h;
+    context.fit(); context.startPositionTracking();
+    invalidate(h); h.frame();
+    assert.equal(context.opened, false);
+    assert.equal(context.layer.hidden, true);
+    assert.equal(h.attributes.get("aria-expanded"), "false");
+    assert.equal(frames.size, 0, "失去锚点后不能留下重试帧");
+  }
+});
+
+test("首次打开时锚点不可见，不会在定位清理后重新显示弹层", async () => {
+  const h = sessionMenuPositionHarness(), { context } = h;
+  context.opened = false; context.layer.hidden = true; context.trigger.hidden = true;
+  Object.assign(context, { beforeOpen: null, syncContext: () => ({}), entryFor: () => ({}), restore() {},
+    render: () => context.fit(), refresh: async () => null, focusEdge: () => assert.fail("隐藏菜单不能聚焦"),
+    setInterval: () => assert.fail("隐藏菜单不能启动刷新"), report: error => { throw error; } });
+  nodeVm.runInContext(sessionMenuSource.slice(sessionMenuSource.indexOf("  function open("),
+    sessionMenuSource.indexOf("  function toggle()")), context);
+  await context.open();
+  assert.equal(context.opened, false);
+  assert.equal(context.layer.hidden, true);
+  assert.equal(h.attributes.get("aria-expanded"), "false");
+  assert.equal(h.frames.size, 0);
+});
+
+test("侧边会话操作子菜单随所属菜单行移动，保留右键位置的行内偏移", () => {
+  const h = sessionMenuPositionHarness(), { context } = h;
+  context.fit(); context.startPositionTracking();
+  const row = { setAttribute() {}, getBoundingClientRect: () => {
+    const left = parseFloat(context.menu.style.left) + 16, top = parseFloat(context.menu.style.top) + 240;
+    return { left, top, right: left + 268, bottom: top + 32 };
+  } };
+  const original = row.getBoundingClientRect();
+  context.showContext(row, { id: "side" }, "owner", { x: original.left + 12, y: original.top + 8 });
+  assert.equal(context.actionMenu.style.left, "908px");
+  assert.equal(context.actionMenu.style.top, "332px");
+  h.moveConversation({ width: 700 }); h.moveHeader({ top: 10 }); h.frame();
+  assert.equal(context.actionMenu.style.left, "688px");
+  assert.equal(context.actionMenu.style.top, "342px");
+  context.close(false, true);
+  assert.equal(context.actionMenu.hidden, true);
+});
+
+test("三个 Claude 与两个 Codex 实例独立迁移、启用和筛选，新类型沿用同一逻辑", () => {
+  const instances = [
+    { id: "codex:local", backend: "codex", ready: true, legacyDefault: true },
+    { id: "codex:wsl:3", backend: "codex", ready: false },
+    { id: "claude:local", backend: "claude", ready: false },
+    { id: "claude:wsl:1", backend: "claude", ready: true, legacyDefault: true },
+    { id: "claude:wsl:2", backend: "claude", ready: true },
+  ].map(instance => ({ ...instance, label: instance.id }));
+  const preferences = { sessionTypes: { codex: true, claude: true }, sessionFilter: "all" };
+  const context = vm.createContext({ nativeConnectionVersion: 1, sessionInstances: instances, appearance: preferences });
+  assert.equal(context.migrateSessionInstances(preferences, instances), true);
+  assert.deepEqual(Object.entries(preferences.sessionInstances).filter(([, enabled]) => enabled).map(([id]) => id),
+    ["codex:local", "claude:wsl:1"]);
+  preferences.sessionInstances["claude:wsl:1"] = false;
+  preferences.sessionInstances["claude:wsl:2"] = true;
+  preferences.sessionInstances["claude:local"] = true;
+  assert.equal(context.migrateSessionInstances(preferences, instances), false);
+  assert.equal(context.sessionTypeVisible({ backend: "claude", instanceId: "claude:wsl:1" }), false);
+  assert.equal(context.sessionTypeVisible({ backend: "claude", instanceId: "claude:wsl:2" }), true);
+  assert.deepEqual(Array.from(context.newChatBackendOptions(), option => option.value), ["codex:local", "claude:wsl:2"]);
+  instances.push({ id: "future:wsl:4", backend: "future", ready: true, label: "Future · WSL4" });
+  preferences.sessionInstances["future:wsl:4"] = true;
+  assert.equal(context.newChatBackendOptions().at(-1).value, "future:wsl:4");
+  assert.equal(context.sessionTypeVisible({ backend: "future", instanceId: "future:wsl:4" }), true);
+  preferences.sessionFilter = "claude";
+  assert.equal(context.sessionTypeVisible({ backend: "future", instanceId: "future:wsl:4" }), false);
+  // 仅使用内存选项验证：环境名称不改变实例开关、列表和新建入口的规则。
+  instances.push({ id: "claude:wsl:third", backend: "claude", ready: true,
+    label: "Claude · WSL · claude-us", distribution: "claude-us" });
+  preferences.sessionInstances["claude:wsl:third"] = true;
+  assert.equal(context.enabledInstanceIds().includes("claude:wsl:third"), true);
+  assert.equal(context.newChatBackendOptions().some(option => option.value === "claude:wsl:third"), true);
+  for (const id of Object.keys(preferences.sessionInstances)) preferences.sessionInstances[id] = false;
+  assert.equal(context.newChatBackendOptions().length, 0, "允许所有实例关闭，不暗中重新启用默认实例");
+});
+
+test("实例偏好重新打开后保留全部关闭，草稿及模型上下文不跨 WSL 实例", () => {
+  const disk = storage();
+  const context = vm.createContext({ nativeConnectionVersion: 1, localStorage: disk, matchMedia: () => ({ matches: false }),
+    creating: true, creationBackend: "claude", creationInstanceId: "claude:wsl:1",
+    session: { claudeInstanceId: "claude:wsl:1" } });
+  vm.runInContext((sourceSection("const appearancePresets =", "let ambientLightStatus =") + sourceSection("function conversationBackend(", "function privateInputScope(") + sourceSection("function sessionFilterValue(")), context);
+  disk.setItem("codex-elves-web-appearance", JSON.stringify({ sessionInstances: {}, sessionTypes: { codex: true, claude: true } }));
+  context.appearance = { ...context.readAppearance(), ...context.legacySharedAppearance() };
+  assert.equal(context.sessionInstanceEnabled("codex:local"), false);
+  assert.equal(context.newChatBackendOptions().length, 0);
+  const a = context.newDraftKey("project", "claude", "claude:wsl:1");
+  const b = context.newDraftKey("project", "claude", "claude:wsl:2");
+  assert.notEqual(a, b);
+  assert.equal(context.newDraftKey("project", "claude"), a, "旧失败恢复只归属原默认实例");
+  const modelsA = context.modelContextKey();
+  context.creationInstanceId = "claude:wsl:2";
+  assert.notEqual(context.modelContextKey(), modelsA);
+  assert.equal(context.modelContext().instanceId, "claude:wsl:2");
+});
+
+test("设置强制切换新建类型时保留文字图片，清理旧模型目标并隔离原草稿", () => {
+  const selector = { value: "codex" }, saved = new Map();
+  const initial = { text: "继续这项工作", attachments: [{ name: "proof.png" }],
+    skills: [{ name: "codex-skill", path: "/skill" }], goalMode: "goal-id" };
+  let current = structuredClone(initial);
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    creating: true, creationBackend: "codex", creationProject: "original-project", selectionVersion: 2,
+    selectedSkills: initial.skills, selectedGoal: initial.goalMode, selectedModel: "codex-model", selectedEffort: "xhigh",
+    appearance: { sessionTypes: { codex: false, claude: true } },
+    $: id => id === "#new-chat-backend" ? selector : null,
+    snapshotDraft: () => structuredClone(current),
+    rememberDraft: () => saved.set(context.draftKey(), structuredClone(current)),
+    storeDraft: (key, value) => saved.set(key, structuredClone(value)),
+    restoreDraft: key => { current = structuredClone(saved.get(key)); },
+    resetComposerOptions: () => { context.selectedModel = context.selectedEffort = ""; },
+    closePopup() {}, closeComposerMenus() {}, renderMessages() {}, updateComposer() {}, renderApprovals() {},
+    setSelectOptions: (node, options, value) => { node.value = value; node.selectOptions = options; },
+    randomId: () => "new-selection",
+  });
+  vm.runInContext(sourceSection("function draftKey()", "function storedDraft("), context);
+  vm.runInContext(sourceSection("function changeCreationB", "function res"), context);
+  context.setCreationBackend("claude");
+  assert.equal(context.creationProject, "original-project");
+  assert.equal(context.creationBackend, "claude");
+  assert.equal(selector.value, "claude:wsl:test");
+  assert.equal(context.selectionVersion, 3);
+  assert.equal(context.selectedModel, "");
+  assert.equal(context.selectedEffort, "");
+  assert.equal(context.selectedGoal, null);
+  assert.equal(context.selectedSkills.length, 0);
+  assert.deepEqual(current, { ...initial, skills: [], goalMode: null });
+  assert.deepEqual(saved.get("$new:original-project"), initial, "原 Codex 草稿仍可恢复");
+  context.creating = false;
+  context.setCreationBackend("codex");
+  assert.equal(context.creationBackend, "claude", "已创建会话不能通过此入口切换类型");
+});
+
+test("Claude 队列编辑使用会话图片能力，桌面离线不禁用保存且不借用其他会话能力", () => {
+  const id = "claude-01234567-89ab-4cde-8fab-0123456789ab";
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    selectedId: id, thread: { id, backend: "claude", capabilities: { queuedImageEditing: true, queueEditRecovery: true } },
+    session: { capabilities: { queuedImageEditing: false, queueEditRecovery: false } },
+    editing: true, hasAttachments: true, editingQueuedMessage: { imageEditing: true },
+    composerAttachmentsPayload: () => [{ name: "new.png" }],
+  });
+  const unsupported = vm.runInContext(`() => {${sourceSection("  const unsupportedImages =", "  const queueImageNote =")}
+    return unsupportedImages; }`, context);
+  assert.equal(unsupported(), false);
+  assert.equal(context.queueCapability("queueEditRecovery"), true);
+  assert.equal(context.queueCapability("queueEditRecovery", "claude-11111111-1111-4111-8111-111111111111"), false);
+  context.thread.capabilities.queuedImageEditing = false;
+  context.session.capabilities.queuedImageEditing = true;
+  assert.equal(unsupported(), true, "Codex 的能力不能冒充 Claude 支持");
+});
+
+test("指令编辑将CRLF规范为textarea文本并恢复原换行，不制造未保存变更", () => {
+  const context = vm.createContext();
+  vm.runInContext(sourceSection("const normalizeInstructionText =", "const instructionDrafts ="), context);
+  context.original = "# 全局指令\r\n中文说明。\r\n";
+  assert.equal(vm.runInContext('instructionFileText(normalizeInstructionText(original), "\\r\\n")', context), context.original);
+  assert.equal(vm.runInContext('normalizeInstructionText(original)', context), "# 全局指令\n中文说明。\n");
+});
+
+function selectComponentHarness() {
+  const opened = [], refreshed = [];
+  let activePopup = null;
+  function element(tag, _class = "", text = "") {
+    const attributes = new Map(), listeners = new Map();
+    return { tag, textContent: text, value: "", disabled: false, children: [], events: [], dataset: {},
+      setAttribute(name, value) { attributes.set(name, String(value)); },
+      getAttribute(name) { return attributes.get(name) ?? null; },
+      addEventListener(name, listener) {
+        if (!listeners.has(name)) listeners.set(name, []);
+        listeners.get(name).push(listener);
+      },
+      dispatchEvent(event) {
+        this.events.push(event);
+        for (const listener of listeners.get(event.type) || []) listener.call(this, event);
+        this["on" + event.type]?.({ target: this, type: event.type });
+        return true;
+      },
+      click() { if (!this.disabled) this.dispatchEvent(new Event("click")); },
+      append(...children) { this.children.push(...children); },
+      replaceChildren(...children) { this.children = children; } };
+  }
+  // 使用实际 button 工厂，保留 addEventListener 与 onclick 同时生效的浏览器行为。
+  const context = nodeVm.createContext({ nativeConnectionVersion: 1, element });
+  nodeVm.runInContext(sourceSection("function button("), context);
+  const togglePopup = node => {
+    opened.push({ node });
+    activePopup = activePopup?.trigger === node ? null : { trigger: node };
+  };
+  const component = createSelectComponent({
+    element, icon: name => element("span", "ui-icon", name),
+    button: context.button,
+    togglePopup,
+    openPopup(node, options) {
+      opened.push({ node, ...options });
+      activePopup = { trigger: node };
+    },
+    refreshPopup: node => refreshed.push(node),
+  });
+  return { element, ...component, togglePopup, opened, refreshed, activePopup: () => activePopup };
+}
+
+test("统一 Select 的程序同步不触发 change，用户选择只触发一次并拒绝禁用项", () => {
+  const h = selectComponentHarness();
+  const node = h.selectControl("weight", "界面字重", [
+    { value: "400", label: "常规" }, { value: "500", label: "中等" }, { value: "600", label: "半粗", disabled: true },
+  ], 400);
+  assert.equal(node.value, "400");
+  assert.equal(node.children[0].textContent, "常规");
+  assert.equal(node.getAttribute("aria-haspopup"), "listbox");
+  assert.equal(h.commitSelectValue(node, 500), true);
+  assert.equal(node.value, "500"); assert.equal(node.events.length, 1);
+  assert.equal(node.events[0].bubbles, true);
+  assert.equal(h.commitSelectValue(node, "500"), false);
+  assert.equal(h.commitSelectValue(node, "600"), false);
+  assert.equal(h.commitSelectValue(node, "missing"), false);
+  h.setSelectValue(node, "400");
+  assert.equal(node.events.length, 1);
+  node.disabled = true;
+  assert.equal(h.commitSelectValue(node, "500"), false);
+  assert.equal(node.events.length, 1);
+});
+
+test("统一 Select 保留失效目标及空状态，键盘打开不越过禁用或输入法状态", () => {
+  const h = selectComponentHarness(), node = h.selectControl("environment", "指令环境", [], "");
+  assert.equal(node.children[0].textContent, "暂无可用选项");
+  h.setSelectOptions(node, [{ value: "old", label: "原环境（暂不可用）", disabled: true },
+    { value: "local", label: "本机" }], "old");
+  assert.equal(node.value, "old");
+  assert.equal(node.children[0].textContent, "原环境（暂不可用）");
+  assert.equal(h.commitSelectValue(node, "old"), false);
+  let prevented = 0;
+  for (const key of ["ArrowDown", "ArrowUp", "Home", "End"])
+    node.onkeydown({ key, preventDefault() { ++prevented; } });
+  assert.equal(prevented, 4);
+  assert.deepEqual(h.opened.map(entry => entry.edge), [null, null, "first", "last"]);
+  node.disabled = true;
+  node.onkeydown({ key: "Home", preventDefault() { throw new Error("禁用时不能打开"); } });
+  node.disabled = false;
+  node.onkeydown({ key: "Home", isComposing: true, preventDefault() { throw new Error("输入法组合时不能打开"); } });
+  assert.equal(h.opened.length, 4);
+});
+
+function permissionSettingsHarness(api) {
+  const select = selectComponentHarness();
+  const element = (tag, className = "", text = "") => ({ ...select.element(tag, className, text), className });
+  const page = element("section");
+  page.isConnected = true;
+  const instances = [
+    { id: "codex:local", backend: "codex", label: "Codex" },
+    { id: "claude:wsl:fixture", backend: "claude", label: "Claude · fixture" }
+  ];
+  let scope = "device-a", readOnly = false;
+  const settings = mountInstancePermissions({
+    page, element, selectControl: select.selectControl, setSelectOptions: select.setSelectOptions,
+    setSelectValue: select.setSelectValue, api, getInstances: () => instances,
+    readOnly: () => readOnly, authorizationScope: () => scope
+  });
+  const find = predicate => {
+    const visit = node => predicate(node) ? node : node.children?.map(visit).find(Boolean);
+    return visit(page);
+  };
+  return { settings, page, instances,
+    get: id => find(node => node.id === id),
+    save: () => find(node => node.textContent === "保存权限" || node.textContent === "保存中…"),
+    status: () => find(node => node.className === "appearance-hint permission-settings-status"),
+    choose(id) { select.commitSelectValue(this.get("permission-instance"), id); },
+    edit(name, value) { select.commitSelectValue(this.get(`permission-global-${name}`), value); },
+    revoke() { scope = "device-b"; },
+    setReadOnly() { readOnly = true; }
+  };
+}
+function permissionRecord(id, settings, revision = "r1") {
+  return { instanceId: id, backend: id.startsWith("claude:") ? "claude" : "codex",
+    path: "/isolated/config", revision, settings, supportedModes: ["manual", "acceptEdits", "plan"] };
+}
+
+function claudeRecapHarness(api) {
+  const select = selectComponentHarness();
+  const element = (tag, className = "", text = "") => ({ ...select.element(tag, className, text), className });
+  const page = element("section"); page.isConnected = true;
+  const instances = [
+    { id: "codex:local", backend: "codex", label: "Codex" },
+    { id: "claude-a", backend: "claude", label: "Claude · A", ready: true },
+    { id: "claude-b", backend: "claude", label: "Claude · B", ready: true }
+  ];
+  let scope = "device-a", readOnly = false;
+  const context = nodeVm.createContext();
+  nodeVm.runInContext(sourceSection("function mountClaudeRecapSettings("), context);
+  const settings = context.mountClaudeRecapSettings({
+    page, element, selectControl: select.selectControl, setSelectOptions: select.setSelectOptions, api,
+    getInstances: () => instances, loadInstances: async () => {},
+    readOnly: () => readOnly, authorizationScope: () => scope
+  });
+  const find = predicate => {
+    const visit = node => predicate(node) ? node : node.children?.map(visit).find(Boolean);
+    return visit(page);
+  };
+  return { settings, instances, page,
+    control: () => find(node => node.id === "claude-recap-enabled"),
+    status: () => find(node => node.id === "claude-recap-status").textContent,
+    async toggle(enabled) { const control = this.control(); control.checked = enabled; await control.onchange(); },
+    revoke() { scope = "device-b"; }, setReadOnly() { readOnly = true; }
+  };
+}
+const recapRecord = (id, enabled = true, revision = "r1") =>
+  ({ instanceId: id, backend: "claude", enabled, revision, explicit: true, readOnly: false });
+
+test("Claude 回顾默认关闭失败按实例提示，不冒充成功并按授权隔离重复提示", () => {
+  const notices = [], context = nodeVm.createContext({ notice: (...value) => notices.push(value) });
+  nodeVm.runInContext(sourceSection("const claudeRecapDef", "function new"), context);
+  const result = {
+    instances: [{ id: "claude-a", label: "Claude · A" }],
+    claudeRecapDefaults: [{ instanceId: "claude-a", initialized: false, error: "配置为只读" }]
+  };
+  context.reportClaudeRecapDefaults(result, "device-a");
+  assert.match(notices[0][0], /Claude · A.*未能默认关闭.*配置为只读/);
+  assert.equal(notices[0][1], true);
+  context.reportClaudeRecapDefaults(result, "device-a");
+  assert.equal(notices.length, 1);
+  context.reportClaudeRecapDefaults(result, "device-b");
+  assert.equal(notices.length, 2);
+  context.reportClaudeRecapDefaults({ claudeRecapDefaults: [{ instanceId: "claude-a", initialized: true }] }, "device-a");
+  context.reportClaudeRecapDefaults(result, "device-a");
+  assert.equal(notices.length, 3, "恢复成功后再次失败需要重新提示");
+  context.reportClaudeRecapDefaults({}, "device-a");
+  assert.equal(notices.length, 3, "兼容没有初始化结果字段的旧服务");
+});
+
+test("Claude 回顾实例目录的迟到结果不能向新授权显示默认关闭失败提示", async () => {
+  const response = deferred(), notices = [], catalogs = [];
+  const context = nodeVm.createContext({
+    session: { device: { id: "same-device" }, scope: "authorization-a" }, sessionInstanceRequest: null,
+    privateInputScope: value => value.scope, api: () => response.promise,
+    applySessionCatalog: result => catalogs.push(result), notice: (...value) => notices.push(value)
+  });
+  nodeVm.runInContext((sourceSection("const claudeRecapDef", "function new") + "\n" + sourceSection("async function loadSessi", "function ren")), context);
+  const reading = context.loadSessionInstances();
+  context.session.scope = "authorization-b";
+  response.resolve({ claudeRecapDefaults: [{ instanceId: "claude-a", error: "旧授权失败" }] });
+  await reading;
+  assert.equal(catalogs.length, 0);
+  assert.equal(notices.length, 0);
+});
+
+test("Claude 回顾开关只保存所选实例的原生配置，确认回执后才改变开关状态", async () => {
+  const requests = [], save = deferred();
+  const h = claudeRecapHarness(async (path, body) => {
+    assert.equal(path, "/api/settings/claude-recap");
+    requests.push(JSON.parse(JSON.stringify(body)));
+    return body.operation === "save" ? save.promise : recapRecord(body.instanceId);
+  });
+  await h.settings.show("claude-b");
+  assert.equal(h.control().checked, true);
+  const pending = h.toggle(false);
+  assert.equal(h.control().disabled, true);
+  assert.equal(h.control().checked, true, "等待保存时保持最后确认的原生状态");
+  assert.deepEqual(requests, [{ instanceId: "claude-b" }, {
+    instanceId: "claude-b", operation: "save", enabled: false, expectedRevision: "r1"
+  }]);
+  save.resolve(recapRecord("claude-b", false, "r2"));
+  await pending;
+  assert.equal(h.control().checked, false);
+  assert.equal(h.control().disabled, false);
+  assert.match(h.status(), /已关闭/);
+});
+
+test("Claude 回顾读取按实例及授权隔离，迟到回包不能覆盖另一个实例或已关闭窗口", async () => {
+  const late = deferred();
+  const h = claudeRecapHarness(async (_path, body) =>
+    body.instanceId === "claude-a" ? late.promise : recapRecord("claude-b", false));
+  const pending = h.settings.show("claude-a");
+  await new Promise(resolve => setImmediate(resolve));
+  await h.settings.show("claude-b");
+  late.resolve(recapRecord("claude-a", true));
+  await pending;
+  assert.equal(h.control().checked, false);
+  const saving = deferred();
+  const revoked = claudeRecapHarness(async (_path, body) =>
+    body.operation === "save" ? saving.promise : recapRecord(body.instanceId));
+  await revoked.settings.show("claude-a");
+  const write = revoked.toggle(false);
+  revoked.revoke();
+  saving.resolve(recapRecord("claude-a", false, "r2"));
+  await write;
+  assert.doesNotMatch(revoked.status(), /已关闭/);
+  h.settings.dispose();
+  await h.toggle(true);
+  assert.equal(h.control().disabled, true);
+});
+
+test("Claude 回顾保存结果未知时禁止重复写入，重新读取后才恢复操作；只读访问不能修改", async () => {
+  let saves = 0;
+  const h = claudeRecapHarness(async (_path, body) => {
+    if (body.operation === "save") { saves++; throw new Error("结果未知"); }
+    return recapRecord(body.instanceId, false, "r2");
+  });
+  await h.settings.show("claude-a");
+  await h.toggle(true);
+  assert.equal(h.control().checked, false);
+  assert.equal(h.control().disabled, true);
+  assert.match(h.status(), /重新读取核对/);
+  await h.toggle(true);
+  assert.equal(saves, 1);
+  await h.settings.show();
+  assert.equal(h.control().disabled, false);
+  h.setReadOnly();
+  await h.toggle(true);
+  assert.equal(saves, 1);
+  assert.equal(h.control().disabled, true);
+});
+
+test("Claude 回顾读取失败或实例不可用时保持未知，不能冒用 Codex 或虚报关闭", async () => {
+  let reads = 0;
+  const h = claudeRecapHarness(async () => { reads++; throw new Error("配置格式无效"); });
+  await h.settings.show("claude-a");
+  assert.equal(h.control().disabled, true);
+  assert.equal(h.control().indeterminate, true);
+  assert.match(h.status(), /配置格式无效/);
+  h.instances.splice(1);
+  await h.settings.show();
+  assert.equal(reads, 1);
+  assert.match(h.status(), /所选 Claude 实例暂不可用/);
+  const empty = claudeRecapHarness(async () => { throw new Error("不应读取 Codex 配置"); });
+  empty.instances.splice(1);
+  await empty.settings.show("codex:local");
+  assert.match(empty.status(), /尚未检测到 Claude/);
+});
+
+test("实例全局权限草稿按实例隔离，保存只包含所选实例改动的字段", async () => {
+  const requests = [];
+  const h = permissionSettingsHarness(async (path, body) => {
+    assert.equal(path, "/api/settings/permissions");
+    requests.push(body);
+    return body.instanceId.startsWith("claude:")
+      ? permissionRecord(body.instanceId, { permissionMode: body.settings?.permissionMode || "manual" }, body.operation ? "r2" : "r1")
+      : permissionRecord(body.instanceId, { approvalPolicy: "on-request", sandboxMode: "workspace-write" });
+  });
+  await h.settings.show("codex:local");
+  h.edit("approvalPolicy", "never");
+  assert.equal(h.save().disabled, false);
+  await h.settings.show("claude:wsl:fixture");
+  h.edit("permissionMode", "acceptEdits");
+  await h.save().onclick();
+  assert.deepEqual(requests.at(-1), { operation: "save", instanceId: "claude:wsl:fixture",
+    expectedRevision: "r1", settings: { permissionMode: "acceptEdits" } });
+  assert.equal(h.save().disabled, true);
+  await h.settings.show("codex:local");
+  assert.equal(h.get("permission-global-approvalPolicy").value, "never");
+  assert.equal(h.get("permission-global-sandboxMode").value, "workspace-write");
+});
+
+test("实例权限迟到读取与保存不能污染另一实例或新的授权", async () => {
+  const pendingRead = deferred(), pendingSave = deferred();
+  const h = permissionSettingsHarness((_, body) => body.operation === "save" ? pendingSave.promise
+    : body.instanceId === "codex:local" ? pendingRead.promise
+      : Promise.resolve(permissionRecord(body.instanceId, { permissionMode: "manual" })));
+  const first = h.settings.show("codex:local");
+  await h.settings.show("claude:wsl:fixture");
+  pendingRead.resolve(permissionRecord("codex:local", { approvalPolicy: "on-request", sandboxMode: "workspace-write" }));
+  await first;
+  assert.equal(h.get("permission-global-approvalPolicy"), undefined);
+  h.edit("permissionMode", "acceptEdits");
+  const saving = h.save().onclick();
+  h.revoke();
+  pendingSave.resolve(permissionRecord("claude:wsl:fixture", { permissionMode: "acceptEdits" }, "r2"));
+  await saving;
+  assert.equal(h.get("permission-global-permissionMode").value, "acceptEdits");
+  assert.doesNotMatch(h.status().textContent, /已保存/);
+});
+
+test("权限配置未知、只读或使用命名权限配置时不能误覆盖", async () => {
+  const failed = permissionSettingsHarness(async () => { throw new Error("隔离读取失败"); });
+  await failed.settings.show();
+  assert.equal(failed.save().disabled, true);
+  assert.match(failed.status().textContent, /隔离读取失败/);
+  const profile = permissionSettingsHarness(async (_, body) => permissionRecord(body.instanceId,
+    { approvalPolicy: "", sandboxMode: "", permissionProfile: "managed", customApproval: true }));
+  await profile.settings.show();
+  assert.equal(profile.get("permission-global-sandboxMode").disabled, true);
+  assert.equal(profile.get("permission-global-approvalPolicy").value, "__custom__");
+  assert.equal(profile.save().disabled, true);
+  const readonly = permissionSettingsHarness(async (_, body) => permissionRecord(body.instanceId,
+    { approvalPolicy: "on-request", sandboxMode: "workspace-write" }));
+  readonly.setReadOnly();
+  await readonly.settings.show();
+  assert.equal(readonly.get("permission-global-approvalPolicy").disabled, true);
+  assert.equal(readonly.save().disabled, true);
+});
+
+test("全局权限保存失败保留原草稿且不会自动重试", async () => {
+  let saves = 0;
+  const h = permissionSettingsHarness(async (_, body) => {
+    if (body.operation) { ++saves; throw new Error("原配置已变化"); }
+    return permissionRecord(body.instanceId, { approvalPolicy: "on-request", sandboxMode: "workspace-write" });
+  });
+  await h.settings.show();
+  h.edit("approvalPolicy", "never");
+  await h.save().onclick();
+  assert.equal(saves, 1);
+  assert.equal(h.get("permission-global-approvalPolicy").value, "never");
+  assert.match(h.status().textContent, /未自动重复保存/);
+});
+
+function composerPermissionHarness({ creating = false, backend = "codex" } = {}) {
+  const attributes = new Map(), requests = [], notices = [];
+  const button = { dataset: {}, value: "", disabled: false,
+    setAttribute: (name, value) => attributes.set(name, String(value)) };
+  const context = nodeVm.createContext({ nativeConnectionVersion: 1,
+    creating, selectedId: "thread-a", thread: { id: "thread-a" }, relatedSessionView: null,
+    session: { device: { id: "device-a" }, capabilities: { sessionPermissions: true } },
+    draftPermissionChoices: new Map(), permissionSelections: new Map(), permissionWrites: new Map(),
+    instancePermissionCatalogs: new Map(backend === "claude" ? [["claude:wsl:fixture", {
+      scope: "device-a", defaultMode: "default",
+      modes: ["default", "manual", "acceptEdits", "plan", "auto", "bypassPermissions"]
+    }]] : []), instancePermissionReads: new Map(),
+    permissionLabel, permissionModeKnown, permissionOptions, privateInputScope: value => value.device.id,
+    api: async (_, body) => ({ instanceId: body.instanceId, backend: "claude",
+      supportedModes: ["default", "acceptEdits", "plan", "auto", "bypassPermissions"],
+      settings: { permissionMode: "default" } }),
+    currentThreadDisplay: () => context.thread, activeBackend: () => backend, isClaude: () => backend === "claude",
+    claudeThreadId: () => backend === "claude",
+    activeInstanceId: () => backend === "claude" ? "claude:wsl:fixture" : "codex:local",
+    draftKey: () => "$new:fixture", snapshotDraft: () => ({ text: "草稿" }),
+    storeDraft: (key, value) => context.draftPermissionChoices.set(key, value.permissionMode),
+    rememberNewChatSettings() {}, newClaudePermissionMode: () => "",
+    $: () => button, sessionInstanceEnabled: () => true, threadReadOnly: () => false,
+    connected: true, busy: false, stopping: false, pending: null, editingMessage: null, editingQueuedMessage: null,
+    isActiveThread: () => false, threadDeletionLocked: () => false,
+    setSelectOptions: (node, options, mode) => { node.options = options; node.value = mode; },
+    notice: (...args) => notices.push(args),
+    mutate: async (action, payload, options) => {
+      assert.equal(options.reliable, true);
+      requests.push([action, payload]);
+      return { ...payload, permissionRevision: 2 };
+    },
+    updateComposer: () => context.updateComposerPermissions()
+  });
+  nodeVm.runInContext((sourceSection("function rememberPer", "let modelQue") + "\n" + sourceSection("async function loadI")), context);
+  return { context, button, requests, notices, attributes };
+}
+
+test("编辑区权限覆盖只保存当前会话，迟到版本不能覆盖新的选择", async () => {
+  const h = composerPermissionHarness();
+  h.context.updateComposerPermissions();
+  h.button.value = "full-access";
+  await h.context.changeComposerPermissions();
+  assert.deepEqual(JSON.parse(JSON.stringify(h.requests)), [["setPermissions",
+    { threadId: "thread-a", instanceId: "codex:local", permissionMode: "full-access" }]]);
+  assert.equal(h.button.value, "full-access");
+  h.context.rememberPermissionSelection("thread-a", "read-only", 1);
+  h.context.updateComposerPermissions();
+  assert.equal(h.button.value, "full-access");
+  h.context.selectedId = "thread-b"; h.context.thread = { id: "thread-b" };
+  h.context.updateComposerPermissions();
+  assert.equal(h.button.value, "configured");
+  h.context.session.device.id = "device-b";
+  h.context.selectedId = "thread-a"; h.context.thread = { id: "thread-a" };
+  h.context.updateComposerPermissions();
+  assert.equal(h.button.value, "configured", "新授权不能使用旧授权的会话选择");
+});
+
+test("PC 侧边与手机关联侧边均隐藏权限入口，回主会话恢复且隐藏入口不能提交", async () => {
+  for (const view of [
+    { thread: { id: "thread-a", serviceSide: true } },
+    { thread: { id: "thread-a", viewKind: "side" } },
+    { thread: { id: "thread-a" }, relatedSessionView: { kind: "side", threadId: "thread-a" } },
+  ]) {
+    const h = composerPermissionHarness();
+    h.context.thread = view.thread;
+    h.context.relatedSessionView = view.relatedSessionView || null;
+    h.context.updateComposerPermissions();
+    assert.equal(h.button.hidden, true);
+    assert.equal(h.button.disabled, true);
+    assert.equal(h.button.dataset.saving, "false");
+    h.button.value = "full-access";
+    await h.context.changeComposerPermissions();
+    assert.equal(h.requests.length, 0);
+    h.context.thread = { id: "thread-a", permissionMode: "auto" };
+    h.context.relatedSessionView = null;
+    h.context.updateComposerPermissions();
+    assert.equal(h.button.hidden, false);
+    assert.equal(h.button.disabled, false);
+    assert.equal(h.button.value, "auto");
+  }
+});
+
+test("主会话权限保存提供完成结果，供侧边创建等待成功且失败不误报已保存", async () => {
+  for (const fail of [false, true]) {
+    const h = composerPermissionHarness();
+    let finish;
+    h.context.mutate = () => new Promise((resolve, reject) => {
+      finish = () => fail ? reject(new Error("权限保存失败"))
+        : resolve({ threadId: "thread-a", instanceId: "codex:local", permissionMode: "auto", permissionRevision: 2 });
+    });
+    h.context.updateComposerPermissions();
+    h.button.value = "auto";
+    const change = h.context.changeComposerPermissions();
+    const writing = h.context.permissionWrites.get("thread-a");
+    assert.ok(writing.completion);
+    finish();
+    await change;
+    assert.equal(await writing.completion, !fail);
+    assert.equal(h.context.permissionWrites.size, 0);
+  }
+});
+
+test("Codex 权限只展示 App 四项，旧只读归类展示但不修改已保存权限", () => {
+  const h = composerPermissionHarness();
+  h.context.thread.permissionMode = "read-only";
+  h.context.thread.permissionRevision = 3;
+  h.context.updateComposerPermissions();
+  assert.deepEqual(Array.from(h.button.options, option => [option.value, option.label, option.icon]), [
+    ["auto", "请求批准", "permissionAsk"],
+    ["guardian-approvals", "帮我批准", "shield"],
+    ["full-access", "完全访问权限", "permissionFull"],
+    ["configured", "自定义 (config.toml)", "settings"]
+  ]);
+  assert.equal(h.button.value, "auto");
+  assert.equal(h.context.permissionSelections.get("thread-a").mode, "read-only");
+  assert.equal(h.context.thread.permissionMode, "read-only");
+  assert.equal(h.requests.length, 0, "展示归类不能静默保存或扩大权限");
+  assert.equal(permissionLabel("codex", "read-only"), "请求批准");
+  assert.equal(permissionLabel("codex", "configured"), "自定义");
+  assert.equal(permissionLabel("codex", "full-access"), "完全访问");
+  assert.equal(h.button.popupTitle, "应如何批准 Codex 操作？");
+  assert.equal(h.button.popupWidth, 340);
+  assert.equal(h.button.popupHelp.label, "了解更多");
+  assert.equal(h.button.popupHelpAfterTitle, true);
+  assert.equal(h.button.popupNotePosition, "bottom");
+});
+
+test("弹层帮助与说明移动到列表上方且只出现一次", () => {
+  const h = sessionFilterPopupHarness();
+  Object.assign(h.trigger, {
+    popupTitle: "标题", popupHelp: { label: "了解更多", href: "https://example.com" },
+    popupHelpAfterTitle: true, popupNote: "顶部说明", popupNotePosition: "top",
+  });
+  h.open();
+  const children = h.context.activePopup.node.children;
+  assert.deepEqual(children.map(node => node.className), ["popup-title", "popup-help", "popup-note", "popup-list"]);
+  assert.equal(children.filter(node => node.className === "popup-help").length, 1);
+  assert.equal(children.filter(node => node.className === "popup-note").length, 1);
+  const bottom = sessionFilterPopupHarness();
+  Object.assign(bottom.trigger, { popupTitle: "标题", popupNote: "底部说明",
+    popupHelp: { label: "了解更多", href: "https://example.com" } });
+  bottom.open();
+  assert.deepEqual(bottom.context.activePopup.node.children.map(node => node.className),
+    ["popup-title", "popup-list", "popup-note", "popup-help"], "未启用顶部定位的普通弹层保持原布局");
+});
+
+test("会话权限菜单文字继承当前设置字号，顶部信息与链接使用下边界", async () => {
+  const css = await readFile(new URL("../assets/harness/style.css", import.meta.url), "utf8");
+  assert.match(css, /\.permission-button>\.ui-icon:last-child\{display:none\}/);
+  const start = css.indexOf(".composer-permissions-popup{"), end = css.indexOf(".composer-add-popup", start);
+  const block = css.slice(start, end);
+  assert.ok(start >= 0 && end > start);
+  assert.match(block, /^\.composer-permissions-popup\{font-size:var\(--font-size\)\}/);
+  const rule = selector => {
+    const from = block.indexOf(`${selector}{`);
+    assert.ok(from >= 0, `缺少 ${selector}`);
+    return block.slice(from, block.indexOf("}", from));
+  };
+  for (const selector of [
+    ".composer-permissions-popup .popup-title", ".composer-permissions-popup .popup-option",
+    ".composer-permissions-popup .popup-option-label small", ".composer-permissions-popup .popup-note",
+    ".composer-codex-permissions-popup .popup-help",
+  ]) assert.match(rule(selector), /font-size:inherit/);
+  assert.match(rule(".composer-codex-permissions-popup .popup-help"), /border-top:0/);
+  assert.match(rule(".composer-codex-permissions-popup .popup-help"), /border-bottom:1px solid/);
+  assert.match(rule(".composer-claude-permissions-popup .popup-note"), /border-top:0/);
+  assert.match(rule(".composer-claude-permissions-popup .popup-note"), /border-bottom:1px solid/);
+});
+
+test("Claude 权限待生效时说明实际权限和原因，不阻断消息或继续选择", () => {
+  const h = composerPermissionHarness({ backend: "claude" });
+  h.context.thread.permissionMode = "plan";
+  h.context.thread.nativeSettings = { permissionMode: "acceptEdits",
+    changes: { permissionMode: { requested: "plan", state: "pending", reason: "原生正在等待审批" } } };
+  h.context.updateComposerPermissions();
+  assert.equal(h.button.dataset.permissionPending, "true");
+  assert.equal(h.button.disabled, false);
+  assert.match(h.button.title, /待生效/);
+  assert.match(h.button.title, /接受编辑/);
+  assert.match(h.button.title, /已选择“计划”，待生效；当前原生权限为“接受编辑”/);
+  assert.match(h.button.popupNote, /原生正在等待审批/);
+  assert.equal(h.context.permissionWrites.size, 0);
+  h.context.thread.nativeSettings = { permissionMode: "plan",
+    changes: { permissionMode: { requested: "plan", state: "applied" } } };
+  h.context.updateComposerPermissions();
+  assert.equal(h.button.dataset.permissionPending, "false");
+  assert.doesNotMatch(h.button.popupNote, /待生效/);
+});
+
+test("Claude 未切换权限或原生已应用时不显示待生效说明", () => {
+  const h = composerPermissionHarness({ backend: "claude" });
+  h.context.thread.permissionMode = "bypassPermissions";
+  // 只有目标值和原生值不同，但没有实际切换记录时不显示待生效。
+  h.context.thread.nativeSettings = { permissionMode: "acceptEdits" };
+  h.context.updateComposerPermissions();
+  assert.equal(h.button.dataset.permissionPending, "false");
+  assert.equal(h.button.popupNote, "“绕过权限”仅在该实例 CLI 支持且已允许时显示");
+  assert.doesNotMatch(h.button.title, /待生效/);
+  // 即使残留 pending 记录，原生已经达到目标时也不能继续显示等待说明。
+  h.context.thread.nativeSettings = { permissionMode: "bypassPermissions",
+    changes: { permissionMode: { requested: "bypassPermissions", state: "pending",
+      reason: "当前轮次尚未结束，绕过权限将在会话空闲后自动应用" } } };
+  h.context.updateComposerPermissions();
+  assert.equal(h.button.dataset.permissionPending, "false");
+  assert.equal(h.button.popupNote, "“绕过权限”仅在该实例 CLI 支持且已允许时显示");
+  assert.doesNotMatch(h.button.title, /待生效/);
+});
+
+test("Claude 权限保存分别提示立即生效与等待原生安全切换", async () => {
+  for (const immediate of [true, false]) {
+    const h = composerPermissionHarness({ backend: "claude" });
+    h.context.updateComposerPermissions();
+    h.context.mutate = async (_action, payload) => ({ ...payload, permissionRevision: 2,
+      appliesTo: immediate ? "immediate" : "whenReady", permissionPending: !immediate });
+    h.button.value = "plan";
+    await h.context.changeComposerPermissions();
+    assert.match(h.notices.at(-1)[0], immediate ? /已生效/ : /等待原生可安全切换/);
+    assert.equal(h.context.permissionWrites.size, 0);
+  }
+});
+
+test("新会话权限保留在本实例草稿中，执行与已有队列均允许保存后续权限", async () => {
+  const h = composerPermissionHarness({ creating: true });
+  h.context.updateComposerPermissions();
+  assert.equal(h.button.value, "configured");
+  h.button.value = "guardian-approvals";
+  await h.context.changeComposerPermissions();
+  assert.equal(h.context.draftPermissionChoices.get("$new:fixture"), "guardian-approvals");
+  assert.equal(h.requests.length, 0, "新建草稿选择不能提前写入全局配置或原生会话");
+  h.context.creating = false;
+  h.context.isActiveThread = () => true;
+  h.context.updateComposerPermissions();
+  assert.equal(h.button.disabled, false);
+  h.context.isActiveThread = () => false;
+  h.context.thread.queuedMessages = [{ id: "awaiting" }];
+  h.context.updateComposerPermissions();
+  assert.equal(h.button.disabled, false);
+  h.context.thread.queuedMessages = [];
+  h.context.pending = { state: "unknown" };
+  h.context.updateComposerPermissions();
+  assert.equal(h.button.disabled, true);
+});
+
+test("新建及已有会话的权限按钮单击只切换一次，鼠标和键盘均可打开并选择", async () => {
+  for (const backend of ["codex", "claude"]) {
+    for (const creating of [true, false]) {
+      const select = selectComponentHarness(), h = composerPermissionHarness({ backend, creating });
+      const reads = [], slot = {};
+      h.context.selectControl = select.selectControl;
+      h.context.icon = name => select.element("span", "ui-icon", name);
+      h.context.element = select.element;
+      h.context.togglePopup = select.togglePopup;
+      h.context.add = { after(node) { slot.button = node; } };
+      h.context.loadInstancePermissionCatalog = id => { reads.push(id); };
+      nodeVm.runInContext(sourceSection('  const permissions = selectControl("permission-button"',
+        "  add.popupDirection ="), h.context);
+      const control = slot.button;
+      h.context.$ = () => control;
+      h.context.setSelectOptions = select.setSelectOptions;
+      h.context.updateComposerPermissions();
+      assert.equal(control.disabled, false, `${backend} ${creating ? "新建" : "已有"}会话可操作`);
+      control.click();
+      assert.equal(select.activePopup()?.trigger, control, "单击后菜单必须保持打开");
+      assert.equal(select.opened.length, 1, "单次点击只能切换一次");
+      assert.equal(reads.length, backend === "claude" ? 1 : 0);
+      control.click();
+      assert.equal(select.activePopup(), null, "再次单击关闭菜单");
+      control.onkeydown({ key: "ArrowDown", preventDefault() {} });
+      assert.equal(select.activePopup()?.trigger, control, "键盘仍可打开菜单");
+      assert.equal(reads.length, backend === "claude" ? 3 : 0);
+      if (backend === "claude") {
+        h.context.instancePermissionCatalogs.set("claude:wsl:fixture", {
+          scope: "device-a", modes: ["default", "acceptEdits", "plan"]
+        });
+        h.context.updateComposerPermissions();
+      }
+      const mode = backend === "claude" ? "acceptEdits" : "guardian-approvals";
+      assert.equal(select.commitSelectValue(control, mode), true);
+      await Promise.resolve();
+      assert.equal(control.value, mode);
+      assert.equal(h.requests.length, creating ? 0 : 1);
+      if (creating) assert.equal(h.context.draftPermissionChoices.get("$new:fixture"), mode);
+    }
+  }
+});
+
+test("Codex 四种权限选择后编辑区入口同步图标和短标题，重复选择不重新保存", async () => {
+  const select = selectComponentHarness(), h = composerPermissionHarness({ creating: true }), slot = {};
+  h.context.selectControl = select.selectControl;
+  h.context.icon = name => select.element("span", "ui-icon", name);
+  h.context.element = select.element;
+  h.context.add = { after(node) { slot.button = node; } };
+  nodeVm.runInContext(sourceSection('  const permissions = selectControl("permission-button"',
+    "  add.popupDirection ="), h.context);
+  const control = slot.button;
+  h.context.$ = () => control;
+  h.context.setSelectOptions = select.setSelectOptions;
+  h.context.updateComposerPermissions();
+  for (const [mode, icon, label] of [
+    ["auto", "permissionAsk", "请求批准"],
+    ["guardian-approvals", "shield", "帮我批准"],
+    ["full-access", "permissionFull", "完全访问"],
+    ["configured", "settings", "自定义"]
+  ]) {
+    assert.equal(select.commitSelectValue(control, mode), true);
+    await Promise.resolve();
+    assert.deepEqual(control.children.map(node => node.textContent), [icon, label, "chevron"]);
+    assert.equal(control.dataset.permissionMode, mode);
+    assert.equal(select.commitSelectValue(control, mode), false);
+    assert.equal(h.context.draftPermissionChoices.get("$new:fixture"), mode);
+  }
+  assert.equal(h.requests.length, 0);
+});
+
+test("Claude 菜单按 CLI 和原生会话开放能力筛选模式", () => {
+  const h = composerPermissionHarness({ backend: "claude" });
+  h.context.instancePermissionCatalogs.set("claude:wsl:fixture", {
+    scope: "device-a", modes: ["manual", "acceptEdits", "plan", "bypassPermissions"]
+  });
+  h.context.thread.permissionModes = ["default", "acceptEdits", "plan"];
+  h.context.updateComposerPermissions();
+  assert.equal(h.button.popupWidth, 340);
+  assert.equal(h.button.popupTitle, "");
+  assert.equal(h.button.popupHelp, null);
+  assert.equal(h.button.popupNotePosition, "top");
+  assert.deepEqual(Array.from(h.button.options, option => option.value),
+    ["manual", "acceptEdits", "plan"]);
+  h.context.creating = true;
+  h.context.updateComposerPermissions();
+  assert.ok(h.button.options.some(option => option.value === "bypassPermissions"));
+});
+
+test("Claude 菜单只提供五种 App 模式，手动别名只显示一次，旧值仅兼容保存记录", () => {
+  assert.deepEqual(permissionOptions("claude").map(option => [option.value, option.label, option.icon]), [
+    ["default", "手动", "claudeManual"],
+    ["acceptEdits", "接受编辑", "claudeEdits"],
+    ["plan", "计划", "claudePlan"],
+    ["auto", "自动", "claudeAuto"],
+    ["bypassPermissions", "绕过权限", "claudeBypass"]
+  ]);
+  assert.deepEqual(permissionOptions("claude", ["manual", "default", "plan"]).map(option => option.value),
+    ["default", "plan"]);
+  assert.deepEqual(permissionOptions("claude", ["manual", "plan"]).map(option => option.value), ["manual", "plan"]);
+  for (const mode of ["configured", "manual", "dontAsk"]) assert.equal(permissionModeKnown("claude", mode), true);
+  assert.equal(permissionLabel("claude", "manual"), "手动");
+  assert.equal(permissionModeKnown("claude", "full-access"), false);
+});
+
+test("Claude 入口按原生实际模式和实例默认显示，不写入隐式权限覆盖", () => {
+  const h = composerPermissionHarness({ backend: "claude" });
+  h.context.thread.nativeSettings = { permissionMode: "acceptEdits" };
+  h.context.instancePermissionCatalogs.get("claude:wsl:fixture").defaultMode = "plan";
+  h.context.updateComposerPermissions();
+  assert.equal(h.button.value, "acceptEdits");
+  assert.match(h.attributes.get("aria-label"), /接受编辑/);
+  h.context.thread.permissionMode = "configured";
+  h.context.updateComposerPermissions();
+  assert.equal(h.button.value, "acceptEdits", "配置继承会话仍以原生实际模式为准");
+  h.context.creating = true;
+  h.context.updateComposerPermissions();
+  assert.equal(h.button.value, "plan", "新建草稿显示所选实例配置");
+  assert.equal(h.context.draftPermissionChoices.size, 0);
+  assert.equal(h.requests.length, 0);
+  h.context.thread.permissionMode = "dontAsk";
+  h.context.thread.permissionRevision = 5;
+  h.context.creating = false;
+  h.context.updateComposerPermissions();
+  assert.equal(h.button.value, "", "旧 CLI 专有模式保留占位，不伪装为手动或绕过权限");
+  assert.equal(h.context.permissionSelections.get("thread-a").mode, "dontAsk");
+  assert.equal(h.button.options.some(option => ["dontAsk", "configured", ""].includes(option.value)), false);
+});
+
+test("Claude 五种模式选择后入口同步原生图标和标题", async () => {
+  const select = selectComponentHarness(), h = composerPermissionHarness({ backend: "claude", creating: true }), slot = {};
+  Object.assign(h.context, {
+    selectControl: select.selectControl, icon: name => select.element("span", "ui-icon", name),
+    element: select.element, add: { after(node) { slot.button = node; } }
+  });
+  nodeVm.runInContext(sourceSection('  const permissions = selectControl("permission-button"',
+    "  add.popupDirection ="), h.context);
+  const control = slot.button;
+  h.context.$ = () => control;
+  h.context.setSelectOptions = select.setSelectOptions;
+  h.context.updateComposerPermissions();
+  for (const [mode, name, label] of [
+    ["acceptEdits", "claudeEdits", "接受编辑"], ["plan", "claudePlan", "计划"],
+    ["auto", "claudeAuto", "自动"], ["bypassPermissions", "claudeBypass", "绕过权限"],
+    ["default", "claudeManual", "手动"]
+  ]) {
+    assert.equal(select.commitSelectValue(control, mode), true);
+    await Promise.resolve();
+    assert.deepEqual(control.children.map(node => node.textContent), [name, label, "chevron"]);
+    assert.equal(control.dataset.permissionMode, mode);
+    assert.equal(h.context.draftPermissionChoices.get("$new:fixture"), mode);
+  }
+  assert.equal(h.requests.length, 0);
+});
+
+test("Claude 权限读取失败不自动循环重试，实例不匹配不接收，显式重读可恢复", async () => {
+  const h = composerPermissionHarness({ backend: "claude", creating: true });
+  h.context.instancePermissionCatalogs.clear();
+  let reads = 0;
+  h.context.api = async () => {
+    ++reads;
+    return { instanceId: "claude:wsl:other", backend: "claude",
+      supportedModes: ["bypassPermissions"], settings: { permissionMode: "bypassPermissions" } };
+  };
+  h.context.updateComposerPermissions();
+  await h.context.instancePermissionReads.get("claude:wsl:fixture");
+  assert.equal(reads, 1);
+  assert.equal(h.button.value, "");
+  assert.equal(h.button.options.length, 0);
+  assert.match(h.notices.at(-1)[0], /不匹配/);
+  h.context.updateComposerPermissions();
+  await Promise.resolve();
+  assert.equal(reads, 1, "失败后的页面刷新不得形成读取循环");
+  h.context.api = async (_, body) => {
+    ++reads;
+    return { instanceId: body.instanceId, backend: "claude",
+      supportedModes: ["manual", "acceptEdits", "plan"], settings: { permissionMode: "manual" } };
+  };
+  await h.context.loadInstancePermissionCatalog("claude:wsl:fixture");
+  assert.equal(reads, 2);
+  assert.equal(h.button.value, "manual");
+  assert.match(h.attributes.get("aria-label"), /手动/);
+});
+
+test("权限选择器可保留未确认占位，显式选择才触发 change", () => {
+  const h = selectComponentHarness();
+  const control = h.selectControl("permission", "权限", permissionOptions("claude"), "default");
+  control.selectAllowEmpty = true;
+  h.setSelectValue(control, "");
+  assert.equal(control.value, "");
+  assert.equal(control.events.length, 0);
+  assert.equal(h.commitSelectValue(control, "plan"), true);
+  assert.equal(control.value, "plan");
+  assert.equal(control.events.length, 1);
+});
+
+test("权限入口紧邻加号，手机固定图标宽度且底栏强制单行", async () => {
+  assert.match(app, /add\.after\(permissions\)/);
+  assert.match(devServerSource, /"\/api\/settings\/permissions"/);
+  const css = await readFile(new URL("../assets/harness/style.css", import.meta.url), "utf8");
+  assert.match(css, /\.composer-toolbar\{gap:6px;flex-wrap:nowrap\}/);
+  assert.match(css, /\.composer-toolbar>\.composer-controls\{gap:0;flex-wrap:nowrap\}/);
+  assert.match(css, /\.permission-button\{flex:0 0 28px;width:28px;max-width:28px/);
+  assert.match(css, /\.composer-toolbar>\.composer-send\{flex:0 0 auto;flex-wrap:nowrap\}/);
+});
+
+function instructionSettingsHarness(api) {
+  const select = selectComponentHarness(), { element } = select;
+  const context = vm.createContext({ nativeConnectionVersion: 1, api, element, setSelectOptions: select.setSelectOptions,
+    connected: true, session: { device: { id: "instruction-device" } },
+    privateInputScope: () => "instruction-device", confirmAction: async () => true,
+    $: (id, dialog) => dialog.nodes.get(id), sidebar: { projects: [] } });
+  vm.runInContext((sourceSection("const normalizeInstructionText =") + sourceSection("const appearanceFontFamilies =", "function openAppearance(")), context);
+  function mount({ withDetectionControls = false } = {}) {
+    const nodes = new Map();
+    for (const name of ["content", "status", "save", "reload", "path"])
+      nodes.set("#instruction-" + name, element("input"));
+    nodes.set("#instruction-instance", select.selectControl("instruction-instance", "会话实例", [], ""));
+    if (withDetectionControls) for (const name of ["detect-environments", "environments-status", "environments"])
+      nodes.set("#appearance-" + name, element("div"));
+    const dialog = { isConnected: true, nodes };
+    const settings = context.mountRemoteSettings(dialog);
+    return { dialog, settings, get: id => nodes.get("#" + id),
+      async chooseInstance(id) {
+        select.commitSelectValue(nodes.get("#instruction-instance"), id);
+        await new Promise(resolve => setImmediate(resolve));
+      },
+      edit(text) { const input = nodes.get("#instruction-content"); input.value = text; input.oninput(); } };
+  }
+  return { context, mount };
+}
+
+test("指令保存迟到不能清掉重新打开窗口后的新草稿", async () => {
+  const pendingSave = deferred();
+  let stored = { content: "旧指令\n", revision: "r1", exists: true, path: "/fixture/AGENTS.md" };
+  const h = instructionSettingsHarness((path, body) => {
+    if (path.endsWith("environments")) return Promise.resolve({ environments: [
+      { id: "local", label: "本机" },
+      { id: "wsl:claude-us", label: "WSL · claude-us", executables: { claude: "/fixture/bin/claude" } },
+      { id: "wsl:unavailable", label: "不可用环境", error: "模拟环境不可用" },
+    ], instances: [
+      { id: "codex:local", label: "Codex · 本机", backend: "codex", environmentId: "local" },
+      { id: "claude:wsl:fixture", label: "Claude · WSL · claude-us", backend: "claude", environmentId: "wsl:claude-us" },
+      { id: "claude:wsl:unavailable", label: "Claude · 不可用环境", backend: "claude", environmentId: "wsl:unavailable" },
+    ] });
+    return Object.hasOwn(body, "content") ? pendingSave.promise : Promise.resolve(stored);
+  });
+  const a = h.mount();
+  await a.settings.show("instructions");
+  assert.deepEqual(Array.from(a.get("instruction-instance").selectOptions.filter(option => !option.disabled), option => option.value),
+    ["codex:local", "claude:wsl:fixture"], "所有正常实例均可编辑全局指令，不按发行版名称限制");
+  a.edit("第一次保存\n");
+  const save = a.get("instruction-save").onclick();
+  a.settings.dispose(); a.dialog.isConnected = false;
+  const b = h.mount();
+  await b.settings.show("instructions");
+  b.edit("第二个窗口尚未保存的新草稿\n");
+  stored = { ...stored, content: "第一次保存\n", revision: "r2" };
+  pendingSave.resolve(stored);
+  await save;
+  b.settings.dispose(); b.dialog.isConnected = false;
+  const c = h.mount();
+  await c.settings.show("instructions");
+  assert.equal(c.get("instruction-content").value, "第二个窗口尚未保存的新草稿\n");
+  assert.match(c.get("instruction-status").textContent, /原文件也已变化/);
+});
+
+test("重新检测实例失效时保留明确的目标与草稿，并禁用保存", async () => {
+  let available = true, writes = 0;
+  const h = instructionSettingsHarness(async (path, body) => {
+    if (path.endsWith("environments")) return { environments: available
+      ? [{ id: "wsl:test", label: "测试 WSL", executables: { claude: "/fixture/bin/claude" } }, { id: "local", label: "本机" }]
+      : [{ id: "local", label: "本机" }], instances: [
+        ...(available ? [{ id: "claude:wsl:test", backend: "claude", label: "Claude · 测试 WSL", environmentId: "wsl:test" }] : []),
+        { id: "codex:local", backend: "codex", label: "Codex · 本机", environmentId: "local" },
+      ] };
+    if (Object.hasOwn(body, "content")) ++writes;
+    return { content: "WSL 指令", revision: "r1", exists: true, path: "/test/AGENTS.md" };
+  });
+  const page = h.mount({ withDetectionControls: true });
+  await page.settings.show("instructions");
+  await page.chooseInstance("claude:wsl:test");
+  page.edit("保留 WSL 草稿");
+  available = false;
+  await page.get("appearance-detect-environments").onclick();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(page.get("instruction-instance").value, "claude:wsl:test", "不能自动跳成本机并保留旧实例的正文");
+  assert.equal(page.get("instruction-instance").selectOptions.find(option => option.value === "claude:wsl:test").disabled, true);
+  assert.equal(page.get("instruction-content").value, "保留 WSL 草稿");
+  assert.equal(page.get("instruction-save").disabled, true);
+  await page.get("instruction-save").onclick();
+  assert.equal(writes, 0);
+});
+
+test("全局指令只按实例读写，实例开关不限制编辑，草稿和换行各自保留", async () => {
+  const catalog = { environments: [
+    { id: "local", user: "" }, { id: "wsl:fixture", user: "fixture-user", executables: { claude: "/fixture/bin/claude" } },
+  ], instances: [
+    { id: "codex:local", backend: "codex", label: "Codex · 本机", environmentId: "local", user: "" },
+    { id: "claude:wsl:fixture", backend: "claude", label: "Claude · WSL · fixture", environmentId: "wsl:fixture", user: "fixture-user" },
+  ] };
+  const stored = new Map([
+    ["codex:local", { content: "Codex 原文\r\n", revision: "c1", exists: true, path: "/fixture/.codex/AGENTS.md" }],
+    ["claude:wsl:fixture", { content: "Claude 原文\r\n", revision: "a1", exists: true, path: "/fixture/.claude/CLAUDE.md" }],
+  ]), requests = [];
+  const h = instructionSettingsHarness(async (path, body) => {
+    if (path.endsWith("environments")) return catalog;
+    requests.push({ ...body });
+    if (Object.hasOwn(body, "content")) stored.set(body.instanceId,
+      { ...stored.get(body.instanceId), content: body.content, revision: "saved" });
+    return stored.get(body.instanceId);
+  });
+  h.context.appearance.sessionInstances = { "codex:local": true, "claude:wsl:fixture": false };
+  const page = h.mount();
+  await page.settings.show("instructions");
+  page.edit("Codex 未保存草稿\n");
+  await page.chooseInstance("claude:wsl:fixture");
+  assert.equal(page.get("instruction-content").value, "Claude 原文\n");
+  page.edit("Claude 全局新指令\n");
+  await page.get("instruction-save").onclick();
+  assert.deepEqual(requests.at(-1), { instanceId: "claude:wsl:fixture",
+    content: "Claude 全局新指令\r\n", expectedRevision: "a1" });
+  assert.equal(page.get("instruction-save").disabled, true);
+  await page.chooseInstance("codex:local");
+  assert.equal(page.get("instruction-content").value, "Codex 未保存草稿\n");
+  assert.equal(stored.get("codex:local").content, "Codex 原文\r\n");
+  assert.ok(requests.filter(body => !Object.hasOwn(body, "content"))
+    .every(body => Object.keys(body).join() === "instanceId"));
+});
+
+test("切换指令实例后忽略旧实例的迟到回包，不能覆盖当前文件", async () => {
+  const pending = deferred();
+  const h = instructionSettingsHarness(async (path, body) => {
+    if (path.endsWith("environments")) return { environments: [{ id: "local" },
+      { id: "wsl:fixture", executables: { claude: "/fixture/bin/claude" } }], instances: [
+      { id: "codex:local", backend: "codex", label: "Codex · 本机", environmentId: "local" },
+      { id: "claude:wsl:fixture", backend: "claude", label: "Claude · WSL · fixture", environmentId: "wsl:fixture" },
+    ] };
+    if (body.instanceId === "codex:local") return pending.promise;
+    return { content: "当前 Claude 指令", revision: "a1", exists: true, path: "/fixture/CLAUDE.md" };
+  });
+  const page = h.mount(), initialRead = page.settings.show("instructions");
+  await new Promise(resolve => setImmediate(resolve));
+  await page.chooseInstance("claude:wsl:fixture");
+  pending.resolve({ content: "迟到 Codex 指令", revision: "c1", exists: true, path: "/fixture/AGENTS.md" });
+  await initialRead;
+  assert.equal(page.get("instruction-content").value, "当前 Claude 指令");
+  assert.equal(page.get("instruction-path").textContent, "/fixture/CLAUDE.md");
+});
+
+test("历史保留实例缺少安装或用户不匹配时不能读取全局指令", async () => {
+  let reads = 0;
+  const h = instructionSettingsHarness(async (path, body) => {
+    if (path.endsWith("environments")) return { environments: [
+      { id: "local", user: "" }, { id: "wsl:uninstalled", user: "fixture", executables: {} },
+      { id: "wsl:other-user", user: "current", executables: { claude: "/fixture/bin/claude" } },
+    ], instances: [
+      { id: "codex:local", backend: "codex", label: "Codex · 本机", environmentId: "local", user: "" },
+      { id: "claude:wsl:uninstalled", backend: "claude", label: "Claude · 已卸载", environmentId: "wsl:uninstalled", user: "fixture" },
+      { id: "claude:wsl:other-user", backend: "claude", label: "Claude · 其他用户", environmentId: "wsl:other-user", user: "saved" },
+    ] };
+    ++reads;
+    assert.equal(body.instanceId, "codex:local");
+    return { content: "Codex 全局指令", revision: "c1", exists: true, path: "/fixture/AGENTS.md" };
+  });
+  const page = h.mount();
+  await page.settings.show("instructions");
+  for (const id of ["claude:wsl:uninstalled", "claude:wsl:other-user"]) {
+    assert.equal(page.get("instruction-instance").selectOptions.find(option => option.value === id).disabled, true);
+    await page.chooseInstance(id);
+    assert.equal(page.get("instruction-instance").value, "codex:local");
+  }
+  assert.equal(reads, 1);
+});
+
+test("Claude 中断修复退役旧气泡并重算分页，同时保留待发送输入和较新的原生消息", () => {
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    turns: new Map([
+      ["real", { _nativeUserId: "real" }],
+      ["interruption", { _nativeUserId: "interruption", items: [{ id: "control-item" }] }],
+      ["pending", { items: [{ id: "pending-item", remotePendingInput: true }] }],
+      ["new-live", { _nativeUserId: "new-live" }],
+    ]),
+    turnVersions: new Map([["new-live", 20]]), itemVersions: new Map(), partialItems: new Set(["interruption:control-item"]),
+    transcriptEvents: new Map([["old-event", { turnId: "interruption" }]]), messageVersion: 20,
+  });
+  assert.equal(context.retireClaudeHistoryTurns(["older", "real"], 10, 21), true);
+  assert.deepEqual([...context.turns.keys()], ["real", "pending", "new-live"]);
+  assert.equal(context.turnVersions.get("interruption"), 21);
+  assert.equal(context.itemVersions.get("interruption:control-item"), 21);
+  assert.equal(context.partialItems.size, 0); assert.equal(context.transcriptEvents.size, 0);
+  assert.equal(context.claudeHistoryCursor(["older", "real"]), "1");
+  context.turns.set("older", { _nativeUserId: "older" });
+  assert.equal(context.claudeHistoryCursor(["older", "real"]), null);
+  assert.equal(context.claudeHistoryCursor(undefined), undefined);
+});
+
+test("自动主题浅色阈值默认10，旧设置兼容且保存值收敛至5至40", () => {
+  const disk = storage();
+  const context = vm.createContext({ nativeConnectionVersion: 1, localStorage: disk, matchMedia: () => ({ matches: false }) });
+  vm.runInContext((sourceSection("const appearancePresets =", "let ambientLightStatus =") + sourceSection("function conversationBackend(", "function privateInputScope(") + sourceSection("function sessionFilterValue(")), context);
+  for (const [saved, expected] of [
+    [undefined, 10], [null, 10], [5, 5], [10, 10], [25, 25], [35, 35], [40, 40],
+    [4, 5], [24, 24], [41, 40], [45, 40], [50, 40], ["40", 10], [35.5, 10],
+  ]) {
+    disk.setItem("codex-elves-web-appearance", JSON.stringify({ themeMode: "auto", automaticThemeLightLux: saved }));
+    context.appearance = context.readAppearance();
+    assert.equal(context.currentAutomaticThemeLightLux(), expected);
+    assert.equal(context.appearance.themeMode, "auto");
+  }
+  assert.equal(context.defaultAppearance().automaticThemeLightLux, 10);
+});
+
+function previewControlsScrollHarness() {
+  class PreviewElement {
+    constructor() {
+      this.children = []; this.parentElement = null; this.hidden = false; this.inert = false;
+      this.scrollTop = 0; this.scrollHeight = 40; this.clientHeight = 40; this.listeners = new Map();
+      this.properties = new Map();
+      this.style = {
+        setProperty: (key, value) => this.properties.set(key, value),
+        removeProperty: key => this.properties.delete(key)
+      };
+    }
+    append(...children) {
+      for (const child of children) {
+        if (child.parentElement) child.parentElement.children.splice(child.parentElement.children.indexOf(child), 1);
+        this.children.push(child); child.parentElement = this;
+      }
+    }
+    before(child) {
+      const parent = this.parentElement;
+      parent.children.splice(parent.children.indexOf(this), 0, child); child.parentElement = parent;
+    }
+    replaceWith(child) {
+      const parent = this.parentElement;
+      if (child.parentElement) child.parentElement.children.splice(child.parentElement.children.indexOf(child), 1);
+      parent.children.splice(parent.children.indexOf(this), 1, child);
+      child.parentElement = parent; this.parentElement = null;
+    }
+    addEventListener(name, listener) { this.listeners.set(name, listener); }
+    removeEventListener(name) { this.listeners.delete(name); }
+  }
+  const screen = new PreviewElement(), controls = new PreviewElement(), body = new PreviewElement();
+  body.scrollHeight = 2000; body.clientHeight = 600; body.scrollTop = 100;
+  screen.append(controls, body);
+  let active = true;
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    Element: PreviewElement, node: () => new PreviewElement(),
+    getComputedStyle: element => ({ overflowY: element.overflowY || "visible" })
+  });
+  vm.runInContext(sessionFiles.slice(sessionFiles.indexOf("export function mountPreviewControlsScroll"),
+    sessionFiles.indexOf("export function mountSessionFiles")).replace(/^export /gm, ""), context);
+  const controller = context.mountPreviewControlsScroll({ body, controls, isActive: () => active });
+  const shell = screen.children[0];
+  const wheel = options => body.listeners.get("wheel")({
+    deltaY: 0, deltaX: 0, deltaMode: 0, target: body, ...options
+  });
+  return { controller, screen, shell, controls, body, wheel, PreviewElement,
+    reveal: () => Number(shell.properties.get("--preview-controls-reveal") ?? 1),
+    active: value => { active = value; } };
+}
+
+test("文件预览第二行在80px手势内收展，聚焦与重新打开恢复完整工具行", () => {
+  const h = previewControlsScrollHarness();
+  h.wheel({ deltaY: 40 });
+  assert.equal(h.reveal(), .5);
+  h.wheel({ deltaY: 120 });
+  assert.equal(h.reveal(), 0); assert.equal(h.shell.inert, true);
+  h.wheel({ deltaY: -80 });
+  assert.equal(h.reveal(), 1); assert.equal(h.shell.inert, false);
+  h.wheel({ deltaY: 80 });
+  assert.equal(h.reveal(), 0);
+  h.controls.listeners.get("focusin")();
+  assert.equal(h.reveal(), 1);
+  assert.equal(h.shell.properties.has("--preview-controls-rows"), false);
+  h.wheel({ deltaY: 500 }); h.controller.reset();
+  assert.equal(h.reveal(), 1);
+  h.controller.dispose();
+  assert.deepEqual(h.screen.children, [h.controls, h.body]);
+  assert.equal(h.body.listeners.size, 0);
+  assert.equal(h.controls.listeners.size, 0);
+});
+
+test("文件预览只响应正文纵向手势，短文件、横向滚动、缩放及内层滚动不会误收起", () => {
+  const h = previewControlsScrollHarness();
+  h.body.scrollHeight = 600; h.body.scrollTop = 0;
+  h.wheel({ deltaY: 100 }); assert.equal(h.reveal(), 1);
+  h.body.scrollHeight = 2000;
+  h.wheel({ deltaX: 200, deltaY: 50 });
+  h.wheel({ ctrlKey: true, deltaY: 200 });
+  assert.equal(h.reveal(), 1);
+  const nested = new h.PreviewElement();
+  nested.scrollHeight = 800; nested.clientHeight = 100; nested.scrollTop = 100; nested.overflowY = "auto";
+  h.body.append(nested);
+  h.wheel({ deltaY: 200, target: nested }); assert.equal(h.reveal(), 1);
+  h.active(false); h.wheel({ deltaY: 200 }); assert.equal(h.reveal(), 1);
+  h.active(true);
+  h.body.listeners.get("touchstart")({ touches: [{ clientX: 100, clientY: 300 }] });
+  h.body.listeners.get("touchmove")({ touches: [{ clientX: 100, clientY: 260 }], target: h.body });
+  assert.equal(h.reveal(), .5);
+  h.body.listeners.get("touchmove")({ touches: [{ clientX: 200, clientY: 250 }], target: h.body });
+  assert.equal(h.reveal(), .5);
+  h.body.scrollTop = 800;
+  assert.equal(h.reveal(), .5, "恢复滚动位置不应改变工具行展开比例");
+  h.controller.dispose();
+});
+
+function newChatBranchHarness() {
+  const reads = [], label = { textContent: "" }, attributes = new Map();
+  const badge = { hidden: false, title: "", querySelector: () => label, setAttribute: (name, value) => attributes.set(name, value) };
+  let now = 1000;
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    AbortController, Date: class extends Date { static now() { return now; } },
+    creationBranchRead: null, creationBranchSnapshot: null,
+    session: { device: { id: "branch-device", createdAtMs: 1 }, runtime: { revision: 1 } },
+    creating: true, creationProject: "alpha", selectionToken: "selection-alpha",
+    $: selector => selector === "#new-chat-branch" ? badge : null,
+    privateInputScope: value => JSON.stringify([value.device.id, value.device.createdAtMs]),
+    api: (path, payload, _id, signal) => {
+      const response = deferred();
+      reads.push({ path, payload, signal, response });
+      return response.promise;
+    },
+  });
+  vm.runInContext(sessionFiles.slice(sessionFiles.indexOf("export function workspaceBranchLabel("),
+    sessionFiles.indexOf("export function createWorkspaceBranch(")).replace(/^export /gm, "")
+    + "\n" + (sourceSection("function resetNe") + "\n" + sourceSection("function refreshNewC", "function sel")), context);
+  return { context, reads, badge, label, attributes, advance: ms => { now += ms; } };
+}
+
+test("新建页切换项目或授权时不显示旧请求的分支，查询只携带项目身份", async () => {
+  const h = newChatBranchHarness();
+  const first = h.context.refreshNewChatBranch();
+  assert.equal(h.label.textContent, "读取分支…");
+  h.context.creationProject = "beta"; h.context.selectionToken = "selection-beta";
+  const second = h.context.refreshNewChatBranch();
+  assert.equal(h.reads[0].signal.aborted, true);
+  h.reads[0].response.resolve({ ok: true, git: { branch: "old-alpha", detachedHead: null } });
+  await first;
+  assert.equal(h.label.textContent, "读取分支…");
+  h.reads[1].response.resolve({ ok: true, git: { branch: "feature/界面优化", detachedHead: null } });
+  await second;
+  assert.equal(h.label.textContent, "feature/界面优化");
+  assert.equal(h.badge.title, "当前分支：feature/界面优化");
+  assert.equal(h.attributes.get("aria-label"), h.badge.title);
+  assert.equal(h.reads.every(read => read.path === "/api/workspace/context"), true);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.reads[1].payload)), { projectId: "beta" });
+
+  h.advance(15000);
+  const previousAuthorization = h.context.refreshNewChatBranch();
+  h.context.session.device.createdAtMs = 2;
+  const newAuthorization = h.context.refreshNewChatBranch();
+  h.reads[2].response.resolve({ ok: true, git: { branch: "old-authorization", detachedHead: null } });
+  await previousAuthorization;
+  assert.equal(h.label.textContent, "读取分支…");
+  h.reads[3].response.resolve({ ok: true, git: { branch: "main", detachedHead: null } });
+  await newAuthorization;
+  assert.equal(h.label.textContent, "main");
+});
+
+test("分支随现有轮询刷新，未选项目、读取失败和重新打开不沿用错误状态", async () => {
+  const h = newChatBranchHarness();
+  const first = h.context.refreshNewChatBranch();
+  h.context.refreshNewChatBranch();
+  assert.equal(h.reads.length, 1, "并发渲染应共享当前读取");
+  h.reads[0].response.resolve({ ok: true, git: { branch: "main", detachedHead: null } });
+  await first;
+  h.context.refreshNewChatBranch();
+  assert.equal(h.reads.length, 1, "15 秒内重复渲染不重复启动 Git");
+  h.advance(15000);
+  const updated = h.context.refreshNewChatBranch();
+  h.reads[1].response.resolve({ ok: true, git: { branch: "release/next", detachedHead: null } });
+  await updated;
+  assert.equal(h.label.textContent, "release/next");
+  h.context.selectionToken = "reopened-new-chat";
+  const reopened = h.context.refreshNewChatBranch();
+  h.reads[2].response.reject(new Error("后台暂不可用"));
+  await reopened;
+  assert.equal(h.label.textContent, "分支不可用", "查询失败不能继续冒充当前分支");
+  h.context.creationProject = "";
+  h.context.refreshNewChatBranch();
+  assert.equal(h.label.textContent, "");
+  assert.equal(h.badge.hidden, true, "不在项目中工作时分支标签不占布局");
+  assert.equal(h.reads.length, 3);
+});
+
+test("路径仅在展示时去掉长路径前缀，分离 HEAD 与无分支状态清楚区分", () => {
+  const context = vm.createContext({ nativeConnectionVersion: 1,});
+  vm.runInContext(sessionFiles.slice(sessionFiles.indexOf("export function displayWorkspacePath("),
+    sessionFiles.indexOf("export function setWorkspaceBranch(")).replace(/^export /gm, ""), context);
+  for (const [input, expected] of [
+    [String.raw`\\?\E:\workspace\project`, String.raw`E:\workspace\project`],
+    ["//?/E:/workspace/project", "E:/workspace/project"],
+    [String.raw`\\?\UNC\server\share\project`, String.raw`\\server\share\project`],
+    ["/home/workspace/project", "/home/workspace/project"],
+    ["E\uf03a\uf05cAppData\uf05cLocal\uf05cnpm-cache", String.raw`E:\AppData\Local\npm-cache`],
+    ["C:/项目/中文\uf03a缓存/报告\uf03f.md", "C:/项目/中文:缓存/报告?.md"],
+    ["\\\\?\\C:\\项目\\E\uf03a\uf05ccache", String.raw`C:\项目\E:\cache`],
+    ["图标\ue000\uf000\uf009\uf020\uf02f\uf8ff", "图标\ue000\uf000\uf009\uf020\uf02f\uf8ff"],
+  ]) assert.equal(context.displayWorkspacePath(input), expected);
+  assert.equal(context.displayWorkspaceName("\uf022\uf02a\uf03a\uf03c\uf03e\uf03f\uf05c\uf07c"), '"*:<>?\\|');
+  assert.equal(context.workspaceBranchLabel({ branch: null, detachedHead: "a".repeat(40) }), "分离 HEAD · aaaaaaaa");
+  assert.equal(context.workspaceBranchLabel({ branch: null, detachedHead: null }), "无 Git 分支");
+  assert.equal(context.workspaceBranchLabel({ unavailable: true }), "分支不可用");
+  assert.equal(context.workspaceBranchLabel(undefined), "", "旧后台没有分支字段时不能伪造分支");
+  assert.equal(context.workspaceBranchLabel({ branch: "\nmain" }), "分支不可用");
+});
+
+test("harness 文件相对链接沿实际引擎目录解析，并继续拒绝越出读取根目录", () => {
+  const context = vm.createContext({ nativeConnectionVersion: 1, contentResponse: null, renderedFile: "" });
+  vm.runInContext(sessionFiles.slice(sessionFiles.indexOf("const parentPath ="), sessionFiles.indexOf("const revisionValid ="))
+    + "\n" + sessionFiles.slice(sessionFiles.indexOf("  function resolveDocumentReference("),
+      sessionFiles.indexOf("  function renderContent(")), context);
+  for (const root of ["C:/Users/fixture/.codex", "//wsl.localhost/Fixture/home/user/.claude", "/home/user/.agents"]) {
+    context.contentResponse = { root, path: "skills/example/SKILL.md" };
+    assert.equal(context.resolveDocumentReference("references/example.md"), `${root}/skills/example/references/example.md`);
+    assert.equal(context.resolveDocumentReference("../other/SKILL.md"), `${root}/skills/other/SKILL.md`);
+    assert.equal(context.resolveDocumentReference("../../../private.txt"), null);
+    assert.equal(context.resolveDocumentReference(String.raw`C:\Users\fixture\.codex\config.toml`),
+      "C:/Users/fixture/.codex/config.toml");
+  }
+  context.contentResponse = { root: "E:/project", path: "docs/readme.md" };
+  assert.equal(context.resolveDocumentReference("../src/main.rs"), "E:/project/src/main.rs");
+});
+
+test("WSL 映射文件名只在界面还原，展开目录与打开文件仍保留原始路径和目录层级", () => {
+  const node = (tag, className = "", text = "") => ({
+    tag, className, textContent: text, children: [], dataset: {}, attributes: new Map(), events: new Map(),
+    style: { setProperty() {} }, classList: { toggle() {} },
+    append(...children) { this.children.push(...children); },
+    setAttribute(name, value) { this.attributes.set(name, value); },
+    addEventListener(name, callback) { this.events.set(name, callback); },
+  });
+  const list = node("div"), opened = [];
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    node, list, expanded: new Set(), renderedFile: "",
+    control: (_label, action, className) => Object.assign(node("button", className), { click: action }),
+    fileTwisty: () => node("span"), fileIcon: () => node("span"), fileIconKind: () => "text",
+    createWorkspaceRepository: () => null, bytesLabel: size => `${size} B`,
+    toggleDirectory: path => opened.push(["directory", path]),
+    openFile: path => opened.push(["file", path]),
+    getContext: () => ({ threadId: "original-thread" }),
+    onFileContextMenu: (event, preview, owner) => opened.push(["menu", preview.path, owner.threadId]),
+    embedded: null,
+  });
+  vm.runInContext(sessionFiles.slice(sessionFiles.indexOf("export function displayWorkspacePath("),
+    sessionFiles.indexOf("export function workspaceBranchLabel(")).replace(/^export /gm, "")
+    + "\n" + sessionFiles.slice(sessionFiles.indexOf("const parentPath ="), sessionFiles.indexOf("const revisionValid ="))
+    + "\n" + sessionFiles.slice(sessionFiles.indexOf("  function renderTreeRow("), sessionFiles.indexOf("  function toggleDirectory("))
+    + "\n" + sessionTools.slice(sessionTools.indexOf("  function fileParts("), sessionTools.indexOf("  function setDetailNotice(")), context);
+
+  const rawDirectory = "E\uf03a\uf05cAppData\uf05cLocal\uf05cnpm-cache";
+  const readableDirectory = String.raw`E:\AppData\Local\npm-cache`;
+  context.renderTreeRow({ name: rawDirectory, path: rawDirectory, kind: "directory" }, 0, false);
+  const directoryButton = list.children[0];
+  assert.equal(directoryButton.children[2].children[0].textContent, readableDirectory);
+  assert.equal(directoryButton.title, readableDirectory);
+  assert.equal(directoryButton.dataset.path, rawDirectory);
+  assert.equal(directoryButton.attributes.get("aria-level"), "1");
+  directoryButton.click();
+  assert.deepEqual(opened[0], ["directory", rawDirectory]);
+  assert.equal(directoryButton.events.has("contextmenu"), false);
+
+  const rawName = "报告\uf05c第一版\uf03f.md", rawPath = `${rawDirectory}/${rawName}`;
+  context.renderTreeRow({ name: rawName, path: rawPath, kind: "file", size: 128 }, 1, true);
+  const fileButton = list.children[1];
+  assert.equal(fileButton.children[2].children[0].textContent, String.raw`报告\第一版?.md`);
+  assert.equal(fileButton.children[2].children[1].textContent, readableDirectory);
+  assert.equal(fileButton.dataset.path, rawPath);
+  assert.equal(fileButton.attributes.get("aria-level"), "2");
+  fileButton.click();
+  assert.deepEqual(opened[1], ["file", rawPath]);
+  fileButton.events.get("contextmenu")({});
+  assert.deepEqual(opened[2], ["menu", rawPath, "original-thread"], "右键预览保留原始文件路径和来源会话");
+
+  const parts = context.fileParts({ path: rawPath });
+  assert.equal(parts.name, String.raw`报告\第一版?.md`);
+  assert.equal(parts.directory, readableDirectory, "显示用的反斜杠不能被重新拆成真实目录");
+  const changes = workspaceChangeContract();
+  const change = { repository: "tools", path: rawPath, section: "unstaged" };
+  assert.equal(changes.displayedPath(change), `tools/${readableDirectory}/报告\\第一版?.md`);
+  assert.equal(JSON.parse(changes.detailKey(change))[2], rawPath, "变更详情的身份不能使用显示路径");
+});
+
+test("文件树右侧显示各仓库的分支和图标，缺失分支时不使用仓库名兜底", () => {
+  const node = (tag, className = "", text = "") => {
+    const element = {
+      tag, className, textContent: text, children: [], attributes: new Map(),
+      append(...children) { this.children.push(...children); },
+      setAttribute(name, value) { this.attributes.set(name, value); },
+      querySelector(selector) {
+        const name = selector.slice(1);
+        for (const child of this.children) {
+          if (child.className.split(" ").includes(name)) return child;
+          const match = child.querySelector(selector);
+          if (match) return match;
+        }
+        return null;
+      },
+    };
+    element.classList = { add: name => { element.className += ` ${name}`; } };
+    return element;
+  };
+  const context = vm.createContext({ nativeConnectionVersion: 1, node });
+  vm.runInContext(sessionFiles.slice(sessionFiles.indexOf("export function workspaceBranchLabel("),
+    sessionFiles.indexOf("export function createWorkspaceLocation(")).replace(/^export /gm, ""), context);
+  for (const [name, branch] of [
+    ["core", "pre-production"], ["sc-video-engine", "feature/render"],
+    ["仓库-前端", "feature/界面优化"], ["<img src=x>", "<img src=branch>"],
+  ]) {
+    const badge = context.createWorkspaceRepository({ name, git: { branch, detachedHead: null } });
+    assert.equal(badge.querySelector(".workspace-branch-label").textContent, branch);
+    assert.equal(badge.querySelector(".workspace-branch-icon").attributes.get("aria-hidden"), "true");
+    assert.ok(badge.querySelector(".workspace-branch-icon").innerHTML.includes("<svg"));
+    assert.equal(badge.title, `当前分支：${branch}`);
+    assert.equal(badge.attributes.get("aria-label"), badge.title);
+    assert.equal(badge.hidden, false);
+    assert.ok(badge.className.includes("session-files-repository"));
+  }
+  for (const [git, label] of [
+    [undefined, "分支不可用"], [{ unavailable: true }, "分支不可用"],
+    [{ branch: null, detachedHead: "a".repeat(40) }, "分离 HEAD · aaaaaaaa"],
+    [{ branch: "\nmain" }, "分支不可用"],
+  ]) {
+    const badge = context.createWorkspaceRepository({ name: "不能冒充当前分支的仓库名", git });
+    assert.equal(badge.querySelector(".workspace-branch-label").textContent, label);
+    assert.equal(badge.title, label);
+    assert.equal(badge.attributes.get("aria-label"), label);
+    assert.equal(badge.hidden, false);
+  }
+  for (const input of [undefined, null, {}, { name: "" }, { name: "core\nmain" }])
+    assert.equal(context.createWorkspaceRepository(input), null);
+});
+
+async function connectionDiagnosticsHarness({ android = true } = {}) {
+  const logs = [], documentListeners = new Map(), windowListeners = new Map(), timers = new Map();
+  const bridgeMessages = [], bridgeListeners = new Map();
+  let now = 1000, nextTimer = 0;
+  const context = {
+    URL, Headers, Response, AbortController, DOMException, TextEncoder, queueMicrotask,
+    Date: class extends Date { static now() { return now; } },
+    performance: { now: () => now },
+    location: new URL("https://diagnostics.example/"),
+    navigator: { onLine: true },
+    document: {
+      hidden: false, cookie: "",
+      addEventListener: (type, callback) => documentListeners.set(type, callback),
+      removeEventListener: type => documentListeners.delete(type)
+    },
+    addEventListener: (type, callback) => windowListeners.set(type, callback),
+    removeEventListener: type => windowListeners.delete(type),
+    setTimeout: (callback, delay) => {
+      timers.set(++nextTimer, { callback, delay, interval: false }); return nextTimer;
+    },
+    setInterval: (callback, delay) => {
+      timers.set(++nextTimer, { callback, delay, interval: true }); return nextTimer;
+    },
+    clearTimeout: id => timers.delete(id), clearInterval: id => timers.delete(id),
+    isAndroidContainer: () => android,
+    getAndroidAppInfo: async () => ({ diagnosticsVersion: 1, requestRoutingVersion: 2 }),
+    ElvesAndroid: {
+      addEventListener: (type, callback) => bridgeListeners.set(type, callback),
+      postMessage: text => {
+        const message = JSON.parse(text);
+        if (message.type === "diagnostics-log") logs.push(message.event);
+        else bridgeMessages.push(message);
+      }
+    }
+  };
+  context.window = context;
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  const load = source => vm.runInContext(source.replace(/^import .*;\r?\n/gm, "").replace(/^export /gm, ""), context);
+  load(diagnostics);
+  await Promise.resolve();
+  return { context, logs, timers, documentListeners, windowListeners, bridgeMessages, bridgeListeners, load,
+    advance: milliseconds => { now += milliseconds; } };
+}
+
+test("诊断快照兼容旧APK并接收一万条日志，拒绝超量和超大桥消息", async () => {
+  const h = await connectionDiagnosticsHarness();
+  await vm.runInContext("support", h.context);
+  const events = Array.from({ length: 10000 }, (_, index) => ({
+    timeMs: index, source: "web", name: "http.complete",
+    fields: { path: "/api/read/history", requestId: `history-${index}`, phase: "complete", status: 200 }
+  }));
+  const snapshot = (requestId, value) => JSON.stringify({
+    type: "diagnostics-snapshot", requestId,
+    bundle: { schemaVersion: 1, capturedAtMs: 10000, app: {}, events: value }
+  });
+  for (const count of [400, 10000]) {
+    const operation = h.context.nativeRequest("diagnostics-snapshot");
+    await new Promise(resolve => setImmediate(resolve));
+    const { requestId } = h.bridgeMessages.at(-1);
+    const data = snapshot(requestId, events.slice(0, count));
+    if (count === 10000) assert.ok(data.length > 384 * 1024, "大快照不能再被旧桥消息上限丢弃");
+    h.bridgeListeners.get("message")({ data });
+    const result = await operation;
+    assert.equal(result.events.length, count);
+    assert.equal(result.events[0].timeMs, 0);
+    assert.equal(result.events.at(-1).timeMs, count - 1);
+  }
+  for (const kind of ["count", "bytes"]) {
+    let completed = false;
+    const operation = h.context.nativeRequest("diagnostics-snapshot").then(result => {
+      completed = true; return result;
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    const { requestId } = h.bridgeMessages.at(-1);
+    const data = kind === "count" ? snapshot(requestId, [...events, events[0]])
+      : snapshot(requestId, []) + " ".repeat(4 * 1024 * 1024 + 64 * 1024);
+    h.bridgeListeners.get("message")({ data });
+    await Promise.resolve();
+    assert.equal(completed, false, "超限桥消息不能作为成功快照交付");
+    h.bridgeListeners.get("message")({ data: snapshot(requestId, []) });
+    assert.equal((await operation).events.length, 0);
+  }
+  assert.equal(h.timers.size, 0);
+});
+
+test("连接诊断关联标识只附加到状态探测，保留业务请求和既有查询参数", async () => {
+  const h = await connectionDiagnosticsHarness(), origin = h.context.location.origin;
+  const options = { method: "GET" };
+  const trace = h.context.traceDiagnosticRequest("/api/session?existing=1", options, origin);
+  const url = new URL(trace.path, origin);
+  const requestId = url.searchParams.get("diag");
+  assert.match(requestId, /^http-[A-Za-z0-9_-]+$/);
+  assert.equal(url.searchParams.get("existing"), "1");
+  trace.response(jsonResponse({ ok: true }));
+  trace.finish();
+  assert.deepEqual(h.logs.map(event => event.fields.requestId), [requestId, requestId, requestId]);
+  assert.equal(h.logs[0].fields.path, "/api/session");
+  assert.equal(JSON.stringify(h.logs).includes("existing"), false);
+  const action = h.context.traceDiagnosticRequest("/api/action/send", { method: "POST" }, origin);
+  assert.equal(action.path, "/api/action/send");
+  assert.deepEqual(options, { method: "GET" });
+  const browser = await connectionDiagnosticsHarness({ android: false });
+  assert.equal(browser.context.traceDiagnosticRequest("/api/session", options, origin).path, "/api/session");
+});
+
+test("连接诊断保留关闭码与恢复状态，剔除消息凭证、原始关闭文本和越界字段", async () => {
+  const h = await connectionDiagnosticsHarness();
+  h.context.recordDiagnostic("socket.closed", {
+    path: "/api/events/ws?channel_token=secret", requestId: "ws-test", closeCode: 1006, wasClean: false,
+    isTrusted: true, delayMs: 500, backgroundMs: 4 * 60 * 60 * 1000, attempt: 2,
+    prompt: "private-message", token: "secret", cookie: "secret", closeReason: "private-server-text",
+    reason: "private-server-text"
+  });
+  assert.deepEqual(h.logs[0].fields, {
+    path: "/api/events/ws", requestId: "ws-test", closeCode: 1006, wasClean: false,
+    isTrusted: true, delayMs: 500, backgroundMs: 14400000, attempt: 2
+  });
+  h.context.recordDiagnostic("socket.closed", {
+    closeCode: 65536, wasClean: "false", isTrusted: 1, delayMs: 86400001, backgroundMs: -1, attempt: 1.5
+  });
+  assert.deepEqual(h.logs[1].fields, {});
+  h.context.setDiagnosticSink(() => { throw new Error("diagnostic failure"); });
+  assert.doesNotThrow(() => h.context.recordDiagnostic("socket.error", { reason: "network-error" }));
+});
+
+test("主题日志保留小数光照和固定判断字段，未知文本及非法年龄不会上传", async () => {
+  const h = await connectionDiagnosticsHarness();
+  h.context.recordDiagnostic("theme.transition", {
+    lux: 44.99, previousLux: 10.01, theme: "dark", previousTheme: "light", targetTheme: "dark",
+    themeMode: "auto", decision: "applied", reason: "sensor", phase: "after",
+    sampleAgeMs: 2100, stableMs: 5000, themeSequence: 1, localHour: 21, timezoneOffsetMinutes: -480,
+    lightLux: 5, darkLux: 4, effectiveLightLux: 13.125, themeLuxShift: 8.125,
+    supported: true, registered: false, token: "private", message: "private"
+  });
+  assert.deepEqual(h.logs[0].fields, {
+    lux: 44.99, previousLux: 10.01, theme: "dark", previousTheme: "light", targetTheme: "dark",
+    themeMode: "auto", decision: "applied", reason: "sensor", phase: "after",
+    sampleAgeMs: 2100, stableMs: 5000, themeSequence: 1, localHour: 21, timezoneOffsetMinutes: -480,
+    lightLux: 5, darkLux: 4, effectiveLightLux: 13.125, themeLuxShift: 8.125,
+    supported: true, registered: false
+  });
+  h.context.recordDiagnostic("theme.sample", {
+    lux: Infinity, previousLux: -1, sampleAgeMs: -1, themeSequence: NaN, localHour: 24,
+    timezoneOffsetMinutes: -841, theme: "private", themeMode: "private", phase: "private", reason: "private",
+    lightLux: 41, darkLux: -1, effectiveLightLux: -1, themeLuxShift: Infinity
+  });
+  assert.deepEqual(h.logs[1].fields, {});
+});
+
+test("光照桥兼容旧APK，非法诊断年龄不改变原有光照回调", () => {
+  const values = [], messages = [], listeners = new Map();
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    values, ElvesAndroid: { postMessage: value => messages.push(JSON.parse(value)) },
+    addEventListener: (name, callback) => listeners.set(name, callback),
+    removeEventListener: name => listeners.delete(name)
+  });
+  vm.runInContext(platform.replace(/^export /gm, ""), context);
+  vm.runInContext(`
+    globalThis.unsubscribe = subscribeAndroidAmbientLight(status => values.push(status));
+    globalThis.emit = json => onAmbientLight({ detail: JSON.parse(json) });
+  `, context);
+  for (const detail of [
+    { type: "ambient-light", supported: true, lux: 9.99 },
+    { type: "ambient-light", supported: true, lux: 45.125, sampleAgeMs: 90000 },
+    { type: "ambient-light", supported: true, lux: 20.5, sampleAgeMs: -1 },
+    { type: "ambient-light", supported: false }
+  ]) context.emit(JSON.stringify(detail));
+  assert.deepEqual(values.map(value => ({ ...value })), [
+    { supported: true, lux: 9.99, sampleAgeMs: null },
+    { supported: true, lux: 45.125, sampleAgeMs: 90000 },
+    { supported: true, lux: 20.5, sampleAgeMs: null },
+    { supported: false, lux: null, sampleAgeMs: null }
+  ]);
+  assert.ok(values.every(Object.isFrozen));
+  context.emit(JSON.stringify({ type: "ambient-light", supported: true, lux: -1 }));
+  assert.equal(values.length, 4);
+  context.unsubscribe();
+  assert.equal(listeners.size, 0);
+  assert.deepEqual(messages.map(value => value.type), ["ambient-light-subscribe", "ambient-light-unsubscribe"]);
+});
+
+async function themeDiagnosticsHarness({ android = true } = {}) {
+  const h = await connectionDiagnosticsHarness({ android });
+  let hour = 21, ambient;
+  const Clock = h.context.Date;
+  h.context.Date = class extends Clock {
+    getHours() { return hour; }
+    getTimezoneOffset() { return -480; }
+  };
+  Object.assign(h.context, {
+    appearance: { theme: "light", themeMode: "auto" },
+    ambientLightStatus: { supported: false, lux: null },
+    syncAppearanceThemeControls: null, applyAppearance() {},
+    subscribeAndroidAmbientLight: callback => { ambient = callback; }
+  });
+  h.load((sourceSection("const appearancePresets =", "let ambientLightStatus =") + sourceSection("function conversationBackend(", "function privateInputScope(") + sourceSection("function sessionFilterValue(")));
+  h.load((sourceSection("const automaticThemeStab", "function set") + "\n" + sourceSection("let automaticThemeLu", "function set") + "\n" + sourceSection("let automaticThemeSh", "function set") + "\n" + sourceSection("function aut", "function mix") + "\n" + sourceSection("function applyAu", "function app")));
+  h.load(sourceSection("setInterval(() => {\n    applyAutomaticAppearance(true);", "\n}\n"));
+  return {
+    ...h, appearance: h.context.appearance, hour: value => { hour = value; },
+    sensor: (lux, sampleAgeMs = 0) => ambient({ supported: lux !== null, lux, sampleAgeMs }),
+    runAfter: delay => {
+      const timer = [...h.timers.entries()].find(([, value]) => !value.interval && value.delay === delay);
+      assert.ok(timer, `缺少 ${delay}ms 诊断回调`);
+      h.timers.delete(timer[0]); timer[1].callback();
+    }
+  };
+}
+
+test("主题切换保留前后真实光照及年龄，延迟采证不会提前应用下一次切换", async () => {
+  const h = await themeDiagnosticsHarness();
+  h.sensor(60.25);
+  h.advance(2000); h.sensor(8.5);
+  assert.equal(h.appearance.theme, "light");
+  assert.equal([...h.timers.values()].filter(timer => !timer.interval).length, 0);
+  h.advance(4999); h.context.applyAutomaticAppearance(true);
+  assert.equal(h.appearance.theme, "light");
+  h.advance(1); h.context.applyAutomaticAppearance(true);
+  assert.equal(h.appearance.theme, "dark");
+  const before = h.logs.filter(event => event.name === "theme.sample" && event.fields.phase === "before");
+  assert.deepEqual(before.map(event => event.fields.lux), [60.25, 8.5]);
+  const after = h.logs.find(event => event.name === "theme.transition" && event.fields.phase === "after").fields;
+  assert.deepEqual({ ...after }, {
+    theme: "dark", themeMode: "auto", themeSequence: 1, supported: true, lux: 8.5, previousLux: 60.25,
+    sampleAgeMs: 5000, localHour: 21, timezoneOffsetMinutes: -480, visible: true,
+    lightLux: 10, darkLux: 9, effectiveLightLux: 10, themeLuxShift: 0,
+    previousTheme: "light", targetTheme: "dark", reason: "timer", phase: "after"
+  });
+  h.advance(2000); h.sensor(12.25); h.runAfter(2000);
+  h.advance(3000); h.sensor(60.125); h.runAfter(5000);
+  h.advance(5000); h.runAfter(10000);
+  const samples = h.logs.filter(event => event.name === "theme.sample" && event.fields.phase === "after");
+  assert.deepEqual(samples.map(event => event.fields.lux), [12.25, 60.125, 60.125]);
+  assert.deepEqual(samples.map(event => event.fields.durationMs), [2000, 5000, 10000]);
+  assert.deepEqual(samples.map(event => event.fields.sampleAgeMs), [0, 0, 5000]);
+  assert.equal(h.appearance.theme, "dark", "诊断回调不能推进已满 5 秒的切换候选");
+  h.context.applyAutomaticAppearance(true);
+  assert.equal(h.appearance.theme, "light", "原有业务触发仍可应用稳定候选");
+  h.windowListeners.get("pagehide")();
+  assert.equal([...h.timers.values()].filter(timer => !timer.interval).length, 0);
+});
+
+test("自动主题使用20:00至次日08:00夜间范围，默认9/10lux滞回并保留候选取消规则", async () => {
+  const h = await themeDiagnosticsHarness();
+  for (const hour of [7, 8, 19, 20, 21]) {
+    h.hour(hour);
+    for (const lux of [null, 0, 9, 9.01, 9.99, 10, 35, 100]) {
+      h.context.ambientLightStatus = { supported: lux !== null, lux };
+      for (const current of ["light", "dark"]) {
+        const expected = hour >= 8 && hour < 20 ? "light"
+          : lux === null || lux <= 9 ? "dark" : lux >= 10 ? "light" : current;
+        assert.equal(h.context.automaticAppearanceTheme(undefined, current), expected);
+      }
+    }
+  }
+  h.hour(20); h.sensor(5); h.advance(3000); h.sensor(50);
+  assert.equal(h.appearance.theme, "light");
+  assert.equal(h.logs.find(event => event.fields.decision === "cancelled").fields.durationMs, 3000);
+  const browser = await themeDiagnosticsHarness({ android: false });
+  browser.sensor(0); browser.advance(5000); browser.context.applyAutomaticAppearance(true);
+  assert.equal(browser.appearance.theme, "dark");
+  assert.equal(browser.logs.length, 0);
+  assert.equal([...browser.timers.values()].filter(timer => !timer.interval).length, 0);
+});
+
+test("自定义光照阈值按所选数值切回浅色，修改后重新累计五秒稳定时间", async () => {
+  const h = await themeDiagnosticsHarness();
+  for (const threshold of [5, 10, 25, 35, 40]) {
+    h.appearance.automaticThemeLightLux = threshold;
+    const darkLux = Math.min(10, threshold - 1);
+    for (const [lux, current, expected] of [
+      [darkLux, "light", "dark"], [darkLux + .01, "light", "light"],
+      [threshold - .01, "dark", "dark"], [threshold - .01, "light", "light"],
+      [threshold, "dark", "light"], [threshold + .01, "dark", "light"],
+    ]) {
+      h.context.ambientLightStatus = { supported: true, lux };
+      assert.equal(h.context.automaticAppearanceTheme(undefined, current), expected, `${threshold} lux/${lux} lux`);
+    }
+  }
+  h.appearance.theme = "dark"; h.appearance.automaticThemeLightLux = 35;
+  h.sensor(37); h.advance(4000);
+  assert.equal(h.context.setAutomaticThemeLightLux(40), true);
+  h.advance(5000); h.context.applyAutomaticAppearance(true);
+  assert.equal(h.appearance.theme, "dark", "升高阈值后原有切亮候选必须失效");
+  assert.equal(h.context.setAutomaticThemeLightLux(35), true);
+  h.advance(4999); h.context.applyAutomaticAppearance(true);
+  assert.equal(h.appearance.theme, "dark");
+  h.advance(1); h.context.applyAutomaticAppearance(true);
+  assert.equal(h.appearance.theme, "light");
+  for (const invalid of [4, 41, 35.5, NaN, "40", null]) {
+    assert.equal(h.context.setAutomaticThemeLightLux(invalid), false);
+    assert.equal(h.appearance.automaticThemeLightLux, 35);
+  }
+});
+
+function enterAutomaticDarkTheme(h, beforeLux = 0, afterLux = 8) {
+  h.appearance.automaticThemeLightLux = 5;
+  h.sensor(beforeLux); h.advance(5000); h.sensor(beforeLux);
+  assert.equal(h.appearance.theme, "dark");
+  h.advance(1000); h.sensor(afterLux);
+  h.advance(2001); h.sensor(afterLux);
+}
+
+test("自动主题从第一次切换补偿0到8lux偏移，环境继续变亮仍按原五秒切回浅色", async () => {
+  const h = await themeDiagnosticsHarness();
+  enterAutomaticDarkTheme(h);
+  for (let sample = 0; sample < 40; sample++) {
+    h.advance(2000); h.sensor(8);
+  }
+  const applied = h.logs.filter(event => event.name === "theme.decision" && event.fields.decision === "applied");
+  assert.deepEqual(applied.map(event => event.fields.theme), ["dark"]);
+  assert.equal(h.appearance.theme, "dark");
+  assert.equal(h.appearance.automaticThemeLightLux, 5, "补偿不能改写用户保存的浅色阈值");
+  const calibration = h.logs.filter(event => event.name === "theme.calibration");
+  assert.equal(calibration.length, 1, "稳定读数不重复校准或刷日志");
+  assert.equal(calibration[0].fields.previousLux, 0);
+  assert.equal(calibration[0].fields.themeLuxShift, 8);
+  assert.equal(calibration[0].fields.effectiveLightLux, 13);
+  h.sensor(12.99); h.advance(6000); h.sensor(12.99);
+  assert.equal(h.appearance.theme, "dark");
+  h.sensor(13);
+  h.advance(4999); h.sensor(13);
+  assert.equal(h.appearance.theme, "dark");
+  h.advance(1); h.sensor(13);
+  assert.equal(h.appearance.theme, "light");
+});
+
+test("自动主题偏移按变化量计算，正负及零偏移都保留原阈值间隔", async () => {
+  for (const [before, after, expectedShift] of [[4, 12, 8], [4, 0, -4], [0, 0, 0]]) {
+    const h = await themeDiagnosticsHarness();
+    enterAutomaticDarkTheme(h, before, after);
+    assert.equal(h.appearance.theme, "dark");
+    assert.equal(h.logs.find(event => event.name === "theme.calibration").fields.themeLuxShift, expectedShift);
+    const target = 5 + expectedShift;
+    h.sensor(target - .01); h.advance(6000); h.sensor(target - .01);
+    assert.equal(h.appearance.theme, "dark");
+    h.sensor(target); h.advance(5000); h.sensor(target);
+    assert.equal(h.appearance.theme, "light");
+  }
+});
+
+test("自动主题校准排除切换前缓存，三秒后环境变化不再归为界面偏移，手动和白天可重置", async () => {
+  const cached = await themeDiagnosticsHarness();
+  cached.appearance.automaticThemeLightLux = 5;
+  cached.sensor(0); cached.advance(5000); cached.sensor(0);
+  cached.advance(1000); cached.sensor(8, 6000);
+  assert.equal(cached.logs.filter(event => event.name === "theme.calibration").length, 0);
+  cached.advance(500); cached.sensor(8);
+  assert.equal(cached.logs.find(event => event.name === "theme.calibration").fields.themeLuxShift, 8);
+  cached.advance(2000); cached.sensor(9);
+  assert.equal(cached.logs.filter(event => event.name === "theme.calibration").length, 1);
+  for (const action of ["manual", "threshold", "daytime"]) {
+    const h = await themeDiagnosticsHarness();
+    enterAutomaticDarkTheme(h);
+    if (action === "manual") h.context.setAppearanceThemeMode("manual", { theme: "light" });
+    else if (action === "threshold") {
+      h.context.setAutomaticThemeLightLux(6);
+      h.sensor(8); h.advance(5000); h.sensor(8);
+    } else {
+      h.hour(8);
+      h.context.applyAutomaticAppearance(true, { immediate: true });
+    }
+    assert.equal(h.appearance.theme, "light", action);
+    assert.equal(h.logs.at(-1).fields.themeLuxShift, 0, action);
+  }
+});
+
+test("光照滑块仅在自动主题下显示，5至40可保存并在切换模式后保留", async () => {
+  const h = await themeDiagnosticsHarness(), disk = storage();
+  const element = (tag, className = "", textContent = "") => ({
+    tag, className, textContent, children: [], attributes: new Map(), properties: new Map(),
+    append(...children) { this.children.push(...children); },
+    setAttribute(name, value) { this.attributes.set(name, value); },
+    style: { values: new Map(), setProperty(name, value) { this.values.set(name, value); } },
+  });
+  Object.assign(h.context, {
+    element, localStorage: disk, matchMedia: () => ({ matches: false }),
+    applyAppearance: save => { if (save) disk.setItem("codex-elves-web-appearance", JSON.stringify(h.appearance)); },
+  });
+  h.appearance.themeMode = "manual";
+  const host = element("div");
+  const sync = h.context.mountAutomaticThemeLightSetting(host);
+  h.context.syncAppearanceThemeControls = sync;
+  const input = host.children[0].children[1].children[0];
+  const output = host.children[0].children[1].children[1];
+  const hint = host.children[1];
+  assert.equal(host.hidden, true);
+  assert.equal(input.disabled, true);
+  assert.equal(input.min, "5"); assert.equal(input.max, "40"); assert.equal(input.step, "1");
+  assert.equal(output.attributes.get("for"), input.id);
+  h.context.setAppearanceThemeMode("auto");
+  assert.equal(host.hidden, false); assert.equal(input.disabled, false);
+  assert.equal(input.value, "10"); assert.equal(output.textContent, "10 lux");
+  assert.equal(input.style.values.get("--range-fill"), `${5 / 35 * 100}%`);
+  assert.equal(hint.textContent, "光线达到此数值后切换为浅色，当前 -- lux");
+  for (const [lux, displayed] of [[26.544523, "26.54"], [79.308532, "79.31"], [0, "0"], [null, "--"]]) {
+    h.sensor(lux);
+    assert.equal(hint.textContent, `光线达到此数值后切换为浅色，当前 ${displayed} lux`);
+    assert.equal(input.value, "10", "实时光照不能覆盖设置的切换阈值");
+  }
+  for (const value of [5, 40]) {
+    input.value = String(value); input.oninput();
+    assert.equal(output.textContent, `${value} lux`);
+    assert.equal(h.context.readAppearance().automaticThemeLightLux, value);
+    assert.equal(input.style.values.get("--range-fill"), value === 5 ? "0%" : "100%");
+  }
+  h.context.setAppearanceThemeMode("manual");
+  assert.equal(host.hidden, true); assert.equal(input.disabled, true);
+  assert.equal(h.context.readAppearance().automaticThemeLightLux, 40);
+  h.context.setAppearanceThemeMode("auto");
+  assert.equal(input.value, "40");
+  Object.assign(h.appearance, h.context.defaultAppearance());
+  sync();
+  assert.equal(input.value, "10");
+});
+
+test("主题诊断限制前序采样数量，缓存及旧APK缺少的采样时间不会伪装成新读数", async () => {
+  const h = await themeDiagnosticsHarness();
+  for (let index = 0; index < 12; index++) { h.sensor(60 + index, 90_000); h.advance(1000); }
+  h.context.setAppearanceThemeMode("manual");
+  const samples = h.logs.filter(event => event.name === "theme.sample" && event.fields.phase === "before");
+  assert.equal(samples.length, 8);
+  assert.equal(samples[0].fields.sampleAgeMs, 98_000);
+  const transitions = h.logs.filter(event => event.name === "theme.transition");
+  assert.deepEqual(transitions.map(event => event.fields.themeMode), ["auto", "manual"]);
+  h.advance(31_000); h.context.setAppearanceThemeMode("auto");
+  const latest = h.logs.filter(event => event.name === "theme.sample" && event.fields.phase === "before").at(-1);
+  assert.equal(latest.fields.sampleAgeMs, 122_000);
+  assert.equal(h.logs.filter(event => event.name === "theme.sample" && event.fields.phase === "before").length, 9);
+  h.sensor(80, null);
+  assert.equal(h.logs.filter(event => event.name === "theme.ambient").at(-1).fields.sampleAgeMs, undefined);
+});
+
+test("前后台日志保留后台时长及网络事件来源，online值仍反映当前浏览器状态", async () => {
+  const h = await connectionDiagnosticsHarness();
+  h.context.configureAndroidDiagnostics({ getSession: () => null, upload: async () => {} });
+  h.context.document.hidden = true;
+  h.documentListeners.get("visibilitychange")({ isTrusted: true });
+  h.advance(14400000);
+  h.context.document.hidden = false;
+  h.documentListeners.get("visibilitychange")({ isTrusted: true });
+  h.windowListeners.get("offline")({ isTrusted: true });
+  const events = h.logs.filter(event => event.name === "page.lifecycle");
+  assert.equal(events[1].fields.backgroundMs, 14400000);
+  assert.equal(events[1].fields.isTrusted, true);
+  assert.deepEqual(events[2].fields, { reason: "offline", visible: true, online: true, isTrusted: true });
+});
+
+test("WebSocket异常关闭及重试记录同一握手标识，诊断不修改原有500毫秒退避", async () => {
+  const h = await connectionDiagnosticsHarness(), sockets = [];
+  class Socket {
+    constructor(url) { this.url = new URL(url); this.listeners = new Map(); sockets.push(this); }
+    addEventListener(type, callback) { this.listeners.set(type, callback); }
+    close() { this.closed = true; }
+  }
+  h.context.WebSocket = Socket;
+  h.load(channels);
+  const stream = h.context.createChannelEventStream();
+  let errors = 0;
+  stream.onerror = () => { errors++; };
+  await Promise.resolve();
+  const socket = sockets[0], requestId = socket.url.searchParams.get("diag");
+  assert.match(requestId, /^ws-[A-Za-z0-9_-]+$/);
+  socket.onopen();
+  assert.equal(stream.readyState, 1);
+  const logsBeforeMessage = h.logs.length;
+  socket.onmessage({ data: JSON.stringify({ method: "remote/heartbeat" }) });
+  assert.equal(h.logs.length, logsBeforeMessage, "每条消息及心跳不刷诊断日志");
+  socket.onerror();
+  socket.listeners.get("close")({ code: 1006, wasClean: false, reason: "private text" });
+  assert.equal(errors, 1);
+  assert.equal(stream.readyState, 0);
+  const close = h.logs.find(event => event.name === "socket.closed");
+  assert.equal(close.fields.requestId, requestId);
+  assert.equal(close.fields.closeCode, 1006);
+  assert.equal(close.fields.wasClean, false);
+  assert.equal(JSON.stringify(h.logs).includes("private text"), false);
+  assert.equal(h.logs.find(event => event.name === "socket.retry").fields.delayMs, 500);
+  const retry = [...h.timers.values()].find(timer => !timer.interval && timer.delay === 500);
+  assert.ok(retry);
+  h.advance(500); retry.callback();
+  assert.equal(sockets.length, 2);
+  assert.notEqual(sockets[1].url.searchParams.get("diag"), requestId);
+  stream.close();
+});
+
+test("SharedWorker转交日志不算作心跳，也不推迟原有失联降级", async () => {
+  const h = await connectionDiagnosticsHarness();
+  let worker, fallbacks = 0;
+  h.context.SharedWorker = class {
+    constructor() {
+      worker = this;
+      this.port = { postMessage() {}, start() {}, close() {} };
+    }
+  };
+  h.context.observeChannelConfiguration = () => () => {};
+  h.context.createChannelEventStream = () => {
+    fallbacks++;
+    return { readyState: 0, close() {} };
+  };
+  h.load(eventsClient);
+  const stream = h.context.createRemoteEventStream();
+  worker.port.onmessage({ data: { type: "ready" } });
+  for (let tick = 1; tick <= 18; tick++) {
+    h.advance(5000);
+    worker.port.onmessage({ data: {
+      type: "diagnostic", event: { name: "socket.retry", fields: { requestId: "ws-test", delayMs: 500 } }
+    } });
+    const watcher = [...h.timers.entries()].find(([, timer]) => timer.delay === 5000);
+    assert.ok(watcher);
+    h.timers.delete(watcher[0]); watcher[1].callback();
+  }
+  assert.equal(fallbacks, 1);
+  assert.equal(stream.transport, "fallback");
+  assert.ok(h.logs.some(event => event.name === "worker.timeout" && event.fields.reason === "worker-response-timeout"));
+  stream.close();
+});
+
+function goalControlHarness({ status = "active", readOnly = false } = {}) {
+  const disk = storage(), calls = [], notices = [];
+  disk.removeItem = key => disk.records.delete(key);
+  const goal = { objective: "手机目标操作回归", status, createdAt: 100, updatedAt: 110,
+    tokenBudget: 8000, tokensUsed: 1200, timeUsedSeconds: 60 };
+  const context = {
+    sessionStorage: disk, session: { device: { id: "device-a" } },
+    thread: { id: "main", goal, messages: ["保留原会话消息"] }, selectedId: "main",
+    goalVersion: 0, connected: true, TextEncoder, queueMicrotask,
+    threadReadOnly: () => readOnly, renderGoalStatus() {}, reloadThread: async () => {},
+    setTimeout: () => 1, clearTimeout() {}, randomId: () => `goal-${calls.length}`,
+    notice: text => notices.push(text), confirmAction: async () => true,
+    api: async (path, payload, receiptId) => {
+      calls.push({ path, payload, receiptId });
+      return context.respond(path, payload, receiptId);
+    },
+    respond: (_path, payload, receiptId) => ({ requestId: receiptId, state: "completed", result: {
+      threadId: "main", goal: payload.operation === "delete" ? null
+        : { ...goal, objective: payload.objective,
+          status: payload.operation === "pause" ? "paused"
+            : payload.operation === "resume" ? "active" : payload.expectedStatus },
+    } }),
+  };
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  vm.runInContext((sourceSection("const goalEd", "function set") + "\n" + sourceSection("function setGoalEditDraf", "function upd") + "\n" + sourceSection("function scheduleGoa", "function ren")), context);
+  return { context, calls, notices, disk,
+    pending: () => vm.runInContext("goalEditPending", context) };
+}
+
+test("Claude 目标回执只确认原生命令受理，不提前改写目标或正文", async () => {
+  const h = goalControlHarness(), before = JSON.stringify(h.context.thread);
+  h.context.respond = (_path, _payload, receiptId) => ({ requestId: receiptId, state: "completed",
+    result: { ok: true, backend: "claude", threadId: "main",
+      nativeCommand: { id: "native-clear", name: "goal", state: "pending" }, goal: null } });
+  await h.context.changeGoalState("delete", h.context.thread.goal);
+  assert.equal(JSON.stringify(h.context.thread), before, "受理不能冒充已经清除原生目标");
+  assert.equal(h.pending(), null);
+  assert.equal(h.calls.length, 1);
+  assert.match(h.notices.at(-1), /状态将随原生执行更新/);
+});
+
+test("Claude 新目标已受理后读取失败不恢复发送锁，也不提前展示目标正文", async () => {
+  const notices = [], cleared = [];
+  const context = vm.createContext({ nativeConnectionVersion: 1, session: { device: { id: "device" } },
+    selectedId: "claude-fixture", thread: { id: "claude-fixture", goal: null },
+    selectionToken: "selection", pending: { id: "receipt" },
+    goalComposerAction: () => true, validRelatedThreadId: id => id === "claude-fixture",
+    draftKey: () => "claude-fixture", clearSubmittedDraft: (...value) => cleared.push(value),
+    goalComposerRecoveries: new Map(), persistGoalComposerRecoveries() {},
+    savePending: value => { context.pending = value; },
+    reloadThread: async () => { throw new Error("暂时离线"); }, loadSidebar: async () => {},
+    notice: value => notices.push(value), updateComposer() {},
+  });
+  vm.runInContext(sourceSection("async function applyGoalComposerReceipt(", "async function manuallyResolveGoalComposer("), context);
+  const result = await context.applyGoalComposerReceipt({ id: "receipt", deviceId: "device",
+    action: "setGoal", selectionToken: "selection", payload: { threadId: "claude-fixture", goalMode: true } },
+    { state: "completed", result: { ok: true, backend: "claude", threadId: "claude-fixture",
+      nativeCommand: { id: "native-goal", name: "goal", state: "pending" } } });
+  assert.equal(result, "succeeded");
+  assert.equal(context.pending, null);
+  assert.equal(context.thread.goal, null);
+  assert.equal(cleared.length, 1);
+  assert.match(notices.at(-1), /等待原生执行/);
+});
+
+test("Claude 原生命令能力按实例目录读取，压缩回执未知也不强制排队普通消息", () => {
+  const context = vm.createContext({ nativeConnectionVersion: 1, thread: { id: "claude-fixture", backend: "claude",
+    instanceId: "claude:wsl:test", capabilities: { goalComposer: true, compact: true, queue: true } },
+    selectedId: "claude-fixture", modelsScope: "claude:wsl:test",
+    modelDefaults: { nativeCapabilities: { goal: true, compact: false } },
+    currentCompaction: () => ({ state: "unknown" }) });
+  assert.equal(context.claudeCommandSupported("goal"), true);
+  assert.equal(context.claudeCommandSupported("compact"), false, "新目录明确不支持时不借用历史能力");
+  context.modelsScope = "codex";
+  assert.equal(context.claudeCommandSupported("compact"), true, "其他实例目录不能覆盖此会话");
+  vm.runInContext(sourceSection("function compactionQueueSendReason(", "function persistCompactions("), context);
+  assert.equal(context.compactionQueueSendReason(), "");
+  assert.equal(context.compactionInProgress({ state: "pending", acknowledged: true }), false);
+  assert.equal(context.compactionInProgress({ state: "running" }), true);
+  context.thread.capabilities.queue = false;
+  assert.equal(context.claudeCommandSupported("goal"), false, "旧 print 会话不能借用目录能力开放控制入口");
+});
+
+test("目标暂停、开始、删除提交准确目标，保留计数、预算和会话消息", async () => {
+  const { context, calls } = goalControlHarness();
+  for (const [operation, status] of [["pause", "paused"], ["resume", "active"]]) {
+    await context.changeGoalState(operation, context.thread.goal);
+    assert.equal(context.thread.goal.status, status);
+    assert.equal(context.thread.goal.tokensUsed, 1200);
+    assert.equal(context.thread.goal.tokenBudget, 8000);
+    assert.equal(context.thread.goal.createdAt, 100);
+  }
+  await context.changeGoalState("delete", context.thread.goal);
+  assert.equal(context.thread.goal, null);
+  assert.deepEqual(context.thread.messages, ["保留原会话消息"]);
+  assert.deepEqual(calls.map(call => call.payload.operation), ["pause", "resume", "delete"]);
+  assert.ok(calls.every(call => call.path === "/api/action/updateGoal"
+    && call.payload.threadId === "main" && call.payload.expectedCreatedAt === 100));
+});
+
+test("只读、预算受限和删除确认期间目标变化时不派发错误操作", async () => {
+  const locked = goalControlHarness({ readOnly: true });
+  await locked.context.changeGoalState("pause", locked.context.thread.goal);
+  assert.equal(locked.calls.length, 0);
+  const budget = goalControlHarness({ status: "budgetLimited" });
+  await budget.context.changeGoalState("resume", budget.context.thread.goal);
+  assert.equal(budget.calls.length, 0);
+  const changed = goalControlHarness();
+  changed.context.confirmAction = async () => {
+    changed.context.thread.goal = { ...changed.context.thread.goal, objective: "另一个目标", createdAt: 200 };
+    return true;
+  };
+  await changed.context.changeGoalState("delete", changed.context.thread.goal);
+  assert.equal(changed.calls.length, 0);
+  assert.equal(changed.context.thread.goal.objective, "另一个目标");
+});
+
+test("目标操作结果未知时只查原回执，不重复暂停或删除，不覆盖后来目标", async () => {
+  const { context, calls, pending } = goalControlHarness();
+  const original = structuredClone(context.thread.goal);
+  context.respond = () => ({ state: "unknown", result: { outcomeUnknown: true } });
+  await context.changeGoalState("pause", original);
+  const receiptId = pending().id;
+  await context.changeGoalState("pause", original);
+  await context.changeGoalState("delete", original);
+  assert.equal(calls.length, 1);
+  context.thread.goal = { ...original, objective: "后来创建的目标", createdAt: 200 };
+  context.respond = () => ({ state: "completed", result: {
+    threadId: "main", goal: { ...original, status: "paused" },
+  } });
+  await context.resolveGoalEditReceipt();
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].path, `/api/receipts/${receiptId}`);
+  assert.equal(pending(), null);
+  assert.equal(context.thread.goal.objective, "后来创建的目标");
+});
+
+test("原有目标正文编辑仍兼容没有operation的请求，不改变目标暂停状态", async () => {
+  const { context, calls } = goalControlHarness({ status: "paused" });
+  vm.runInContext(`goalEditDraft = { threadId:"main",
+    baseline:goalEditBaseline(thread.goal), objective:"修改后的目标" }`, context);
+  await context.submitGoalEdit();
+  assert.equal(calls.length, 1);
+  assert.equal(Object.hasOwn(calls[0].payload, "operation"), false);
+  assert.equal(context.thread.goal.objective, "修改后的目标");
+  assert.equal(context.thread.goal.status, "paused");
+});
+
+function queueDeliveryHarness(messages) {
+  const element = (tag, className = "", text = "") => ({
+    tag, className, text, dataset: {}, attributes: {}, children: [],
+    setAttribute(name, value) { this.attributes[name] = value; },
+    append(...children) { this.children.push(...children); },
+  });
+  const notices = [];
+  const context = {
+    element, icon: name => element("svg", name),
+    button: (label, aria, action, className) => {
+      const node = element("button", className, label);
+      node.setAttribute("aria-label", aria);
+      node.action = action;
+      return node;
+    },
+    selectedId: "main", thread: { id: "main", queuedMessages: messages },
+    queueVersion: 1, connected: true, busy: false, stopping: false, pending: null,
+    queuedActionBusy: new Set(), editingQueuedMessage: null, editingMessage: null,
+    threadReadOnly: () => false, compactionLocked: () => false,
+    confirmedSendDisplayFor: () => null, reconcileSentMessageDisplays: () => false,
+    queueDisplayMessages: value => value, queueMessageText: value => value.text,
+    applyQueueSnapshot: () => true, queueSnapshotIsVersioned: () => true,
+    notice: value => notices.push(value),
+  };
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  for (const [start, end] of [
+    ["function queueRe", "function que"],
+    ["function applyQueued", "function con"],
+    ["function renderQueuedMessages(", "function renderQueueArea("],
+    ["function isActiveThread()", null],
+    ["let expandedClaudeGoalNotice", null],
+  ]) {
+    vm.runInContext(sourceSection(start, end), context);
+  }
+  return { context, notices };
+}
+
+test("已接受的本地队列残留不算待执行，不提供引导、编辑或重排，保留明确移除入口", () => {
+  const messages = [
+    { id: "consumed", clientUserMessageId: "client-a", createdAt: 1, text: "已接受的原消息",
+      submission: { status: "queued" }, remoteDeliveryState: "accepted", remoteQueueSyncPending: true },
+    { id: "waiting", clientUserMessageId: "client-b", createdAt: 2, text: "尚未执行的消息",
+      submission: { status: "queued" } },
+  ];
+  const { context, notices } = queueDeliveryHarness(messages);
+  const queue = context.renderQueuedMessages(messages);
+  assert.equal(queue.attributes["aria-label"], "原生消息队列，1 条待执行，1 条已发送待同步");
+  const accepted = queue.children.find(row => row.dataset.messageId === "consumed");
+  const status = accepted.children.find(node => node.className === "queued-steer-button");
+  assert.equal(status.disabled, true);
+  assert.equal(status.attributes["aria-label"], "消息已发送，队列记录待同步");
+  const menu = accepted.children.find(node => node.className === "queued-menu-button");
+  assert.equal(menu.disabled, false, "只限制受影响动作，保留用户显式移除记录");
+  assert.equal(menu.menuOptions.find(option => option.label === "编辑消息").disabled, true);
+  assert.equal(menu.menuOptions.find(option => option.value === "remove").label, "移除已发送记录");
+  assert.equal(context.queueReorderAvailable(), false);
+  const waiting = queue.children.find(row => row.dataset.messageId === "waiting");
+  assert.equal(waiting.children.find(node => node.className === "queued-steer-button").disabled, false);
+  context.applyQueuedSendResult("main", {
+    threadId: "main", deliveryState: "accepted", queueSyncPending: true, queuedMessages: messages,
+  }, 1);
+  assert.deepEqual(notices, [], "已发送状态由队列条目展示，不额外弹出提示");
+});
+
+test("普通队列仍按待执行显示，保留引导、编辑、删除及排序", () => {
+  const messages = ["a", "b"].map((id, index) => ({
+    id, clientUserMessageId: `client-${id}`, createdAt: index + 1, text: `待执行-${id}`,
+    submission: { status: "queued" },
+  }));
+  const { context } = queueDeliveryHarness(messages);
+  const queue = context.renderQueuedMessages(messages);
+  assert.equal(queue.attributes["aria-label"], "原生消息队列，2 条待执行");
+  assert.equal(context.queueReorderAvailable(), true);
+  for (const row of queue.children) {
+    assert.equal(row.children.find(node => node.className === "queued-steer-button").disabled, false);
+    const menu = row.children.find(node => node.className === "queued-menu-button");
+    assert.equal(menu.menuOptions.find(option => option.label === "编辑消息").disabled, false);
+    assert.equal(menu.menuOptions.find(option => option.value === "remove").label, "删除排队消息");
+  }
+});
+
+test("Claude 仅按原生能力提供一次整队立即执行，不开放逐条编辑、删除或排序", () => {
+  const messages = ["a", "b"].map(id => ({ id, text: `待执行-${id}` }));
+  const { context } = queueDeliveryHarness(messages), calls = [];
+  context.thread.backend = "claude";
+  context.thread.status = { type: "active" };
+  context.thread.capabilities = { queueSendNow: true };
+  context.steerQueuedMessage = (threadId, messageId) => calls.push({ threadId, messageId });
+  context.openPopup = () => assert.fail("Claude 不应通过右键打开 Codex 队列菜单");
+  const queue = context.renderQueuedMessages(messages);
+  const actions = queue.children.flatMap(row =>
+    row.children.filter(node => node.className === "queued-steer-button"));
+  assert.equal(actions.length, 1);
+  assert.equal(actions[0].text, "立即执行全部");
+  assert.equal(actions[0].disabled, false);
+  assert.equal(context.queueReorderAvailable(), false);
+  for (const row of queue.children) {
+    assert.equal(row.children.some(node => node.className === "queued-menu-button"), false);
+    row.oncontextmenu({ preventDefault() {}, target: { closest: () => null } });
+  }
+  actions[0].action();
+  assert.deepEqual(calls, [{ threadId: "main", messageId: "a" }]);
+  context.thread.capabilities.queueSendNow = false;
+  assert.equal(context.renderQueuedMessages(messages).children.some(row =>
+    row.children.some(node => node.className === "queued-steer-button")), false);
+});
+
+test("Claude 远程待发送队列逐条引导并开放编辑删除排序，原生已接收记录保持只读", () => {
+  const messages = ["B", "C", "D"].map((id,index) => ({
+    id, clientUserMessageId:id, createdAt:index+1, text:`待发送-${id}`,
+    remoteQueueSource:"remote", submission:{status:"queued"},
+  }));
+  const {context}=queueDeliveryHarness(messages), calls=[];
+  context.thread.backend="claude";
+  context.thread.status={type:"active"};
+  context.thread.capabilities={remoteQueue:true,queueSendNow:false};
+  context.steerQueuedMessage=(threadId,messageId)=>calls.push({threadId,messageId});
+  const queue=context.renderQueuedMessages(messages);
+  assert.equal(queue.attributes["aria-label"],"远程待发送队列，3 条待执行");
+  assert.equal(context.queueReorderAvailable(),true);
+  for (const row of queue.children) {
+    const action=row.children.find(n=>n.className==="queued-steer-button");
+    assert.equal(action.children.at(-1).text,"引导");
+    assert.equal(action.disabled,false);
+    const menu=row.children.find(n=>n.className==="queued-menu-button");
+    assert.equal(menu.menuOptions[0].disabled,false);
+    assert.equal(menu.menuOptions[1].label,"删除排队消息");
+    assert.notEqual(row.children[0].hidden,true);
+  }
+  queue.children[1].children.find(n=>n.className==="queued-steer-button").action();
+  assert.deepEqual(calls,[{threadId:"main",messageId:"C"}]);
+  const accepted={...messages[0],remoteQueueSource:"native",remoteDeliveryState:"accepted",
+    submission:{status:"accepted"},canSendNow:false};
+  context.thread.queuedMessages=[accepted,...messages.slice(1)];
+  const readonly=context.renderQueuedMessages(context.thread.queuedMessages).children[0];
+  assert.equal(readonly.children.find(n=>n.className==="queued-steer-button").disabled,true);
+  assert.equal(readonly.children.some(n=>n.className==="queued-menu-button"),false);
+});
+
+test("原生暂停的队列消息显示可用重试按钮，点击仍操作原消息", () => {
+  for (const submission of [undefined, { status: "queued" }]) {
+    const message = { id: "original-queue", text: "原图文消息", clientUserMessageId: "original-client",
+      createdAt: 1, pausedReason: "原生准备失败", ...(submission ? { submission } : {}) };
+    const { context } = queueDeliveryHarness([message]);
+    const calls = [];
+    context.steerQueuedMessage = (threadId, messageId) => calls.push({ threadId, messageId });
+    const row = context.renderQueuedMessages([message]).children[0];
+    const retry = row.children.find(node => node.className === "queued-steer-button");
+    assert.equal(retry.attributes["aria-label"], "重试此队列消息");
+    assert.equal(retry.title, message.pausedReason);
+    assert.equal(retry.children[0].className, "retry");
+    assert.equal(retry.children[1].text, "重试");
+    assert.equal(retry.disabled, false);
+    retry.action();
+    assert.deepEqual(calls, [{ threadId: "main", messageId: "original-queue" }]);
+  }
+});
+
+test("会话恢复执行后，暂停的队列消息显示引导并操作原消息", () => {
+  for (const status of ["active", "inProgress", "running", "pending", { type: "active" }, { status: { type: "running" } }]) {
+    const message = { id: "paused-queue", text: "保留的排队内容", pausedReason: "消息已暂停",
+      submission: { status: "queued" }, canSendNow: true };
+    const { context } = queueDeliveryHarness([message]), calls = [];
+    context.thread.status = status;
+    context.steerQueuedMessage = (threadId, messageId) => calls.push({ threadId, messageId });
+    const row = context.renderQueuedMessages([message]).children[0];
+    const action = row.children.find(node => node.className === "queued-steer-button");
+    assert.equal(action.children[1].text, "引导");
+    assert.equal(action.children[0].className, "steer");
+    assert.equal(action.attributes["aria-label"], "引导此队列消息");
+    assert.equal(action.disabled, false);
+    assert.equal(message.pausedReason, "消息已暂停", "显示更新不能伪造队列状态或自动重发");
+    assert.equal(calls.length, 0);
+    action.action();
+    assert.deepEqual(calls, [{ threadId: "main", messageId: message.id }]);
+  }
+});
+
+test("结果未知或正在核对回执时不把队列消息变成可重复提交的重试", () => {
+  for (const uncertain of ["native", "receipt"]) {
+    const message = { id: "original-queue", text: "原消息", pausedReason: "之前的异常",
+      ...(uncertain === "native" ? { submission: { status: "outcome-unknown" } } : {}) };
+    const { context } = queueDeliveryHarness([message]);
+    if (uncertain === "receipt") context.pending = {
+      action: "steerQueued", payload: { threadId: "main", messageId: message.id },
+    };
+    const row = context.renderQueuedMessages([message]).children[0];
+    const action = row.children.find(node => node.className === "queued-steer-button");
+    assert.equal(action.children[1].text, "待确认");
+    assert.equal(action.disabled, true);
+  }
+});
+
+test("普通引导、原生禁止发送及已接受残留保持各自状态", () => {
+  const messages = [
+    { id: "normal", text: "普通消息" },
+    { id: "blocked", text: "暂不支持", pausedReason: "宿主暂不可用", canSendNow: false },
+    { id: "accepted", text: "已接受", pausedReason: "旧异常", remoteDeliveryState: "accepted" },
+  ];
+  const { context } = queueDeliveryHarness(messages);
+  const actions = context.renderQueuedMessages(messages).children
+    .map(row => row.children.find(node => node.className === "queued-steer-button"));
+  assert.equal(actions[0].children[1].text, "引导");
+  assert.equal(actions[0].disabled, false);
+  assert.equal(actions[1].children[1].text, "重试");
+  assert.equal(actions[1].disabled, true);
+  assert.equal(actions[2].children[1].text, "已发送");
+  assert.equal(actions[2].disabled, true);
+});
+
+function draftOwnerHarness() {
+  const empty = () => ({ text: "", skills: [], attachments: [], goalMode: null });
+  const stored = new Map([
+    ["$new:", { text: "尚未发送的新会话草稿\n保留第二行", skills: [{ name: "只读检查", path: "/test/skill" }],
+      attachments: [{ kind: "inline", name: "test.png", dataUrl: "data:image/png;base64,dGVzdA==" }], goalMode: null }],
+    ["owned-thread", { ...empty(), text: "会话自身草稿" }],
+  ]);
+  const writes = [], queued = [];
+  const context = {
+    selectedId: null, creating: false, creationProject: "",
+    editingQueuedMessage: null, selectedGoal: null, currentDraft: empty(),
+    draftKey: () => context.selectedId || `$new:${context.creationProject}`,
+    snapshotDraft: () => structuredClone(context.currentDraft),
+    storedDraft: key => structuredClone(stored.get(key) || empty()),
+    storeDraft: (key, value) => {
+      writes.push({ key, value: structuredClone(value) });
+      stored.set(key, structuredClone(value));
+    },
+    rememberQueuedMessageEdit: () => queued.push(context.editingQueuedMessage.editId),
+    sameSkills: (left, right) => JSON.stringify(left) === JSON.stringify(right),
+    randomId: () => "new-goal-draft",
+  };
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  vm.runInContext(sourceSection("function rememberDra", "function per"), context);
+  return { context, stored, writes, queued };
+}
+
+test("欢迎页和只读初始页没有草稿所属会话，空输入不得覆盖已恢复的新会话草稿", () => {
+  const { context, stored, writes } = draftOwnerHarness();
+  const original = structuredClone(stored.get("$new:"));
+  context.rememberDraft();
+  // 页面退出时会再次尝试记忆输入；仍不能把未激活的空编辑器当成用户清空。
+  context.rememberDraft();
+  assert.equal(writes.length, 0);
+  assert.deepEqual(stored.get("$new:"), original);
+  context.creating = true;
+  context.currentDraft = structuredClone(stored.get("$new:"));
+  context.rememberDraft();
+  assert.deepEqual(stored.get("$new:"), original);
+});
+
+test("真实新会话和已有会话中的主动清空仍保存到各自草稿，不能因保护欢迎页而失效", () => {
+  const { context, stored } = draftOwnerHarness();
+  context.creating = true;
+  context.rememberDraft();
+  assert.equal(stored.get("$new:").text, "");
+  assert.equal(stored.get("owned-thread").text, "会话自身草稿");
+  context.creating = false;
+  context.selectedId = "owned-thread";
+  context.rememberDraft();
+  assert.equal(stored.get("owned-thread").text, "");
+});
+
+test("队列编辑的草稿继续使用准确编辑事务，不覆盖普通新会话草稿", () => {
+  const { context, stored, writes, queued } = draftOwnerHarness();
+  const original = structuredClone(stored.get("$new:"));
+  context.selectedId = "owned-thread";
+  context.editingQueuedMessage = { threadId: "owned-thread", editId: "owned-edit" };
+  context.currentDraft.text = "正在修改队列消息";
+  context.rememberDraft();
+  assert.deepEqual(queued, ["owned-edit"]);
+  assert.equal(writes.length, 0);
+  assert.deepEqual(stored.get("$new:"), original);
+});
+
+function queuedEditPersistenceHarness({ storageFails = false } = {}) {
+  const { context, writes: draftWrites } = draftOwnerHarness();
+  const persisted = [], notices = [], submissions = [];
+  const prompt = { value: "修改后的队列消息 ", querySelector: () => null, focus() {} };
+  const attachments = [{ name: "保留的图片.png", kind: "inline" }];
+  const edit = {
+    threadId: "owned-thread", editId: "owned-edit", state: "editing",
+    message: { id: "queued-a" }, text: "原始消息", attachments: [],
+  };
+  Object.assign(context, {
+    selectedId: edit.threadId, thread: { id: edit.threadId }, editingQueuedMessage: edit,
+    queuedEdits: new Map([[edit.threadId, edit]]), queueVersion: 1, queuedActionBusy: new Set(),
+    recoveryScope: null, recoveryGeneration: 0, draftWrites: new Map(),
+    threadEphemeralState: () => false,
+    session: { capabilities: {} }, connected: true, busy: false, stopping: false, pending: null,
+    $: () => prompt, composerAttachmentSnapshot: () => structuredClone(attachments),
+    composerAttachmentsLoading: () => false, composerHasAttachments: () => false,
+    threadReadOnly: () => false, compactionLocked: () => false,
+    forgetPromptCanonicalText() {}, restorePromptCanonicalContent() {},
+    syncSelectedSkillsFromPrompt() {}, syncPromptTrailingBreak() {},
+    updateComposer() {}, closeSkillMenu() {}, updateSkillMenu() {}, skillIndex: 0,
+    completeQueuedEditAction() {},
+    notice: message => notices.push(message),
+    sessionStorage: {
+      setItem(key, value) {
+        persisted.push({ key, value });
+        if (storageFails) throw new Error("quota");
+      },
+      removeItem() { assert.fail("仍有队列编辑时不能删除其存储"); },
+    },
+    persistInputDraft: async () => {},
+    mutate: async (action, payload) => { submissions.push({ action, payload }); return {}; },
+  });
+  vm.runInContext([
+    sourceSection("function persistQueuedEditDraft(", "function persistQueuedEdits("),
+    sourceSection("function persistQueuedEdits(", "function mat"),
+    sourceSection("function handlePromptInput("),
+    sourceSection("async function submitQue"),
+  ].join("\n"), context);
+  return { context, prompt, edit, attachments, persisted, notices, submissions, draftWrites };
+}
+
+test("队列编辑普通输入只持久化一次最终文本和附件，不写普通草稿", () => {
+  const { context, prompt, attachments, persisted, draftWrites } = queuedEditPersistenceHarness();
+  context.restorePromptCanonicalContent = () => { prompt.value = "还原后的规范文本"; };
+  context.handlePromptInput({}, { preserveCanonical: true });
+  assert.equal(persisted.length, 1);
+  const [saved] = JSON.parse(persisted[0].value);
+  assert.equal(saved.text, prompt.value);
+  assert.deepEqual(saved.attachments, attachments);
+  assert.equal(draftWrites.length, 0);
+});
+
+test("队列编辑组合输入仍保存一次当前文本，并延后规范化", () => {
+  const { context, prompt, persisted, draftWrites } = queuedEditPersistenceHarness();
+  context.restorePromptCanonicalContent = () => assert.fail("组合输入尚未完成");
+  context.syncSelectedSkillsFromPrompt = () => assert.fail("组合输入尚未完成");
+  context.handlePromptInput({ isComposing: true }, { preserveCanonical: true });
+  assert.equal(persisted.length, 1);
+  assert.equal(JSON.parse(persisted[0].value)[0].text, prompt.value);
+  assert.equal(draftWrites.length, 0);
+});
+
+test("队列编辑保存只持久化一次最新草稿，再提交可靠写入", async () => {
+  const { context, prompt, attachments, persisted, submissions } = queuedEditPersistenceHarness();
+  await context.submitQueuedMessageEdit();
+  assert.equal(persisted.length, 1);
+  const [saved] = JSON.parse(persisted[0].value);
+  assert.equal(saved.text, prompt.value);
+  assert.deepEqual(saved.attachments, attachments);
+  assert.equal(submissions.length, 1);
+  assert.equal(submissions[0].action, "editQueued");
+  assert.equal(submissions[0].payload.prompt, prompt.value.trim());
+  assert.equal(context.busy, false);
+});
+
+test("取回队列消息重新发送只更新输入，不携带另选的模型和思考深度", async () => {
+  const { context, submissions } = queuedEditPersistenceHarness();
+  context.selectedModel = "gpt-6.1-other";
+  context.selectedEffort = "high";
+  await context.submitQueuedMessageEdit();
+  assert.equal(submissions[0].payload.model, undefined);
+  assert.equal(submissions[0].payload.reasoningEffort, undefined);
+  assert.equal(context.selectedModel, "gpt-6.1-other");
+  assert.equal(context.selectedEffort, "high");
+});
+
+test("Codex 活动期间发送不把新模型冻结进队列，停止或完成后新发送才使用保留的选择", () => {
+  const code = sourceSection("  const rememberedModel = creating && !selectedModel",
+    "  if (creating && !payload.projectId") + "\nglobalThis.actualPayload = payload;";
+  for (const active of [true, false]) {
+    const context = nodeVm.createContext({ nativeConnectionVersion: 1,
+      creating: false, selectedModel: "gpt-new", selectedEffort: "high",
+      rememberedNewChatModel: () => null, isClaude: () => false, isActiveThread: () => active,
+      currentModelId: () => "gpt-new", activeInstanceId: () => "codex:local",
+      prompt: "后续消息", id: "thread", goalMode: false, queueOnly: false,
+      session: { capabilities: { queueSendRecovery: true } }, randomId: () => "same-message",
+      draft: { skills: [] }, images: [], files: []
+    });
+    nodeVm.runInContext(code, context);
+    assert.equal(context.actualPayload.model, active ? undefined : "gpt-new");
+    assert.equal(context.actualPayload.reasoningEffort, active ? undefined : "high");
+    assert.equal(context.selectedModel, "gpt-new");
+    assert.equal(context.selectedEffort, "high");
+  }
+});
+
+test("队列草稿发送完成保留新模型选择，不恢复为取回前的旧模型", () => {
+  const edit = { threadId: "thread", editId: "edit", model: "gpt-old", effort: "low",
+    backup: { text: "" }, modelChoiceVersion: 1 };
+  const context = nodeVm.createContext({ nativeConnectionVersion: 1, queuedEdits: new Map([["thread", edit]]), selectedId: "thread",
+    thread: { id: "thread", queuedEdits: [{ editId: "edit" }] }, editingQueuedMessage: edit,
+    notifiedQueueEdits: null, selectedModel: "gpt-new", selectedEffort: "high", modelChoiceVersion: 2,
+    storeDraft() {}, persistQueuedEdits() {}, $: () => ({}), restoreDraft() {} });
+  nodeVm.runInContext(sourceSection("function finishQueuedMessageEdit(", "function completeQueuedEditAction("), context);
+  context.finishQueuedMessageEdit(edit);
+  assert.equal(context.editingQueuedMessage, null);
+  assert.equal(context.selectedModel, "gpt-new");
+  assert.equal(context.selectedEffort, "high");
+});
+
+test("队列编辑存储失败时保留最新草稿、提示一次并阻止提交", async () => {
+  const { context, prompt, edit, attachments, persisted, notices, submissions }
+    = queuedEditPersistenceHarness({ storageFails: true });
+  await context.submitQueuedMessageEdit();
+  assert.equal(persisted.length, 1);
+  assert.equal(submissions.length, 0);
+  assert.equal(notices.length, 1);
+  assert.match(notices[0], /无法保存队列编辑草稿，操作未提交/);
+  assert.equal(edit.text, prompt.value);
+  assert.deepEqual(edit.attachments, attachments);
+  assert.equal(edit.state, "editing");
+  assert.equal(context.busy, false);
+  assert.equal(context.queuedActionBusy.size, 0);
+});
+
+function unfinishedQueueEditHarness() {
+  const disk = storage(), notices = [], writes = [];
+  disk.removeItem = key => disk.records.delete(key);
+  const prompt = { value: "", focus() { assert.fail("自动恢复不能弹出手机键盘"); } };
+  const summary = { editId: "unfinished-edit", messageId: "queued-original", state: "editing", originalText: "取回时原文" };
+  const context = nodeVm.createContext({
+    session: { device: { id: "device-a" } }, selectedId: "main",
+    thread: { id: "main", queuedEdits: [summary] },
+    busy: false, stopping: false, pending: null, editingMessage: null, editingQueuedMessage: null,
+    connected: true, readonly: false, compacting: false, queuedEdits: new Map(),
+    recoveryScope: null, recoveryGeneration: 0, draftWrites: new Map(),
+    threadEphemeralState: () => false,
+    threadReadOnly: () => context.readonly, compactionLocked: () => context.compacting,
+    selectedModel: "selected-model", selectedEffort: "high", modelChoiceVersion: 1,
+    selectedSkills: [], selectedGoal: null, attachments: [],
+    $: () => prompt, sessionStorage: disk,
+    persistInputDraft: async id => writes.push(id),
+    snapshotDraft: () => ({ text: prompt.value, skills: context.selectedSkills,
+      attachments: context.attachments, goalMode: context.selectedGoal }),
+    rememberDraft() {}, renderSelectedSkills() {},
+    setComposerAttachments: (images, options) => { context.attachments = images; context.attachmentOptions = options; },
+    notice: (text, error) => notices.push({ text, error }),
+    mutate() { assert.fail("自动恢复只能恢复输入，不能写服务端队列或发送"); },
+  });
+  nodeVm.runInContext([
+    sourceSection("function inputDraftEmpty(", "function persistInputDraft("),
+    sourceSection("function persistQueuedEditDraft(", "function persistQueuedEdits("),
+    (sourceSection("function persistQueuedEdits(", "function mat") + "\n" + sourceSection("function restoreQueuedMe", "function cle")),
+    sourceSection("function restoreUnfinishedQueuedMessageEdit(", "async function beginQueuedMessageEdit("),
+  ].join("\n"), context);
+  return { context, prompt, summary, disk, notices, writes };
+}
+
+test("未完成队列编辑在重新打开后直接恢复原输入和 editId，不显示引导也不自动提交", () => {
+  const h = unfinishedQueueEditHarness();
+  assert.equal(h.context.restoreUnfinishedQueuedMessageEdit(), true);
+  assert.equal(h.prompt.value, "取回时原文");
+  assert.equal(h.context.editingQueuedMessage.editId, h.summary.editId);
+  assert.equal(h.context.editingQueuedMessage.message.id, h.summary.messageId);
+  assert.equal(h.context.editingQueuedMessage.state, "editing");
+  assert.equal(h.context.selectedModel, "selected-model");
+  assert.equal(h.context.selectedEffort, "high");
+  assert.equal(h.context.attachmentOptions.readOnly, true, "只有服务记录时仍由服务保留原图，不伪造可删除图片");
+  assert.deepEqual(h.writes, []);
+  h.prompt.value = "恢复后继续修改";
+  assert.equal(h.context.restoreUnfinishedQueuedMessageEdit(), false);
+  assert.equal(h.prompt.value, "恢复后继续修改", "重复状态刷新不能把新修改还原");
+  assert.deepEqual(h.notices, []);
+});
+
+test("普通队列消息恢复编辑不显示图片保留提示，原消息有图片时才显示资格", () => {
+  const context = vm.createContext({});
+  vm.runInContext(sourceSection("function queuedEditH", "async functi"), context);
+  assert.equal(context.queuedEditHasOriginalImages({
+    state: "editing", imageRemoval: false, imageEditing: false,
+    attachments: [], originalImageSources: []
+  }), false);
+  assert.equal(context.queuedEditHasOriginalImages({
+    state: "editing", imageRemoval: false, imageEditing: false,
+    attachments: [{ source: "remote-image" }], originalImageSources: ["remote-image"]
+  }), true);
+  assert.equal(context.queuedEditHasOriginalImages({
+    state: "editing", imageRemoval: true, imageEditing: false,
+    attachments: [], originalImageSources: ["remote-image"]
+  }), true);
+});
+
+test("自动恢复队列编辑保留已有普通文字、Skill、附件和目标，不覆盖输入", () => {
+  for (const change of [
+    h => { h.prompt.value = "刚输入的普通草稿"; },
+    h => { h.context.selectedSkills = [{ name: "skill", path: "/skill" }]; },
+    h => { h.context.attachments = [{ kind: "inline", dataUrl: "data:image/png;base64,AQID" }]; },
+    h => { h.context.selectedGoal = "goal-draft"; },
+  ]) {
+    const h = unfinishedQueueEditHarness();
+    change(h);
+    const before = structuredClone(h.context.snapshotDraft());
+    assert.equal(h.context.restoreUnfinishedQueuedMessageEdit(), false);
+    assert.deepEqual(structuredClone(h.context.snapshotDraft()), before);
+    assert.equal(h.context.editingQueuedMessage, null);
+    assert.deepEqual(h.writes, []);
+  }
+});
+
+test("重开时输入框中的内容若只是取回前备份，会被未完成编辑正文替换；用户新改内容不会被覆盖", () => {
+  const h = unfinishedQueueEditHarness();
+  const edit = { threadId: "main", editId: h.summary.editId, deviceId: "device-a", state: "editing",
+    message: { id: h.summary.messageId }, originalText: h.summary.originalText, text: "重启前的队列修改",
+    attachments: [], originalImageSources: [], imageRemoval: false, imageEditing: false,
+    backup: { text: "取回前备份", skills: [], attachments: [], goalMode: null } };
+  h.context.queuedEdits.set("main", edit);
+  h.context.snapshotDraft = () => ({ text: h.prompt.value, skills: [], attachments: [], goalMode: null });
+  h.prompt.value = "取回前备份";
+  assert.equal(h.context.restoreUnfinishedQueuedMessageEdit(), true);
+  assert.equal(h.prompt.value, edit.text);
+  const next = unfinishedQueueEditHarness();
+  next.context.queuedEdits.set("main", edit);
+  next.context.snapshotDraft = () => ({ text: next.prompt.value, skills: [], attachments: [], goalMode: null });
+  next.prompt.value = "用户刚输入的新内容";
+  assert.equal(next.context.restoreUnfinishedQueuedMessageEdit(), false);
+  assert.equal(next.prompt.value, "用户刚输入的新内容");
+});
+
+test("自动恢复队列编辑遇到未知回执、其他编辑、只读、离线或会话变化时不解除保护", () => {
+  for (const change of [
+    h => { h.context.pending = { id: "original-receipt", action: "editQueued" }; },
+    h => { h.context.busy = true; }, h => { h.context.stopping = true; },
+    h => { h.context.editingMessage = { id: "history-message" }; },
+    h => { h.context.readonly = true; }, h => { h.context.connected = false; },
+    h => { h.context.compacting = true; }, h => { h.context.thread.id = "another-thread"; },
+    h => { h.summary.state = "unknown"; },
+    h => { h.context.queuedEdits.set("main", { editId: h.summary.editId, deviceId: "another-device" }); },
+  ]) {
+    const h = unfinishedQueueEditHarness();
+    change(h);
+    const pending = h.context.pending;
+    assert.equal(h.context.restoreUnfinishedQueuedMessageEdit(), false);
+    assert.equal(h.context.editingQueuedMessage, null);
+    assert.equal(h.context.pending, pending);
+    assert.deepEqual(h.writes, []);
+  }
+});
+
+test("取回中断后仅在服务端确认同一编辑且没有待确认回执时恢复编辑正文", () => {
+  const h = unfinishedQueueEditHarness();
+  const edit = { editId: h.summary.editId, threadId: "main", deviceId: "device-a", state: "starting",
+    message: { id: h.summary.messageId }, text: "要继续编辑的原消息",
+    backup: { text: "取回前的普通草稿", skills: [], attachments: [] } };
+  h.context.queuedEdits.set("main", edit);
+  h.context.editingQueuedMessage = edit;
+  h.prompt.value = edit.backup.text;
+  h.context.pending = { id: "original-request", action: "beginQueuedEdit" };
+  assert.equal(h.context.restoreUnfinishedQueuedMessageEdit(), false);
+  assert.equal(edit.state, "starting");
+  h.context.pending = null;
+  assert.equal(h.context.restoreUnfinishedQueuedMessageEdit(), true);
+  assert.equal(edit.state, "editing");
+  assert.equal(h.prompt.value, edit.text);
+  assert.equal(edit.backup.text, "取回前的普通草稿");
+});
+
+test("未完成队列编辑只从可继续编辑的状态恢复，正常编辑不再出现继续编辑引导", () => {
+  const h = cachedControlsHarness();
+  h.context.thread = { id: "main", queuedMessages: [], queuedEdits: [
+    { state: "editing", editId: "recoverable", messageId: "original", originalText: "输入内容" }
+  ] };
+  h.context.renderQueuedEditRecoveryControls = node => node.append({ text: "核对编辑状态" });
+  h.context.renderQueueArea();
+  assert.equal(h.queue.querySelector(".queued-edit-recovery"), null);
+  h.context.thread.queuedEdits[0].state = "unknown";
+  h.context.renderQueueArea();
+  assert.equal(h.queue.querySelector(".queued-edit-recovery-text").text, "正在确认队列编辑结果。");
+  assert.equal(h.queue.hidden, false, "真正未知的结果仍保留核对入口");
+});
+
+test("服务端已返回编辑完成后，刷新不会再次恢复旧编辑记录；待确认回执仍保留", () => {
+  const h = cachedControlsHarness();
+  const edit = { threadId: "main", editId: "finished-edit", deviceId: "device-a", state: "editing",
+    message: { id: "original" }, originalText: "原文", text: "已修改", backup: { text: "" } };
+  h.context.session = { device: { id: "device-a" } };
+  h.context.queuedEdits = new Map([["main", edit]]);
+  h.context.selectedId = "main"; h.context.thread = { id: "main", queuedMessages: [], queuedEdits: [] };
+  h.context.pending = null; h.context.restoreQueuedMessageEdit = () => assert.fail("完成的编辑不能再次恢复");
+  h.context.renderQueueArea = () => {};
+  h.context.persistQueuedEdits = () => {};
+  h.context.persistQueuedEditDraft = (_edit, remove) => { assert.equal(remove, true); return Promise.resolve(); };
+  nodeVm.runInContext(sourceSection("function reconcileQueuedEditRecovery(", "function applyQueueSnapshot("), h.context);
+  h.context.reconcileQueuedEditRecovery("main", []);
+  assert.equal(h.context.queuedEdits.size, 0);
+  const pending = { action: "editQueued", deviceId: "device-a", payload: { threadId: "main", editId: "pending-edit" } };
+  const waiting = { ...edit, editId: "pending-edit" };
+  h.context.queuedEdits = new Map([["main", waiting]]);
+  h.context.pending = pending;
+  h.context.persistQueuedEditDraft = () => assert.fail("待确认编辑不能清理");
+  h.context.reconcileQueuedEditRecovery("main", []);
+  assert.equal(h.context.queuedEdits.get("main"), waiting);
+});
+
+test("客户端丢失会话存储后，从持久草稿恢复最新队列修改和附件，完成后清理编辑身份", async () => {
+  for (const backupText of ["", "编辑前的普通草稿"]) {
+  const backup = { text: backupText, skills: [], attachments: [], goalMode: null };
+  const shared = sharedOrdinaryDraftHarness(), first = shared.page("first", backup);
+  shared.disk.set("main", structuredClone(backup));
+  const edit = { threadId: "main", editId: "durable-edit", deviceId: "shared-device", state: "editing",
+    message: { id: "original-message" }, originalText: "取回原文", text: "取回原文",
+    backup, attachments: [], modelChoiceVersion: 1, model: "model", effort: "high" };
+  first.context.editingQueuedMessage = edit;
+  first.context.queuedEdits.set("main", edit);
+  first.context.sessionStorage = { setItem() {}, removeItem() {} };
+  first.context.composerAttachmentSnapshot = () => first.context.currentAttachments;
+  nodeVm.runInContext([
+    sourceSection("function persistQueuedEditDraft(", "function persistQueuedEdits("),
+    sourceSection("function persistQueuedEdits(", "function mat"),
+  ].join("\n"), first.context);
+  first.prompt.value = "重启前最后修改的内容";
+  first.context.currentAttachments = [{ kind: "inline", name: "草稿.png", dataUrl: "data:image/png;base64,AQID" }];
+  first.context.rememberQueuedMessageEdit();
+  await first.settled();
+  const saved = shared.disk.get("main");
+  const savedEdit = shared.disk.get(`$queue-edit:${edit.editId}`);
+  assert.equal(saved.text, backup.text, "编辑稿不能替换原普通草稿备份");
+  assert.ok(savedEdit, `队列编辑持久化记录缺失：${JSON.stringify(shared.writes)}`);
+  assert.equal(savedEdit.text, first.prompt.value);
+  assert.equal(savedEdit.attachments[0].name, "草稿.png");
+  const reopened = shared.page("reopened"), context = reopened.context;
+  Object.assign(context, {
+    pending: null, submittedDrafts: new WeakMap(), goalComposerRecoveries: new Map(), failedInputRecoveries: new Map(),
+    privateInputScope: value => JSON.stringify([value.device.id, value.device.createdAtMs]),
+    validSkillSelection: Array.isArray, validQueuedImageSources: Array.isArray,
+    sessionStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+    renderSelectedSkills() {}, selectedModel: "", selectedEffort: "", modelChoiceVersion: 1,
+    setComposerAttachments: value => { context.currentAttachments = value; },
+    thread: { id: "main", queuedEdits: [{ editId: edit.editId }] }, notifiedQueueEdits: null,
+  });
+  context.recoveryStore.activate = async () => {};
+  context.recoveryStore.list = async (_scope, kind) => {
+    if (kind === "draft")
+      return [...shared.disk].filter(([id]) => !id.startsWith("$queue-edit:"))
+        .map(([id, value]) => ({ id, value: structuredClone(value) }));
+    if (kind === "queue-edit")
+      return [...shared.disk].filter(([id]) => id.startsWith("$queue-edit:"))
+        .map(([id, value]) => ({ id: id.slice("$queue-edit:".length), value: structuredClone(value) }));
+    return [];
+  };
+  nodeVm.runInContext([
+    sourceSection("function validQueuedMessageEdit(", "function restoreQueuedEdits("),
+    sourceSection("async function restorePr", "async functi"),
+    (sourceSection("function restoreDraf", "function cle") + "\n" + sourceSection("function persistQueu", "function mat")),
+    sourceSection("function finishQueuedMessageEdit(", "function completeQueuedEditAction("),
+  ].join("\n"), context);
+  await context.restorePrivateInputs(context.session);
+  context.restoreQueuedMessageEdit();
+  assert.equal(reopened.prompt.value, "重启前最后修改的内容");
+  assert.equal(context.editingQueuedMessage.editId, edit.editId);
+  assert.equal(context.currentAttachments[0].name, "草稿.png");
+  context.finishQueuedMessageEdit(context.editingQueuedMessage);
+  await reopened.settled();
+  assert.equal(reopened.prompt.value, backup.text);
+  assert.equal(context.editingQueuedMessage, null);
+  assert.equal(shared.disk.get("main")?.queuedEdit, undefined, "完成后不能在下次重开时复活旧编辑");
+  if (!backupText) assert.equal(shared.disk.has("main"), false, "空普通草稿也不能遗留编辑恢复记录");
+  }
+});
+
+function queuedEditFeedbackHarness() {
+  const h = queuedEditPersistenceHarness(), { context } = h, response = deferred();
+  const element = (tag, className = "", text = "") => ({
+    tag, className, text, dataset: {}, attributes: {}, children: [], disabled: false,
+    get textContent() { return this.text + this.children.map(node => node.textContent).join(""); },
+    set textContent(value) { this.text = value; this.children = []; },
+    setAttribute(key, value) { this.attributes[key] = value; },
+    append(...children) { this.children.push(...children); },
+    replaceChildren(...children) { this.text = ""; this.children = children; },
+    querySelector(selector) {
+      for (const node of this.children) {
+        if (selector.startsWith(".") ? node.className.split(" ").includes(selector.slice(1)) : node.tag === selector)
+          return node;
+        const nested = node.querySelector?.(selector);
+        if (nested) return nested;
+      }
+      return null;
+    },
+  });
+  const send = element("button"), status = element("span");
+  Object.assign(context, {
+    element, icon: name => element("svg", name), send,
+    button: (label, aria, action, className) => {
+      const node = element("button", className, label); node.setAttribute("aria-label", aria); node.action = action;
+      return node;
+    },
+    document: { createTextNode: text => element("#text", "", text) },
+    $: (selector, root) => root ? root.querySelector(selector)
+      : selector === "#send-status" ? status : h.prompt,
+    session: { device: { id: "device-a" }, capabilities: {} },
+    sending: null, compacting: false, goalMode: false, editing: true, editingMessage: null, active: false, hasAttachments: false,
+    unsupportedImages: false, unsupportedProjectless: false, goalReason: "", queueOnly: false,
+    sessionTypeEnabled: true,
+    compactionSendReason: "", compaction: { state: "idle" }, deleting: false, prompt: h.prompt.value,
+    pageLeaving: false, stream: null, composerDiagnosticState: "", creating: false,
+    privateInputScope: () => "device-a", recordRuntimeDiagnostic() {},
+    isClaude: () => false, serviceSideThread: () => true,
+    mutate: async (action, payload) => {
+      h.submissions.push({ action, payload });
+      context.pending = { id: "edit-receipt", action, payload, deviceId: "device-a", time: Date.now() };
+      try {
+        const result = await response.promise;
+        if (result.outcomeUnknown) throw Object.assign(new Error("操作结果未确认"), { pendingFeedback: true });
+        context.pending = null;
+        return result;
+      } catch (error) {
+        if (!error.pendingFeedback) context.pending = null;
+        throw error;
+      }
+    },
+  });
+  h.edit.deviceId = "device-a";
+  vm.runInContext([
+    sourceSection("function queuedEditSubmittingAction(", "async function submitMessageEdit("),
+    sourceSection("function reportMutationError(", "function acceptedSendItem("),
+    (sourceSection("const pendingFee", "function set") + "\n" + sourceSection("function pen", "function cle")),
+    `function renderSendFeedback(){${sourceSection("  const queuedEditAction = queuedEditSubmittingAction();",
+      '  $("#prompt").disabled =')}}`,
+    `function renderComposerPlaceholder(){${sourceSection('  $("#prompt").placeholder =',
+      "  const model = currentModel(), effort = currentEffort();")}}`,
+  ].join("\n"), context);
+  context.updateComposer = () => { context.renderSendFeedback(); context.renderComposerPlaceholder(); };
+  context.updateComposer();
+  return { ...h, response, send, status };
+}
+
+function compactionComposerHarness() {
+  const h = queuedEditFeedbackHarness(), { context } = h;
+  Object.assign(context, {
+    editingQueuedMessage: null, editing: false, prompt: "", active: false,
+    compacting: true, compaction: { state: "running", nativeConfirmed: true },
+    compactionSendReason: "当前服务不支持压缩期间排队发送", queueOnly: false,
+    currentCompaction: () => context.compaction, isActiveThread: () => context.active,
+    updateComposer: () => context.renderSendFeedback(),
+  });
+  vm.runInContext(sourceSection("async function stopG", "function mou"), context);
+  context.updateComposer();
+  return h;
+}
+
+test("已确认压缩先于线程执行状态到达时，空输入显示可用停止按钮，有内容仍可排队发送", () => {
+  const h = compactionComposerHarness();
+  h.context.remoteFastWriting = { key: "current-fast" };
+  h.context.remoteFastKey = () => "current-fast";
+  h.context.updateComposer();
+  assert.equal(h.send.dataset.action, "stop");
+  assert.equal(h.send.disabled, false, "Fast 保存和排队发送能力缺失均不能禁用停止压缩");
+  h.context.remoteFastWriting = null;
+  assert.ok(h.send.querySelector(".stop"));
+  assert.equal(h.send.attributes["aria-label"], "停止压缩");
+  assert.equal(h.send.title, "停止压缩");
+  h.context.compactionSendReason = ""; h.context.queueOnly = true;
+  for (const [prompt, hasAttachments] of [["补充消息", false], ["", true]]) {
+    Object.assign(h.context, { prompt, hasAttachments });
+    h.context.updateComposer();
+    assert.equal(h.send.dataset.action, "send");
+    assert.equal(h.send.disabled, false);
+    assert.ok(h.send.querySelector(".arrowUp"));
+    assert.equal(h.send.attributes["aria-label"], "发送到原生消息队列");
+  }
+  h.context.prompt = ""; h.context.hasAttachments = false; h.context.compacting = false;
+  h.context.compaction = { state: "idle" }; h.context.queueOnly = false;
+  h.context.updateComposer();
+  assert.equal(h.send.dataset.action, "send");
+  assert.equal(h.send.disabled, true, "压缩结束后恢复空输入的发送禁用状态");
+});
+
+test("未确认或未知压缩保留发送锁定，已确认压缩仍受只读和离线限制", async () => {
+  const h = compactionComposerHarness(), writes = [];
+  h.context.mutate = async (...input) => { writes.push(input); };
+  for (const state of ["pending", "unknown"]) {
+    h.context.compaction = { state };
+    h.context.compactionSendReason = "等待原压缩回执";
+    h.context.updateComposer();
+    assert.equal(h.send.dataset.action, "send");
+    assert.equal(h.send.disabled, true);
+    await h.context.stopGeneration();
+  }
+  assert.equal(writes.length, 0);
+  h.context.compaction = { state: "running" };
+  for (const lockedBy of ["read-only", "offline"]) {
+    h.context.threadReadOnly = () => lockedBy === "read-only";
+    h.context.connected = lockedBy !== "offline";
+    h.context.updateComposer();
+    assert.equal(h.send.dataset.action, "stop");
+    assert.equal(h.send.disabled, true);
+    await h.context.stopGeneration();
+  }
+  assert.equal(writes.length, 0);
+});
+
+test("停止压缩实际提交当前会话停止请求，在途重复点击不重复提交，回读后恢复发送状态", async () => {
+  for (const compaction of [{ state: "running" }, { state: "pending", acknowledged: true },
+    { state: "pending", nativeConfirmed: true }]) {
+    const h = compactionComposerHarness(), response = deferred(), writes = [];
+    h.context.compaction = compaction;
+    h.context.mutate = async (action, payload) => { writes.push({ action, ...payload }); return response.promise; };
+    let reloaded = 0;
+    h.context.reloadThread = async () => {
+      reloaded++; h.context.compaction = { state: "idle" }; h.context.compacting = false;
+      h.context.compactionSendReason = "";
+    };
+    const operation = h.context.stopGeneration();
+    assert.equal(h.context.stopping, true);
+    assert.equal(h.send.disabled, true);
+    await h.context.stopGeneration();
+    assert.deepEqual(writes, [{ action: "stop", threadId: h.context.selectedId }]);
+    response.resolve({ ok: true });
+    await operation;
+    assert.equal(reloaded, 1);
+    assert.equal(h.context.stopping, false);
+    assert.equal(h.send.dataset.action, "send");
+    assert.equal(h.send.disabled, true);
+  }
+});
+
+test("取回排队消息后沿用普通输入和发送入口，修改或清空均不自动恢复队列", () => {
+  const h = queuedEditFeedbackHarness();
+  for (const active of [false, true]) {
+    h.context.active = active;
+    h.context.editingQueuedMessage = null;
+    h.context.updateComposer();
+    const placeholder = h.prompt.placeholder;
+    h.context.editingQueuedMessage = h.edit;
+    for (const value of ["继续修改的排队消息", ""]) {
+      h.prompt.value = value; h.context.prompt = value;
+      h.context.handlePromptInput({});
+      h.context.updateComposer();
+      assert.equal(h.prompt.placeholder, placeholder);
+      assert.equal(h.send.dataset.action, "send");
+      assert.equal(h.send.dataset.queuedEditState, "editing");
+      assert.equal(h.send.attributes["aria-label"], "发送消息");
+      assert.equal(h.send.title, "发送消息");
+      assert.ok(h.send.querySelector(".arrowUp"));
+      assert.equal(h.send.disabled, !value);
+      assert.equal(h.edit.state, "editing");
+      assert.equal(h.edit.text, value);
+      assert.deepEqual(h.submissions, [], "输入变化不能恢复原消息或发出新消息");
+    }
+  }
+});
+
+test("排队输入发送明确失败时保留草稿和原编辑身份，并恢复普通发送入口", async () => {
+  const h = queuedEditFeedbackHarness(), operation = h.context.submitQueuedMessageEdit();
+  assert.equal(h.send.attributes["aria-label"], "发送中…");
+  assert.ok(h.send.querySelector(".spinner"));
+  assert.equal(h.send.disabled, true);
+  h.response.reject(new Error("发送操作明确失败"));
+  await operation;
+  assert.equal(h.send.attributes["aria-label"], "发送消息");
+  assert.ok(h.send.querySelector(".arrowUp"));
+  assert.equal(h.send.querySelector(".spinner"), null);
+  assert.equal(h.send.disabled, false);
+  assert.equal(h.status.textContent, "");
+  assert.equal(h.context.editingQueuedMessage, h.edit);
+  assert.equal(h.edit.text, h.prompt.value);
+  assert.deepEqual(h.submissions.map(({ action, payload }) => [action, payload.editId]),
+    [["editQueued", h.edit.editId]]);
+  assert.deepEqual(h.notices, ["发送操作明确失败"]);
+});
+
+test("排队输入使用原编辑身份发送，在途重复点击不重复提交，成功后恢复普通草稿", async () => {
+  const h = queuedEditFeedbackHarness();
+  h.context.completeQueuedEditAction = () => {
+    h.context.editingQueuedMessage = null; h.context.editing = false;
+  };
+  const operation = h.context.submitQueuedMessageEdit();
+  assert.equal(h.status.textContent, "发送中…");
+  assert.equal(h.send.attributes["aria-label"], "发送中…");
+  assert.ok(h.send.querySelector(".spinner"));
+  assert.equal(h.send.disabled, true);
+  await h.context.submitQueuedMessageEdit();
+  assert.deepEqual(h.submissions.map(({ action, payload }) => [action, payload.editId, payload.prompt]),
+    [["editQueued", h.edit.editId, h.prompt.value.trim()]]);
+  h.response.resolve({});
+  await operation;
+  assert.equal(h.status.textContent, "");
+  assert.equal(h.send.attributes["aria-label"], "发送消息");
+  assert.equal(h.send.querySelector(".spinner"), null);
+  assert.equal(h.send.disabled, false);
+});
+
+test("排队输入发送结果未知时保留原回执和草稿，停止spinner并锁定重复发送", async () => {
+  const h = queuedEditFeedbackHarness(), operation = h.context.submitQueuedMessageEdit();
+  h.response.resolve({ outcomeUnknown: true });
+  await operation;
+  const record = h.context.pending;
+  assert.equal(h.context.busy, false);
+  assert.equal(h.send.disabled, true);
+  assert.equal(h.send.querySelector(".spinner"), null);
+  assert.equal(h.context.pendingFeedbackReady(record), false);
+  record.time -= 5000;
+  assert.equal(h.context.pendingFeedbackReady(record), false);
+  record.time -= 3000;
+  assert.equal(h.context.pendingFeedbackReady(record), true);
+  assert.equal(h.context.pending, record);
+  assert.equal(h.context.editingQueuedMessage, h.edit);
+  await h.context.submitQueuedMessageEdit();
+  assert.equal(h.submissions.length, 1);
+  assert.deepEqual(h.notices, []);
+});
+
+test("其他编辑身份的请求不显示当前发送进度，取回期间禁用发送但不改变按钮用途", () => {
+  const h = queuedEditFeedbackHarness();
+  h.context.busy = true;
+  h.context.queuedActionBusy.add(`${h.edit.threadId}:${h.edit.message.id}`);
+  h.context.pending = { action: "cancelQueuedEdit", deviceId: "device-a",
+    payload: { threadId: h.edit.threadId, editId: "other-edit" } };
+  h.context.updateComposer();
+  assert.equal(h.status.textContent, "");
+  assert.equal(h.send.dataset.action, "send");
+  assert.equal(h.send.querySelector(".spinner"), null);
+  h.edit.state = "starting";
+  h.context.pending.payload.editId = h.edit.editId;
+  h.context.updateComposer();
+  assert.equal(h.status.textContent, "");
+  assert.equal(h.send.dataset.action, "send");
+  assert.equal(h.send.disabled, true);
+  assert.equal(h.send.dataset.queuedEditState, "starting");
+  assert.equal(h.send.querySelector(".spinner"), null);
+});
+
+function questionReceiptHarness(readReceipt) {
+  const writes = [], calls = [], reloads = [];
+  const key = JSON.stringify(["device-a", "thread-a", "question-a"]);
+  const record = { id: "receipt-a", deviceId: "device-a", threadId: "thread-a",
+    requestId: "question-a", state: "unknown" };
+  const context = {
+    session: { device: { id: "device-a", createdAtMs: 1 } },
+    selectedId: "thread-a", questionVersion: 0, notifiedQuestions: null,
+    document: { hidden: false }, navigator: { onLine: true }, pageLeaving: false,
+    thread: { id: "thread-a", requests: [
+      { id: "question-a", method: "remote/requestUserInputAsync" },
+      { id: "question-new", method: "remote/requestUserInputAsync" },
+    ] },
+    questionReplyReceipts: new Map([[key, record]]), questionReceiptChecks: new Map(),
+    questionDrafts: new Map([[key, new Map([["question-field", "未提交的私密答案"]])]]),
+    sessionStorage: { setItem: (name, value) => writes.push({ name, value }) },
+    privateInputScope: session => JSON.stringify([session?.device?.id, session?.device?.createdAtMs]),
+    renderApprovals() {}, renderSidebar() {}, notice() {}, approvalSignature: null,
+    reloadThread: async () => { reloads.push(context.thread?.id); },
+    api: async (path, payload) => { calls.push({ path, payload }); return readReceipt(path); },
+  };
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  vm.runInContext((sourceSection("function replaceAsyn", "function com") + "\n" + sourceSection("async function applyQues")), context);
+  return { context, key, record, writes, calls, reloads };
+}
+
+test("问答未知回执只查询原ID，完成后解除锁且不清除后来的问题", async () => {
+  const { context, key, calls, writes, reloads } = questionReceiptHarness(async () => ({
+    requestId: "receipt-a", state: "completed",
+    result: { ok: true, threadId: "thread-a", requestId: "question-a" },
+  }));
+  await context.recoverQuestionReceipts?.();
+  assert.deepEqual(calls, [{ path: "/api/receipts/receipt-a", payload: undefined }]);
+  assert.equal(context.questionReplyReceipts.has(key), false);
+  assert.deepEqual(Array.from(context.thread.requests, request => request.id), ["question-new"]);
+  assert.deepEqual(reloads, ["thread-a"]);
+  assert.ok(writes.every(write => !write.value.includes("未提交的私密答案")));
+});
+
+test("问答明确失败解锁但保留答案草稿，unknown和404不能解锁或重发", async () => {
+  for (const outcome of ["failed", "unknown", "not-found", "failed-unknown"]) {
+    const { context, key, calls } = questionReceiptHarness(async () => {
+      if (outcome === "not-found") throw Object.assign(new Error("未找到"), { code: 404 });
+      return { requestId: "receipt-a", state: outcome === "failed-unknown" ? "failed" : outcome,
+        result: { message: "未完成", outcomeUnknown: outcome === "failed-unknown" } };
+    });
+    await context.recoverQuestionReceipts?.();
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].path, "/api/receipts/receipt-a");
+    assert.equal(calls[0].payload, undefined);
+    assert.equal(context.questionReplyReceipts.has(key), outcome !== "failed");
+    assert.equal(context.questionDrafts.get(key).get("question-field"), "未提交的私密答案");
+  }
+});
+
+test("并发问答回执核对共用一次读取，不能清除同键后来创建的操作锁", async () => {
+  let finish;
+  const { context, key, calls } = questionReceiptHarness(() => new Promise(resolve => { finish = resolve; }));
+  const first = context.recoverQuestionReceipts?.(), second = context.recoverQuestionReceipts?.();
+  assert.equal(calls.length, 1);
+  context.questionReplyReceipts.set(key, { ...context.questionReplyReceipts.get(key), id: "receipt-new" });
+  finish({ requestId: "receipt-a", state: "completed", result: { ok: true } });
+  await Promise.all([first, second]);
+  assert.equal(context.questionReplyReceipts.get(key).id, "receipt-new");
+  assert.equal(context.questionDrafts.has(key), true);
+  assert.equal(context.questionReceiptChecks.size, 0);
+});
+
+test("迟到的初始问答回执和换授权后的读取不能清除新记录", async () => {
+  const direct = questionReceiptHarness(async () => ({}));
+  direct.context.questionReplyReceipts.set(direct.key, { ...direct.record, id: "receipt-new" });
+  await direct.context.applyQuestionReceipt(direct.key, {
+    requestId: "receipt-a", state: "completed", result: { ok: true },
+  });
+  assert.equal(direct.context.questionReplyReceipts.get(direct.key)?.id, "receipt-new");
+  let finish;
+  const scoped = questionReceiptHarness(() => new Promise(resolve => { finish = resolve; }));
+  const recovery = scoped.context.recoverQuestionReceipts?.();
+  assert.equal(scoped.calls.length, 1);
+  scoped.context.session = { device: { id: "device-b", createdAtMs: 2 } };
+  finish({ requestId: "receipt-a", state: "completed", result: { ok: true } });
+  await recovery;
+  assert.equal(scoped.context.questionReplyReceipts.has(scoped.key), true);
+});
+
+test("问答回执核对可在原生断开或只读时进行，但后台页和其他设备记录不发起读取", async () => {
+  for (const situation of ["native-unavailable", "read-only", "hidden", "other-device"]) {
+    const { context, calls } = questionReceiptHarness(async () => ({
+      requestId: "receipt-a", state: "pending", result: null,
+    }));
+    context.connected = false;
+    if (situation === "read-only") context.session.readOnly = true;
+    if (situation === "hidden") context.document.hidden = true;
+    if (situation === "other-device") context.session.device.id = "device-b";
+    await context.recoverQuestionReceipts?.();
+    assert.equal(calls.length, ["hidden", "other-device"].includes(situation) ? 0 : 1, situation);
+  }
+});
+
+test("切到另一会话后核对原回答，只解除原锁，不改当前会话的问题和草稿", async () => {
+  const { context, key, reloads } = questionReceiptHarness(async () => ({
+    requestId: "receipt-a", state: "completed",
+    result: { ok: true, threadId: "thread-a", requestId: "question-a" },
+  }));
+  const other = { id: "thread-b", requests: [{ id: "other-question", method: "remote/requestUserInputAsync" }] };
+  context.thread = other; context.selectedId = other.id;
+  context.ordinaryDraft = "另一会话中未发送的两行草稿\n保留内容";
+  await context.recoverQuestionReceipts();
+  assert.equal(context.questionReplyReceipts.has(key), false);
+  assert.equal(context.thread, other);
+  assert.deepEqual(other.requests, [{ id: "other-question", method: "remote/requestUserInputAsync" }]);
+  assert.equal(context.ordinaryDraft, "另一会话中未发送的两行草稿\n保留内容");
+  assert.deepEqual(reloads, []);
+});
+
+function toolRenderer() {
+  function element(tag, className = "", text = "") {
+    const node = { tagName: tag.toUpperCase(), className, ownText: String(text), children: [], attributes: {},
+      append(...children) { this.children.push(...children); },
+      replaceChildren(...children) { this.children = children; },
+      setAttribute(name, value) { this.attributes[name] = value; },
+      get textContent() { return this.ownText + this.children.map(child => child?.textContent ?? child).join(""); },
+    };
+    node.classList = { add(...names) { node.className += ` ${names.join(" ")}`; } };
+    return node;
+  }
+  const context = {
+    element, icon: () => element("svg"),
+    isSubagentItem: () => false, transcriptEventTypes: new Set(),
+    skillReadInfo: () => null, renderToolOutput: () => {},
+    claudeQuestionReplies: () => null, renderClaudeQuestionReply: () => element("article"),
+    genericToolPresentation: () => ({ description: "测试工具", icon: "tool" }),
+    commandText: item => item.command || "",
+  };
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  vm.runInContext(sourceSection("function renderItem("), context);
+  return context.renderItem;
+}
+
+function compactionRenderer() {
+  function element(tag, className = "", text = "") {
+    return { tagName: tag, className, ownText: text, children: [], attributes: {},
+      classList: { add() {} }, append(...nodes) { this.children.push(...nodes); },
+      replaceChildren(...nodes) { this.children = nodes; },
+      setAttribute(name, value) { this.attributes[name] = value; },
+      get textContent() { return this.ownText + this.children.map(node => node.textContent || "").join(""); },
+    };
+  }
+  const context = { element, icon: () => element("svg"), button: () => element("button"),
+    compactionQueueSendReason: () => "", models: [],
+    effortLabels: { high: "高", xhigh: "极高", max: "Max" } };
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  vm.runInContext(sourceSection("function transcriptModelName(", "function readableToolName("), context);
+  return context.renderTranscriptEvent;
+}
+
+test("Claude 压缩沿用同一正文行，状态和说明不写死执行器且保留原生统计", () => {
+  const render = compactionRenderer();
+  const base = { id: "operation", type: "contextCompaction", remoteCompactionLifecycle: true,
+    status: "inProgress", startedAtMs: 1000 };
+  const node = render(base);
+  assert.match(node.textContent, /正在压缩上下文/);
+  assert.doesNotMatch(node.attributes["aria-label"], /Codex|Claude/);
+  assert.equal(render({ ...base, phase: "stopping" }, node), node);
+  assert.match(node.textContent, /正在停止压缩/);
+  render({ ...base, status: "unknown" }, node);
+  assert.match(node.textContent, /压缩结果待确认/);
+  assert.equal(node.attributes.role, "note");
+  render({ ...base, status: "completed", completed: true, source: "automatic",
+    preTokens: 21279, postTokens: 5086, durationMs: 105521 }, node);
+  assert.match(node.textContent, /上下文已自动压缩/);
+  assert.match(node.attributes["aria-label"], /21,279.*5,086.*105.521/);
+  render({ ...base, status: "interrupted", completed: true }, node);
+  assert.match(node.textContent, /已中断/);
+  render({ ...base, status: "failed", completed: true }, node);
+  assert.match(node.textContent, /失败/);
+  render({ ...base, status: "completed", completed: true, outcome: "noop" }, node);
+  assert.match(node.textContent, /无需压缩/);
+});
+
+test("Claude 目标统计只显示显式返回值，等待期间不自行累计耗时", () => {
+  const rows = new Map(["tokens-used", "token-budget", "tokens-remaining", "iterations", "duration"]
+    .map(key => [key, { hidden: false, output: {}, querySelector() { return this.output; } }]));
+  const metrics = {};
+  const root = { querySelector: selector => selector === ".goal-metrics" ? metrics : rows.get(selector.replace(".goal-metric-", "")) };
+  const context = vm.createContext({ nativeConnectionVersion: 1, Intl, updateGoalDurationView: (_root, goal) =>
+    Number.isFinite(goal.timeUsedSeconds) ? `${goal.timeUsedSeconds}s` : null, syncGoalLiveTimer() {} });
+  vm.runInContext(sourceSection("function formatGoalTokens(", "let goalLiveTimer =")
+    + sourceSection("function goalDurationSeconds(", "function stopGoalLiveTimer(")
+    + sourceSection("function updateGoalL", "let selected"), context);
+  const goal = { source: "claude", status: "active", updatedAt: 100, tokensUsed: 134, timeUsedSeconds: 28.29, iterations: 1 };
+  assert.equal(context.goalDurationSeconds(goal, 200000), 28.29);
+  context.updateGoalLiveView(root, goal);
+  assert.equal(rows.get("tokens-used").output.textContent, "134");
+  assert.equal(rows.get("iterations").output.textContent, "1");
+  assert.equal(rows.get("token-budget").hidden, true);
+  context.updateGoalLiveView(root, { source: "claude", status: "active" });
+  assert.equal(metrics.hidden, true);
+});
+
+test("Claude 压缩输入区只保留一处待确认，目标原文折叠展示并保留展开状态", () => {
+  const element = (tag, className = "", text = "") => ({ tag, className, text, children: [],
+    append(...children) { this.children.push(...children); } });
+  const context = vm.createContext({ nativeConnectionVersion: 1, element, button: (text, label) => element("button", "", text),
+    session: { device: { id: "device" } }, selectedId: "claude-fixture",
+    thread: { id: "claude-fixture", backend: "claude", capabilities: { queue: true },
+      nativeCommands: [{ name: "compact", state: "unknown" }] },
+    compactionLocked: () => true, compactionQueueSendReason: () => "", pendingFeedbackReady: () => true,
+    privateInputScope: () => "auth", expandedClaudeGoalNotice: "", connected: true });
+  vm.runInContext((sourceSection("function renderClaudeControlNotices(") + sourceSection("const nativeCompactionStartGraceMs", "function renderCompactionBanner(") + sourceSection("function renderCompactionBanner(", "async function applyCompactionReceipt(")), context);
+  const root = element("div");
+  context.renderClaudeControlNotices(root);
+  context.renderCompactionBanner(root, "claude-fixture", { state: "unknown", receiptId: "receipt" });
+  assert.equal(root.children.length, 1);
+  context.thread.nativeCommands = [{ name: "compact", state: "completed", message: "压缩已停止" }];
+  const stopped = element("div");
+  context.renderClaudeControlNotices(stopped);
+  assert.equal(stopped.children.length, 0, "终态不能长期残留输入区");
+  context.thread.goalNotice = "Goal still active · the goal check could not complete";
+  const notice = element("div");
+  context.renderClaudeControlNotices(notice);
+  const details = notice.children[0];
+  assert.match(details.children[0].text, /^目标评估暂未完成/);
+  assert.equal(details.children[1].text, context.thread.goalNotice);
+  details.open = true; details.ontoggle();
+  const redrawn = element("div");
+  context.renderClaudeControlNotices(redrawn);
+  assert.equal(redrawn.children[0].open, true);
+});
+
+test("Claude 模型和等级变化沿用 Codex 变更行，纯等级调整不显示假模型切换", () => {
+  const render = compactionRenderer();
+  const effort = render({ id: "effort", type: "modelChanged", source: "claude",
+    fromModel: "claude-opus-5-5", toModel: "claude-opus-5-5", fromEffort: "max", toEffort: "xhigh" });
+  assert.match(effort.className, /transcript-event.*model-change/);
+  assert.match(effort.textContent, /思考深度已从 Max 更改为 极高/);
+  assert.doesNotMatch(effort.textContent, /模型已从|command-name|local-command-stdout/);
+  assert.match(effort.attributes["aria-label"], /原生实际请求确认/);
+  const partial = render({ id: "partial", type: "modelChanged", source: "claude",
+    fromModel: null, toModel: "model-b", fromEffort: "high", toEffort: "max" });
+  assert.match(partial.textContent, /思考深度已从 高 更改为 Max/);
+  assert.doesNotMatch(partial.textContent, /模型已从|未知模型/, "缺失旧型号不能猜造型号切换");
+  const both = render({ id: "both", type: "modelChanged", source: "claude",
+    fromModel: "model-a", toModel: "model-b", fromEffort: "high", toEffort: "max" });
+  assert.match(both.textContent, /模型已从 model-a 更改为 model-b，思考深度从 高 更改为 Max/);
+  const codex = render({ id: "codex", type: "modelChanged", fromModel: "model-a", toModel: "model-b" });
+  assert.equal(codex.textContent, "模型已从 model-a 更改为 model-b");
+  assert.match(codex.attributes["aria-label"], /模型切换可能触发上下文压缩/);
+});
+
+test("Claude 首次生效提示位于对应问题前，中途变更保持原生请求位置且重绘不重复", () => {
+  const context = { transcriptEvents: new Map(), itemVersions: new Map() };
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  vm.runInContext([
+    sourceSection("const transcriptEventTyp", "function mergeRe"),
+    (sourceSection("function completedIt") + "\n" + sourceSection("function mergeRe")),
+  ].join("\n"), context);
+  const input = { id: "input", type: "userMessage" }, first = { id: "first", type: "agentMessage" },
+    second = { id: "second", type: "agentMessage" };
+  const initial = { id: "initial-change", type: "modelChanged", source: "claude", beforeItemId: "input" };
+  const inline = { id: "inline-change", type: "modelChanged", source: "claude",
+    remoteInlineEvent: true, beforeItemId: "second" };
+  let turn = { id: "turn", status: "completed", items: [input, initial, first, inline, second] };
+  for (let index = 0; index < 3; index++) turn = context.enrichTurnTranscriptEvents(turn);
+  assert.deepEqual([...turn.items.map(item => item.id)], ["initial-change", "input", "first", "inline-change", "second"]);
+  assert.equal(turn.items.filter(item => item.type === "modelChanged").length, 2);
+});
+
+test("手动压缩完成事件误插到最终回复前时，重排到该轮末尾；回复前压缩保持原位", () => {
+  const context = { transcriptEvents: new Map(), itemVersions: new Map() };
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  vm.runInContext([
+    sourceSection("const transcriptEventTyp", "function mergeRe"),
+    (sourceSection("function completedIt") + "\n" + sourceSection("function mergeRe")),
+  ].join("\n"), context);
+  const input = { id: "input", type: "userMessage" };
+  const reply = { id: "reply", type: "agentMessage", text: "已完成回复" };
+  const manual = { id: "manual", type: "contextCompaction", source: "manual", status: "completed", completed: true };
+  assert.equal(context.completedItem(manual), true);
+  const moved = context.enrichTurnTranscriptEvents({ id: "after-reply", items: [input, manual, reply] });
+  assert.deepEqual([...moved.items.map(item => item.id)], ["input", "reply", "manual"]);
+  const before = context.enrichTurnTranscriptEvents({ id: "before-reply", items: [input,
+    { ...manual, source: "automatic" }, reply],
+    status: "inProgress" });
+  // “压缩后生成回复”的情形没有回复在压缩前，不能套用末尾修复规则。
+  assert.deepEqual([...before.items.map(item => item.id)], ["input", "manual", "reply"]);
+});
+
+test("压缩历史仅有时间字段时，切回会话即可显示进行中或已完成", () => {
+  const render = compactionRenderer();
+  // 真实服务历史没有 completed 字段，不能依赖下一次实时事件才补全显示状态。
+  const item = { type: "contextCompaction", id: "compact", startedAtMs: 1794147063807 };
+  assert.match(render(item).textContent, /正在压缩上下文/);
+  assert.match(render({ ...item, completedAtMs: 1794147151527 }).textContent, /上下文已压缩/);
+  assert.doesNotMatch(render({ ...item, completedAtMs: 1794147151527 }).textContent, /正在压缩|状态已更新/);
+});
+
+test("压缩失败、中断和未知历史不能显示为成功完成", () => {
+  const render = compactionRenderer(), item = { type: "contextCompaction", id: "compact" };
+  assert.match(render({ ...item, status: "failed", completedAtMs: 100 }).textContent, /失败/);
+  for (const status of ["interrupted", "cancelled", "canceled"]) {
+    assert.match(render({ ...item, status, completedAtMs: 100 }).textContent, /中断/);
+  }
+  assert.match(render(item).textContent, /状态已更新/);
+});
+
+test("切回会话的迟到快照不能抹掉压缩完成事件或把它恢复为进行中", () => {
+  const context = { transcriptEvents: new Map(), turns: new Map(), itemVersions: new Map() };
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  vm.runInContext([
+    sourceSection("const transcriptEventTyp", "function mergeRe"),
+    (sourceSection("function completedIt") + "\n" + sourceSection("function mergeRe")),
+  ].join("\n"), context);
+  const completed = { turnId: "compact-turn", item: {
+    type: "contextCompaction", id: "compact", completed: true, completedAtMs: 2000,
+  } };
+  context.mergeTranscriptEvents([completed]);
+  context.itemVersions.set("compact-turn:compact", 2);
+  context.replaceTranscriptEvents([], 1);
+  assert.equal(context.transcriptEvents.size, 1);
+  context.mergeTranscriptEvents([{ ...completed, item: { ...completed.item, completed: false, completedAtMs: undefined } }]);
+  const restored = context.enrichTurnTranscriptEvents({ id: "compact-turn", items: [] });
+  assert.equal(restored.items.length, 1);
+  assert.equal(restored.items[0].completed, true);
+  assert.match(compactionRenderer()(restored.items[0]).textContent, /上下文已压缩/);
+  // 新选择用另一会话的快照时仍必须隔离，不能把上一会话的事件带过去。
+  context.replaceTranscriptEvents([]);
+  assert.equal(context.transcriptEvents.size, 0);
+  const interrupted = context.enrichTurnTranscriptEvents({ id: "stopped", status: "interrupted",
+    items: [{ type: "contextCompaction", id: "unfinished", startedAtMs: 1000 }] });
+  assert.match(compactionRenderer()(interrupted.items[0]).textContent, /已中断/);
+  const finishedBeforeInterruption = context.enrichTurnTranscriptEvents({ id: "stopped", status: "interrupted",
+    items: [{ type: "contextCompaction", id: "finished", startedAtMs: 1000, completedAtMs: 2000 }] });
+  assert.match(compactionRenderer()(finishedBeforeInterruption.items[0]).textContent, /上下文已压缩/);
+});
+
+test("服务历史先补回继续消息，再翻页时保留顺序且不重复首条输入", () => {
+  const context = { turns: new Map(), transcriptEvents: new Map(), itemVersions: new Map(),
+    turnVersions: new Map(), turnFieldVersions: new Map(), partialItems: new Set(),
+    reconcileConfirmedInputOrder: () => false };
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  vm.runInContext([
+    sourceSection("const transcriptEventTyp", "function mergeRe"),
+    (sourceSection("function mergeLi") + "\n" + sourceSection("function mergeRe") + "\n" + sourceSection("function mergeHi", "async functi")),
+  ].join("\n"), context);
+  const items = Array.from({ length: 114 }, (_, index) => ({
+    id: `item-${String(index).padStart(3, "0")}`,
+    ...(index === 0 ? { type: "userMessage", content: [{ type: "text", text: "继续" }] }
+      : { type: "commandExecution", command: "echo check", status: "completed" }),
+  }));
+  let turn = context.mergeHistoryTurn({ id: "turn", status: "completed",
+    items: [{ ...items[0], remoteHistoryContext: true }, ...items.slice(74)],
+    itemsPageComplete: true, itemsComplete: false, itemsNextCursor: "page-2" }, 0);
+  context.turns.set(turn.id, turn);
+  assert.equal(turn.items[0].content[0].text, "继续");
+  assert.equal(turn.itemsCursorAnchor, "item-074");
+  for (const [pageItems, next] of [[items.slice(34, 74), "page-3"], [items.slice(0, 34), null]]) {
+    turn = context.mergeHistoryTurn({ id: "turn", items: pageItems,
+      itemsPageComplete: true, itemsComplete: next == null, itemsNextCursor: next },
+    0, { older: true, beforeId: turn.itemsCursorAnchor });
+    context.turns.set(turn.id, turn);
+  }
+  assert.equal(turn.items.length, 114);
+  assert.deepEqual(Array.from(turn.items, item => item.id), items.map(item => item.id));
+  assert.equal(turn.items.filter(item => item.type === "userMessage").length, 1);
+  assert.equal(turn.itemsComplete, true);
+  assert.equal(turn.itemsNextCursor, null);
+});
+
+test("工具证据未知时实际渲染状态未知，不能因父轮运行或结束显示完成勾号", () => {
+  const render = toolRenderer();
+  for (const type of ["sleep", "reasoning", "dynamicToolCall", "commandExecution"]) {
+    for (const parentRunning of [false, true]) {
+      const node = render({ id: "unknown-tool", type, status: "unknown", remoteItemCompleted: false },
+        null, false, parentRunning);
+      assert.match(node.textContent, /状态未知/);
+      assert.doesNotMatch(node.textContent, /✓|已完成思考|已运行|进行中/);
+    }
+  }
+});
+
+test("等待工具在真实进行中与完成两态分别渲染，不以预计时长冒充完成", () => {
+  const render = toolRenderer();
+  const active = render({ type: "sleep", id: "sleep", status: "inProgress",
+    startedAtMs: 10, durationMs: 15000, remoteItemCompleted: false }, null, false, true);
+  assert.match(active.textContent, /进行中/);
+  assert.doesNotMatch(active.textContent, /✓/);
+  const completed = render({ type: "sleep", id: "sleep", status: "completed",
+    startedAtMs: 10, completedAtMs: 15010, remoteItemCompleted: true }, null, false, false);
+  assert.match(completed.textContent, /✓/);
+  assert.doesNotMatch(completed.textContent, /进行中|状态未知/);
+});
+
+test("失败与中断的工具条目不能渲染成功勾号", () => {
+  const render = toolRenderer();
+  for (const status of ["failed", "interrupted", "cancelled", "canceled"]) {
+    const node = render({ type: "sleep", id: "sleep", status }, null, false, false);
+    assert.doesNotMatch(node.textContent, /✓/);
+    assert.match(node.textContent, status === "failed" ? /失败/ : /已中断/);
+  }
+});
+
+test("Claude 内置工具按原生动作展示，工作摘要不把内置工具称为集成", () => {
+  const context = nodeVm.createContext({ nativeConnectionVersion: 1, URL, skillReadInfo: () => null, reasoningPreviewText: () => "" });
+  nodeVm.runInContext(sourceSection("function readableToolName(", "function reasoningPreviewText("), context);
+  nodeVm.runInContext(sourceSection("function wor"), context);
+  const claude = (tool, args = {}) => ({ type: "dynamicToolCall", source: "claude", tool, arguments: args, status: "completed" });
+  const shown = item => {
+    const { icon, description, explore } = context.genericToolPresentation(item);
+    return { icon, description, explore: explore === true };
+  };
+  assert.deepEqual(shown(claude("Read", { file_path: "/w/src/app.js" })), { icon: "eye", description: "读取文件 · app.js", explore: true });
+  assert.deepEqual(shown(claude("Grep", { pattern: "foo  bar", path: "/w/src/" })), { icon: "search", description: "搜索 · “foo bar” · src", explore: true });
+  assert.deepEqual(shown(claude("WebFetch", { url: "https://example.com/a?b=1" })), { icon: "globe", description: "读取网页 · example.com", explore: false });
+  assert.deepEqual(shown(claude("TaskUpdate", { taskId: 3 })), { icon: "queue", description: "更新任务 · #3", explore: false });
+  assert.deepEqual(shown(claude("Monitor", { description: "等待测试结束", command: "until ..." })), { icon: "eye", description: "监控 · 等待测试结束", explore: false });
+  assert.equal(shown(claude("SendFeedback")).description, "Send Feedback");
+  // 未标记来源的 Codex 动态工具保持原有展示。
+  assert.equal(shown({ type: "dynamicToolCall", tool: "Read", arguments: { title: "原标题" } }).description, "原标题");
+
+  const summary = context.workGroupSummary([
+    claude("Read", { file_path: "/w/a.js" }), claude("Skill", { skill: "review" }),
+    { type: "mcpToolCall", source: "claude", server: "fetch", tool: "fetch", status: "completed" },
+    { type: "commandExecution", command: "ls", status: "completed", exitCode: 0 }
+  ]);
+  assert.equal(summary.text, "已使用 fetch 集成浏览了文件使用了工具运行了命令");
+  assert.equal(summary.description, "1 条命令，3 次工具调用");
+  assert.equal(context.workGroupSummary([claude("Glob", { pattern: "**/*.rs" })]).text, "浏览了文件");
+});
+
+test("Claude 终端回退菜单提示说明消息排队与回退后的执行位置", () => {
+  const context = nodeVm.createContext({ nativeConnectionVersion: 1,});
+  nodeVm.runInContext(sourceSection("function claudeRewindDialogText(", "function claudePlanOptionLabel("), context);
+  const queued = "此时发送的消息会先排队，等终端完成或取消回退后再执行；如果终端确认回退，这些消息会接在回退点之后执行。";
+  assert.deepEqual([...context.claudeRewindDialogText({ kind: "rewind", step: "select", description: "" })],
+    ["终端正在选择要回退到哪条消息之前。", queued]);
+  assert.deepEqual([...context.claudeRewindDialogText({ kind: "rewind", step: "confirm", description: "只回复\n  R2-OK" })],
+    ["终端正在确认回退到这条消息之前：只回复 R2-OK", queued]);
+  assert.equal(context.claudeRewindDialogText({ step: "confirm" })[0], "终端正在确认回退到这条消息之前：（未读到消息原文）");
+});
+
+test("Claude 自动续跑提示使用中文，recap 沿用原生前缀，未知写法保留原文", () => {
+  const context = nodeVm.createContext({ nativeConnectionVersion: 1,});
+  nodeVm.runInContext(sourceSection("function claudeTaskNotificationText(", "function renderTranscriptEvent("), context);
+  nodeVm.runInContext(sourceSection("function claudeBackgroundLabel(", "function renderClaudeControlNotices("), context);
+  const text = item => ({ ...context.claudeTaskNotificationText(item) });
+  assert.deepEqual(text({ kind: "command", status: "failed", summary: "Background command \"make\" failed with exit code 2" }),
+    { label: "后台命令失败 · Claude 自动继续", description: "Background command \"make\" failed with exit code 2" });
+  assert.deepEqual(text({ kind: "monitor", summary: "Monitor event: \"等待\"", event: "EXIT=0" }),
+    { label: "监控收到事件 · Claude 自动继续", description: "Monitor event: \"等待\"\nEXIT=0" });
+  assert.equal(text({ kind: "monitor", status: "completed", summary: "Monitor stream ended" }).label, "监控已结束 · Claude 自动继续");
+  assert.deepEqual(text({ kind: "schedule", summary: "只回复“定时触发成功”。", event: "Running scheduled task (Nov 14 12:27am)" }),
+    { label: "定时任务已触发 · Claude 自动继续", description: "只回复“定时触发成功”。\nRunning scheduled task (Nov 14 12:27am)" });
+  assert.equal(text({ kind: "agent", status: "completed" }).label, "后台子代理已完成 · Claude 自动继续");
+  assert.equal(text({ kind: "task", status: "killed" }).label, "后台任务已停止 · Claude 自动继续");
+  assert.equal(text({}).description, "原生任务通知没有提供摘要。");
+  assert.equal(context.claudeBackgroundLabel("1 shell"), "1 个后台命令");
+  assert.equal(context.claudeBackgroundLabel("2 shells, 1 monitor"), "2 个后台命令、1 个监控");
+  assert.equal(context.claudeBackgroundLabel("1 local agent"), "1 个后台子代理");
+  assert.equal(context.claudeBackgroundLabel("background"), "后台任务");
+  assert.equal(context.claudeBackgroundLabel("3 bashes running"), "3 bashes running");
+  const event = item => ({ ...context.claudeEventText(item) });
+  assert.deepEqual(event({ type: "claudeLocalCommand", name: "/resume", args: "", output: "已在后台运行" }),
+    { label: "终端执行了 /resume", description: "已在后台运行" });
+  assert.equal(event({ type: "claudeLocalCommand", name: "/skills", output: null }).description, "尚未收到命令输出。");
+  assert.equal(event({ type: "claudeLocalCommand", name: "/skills", output: "" }).description, "命令没有输出。");
+  assert.equal(event({ type: "claudeNotice", kind: "awaySummary", text: "已问候" }).label, "※ recap: 已问候");
+  assert.deepEqual(event({ type: "claudeNotice", kind: "stopHook", prevented: true, reason: "测试未通过", errors: ["exit 2"] }),
+    { label: "Stop Hook 阻止了继续执行", description: "测试未通过\nexit 2" });
+  assert.equal(event({ type: "claudeNotice", kind: "informational", text: "x".repeat(130) }).label, `Claude 提示：${"x".repeat(120)}…`);
+});
+
+function transportClient(fetchResponse) {
+  const calls = [];
+  const context = {
+    URL, Headers, Response, AbortController, DOMException, TextEncoder, performance,
+    setTimeout, clearTimeout, setInterval, clearInterval,
+    location: new URL("http://127.0.0.1:54321/"),
+    document: { hidden: false }, navigator: { onLine: true },
+    getAndroidAppInfo: async () => ({}), isAndroidContainer: () => false,
+    diagnosticLocation: value => ({ origin: value }), recordDiagnostic: () => {},
+    traceDiagnosticRequest: () => ({ response() {}, finish() {} }),
+    session: null, pageLeaving: false,
+    threadReadOnly: () => false, threadDeletionLocked: () => false, threadDeleted: () => false,
+    beginPwaForegroundWork: () => () => {}, currentChannelMeasurements: () => [],
+    markMessageChannelUnavailable: () => {}, requireAuthentication: () => {},
+    fetch: async (url, options) => {
+      const call = { path: new URL(url).pathname, options };
+      calls.push(call);
+      return fetchResponse(call, calls.length);
+    },
+  };
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  // 运行完整传输实现及实际 api 消费器；只替换浏览器/网络外部依赖。
+  vm.runInContext(channels.replace(/^import .*;\r?\n/gm, "").replace(/^export /gm, ""), context);
+  vm.runInContext(sourceSection("function threadActionReadOnly(", "function threadReadOnlyMessage(")
+    + sourceSection("async function api(", "function promoteReadPriority("), context);
+  return { context, calls };
+}
+
+const jsonResponse = (value, status = 200, headers = {}) => new Response(JSON.stringify(value), {
+  status, headers: { "Content-Type": "application/json; charset=utf-8", ...headers },
+});
+
+test("单项原生读取返回业务503后，主会话状态读取和单次发送仍能使用同一线路", async () => {
+  const { context, calls } = transportClient(({ path, options }) => {
+    if (path === "/api/read/relatedThreads")
+      return jsonResponse({ ok: false, message: "侧边会话暂不可用" }, 503);
+    if (path === "/api/session") return jsonResponse({ ok: true, serviceConnected: true });
+    return jsonResponse({ requestId: options.headers.get("Idempotency-Key"),
+      state: "completed", result: { ok: true, threadId: "owned" } });
+  });
+  await assert.rejects(context.api("/api/read/relatedThreads", { threadId: "owned" }),
+    error => error.code === 503 && error.message === "侧边会话暂不可用");
+  assert.equal((await context.api("/api/session")).serviceConnected, true);
+  assert.equal((await context.api("/api/action/send", { threadId: "owned", prompt: "测试" }, "only-once")).state,
+    "completed");
+  assert.deepEqual(calls.map(call => call.path), ["/api/read/relatedThreads", "/api/session", "/api/action/send"]);
+});
+
+test("迟到的业务503保持中性，不能清除并发服务状态失败建立的退避", async () => {
+  let replySession, replyFeature;
+  const { context, calls } = transportClient(({ path, options }) => {
+    if (path === "/api/session") return new Promise(resolve => { replySession = resolve; });
+    if (path === "/api/read/relatedThreads") return new Promise(resolve => { replyFeature = resolve; });
+    return jsonResponse({ requestId: options.headers.get("Idempotency-Key"),
+      state: "completed", result: { ok: true } });
+  });
+  const sessionRead = context.api("/api/session").catch(error => error);
+  const featureRead = context.api("/api/read/relatedThreads", { threadId: "owned" }).catch(error => error);
+  replySession(jsonResponse({ ok: false, message: "服务暂不可用" }, 503));
+  assert.equal((await sessionRead).code, 503);
+  await assert.rejects(context.api("/api/action/send", { threadId: "owned", prompt: "测试" }, "before-feature"),
+    error => error.notSubmitted === true);
+  replyFeature(jsonResponse({ ok: false, message: "侧边会话暂不可用" }, 503));
+  assert.equal((await featureRead).code, 503);
+  await assert.rejects(context.api("/api/action/send", { threadId: "owned", prompt: "测试" }, "after-feature"),
+    error => error.notSubmitted === true);
+  assert.deepEqual(calls.map(call => call.path), ["/api/session", "/api/read/relatedThreads"]);
+});
+
+test("网关503、非业务JSON、429及Retry-After仍阻止冷却期内的新请求", async () => {
+  for (const response of [
+    () => new Response("<html>gateway unavailable</html>", { status: 503 }),
+    () => jsonResponse({ message: "unknown gateway" }, 503),
+    () => jsonResponse({ ok: false, message: "限流" }, 429, { "Retry-After": "60" }),
+    () => jsonResponse({ ok: false, message: "稍后重试" }, 503, { "Retry-After": "30" }),
+  ]) {
+    const { context, calls } = transportClient(response);
+    await assert.rejects(context.api("/api/read/relatedThreads", { threadId: "owned" }));
+    await assert.rejects(context.api("/api/action/send", { threadId: "owned", prompt: "测试" }, "only-once"),
+      error => error.notSubmitted === true);
+    assert.equal(calls.length, 1, "传输退避期间不得偷偷发送");
+  }
+});
+
+test("整个服务状态读取失败与破损回包仍按线路失败处理", async () => {
+  for (const response of [
+    () => jsonResponse({ ok: false, message: "服务已停止" }, 503),
+    () => new Response("{broken", { status: 200, headers: { "Content-Type": "application/json" } }),
+  ]) {
+    const { context, calls } = transportClient(response);
+    await assert.rejects(context.api("/api/session"));
+    await assert.rejects(context.api("/api/read/thread", { threadId: "owned" }),
+      error => error.notSubmitted === true);
+    assert.equal(calls.length, 1);
+  }
+});
+
+test("未知写回执仍保持未知并且只派发一次，不因业务错误隔离而重放", async () => {
+  const { context, calls } = transportClient(() =>
+    jsonResponse({ ok: false, message: "结果待确认", outcomeUnknown: true }, 503));
+  await assert.rejects(context.api("/api/action/send", { threadId: "owned", prompt: "测试" }, "only-once"),
+    error => error.code === 503 && error.outcomeUnknown === true);
+  assert.equal(calls.length, 1);
+});
+
+const sidebarPreferenceSource = sourceSection("function restoreSidebarPreferences()", "async function changeSidebar(payload)");
+
+function client(disk, extra = {}) {
+  const context = {
+    session: { device: { id: "device-a", createdAtMs: 1 }, readOnly: false },
+    sidebar: { preferences: { mode: "list" } },
+    sidebarFilters: { mode: null, chats: null, projects: null, pinned: null },
+    sidebarPreferenceScope: null,
+    sidebarPreferenceStore: createSidebarPreferenceStore({ storage: disk }), sharedServer: disk,
+    privateInputScope: value => value?.device
+      ? JSON.stringify([value.device.id, value.device.createdAtMs]) : null,
+    rendered: [], notices: [], bridgeCalls: 0, connected: true,
+    mutate: () => { context.bridgeCalls++; throw new Error("CDP 与 CLI 均不可用"); },
+    notice: message => context.notices.push(message),
+    renderSidebar: () => context.rendered.push(context.sidebarFilters.mode),
+    ...extra,
+  };
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  vm.runInContext(sidebarPreferenceSource, context);
+  return context;
+}
+
+test("侧栏视图通过共享设置保存并刷新恢复，不调用会话引擎", () => {
+  const disk = storage(), current = client(disk);
+  current.changeSidebarView("project");
+  assert.equal(current.sidebarFilters.mode, "project");
+  assert.equal(current.bridgeCalls, 0);
+  const reopened = client(disk);
+  reopened.restoreSidebarPreferences();
+  assert.equal(reopened.sidebarFilters.mode, "project");
+  assert.equal(reopened.bridgeCalls, 0);
+});
+
+test("只读授权不能改写所有客户端共用的侧栏视图", async () => {
+  const current = client(storage());
+  current.session.readOnly = true;
+  await current.changeSidebarView("project");
+  await current.changeSidebarView("list");
+  assert.equal(current.sidebarFilters.mode, null);
+  assert.equal(current.bridgeCalls, 0);
+  assert.equal(current.notices.length, 2);
+});
+
+test("快速切换以最后一次共享选择为准，不再依赖本地存储", () => {
+  const current = client(storage());
+  for (const mode of ["project", "list", "project"]) current.changeSidebarView(mode);
+  current.sidebar.preferences.mode = "list";
+  current.restoreSidebarPreferences();
+  assert.equal(current.sidebarFilters.mode, "project");
+  assert.equal(current.sharedSettingsState.settings.sidebar.mode, "project");
+  assert.equal(current.sidebarPreferenceStore.read('["device-a",1]').mode, undefined);
+  assert.equal(current.bridgeCalls, 0);
+});
+
+test("共享设置保存失败保留已确认值并明确提示，不只在本页生效", async () => {
+  const disk = storage();
+  disk.setItem = () => { throw Object.assign(new Error("quota"), { name: "QuotaExceededError" }); };
+  const current = client(disk, { sharedSaveError: "共享设置保存失败" });
+  await current.changeSidebarView("project");
+  assert.equal(current.sidebarFilters.mode, null);
+  assert.equal(current.notices.length, 1);
+  assert.match(current.notices[0], /共享设置保存失败/);
+  assert.equal(current.bridgeCalls, 0);
+});
+
+test("同一 Harness的不同设备授权共用侧栏偏好", () => {
+  const current = client(storage());
+  current.changeSidebarView("project");
+  current.session = { device: { id: "device-b", createdAtMs: 1 } };
+  current.restoreSidebarPreferences();
+  assert.equal(current.sidebarFilters.mode, "project");
+  current.changeSidebarView("list");
+  current.session = { device: { id: "device-a", createdAtMs: 1 } };
+  current.restoreSidebarPreferences();
+  assert.equal(current.sidebarFilters.mode, "list");
+});
+
+test("最近置顶分组开关在可写时共享，只读与离线不产生本地覆盖", async () => {
+  const disk = storage(), current = client(disk);
+  current.restoreSidebarPreferences();
+  assert.equal(current.sidebarFilters.showPinned, false);
+  await current.setRecentPinnedVisible(true);
+  assert.equal(current.sidebarFilters.showPinned, true);
+  const reopened = client(disk); reopened.restoreSidebarPreferences();
+  assert.equal(reopened.sidebarFilters.showPinned, true);
+  reopened.session = { device: { id: "device-b", createdAtMs: 1 } };
+  reopened.restoreSidebarPreferences();
+  assert.equal(reopened.sidebarFilters.showPinned, true);
+  reopened.session.readOnly = true;
+  await reopened.setRecentPinnedVisible(false);
+  assert.equal(reopened.sidebarFilters.showPinned, true);
+  reopened.session.readOnly = false; reopened.connected = false;
+  await reopened.setRecentPinnedVisible(false);
+  assert.equal(reopened.sidebarFilters.showPinned, true);
+  assert.equal(current.bridgeCalls + reopened.bridgeCalls, 0);
+  assert.equal(current.notices.length, 0);
+});
+
+function recentSidebarHarness({ disk = storage(), showPinned = false } = {}) {
+  let document, context;
+  class Node {
+    constructor(tag, className = "", text = "") {
+      Object.assign(this, { tag, className, ownText: text ?? "", children: [], attributes: new Map(),
+        dataset: {}, style: {}, disabled: false, hidden: false, isConnected: true, scrollTop: 0 });
+      this.classList = {
+        contains: name => this.className.split(/\s+/).includes(name),
+        add: (...names) => { this.className = [...new Set([...this.className.split(/\s+/).filter(Boolean), ...names])].join(" "); },
+      };
+    }
+    get textContent() { return this.ownText + this.children.map(child => child.textContent).join(""); }
+    set textContent(value) { this.ownText = value ?? ""; this.children = []; }
+    append(...children) { for (const child of children) { child.parentElement = this; this.children.push(child); } }
+    prepend(...children) { for (const child of children) child.parentElement = this; this.children.unshift(...children); }
+    replaceChildren(...children) {
+      for (const child of this.children) child.parentElement = null;
+      this.children = []; this.ownText = ""; this.append(...children);
+    }
+    setAttribute(name, value) { this.attributes.set(name, String(value)); }
+    getAttribute(name) { return this.attributes.get(name) ?? null; }
+    removeAttribute(name) { this.attributes.delete(name); }
+    contains(node) { return this === node || this.children.some(child => child.contains(node)); }
+    matches(selector) {
+      if (selector === "*") return true;
+      if (selector.startsWith(".")) return selector.slice(1).split(".").every(name => this.classList.contains(name));
+      if (selector.startsWith("#")) return this.id === selector.slice(1);
+      return this.tag === selector;
+    }
+    closest(selector) { return this.matches(selector) ? this : this.parentElement?.closest(selector) || null; }
+    querySelectorAll(selector) {
+      const result = [];
+      for (const child of this.children) {
+        if (selector.split(",").some(part => child.matches(part.trim()))) result.push(child);
+        result.push(...child.querySelectorAll(selector));
+      }
+      return result;
+    }
+    querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+    focus() { document.activeElement = this; }
+    getBoundingClientRect() { return { left: 240, top: 80, right: 268, bottom: 108, width: 28, height: 28 }; }
+  }
+  const element = (tag, className, text) => new Node(tag, className, text);
+  const root = element("div", "sidebar-content"); root.id = "sidebar-content";
+  const controls = new Map([["#sidebar-content", root], ["#sidebar-view-toggle", element("button")],
+    ["#project-select", element("select")]]);
+  document = { body: element("body"), getElementById: id =>
+    [document.body, ...document.body.querySelectorAll("*")].find(node => node.id === id) || null };
+  document.body.append(root); document.activeElement = document.body;
+  const now = Date.now();
+  const item = (id, title, extra = {}) => ({
+    id, title, backend: "codex", instanceId: "codex:local", cwd: "/work/project",
+    createdAt: now - 60_000, updatedAt: now - 1_000, ...extra
+  });
+  const running = item("running", "执行中的会话", { priority: { attentionState: "active", active: true } });
+  const pinned = item("pinned", "置顶文件任务", { pinned: true });
+  const unread = item("pinned-unread", "置顶未读会话", {
+    pinned: true, hasUnreadTurn: true, priority: { attentionState: "unread", active: false } });
+  const regular = item("regular", "普通会话");
+  const selected = [], renders = [];
+  context = vm.createContext({
+    document, element, Date, Set, Map, selectedId: "running", thread: { id: "running" },
+    session: { device: { id: "device-a", createdAtMs: 1 }, readOnly: false },
+    sidebar: { recent: [running, pinned, unread, regular], pinnedThreads: [pinned, unread], projects: [],
+      preferences: { mode: "list", chats: "updated_at", pinned: "manual", projects: "manual" } },
+    sidebarFilters: { mode: null, chats: null, pinned: null, projects: null, showPinned },
+    sidebarPreferenceScope: '["device-a",1]',
+    sidebarPreferenceStore: createSidebarPreferenceStore({ storage: disk }), connected: true,
+    privateInputScope: value => value?.device ? JSON.stringify([value.device.id, value.device.createdAtMs]) : null,
+    $: selector => controls.get(selector),
+    icon: name => { const node = element("span", "ui-icon"); node.dataset.icon = name; return node; },
+    button: (text, label, action, className) => {
+      const node = element("button", className, text);
+      node.title = label; node.setAttribute("aria-label", label); node.onclick = action; return node;
+    },
+    renderSessionFilter() {}, syncSideThreadUnread() {}, syncClientUnreadBadge() {}, filterDeletedSidebar() {},
+    filterSideThreadSidebar() {}, setSelectOptions() {}, changeCreationProject() {}, newChatProjectOptions: () => [],
+    restoreSidebarPreferences() {}, appearance: { projectThreadLimit: 5 }, search: "", enabled: null,
+    sessionTypeVisible: item => !context.enabled || context.enabled.has(item.instanceId),
+    projectTypeVisible: () => true, collapsed: new Set(), collapsedSidebarSections: new Set(),
+    projectVisibleThreadCounts: new Map(), recentLimit: 40, recentPriorityIds: null,
+    threadDeletions: new Map(),
+    threadDeletionKey: id => JSON.stringify(["device-a", id]),
+    threadDeletionChecks: new Set(), threadDeletionConflict: () => false,
+    independentThreadWindowAvailable: () => false, threadOpenInMenu: () => [],
+    threadMenuOptions: () => [], bindSidebarRowMenu() {},
+    rowMenu: (id, label, options) => Object.assign(element("button", "row-menu-button"), { id, menuOptions: options }),
+    recentPriorityKnownIds: new Set(), recentPriorityOpenedAt: 0, recentPrioritySelectionSuppressions: new Set(),
+    activePopup: null, fitPopup() {}, renderPopup: () => renders.push(context.activePopup),
+    closePopup: () => { context.activePopup = null; },
+    togglePopup: trigger => { context.activePopup = { trigger, node: { id: "active-popup" } }; },
+    openPopup: trigger => { context.activePopup = { trigger, node: { id: "active-popup" } }; },
+    claudeThreadId: id => id.startsWith("claude-"), threadReadOnly: () => true,
+    selectThread: async id => { selected.push(id); context.selectedId = id; context.thread = { id }; },
+    notice() {}, markVisibleThreadRead() {},
+  });
+  vm.runInContext([
+    sidebarPreferenceSource,
+    sourceSection("function sidebarThreadActive(", "function clientUnreadThreadCount("),
+    sourceSection("function sidebarTimestamp(", "function markSidebarThreadReadLocally("),
+    sourceSection("function sidebarAttentionState("),
+    sourceSection("function captureSidebarPopup(", "function renderSidebar("),
+    sourceSection("function renderSidebar("),
+  ].join("\n"), context);
+  const sections = () => root.children.filter(node => node.classList.contains("section-label"))
+    .map(heading => ({ heading, label: heading.querySelector(".section-label-text").textContent,
+      body: document.getElementById(heading.querySelector(".section-toggle").getAttribute("aria-controls")) }));
+  const section = label => sections().find(section => section.label === label);
+  const ids = section => section?.body.querySelectorAll(".thread-row").map(node => node.dataset.threadId) || [];
+  const node = id => document.getElementById(id);
+  context.renderSidebar();
+  return { context, root, sections, section, ids, node, selected, renders, running, pinned, unread, regular, disk };
+}
+
+test("最近会话更名优先事项，双滑杆固定为最后一个操作，清除已读位于其左侧", async () => {
+  const h = recentSidebarHarness();
+  assert.equal(h.sections()[0].label, "优先事项");
+  assert.equal(h.sections().some(section => section.label === "优先级"), false);
+  assert.equal(h.node("recent-priority-options").children[0].dataset.icon, "slidersHorizontal");
+  h.context.sidebar.recent[0].priority = { attentionState: "idle", active: false };
+  h.context.renderSidebar();
+  assert.deepEqual(h.section("优先事项").heading.querySelector(".priority-section-actions").children.map(node => node.id),
+    ["clear-recent-priority", "recent-priority-options"]);
+  h.node("clear-recent-priority").onclick();
+  assert.equal(h.node("clear-recent-priority"), null);
+  assert.equal(h.section("优先事项").heading.querySelector(".priority-section-actions").children.at(-1).id,
+    "recent-priority-options");
+  assert.equal(h.context.selectedId, "running");
+  assert.deepEqual(h.selected, []);
+  const css = await readFile(new URL("../assets/harness/style.css", import.meta.url), "utf8");
+  assert.match(css, /\.priority-section-actions\{[^}]*flex:0 0 auto[^}]*margin-left:auto/);
+});
+
+test("置顶选项开启后在优先事项下方列出会话，日期分组去重且刷新保持同一菜单", () => {
+  const h = recentSidebarHarness();
+  assert.equal(h.section("置顶"), undefined);
+  h.node("recent-priority-options").onclick();
+  const popup = h.context.activePopup;
+  h.node("recent-priority-options").menuOptions[0].action();
+  assert.deepEqual(h.sections().slice(0, 2).map(section => section.label), ["优先事项", "置顶"]);
+  assert.deepEqual(h.ids(h.section("置顶")), ["pinned", "pinned-unread"]);
+  assert.ok(h.ids(h.section("优先事项")).includes("pinned-unread"), "保留未读置顶会话的原有优先显示");
+  assert.equal(h.ids(h.section("今天")).includes("pinned"), false);
+  assert.equal(h.node("recent-priority-options").menuOptions[0].selected, true);
+  assert.equal(h.context.activePopup, popup);
+  assert.equal(popup.trigger, h.node("recent-priority-options"));
+  assert.equal(h.renders.length, 1);
+  assert.equal(h.context.sidebarFilters.showPinned, true);
+  h.node("recent-priority-options").menuOptions[0].action();
+  assert.equal(h.section("置顶"), undefined);
+  assert.ok(h.ids(h.section("今天")).includes("pinned"));
+  assert.equal(h.context.sidebar.pinnedThreads.length, 2, "显隐不修改真实置顶会话");
+  assert.deepEqual(h.selected, []);
+});
+
+test("最近置顶分组遵循实例与搜索筛选，取消置顶后同步移回日期分组", () => {
+  const h = recentSidebarHarness({ showPinned: true });
+  h.unread.instanceId = "claude:wsl:test"; h.unread.backend = "claude";
+  h.context.enabled = new Set(["codex:local"]);
+  h.context.renderSidebar();
+  assert.deepEqual(h.ids(h.section("置顶")), ["pinned"]);
+  h.context.search = "普通";
+  h.context.renderSidebar();
+  assert.deepEqual(h.ids(h.section("置顶")), []);
+  assert.ok(h.ids(h.section("今天")).includes("regular"));
+  h.context.search = "";
+  h.context.sidebar.pinnedThreads = [h.unread]; h.pinned.pinned = false;
+  h.context.renderSidebar();
+  assert.deepEqual(h.ids(h.section("置顶")), []);
+  assert.ok(h.ids(h.section("今天")).includes("pinned"));
+});
+
+test("空优先事项仍可开启置顶分组，折叠和切换项目视图不遗失显示偏好", () => {
+  const h = recentSidebarHarness();
+  h.context.sidebar.recent = [h.pinned, h.regular]; h.context.sidebar.pinnedThreads = [h.pinned];
+  h.context.recentPriorityIds = null;
+  h.context.renderSidebar();
+  assert.equal(h.ids(h.section("优先事项")).length, 0);
+  h.node("recent-priority-options").menuOptions[0].action();
+  h.section("置顶").heading.querySelector(".section-toggle").onclick();
+  assert.equal(h.section("置顶").body.hidden, true);
+  h.context.changeSidebarView("project");
+  assert.equal(h.node("recent-priority-options"), null);
+  assert.equal(h.context.sidebarFilters.showPinned, true);
+  h.context.changeSidebarView("list");
+  assert.equal(h.section("置顶").body.hidden, true, "返回最近视图仍保留原折叠");
+  const stale = h.node("recent-priority-options").menuOptions[0];
+  h.context.session.device.id = "device-b";
+  h.context.renderSidebar();
+  stale.action();
+  assert.equal(h.context.sidebarFilters.showPinned, true, "旧菜单不能改写同一服务已经共享的偏好");
+});
+
+// 在单个模块内截取源码片段；省略 end 表示截取到该模块末尾。跨模块片段须分段截取。
+function sourceSection(start, end) {
+  return remoteSource.section(start, end);
+}
+
+function messageImageRefreshHarness() {
+  const oldUrl = `/api/images/${"a".repeat(64)}`, newUrl = `/api/images/${"b".repeat(64)}`;
+  const source = "C:/workspace/images/default.png", otherSource = "C:/workspace/images/details.png";
+  const item = { id: "old-answer", type: "agentMessage", text: "已确认的完整正文",
+    remoteItemCompleted: true, remoteImages: [{ source, url: oldUrl }, { source: otherSource, url: oldUrl }] };
+  const turn = { id: "old-turn", status: "completed", items: [item], itemsNextCursor: "retained-cursor" };
+  const calls = [], h = { oldUrl, newUrl, source, otherSource, item, turn, calls, renders: 0, remembered: 0 };
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    session: { device: { id: "image-device", createdAtMs: 1 } }, selectedId: "thread-images",
+    selectionVersion: 3, pageLeaving: false, AbortController,
+    turns: new Map([[turn.id, turn]]), renderedItems: new Map(),
+    itemVersions: new Map(), turnVersions: new Map(), turnFieldVersions: new Map(), partialItems: new Set(),
+    enrichTurnTranscriptEvents: value => value,
+    renderMessages: () => ++h.renders, rememberTranscript: () => ++h.remembered,
+    api: async (path, payload, id, signal) => {
+      calls.push({ path, payload, signal });
+      return await h.respond(payload);
+    },
+  });
+  vm.runInContext([
+    sourceSection("function privateInputScope(", "function validRelatedThreadId("),
+    (sourceSection("function completedIt") + "\n" + sourceSection("function mergeRe", "function mer")),
+    (sourceSection("function messageImageOwn", "function sch") + "\n" + sourceSection("async function refreshMe", "function bin")),
+  ].join("\n"), context);
+  h.context = context;
+  h.owner = (imageSource = source) => ({ threadId: context.selectedId, turnId: turn.id, itemId: item.id,
+    source: imageSource, scope: context.privateInputScope(context.session), selection: context.selectionVersion });
+  h.page = (images = [{ source, url: newUrl }, { source: otherSource, url: newUrl }]) => ({
+    ok: true, scope: "items", threadId: "thread-images", turnId: turn.id,
+    data: [{ id: item.id, type: item.type, text: "分页中的旧正文不得改写现有内容", remoteImages: images }],
+    itemsNextCursor: null
+  });
+  h.respond = async () => h.page();
+  return h;
+}
+
+test("完成正文继续保护内容，新历史可恢复同源图片且旧缓存和迟到历史不能退回媒体 URL", () => {
+  const h = messageImageRefreshHarness(), c = h.context;
+  c.reconcileConfirmedInputOrder = () => false;
+  vm.runInContext((sourceSection("function mergeLi") + "\n" + sourceSection("function mergeRe") + "\n" + sourceSection("function mergeHi", "async functi")), c);
+  const history = { id: h.turn.id, status: "completed", items: [{
+    id: h.item.id, type: h.item.type, text: "较早的不完整正文", completed: true,
+    remoteImages: [{ source: h.source, url: h.newUrl }]
+  }] };
+  const restored = c.mergeHistoryTurn(history, 0, { mediaReadVersion: 2 });
+  assert.equal(restored.items[0].text, h.item.text);
+  assert.equal(restored.items[0].remoteItemCompleted, true);
+  assert.equal(restored.items[0].remoteImages[0].url, h.newUrl);
+  c.turns.set(h.turn.id, restored);
+  const stale = { ...history, items: [{ ...history.items[0], text: h.item.text,
+    remoteImages: [{ source: h.source, url: h.oldUrl }] }] };
+  for (const options of [{ mediaReadVersion: 1 }, { cached: true }, {}]) {
+    const current = c.turns.get(h.turn.id);
+    c.turns.set(h.turn.id, { ...current, items: current.items.map(item => ({ ...item })) });
+    const next = c.mergeHistoryTurn(stale, 0, options);
+    assert.equal(next.items[0].remoteImages[0].url, h.newUrl);
+    c.turns.set(h.turn.id, next);
+  }
+  const event = c.mergeItemProjection(c.turns.get(h.turn.id).items[0], stale.items[0]);
+  assert.equal(event.remoteImages[0].url, h.newUrl, "迟到单条投影同样不能撤回已刷新图片");
+});
+
+test("旧轮图片重试按真实轮次和消息重读，同轮多图与重复进入复用读取且只更新媒体映射", async () => {
+  const h = messageImageRefreshHarness(), c = h.context;
+  let respond;
+  h.respond = () => new Promise(resolve => { respond = resolve; });
+  const message = { dataset: { key: `${h.turn.id}:${h.item.id}` },
+    closest: () => ({ dataset: { turnId: h.turn.id } }) };
+  c.renderedItems.set(message.dataset.key, { item: h.item });
+  const owner = c.messageImageOwner({ closest: () => message }, h.oldUrl);
+  assert.equal(owner.itemId, h.item.id);
+  const one = c.refreshMessageImageAsset(owner), repeated = c.refreshMessageImageAsset(owner),
+    two = c.refreshMessageImageAsset(h.owner(h.otherSource));
+  await Promise.resolve();
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls[0].path, "/api/read/history");
+  assert.equal(h.calls[0].payload.threadId, "thread-images");
+  assert.equal(h.calls[0].payload.turnId, "old-turn");
+  assert.equal(h.calls[0].payload.itemCursor, null);
+  assert.equal(Object.hasOwn(h.calls[0].payload, "source"), false, "不能发送任意文件路径");
+  respond(h.page());
+  const result = await Promise.all([one, repeated, two]);
+  assert.ok(result.every(asset => asset.url === h.newUrl));
+  const current = c.turns.get(h.turn.id);
+  assert.equal(current.items[0].text, h.item.text);
+  assert.equal(current.items[0].remoteItemCompleted, true);
+  assert.equal(current.status, h.turn.status);
+  assert.equal(current.itemsNextCursor, h.turn.itemsNextCursor);
+  assert.equal(current.items.length, 1);
+  assert.equal(h.renders, 1);
+  assert.equal(h.remembered, 1);
+  assert.equal(c.messageImageRefreshes.size, 0);
+});
+
+test("图片重试沿本轮分页找到原图，重复游标和没有新增条目时停止并保留已有内容", async () => {
+  const h = messageImageRefreshHarness();
+  h.respond = async payload => payload.itemCursor == null
+    ? { ...h.page([]), data: [{ id: "later-item" }], itemsNextCursor: "older-images" } : h.page();
+  assert.equal((await h.context.refreshMessageImageAsset(h.owner())).url, h.newUrl);
+  assert.deepEqual(h.calls.map(call => call.payload.itemCursor), [null, "older-images"]);
+  for (const mode of ["repeated-cursor", "repeated-items", "page-limit"]) {
+    const missing = messageImageRefreshHarness(), before = JSON.stringify([...missing.context.turns]);
+    missing.respond = async () => ({ ...missing.page([]),
+      data: [{ id: mode === "repeated-items" ? "same-item" : `unrelated-${missing.calls.length}` }],
+      itemsNextCursor: mode === "repeated-cursor" ? "same-cursor" : `cursor-${missing.calls.length}` });
+    assert.equal(await missing.context.refreshMessageImageAsset(missing.owner()), null);
+    assert.equal(missing.calls.length, mode === "page-limit" ? 12 : 2);
+    assert.equal(JSON.stringify([...missing.context.turns]), before);
+    assert.equal(missing.renders, 0);
+    assert.equal(missing.remembered, 0);
+  }
+});
+
+test("图片重读期间切换会话、重新进入或授权变化后丢弃迟到结果", async () => {
+  for (const change of [
+    c => { c.selectedId = "another-thread"; },
+    c => { ++c.selectionVersion; },
+    c => { c.session = { device: { id: "image-device", createdAtMs: 2 } }; },
+    c => { c.session = null; },
+  ]) {
+    const h = messageImageRefreshHarness(), c = h.context;
+    let respond;
+    h.respond = () => new Promise(resolve => { respond = resolve; });
+    const before = JSON.stringify([...c.turns]), pending = c.refreshMessageImageAsset(h.owner());
+    await Promise.resolve();
+    change(c); respond(h.page());
+    assert.equal(await pending, null);
+    assert.equal(JSON.stringify([...c.turns]), before);
+    assert.equal(h.renders, 0);
+    assert.equal(h.remembered, 0);
+  }
+});
+
+function independentPromptOptimizationHarness(backend = "claude") {
+  const control = { hidden: true, dataset: {}, attributes: {},
+    setAttribute(name, value) { this.attributes[name] = value; } };
+  const prompt = { value: "请整理这段需求", disabled: false, focus() {} }, add = {};
+  const calls = [], notices = [], attachments = [{ id: "fixture-image", src: "data:image/png;base64,AQID" }];
+  const h = { control, prompt, add, calls, notices, attachments,
+    respond: async () => ({ state: "completed", result: { state: "completed", text: "优化后的需求", totalTokens: 12 } }) };
+  let sequence = 0;
+  const context = {
+    backend, scope: `new:project:${backend}:fixture-a`, readOnly: false,
+    session: { device: { id: "device-a" }, serviceConnected: false,
+      capabilities: { promptOptimization: true } },
+    connected: false, busy: false, stopping: false, pending: null, selectionVersion: 1,
+    editingQueuedMessage: null, selectedSkills: [{ name: "fixture-skill", path: "/fixtures/skill" }],
+    promptOptimizations: new Map(),
+    turns: new Map([["turn", { items: [
+      { type: "userMessage", text: "先前需求" }, { type: "agentMessage", text: "已有解释" },
+    ] }]]),
+    $: selector => selector === "#prompt" ? prompt : selector === "#composer-add" ? add : control,
+    draftKey: () => context.scope, threadReadOnly: () => context.readOnly,
+    isClaude: () => context.backend === "claude",
+    currentThreadDisplay: () => ({ tokenUsage: null }), contextUsage: () => null,
+    compactUsageDescription: () => "", compactCommandAvailable: () => false, compactContext() {},
+    claudeCommandSupported: () => false,
+    goalComposerReason: () => "当前原生会话不提供目标", selectGoalCommand() {},
+    deleting: false, composerCanAddImages: () => true, chooseComposerImages() {},
+    activePopup: null, renderPopup() {}, closePopup() {}, closeComposerMenus() {},
+    currentModelId: () => context.backend === "claude" ? "claude-opus-5-5" : "gpt-fixture",
+    randomId: () => `optimize-${++sequence}`, messageCopyText: item => item.text,
+    writePromptContent: (node, text) => { node.value = text; }, setPromptSelection() {}, rememberDraft() {},
+    notice: (message, error = false) => notices.push({ message, error }), tokenCount: String,
+    api: async (path, payload, id) => {
+      calls.push({ path, payload: JSON.parse(JSON.stringify(payload)), id });
+      if (path === "/api/action/cancelPromptOptimize") return { state: "completed", result: { state: "cancelled" } };
+      assert.equal(path, "/api/action/optimizePrompt", "独立优化不能请求会话、模型目录或原生 CLI");
+      return h.respond();
+    },
+  };
+  nodeVm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  nodeVm.runInContext(sourceSection("function promptOptimizationScope()")
+    + `\nfunction renderComposerTools(){${sourceSection('  const add = $("#composer-add");\n  const usage = contextUsage(',
+      "  const queuedEditAction = queuedEditSubmittingAction();")}}`, context);
+  context.updateComposer = () => { context.renderComposerTools(); context.updatePromptOptimization(); };
+  context.updateComposer();
+  h.context = context;
+  return h;
+}
+
+test("输入区菜单严格按文件和文件夹、图片、目标、压缩排序，旧客户端和浏览器隐藏本机入口", async () => {
+  const h = independentPromptOptimizationHarness("codex"), c = h.context, selected = [];
+  c.session.capabilities.localFileInput = true;
+  c.composerLocalInputsSupported = () => true;
+  c.composerCanAddLocalInputs = () => true;
+  c.chooseComposerLocalInputs = folders => selected.push(folders);
+  c.updateComposer();
+  assert.deepEqual(Array.from(h.add.menuOptions, option => option.label), ["文件和文件夹", "图片", "目标", "压缩"]);
+  assert.equal(h.add.menuOptions[0].disabled, false);
+  h.add.menuOptions[0].submenu[0].action();
+  h.add.menuOptions[0].submenu[1].action();
+  assert.deepEqual(selected, [false, true]);
+  c.session.capabilities.localFileInput = false;
+  c.updateComposer();
+  assert.equal(h.add.menuOptions[0].disabled, true, "旧服务不能把附件静默丢弃");
+  c.composerLocalInputsSupported = () => false;
+  c.updateComposer();
+  assert.deepEqual(Array.from(h.add.menuOptions, option => option.label), ["图片", "目标", "压缩"]);
+});
+
+test("Claude 与 Codex 均显示独立提示词优化，不依赖原生连接并保留恢复、附件和写入限制", async () => {
+  for (const backend of ["claude", "codex"]) {
+    const h = independentPromptOptimizationHarness(backend), { context, control, prompt } = h;
+    const skills = JSON.stringify(context.selectedSkills), images = JSON.stringify(h.attachments);
+    assert.equal(control.hidden, false);
+    assert.equal(control.disabled, false, "未连接原生服务也可以使用独立优化");
+    assert.deepEqual(Array.from(h.add.menuOptions, option => option.value || option.label),
+      backend === "claude" ? ["images"] : ["images", "goal", "compact"]);
+    await context.activatePromptOptimization();
+    assert.equal(prompt.value, "优化后的需求");
+    assert.equal(control.dataset.state, "optimized");
+    assert.equal(h.calls.length, 1);
+    assert.deepEqual(Object.keys(h.calls[0].payload).sort(), ["input", "model", "recentContext"]);
+    assert.equal(h.calls[0].payload.model, backend === "claude" ? "claude-opus-5-5" : "gpt-fixture");
+    assert.deepEqual(h.calls[0].payload.recentContext, { user: "先前需求", assistant: "已有解释" });
+    await context.activatePromptOptimization();
+    assert.equal(prompt.value, "请整理这段需求");
+    assert.equal(h.calls.length, 1, "恢复原文不能再次调用优化服务");
+    assert.equal(JSON.stringify(context.selectedSkills), skills);
+    assert.equal(JSON.stringify(h.attachments), images);
+    for (const lock of ["readOnly", "input", "busy", "stopping", "pending", "capability"]) {
+      const blocked = independentPromptOptimizationHarness(backend);
+      if (lock === "input") blocked.prompt.disabled = true;
+      else if (lock === "capability") blocked.context.session.capabilities.promptOptimization = false;
+      else blocked.context[lock] = lock === "pending" ? {} : true;
+      blocked.context.updateComposer();
+      assert.equal(blocked.control.hidden, false);
+      assert.equal(blocked.control.disabled, true, lock);
+      await blocked.context.activatePromptOptimization();
+      assert.equal(blocked.calls.length, 0, lock);
+    }
+  }
+});
+
+test("Claude 独立优化取消、继续编辑或切换实例与授权后，迟到结果不能覆盖草稿", async () => {
+  for (const change of ["cancel", "edit", "scope", "device", "skills"]) {
+    const h = independentPromptOptimizationHarness(), { context, prompt } = h, response = deferred();
+    h.respond = () => response.promise;
+    const running = context.activatePromptOptimization();
+    assert.equal(h.control.dataset.state, "loading");
+    if (change === "cancel") await context.activatePromptOptimization();
+    if (change === "edit") prompt.value = "用户继续编辑";
+    if (change === "scope") {
+      context.scope = "new:project:claude:fixture-b"; context.selectionVersion++;
+      prompt.value = "另一个实例的草稿";
+    }
+    if (change === "device") { context.session.device = { id: "device-b" }; prompt.value = "新授权的草稿"; }
+    if (change === "skills") context.selectedSkills.push({ name: "new-skill", path: "/fixtures/new-skill" });
+    context.updateComposer();
+    const currentText = prompt.value, currentImages = JSON.stringify(h.attachments);
+    response.resolve({ state: "completed", result: { state: "completed", text: "已过期的优化结果" } });
+    await running;
+    assert.equal(prompt.value, currentText, change);
+    assert.equal(JSON.stringify(h.attachments), currentImages);
+    assert.equal(h.calls.filter(call => call.path === "/api/action/optimizePrompt").length, 1);
+    assert.equal(h.calls.filter(call => call.path === "/api/action/cancelPromptOptimize").length,
+      change === "device" ? 0 : 1, "新授权不能取消旧设备的请求");
+  }
+  const failed = independentPromptOptimizationHarness();
+  failed.respond = async () => ({ state: "completed", result: { state: "failed", message: "优化配置不可用" } });
+  await failed.context.activatePromptOptimization();
+  assert.equal(failed.prompt.value, "请整理这段需求");
+  assert.equal(failed.notices.at(-1).error, true);
+  assert.equal(failed.control.hidden, false);
+  assert.equal(failed.control.disabled, false);
+});
+
+function mermaidRootsHarness() {
+  const observers = [], rendered = [];
+  class Observer {
+    constructor(callback, options) {
+      this.callback = callback; this.options = options; this.blocks = new Set(); this.disconnected = false;
+      observers.push(this);
+    }
+    observe(block) { this.blocks.add(block); }
+    unobserve(block) { this.blocks.delete(block); }
+    disconnect() { this.disconnected = true; this.blocks.clear(); }
+  }
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    IntersectionObserver: Observer, document: { documentElement: { dataset: { theme: "light" } } },
+    renderMermaidBlock: (block, callback) => { rendered.push(block); callback?.(); },
+  });
+  vm.runInContext(markdownRendererSource.slice(markdownRendererSource.indexOf("  const diagramRoots ="),
+    markdownRendererSource.indexOf("  function renderMermaidBlock(")), context);
+  const root = name => {
+    const block = { name, isConnected: true, querySelector: () => ({ textContent: "flowchart TD; A --> B" }) };
+    return { isConnected: true, blocks: [block], querySelectorAll() { return this.blocks; },
+      contains(value) { return this.blocks.includes(value); } };
+  };
+  return { context, observers, rendered, root };
+}
+
+test("消息与文件分别观察 Mermaid，打开文件不会取消消息里的离屏图表", () => {
+  const h = mermaidRootsHarness(), messages = h.root("message"), files = h.root("file");
+  h.context.renderMermaidBlocks(messages);
+  h.context.renderMermaidBlocks(files);
+  assert.equal(h.observers.length, 2);
+  assert.equal(h.observers[0].disconnected, false);
+  assert.equal(h.observers[0].options.root, messages);
+  assert.equal(h.observers[1].options.root, files);
+  for (const observer of h.observers)
+    observer.callback([...observer.blocks].map(target => ({ target, isIntersecting: true })));
+  assert.deepEqual(h.rendered.map(block => block.name), ["message", "file"]);
+  h.context.renderMermaidBlocks(messages);
+  assert.equal(h.observers.length, 2, "重新扫描复用当前容器的观察器");
+});
+
+test("文件关闭、容器移除或主题更新后，旧 Mermaid 任务不能写回新内容", () => {
+  const h = mermaidRootsHarness(), messages = h.root("message"), files = h.root("file");
+  h.context.renderMermaidBlocks(messages); h.context.renderMermaidBlocks(files);
+  const message = messages.blocks[0], file = files.blocks[0];
+  message.mermaidKey = "message-key"; file.mermaidKey = "file-key";
+  h.context.releaseMermaidBlocks(files);
+  assert.equal(h.observers[1].disconnected, true);
+  assert.equal(h.context.currentDiagramBlock(file, "file-key"), false);
+  assert.equal(h.context.currentDiagramBlock(message, "message-key"), true);
+  message.mermaidKey = "new-theme";
+  assert.equal(h.context.currentDiagramBlock(message, "old-theme"), false);
+  assert.equal(message.mermaidKey, "new-theme", "旧任务不能清除新主题标识");
+  h.context.renderMermaidBlocks(files);
+  files.isConnected = false;
+  h.context.renderMermaidBlocks(messages);
+  assert.equal(h.observers[2].disconnected, true);
+});
+
+test("文件图表只在当前 Markdown 预览扫描，并使用文件自己的布局事务", () => {
+  const calls = [], body = {};
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    disposed: false, route: { kind: "file" }, contentResponse: { kind: "text" }, sourceMode: false, body,
+    renderMermaidBlocks: (root, _onRender, withLayout) => { calls.push(root); withLayout(() => calls.push("change")); },
+    withStableMessageLayout: (root, change) => { assert.equal(root, body); calls.push("layout"); change(); },
+  });
+  const source = awaitSource => awaitSource.slice(awaitSource.indexOf("  function refreshFileDiagrams()"),
+    awaitSource.indexOf("  const diagramThemeObserver ="));
+  vm.runInContext(source(sessionFiles), context);
+  context.refreshFileDiagrams();
+  assert.deepEqual(calls, [body, "layout", "change"]);
+  for (const change of [
+    () => { context.sourceMode = true; },
+    () => { context.sourceMode = false; context.route = { kind: "list" }; },
+    () => { context.route = { kind: "file" }; context.disposed = true; },
+  ]) { change(); context.refreshFileDiagrams(); }
+  assert.equal(calls.length, 3, "源码、目录和已销毁页面不继续渲染");
+});
+
+test("首次目录尚未返回时可以搜索文件，不把两侧空 root 当成缓存命中", async () => {
+  for (const listResponse of [null, undefined]) {
+    const results = [{ name: "diagram.md", path: "docs/diagram.md", kind: "file" }];
+    const reads = [];
+    const context = vm.createContext({ nativeConnectionVersion: 1,
+      responses: new Map(), listResponse, searchMatches: null, searchEpoch: 0, searchController: null,
+      route: { kind: "list" }, AbortController, listStatus: {},
+      listing: { location: { set() {} } }, renderDirectory() {}, message() {},
+      read: async (...input) => { reads.push(input); return { root: "/project", files: results, truncated: false }; },
+    });
+    vm.runInContext(sessionFiles.slice(sessionFiles.indexOf("  async function searchProject("),
+      sessionFiles.indexOf("  async function openFile(")), context);
+    await context.searchProject("diagram.md");
+    assert.equal(reads.length, 1);
+    assert.equal(reads[0][3], "diagram.md");
+    assert.equal(context.searchMatches, results);
+  }
+});
+
+function deferred() {
+  let resolve, reject;
+  const promise = new Promise((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
+}
+function installSentMessageDisplayHarness(context) {
+  context.restoreUnfinishedQueuedMessageEdit ??= () => false;
+  context.sentMessageDisplays ??= new Map();
+  context.retiredSendPayloads ??= new WeakSet();
+  context.turns ??= new Map();
+  vm.runInContext([
+    sourceSection("function rememberSendDisplay("),
+    (sourceSection("function queueMe", "function queueMe") + "\n" + sourceSection("function reconcileQu", "function app")),
+  ].join("\n"), context);
+}
+test("显式历史回退后迟到成功回执不能复活旧输入，新消息仍可正常确认", () => {
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    session: { device: { id: "device" } }, selectedId: "main",
+    privateInputScope: () => "scope",
+  });
+  installSentMessageDisplayHarness(context);
+  const old = { threadId: "main", clientUserMessageId: "old-client", prompt: "旧问题" };
+  const result = { ok: true, threadId: "main", clientUserMessageId: "old-client", deliveryState: "accepted" };
+  assert.equal(context.confirmSendDisplay(old, result), true);
+  context.clearSentMessageDisplays("main", { retire: true });
+  assert.equal(context.confirmSendDisplay(old, result), false);
+  assert.equal(context.sentMessageDisplays.size, 0);
+  const next = { threadId: "main", clientUserMessageId: "new-client", prompt: "新问题" };
+  const nextResult = { ...result, clientUserMessageId: "new-client" };
+  assert.equal(context.confirmSendDisplay(next, nextResult), true);
+  context.clearSentMessageDisplays("main");
+  assert.equal(context.confirmSendDisplay(next, nextResult), true, "普通展示缓存清理不撤销有效发送");
+});
+function queueReloadHarness() {
+  const timers = new Map(), threadReads = [], historyReads = [], notices = [];
+  let timerId = 0;
+  const nodes = new Map([
+    ["#model-settings", { hidden: true }], ["#thread-title", {}], ["#thread-path", {}],
+  ]);
+  const context = {
+    AbortController, performance, pageLeaving: false, document: { hidden: false },
+    selectedId: "main", selectionVersion: 1, foregroundReadGeneration: 0,
+    thread: { id: "main", queuedMessages: [{ id: "queued-a", text: "引导消息" }] },
+    threadRequest: null, threadReadVersion: 0, threadReadFailed: false,
+    tokenUsageVersion: 0, questionVersion: 0, statusVersion: 0, goalVersion: 0, compactionVersion: 0, messageVersion: 0,
+    queueVersion: 0, queueSnapshotVersion: null, retiredQueueEpochs: new Set(),
+    notifiedQueue: null, notifiedQueueEdits: null, pendingSteer: null,
+    connected: true, queuedActionBusy: new Set(), pending: null, busy: false, stopping: false,
+    session: { device: { id: "device-a", createdAtMs: 1 } }, recoveryGeneration: 0,
+    privateInputScope: value => JSON.stringify([value?.device?.id, value?.device?.createdAtMs]),
+    threadDeleted: () => false, threadReadOnly: () => false, compactionLocked: () => false,
+    isMissingThreadError: () => false,
+    blockingRequestState: () => ({ generation: 0 }),
+    queueMessageText: message => message?.text || "", $: selector => nodes.get(selector),
+    setTimeout(callback, delay) { const id = ++timerId; timers.set(id, { callback, delay }); return id; },
+    clearTimeout(id) { timers.delete(id); }, refreshTimer: null,
+    notice: message => notices.push(message),
+    recordDiagnostic() {}, renderMessages() {}, renderQueueArea() {},
+    confirmedSendDisplayFor: () => null, reconcileSentMessageDisplays: () => false,
+    rememberThreadDisplay() {}, applyRelatedThreadMetadata() {}, mergeBlockingRequestsRead() {},
+    replaceTranscriptEvents() {}, refreshTranscriptEvents() {}, syncEditableMessageMetadata() {},
+    reconcileCompaction() {}, syncThreadHash() {}, updateComposer() {}, renderApprovals() {},
+    loadHistory: async () => { historyReads.push(context.selectedId); },
+    api: async (path, _payload, _requestId, signal) => {
+      assert.equal(path, "/api/read/thread");
+      const read = { ...deferred(), signal }; threadReads.push(read); return read.promise;
+    },
+    mutate: async (action, payload, options) => {
+      assert.equal(action, "steerQueued");
+      assert.equal(payload.threadId, "main");
+      assert.equal(payload.messageId, "queued-a");
+      assert.equal(options.reliable, true);
+      return { threadId: "main", turnId: "active-turn", queuedMessages: [] };
+    },
+  };
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  installSentMessageDisplayHarness(context);
+  vm.runInContext([
+    (sourceSection("function queueSn", "function queueMessageTex") + "\n" + sourceSection("function reconcileQu", "async functi")),
+    sourceSection("async function steerQueuedMessage("),
+    sourceSection("async function reloadThr", "function ret"),
+    sourceSection("function scheduleReload()", "function scheduleSidebarRefresh("),
+  ].join("\n"), context);
+  const runTimers = () => {
+    for (const [id, timer] of [...timers]) {
+      timers.delete(id);
+      timer.callback();
+    }
+  };
+  const completeRead = index => threadReads[index].resolve({
+    thread: { id: "main", title: "会话", cwd: "", queuedMessages: context.thread.queuedMessages },
+  });
+  return { context, timers, threadReads, historyReads, notices, runTimers, completeRead };
+}
+
+test("引导成功后的主动读取合并队列移除安排的刷新，只读取一次会话和历史", async () => {
+  const { context, timers, threadReads, historyReads, notices, runTimers, completeRead } = queueReloadHarness();
+  await context.steerQueuedMessage("main", "queued-a");
+  assert.equal(context.thread.queuedMessages.length, 0);
+  assert.equal(threadReads.length, 1);
+  assert.equal(historyReads.length, 1);
+  assert.equal(timers.size, 0);
+  assert.equal(context.refreshTimer, null);
+  runTimers();
+  const request = context.threadRequest;
+  assert.equal(request.again, false);
+  completeRead(0);
+  await request.promise;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(threadReads.length, 1);
+  assert.equal(historyReads.length, 1);
+  assert.equal(notices.length, 0);
+});
+
+test("主动读取开始后的新刷新事件仍触发下一次读取，不丢失后续更新", async () => {
+  const { context, timers, threadReads, historyReads, runTimers, completeRead } = queueReloadHarness();
+  context.scheduleReload();
+  const read = context.reloadThread();
+  context.scheduleReload();
+  assert.equal(timers.size, 1, "主动读取只合并开始前已排队的刷新");
+  runTimers();
+  assert.equal(context.threadRequest.again, true);
+  completeRead(0);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(threadReads.length, 2);
+  assert.equal(historyReads.length, 2);
+  completeRead(1);
+  await read;
+  assert.equal(context.threadRequest, null);
+});
+
+test("删除、切换会话或授权后迟到详情错误不弹提示，也不触发旧请求的后续刷新", async () => {
+  for (const reason of ["deleted", "selection", "authorization", "generation", "read-version", "leaving"]) {
+    const h = queueReloadHarness(), { context } = h;
+    context.scheduleReload(); h.runTimers();
+    const request = context.threadRequest;
+    request.again = true;
+    if (reason === "deleted") context.threadDeleted = id => id === "main";
+    if (reason === "selection") {
+      context.selectedId = "next"; context.selectionVersion++;
+      context.thread = { id: "next", title: "当前会话" };
+    }
+    if (reason === "authorization") context.session = { device: { id: "device-a", createdAtMs: 2 } };
+    if (reason === "generation") context.foregroundReadGeneration++;
+    if (reason === "read-version") context.threadReadVersion++;
+    if (reason === "leaving") context.pageLeaving = true;
+    const currentThread = context.thread;
+    h.threadReads[0].reject(Object.assign(new Error("Codex 操作失败：thread not loaded: main"), { code: 409 }));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.threadReads.length, 1, `${reason}: 过期请求不能继续读取`);
+    await request.promise;
+    assert.deepEqual(h.notices, [], reason);
+    assert.equal(context.threadReadFailed, false, reason);
+    assert.equal(context.thread, currentThread, reason);
+    assert.equal(h.threadReads.length, 1, reason);
+  }
+});
+
+test("当前会话的真实详情读取失败继续提示，不冒充已删除或读取成功", async () => {
+  for (const code of [409, 503]) {
+    const h = queueReloadHarness(), { context } = h;
+    context.scheduleReload(); h.runTimers();
+    const failure = Object.assign(new Error("当前会话读取失败"), { code });
+    const rejected = assert.rejects(context.threadRequest.promise, error => error === failure);
+    h.threadReads[0].reject(failure);
+    await rejected;
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(h.notices, [failure.message]);
+    assert.equal(context.threadReadFailed, true);
+    assert.equal(context.thread.id, "main");
+    assert.equal(context.threadDeleted("main"), false);
+    assert.equal(h.threadReads.length, 1);
+  }
+});
+
+test("授权变化后的详情读取不复用旧请求，旧请求结束也不释放新请求", async () => {
+  const h = queueReloadHarness(), { context } = h;
+  const oldRead = context.reloadThread();
+  context.session = { device: { id: "device-a", createdAtMs: 2 } };
+  const newRead = context.reloadThread(), current = context.threadRequest;
+  assert.equal(h.threadReads.length, 2);
+  h.threadReads[0].reject(Object.assign(new Error("旧授权读取失败"), { code: 409 }));
+  await oldRead;
+  assert.equal(context.threadRequest, current);
+  const failure = Object.assign(new Error("当前授权读取失败"), { code: 503 });
+  const rejected = assert.rejects(newRead, error => error === failure);
+  h.threadReads[1].reject(failure);
+  await rejected;
+});
+
+test("切换会话后旧详情成功回包不覆盖当前内容，也不继续旧读取", async () => {
+  const h = queueReloadHarness(), { context } = h;
+  const pending = context.reloadThread();
+  context.threadRequest.again = true;
+  context.selectedId = "next"; context.selectionVersion++;
+  const current = context.thread = { id: "next", title: "新会话内容", queuedMessages: [] };
+  h.completeRead(0);
+  await pending;
+  assert.equal(context.thread, current);
+  assert.deepEqual(h.notices, []);
+  assert.equal(h.threadReads.length, 1);
+});
+
+function installMessageResetHarness(context) {
+  Object.assign(context, {
+    messageImageRefreshes: new Map(), composerScroll: null, clearPendingFeedbackTimer() {},
+    stopActivityTimer() {}, finishQueueDrag() {}, cancelAnimationFrame() {},
+    historyController: new AbortController(), historyRequest: {},
+    selectionController: new AbortController(), historyLoadFrame: null, messageFrame: null,
+    renderedItems: new Map(), renderedTurns: new Map(), renderedActivities: new Map(),
+    itemVersions: new Map(), turnVersions: new Map(), turnFieldVersions: new Map(), partialItems: new Set(),
+  });
+  vm.runInContext(sourceSection("function resetMessages()", "function rememberTranscript("), context);
+}
+
+test("删除后页面重置取消显示读取，保留写回执；旧请求结束不清理新会话读取", async () => {
+  const h = queueReloadHarness(), { context } = h;
+  installMessageResetHarness(context);
+  const write = new AbortController();
+  const pending = context.pending = { id: "retained-write", state: "unknown", controller: write };
+  const drafts = context.drafts = new Map([["next", "下一会话草稿"]]);
+  const history = context.historyController, selection = context.selectionController;
+  const oldRead = context.reloadThread();
+  context.resetMessages();
+  assert.equal(h.threadReads[0].signal.aborted, true);
+  assert.equal(history.signal.aborted, true);
+  assert.equal(selection.signal.aborted, true);
+  assert.equal(context.threadRequest, null);
+  assert.equal(context.historyRequest, null);
+  assert.equal(write.signal.aborted, false);
+  assert.equal(context.pending, pending);
+  assert.equal(context.drafts, drafts);
+  context.selectedId = "next"; context.selectionVersion++;
+  context.thread = { id: "next", title: "新会话内容", queuedMessages: [] };
+  const newRead = context.reloadThread(), nextRequest = context.threadRequest;
+  assert.equal(h.threadReads.length, 2);
+  h.threadReads[0].reject(Object.assign(new Error("已删除会话的迟到错误"), { code: 409 }));
+  await oldRead;
+  assert.equal(context.threadRequest, nextRequest);
+  assert.equal(h.threadReads[1].signal.aborted, false);
+  const failure = Object.assign(new Error("新会话仍需报告的错误"), { code: 503 });
+  const rejected = assert.rejects(newRead, error => error === failure);
+  h.threadReads[1].reject(failure);
+  await rejected;
+  assert.equal(context.pending, pending);
+  assert.equal(write.signal.aborted, false);
+});
+
+test("详情错误已进入展示队列后再删除会话，也不能覆盖成功提示", async () => {
+  for (const retire of [true, false]) {
+    const h = queueReloadHarness(), { context } = h;
+    const failure = Object.assign(new Error("Codex 操作失败：thread not loaded: main"), { code: 409 });
+    context.reloadThread = () => {
+      const promise = Promise.reject(failure);
+      if (retire) queueMicrotask(() => {
+        context.threadDeleted = id => id === "main";
+        context.selectedId = null; context.selectionVersion++;
+      });
+      return promise;
+    };
+    context.scheduleReload(); h.runTimers();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(h.notices, retire ? [] : [failure.message]);
+  }
+});
+
+function queuedReceiptHarness({ disk = storage(), refresh = async () => {} } = {}) {
+  disk.removeItem = key => disk.records.delete(key);
+  const requests = [], notices = [], refreshes = [], timers = new Map(), clearedDrafts = [];
+  const draft = { text: "操作期间保留的普通草稿", skills: [{ name: "skill-a", path: "/skill-a" }],
+    attachments: [{ kind: "inline", dataUrl: "data:image/png;base64,AQID" }] };
+  const area = { children: [], append(node) { this.children.push(node); } };
+  let sequence = 0;
+  const context = {
+    performance, sessionStorage: disk, session: { device: { id: "device-a", createdAtMs: 1 }, capabilities: {} },
+    selectedId: "main", thread: { id: "main", queuedMessages: [{ id: "queued-a", text: "原队列正文" }] },
+    selectionVersion: 1, selectionToken: "selected-a", recoveryGeneration: 0, recoveryScope: null,
+    connected: true, busy: false, stopping: false, pending: null, pendingTimer: null, sending: null,
+    claudeThreadId: id => typeof id === "string" && id.startsWith("claude-"),
+    queuedActionBusy: new Set(), queuedEditActions: new Set(["beginQueuedEdit", "editQueued", "cancelQueuedEdit"]),
+    pendingSteer: null, turns: new Map(), queueVersion: 0, goalVersion: 0, submittedDrafts: new Map(),
+    goalComposerRecoveries: new Map(), editingMessage: null,
+    privateInputScope: value => JSON.stringify([value?.device?.id, value?.device?.createdAtMs]),
+    goalComposerAction: () => false, goalComposerStorageRecord: value => value,
+    hydrateGoalComposerRecord: value => value, validSkillSelection: () => true,
+    threadReadOnly: () => false, compactionLocked: () => false, isActiveThread: () => true,
+    randomId: () => `queue-receipt-${++sequence}`, snapshotDraft: () => draft,
+    recoveryStorageMessage: error => error.message,
+    recoveryStore: { activate: async () => {}, put: async () => {}, remove: async () => {} },
+    clearSubmittedDraft: (...args) => { clearedDrafts.push(args); draft.text = ""; },
+    setTimeout(callback, delay) { const id = ++sequence; timers.set(id, { callback, delay }); return id; },
+    clearTimeout: id => timers.delete(id),
+    api: (path, payload, requestId) => {
+      const response = deferred(); requests.push({ path, payload, requestId, ...response }); return response.promise;
+    },
+    queueMessageText: message => message?.text || "",
+    queueSnapshotIsVersioned: value => Number.isInteger(value?.queueRevision),
+    applyQueueSnapshot: (id, messages) => {
+      if (id !== context.selectedId) return false;
+      context.thread.queuedMessages = messages; ++context.queueVersion; return true;
+    },
+    reloadThread: () => { refreshes.push("thread"); return refresh(); },
+    reloadQueue: () => { refreshes.push("queue"); return refresh(); },
+    notice: (message, error) => notices.push({ message, error }),
+    updateComposer() {}, renderMessages() {}, renderQueueArea() {}, recordDiagnostic() {},
+    $: () => area,
+    element: (_tag, _className, text) => ({ text, children: [], append(node) { this.children.push(node); } }),
+    button: (label, aria, action) => ({ label, aria, action }),
+  };
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  installSentMessageDisplayHarness(context);
+  vm.runInContext([
+    sourceSection("function threadActionReadOnly(", "function threadReadOnlyMessage("),
+    (sourceSection("const pendingFee", "function set") + "\n" + sourceSection("function pen", "function cle")),
+    sourceSection("function savePen"),
+    (sourceSection("function ordinar", "function rem") + "\n" + sourceSection("async function recoverFa", "function res")),
+    (sourceSection("async function mutat", "async functi") + "\n" + sourceSection("function reportM", "function acc")),
+    sourceSection("async function resolvePending()"),
+    sourceSection("function confirmQueuedSteerDisplay(", "function renderQueuedMessages("),
+    sourceSection("async function removeQueuedMessage("),
+    sourceSection("async function stopG", "function mou"),
+    `function renderPending(){${sourceSection("  if (pending && (!sending || pending.payload !== sending.payload)",
+      "  renderFailedInputRecovery(")}}`,
+  ].join("\n"), context);
+  context.pending = vm.runInContext(`(()=>{${(sourceSection("let pending = null;", "function rep") + "\n" + sourceSection("function restoreStor", "function sav"))}
+    restoreStoredPending(); return pending;})()`, context);
+  const receipt = (index, state, result = {}) => requests[index].resolve({
+    requestId: requests[index].requestId || context.pending?.id, state, result,
+  });
+  const completed = index => receipt(index, "completed", {
+    ok: true, threadId: "main", messageId: "queued-a", turnId: "active-turn",
+    queueEpoch: "current", queueRevision: 2, queuedMessages: [],
+  });
+  const invoke = action => action === "steerQueued"
+    ? context.steerQueuedMessage("main", "queued-a") : context.removeQueuedMessage("main", "queued-a");
+  return { context, requests, notices, refreshes, timers, draft, area, disk, clearedDrafts, receipt, completed, invoke };
+}
+
+test("Claude 引导确认前不展示正文，成功后保留一份消息", async () => {
+  const h = queuedReceiptHarness();
+  h.context.thread.backend = "claude";
+  const operation = h.invoke("steerQueued");
+  assert.equal(h.context.withSentMessageDisplays().flatMap(turn => turn.items).length, 0);
+  h.receipt(0, "completed", { ok: true, threadId: "main", scope: "all",
+    queuedMessages: h.context.thread.queuedMessages, queuedEdits: [] });
+  await operation;
+  assert.equal(h.context.withSentMessageDisplays().flatMap(turn => turn.items).length, 1);
+  assert.equal(h.context.pendingSteer, null);
+  assert.equal(h.context.pending, null);
+  assert.equal(h.requests.length, 1);
+  assert.equal(h.draft.text, "操作期间保留的普通草稿");
+});
+
+test("引导原生正文早于回执时按身份接收，确认前不凭同文问题展示消息", async () => {
+  const h = queuedReceiptHarness();
+  h.context.thread.queuedMessages[0].clientUserMessageId = "old-client";
+  const operation = h.invoke("steerQueued"), preview = h.context.pendingSteer;
+  assert.equal(h.context.withSentMessageDisplays().flatMap(turn => turn.items).length, 0);
+  h.context.turns.set("active-turn", { id: "active-turn", status: "inProgress", items: [
+    { id: "original", type: "userMessage", clientId: "initial-client",
+      content: [{ type: "text", text: preview.text }] },
+  ] });
+  assert.equal(h.context.withSentMessageDisplays().flatMap(turn => turn.items).length, 1,
+    "同文初始问题不能被误判为引导已送达");
+  h.context.turns.get("active-turn").items.push({
+    id: "server-steer", type: "userMessage", clientId: "restored-client",
+    restoreMessage: { id: "queued-a" }, content: [{ type: "text", text: preview.text }],
+  });
+  assert.equal(h.context.withSentMessageDisplays().flatMap(turn => turn.items).length, 2);
+  h.completed(0);
+  await operation;
+  assert.equal(h.context.withSentMessageDisplays().flatMap(turn => turn.items).length, 2, "成功回执不能重复插入引导正文");
+  assert.equal(h.context.pendingSteer, null);
+  assert.equal(h.requests.length, 1);
+});
+
+test("引导成功后历史空档和迟到读取不移除正文，也不影响后续引导", async () => {
+  const reload = deferred(), h = queuedReceiptHarness({ refresh: () => reload.promise });
+  const operation = h.invoke("steerQueued"), preview = h.context.pendingSteer;
+  h.completed(0);
+  await operation;
+  assert.equal(h.context.pendingSteer, null);
+  const displayed = h.context.withSentMessageDisplays().flatMap(turn => turn.items);
+  assert.equal(displayed.length, 1);
+  assert.equal(displayed[0].content[0].text, preview.text);
+  reload.resolve();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.context.withSentMessageDisplays().flatMap(turn => turn.items).length, 1,
+    "成功后的读取缺项不能清掉已确认内容");
+  const laterReload = deferred(), later = queuedReceiptHarness({ refresh: () => laterReload.promise });
+  const laterOperation = later.invoke("steerQueued");
+  later.completed(0);
+  await laterOperation;
+  const nextPreview = { threadId: "main", messageId: "queued-b", text: "下一条消息" };
+  later.context.pendingSteer = nextPreview;
+  laterReload.resolve();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(later.context.pendingSteer, nextPreview);
+});
+
+test("已收到原生消息时回执立即确认，慢查询、旧授权和发送占位不能误判", async () => {
+  const reads = [], late = deferred();
+  const current = { action: "send", deviceId: "device-a",
+    payload: { threadId: "thread-a", clientUserMessageId: "client-a" } };
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    session: { device: { id: "device-a" }, capabilities: { queueSendRecovery: true } },
+    selectedId: "thread-a", turns: new Map(), pendingSendRequest: null,
+    api: async (...args) => { reads.push(args); return late.promise; },
+  });
+  vm.runInContext(sourceSection("function acc"), context);
+  const waiting = context.confirmPendingSend(current);
+  assert.equal(reads.length, 1);
+  context.turns.set("turn", { id: "turn", items: [
+    { type: "userMessage", id: "server-user", clientId: "client-a" },
+  ] });
+  const accepted = await context.confirmPendingSend(current);
+  assert.equal(accepted.deliveryState, "accepted");
+  assert.equal(accepted.messageId, "server-user");
+  assert.equal(reads.length, 1, "无需再查询已确认的原生消息");
+  assert.equal(await context.confirmPendingSend({ ...current, deviceId: "other-device" }), null);
+  assert.equal(await context.confirmPendingSend(current, { threadId: "other-thread" }), null);
+  late.resolve({ confirmed: false });
+  await waiting;
+  for (const patch of [
+    { pendingUserMessageAdmission: true },
+    { id: null },
+    { items: [{ type: "userMessage", clientId: "client-a", remotePendingInput: true }] },
+    { items: [{ type: "steeringUserMessage", clientId: "client-a", status: "pending" }] },
+  ]) {
+    context.turns.set("turn", { id: "turn", items: [
+      { type: "userMessage", id: "server-user", clientId: "client-a" },
+    ], ...patch });
+    assert.equal(await context.confirmPendingSend(current), null);
+  }
+});
+
+test("侧边引导在实时轮次、重进历史与迟到旧状态中只显示一份正文", () => {
+  const h = vm.createContext({ nativeConnectionVersion: 1,
+    turns: new Map(), itemVersions: new Map(), turnVersions: new Map(), turnFieldVersions: new Map(),
+    partialItems: new Map(), enrichTurnTranscriptEvents: value => value,
+    reconcileConfirmedInputOrder: () => false,
+  });
+  vm.runInContext((sourceSection("function normalizeDi") + "\n" + sourceSection("function mergeRe") + "\n" + sourceSection("function mergeHi", "async functi")), h);
+  const steer = { id: "local", type: "steeringUserMessage", status: "accepted",
+    serverUserMessageId: "server", clientUserMessageId: "logical", input: [{ type: "text", text: "补充正文" }] };
+  const marker = { id: "server", type: "steered" };
+  for (const items of [[steer, marker], [marker, steer]]) {
+    const turn = h.mergeHistoryTurn({ id: "turn", status: "completed", items }, 0);
+    assert.equal(turn.items.length, 1);
+    assert.equal(turn.items[0].type, "userMessage");
+    assert.equal(turn.items[0].content[0].text, "补充正文");
+    h.turns.set(turn.id, turn);
+    assert.equal(h.mergeItemProjection(turn.items[0], marker).type, "userMessage");
+    const stale = h.mergeHistoryTurn({ id: "turn", status: "completed", items: [marker] }, 100);
+    assert.equal(stale.items[0].type, "userMessage", "迟到旧分页不能再次抹掉正文");
+    h.turns.clear();
+  }
+});
+
+test("队列引导和删除unknown保留原回执，刷新只读恢复且不清普通草稿", async () => {
+  for (const action of ["steerQueued", "removeQueued"]) {
+    const first = queuedReceiptHarness(), original = structuredClone(first.draft);
+    const operation = first.invoke(action);
+    assert.equal(first.requests.length, 1);
+    const id = first.requests[0].requestId;
+    assert.equal(first.context.pending.id, id);
+    first.receipt(0, "unknown", { ok: false, outcomeUnknown: true });
+    await operation;
+    assert.equal(first.context.withSentMessageDisplays().flatMap(turn => turn.items).length, 0,
+      "未知引导回执不能展示正文");
+    assert.equal(first.notices.length, 0, "快速返回未确认时不得抢先弹出错误提示");
+    assert.equal(first.requests[1].path, `/api/receipts/${id}`);
+    await first.invoke(action);
+    await first.invoke(action === "steerQueued" ? "removeQueued" : "steerQueued");
+    assert.equal(first.requests.length, 2, "未知期间不能再次引导、删除或普通发送补偿");
+    first.receipt(1, "unknown", { ok: false, outcomeUnknown: true });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(first.context.pending.id, id);
+    first.context.renderPending();
+    assert.equal(first.area.children.length, 0, "正常等待的前八秒不额外显示回执横幅");
+    first.context.pending.time -= 5000;
+    first.context.renderPending();
+    assert.equal(first.area.children.length, 0, "队列操作等待五秒时仍不显示回执横幅");
+    first.context.pending.time -= 3000;
+    first.context.renderPending();
+    const banner = first.area.children[0];
+    assert.match(banner.text, /正在确认队列.*结果/);
+    assert.deepEqual(banner.children.map(node => node.label), ["查回执"]);
+    assert.match(banner.children[0].aria, /只查询原队列操作回执/);
+    assert.deepEqual(first.draft, original);
+
+    const reopened = queuedReceiptHarness({ disk: first.disk });
+    assert.equal(reopened.context.pending.id, id, "刷新必须接受这两个既有动作的原记录");
+    assert.equal(reopened.context.pending.invalid, undefined);
+    reopened.draft.text = "刷新后继续编辑的新普通稿";
+    const retained = structuredClone(reopened.draft);
+    const recovery = reopened.context.resolvePending();
+    assert.equal(reopened.requests.length, 1);
+    assert.equal(reopened.requests[0].path, `/api/receipts/${id}`);
+    reopened.completed(0);
+    await recovery;
+    assert.equal(reopened.context.pending, null);
+    assert.equal(reopened.disk.getItem("codex-elves-pending"), null);
+    assert.deepEqual(reopened.draft, retained);
+    assert.deepEqual(reopened.clearedDrafts, []);
+    assert.equal(reopened.requests.filter(request => request.path.startsWith("/api/action/")).length, 0);
+    assert.deepEqual(reopened.refreshes, [action === "steerQueued" ? "thread" : "queue"]);
+    assert.equal(reopened.context.withSentMessageDisplays().flatMap(turn => turn.items).length,
+      action === "steerQueued" ? 1 : 0, "原回执恢复后才确认引导正文，删除不产生正文");
+  }
+});
+
+test("队列写回包中断仍只查同一原回执，明确失败解锁且保留普通草稿", async () => {
+  for (const action of ["steerQueued", "removeQueued"]) {
+    const fixture = queuedReceiptHarness(), original = structuredClone(fixture.draft);
+    const operation = fixture.invoke(action), id = fixture.requests[0].requestId;
+    fixture.requests[0].reject(new TypeError("response body interrupted"));
+    await operation;
+    assert.equal(fixture.notices.length, 0, "传输中断不等于原生操作失败，等待原回执期间不立即弹红提示");
+    assert.equal(fixture.context.pending.id, id);
+    assert.equal(fixture.requests[1].path, `/api/receipts/${id}`);
+    fixture.receipt(1, "failed", { ok: false, code: 409, message: "原队列已过期" });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.ok(fixture.notices.some(item => item.error === true && item.message === "原队列已过期"));
+    assert.equal(fixture.context.pending, null);
+    assert.deepEqual(fixture.draft, original);
+    assert.deepEqual(fixture.clearedDrafts, []);
+    assert.equal(fixture.requests.filter(request => request.path.startsWith("/api/action/")).length, 1);
+    assert.deepEqual(fixture.refreshes, []);
+  }
+});
+
+test("队列原回执404或结果身份不符继续保锁，不重复写入", async () => {
+  for (const action of ["steerQueued", "removeQueued"]) {
+    const fixture = queuedReceiptHarness(), operation = fixture.invoke(action);
+    const id = fixture.requests[0].requestId;
+    fixture.receipt(0, "unknown", { ok: false, outcomeUnknown: true });
+    await operation;
+    fixture.requests[1].reject(Object.assign(new Error("original receipt missing"), { code: 404 }));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(fixture.context.pending.id, id);
+    assert.equal(fixture.context.pending.receiptMissing, true);
+    assert.deepEqual(fixture.notices, [], "不存在的回执保持页内提示，不反复弹红色错误");
+    const check = fixture.context.resolvePending();
+    fixture.receipt(2, "completed", { ok: true, threadId: "other-thread", messageId: "queued-a" });
+    await check;
+    assert.equal(fixture.context.pending.id, id);
+    await fixture.invoke(action);
+    assert.equal(fixture.requests.filter(request => request.path.startsWith("/api/action/")).length, 1);
+    assert.deepEqual(fixture.clearedDrafts, []);
+  }
+});
+
+test("队列明确未派发的409立即结束等待，保留普通草稿且不查询不存在的回执", async () => {
+  const h = queuedReceiptHarness(), original = structuredClone(h.draft);
+  const operation = h.invoke("steerQueued");
+  h.requests[0].reject(Object.assign(new Error("验收入口未开放此操作"),
+    { code: 409, notSubmitted: true }));
+  await operation;
+  assert.equal(h.context.pending, null);
+  assert.equal(h.requests.length, 1);
+  assert.deepEqual(h.draft, original);
+  assert.deepEqual(h.clearedDrafts, []);
+});
+
+test("Claude 旧队列回执缺失时，以原生接收记录和当前队列核对残留，不能凭404假定完成", async () => {
+  for (const delivered of [true, false]) {
+    const h = queuedReceiptHarness(), original = structuredClone(h.draft);
+    const threadId = "claude-12345678-1234-1234-1234-123456789abc";
+    h.context.selectedId = threadId;
+    h.context.thread.id = threadId;
+    h.context.thread.backend = "claude";
+    const operation = h.context.steerQueuedMessage(threadId, "queued-a");
+    h.receipt(0, "unknown", { ok: false, outcomeUnknown: true });
+    await operation;
+    h.requests[1].reject(Object.assign(new Error("missing"), { code: 404 }));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.requests[2].path, "/api/read/queue");
+    h.requests[2].resolve({ ok: true, threadId, queuedMessages: [{ id: "other-message" }], queuedEdits: [] });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.requests[3].path, "/api/read/history");
+    h.requests[3].resolve({ ok: true, threadId, data: [{ items: [{
+      type: "userMessage", clientId: delivered ? "queued-a" : "unrelated-message"
+    }] }] });
+    await new Promise(resolve => setImmediate(resolve));
+    if (delivered) {
+      assert.equal(h.context.pending, null);
+      assert.deepEqual(h.context.thread.queuedMessages.map(message => message.id), ["other-message"]);
+    } else {
+      assert.equal(h.context.pending.receiptMissing, true);
+      assert.equal(h.context.thread.queuedMessages[0].id, "queued-a");
+    }
+    assert.equal(h.requests.filter(request => request.path.startsWith("/api/action/")).length, 1);
+    assert.deepEqual(h.notices, []);
+    assert.deepEqual(h.draft, original);
+    assert.deepEqual(h.clearedDrafts, []);
+  }
+});
+
+test("正常可靠引导不等待后续会话读取，也不额外查询原回执", async () => {
+  const read = deferred(), fixture = queuedReceiptHarness({ refresh: () => read.promise });
+  const operation = fixture.invoke("steerQueued"), original = structuredClone(fixture.draft);
+  fixture.completed(0);
+  await operation;
+  assert.equal(fixture.context.pending, null);
+  assert.deepEqual(fixture.refreshes, ["thread"]);
+  assert.equal(fixture.requests.length, 1, "正常成功不串行追加回执或队列读取");
+  assert.deepEqual(fixture.draft, original);
+  read.resolve();
+});
+
+test("旧授权的可靠请求错误不显示旧提示，不查询回执或改新pending", async () => {
+  for (const action of ["send", "steerQueued", "removeQueued"]) {
+    for (const change of ["device", "created-at", "generation"]) {
+      const fixture = queuedReceiptHarness(), original = structuredClone(fixture.draft);
+      const operation = fixture.context.mutate(action,
+        { threadId: "main", messageId: "queued-a", prompt: "原提交", skills: [] }, { reliable: true }).catch(error => error);
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(fixture.requests.length, 1);
+      if (change === "generation") ++fixture.context.recoveryGeneration;
+      else fixture.context.session = { ...fixture.context.session, device: {
+        id: change === "device" ? "device-b" : "device-a", createdAtMs: change === "created-at" ? 2 : 1,
+      } };
+      const newPending = { id: "new-original-receipt", action: "send" };
+      fixture.context.pending = newPending;
+      fixture.requests[0].reject(Object.assign(new Error("old response failed"), { code: 503 }));
+      await operation;
+      assert.equal(fixture.context.pending, newPending);
+      assert.deepEqual(fixture.notices, []);
+      assert.equal(fixture.requests.length, 1);
+      assert.deepEqual(fixture.refreshes, []);
+      assert.deepEqual(fixture.draft, original);
+    }
+  }
+});
+
+test("停止回执cleanupPending仅提示清理尚未确认，正常清理仍显示原成功提示", async () => {
+  for (const cleanupPending of [true, false]) {
+    const fixture = queuedReceiptHarness(), operation = fixture.context.stopGeneration();
+    assert.equal(fixture.requests[0].path, "/api/action/stop");
+    fixture.receipt(0, "completed", { ok: true, threadId: "main", cleanupPending });
+    await operation;
+    assert.equal(fixture.notices.length, 1);
+    assert.match(fixture.notices[0].message, cleanupPending ? /后台终端清理尚未确认/ : /已请求停止并清理/);
+    assert.equal(fixture.context.stopping, false);
+    assert.equal(fixture.requests.length, 1);
+  }
+});
+
+function sidebarReadHarness() {
+  const reads = [], notices = [];
+  const context = {
+    AbortController, pageLeaving: false, document: { hidden: false, activeElement: {} },
+    foregroundReadGeneration: 0, sidebarVersion: 0, sidebarRequest: null,
+    session: { device: { id: "device-a" }, readOnly: false },
+    sidebarFilterDeviceId: "device-a", sidebar: null, selectedId: null,
+    sidebarBusy: false, connected: true, sidebarReadRefreshSuppressions: new Set(),
+    promoteReadPriority: () => {}, filterDeletedSidebar: () => {}, filterSideThreadSidebar: () => {},
+    cacheDisplayData: () => {}, sidebarSnapshot: value => value, renderSidebar: () => {},
+    threadDeletionLocked: () => false, threadDeleted: () => false,
+    $: () => ({ contains: () => false }),
+    notice: message => notices.push(message),
+    mutate: async () => ({ ok: true }),
+    api: async (path, payload) => {
+      assert.equal(path, "/api/read/sidebar");
+      const request = { ...deferred(), payload };
+      reads.push(request);
+      return request.promise;
+    },
+  };
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  vm.runInContext([
+    (sourceSection("function mergeIn", "function set") + "\n" + sourceSection("function clientUnreadBad", "async function l") + "\n" + sourceSection("function clientUnreadThr", "function sid")),
+    (sourceSection("async function loadSideb", "function ren") + "\n" + sourceSection("function sidebarTime", "function sid")),
+    sourceSection("async function changeSidebar("),
+  ].join("\n"), context);
+  const snapshot = pinned => ({
+    recent: pinned ? [] : [{ id: "main", title: "主会话" }],
+    pinnedThreads: pinned ? [{ id: "main", title: "主会话" }] : [],
+    projects: [], nextCursor: null,
+  });
+  return { context, reads, notices, snapshot };
+}
+
+test("并发侧栏普通读取共享原请求，不在完成后重复读取", async () => {
+  const { context, reads, snapshot } = sidebarReadHarness();
+  const first = context.loadSidebar();
+  const second = context.loadSidebar();
+  const poll = context.loadSidebar(null, { resourcePriority: "background" });
+  assert.equal(reads.length, 1);
+  reads[0].resolve(snapshot(false));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(reads.length, 1);
+  await Promise.all([first, second, poll]);
+  assert.equal(context.sidebar.recent[0].id, "main");
+});
+
+test("置顶完成时已有旧侧栏读取，必须补读并显示新的置顶结果", async () => {
+  const { context, reads, snapshot, notices } = sidebarReadHarness();
+  const oldRead = context.loadSidebar();
+  const pin = context.changeSidebar({ threadId: "main", pinned: true });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(reads.length, 1);
+  reads[0].resolve(snapshot(false));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(reads.length, 2);
+  reads[1].resolve(snapshot(true));
+  await Promise.all([oldRead, pin]);
+  assert.equal(context.sidebar.pinnedThreads[0].id, "main");
+  assert.equal(context.sidebar.recent.length, 0);
+  assert.equal(context.sidebarBusy, false);
+  assert.deepEqual(notices, []);
+});
+
+test("侧栏旧请求失败后仍完成已要求的新读取，普通并发读不增加第三次请求", async () => {
+  const { context, reads, snapshot } = sidebarReadHarness();
+  const first = context.loadSidebar();
+  const fresh = context.loadSidebar(null, { fresh: true });
+  reads[0].reject(new Error("旧读取失败"));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(reads.length, 2);
+  const poll = context.loadSidebar();
+  reads[1].resolve(snapshot(true));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(reads.length, 2);
+  await Promise.all([first, fresh, poll]);
+  assert.equal(context.sidebar.pinnedThreads[0].id, "main");
+});
+
+function lifecycle() {
+  const reads = [], refreshes = [];
+  const pendingWrite = new AbortController();
+  const context = {
+    AbortController, DOMException, clearTimeout,
+    clearPendingFeedbackTimer() {},
+    session: { device: { id: "device-a" } },
+    selectedId: "thread-a", selectionVersion: 1, threadReadVersion: 0,
+    foregroundReadGeneration: 0, pageLeaving: false, document: { hidden: false },
+    historyRequest: null, threadRequest: null, refreshRequest: null, sidebarRequest: null,
+    selectionController: null, historyController: null,
+    historyLoading: false, historyLoadingTurnId: null, historyLoadingOlder: false,
+    refreshTimer: null, sidebarTimer: null, transcriptChecking: false,
+    threadDeleted: () => false, syncHistoryButtons: () => {},
+    pending: { id: "original-write", state: "unknown", controller: pendingWrite },
+    drafts: new Map([["thread-a", "保留原草稿"]]),
+    turns: new Map([["turn-a", { id: "turn-a", text: "保留已显示内容" }]]),
+    readHistoryPage: async (_older, _version, _items, generation) => {
+      const job = { ...deferred(), generation, controller: new AbortController() };
+      reads.push(job); context.historyController = job.controller;
+      await job.promise;
+    },
+    loadSidebar: async () => {},
+    reloadThread: async () => {
+      const job = deferred(); refreshes.push(job); await job.promise;
+    },
+  };
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  vm.runInContext([
+    sourceSection("async function loadHistory(", "async function readHistoryPage("),
+    sourceSection("async function refreshAl", "function rec"),
+    sourceSection("function retireForegroundReads(", "function suspendPage("),
+  ].join("\n"), context);
+  return { context, reads, refreshes, pendingWrite };
+}
+
+test("返回前台必须启动新历史读取，不复用后台旧 promise；旧完成不清理新请求", async () => {
+  const { context, reads } = lifecycle();
+  const oldRead = context.loadHistory();
+  await new Promise(resolve => setImmediate(resolve));
+  const oldRequest = context.historyRequest;
+  oldRequest.latestPending = true;
+  context.document.hidden = true;
+  context.retireForegroundReads();
+  assert.equal(reads[0].controller.signal.aborted, true);
+  context.document.hidden = false;
+  const newRead = context.loadHistory();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(reads.length, 2);
+  assert.notEqual(reads[0].generation, reads[1].generation);
+  const newRequest = context.historyRequest;
+  reads[0].resolve();
+  await oldRead;
+  assert.equal(context.historyRequest, newRequest);
+  assert.equal(reads.length, 2, "后台旧请求的 latestPending 不得派生第三次读取");
+  reads[1].resolve();
+  await newRead;
+  assert.equal(context.historyRequest, null);
+});
+
+test("后台刷新任务退役后不阻挡前台刷新，也不覆盖新刷新所有权", async () => {
+  const { context, refreshes } = lifecycle();
+  const oldRefresh = context.refreshAll();
+  context.refreshRequest.again = true;
+  context.retireForegroundReads();
+  const newRefresh = context.refreshAll({ fresh: true });
+  const newRequest = context.refreshRequest;
+  assert.equal(refreshes.length, 2);
+  refreshes[0].resolve();
+  await oldRefresh;
+  assert.equal(context.refreshRequest, newRequest);
+  assert.equal(refreshes.length, 2);
+  refreshes[1].resolve();
+  await newRefresh;
+});
+
+test("后台只取消显示读取，保留原写请求、未知回执、草稿和已显示内容", () => {
+  const { context, pendingWrite } = lifecycle();
+  const selection = new AbortController(), sidebar = new AbortController(), thread = new AbortController();
+  context.selectionController = selection;
+  context.sidebarRequest = { controller: sidebar };
+  context.threadRequest = { controller: thread };
+  const pending = context.pending, drafts = context.drafts, turns = context.turns;
+  context.retireForegroundReads();
+  assert.equal(selection.signal.aborted, true);
+  assert.equal(sidebar.signal.aborted, true);
+  assert.equal(thread.signal.aborted, true);
+  assert.equal(pendingWrite.signal.aborted, false);
+  assert.equal(context.pending, pending);
+  assert.equal(context.pending.state, "unknown");
+  assert.equal(context.drafts, drafts);
+  assert.equal(context.turns, turns);
+  assert.equal(context.drafts.get("thread-a"), "保留原草稿");
+});
+
+test("后台事件不会重建历史请求或整页刷新；前台后可以正常发起", async () => {
+  const { context, reads, refreshes } = lifecycle();
+  context.document.hidden = true;
+  await context.loadHistory();
+  await context.refreshAll({ fresh: true });
+  assert.equal(reads.length, 0);
+  assert.equal(refreshes.length, 0);
+  context.document.hidden = false;
+  const read = context.loadHistory();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(reads.length, 1);
+  reads[0].resolve();
+  await read;
+});
+
+// 摘自 119 的 closed-test-probe.json；测试不依赖本机 dist 取证目录。
+const expiredSideProbe = {
+  threadId: "01a19a9a-0435-70b1-b979-e041ed4e25ed",
+  thread: { code: -32600, message: "thread not loaded: 01a19a9a-0435-70b1-b979-e041ed4e25ed" },
+};
+
+function sideExpiryHarness(response) {
+  const { context, calls } = transportClient(response), scheduled = new Map(), menuChanges = [], notices = [];
+  const node = () => ({ hidden: false, attributes: {}, classList: { toggle() {}, remove() {} },
+    setAttribute(name, value) { this.attributes[name] = value; } });
+  const nodes = new Map([".workspace", "#composer", "#side-thread-expired", "#open-sidebar", "#connection-state",
+    "#open-session-tools", "#related-session-back", "#pending-area"].map(selector => [selector, node()]));
+  const id = expiredSideProbe.threadId, parent = "test-parent";
+  const device = { id: "side-device", createdAtMs: 1 }, scope = JSON.stringify([device.id, device.createdAtMs]);
+  const view = { scope, threadId: id, parentThreadId: parent, kind: "side", name: "已保留的侧边会话" };
+  Object.assign(context, {
+    session: { device, readOnly: false, capabilities: { serviceSideThreads: true } }, selectedId: id, selectionVersion: 1,
+    relatedSessionView: view, relatedThreadViews: new Map([[id, view]]), relatedNavigationOwner: "local-page",
+    thread: { id, title: "已保留的侧边会话", viewKind: "side", parentThreadId: parent, ephemeral: true },
+    turns: new Map([["saved-turn", { id: "saved-turn", items: [{ type: "agentMessage", text: "保留已有消息" }] }]]),
+    drafts: new Map([[id, { text: "保留未发送草稿", skills: [{ name: "chosen", path: "/chosen/SKILL.md" }],
+      attachments: [{ name: "kept.png", dataUrl: "data:image/png;base64,a2VlcA==" }] }]]),
+    historyInitialized: true, transcriptChecking: true, historyError: "", recentHistoryPage: null,
+    creating: false, relatedBackPending: false, connected: true, sidebar: { unreadSideThreads: [{ id }] },
+    sessionMenu: { markSideThreadRead: value => menuChanges.push(["read", value]),
+      removeThread: value => menuChanges.push(["remove", value]), updateContext() {}, reposition() {} },
+    syncRelatedModelDisplay() {}, syncRelatedSidebarLayout: null, markSidebarThreadReadLocally() {},
+    $: selector => nodes.get(selector), renderMessages() {}, renderSidebar() {},
+    resetRelatedSessions() { assert.fail("缺失识别不得清除当前侧边关系"); },
+    showWelcome() { assert.fail("侧边过期或暂未加载不得跳到欢迎页"); },
+    retryConnectionRecovery() { assert.fail("单个会话错误不得触发全局连接恢复"); },
+    resetMessages() { assert.fail("暂未加载不得丢弃已显示消息"); },
+    notice: message => notices.push(message), readScope: null,
+    relatedSessionCheckTimer: null, refreshTimer: null, foregroundReadGeneration: 0,
+    threadRequest: null, threadReadVersion: 0, tokenUsageVersion: 0, questionVersion: 0, statusVersion: 0,
+    goalVersion: 0, compactionVersion: 0, queueVersion: 0, blockingRequestState: () => ({ generation: 0 }),
+    loadHistory: async () => {}, markVisibleThreadRead: async () => {}, threadDeleted: () => false,
+    historyLoading: false, historyLoadingVersion: 0, historyLoadingTurnId: null, historyLoadingOlder: false,
+    historyAutoFailed: false, historyCursor: null, historyController: null, messageVersion: 0,
+    recoveryErrorSilenceDepth: 0, syncHistoryButtons() {},
+    retireNativeSideThreads() { assert.fail("读取失败不得伪造原生关闭事件"); },
+    setTimeout(callback, delay) {
+      if (delay !== 2000) return setTimeout(callback, delay);
+      const token = {}; scheduled.set(token, callback); return token;
+    },
+    clearTimeout(token) { if (!scheduled.delete(token)) clearTimeout(token); },
+  });
+  vm.runInContext([
+    sourceSection("function pri", "function isA"),
+    (sourceSection("function syncRelatedSess", "function fin") + "\n" + sourceSection("function syncSid", "function ses")),
+    sourceSection("function scheduleRelatedSessionCheck()", "function resetRelatedSessions("),
+    (sourceSection("function threadE", "function per") + "\n" + sourceSection("function retireM", "function his")),
+    sourceSection("async function reloadThr", "function ret"),
+    (sourceSection("async function readH", "function pru") + "\n" + sourceSection("function orderCl", "function mer")),
+  ].join("\n"), context);
+  context.syncRelatedSessionLayout();
+  const retained = { turns: context.turns, turnsJson: JSON.stringify([...context.turns]),
+    drafts: context.drafts, draftsJson: JSON.stringify([...context.drafts]) };
+  const assertRetained = () => {
+    assert.equal(context.turns, retained.turns);
+    assert.equal(JSON.stringify([...context.turns]), retained.turnsJson);
+    assert.equal(context.drafts, retained.drafts);
+    assert.equal(JSON.stringify([...context.drafts]), retained.draftsJson);
+    assert.equal(context.connected, true);
+    assert.equal(calls.some(call => call.path.startsWith("/api/action/")), false);
+  };
+  return { context, calls, nodes, id, parent, menuChanges, notices, assertRetained,
+    runCheck: async () => {
+      const [token, callback] = [...scheduled][0];
+      scheduled.delete(token);
+      await callback();
+    } };
+}
+
+test("准确侧边的中文404和原始119缺失证据进入已有过期态，隐藏输入框并保留消息草稿", async () => {
+  for (const message of ["会话已关闭或不存在", "原生临时侧边会话已关闭或不存在", expiredSideProbe.thread.message]) {
+    for (const endpoint of ["thread", "history"]) {
+      const fixture = sideExpiryHarness(() => jsonResponse({ ok: false, message },
+        message === expiredSideProbe.thread.message ? 503 : 404));
+      const { context, nodes, id, assertRetained, calls } = fixture;
+      if (endpoint === "thread") await context.reloadThread();
+      else await context.readHistoryPage(false, context.selectionVersion);
+      assert.equal(context.sideThreadExpired(id), true, `${endpoint}: ${message}`);
+      assert.equal(nodes.get("#composer").hidden, true);
+      assert.equal(nodes.get("#side-thread-expired").hidden, false);
+      assert.equal(context.thread.readOnly, true);
+      assert.equal(context.historyError, "");
+      assert.equal(context.historyInitialized, true);
+      assert.equal(context.selectedId, id);
+      assert.equal(calls.length, 1, "只读取原请求，不重试、不重发");
+      assertRetained();
+    }
+  }
+});
+
+test("侧边过期后仍读取服务保留的最新历史和较早消息", async () => {
+  const fixture = sideExpiryHarness(() => jsonResponse({
+    ok: true, data: [{ id: "latest-turn", status: "completed",
+      items: [{ id: "latest-answer", type: "agentMessage", text: "过期前的最终回复" }] }],
+    nextCursor: null, ephemeral: true, sideHistoryVersion: 1
+  }));
+  const { context, id, calls } = fixture;
+  await context.retireExpiredSideThread(id);
+  Object.assign(context, {
+    transcriptEvents: new Map(), mergeHistoryTurn: turn => turn, mergeTranscriptEvents() {},
+    syncEditableMessageMetadata() {}, rememberTranscript() {}, discardPersistentThreadDisplay() {}
+  });
+  await context.readHistoryPage(false, context.selectionVersion);
+  assert.equal(calls.length, 1, "执行过期不能阻断只读补读");
+  assert.equal(context.turns.get("latest-turn").items[0].text, "过期前的最终回复");
+  assert.equal(context.historyError, "");
+  assert.equal(context.latestHistoryReadFailed, false);
+  assert.equal(context.sideThreadExpired(id), true, "历史补读不恢复写入能力");
+  context.historyCursor = "side-turn:latest-turn";
+  await context.readHistoryPage(true, context.selectionVersion);
+  assert.equal(calls.length, 2, "过期后仍可向前翻页");
+  assert.equal(calls.every(call => call.path === "/api/read/history"), true);
+});
+
+test("过期侧边阅读后提交已读，清除父会话蓝点并保留其它侧边未读", async () => {
+  const acknowledgements = [], timers = [];
+  const transport = transportClient(({ path, options }) => {
+    acknowledgements.push({ action: path.split("/").at(-1), payload: JSON.parse(options.body) });
+    return jsonResponse({ requestId: options.headers.get("Idempotency-Key"),
+      state: "completed", result: { ok: true } });
+  });
+  const parent = { id: "parent", hasUnreadTurn: false, sideThreadAttention: { unread: true } };
+  const otherParent = { id: "other-parent", sideThreadAttention: { unread: true } };
+  const context = Object.assign(transport.context, {
+    session: { device: { id: "device" }, readOnly: false }, selectedId: "side",
+    thread: { id: "side", viewKind: "side", readOnly: true, sideThreadExpired: true, hasUnreadTurn: true },
+    relatedSessionView: { threadId: "side", kind: "side" }, relatedThreadViews: new Map(),
+    normalizeRelatedView: value => value, connected: true, historyInitialized: true, historyError: "",
+    transcriptChecking: false, document: { hidden: false }, followMessages: true,
+    threadDeletionLocked: () => false, threadDeleted: () => false,
+    readMarkRequests: new Map(), recentPrioritySelectionSuppressions: new Set(),
+    sidebarReadRefreshSuppressions: new Set(), setTimeout: callback => timers.push(callback),
+    selectionVersion: 1, messageVersion: 0, recoveryGeneration: 0, randomId: () => "read-receipt",
+    privateInputScope: value => value.device.id, goalComposerAction: () => false,
+    sidebar: { recent: [parent, otherParent], pinnedThreads: [], projects: [],
+      unreadSideThreads: [{ id: "side", parentThreadId: "parent" },
+        { id: "other-side", parentThreadId: "other-parent" }] },
+    sessionMenu: { markSideThreadRead() {} }, syncSideThreadUnread() {}, renderSidebar() {}
+  });
+  vm.runInContext([
+    sourceSection("function threadReadOnly(", "function threadReadOnlyMessage("),
+    sourceSection("async function mutat", "async functi"),
+    sourceSection("function markSidebarThreadReadLocally(", "function sidebarAttentionState("),
+    sourceSection("async function markVisibleThreadRead(")
+  ].join("\n"), context);
+  await context.markVisibleThreadRead();
+  assert.equal(acknowledgements.length, 1, "侧边只读不应禁止已读回执");
+  assert.equal(acknowledgements[0].action, "markRead");
+  assert.equal(acknowledgements[0].payload.threadId, "side");
+  assert.equal(transport.calls.length, 1, "已读须通过真实 api 和传输层，不得被中间的只读检查拦截");
+  assert.equal(context.thread.hasUnreadTurn, false);
+  assert.equal(parent.sideThreadAttention.unread, false);
+  assert.equal(otherParent.sideThreadAttention.unread, true);
+  assert.deepEqual(context.sidebar.unreadSideThreads.map(item => item.id), ["other-side"]);
+  parent.sideThreadAttention.unread = true;
+  context.sidebar.unreadSideThreads.push({ id: "side", parentThreadId: "parent" },
+    { id: "same-parent-side", parentThreadId: "parent" });
+  context.markSidebarThreadReadLocally("side");
+  assert.equal(parent.sideThreadAttention.unread, true, "同父会话仍有未读侧边时保留蓝点");
+  context.markSidebarThreadReadLocally("same-parent-side");
+  assert.equal(parent.sideThreadAttention.unread, false);
+  context.session.readOnly = true;
+  await context.markVisibleThreadRead();
+  assert.equal(acknowledgements.length, 1, "设备只读授权仍不允许提交已读");
+  await assert.rejects(context.mutate("markRead", { threadId: "side" }), error => error.code === 403);
+  context.session.readOnly = false;
+  await assert.rejects(context.mutate("send", { threadId: "side" }), error => error.code === 403);
+  context.thread.viewKind = "subagent";
+  await assert.rejects(context.mutate("markRead", { threadId: "side" }), error => error.code === 403);
+});
+
+test("侧边过期且从未读到正文时显示读取失败，不伪装成空会话或提交已读", async () => {
+  const h = sideExpiryHarness(() => jsonResponse({
+    ok: false, message: `thread not loaded: ${expiredSideProbe.threadId}`
+  }, 503));
+  h.context.turns.clear();
+  await h.context.readHistoryPage(false, h.context.selectionVersion);
+  assert.match(h.context.historyError, /历史暂时不可读取/);
+  assert.equal(h.calls.some(call => call.path.startsWith("/api/action/")), false);
+});
+
+test("缺失错误归属原请求ID和授权，网络503、权限403、他人ID或无缺失原因均不判过期", async () => {
+  const fixture = sideExpiryHarness(() => jsonResponse({ ok: false, message: "会话已关闭或不存在" }, 404));
+  const { context, id, nodes } = fixture;
+  const captured = await context.api("/api/read/thread", { threadId: id }).catch(error => error);
+  assert.equal(captured.readThreadId, id);
+  assert.equal(captured.readThreadScope, context.privateInputScope(context.session));
+  assert.equal(context.isMissingThreadError(captured, id), true);
+  for (const error of [
+    Object.assign(new Error("会话已关闭或不存在"), { code: 503, readThreadId: id }),
+    Object.assign(new Error("thread not loaded: other-side"), { code: 503, readThreadId: id }),
+    Object.assign(new Error(`thread not loaded: ${id}`), { code: 403, readThreadId: id }),
+    Object.assign(new Error("thread not loaded: other-side"), { code: 404, readThreadId: id }),
+    Object.assign(new Error("会话已关闭或不存在"), { code: 404, readThreadId: "other-side" }),
+    Object.assign(new Error("HTTP 404"), { code: 404, readThreadId: id }),
+    Object.assign(new Error("会话已关闭或不存在"), { code: 404 }),
+  ]) assert.equal(context.isMissingThreadError(error, id), false, error.message);
+  context.session = { device: { ...context.session.device, createdAtMs: 2 } };
+  context.relatedSessionView = { ...context.relatedSessionView, scope: context.privateInputScope(context.session) };
+  assert.equal(context.isMissingThreadError(captured, id), false, "旧授权错误不能作用于新授权下同ID");
+  assert.equal(nodes.get("#composer").hidden, false);
+  assert.equal(nodes.get("#side-thread-expired").hidden, true);
+});
+
+test("静默恢复时最新历史读取失败仍保留待补读状态，不误判过期或丢失缓存草稿", async () => {
+  const h = sideExpiryHarness(() => jsonResponse({ ok: false, message: "临时无法读取历史" }, 503));
+  h.context.recoveryErrorSilenceDepth = 1;
+  h.context.transcriptChecking = false;
+  await h.context.readHistoryPage(false, h.context.selectionVersion);
+  assert.equal(h.context.latestHistoryReadFailed, true);
+  assert.equal(h.context.sideThreadExpired(h.id), false);
+  assert.equal(h.notices.length, 0);
+  h.assertRetained();
+});
+
+test("服务侧边定时补读只读当前侧边，准确中文或英文缺失才显示过期提示", async () => {
+  for (const available of [true, false]) {
+    for (const language of ["zh", "en"]) {
+      let fixture;
+      fixture = sideExpiryHarness(({ path, options }) => {
+        const body = JSON.parse(options.body);
+        assert.equal(path, "/api/read/thread");
+        assert.equal(body.threadId, fixture.id);
+        return available
+          ? jsonResponse({ thread: { id: body.threadId } })
+          : jsonResponse({ ok: false, message: language === "zh" ? "会话已关闭或不存在"
+            : `thread not loaded: ${fixture.id}` }, 404);
+      });
+      await fixture.runCheck();
+      assert.equal(fixture.context.sideThreadExpired(), !available);
+      assert.equal(fixture.nodes.get("#composer").hidden, !available);
+      assert.equal(fixture.nodes.get("#side-thread-expired").hidden, available);
+      fixture.assertRetained();
+      assert.equal(fixture.calls.length, 1, "服务侧边不借父会话的关联列表判断自身存活");
+    }
+  }
+});
+
+test("无父关系、旧授权或裸旧ID不推断为侧边，主会话暂时notLoaded保持可见消息", async () => {
+  for (const kind of ["bare", "no-parent", "old-scope", "main", "main-503"]) {
+    let fixture;
+    fixture = sideExpiryHarness(() => jsonResponse({ ok: false,
+      message: kind.startsWith("main") ? `thread not loaded: ${fixture.id}` : "原生临时侧边会话已关闭或不存在" },
+    kind === "main-503" ? 503 : 404));
+    const { context, nodes } = fixture;
+    if (kind === "bare" || kind.startsWith("main")) {
+      context.relatedSessionView = null; context.relatedThreadViews.clear();
+      context.thread = { id: fixture.id, ephemeral: kind.startsWith("main") };
+    } else if (kind === "no-parent") {
+      context.relatedSessionView = { ...context.relatedSessionView, parentThreadId: null };
+      context.relatedThreadViews.clear();
+    } else context.relatedSessionView = { ...context.relatedSessionView, scope: "old-authorization" };
+    context.syncRelatedSessionLayout();
+    await assert.rejects(context.reloadThread(), error => error.code === (kind === "main-503" ? 503 : 404));
+    assert.equal(context.thread.sideThreadExpired, undefined, kind);
+    assert.equal(nodes.get("#composer").hidden, false, kind);
+    assert.equal(nodes.get("#side-thread-expired").hidden, true, kind);
+    fixture.assertRetained();
+  }
+});
+
+test("503和403的实际历史读取不清消息或隐藏输入框，也不发起全局断连和写入", async () => {
+  for (const [status, message] of [
+    [503, "会话已关闭或不存在"], [503, "服务暂不可用"], [503, "thread not loaded: other-side"],
+    [403, "会话已关闭或不存在"], [403, expiredSideProbe.thread.message],
+  ]) {
+    const fixture = sideExpiryHarness(() => jsonResponse({ ok: false, message }, status));
+    await fixture.context.readHistoryPage(false, fixture.context.selectionVersion);
+    assert.equal(fixture.context.sideThreadExpired(), false);
+    assert.equal(fixture.nodes.get("#composer").hidden, false);
+    assert.equal(fixture.nodes.get("#side-thread-expired").hidden, true);
+    assert.equal(fixture.calls.length, 1);
+    fixture.assertRetained();
+  }
+});
+
+test("旧会话和旧授权的迟到读取不改变当前页，reload等待历史后也重新核对归属", async () => {
+  for (const path of ["thread", "history", "poll", "after-history"]) {
+    const response = deferred(), history = deferred();
+    let fixture;
+    fixture = sideExpiryHarness(({ path: requestPath }) => requestPath === "/api/read/relatedThreads"
+      ? jsonResponse({ sideThreads: [{ id: fixture.id }] }) : response.promise);
+    const { context, nodes, id } = fixture;
+    if (path === "after-history") context.loadHistory = () => history.promise;
+    const run = path === "history" ? context.readHistoryPage(false, context.selectionVersion)
+      : path === "poll" ? fixture.runCheck() : context.reloadThread();
+    const captured = run.catch(error => error);
+    if (path === "after-history") {
+      response.resolve(jsonResponse({ ok: false, message: "会话已关闭或不存在" }, 404));
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    if (path === "thread" || path === "history") {
+      context.selectedId = "new-current"; ++context.selectionVersion;
+      context.relatedSessionView = null; context.thread = { id: "new-current" };
+    } else {
+      context.session = { device: { ...context.session.device, createdAtMs: 2 } };
+      context.relatedSessionView = { ...context.relatedSessionView, scope: context.privateInputScope(context.session) };
+    }
+    context.syncRelatedSessionLayout();
+    response.resolve(jsonResponse({ ok: false, message: "会话已关闭或不存在" }, 404));
+    history.resolve();
+    assert.equal(await captured, undefined, path);
+    assert.equal(context.thread.sideThreadExpired, undefined, path);
+    assert.equal(context.relatedThreadViews.get(id)?.expired, undefined, path);
+    assert.equal(nodes.get("#composer").hidden, false, path);
+    assert.equal(nodes.get("#side-thread-expired").hidden, true, path);
+    fixture.assertRetained();
+  }
+});
+
+function sidebarDeletionHarness() {
+  const reply = deferred(), calls = [], notices = [], disk = new Map(), removedDrafts = [];
+  const target = { id: "delete-target", title: "本轮删除目标" };
+  const control = { id: "control", title: "另一会话" };
+  const controlRecord = {
+    id: "control-receipt", deviceId: "device-a", threadId: control.id, state: "unknown",
+  };
+  const context = {
+    URLSearchParams, session: { device: { id: "device-a" }, readOnly: false }, connected: true,
+    selectedId: control.id, busy: false, stopping: false, sidebarBusy: false,
+    pending: null, goalEditPending: null, goalEditDraft: null, recoveryScope: null,
+    threadDeletionStorageKey: "codex-elves-thread-deletions",
+    threadDeletions: new Map([[JSON.stringify(["device-a", control.id]), controlRecord]]),
+    sessionStorage: { setItem: (key, value) => disk.set(key, value) },
+    randomId: () => "original-delete-receipt", confirmAction: async () => true,
+    mutate: async (action, payload, options) => {
+      calls.push({ action, payload, options }); return reply.promise;
+    },
+    notice: (message, error) => notices.push({ message, error }),
+    loadSidebar: async () => { assert.fail("未知或原生已确认的迟到失败不得额外重新读取侧栏"); },
+    compactionLocked: () => false, queuedActionBusy: new Set(), queuedEditChecks: new Set(),
+    drafts: new Map([[target.id, "删除目标草稿"], [control.id, "另一会话草稿"]]),
+    skillDrafts: new Map(), attachmentDrafts: new Map(), goalDrafts: new Map(),
+    persistInputDraft: async (id, remove) => { removedDrafts.push({ id, remove }); },
+    transcriptCache: { remove() {} }, threadDisplays: new Map(), threadDisplayKey: id => id,
+    readScope: null, sessionMenu: { removeThread() {} }, persistGoalComposerRecoveries: () => true,
+    persistQueuedEdits() {}, persistCompactions() {}, cancelPromptOptimization() {},
+    recentPriorityIds: new Set([target.id, control.id]),
+    recentPriorityKnownIds: new Set([target.id, control.id]), recentPrioritySelectionSuppressions: new Set(),
+    sidebar: { recent: [target, control], pinnedThreads: [target, control],
+      projects: [{ id: "project", threads: [target, control] }] },
+    cacheDisplayData() {}, sidebarSnapshot: value => value,
+    location: { hash: "#thread=control", pathname: "/", search: "" },
+    history: { replaceState() { assert.fail("删除其他会话不得改写当前会话路由"); } },
+    renderSidebar() {}, updateComposer() {}, renderApprovals() {},
+  };
+  for (const name of ["goalComposerRecoveries", "promptOptimizations", "readMarkRequests", "queuedEdits",
+    "compactions", "blockingRequestStates", "approvalReplies", "approvalDrafts",
+    "questionReplyReceipts", "questionDrafts", "sentMessageDisplays"]) context[name] = new Map();
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  vm.runInContext([
+    sourceSection("function clearSentMessageDisplays(", "function sentMessageIdentities("),
+    sourceSection("function deleteDraft(", "function inputDraftEmpty("),
+    (sourceSection("function threadDeletionK") + "\n" + sourceSection("function filterS", "function res") + "\n" + sourceSection("function applyTh", "async function c")),
+  ].join("\n"), context);
+  const failReply = () => reply.reject(Object.assign(new TypeError("Failed to fetch"),
+    { outcomeUnknown: true, operationState: "unknown" }));
+  const assertControlRetained = () => {
+    assert.equal(context.selectedId, control.id);
+    assert.equal(context.drafts.get(control.id), "另一会话草稿");
+    assert.equal(context.threadDeletions.get(context.threadDeletionKey(control.id, "device-a")), controlRecord);
+    assert.equal(context.sidebar.recent.some(item => item.id === control.id), true);
+    assert.equal(removedDrafts.some(record => record.id === control.id), false);
+  };
+  const persisted = () => JSON.parse(disk.get(context.threadDeletionStorageKey));
+  return { context, reply, calls, notices, target, control, failReply, persisted, assertControlRetained };
+}
+
+test("删除主会话的确认文案明确包含侧边关闭和执行中限制", async () => {
+  const h = sidebarDeletionHarness();
+  let confirmation = "";
+  h.context.confirmAction = async (_title, message) => { confirmation = message; return true; };
+  h.context.loadSidebar = async () => {};
+  const deletion = h.context.deleteSidebarThread(h.target);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(confirmation, /并关闭所属临时侧边会话/);
+  assert.match(confirmation, /主会话或任一侧边会话执行中的任务需先停止/);
+  h.reply.resolve({ ok: true, threadId: h.target.id, deleted: true, status: "local_deleted" });
+  await deletion;
+});
+
+test("删除成功回执后迟到详情409只保留成功提示，不恢复会话或重发删除", async () => {
+  const h = sidebarDeletionHarness(), { context } = h;
+  const read = deferred(), timers = [], sidebarReads = [], locations = [];
+  Object.assign(context, {
+    AbortController, performance, pageLeaving: false, document: { hidden: false },
+    selectedId: h.target.id, thread: { id: h.target.id }, selectionVersion: 1, foregroundReadGeneration: 0,
+    threadRequest: null, threadReadVersion: 0, threadReadFailed: false,
+    tokenUsageVersion: 0, questionVersion: 0, statusVersion: 0, compactionVersion: 0, messageVersion: 0,
+    queueVersion: 0, queueSnapshotVersion: null, retiredQueueEpochs: new Set(),
+    privateInputScope: value => JSON.stringify([value?.device?.id, value?.device?.createdAtMs ?? null]),
+    blockingRequestState: () => ({ generation: 0 }), loadHistory: async () => {}, isMissingThreadError: () => false,
+    setTimeout(callback) { timers.push(callback); return timers.length; }, clearTimeout() {}, refreshTimer: null,
+    api: async (path, payload, _id, signal) => {
+      assert.equal(path, "/api/read/thread"); assert.equal(payload.threadId, h.target.id);
+      read.signal = signal;
+      return read.promise;
+    },
+    location: { hash: `#thread=${h.target.id}`, pathname: "/", search: "" },
+    history: { replaceState(_state, _title, value) { locations.push(value); } },
+    loadSidebar: async () => { sidebarReads.push(true); }, stopGoalLiveTimer() {},
+    showWelcome() {
+      context.resetMessages();
+      context.selectionVersion++; context.threadReadVersion++;
+      context.selectedId = null; context.thread = null; context.creating = true;
+    },
+  });
+  installMessageResetHarness(context);
+  vm.runInContext(sourceSection("async function reloadThread()", "function retireMissingEphemeralTranscript(")
+    + sourceSection("function scheduleReload()", "function scheduleSidebarRefresh("), context);
+  context.scheduleReload(); timers.shift()();
+  const oldRequest = context.threadRequest;
+  const deletion = context.deleteSidebarThread(h.target);
+  await new Promise(resolve => setImmediate(resolve));
+  h.reply.resolve({ ok: true, deleted: true, threadId: h.target.id, status: "local_deleted" });
+  await deletion;
+  assert.equal(read.signal.aborted, true);
+  assert.equal(context.threadDeleted(h.target.id), true);
+  assert.equal(context.selectedId, null);
+  assert.equal(context.drafts.has(h.target.id), false);
+  assert.equal(context.sidebar.recent.some(item => item.id === h.target.id), false);
+  assert.deepEqual(locations, ["/"]);
+  read.reject(Object.assign(new Error(`Codex 操作失败：thread not loaded: ${h.target.id}`), { code: 409 }));
+  await oldRequest.promise;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(h.notices, [{ message: "会话已永久删除", error: false }]);
+  assert.equal(context.threadDeletions.get(context.threadDeletionKey(h.target.id)).state, "deleted");
+  assert.equal(context.drafts.get(h.control.id), "另一会话草稿");
+  assert.equal(h.calls.length, 1);
+  assert.equal(sidebarReads.length, 1);
+});
+
+test("删除挂起期间同设备同会话的原生删除事实先生效，迟到HTTP失败不得重建unknown或提示失败", async () => {
+  const h = sidebarDeletionHarness();
+  const deletion = h.context.deleteSidebarThread(h.target);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls[0].action, "deleteThread");
+  assert.equal(h.calls[0].payload.threadId, h.target.id);
+  assert.equal(h.calls[0].options.receiptId, "original-delete-receipt");
+  const key = h.context.threadDeletionKey(h.target.id, "device-a");
+  assert.equal(h.context.threadDeletions.get(key).state, "submitting");
+  h.context.applyThreadDeletion(h.target.id, "device-a");
+  const confirmed = h.context.threadDeletions.get(key);
+  assert.equal(confirmed.state, "deleted");
+  assert.equal(confirmed.id, "original-delete-receipt");
+  assert.equal(h.context.drafts.has(h.target.id), false);
+  assert.equal(h.context.sidebar.recent.some(item => item.id === h.target.id), false);
+  h.failReply();
+  await deletion;
+  assert.equal(h.context.threadDeletions.get(key), confirmed);
+  assert.equal(h.persisted().find(record => record.threadId === h.target.id).state, "deleted");
+  assert.deepEqual(h.notices, []);
+  assert.equal(h.calls.length, 1);
+  h.assertControlRetained();
+});
+
+test("删除尚无原生确认时迟到HTTP失败仍保留准确原回执unknown和原错误提示", async () => {
+  const h = sidebarDeletionHarness();
+  const deletion = h.context.deleteSidebarThread(h.target);
+  await new Promise(resolve => setImmediate(resolve));
+  h.failReply();
+  await deletion;
+  const record = h.context.threadDeletions.get(h.context.threadDeletionKey(h.target.id, "device-a"));
+  assert.equal(record.id, "original-delete-receipt");
+  assert.equal(record.state, "unknown");
+  assert.equal(h.persisted().find(item => item.threadId === h.target.id).state, "unknown");
+  assert.equal(h.context.drafts.get(h.target.id), "删除目标草稿");
+  assert.equal(h.context.sidebar.recent.some(item => item.id === h.target.id), true);
+  assert.deepEqual(h.notices, [{ message: "Failed to fetch", error: true }]);
+  assert.equal(h.calls.length, 1);
+  h.assertControlRetained();
+});
+
+test("其他 Codex 持有明确拒绝删除时展示简洁提示，解除锁定并保留会话和草稿", async () => {
+  const h = sidebarDeletionHarness();
+  const deletion = h.context.deleteSidebarThread(h.target);
+  await new Promise(resolve => setImmediate(resolve));
+  const message = "该会话由其他 Codex 持有，当前无法删除。";
+  h.reply.reject(Object.assign(new Error(message), { code: 409, operationState: "failed" }));
+  await deletion;
+  assert.equal(h.context.threadDeletions.has(h.context.threadDeletionKey(h.target.id)), false);
+  assert.equal(h.context.drafts.get(h.target.id), "删除目标草稿");
+  assert.equal(h.context.sidebar.recent.some(item => item.id === h.target.id), true);
+  assert.deepEqual(h.notices, [{ message, error: true }]);
+  assert.equal(h.calls.length, 1);
+  h.assertControlRetained();
+});
+
+test("旧版删除unknown回执使用删除提示且核对时绝不重发", async () => {
+  const h = sidebarDeletionHarness();
+  const deletion = h.context.deleteSidebarThread(h.target);
+  await new Promise(resolve => setImmediate(resolve));
+  const legacy = "送达状态未知，请查看原生会话，不要重复发送";
+  const expected = "删除结果尚未确认，请在原生客户端核对，勿重复删除。";
+  h.reply.reject(Object.assign(new Error(legacy), { operationState: "unknown", outcomeUnknown: true }));
+  await deletion;
+  const key = h.context.threadDeletionKey(h.target.id);
+  const record = h.context.threadDeletions.get(key);
+  assert.equal(record.state, "unknown");
+  assert.deepEqual(h.notices, [{ message: expected, error: true }]);
+  const reads = [];
+  h.context.threadDeletionChecks = new Set();
+  h.context.api = async path => {
+    reads.push(path);
+    return { requestId: record.id, state: "unknown", result: { message: legacy } };
+  };
+  vm.runInContext(sourceSection("async function checkThre"), h.context);
+  await h.context.checkThreadDeletion(record);
+  assert.deepEqual(reads, ["/api/receipts/original-delete-receipt"]);
+  assert.equal(h.context.threadDeletions.get(key).state, "unknown");
+  assert.equal(h.context.drafts.get(h.target.id), "删除目标草稿");
+  assert.deepEqual(h.notices.at(-1), { message: expected, error: true });
+  assert.equal(h.calls.length, 1);
+  h.assertControlRetained();
+});
+
+test("服务模式返回明确删除回执后立即清理目标，不提示未确认", async () => {
+  const h = sidebarDeletionHarness();
+  let refreshed = 0;
+  h.context.loadSidebar = async () => { refreshed++; };
+  const deletion = h.context.deleteSidebarThread(h.target);
+  await new Promise(resolve => setImmediate(resolve));
+  h.reply.resolve({ ok: true, threadId: h.target.id, deleted: true, status: "local_deleted",
+    executionTransport: "app-server-stdio" });
+  await deletion;
+  assert.equal(h.context.threadDeleted(h.target.id), true);
+  assert.equal(h.context.sidebar.recent.some(item => item.id === h.target.id), false);
+  assert.deepEqual(h.notices, [{ message: "会话已永久删除", error: false }]);
+  assert.equal(refreshed, 1);
+  assert.equal(h.calls.length, 1);
+  h.assertControlRetained();
+});
+
+test("旧服务删除回执恢复后只核对原回执，不再次派发删除", async () => {
+  const h = sidebarDeletionHarness(), reads = [];
+  h.context.threadDeletionChecks = new Set();
+  const record = { id: "original-delete-receipt", threadId: h.target.id, deviceId: "device-a", state: "unknown" };
+  h.context.threadDeletions.set(h.context.threadDeletionKey(h.target.id), record);
+  h.context.api = async path => {
+    reads.push(path);
+    return { requestId: record.id, state: "completed", result: {
+      ok: true, threadId: h.target.id, deleted: true, status: "local_deleted", executionTransport: "app-server-stdio",
+    } };
+  };
+  vm.runInContext(sourceSection("async function checkThre"), h.context);
+  await h.context.checkThreadDeletion(record);
+  assert.deepEqual(reads, ["/api/receipts/original-delete-receipt"]);
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.context.threadDeleted(h.target.id), true);
+  assert.deepEqual(h.notices, [{ message: "已确认会话永久删除", error: false }]);
+  h.assertControlRetained();
+});
+
+test("删除核对拒绝串回执和矛盾成功，始终保留原会话、草稿和请求标识", async () => {
+  for (const override of [
+    { requestId: "different-request" },
+    { state: "pending" },
+    { state: "unknown" },
+    { state: "failed" },
+    { result: { ok: true, deleted: true, threadId: "delete-target", outcomeUnknown: true } },
+    { result: { ok: true, deleted: true, threadId: "another-thread" } },
+  ]) {
+    const h = sidebarDeletionHarness();
+    const record = { id: "original-delete-receipt", threadId: h.target.id, deviceId: "device-a", state: "unknown" };
+    const key = h.context.threadDeletionKey(h.target.id);
+    h.context.threadDeletions.set(key, record);
+    h.context.threadDeletionChecks = new Set();
+    h.context.api = async () => ({ requestId: record.id, state: "completed",
+      result: { ok: true, deleted: true, threadId: h.target.id }, ...override });
+    vm.runInContext(sourceSection("async function checkThre"), h.context);
+    await h.context.checkThreadDeletion(record);
+    assert.equal(h.context.threadDeleted(h.target.id), false);
+    assert.equal(h.context.threadDeletions.get(key).id, record.id);
+    assert.equal(h.context.drafts.get(h.target.id), "删除目标草稿");
+    assert.equal(h.calls.length, 0);
+    h.assertControlRetained();
+  }
+});
+
+test("明确删除失败核对解除锁定，部分清理成功仍移除已删除会话", async () => {
+  for (const outcome of ["failed", "partial"]) {
+    const h = sidebarDeletionHarness();
+    const record = { id: "original-delete-receipt", threadId: h.target.id, deviceId: "device-a", state: "unknown" };
+    const key = h.context.threadDeletionKey(h.target.id);
+    h.context.threadDeletions.set(key, record);
+    h.context.threadDeletionChecks = new Set();
+    h.context.api = async () => ({ requestId: record.id, state: outcome === "failed" ? "failed" : "completed",
+      result: outcome === "failed" ? { ok: false, notSent: true, message: "本次未删除" }
+        : { ok: true, deleted: true, threadId: h.target.id, status: "partial", message: "已删除，清理待完成" } });
+    vm.runInContext(sourceSection("async function checkThre"), h.context);
+    await h.context.checkThreadDeletion(record);
+    assert.equal(h.context.threadDeleted(h.target.id), outcome === "partial");
+    assert.equal(h.context.drafts.has(h.target.id), outcome === "failed");
+    assert.equal(h.calls.length, 0);
+    h.assertControlRetained();
+  }
+});
+
+for (const [label, deletedId, deviceId] of [
+  ["其他设备的同ID", "delete-target", "device-b"],
+  ["同设备的其他会话", "another-deleted-thread", "device-a"],
+])
+  test(`${label}已删除不得压制当前未确认删除的HTTP错误或改写其原回执`, async () => {
+    const h = sidebarDeletionHarness();
+    const deletion = h.context.deleteSidebarThread(h.target);
+    await new Promise(resolve => setImmediate(resolve));
+    h.context.applyThreadDeletion(deletedId, deviceId);
+    const otherKey = h.context.threadDeletionKey(deletedId, deviceId);
+    const confirmedOther = h.context.threadDeletions.get(otherKey);
+    h.failReply();
+    await deletion;
+    const record = h.context.threadDeletions.get(h.context.threadDeletionKey(h.target.id, "device-a"));
+    assert.equal(record.id, "original-delete-receipt");
+    assert.equal(record.state, "unknown");
+    assert.equal(h.context.threadDeletions.get(otherKey), confirmedOther);
+    assert.equal(confirmedOther.state, "deleted");
+    assert.equal(h.context.drafts.get(h.target.id), "删除目标草稿");
+    assert.deepEqual(h.notices, [{ message: "Failed to fetch", error: true }]);
+    assert.equal(h.calls.length, 1);
+    h.assertControlRetained();
+  });
+
+function sendRecoveryHarness() {
+  const actions = [], draftRemovals = [], notices = [], reads = [];
+  const prompt = { value: "专用测试草稿" }, originalText = prompt.value;
+  let nextId = 0;
+  const context = {
+    TextEncoder, clearTimeout, session: { device: { id: "device-a", createdAtMs: 1 }, capabilities: {} },
+    selectedId: "main", thread: { id: "main" }, selectionVersion: 1, selectionToken: "selection-a",
+    recoveryScope: '["device-a",1]', recoveryGeneration: 0, connected: true, creating: false,
+    busy: false, stopping: false, pending: null, sending: null, pendingSendRequest: null,
+    editingQueuedMessage: null, editingMessage: null, goalEditPending: null, pendingTimer: null,
+    selectedSkills: [], selectedGoal: null, selectedModel: "", selectedEffort: "", goalVersion: 0, queueVersion: 0,
+    snapshotDraft: () => ({ text: prompt.value, skills: [], attachments: [], goalMode: null }),
+    storedDraft: key => ({ text: context.drafts.get(key) || "", skills: [], attachments: [], goalMode: null }),
+    threadDeletionLocked: () => false, threadDeleted: () => false, threadReadOnly: () => false,
+    composerAttachmentsLoading: () => false, composerAttachmentsPayload: () => [], goalPrefix: () => null,
+    composerPrompt: text => text, compactionLocked: () => false, rememberedNewChatModel: () => null,
+    codexCreationDefaultsState: null, loadModels: async () => [],
+    isActiveThread: () => false,
+    randomId: () => `send-${++nextId}`, goalComposerAction: () => false, updateComposer() {},
+    recoveryStore: { activate: async () => {}, put: async () => {}, remove: async () => {}, clear: async () => {} },
+    savePending: value => { context.pending = value; }, clearPendingFeedbackTimer() {},
+    api: async (path, payload, requestId) => {
+      const result = deferred(); actions.push({ path, payload, requestId, ...result }); return result.promise;
+    },
+    applyQueuedSendResult: () => false, sameSkills: () => true, persistSmallInputRecoveries() {},
+    rememberSendDisplay: () => null, finishSendDisplay() {},
+    persistInputDraft: (key, remove) => {
+      draftRemovals.push({ key, remove, scope: context.recoveryScope }); return Promise.resolve();
+    },
+    notice: message => notices.push(message), loadSidebar: async () => { reads.push("sidebar"); },
+    reloadThread: async () => { reads.push("thread"); }, resetRelatedSessions() {}, clearReadViews: async () => {},
+    transcriptCache: { clear() {} }, threadDeletionStorageKey: "deletions",
+    sessionStorage: { getItem: () => null, removeItem() {} },
+    clearComposerAttachments() {}, renderSelectedSkills() {}, $: () => prompt,
+  };
+  for (const name of ["drafts", "skillDrafts", "attachmentDrafts", "goalDrafts", "draftWrites",
+    "failedInputRecoveries", "goalComposerRecoveries", "submittedDrafts", "queuedEdits", "questionDrafts",
+    "questionReplyReceipts", "questionReceiptChecks", "compactions", "blockingRequestStates", "approvalReplies",
+    "approvalDrafts", "threadDeletions", "sentMessageDisplays"]) context[name] = new Map();
+  context.drafts.set("main", originalText);
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  vm.runInContext([
+    sourceSection("function threadActionReadOnly(", "function threadReadOnlyMessage("),
+    sourceSection("function privateInputScope(", "function validRelatedThreadId("),
+    sourceSection("function clearPrivateInputs(", "async function restorePrivateInputs("),
+    sourceSection("function deleteDraft(", "function inputDraftEmpty("),
+    (sourceSection("function mat") + "\n" + sourceSection("function clearSu")),
+    (sourceSection("async function mutat", "async functi") + "\n" + sourceSection("function reportM", "function acc")),
+    sourceSection("async function sendMessage(", "async function stopGeneration("),
+  ].join("\n"), context);
+  const complete = index => actions[index].resolve({
+    requestId: actions[index].requestId, state: "completed", result: { ok: true, threadId: "main" },
+  });
+  return { context, actions, draftRemovals, notices, reads, prompt, originalText, complete };
+}
+
+test("Codex 新建发送等待模型目录，默认设置先返回时仍保留记住的模型和深度", async () => {
+  const h = sendRecoveryHarness(), c = h.context;
+  const defaults = deferred(), catalog = deferred();
+  let catalogReady = false;
+  Object.assign(c, {
+    creating: true, selectedId: null,
+    isClaude: () => false, activeBackend: () => "codex", activeInstanceId: () => "codex:local",
+    codexCreationDefaultsKey: () => "same-project-and-authorization",
+    loadCodexCreationDefaults: () => defaults.promise,
+    loadModels: async () => { await catalog.promise; catalogReady = true; },
+    rememberedNewChatModel: () => catalogReady ? { model: "remembered-model" } : null,
+    currentModelId: () => catalogReady ? "remembered-model" : "native-model",
+    currentEffort: () => catalogReady ? "high" : "xhigh",
+    newCodexPermissionMode: () => "full-access",
+    selectCreatedThread: async () => {},
+  });
+  c.session.capabilities.codexSessionDefaults = c.session.capabilities.sessionPermissions = true;
+  const query = c.$;
+  c.$ = (selector, root) => selector === "#project-select" ? { value: "project" }
+    : selector === "#permission-button" ? { value: "full-access", dataset: {} } : query(selector, root);
+  const sending = c.sendMessage();
+  defaults.resolve({ model: "native-model", reasoningEffort: "xhigh" });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.actions.length, 0, "目录尚未返回时不能发送原生默认模型");
+  catalog.resolve();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.actions.length, 1);
+  assert.equal(h.actions[0].payload.model, "remembered-model");
+  assert.equal(h.actions[0].payload.reasoningEffort, "high");
+  assert.equal(h.actions[0].payload.permissionMode, "full-access");
+  h.complete(0);
+  await sending;
+});
+
+test("新建发送保留显式和旧草稿权限，Claude 展示实例默认时仍传配置继承", async () => {
+  for (const [backend, draftMode, displayMode, expected] of [
+    ["claude", null, "plan", "configured"],
+    ["claude", null, "bypassPermissions", "configured"],
+    ["claude", "bypassPermissions", "bypassPermissions", "bypassPermissions"],
+    ["claude", "dontAsk", "", "dontAsk"],
+    ["claude", "configured", "", "configured"],
+    ["codex", "read-only", "auto", "read-only"]
+  ]) {
+    const h = sendRecoveryHarness(), { context } = h;
+    context.selectedId = null; context.creating = true;
+    context.session.capabilities.sessionPermissions = true;
+    context.isClaude = () => backend === "claude";
+    context.activeBackend = () => backend;
+    context.activeInstanceId = () => backend === "claude" ? "claude:wsl:fixture" : "codex:local";
+    context.sessionInstanceEnabled = () => true;
+    context.selectCreatedThread = async () => {};
+    context.snapshotDraft = () => ({ text: h.prompt.value, skills: [], attachments: [], goalMode: null,
+      ...(draftMode ? { permissionMode: draftMode } : {}) });
+    const query = context.$;
+    context.$ = (selector, root) => selector === "#project-select" ? { value: "project" }
+      : selector === "#permission-button" ? { value: displayMode, dataset: {} } : query(selector, root);
+    const sending = context.sendMessage();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.actions.length, 1);
+    assert.equal(h.actions[0].path, "/api/action/create");
+    assert.equal(h.actions[0].payload.permissionMode, expected);
+    h.complete(0); await sending;
+    assert.equal(h.actions.length, 1, "发送不得额外改写实例全局权限");
+  }
+});
+
+test("Claude 新建发送等待完整目录与同一权限读取，恢复 Max 和权限且不误用展示默认值", async () => {
+  for (const scenario of ["remembered", "unsupported-permission", "explicit-draft", "changed-project", "catalog-failure"]) {
+    const h = sendRecoveryHarness(), c = h.context, catalog = deferred(), permissionRead = deferred();
+    const instanceId = "claude:wsl:codex-elves-claude-test", permissionRequests = [];
+    Object.assign(c, {
+      creating: true, creationBackend: "claude", creationInstanceId: instanceId,
+      selectedId: null, thread: null, newChatModels: new Map(), localStorage: storage(),
+      models: [], modelDefaults: {}, currentThreadDisplay: () => c.thread,
+      sessionInstanceEnabled: () => true, updateComposerPermissions() {},
+      loadModels: async (_force, options) => {
+        assert.equal(options.includeAvailable, true);
+        await catalog.promise;
+        c.models = [{ model: "gpt-6.1-sol", defaultReasoningEffort: "high",
+          supportedReasoningEfforts: [{ reasoningEffort: "high" }, { reasoningEffort: "max" }] }];
+        c.modelDefaults = { model: "gpt-6.1-sol", reasoningEffort: "high" };
+        return c.models;
+      },
+      selectCreatedThread: async () => {},
+    });
+    c.session.capabilities.sessionPermissions = true;
+    const sendApi = c.api;
+    c.api = (path, payload, ...args) => {
+      if (path !== "/api/settings/permissions") return sendApi(path, payload, ...args);
+      permissionRequests.push({ path, payload });
+      return permissionRead.promise;
+    };
+    vm.runInContext((sourceSection("function rememberIns", "let modelQue") + "\n" + sourceSection("async function loadI", "function upd")), c);
+    vm.runInContext(((sourceSection("function rememberedN") + "\n" + sourceSection("function rememberNewChatMode")) + (sourceSection("function defaultMode") + "\n" + sourceSection("function currentMode") + "\n" + (sourceSection("function modelFo") + "\n" + sourceSection("function claudePendingSetting(")) + "\n" + sourceSection("async function t")) + sourceSection("function renderModelMenu(", "function fitComposerMenu(")), c);
+    c.rememberNewChatSettings({ model: "gpt-6.1-sol", reasoningEffort: "max",
+      permissionMode: scenario === "unsupported-permission" ? "bypassPermissions" : "plan" });
+    c.newChatModels.clear();
+    if (scenario === "explicit-draft") {
+      const snapshot = c.snapshotDraft;
+      c.snapshotDraft = () => ({ ...snapshot(), permissionMode: "acceptEdits" });
+    }
+    const query = c.$;
+    c.$ = (selector, root) => selector === "#project-select" ? { value: "project" }
+      : selector === "#permission-button" ? { value: "acceptEdits", dataset: {} } : query(selector, root);
+    const readingPermissions = c.loadInstancePermissionCatalog(instanceId);
+    const sending = c.sendMessage();
+    assert.equal(permissionRequests.length, 1, "发送复用已经开始的权限读取");
+    if (scenario === "changed-project") { c.creationProject = "other-project"; ++c.selectionVersion; }
+    if (scenario !== "catalog-failure") catalog.resolve();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.actions.length, 0, "权限目录未返回时不能提前发送");
+    permissionRead.resolve({ backend: "claude", instanceId, settings: { permissionMode: "acceptEdits" },
+      supportedModes: ["default", "acceptEdits", "plan"] });
+    await readingPermissions;
+    if (scenario === "catalog-failure") catalog.reject(new Error("隔离模型目录读取失败"));
+    await new Promise(resolve => setImmediate(resolve));
+    if (scenario === "changed-project" || scenario === "catalog-failure") {
+      await sending;
+      assert.equal(h.actions.length, 0);
+      assert.equal(h.prompt.value, h.originalText);
+      if (scenario === "catalog-failure") assert.match(h.notices.at(-1), /模型目录读取失败/);
+      continue;
+    }
+    assert.equal(h.actions.length, 1);
+    assert.equal(h.actions[0].payload.instanceId, instanceId);
+    assert.equal(h.actions[0].payload.model, "gpt-6.1-sol");
+    assert.equal(h.actions[0].payload.reasoningEffort, "max");
+    assert.equal(h.actions[0].payload.permissionMode, scenario === "explicit-draft" ? "acceptEdits"
+      : scenario === "unsupported-permission" ? "configured" : "plan");
+    assert.deepEqual({ ...permissionRequests[0].payload }, { instanceId });
+    h.complete(0); await sending;
+    assert.equal(h.prompt.value, "", "恢复的权限属于发送参数，不能阻止成功后的输入框清空");
+  }
+});
+
+test("继承权限的回执匹配原始草稿，不清除后来显式修改的权限或文字", () => {
+  for (const backend of ["codex", "claude"]) {
+    const h = sendRecoveryHarness(), c = h.context;
+    const draft = c.snapshotDraft();
+    const payload = { backend, projectId: "project", prompt: draft.text, permissionMode: "plan" };
+    c.submittedDrafts.set(payload, draft);
+    assert.equal(c.matchingDraft(draft, payload), true);
+    assert.equal(c.matchingDraft({ ...draft, permissionMode: "plan" }, payload), false,
+      "后来显式选择即使与发送时的默认权限相同，也属于新草稿");
+    assert.equal(c.matchingDraft({ ...draft, text: "后来编辑的文字" }, payload), false);
+    c.submittedDrafts.delete(payload);
+    assert.equal(c.matchingDraft(draft, payload), false, "没有原始提交快照时保留原权限匹配约束");
+  }
+});
+
+test("远程新建首条携带草稿 Fast 布尔值，开启时明确默认模型，发送不再额外查询能力", async () => {
+  for (const enabled of [false, true]) {
+    const h = sendRecoveryHarness(), { context } = h;
+    context.selectedId = null; context.creating = true;
+    context.session.capabilities.fastMode = true;
+    context.selectedDraftFast = enabled;
+    context.remoteFastKey = () => "fast-new";
+    context.remoteFastState = { key: "fast-new", supported: true };
+    context.currentModelId = () => "gpt-default";
+    context.selectCreatedThread = async () => {};
+    const query = context.$;
+    context.$ = (selector, root) => selector === "#project-select" ? { value: "project" } : query(selector, root);
+    const sending = context.sendMessage();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.actions.length, 1);
+    assert.equal(h.actions[0].path, "/api/action/create");
+    assert.equal(h.actions[0].payload.fastMode, enabled);
+    if (enabled) assert.equal(h.actions[0].payload.model, "gpt-default");
+    h.complete(0); await sending;
+    assert.equal(h.actions.length, 1, "Fast 能力展示不成为每次发送的串行前置请求");
+  }
+});
+
+test("Codex 新建将已解析的模型、思考深度和权限一并送达，读取期间换项目则取消发送", async () => {
+  for (const changeProject of [false, true]) {
+    const h = sendRecoveryHarness(), c = h.context, defaults = deferred();
+    Object.assign(c, { creating: true, selectedId: null, isClaude: () => false,
+      currentModelId: () => "gpt-default", currentEffort: () => "medium",
+      newCodexPermissionMode: () => "full-access", selectionVersion: 1,
+      codexCreationDefaultsKey: () => `project-${c.selectionVersion}`,
+      loadCodexCreationDefaults: () => defaults.promise,
+      loadModels: async () => [], codexCreationDefaultsState: null,
+      selectCreatedThread: async () => {} });
+    c.session.capabilities.codexSessionDefaults = true;
+    c.session.capabilities.sessionPermissions = true;
+    const query = c.$;
+    c.$ = (selector, root) => selector === "#project-select" ? { value: "project" }
+      : selector === "#permission-button" ? { value: "full-access", dataset: {} } : query(selector, root);
+    const sending = c.sendMessage();
+    assert.equal(h.actions.length, 0);
+    if (changeProject) ++c.selectionVersion;
+    defaults.resolve({ model: "gpt-default", reasoningEffort: "medium", permissionMode: "full-access" });
+    await new Promise(resolve => setImmediate(resolve));
+    if (changeProject) {
+      await sending;
+      assert.equal(h.actions.length, 0);
+      assert.equal(h.prompt.value, h.originalText);
+    } else {
+      assert.equal(h.actions.length, 1);
+      assert.equal(h.actions[0].payload.model, "gpt-default");
+      assert.equal(h.actions[0].payload.reasoningEffort, "medium");
+      assert.equal(h.actions[0].payload.permissionMode, "full-access");
+      h.complete(0); await sending;
+    }
+  }
+});
+
+test("仅当前会话保存 Fast 期间阻止抢先发送，其他会话的保存不阻塞输入", async () => {
+  const h = sendRecoveryHarness(), { context } = h;
+  context.remoteFastKey = () => "fast-current";
+  context.remoteFastWriting = { key: "fast-current" };
+  await context.sendMessage();
+  assert.equal(h.actions.length, 0);
+  assert.match(h.notices.at(-1), /正在保存 Fast/);
+  assert.equal(h.prompt.value, h.originalText);
+  context.remoteFastWriting = { key: "fast-other" };
+  const sending = context.sendMessage();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.actions.length, 1);
+  assert.equal(Object.hasOwn(h.actions[0].payload, "fastMode"), false, "旧会话直接复用原生偏好");
+  h.complete(0); await sending;
+});
+
+test("Claude 目录信任检查只在明确确认后附加精确目录，取消和已信任均不写确认参数", async () => {
+  for (const state of ["trusted", "confirm", "cancel"]) {
+    const calls = [];
+    const context = vm.createContext({ nativeConnectionVersion: 1,
+      api: async (path, payload) => {
+        calls.push({ path, payload });
+        return { ok: true, instanceId: "claude:fixture", instanceLabel: "Claude · 测试",
+          trusted: state === "trusted", trustPath: "/project" };
+      },
+      confirmAction: async (title, message, action) => {
+        calls.push({ title, message, action });
+        return state === "confirm";
+      },
+    });
+    vm.runInContext(sourceSection("async function prepa"), context);
+    const payload = { backend: "claude", instanceId: "claude:fixture", projectId: "project", prompt: "原消息" };
+    assert.equal(await context.prepareClaudeProjectCreation(payload, () => true), state !== "cancel");
+    assert.equal(calls[0].path, "/api/read/projectTrust");
+    assert.equal(payload.trustProject, state === "confirm" ? true : undefined);
+    assert.equal(payload.expectedProjectPath, state === "confirm" ? "/project" : undefined);
+    assert.equal(payload.prompt, "原消息");
+    if (state === "trusted") assert.equal(calls.length, 1);
+    else {
+      assert.match(calls[1].message, /Claude · 测试/);
+      assert.match(calls[1].message, /\/project/);
+      assert.equal(calls[1].action, "信任并继续");
+    }
+  }
+});
+
+test("Claude 信任结果实例不匹配或确认期间切换选择时不能继续发送", async () => {
+  let selected = true;
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    api: async () => ({ ok: true, trusted: false, instanceId: "claude:fixture", trustPath: "/project" }),
+    confirmAction: async () => { selected = false; return true; },
+  });
+  vm.runInContext(sourceSection("async function prepa"), context);
+  const payload = { backend: "claude", instanceId: "claude:fixture", projectId: "project" };
+  assert.equal(await context.prepareClaudeProjectCreation(payload, () => selected), false);
+  assert.equal(payload.trustProject, undefined);
+  await assert.rejects(context.prepareClaudeProjectCreation({ instanceId: "claude:other" }, () => true),
+    /检查结果不匹配/);
+});
+
+test("Claude 新建入口先等待目录信任，确认才提交一次创建，取消保留输入且不创建空会话", async () => {
+  for (const accepted of [false, true]) {
+    const h = sendRecoveryHarness(), { context } = h, approval = deferred();
+    context.creating = true;
+    context.creationBackend = "claude";
+    context.creationInstanceId = "claude:wsl:test";
+    context.appearance.sessionTypes.claude = true;
+    context.session.capabilities.claudeProjectTrust = true;
+    context.confirmAction = () => approval.promise;
+    context.selectCreatedThread = async () => {};
+    const query = context.$;
+    context.$ = (selector, root) => selector === "#project-select" ? { value: "project" } : query(selector, root);
+    vm.runInContext(sourceSection("async function prepa"), context);
+    const sending = context.sendMessage();
+    assert.equal(h.actions.length, 1);
+    assert.equal(h.actions[0].path, "/api/read/projectTrust");
+    h.actions[0].resolve({ ok: true, instanceId: "claude:wsl:test", trusted: false, trustPath: "/project" });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.actions.length, 1, "确认前不得派发 create 或首条消息");
+    approval.resolve(accepted);
+    await new Promise(resolve => setImmediate(resolve));
+    if (accepted) {
+      assert.equal(h.actions.length, 2);
+      const create = h.actions[1];
+      assert.equal(create.path, "/api/action/create");
+      assert.equal(create.payload.trustProject, true);
+      assert.equal(create.payload.expectedProjectPath, "/project");
+      create.resolve({ requestId: create.requestId, state: "completed", result: { ok: true, threadId: "created" } });
+    }
+    await sending;
+    if (!accepted) {
+      assert.equal(h.actions.length, 1);
+      assert.equal(h.prompt.value, h.originalText);
+      assert.equal(context.submittedDrafts.size, 0);
+      assert.equal(context.busy, false);
+    }
+  }
+});
+
+function idleSendDisplayHarness(mode = "native") {
+  const h = sendRecoveryHarness(), controls = cachedControlsHarness(h.context);
+  const { context } = h, frames = [], reloads = [];
+  const controlsQuery = context.$;
+  Object.assign(context, {
+    session: { ...context.session, runtime: { mode }, capabilities: { queueSendRecovery: true, compactionQueueSend: true } },
+    relatedSessionView: null, recentHistoryPage: null, relatedThreadViews: new Map(), normalizeRelatedView: () => null,
+    validRelatedThreadId: value => typeof value === "string" && /^[A-Za-z0-9_-]+$/.test(value),
+    thread: { id: "main", status: { type: "idle" }, queuedMessages: [], queuedEdits: [] },
+    turns: new Map([["previous", { id: "previous", status: "completed", items: [] }]]),
+    notifiedQueue: [], notifiedQueueEdits: [], queueSnapshotVersion: null, retiredQueueEpochs: new Set(),
+    recordDiagnostic() {}, compactionQueueSendReason: () => "",
+    scheduleReload: () => reloads.push("thread"), reloadQueue: async () => reloads.push("queue"),
+    renderMessages: () => frames.push(context.withSentMessageDisplays()),
+    updateComposer: () => context.renderQueueArea(),
+    $: (selector, root) => !root && selector === "#prompt" ? h.prompt : controlsQuery(selector, root),
+  });
+  vm.runInContext([
+    sourceSection("function acceptedSendItem(", "async function confirmPendingSend("),
+    (sourceSection("function queueSn", "function queueMessageTex") + "\n" + sourceSection("function reconcileQu", "async functi")),
+    sourceSection("function applyQueued", "function con"),
+  ].join("\n"), context);
+  const snapshot = (messages, revision) => ({
+    ok: true, threadId: "main", queuedMessages: messages, queuedEdits: [],
+    queueEpoch: "send-display-epoch", queueRevision: revision
+  });
+  const queued = action => ({
+    id: "server-message", text: action.payload.prompt, createdAt: 1, submission: { status: "queued" },
+    ...(mode === "native"
+      ? { serverQueuedMessageId: "native-message", submissionOptions: { clientUserMessageId: action.payload.clientUserMessageId } }
+      : { clientUserMessageId: action.payload.clientUserMessageId })
+  });
+  const completeQueued = (action, messages, revision) => action.resolve({
+    requestId: action.requestId, state: "completed",
+    result: { ...snapshot(messages, revision), deliveryState: "queued", confirmed: true }
+  });
+  return { ...h, queue: controls.queue, frames, reloads, snapshot, queued, completeQueued };
+}
+
+const displayedUserMessages = context => context.withSentMessageDisplays().flatMap(turn => turn.items)
+  .filter(item => item.type === "userMessage");
+
+test("纯文件和文件夹输入经过原可靠发送，成功前不显示正文且旧服务保留附件", async () => {
+  const h = idleSendDisplayHarness(), c = h.context, files = localInputFixtures();
+  h.prompt.value = "";
+  c.session.capabilities.localFileInput = true;
+  c.composerLocalInputsSupported = () => false;
+  c.composerLocalInputsPayload = () => files;
+  c.snapshotDraft = () => ({ text: "", skills: [], attachments: structuredClone(files), goalMode: null });
+  const sending = c.sendMessage();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.actions.length, 1);
+  assert.equal(h.actions[0].payload.prompt, "");
+  assert.deepEqual(h.actions[0].payload.files, files);
+  assert.equal(displayedUserMessages(c).length, 0);
+  const action = h.actions[0];
+  action.resolve({ requestId: action.requestId, state: "completed", result: {
+    ok: true, threadId: "main", clientUserMessageId: action.payload.clientUserMessageId, deliveryState: "accepted"
+  } });
+  await sending;
+  const confirmed = displayedUserMessages(c);
+  assert.equal(confirmed.length, 1);
+  assert.match(confirmed[0].content[0].text, /需求说明\.txt.*素材（文件夹）/);
+  assert.equal(h.notices.length, 0);
+  const old = sendRecoveryHarness();
+  old.prompt.value = "";
+  old.context.composerLocalInputsSupported = () => true;
+  old.context.composerLocalInputsPayload = () => files;
+  await old.context.sendMessage();
+  assert.equal(old.actions.length, 0);
+  assert.match(old.notices[0], /附件已保留/);
+});
+
+test("仅确认入队的消息留在队列，运行状态变化不能提前展示正文", async () => {
+  for (const mode of ["native", "service"]) {
+    const h = idleSendDisplayHarness(mode), { context } = h;
+    context.thread.status = { type: "active" };
+    const send = context.sendMessage();
+    await new Promise(resolve => setImmediate(resolve));
+    const action = h.actions[0], queued = h.queued(action);
+    context.applyQueueSnapshot("main", [queued], [], h.snapshot([queued], 1));
+    h.completeQueued(action, [queued], 1);
+    await send;
+    assert.equal(h.queue.hidden, false);
+    assert.equal(displayedUserMessages(context).length, 0);
+    context.thread.status = { type: "idle" };
+    context.renderMessages();
+    assert.equal(displayedUserMessages(context).length, 0, "空闲本身不证明队列消息已发送");
+    const accepted = { ...queued, remoteDeliveryState: "accepted" };
+    context.applyQueueSnapshot("main", [accepted], [], h.snapshot([accepted], 2));
+    assert.equal(displayedUserMessages(context).length, 1, "原生接受证据可确认后续自动发送");
+    context.applyQueueSnapshot("main", [], [], h.snapshot([], 3));
+    assert.equal(displayedUserMessages(context).length, 1);
+    assert.equal(h.actions.length, 1);
+  }
+});
+
+test("发送成功完整保留图片和技能，原生身份先到正文后到时不闪空", async () => {
+  const h = idleSendDisplayHarness("service"), { context } = h;
+  const image = { id: "image-1", name: "附件.png", dataUrl: "data:image/png;base64,AA==" };
+  context.composerAttachmentsPayload = () => [image];
+  context.session.capabilities.imageInput = true;
+  context.snapshotDraft = () => ({ text: h.originalText, skills: [{ name: "示例", path: "/skills/example" }], attachments: [image] });
+  const send = context.sendMessage();
+  await new Promise(resolve => setImmediate(resolve));
+  const action = h.actions[0];
+  assert.equal(displayedUserMessages(context).length, 0);
+  action.resolve({ requestId: action.requestId, state: "completed", result: {
+    ok: true, threadId: "main", deliveryState: "accepted", result: { status: "sent", turnId: "native-turn" }
+  } });
+  await send;
+  const confirmed = displayedUserMessages(context)[0];
+  assert.equal(confirmed.content.find(part => part.type === "image").url, image.dataUrl);
+  assert.equal(confirmed.content.find(part => part.type === "skill").name, "示例");
+  context.turns.set("native-turn", { id: "native-turn", items: [{ id: "native-input", type: "userMessage",
+    clientId: action.payload.clientUserMessageId, content: [] }] });
+  const adopted = displayedUserMessages(context);
+  assert.equal(adopted.length, 1);
+  assert.equal(adopted[0].id, "native-input");
+  assert.equal(adopted[0].content.find(part => part.type === "image").url, image.dataUrl);
+  assert.equal(h.actions.length, 1);
+});
+
+test("重进成功消息缓存后原生跨轮接替，正文和附件保留且只显示一次", () => {
+  const { context } = idleSendDisplayHarness();
+  const cached = { id: "cached-input", type: "userMessage", clientId: "cache-client",
+    remotePendingInput: true, remoteConfirmedInput: true, remoteDirectSend: true,
+    content: [{ type: "text", text: "已成功消息" }, { type: "image", url: "data:image/png;base64,AA==" }] };
+  context.turns.set("cached-turn", { id: "cached-turn", status: "completed", items: [cached] });
+  context.turns.set("native-turn", { id: "native-turn", status: "completed", items: [
+    { id: "native-input", type: "userMessage", clientId: "cache-client", content: [] }
+  ] });
+  const messages = displayedUserMessages(context);
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].id, "native-input");
+  assert.equal(messages[0].content.length, 2);
+  context.turns.clear();
+  assert.equal(displayedUserMessages(context).length, 1, "原生接替后短暂空历史也不能删除已显示消息");
+});
+
+test("历史同步空档内连续成功的消息按确认顺序显示，队列登记顺序不能把正文倒排", () => {
+  const { context } = idleSendDisplayHarness();
+  const first = { threadId: "main", clientUserMessageId: "first", prompt: "先登记后发送" };
+  const second = { threadId: "main", clientUserMessageId: "second", prompt: "后登记先发送" };
+  context.rememberSendDisplay(first);
+  context.rememberSendDisplay(second);
+  context.confirmSendDisplay(second, { ok: true, threadId: "main", deliveryState: "accepted" });
+  context.confirmSendDisplay(first, { ok: true, threadId: "main", deliveryState: "accepted" });
+  assert.deepEqual(Array.from(displayedUserMessages(context), item => item.clientId), ["second", "first"]);
+  context.applyQueueSnapshot("main", [], [], { queueEpoch: "order", queueRevision: 1 });
+  assert.deepEqual(Array.from(displayedUserMessages(context), item => item.clientId), ["second", "first"]);
+});
+
+// 用户反馈：切换会话后，旧消息只剩提问、被补到正文末尾或执行中轮次之前。
+function sentDisplayWindowHarness() {
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    session: { device: { id: "device" } }, selectedId: "main", privateInputScope: () => "scope",
+  });
+  installSentMessageDisplayHarness(context);
+  vm.runInContext(sourceSection("function queueMessageTex"), context);
+  const user = (id, clientId, text, extra = {}) => ({ id: `${id}-user`, type: "userMessage", clientId,
+    content: [{ type: "text", text }], ...extra });
+  const turn = (id, clientId, text, status = "completed") => ({ id, status, items: [
+    user(id, clientId, text), { id: `${id}-reply`, type: "agentMessage", text: `${text}的回复` }] });
+  const texts = () => Array.from(context.withSentMessageDisplays().flatMap(item => item.items)
+    .filter(item => item.type === "userMessage"), item => item.content[0].text);
+  return { context, user, turn, texts };
+}
+
+test("切换会话后只读到最新几轮时，已被原生接替的旧消息不按旧窗口位置补插", () => {
+  const { context, turn, texts } = sentDisplayWindowHarness();
+  context.turns = new Map([["early", turn("early", "early-client", "早期消息")]]);
+  // Codex 队列自动投递不给 accepted，原生正文出现后才确认；“立即发送”先由成功回执确认，再由原生正文接替。
+  context.reconcileSentMessageDisplays("main", [{ id: "queued-x", clientUserMessageId: "x", text: "队列消息",
+    submission: { status: "queued" } }]);
+  context.turns.set("turn-x", turn("turn-x", "x", "队列消息"));
+  context.confirmSendDisplay({ threadId: "main", clientUserMessageId: "y", prompt: "立即发送消息" },
+    { ok: true, threadId: "main", clientUserMessageId: "y", deliveryState: "accepted", turnId: "turn-y" });
+  context.turns.set("turn-y", turn("turn-y", "y", "立即发送消息"));
+  assert.deepEqual(texts(), ["早期消息", "队列消息", "立即发送消息"]);
+  context.confirmSendDisplay({ threadId: "main", clientUserMessageId: "z", prompt: "尚未同步的成功消息" },
+    { ok: true, threadId: "main", clientUserMessageId: "z", deliveryState: "accepted" });
+
+  // 切到其他会话再切回：清空旧轮次后重新读取，最新一页不含旧消息所在轮次。
+  context.settleSentMessageDisplays("main");
+  context.turns = new Map([["latest", turn("latest", "latest-client", "最近一轮")],
+    ["running", turn("running", "running-client", "执行中的提问", "inProgress")]]);
+  assert.deepEqual(texts(), ["最近一轮", "执行中的提问", "尚未同步的成功消息"],
+    "旧消息属于未加载的更早历史，不能补到执行中轮次前后；仍未见原生正文的成功消息继续显示");
+
+  // 加载更早历史后，旧消息回到所在轮次且各只显示一次。
+  context.turns = new Map([["turn-x", turn("turn-x", "x", "队列消息")],
+    ["turn-y", turn("turn-y", "y", "立即发送消息")], ...context.turns]);
+  const loaded = texts();
+  assert.deepEqual(loaded.slice(0, 2), ["队列消息", "立即发送消息"]);
+  assert.equal(loaded.filter(text => text === "队列消息" || text === "立即发送消息").length, 2);
+
+  // 切回后本视图内接替的消息仍保留原保护：整轮暂缺时不消失。
+  context.confirmSendDisplay({ threadId: "main", clientUserMessageId: "w", prompt: "切回后发送" },
+    { ok: true, threadId: "main", clientUserMessageId: "w", deliveryState: "accepted", turnId: "turn-w" });
+  context.turns.set("turn-w", turn("turn-w", "w", "切回后发送"));
+  assert.equal(texts().filter(text => text === "切回后发送").length, 1);
+  context.turns.delete("turn-w");
+  assert.equal(texts().filter(text => text === "切回后发送").length, 1, "本视图内已显示的成功消息不因整轮暂缺消失");
+});
+
+test("重启后从缓存恢复的原生副本以新读取的历史为准，旧缓存补插轮次不再插到执行中轮次之前", () => {
+  const { context, user, turn, texts } = sentDisplayWindowHarness();
+  const copy = (id, clientId, text) => ({ id, status: "completed",
+    items: [user(id, clientId, text, { remoteConfirmedInput: true })] });
+  // 旧版本把补插出来的原生副本当作完成轮次写入缓存；未见原生正文的成功投影也随缓存恢复。
+  context.turns = new Map([
+    ["latest", copy("latest", "latest-client", "最近一轮")],
+    ["turn-y", copy("turn-y", "y", "立即发送消息")],
+    ["turn-x", copy("turn-x", "x", "队列消息")],
+    ["remote-confirmed-turn:p", { id: "remote-confirmed-turn:p", status: "completed", items: [
+      { id: "remote-confirmed-input:p", type: "userMessage", clientId: "p", remotePendingInput: true,
+        remoteConfirmedInput: true, content: [{ type: "text", text: "尚未同步的成功消息" }] }] }],
+  ]);
+  assert.equal(texts().length, 4, "恢复缓存时先按缓存显示");
+  // 最新一页只有最近两轮，核对缓存时已剪除多出的旧轮次。
+  context.turns = new Map([["latest", turn("latest", "latest-client", "最近一轮")],
+    ["running", turn("running", "running-client", "执行中的提问", "inProgress")]]);
+  assert.deepEqual(texts(), ["最近一轮", "执行中的提问", "尚未同步的成功消息"]);
+});
+
+test("离开会话时只缓存已加载轮次和未见原生正文的成功投影，补插的原生副本不写成历史轮次", () => {
+  const saved = [], persisted = [];
+  const { context, turn, texts } = sentDisplayWindowHarness();
+  Object.assign(context, {
+    historyInitialized: true, historyCursor: "older-cursor", recentHistoryPage: null, sidebar: null,
+    thread: { title: "会话", cwd: "/project" }, transcriptEvents: new Map(), relatedSessionView: null,
+    relatedReturnTranscript: null, renderedItems: new Map(), renderedTurns: new Map(), renderedActivities: new Map(),
+    rememberThreadDisplay() {}, threadDeleted: () => false, threadEphemeralState: () => undefined,
+    readingPosition: () => ({ followMessages: true, scrollTop: 0, anchor: null }), normalizeRelatedView: () => null,
+    rememberReadingPosition() {},
+    transcriptCache: { put: (_device, _id, snapshot, view) => { saved.push({ snapshot, view }); return snapshot; } },
+    cacheDisplayData: (_kind, _id, value) => persisted.push(value),
+  });
+  vm.runInContext((sourceSection("function rememberTranscr") + "\n" + sourceSection("function legacySentDisplayTurn(", "let historyC")), context);
+  context.turns = new Map([["turn-x", turn("turn-x", "x", "已接替消息")], ["latest", turn("latest", "latest-client", "最近一轮")]]);
+  context.confirmSendDisplay({ threadId: "main", clientUserMessageId: "x", prompt: "已接替消息" },
+    { ok: true, threadId: "main", clientUserMessageId: "x", deliveryState: "accepted", turnId: "turn-x" });
+  context.withSentMessageDisplays();
+  context.turns.delete("turn-x");
+  context.confirmSendDisplay({ threadId: "main", clientUserMessageId: "p", prompt: "尚未同步的成功消息" },
+    { ok: true, threadId: "main", clientUserMessageId: "p", deliveryState: "accepted" });
+  assert.deepEqual(texts(), ["已接替消息", "最近一轮", "尚未同步的成功消息"], "当前视图仍保持已显示的消息");
+  context.rememberTranscript({ retainView: true });
+  const [{ snapshot, view }] = saved;
+  assert.deepEqual(Array.from(snapshot.turns, item => item.id), ["latest", "remote-confirmed-turn:p"]);
+  assert.deepEqual([...view.turns.keys()], ["latest", "remote-confirmed-turn:p"]);
+  assert.deepEqual(Array.from(persisted[0].turns, item => item.id), ["latest", "remote-confirmed-turn:p"]);
+});
+
+test("切换会话清空旧轮次后沉淀之前已接替的成功记录", async () => {
+  const h = sideCreationNavigationHarness(), calls = [];
+  Object.assign(h.context, { threadEphemeralState: () => false, isMissingThreadError: () => false,
+    notifiedQueue: null, notifiedQueueEdits: null });
+  h.context.turns.set("main-turn", { id: "main-turn", status: "completed", items: [] });
+  h.context.settleSentMessageDisplays = id => calls.push({ id, loadedTurns: h.context.turns.size });
+  await h.context.selectThread("other");
+  assert.equal(h.context.selectedId, "other");
+  assert.deepEqual(calls, [{ id: "other", loadedTurns: 0 }]);
+});
+
+test("升级后恢复旧缓存时剔除旧版补插的提问轮次，真实轮次和仍未同步的成功投影保留", () => {
+  const { context, user, turn, texts } = sentDisplayWindowHarness();
+  const legacy = (id, clientId, text) => ({ id, status: "completed",
+    items: [user(id, clientId, text, { remoteConfirmedInput: true })] });
+  const cached = { transcriptEvents: [], historyCursor: "older-cursor", followMessages: true, turns: [
+    { ...turn("latest", "latest-client", "最近一轮"), startedAt: 1, itemsView: "full" },
+    legacy("turn-y", "y", "立即发送消息"), legacy("turn-x", "x", "队列消息"),
+    { id: "question-only", status: "completed", startedAt: 2, itemsView: "full",
+      items: [user("question-only", "q", "只有提问的真实轮次", { remoteConfirmedInput: true })] },
+    { id: "remote-confirmed-turn:p", status: "completed", items: [{ id: "remote-confirmed-input:p",
+      type: "userMessage", clientId: "p", remotePendingInput: true, remoteConfirmedInput: true,
+      content: [{ type: "text", text: "尚未同步的成功消息" }] }] },
+  ] };
+  Object.assign(context, {
+    relatedReturnTranscript: null, relatedSessionView: null, relatedThreadViews: new Map(), readScope: null,
+    renderedItems: new Map(), renderedTurns: new Map(), renderedActivities: new Map(),
+    transcriptCache: { get: () => cached, takeView: () => null, remove() {} },
+    normalizeRelatedView: () => null, syncRelatedSessionLayout() {}, replaceTranscriptEvents() {},
+    renderMessages() {}, $: () => null,
+  });
+  vm.runInContext((sourceSection("function legacySentDisplayTurn(", "let historyC") + "\n" + sourceSection("function restoreTran")), context);
+  assert.equal(context.restoreTranscript("main"), cached);
+  assert.deepEqual([...context.turns.keys()], ["latest", "question-only", "remote-confirmed-turn:p"]);
+  assert.deepEqual(texts(), ["最近一轮", "只有提问的真实轮次", "尚未同步的成功消息"]);
+});
+
+test("暂停、结果未知和其他设备抢先执行都不能在成功前产生正文气泡", async () => {
+  for (const outcome of ["paused", "unknown", "peer-turn"]) {
+    const h = idleSendDisplayHarness(), { context } = h;
+    const send = context.sendMessage();
+    await new Promise(resolve => setImmediate(resolve));
+    const action = h.actions[0], queued = h.queued(action);
+    if (outcome === "paused") queued.pausedReason = "原生尚未接收";
+    if (outcome === "unknown") queued.submission = { status: "outcome-unknown" };
+    if (outcome === "peer-turn") context.thread.status = { type: "active" };
+    context.applyQueueSnapshot("main", [queued], [], h.snapshot([queued], 1));
+    assert.equal(displayedUserMessages(context).length, 0);
+    h.completeQueued(action, [queued], 1);
+    await send;
+    assert.equal(displayedUserMessages(context).length, 0);
+    assert.equal(h.queue.hidden, false);
+  }
+});
+
+test("授权清理后迟到发送回执不展示旧正文，也不删除新授权的展示记录", async () => {
+  const h = idleSendDisplayHarness(), { context } = h;
+  const send = context.sendMessage();
+  await new Promise(resolve => setImmediate(resolve));
+  const action = h.actions[0];
+  context.clearPrivateInputs();
+  assert.equal(context.sentMessageDisplays.size, 0);
+  context.session = { ...context.session, device: { id: "device-b", createdAtMs: 2 } };
+  const record = context.rememberSendDisplay({ threadId: "main", clientUserMessageId: "new-client", prompt: "新输入" });
+  action.resolve({ requestId: action.requestId, state: "completed", result: {
+    ok: true, threadId: "main", deliveryState: "accepted"
+  } });
+  await send;
+  assert.equal(context.sentMessageDisplays.size, 1);
+  assert.equal([...context.sentMessageDisplays.values()][0], record);
+  assert.equal(displayedUserMessages(context).length, 0);
+});
+
+test("真实渲染入口过滤未确认占位，已确认正文在后续渲染保留", () => {
+  const h = idleSendDisplayHarness(), { context } = h;
+  context.turns.set("native-pending", { id: "native-pending", items: [{ id: "pending-user", type: "userMessage",
+    remotePendingInput: true, clientId: "pending", content: [{ type: "text", text: "尚未成功" }] }] });
+  const originalQuery = context.$, messagesRoot = { scrollHeight: 0, scrollTop: 0 };
+  Object.assign(context, {
+    messageFrame: null, followMessages: true, composerScroll: null,
+    cancelAnimationFrame() {}, scheduleMermaidBlocks() {},
+    $: (selector, root) => !root && selector === "#messages" ? messagesRoot : originalQuery(selector, root),
+  });
+  vm.runInContext(sourceSection("function renderMessages(", "  loadMessageSkillChoices(sorted.flatMap")
+    .replace("function renderMessages(", "function projectDisplayTurns(") + "\nreturn sorted;\n}", context);
+  assert.equal(context.projectDisplayTurns().flatMap(turn => turn.items).length, 0);
+  context.confirmSendDisplay({ threadId: "main", clientUserMessageId: "success", prompt: "已经成功" },
+    { ok: true, threadId: "main", deliveryState: "accepted" });
+  assert.equal(context.projectDisplayTurns().flatMap(turn => turn.items).length, 1);
+  context.clearSentMessageDisplays("main");
+  assert.equal(context.projectDisplayTurns().flatMap(turn => turn.items).length, 0, "明确回退可清除成功展示缓存");
+});
+
+test("发送网络结果未知保留草稿和原回执，核对成功前没有正文也不重发", async () => {
+  const h = idleSendDisplayHarness("service"), { context } = h;
+  let receiptChecks = 0;
+  context.resolvePending = async () => { receiptChecks++; };
+  const send = context.sendMessage();
+  await new Promise(resolve => setImmediate(resolve));
+  const action = h.actions[0], queued = h.queued(action);
+  context.applyQueueSnapshot("main", [queued], [], h.snapshot([queued], 1));
+  action.reject(new TypeError("network unavailable"));
+  await send;
+  assert.equal(context.pending.id, action.requestId);
+  assert.equal(context.pending.payload.clientUserMessageId, action.payload.clientUserMessageId);
+  assert.equal(h.prompt.value, h.originalText);
+  assert.equal(context.drafts.get("main"), h.originalText);
+  assert.equal(displayedUserMessages(context).length, 0);
+  assert.equal(h.queue.querySelector(".queued-steer-button").disabled, true);
+  assert.equal(receiptChecks, 1);
+  assert.equal(h.actions.length, 1);
+});
+
+test("成功消息沿用普通用户气泡，正文不附加发送中或等待同步标签", () => {
+  const element = (tag, className = "", text = "") => ({
+    tag, className, text, children: [], classList: { add() {}, remove() {} },
+  });
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    element, editingMessage: null, selectedId: "main", $: () => null,
+    userDisplayContent: item => ({ text: item.content[0].text }),
+    setMarkdown: (node, text) => { node.text = text; }, userMessageSkillOptions: () => ({}),
+    reconcileChildren: (node, children) => { node.children = children; },
+    bindMessageVideos() {}, prepareRemoteTunnelAccess() {},
+  });
+  vm.runInContext(sourceSection("function renderItem(", '  if (item.type === "agentMessage"')
+    + "\nreturn null;\n}", context);
+  for (const confirmed of [false, true]) {
+    const node = context.renderItem({ id: "input", type: "userMessage", remoteDirectSend: confirmed,
+      content: [{ type: "text", text: "成功输入" }] });
+    assert.equal(node.className, "message user-message");
+    assert.equal(node.children.length, 1);
+    assert.equal(node.children[0].text, "成功输入");
+  }
+});
+
+test("旧授权普通发送的迟到成功不得清理新授权同键同内容草稿或刷新新授权页面", async () => {
+  for (const change of ["device", "created-at", "generation"]) {
+    const { context, actions, draftRemovals, reads, originalText, complete } = sendRecoveryHarness();
+    const oldSend = context.sendMessage();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(actions.length, 1);
+    context.session = { device: { id: change === "device" ? "device-b" : "device-a",
+      createdAtMs: change === "created-at" ? 2 : 1 }, capabilities: {} };
+    if (change === "generation") ++context.recoveryGeneration;
+    context.recoveryScope = context.privateInputScope(context.session);
+    context.pending = null; ++context.selectionVersion;
+    context.drafts = new Map([["main", originalText]]);
+    complete(0);
+    await oldSend;
+    assert.equal(context.drafts.get("main"), originalText, change);
+    assert.deepEqual(draftRemovals, [], change);
+    assert.deepEqual(reads, [], change);
+  }
+});
+
+test("清理旧授权后立即允许新发送，旧发送迟到成功不能释放新发送的busy或清理新稿", async () => {
+  const { context, actions, notices, originalText, complete } = sendRecoveryHarness();
+  const oldSend = context.sendMessage();
+  await new Promise(resolve => setImmediate(resolve));
+  await context.clearPrivateInputs();
+  assert.equal(context.busy, false);
+  assert.equal(context.sending, null);
+  context.session = { device: { id: "device-b", createdAtMs: 2 }, capabilities: {} };
+  context.recoveryScope = context.privateInputScope(context.session); ++context.selectionVersion;
+  context.drafts.set("main", originalText);
+  const newSend = context.sendMessage();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(actions.length, 2);
+  const currentSending = context.sending;
+  complete(0);
+  await oldSend;
+  assert.equal(context.busy, true);
+  assert.equal(context.sending, currentSending);
+  assert.equal(context.drafts.get("main"), originalText);
+  assert.deepEqual(notices, []);
+  complete(1);
+  await newSend;
+  assert.equal(context.busy, false);
+  assert.equal(context.sending, null);
+  assert.equal(context.drafts.has("main"), false);
+});
+
+test("同授权切到另一会话后原发送成功仍清理原稿，不清当前会话新稿", async () => {
+  const { context, complete, prompt } = sendRecoveryHarness();
+  const send = context.sendMessage();
+  await new Promise(resolve => setImmediate(resolve));
+  context.selectedId = "control"; context.thread = { id: "control" }; ++context.selectionVersion;
+  context.drafts.set("control", "另一会话的新稿"); prompt.value = "另一会话的新稿";
+  complete(0);
+  await send;
+  assert.equal(context.drafts.has("main"), false);
+  assert.equal(context.drafts.get("control"), "另一会话的新稿");
+  assert.equal(prompt.value, "另一会话的新稿");
+});
+
+function answeredQuestionReadHarness({ loading = false } = {}) {
+  const { context, threadReads } = queueReloadHarness(), frames = [];
+  const question = id => ({ id, method: "remote/requestUserInputAsync", params: { questions: [{ id: `${id}-field` }] } });
+  const first = question("answered"), remaining = question("remaining");
+  const blocking = { id: "blocking", method: "item/tool/requestUserInput", params: {} };
+  const key = JSON.stringify(["device-a", "main", first.id]);
+  Object.assign(context, {
+    session: { device: { id: "device-a", createdAtMs: 1 } },
+    thread: loading ? null : { id: "main", requests: [first, remaining, blocking] },
+    questionReplyReceipts: new Map([[key, {
+      id: "answer-receipt", deviceId: "device-a", threadId: "main", requestId: first.id, state: "unknown",
+    }]]),
+    questionDrafts: new Map([[key, new Map([["answered-field", "原回答"]])],
+      [JSON.stringify(["device-a", "main", remaining.id]), new Map([["remaining-field", "保留未提交回答"]])]]),
+    notifiedQuestions: null, sessionStorage: { setItem() {} }, renderSidebar() {}, approvalSignature: null,
+    renderApprovals: () => frames.push({ ids: (context.thread?.requests || []).map(request => request.id),
+      locked: context.questionReplyReceipts.has(key) }),
+  });
+  vm.runInContext((sourceSection("function replaceAsyn", "function com") + "\n" + sourceSection("async function applyQues", "async functi")), context);
+  const completeRead = (index, requests) => threadReads[index].resolve({
+    thread: { id: "main", title: "测试问答", cwd: "", requests },
+  });
+  return { context, threadReads, frames, key, first, remaining, blocking, completeRead };
+}
+
+for (const loading of [false, true]) test(`问答成功后迟到旧读不复活原题且保留其他题${loading ? "，当前详情仍在加载" : ""}`, async () => {
+  const { context, threadReads, frames, key, first, remaining, blocking, completeRead } = answeredQuestionReadHarness({ loading });
+  const oldRead = context.reloadThread();
+  const success = context.applyQuestionReceipt(key, {
+    requestId: "answer-receipt", state: "completed",
+    result: { ok: true, threadId: "main", requestId: first.id },
+  });
+  completeRead(0, [first, remaining, blocking]);
+  await new Promise(resolve => setImmediate(resolve));
+  const beforeFresh = (context.thread?.requests || []).map(request => request.id);
+  const readsBeforeFresh = threadReads.length;
+  if (threadReads[1]) completeRead(1, [remaining, blocking]);
+  await Promise.all([oldRead, success]);
+  assert.equal(readsBeforeFresh, 2);
+  assert.equal(beforeFresh.includes(first.id), false);
+  assert.equal(frames.some(frame => frame.ids.includes(first.id) && !frame.locked), false);
+  assert.equal(context.questionReplyReceipts.has(key), false);
+  assert.deepEqual(context.thread.requests.map(request => request.id), [remaining.id, blocking.id]);
+  assert.equal(context.questionDrafts.get(JSON.stringify(["device-a", "main", remaining.id])).get("remaining-field"),
+    "保留未提交回答");
+});
+
+test("实际offline再online回调立即退役旧显示读取并启动新读，保留原写和草稿", async () => {
+  const { context, refreshes, pendingWrite } = lifecycle(), listeners = new Map();
+  Object.assign(context, {
+    window: { addEventListener: (name, callback) => listeners.set(name, callback) },
+    navigator: { onLine: true }, initialAuthenticationRequired: false, connecting: null, recoveryErrorSilenceDepth: 0,
+    stream: null, connected: false,
+    stopCatalogRefresh() {}, setConnection: value => { context.connected = value; },
+    recoverQuestionReceipts() {}, refreshCachedCatalogs() {}, ensureStream() {},
+    connectionRecoveryRequest: null, privateInputScope: value => value?.device?.id,
+    startConnectionPoll() {}, cancelConnectionProbe() {}, renderConnectionIndicator() {},
+    syncConnectionState: async source => {
+      assert.equal(source, context.stream);
+      context.connected = true;
+      return true;
+    },
+    showConnectionRecovery() {},
+    DOMException,
+  });
+  vm.runInContext([
+    sourceSection("async function refreshConnectedSession(", "function setConnection("),
+    sourceSection("function withRecoveryErrorSilence(", "async function refreshAll("),
+    (sourceSection("function probeCo") + "\n" + sourceSection("function retryCo", "function ins")),
+    sourceSection('window.addEventListener("online",', 'document.addEventListener("visibilitychange", () => {\n    if (document.hidden) {\n      stopCatalogRefresh();'),
+  ].join("\n"), context);
+  const oldRefresh = context.refreshAll();
+  listeners.get("offline")(); listeners.get("online")();
+  await new Promise(resolve => setImmediate(resolve));
+  const readsBeforeOldFinished = refreshes.length, generation = context.foregroundReadGeneration;
+  for (const request of refreshes) request.resolve();
+  await new Promise(resolve => setImmediate(resolve));
+  for (const request of refreshes) request.resolve();
+  await oldRefresh;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(readsBeforeOldFinished, 2);
+  assert.equal(generation, 1);
+  assert.equal(pendingWrite.signal.aborted, false);
+  assert.equal(context.pending.id, "original-write");
+  assert.equal(context.drafts.get("thread-a"), "保留原草稿");
+});
+
+function connectionRecoveryHarness() {
+  const { context, threadReads, historyReads, notices } = queueReloadHarness();
+  const probes = [], sidebarReads = [], frames = [], receiptChecks = [], writes = [], intervals = new Map();
+  const listeners = new Map(), pendingWrite = new AbortController(), connectionIndicator = {};
+  const question = {
+    id: "existing-question", method: "item/tool/requestUserInput",
+    params: { questions: [{ id: "existing-field", question: "断线期间已生成的问题" }] },
+  };
+  const snapshot = (overrides = {}) => ({
+    device: { id: "device-a", createdAtMs: 1 }, serviceConnected: true, ...overrides,
+  });
+  const makeStream = () => ({ readyState: 1, transport: "shared", close() { this.readyState = 2; } });
+  let routeReady = false, intervalId = 0;
+  const readThread = context.api, node = context.$;
+  Object.assign(context, {
+    DOMException, EventSource: { OPEN: 1, CLOSED: 2 },
+    session: snapshot(), thread: { id: "main", title: "原会话", requests: [], queuedMessages: [] },
+    connected: false, stream: makeStream(), streamRetry: null, streamBackoff: 1000,
+    refreshRequest: null,
+    creating: false, historyInitialized: true, transcriptChecking: false, historyError: "",
+    threadReadFailed: false, latestHistoryReadFailed: false,
+    selectionController: null, historyRequest: null, sideThreadExpired: () => false,
+    isMissingThreadError: () => false,
+    nativeConnectionVersion: 0, connectionCycleVersion: 0, connectionPollVersion: 0,
+    connectionPollPending: null, recoveryErrorSilenceDepth: 0, connectionRecoveryRequest: null,
+    renderConnectionIndicator() {},
+    navigator: { onLine: true }, initialAuthenticationRequired: false, connecting: null,
+    pending: { id: "original-write", state: "unknown", controller: pendingWrite },
+    drafts: new Map([["main", "保留普通草稿"]]),
+    questionDrafts: new Map([["existing-question", "保留未提交回答"]]),
+    window: { addEventListener: (name, callback) => listeners.set(name, callback) },
+    $: selector => selector === "#connection-state" ? connectionIndicator : node(selector),
+    setConnection: value => { context.connected = value; },
+    readConnectionSession: async (_signal, _observation, options) => {
+      const probe = { ...deferred(), options }; probes.push(probe);
+      const latest = await probe.promise;
+      routeReady = true;
+      return latest;
+    },
+    api: async (...args) => {
+      assert.equal(routeReady, true, "线路尚未探测恢复时不得提前消耗当前线程读取");
+      return readThread(...args);
+    },
+    loadSidebar: async (_payload, options) => {
+      sidebarReads.push(options);
+      assert.equal(routeReady, true, "线路尚未探测恢复时不得提前读取侧栏");
+    },
+    renderApprovals: () => frames.push((context.thread?.requests || []).map(request => request.id)),
+    reconnectChangedAuthorization: async () => { receiptChecks.push("authorization-changed"); },
+    resolvePending: async () => { receiptChecks.push("original-receipt"); },
+    mutate: async (...args) => { writes.push(args); assert.fail("恢复连接不得自动重新派发写操作"); },
+    recoverQuestionReceipts: async () => {},
+    refreshCachedCatalogs() {}, ensureStream() {}, stopCatalogRefresh() {}, showConnectionRecovery() {},
+    syncGoalLiveTimer() {}, scheduleRelatedOperationCheck() {}, scheduleRelatedSessionCheck() {}, drainPendingNotificationOpen() {},
+    clearPendingFeedbackTimer() {},
+    syncActivityTimer() {}, stopActivityTimer() {}, stopGoalLiveTimer() {}, finishQueueDrag() {},
+    closeContextUsageTip() {}, rememberDraft() {}, rememberTranscript() {}, rememberReadingPosition() {},
+    stopRelatedSessionTimers() {}, sessionMenu: null, cancelConnectionProbe() {}, syncHistoryButtons() {},
+    sidebarRequest: null, sidebarTimer: null, historyController: null,
+    handleRemoteChannelEvent: () => false, scheduleRelatedMenuRefresh() {},
+    createRemoteEventStream: makeStream, sharedEventsAvailable: () => true,
+    loadModels: async () => {}, refreshSkillCatalog: async () => {},
+    connect: { poll: null },
+    setInterval(callback, delay) {
+      assert.equal(delay, 15000, "沿用既有连接轮询周期");
+      const id = ++intervalId; intervals.set(id, callback); return id;
+    },
+    clearInterval(id) { intervals.delete(id); },
+  });
+  context.document.addEventListener = (name, callback) => listeners.set(name, callback);
+  vm.runInContext([
+    sourceSection("function connectionE", "let sessionR"),
+    sourceSection("async function syncConnectionState(", "function setConnection("),
+    sourceSection("function withRecoveryErrorSilence(", "async function refreshAll("),
+    sourceSection("async function refreshAl", "function rec"),
+    sourceSection("function openStream(", "function stopConnectionPoll("),
+    (sourceSection("function stopCon", "function ret") + "\n" + sourceSection("function selectedThreadR")),
+    (sourceSection("function retireF", "async functi") + "\n" + sourceSection("function recordR")),
+    sourceSection("let promptFocusSnapshot", "function resumePage"),
+    sourceSection("function resumePage(", "function ret"),
+    (sourceSection("function probeCo") + "\n" + sourceSection("function retryCo", "function ins")),
+    `${sourceSection("function receive(event) {", "  const params = { ...event.params || {} };")}\n}`,
+    sourceSection('  $("#connection-state").onclick =', "  const toolsTrigger ="),
+    sourceSection('window.addEventListener("online",', 'document.addEventListener("visibilitychange", () => {\n    if (document.hidden) {\n      stopCatalogRefresh();'),
+    sourceSection('document.addEventListener("visibilitychange", () => {\n    if (document.hidden) {\n      stopCatalogRefresh();',
+      'window.addEventListener("popstate",'),
+  ].join("\n"), context);
+  const recover = source => {
+    if (source === "open") { context.openStream(); return context.stream.onopen(); }
+    if (source === "resync" || source === "reconnected")
+      return context.receive({ method: `remote/${source}`, params: { serviceConnected: true } });
+    if (source === "resume") { context.pageLeaving = true; return context.resumePage(); }
+    if (source === "online") return listeners.get("online")();
+    assert.equal(source, "manual");
+    return connectionIndicator.onclick();
+  };
+  const completeRead = index => threadReads[index].resolve({
+    thread: { id: "main", title: "原会话", cwd: "", requests: [question], queuedMessages: [] },
+  });
+  return {
+    context, probes, sidebarReads, frames, receiptChecks, writes, threadReads, historyReads, notices,
+    pendingWrite, question, snapshot, recover, completeRead, listeners,
+    poll: () => {
+      const callback = intervals.get(context.connect.poll);
+      assert.equal(typeof callback, "function");
+      return callback();
+    },
+  };
+}
+
+function transportRecoveryHarness() {
+  const h = connectionRecoveryHarness(), context = h.context;
+  const calls = [], sockets = [], pending = [], catalogReads = [], refreshes = [], timers = new Map();
+  const listeners = new Map([...h.listeners].map(([name, callback]) => [name, new Set([callback])]));
+  let now = 1000, sequence = 0, networkReady = false, sessionReply = null;
+  const node = () => ({
+    textContent: "", children: [], disabled: false, attributes: new Map(), classes: new Map(),
+    setAttribute(key, value) { this.attributes.set(key, value); },
+    replaceChildren(...children) { this.children = children; },
+    classList: { toggle() {} },
+  });
+  const indicator = node();
+  indicator.onclick = context.refreshConnectionFromIndicator;
+  const timer = (callback, delay, interval = false) => {
+    timers.set(++sequence, { callback, at: now + delay, delay, interval });
+    return sequence;
+  };
+  const json = value => jsonResponse(value);
+  Object.assign(context, {
+    URL, Headers, Response, TextEncoder, queueMicrotask,
+    Date: class extends Date { static now() { return now; } },
+    performance: { now: () => now },
+    location: new URL("http://recovery.example:39399/"),
+    setTimeout: (callback, delay) => timer(callback, delay),
+    clearTimeout: id => timers.delete(id),
+    setInterval: (callback, delay) => timer(callback, delay, true),
+    clearInterval: id => timers.delete(id),
+    addEventListener(name, callback) {
+      if (!listeners.has(name)) listeners.set(name, new Set());
+      listeners.get(name).add(callback);
+    },
+    removeEventListener(name, callback) { listeners.get(name)?.delete(callback); },
+    isAndroidContainer: () => false, getAndroidAppInfo: async () => ({}),
+    diagnosticLocation: () => ({}), newDiagnosticRequestId: () => `test-${++sequence}`,
+    recordDiagnostic() {}, traceDiagnosticRequest: () => ({ response() {}, finish() {} }),
+    beginPwaForegroundWork: () => () => {}, requireAuthentication() { assert.fail("网络恢复不能清除授权"); },
+    threadDeletionLocked: () => false, threadDeleted: () => false,
+    recoveryStore: { observe: async () => ({}) }, sessionRecoveryReads: new WeakMap(),
+    sessionRequest: null, connectionRtt: null, connectionLatencyVersion: 0, connectionLatencyFloor: 0,
+    channelRtts: new Map(), connectionRttDescription: "点击探测连接并刷新会话",
+    $: selector => selector === "#connection-state" ? indicator : null,
+    refreshAll: async () => { refreshes.push("read"); },
+    loadSidebar: async () => {},
+    loadModels: async () => { catalogReads.push("models"); },
+    refreshSkillCatalog: async () => { catalogReads.push("skills"); },
+    fetch(url, options) {
+      const path = new URL(url).pathname;
+      calls.push({ path, time: now, method: options.method });
+      assert.equal(options.method, "GET", "恢复探测不能发送写请求");
+      if (networkReady) {
+        if (path === "/api/session") return sessionReply ? sessionReply.promise : Promise.resolve(json(h.snapshot()));
+        return Promise.resolve(json({
+          ok: true, schemaVersion: 1, deviceId: "device-a",
+          serverId: "12345678-1234-1234-1234-123456789abc", token: "a".repeat(64),
+          expiresAtMs: now + 3600000, origins: [context.location.origin],
+        }));
+      }
+      const result = deferred(); pending.push({ path, ...result });
+      options.signal?.addEventListener("abort", () => result.reject(options.signal.reason), { once: true });
+      return result.promise;
+    },
+    WebSocket: class {
+      constructor() { sockets.push({ socket: this, time: now }); }
+      addEventListener() {}
+      close() {}
+    },
+  });
+  context.window = context;
+  context.document.createElement = node;
+  context.document.addEventListener = () => {};
+  context.document.removeEventListener = () => {};
+  vm.runInContext(channels.replace(/^import .*;\r?\n/gm, "").replace(/^export /gm, ""), context);
+  vm.runInContext([
+    sourceSection("function threadActionReadOnly(", "function threadReadOnlyMessage("),
+    (sourceSection("async function api(") + (sourceSection("function readCon", "async function r") + "\n" + sourceSection("function cancelC", "function cur"))),
+    sourceSection("function currentChan", "let stream ="),
+  ].join("\n"), context);
+  context.createRemoteEventStream = () => context.createChannelEventStream();
+  context.sharedEventsAvailable = () => false;
+  context.ensureStream = () => {};
+  const flush = async () => { for (let turn = 0; turn < 30; turn++) await Promise.resolve(); };
+  const advance = async target => {
+    for (;;) {
+      const next = [...timers].filter(([, item]) => item.at <= target).sort((a, b) => a[1].at - b[1].at)[0];
+      if (!next) break;
+      const [id, item] = next;
+      now = item.at; timers.delete(id);
+      if (item.interval) timers.set(id, { ...item, at: now + item.delay });
+      item.callback(); await flush();
+    }
+    now = target; await flush();
+  };
+  const establishCooldown = async () => {
+    context.openStream(); await flush();
+    const probe = context.readConnectionSession().catch(error => error);
+    await flush();
+    await advance(11000);
+    const discovery = context.api("/api/channels").catch(error => error);
+    await flush();
+    await advance(16000); await probe;
+    await advance(17000);
+    pending.find(item => item.path === "/api/channels").reject(new TypeError("network unavailable"));
+    await discovery; await flush();
+    assert.equal(sockets.length, 1);
+    networkReady = true;
+  };
+  return { ...h, context, indicator, calls, sockets, catalogReads, refreshes, flush, advance, establishCooldown,
+    fire: name => { for (const callback of [...listeners.get(name) || []]) callback({ isTrusted: true }); },
+    setNetworkReady: () => { networkReady = true; },
+    holdSession: () => (sessionReply = deferred()),
+    json,
+    dispose: () => { context.stream?.close(); context.stopConnectionPoll(); context.clearRemoteChannels(); timers.clear(); },
+  };
+}
+
+for (const source of ["online", "manual"])
+  test(`${source}通过真实HTTP和事件线路绕过30秒网络退避，成功前仍禁止普通请求`, async () => {
+    const h = transportRecoveryHarness(), pending = h.context.pending;
+    try {
+      await h.establishCooldown();
+      const before = h.calls.length, reply = h.holdSession();
+      if (source === "online") h.fire("online");
+      else void h.indicator.onclick();
+      await h.flush();
+      assert.equal(h.calls.length, before + 1);
+      assert.equal(h.calls.at(-1).path, "/api/session");
+      assert.equal(h.calls.at(-1).time, 17000, "不能等到47000毫秒的旧退避截止时间");
+      assert.equal(h.indicator.textContent, "正在探测…");
+      assert.equal(h.indicator.disabled, true);
+      assert.equal(h.indicator.attributes.get("aria-busy"), "true");
+      assert.equal(h.catalogReads.length, 0);
+      await assert.rejects(h.context.requestRemote("/api/read/thread", { method: "POST" }, r => r.json()),
+        error => error.notSubmitted === true);
+      const duplicate = h.indicator.onclick();
+      h.fire("online"); await h.flush();
+      assert.equal(h.calls.length, before + 1, "点击与在线事件合并为一次探测");
+      reply.resolve(h.json(h.snapshot())); await duplicate; await h.flush();
+      assert.equal(h.sockets.length, 2, "探测成功后事件通道立即重新握手");
+      assert.equal(h.sockets[1].time, 17000);
+      assert.equal(h.indicator.disabled, false);
+      assert.equal(h.context.pending, pending);
+      assert.equal(h.pendingWrite.signal.aborted, false);
+      assert.equal(h.context.drafts.get("main"), "保留普通草稿");
+      assert.equal(h.writes.length, 0);
+    } finally { h.dispose(); }
+  });
+
+for (const [status, headers] of [[429, {}], [429, { "Retry-After": "60" }], [503, { "Retry-After": "60" }]])
+  test(`手动探测保留HTTP ${status}及${headers["Retry-After"] || "默认"}限流等待`, async () => {
+    const h = transportRecoveryHarness();
+    try {
+      h.context.fetch = async () => {
+        h.calls.push("limited");
+        return jsonResponse({ message: "limited" }, status, headers);
+      };
+      await assert.rejects(h.context.raceRemoteRead("/api/session", { method: "GET" }, response => {
+        if (!response.ok) throw new Error("limited");
+        return response.json();
+      }, () => {}));
+      await h.indicator.onclick();
+      assert.equal(h.calls.length, 1, "手动点击不能越过服务端限流");
+      assert.match(h.notices.at(-1), /服务暂时限制请求/);
+      assert.equal(h.indicator.disabled, false);
+    } finally { h.dispose(); }
+  });
+
+test("显式点击在浏览器offline标记尚未更新时仍执行只读探测", async () => {
+  const h = transportRecoveryHarness();
+  try {
+    await h.establishCooldown();
+    h.context.navigator.onLine = false;
+    const before = h.calls.length, reply = h.holdSession(), probe = h.indicator.onclick();
+    await h.flush();
+    assert.equal(h.calls.length, before + 1);
+    assert.equal(h.calls.at(-1).path, "/api/session");
+    assert.equal(h.indicator.disabled, true);
+    reply.reject(new TypeError("network unavailable"));
+    await probe;
+    assert.equal(h.indicator.disabled, false);
+    assert.equal(h.writes.length, 0);
+  } finally { h.dispose(); }
+});
+
+test("手动探测失败会释放按钮，下次点击仍能越过网络退避，迟到页面结果不弹提示", async () => {
+  const h = transportRecoveryHarness();
+  try {
+    await h.establishCooldown();
+    const first = h.holdSession(), failed = h.indicator.onclick();
+    await h.flush();
+    first.reject(new TypeError("network unavailable")); await failed;
+    assert.equal(h.indicator.disabled, false);
+    assert.equal(h.notices.length, 1);
+    const count = h.calls.length, second = h.holdSession(), recovered = h.indicator.onclick();
+    await h.flush();
+    assert.equal(h.calls.length, count + 1);
+    h.context.pageLeaving = true;
+    second.reject(new TypeError("late failure")); await recovered;
+    assert.equal(h.notices.length, 1, "已离开页面不得弹出旧请求错误");
+    assert.equal(h.context.pending.id, "original-write");
+    assert.equal(h.pendingWrite.signal.aborted, false);
+  } finally { h.dispose(); }
+});
+
+for (const phase of ["connecting", "retrying", "open"])
+  test(`成功探测处理${phase}事件通道，只重新建立过时握手或解除旧退避`, async () => {
+    const h = transportRecoveryHarness();
+    try {
+      h.context.openStream(); await h.flush();
+      const original = h.sockets[0].socket;
+      if (phase === "retrying") original.onerror();
+      if (phase === "open") {
+        // 本例只验证传输层与手动探测，避免初次 onopen 同时派发独立会话读取。
+        h.context.stream.onopen = () => {};
+        original.onopen();
+      }
+      h.setNetworkReady();
+      await h.indicator.onclick(); await h.flush();
+      assert.equal(h.sockets.length, phase === "open" ? 1 : 2);
+      assert.ok(h.sockets.every(entry => entry.time === 1000), "成功探测后不得等待旧重试或握手超时");
+      if (phase === "retrying") {
+        h.sockets.at(-1).socket.onopen(); await h.flush();
+        await h.advance(2000);
+        assert.equal(h.sockets.length, 2, "已恢复的连接不能被外层旧重试计时器再次关闭");
+      }
+      assert.equal(h.writes.length, 0);
+    } finally { h.dispose(); }
+  });
+
+test("手动恢复退役旧onopen探测，旧取消错误不覆盖新连接或弹出提示", async () => {
+  const h = transportRecoveryHarness();
+  try {
+    h.context.openStream(); await h.flush();
+    h.sockets[0].socket.onopen(); await h.flush();
+    assert.equal(h.calls.filter(call => call.path === "/api/session").length, 1);
+    h.setNetworkReady();
+    await h.indicator.onclick(); await h.flush();
+    assert.equal(h.calls.filter(call => call.path === "/api/session").length, 2);
+    assert.equal(h.context.connected, true);
+    assert.deepEqual(h.notices, []);
+    assert.equal(h.indicator.disabled, false);
+  } finally { h.dispose(); }
+});
+
+test("HTTP探测成功但WebSocket构造失败时保留新退避，不递归重连", async () => {
+  const h = transportRecoveryHarness();
+  let attempts = 0;
+  try {
+    h.context.WebSocket = class { constructor() { attempts++; throw new Error("socket unavailable"); } };
+    h.context.openStream(); await h.flush();
+    assert.equal(attempts, 1);
+    h.setNetworkReady();
+    await h.indicator.onclick(); await h.flush();
+    assert.equal(attempts, 2);
+    assert.equal(h.indicator.disabled, false);
+    assert.equal(h.context.connected, false);
+  } finally { h.dispose(); }
+});
+
+test("准备导航但仍停留原页面时，beforeunload 不关闭实时连接或连接轮询", () => {
+  const h = connectionRecoveryHarness(), original = h.context.stream;
+  h.context.connected = true;
+  h.context.startConnectionPoll("device-a");
+  const poll = h.context.connect.poll;
+  h.listeners.get("beforeunload")();
+  assert.equal(h.context.pageLeaving, false, "准备导航不等于原文档已经离开");
+  assert.equal(h.context.stream, original);
+  assert.equal(original.readyState, 1);
+  assert.equal(h.context.connect.poll, poll);
+  assert.equal(h.pendingWrite.signal.aborted, false);
+});
+
+test("发送状态诊断区分未读完整、回执和压缩锁定，只在状态变化时记录计数", () => {
+  const events = [], receipt = { id: "original-write" };
+  const context = {
+    editingMessage: null, editingQueuedMessage: null, editing: false,
+    deleting: false, busy: false, stopping: false, compacting: false,
+    compactionSendReason: "", compaction: { state: "idle" },
+    session: { device: { id: "device-a" } }, connected: true, pageLeaving: false,
+    stream: { readyState: 1 }, threadReadOnly: () => false,
+    unsupportedImages: false, unsupportedProjectless: false, goalReason: "", sessionTypeEnabled: true,
+    composerAttachmentsLoading: () => false, action: "send", pending: null,
+    prompt: "不应进入日志的私人正文", hasAttachments: false, creating: false,
+    selectedId: "main", thread: null, send: {}, composerDiagnosticState: "",
+    privateInputScope: () => "device-a",
+    composerAttachmentSnapshot: () => [],
+    recordRuntimeDiagnostic: (name, fields) => events.push({ name, fields }),
+  };
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  const update = vm.runInContext(`() => {${sourceSection(
+    "  const blockedBy =", '  $("#prompt").disabled =')}}`, context);
+  update();
+  assert.equal(context.send.disabled, true);
+  assert.equal(events.at(-1).fields.blockedBy, "thread-not-loaded");
+  context.thread = { id: "main" };
+  update();
+  assert.equal(context.send.disabled, false);
+  assert.equal(events.at(-1).fields.blockedBy, "ready");
+  context.prompt += "继续编辑";
+  update();
+  assert.equal(events.length, 2, "普通输入不得逐键刷日志");
+  context.pending = receipt;
+  update();
+  assert.equal(context.send.disabled, true);
+  assert.equal(events.at(-1).fields.blockedBy, "pending-receipt");
+  assert.equal(context.pending, receipt, "记录诊断不能解除未知回执锁");
+  context.pending = null;
+  context.compacting = true; context.compaction = { state: "unknown" };
+  context.compactionSendReason = "等待原压缩回执";
+  update();
+  assert.equal(context.send.disabled, true);
+  assert.equal(events.at(-1).fields.blockedBy, "compaction-unknown");
+  context.compaction = { state: "running", nativeConfirmed: true };
+  context.compactionSendReason = "";
+  update();
+  assert.equal(context.send.disabled, false, "已确认压缩且可排队时不能因诊断改动禁用发送");
+  assert.equal(events.at(-1).fields.blockedBy, "ready");
+  context.isClaude = () => true;
+  context.active = false; context.modelsLoadedAt = 0;
+  context.currentThreadDisplay = () => context.thread;
+  update();
+  assert.equal(events.at(-1).fields.blockedBy, "claude-models");
+  context.thread.model = "history-model";
+  update();
+  assert.equal(context.send.disabled, false, "历史已知当前模型时，完整目录尚未加载也可续发");
+  assert.equal(JSON.stringify(events).includes("私人正文"), false);
+  assert.ok(events.every(({ fields }) => Number.isInteger(fields.draftChars) && fields.attachmentCount === 0));
+});
+
+for (const source of ["visibility", "cancelled-navigation", "pagehide-visible", "pagehide-pageshow"])
+  test(`${source}通过实际生命周期事件恢复读取，保留草稿与未知回执`, async () => {
+    const h = connectionRecoveryHarness(), pending = h.context.pending;
+    h.context.connected = true;
+    h.context.startConnectionPoll("device-a");
+    if (source === "cancelled-navigation") h.listeners.get("beforeunload")();
+    if (source.startsWith("pagehide")) h.listeners.get("pagehide")();
+    h.context.document.hidden = true;
+    h.listeners.get("visibilitychange")();
+    h.context.document.hidden = false;
+    if (source === "pagehide-pageshow") h.listeners.get("pageshow")();
+    else h.listeners.get("visibilitychange")();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.context.pageLeaving, false);
+    assert.equal(h.probes.length, 1, "恢复后必须实际发起连接读取，不能只恢复界面可见性");
+    h.probes[0].resolve(h.snapshot());
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.threadReads.length, 1);
+    assert.equal(h.historyReads.length, 1);
+    h.completeRead(0);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.context.thread.requests[0].id, h.question.id);
+    assert.equal(h.context.pending, pending);
+    assert.equal(h.pendingWrite.signal.aborted, false);
+    assert.equal(h.context.drafts.get("main"), "保留普通草稿");
+    assert.equal(h.context.questionDrafts.get(h.question.id), "保留未提交回答");
+    assert.equal(h.writes.length, 0);
+  });
+
+for (const source of ["open", "resync", "reconnected", "resume", "online", "manual"])
+  test(`${source}恢复先完成连接探测，再自动读出原问题，未决写和草稿保持`, async () => {
+    const h = connectionRecoveryHarness(), pending = h.context.pending;
+    const recovery = h.recover(source);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.probes.length, 1);
+    assert.equal(h.threadReads.length, 0, "探测尚未完成时不得先派发当前会话读取");
+    assert.equal(h.historyReads.length, 0, "探测尚未完成时不得先消耗历史刷新机会");
+    assert.equal(h.sidebarReads.length, 0);
+    assert.equal(h.context.refreshRequest, null);
+    assert.deepEqual(h.context.thread.requests, []);
+    h.probes[0].resolve(h.snapshot());
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.context.connected, true);
+    assert.equal(h.threadReads.length, 1);
+    assert.equal(h.historyReads.length, 1);
+    h.completeRead(0);
+    await recovery;
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.context.thread.requests[0].id, h.question.id);
+    assert.equal(h.frames.some(ids => ids.includes(h.question.id)), true);
+    assert.equal(h.context.pending, pending);
+    assert.equal(h.context.pending.state, "unknown");
+    assert.equal(h.pendingWrite.signal.aborted, false);
+    assert.equal(h.context.drafts.get("main"), "保留普通草稿");
+    assert.equal(h.context.questionDrafts.get(h.question.id), "保留未提交回答");
+    assert.equal(h.writes.length, 0);
+    assert.equal(h.notices.length, 0);
+  });
+
+for (const [label, invalidate, latest] of [
+  ["旧事件流", context => { context.stream = { readyState: 1 }; }],
+  ["旧原生连接代次", context => { ++context.nativeConnectionVersion; }],
+  ["旧连接周期", context => { ++context.connectionCycleVersion; }],
+  ["旧轮询代次", context => { ++context.connectionPollVersion; }],
+  ["已离开页面", context => { context.pageLeaving = true; }],
+  ["设备授权已更换", context => { context.session = { device: { id: "device-b", createdAtMs: 1 } }; }],
+  ["同设备授权范围已更换", () => {}, { device: { id: "device-a", createdAtMs: 2 } }],
+])
+  test(`${label}的探测结果不得派生当前会话或历史读取`, async () => {
+    const h = connectionRecoveryHarness(), pending = h.context.pending;
+    h.context.connected = true;
+    h.recover("online");
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.probes.length, 1);
+    invalidate(h.context);
+    h.probes[0].resolve(h.snapshot(latest));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.threadReads.length, 0);
+    assert.equal(h.historyReads.length, 0);
+    assert.equal(h.sidebarReads.length, 0);
+    assert.equal(h.context.pending, pending);
+    assert.equal(h.context.drafts.get("main"), "保留普通草稿");
+    assert.equal(h.writes.length, 0);
+  });
+
+for (const [label, source, prepare, latest] of [
+  ["WS仍在连接时手动刷新", "manual", context => { context.stream.readyState = 0; }, {}],
+  ["原生尚未就绪时open核对原回执", "open", () => {}, { serviceConnected: false }],
+])
+  test(`${label}只要session探测已应用就允许补读原问题`, async () => {
+    const h = connectionRecoveryHarness(), pending = h.context.pending;
+    prepare(h.context);
+    const recovery = h.recover(source);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.probes.length, 1);
+    assert.equal(h.threadReads.length, 0);
+    assert.equal(h.historyReads.length, 0);
+    h.probes[0].resolve(h.snapshot(latest));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.context.connected, false);
+    assert.equal(h.threadReads.length, 1, "已应用session结果后不得额外用WS或原生状态封锁读取");
+    assert.equal(h.historyReads.length, 1);
+    if (source === "open")
+      assert.deepEqual(h.receiptChecks, ["original-receipt"], "原回执核对不等待原生ready或全文读取完成");
+    h.completeRead(0);
+    await recovery;
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.context.thread.requests[0].id, h.question.id);
+    assert.equal(h.context.pending, pending);
+    assert.equal(h.context.drafts.get("main"), "保留普通草稿");
+    assert.equal(h.context.questionDrafts.get(h.question.id), "保留未提交回答");
+    assert.equal(h.writes.length, 0);
+  });
+
+test("open探测被冷却拒绝后，既有轮询恢复连接会补出原问题，连续在线轮询不重复读全文", async () => {
+  const h = connectionRecoveryHarness(), pending = h.context.pending;
+  const opened = h.recover("open");
+  await new Promise(resolve => setImmediate(resolve));
+  const unavailable = Object.assign(new Error("所有线路仍在冷却"), { notSubmitted: true });
+  h.probes[0].reject(unavailable);
+  await opened;
+  assert.equal(h.context.connected, false);
+  assert.equal(h.threadReads.length, 0);
+  assert.equal(h.historyReads.length, 0);
+  assert.equal(h.sidebarReads.length, 0);
+  h.context.startConnectionPoll("device-a");
+  const restored = h.poll();
+  assert.equal(h.probes.length, 2);
+  h.probes[1].resolve(h.snapshot());
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.context.connected, true);
+  assert.equal(h.threadReads.length, 1);
+  assert.equal(h.historyReads.length, 1);
+  h.completeRead(0);
+  await restored;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.context.thread.requests[0].id, h.question.id);
+  assert.equal(h.frames.some(ids => ids.includes(h.question.id)), true);
+  for (let index = 2; index < 4; index++) {
+    const online = h.poll();
+    assert.equal(h.probes.length, index + 1);
+    h.probes[index].resolve(h.snapshot());
+    await online;
+  }
+  assert.equal(h.threadReads.length, 1, "持续在线的轮询只更新连接与侧栏，不重复读取全文");
+  assert.equal(h.historyReads.length, 1);
+  assert.equal(h.context.pending, pending);
+  assert.equal(h.context.pending.state, "unknown");
+  assert.equal(h.pendingWrite.signal.aborted, false);
+  assert.equal(h.context.drafts.get("main"), "保留普通草稿");
+  assert.equal(h.context.questionDrafts.get(h.question.id), "保留未提交回答");
+  assert.equal(h.writes.length, 0);
+});
+
+test("连接一直在线但只恢复旧消息、会话设置缺失时，既有轮询自动补读并保留草稿", async () => {
+  const h = connectionRecoveryHarness();
+  h.context.connected = true;
+  h.context.thread = null;
+  h.context.transcriptChecking = true;
+  h.context.startConnectionPoll("device-a");
+  const poll = h.poll();
+  h.probes[0].resolve(h.snapshot());
+  await poll;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.threadReads.length, 1, "连接成功不能掩盖当前会话设置仍未取得");
+  assert.equal(h.historyReads.length, 1);
+  h.completeRead(0);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.context.thread.id, "main");
+  assert.equal(h.context.drafts.get("main"), "保留普通草稿");
+  assert.equal(h.writes.length, 0);
+});
+
+test("恢复补读失败后下次在线探测重试读取，成功后停止补读而不重发消息", async () => {
+  const h = connectionRecoveryHarness(), pending = h.context.pending;
+  h.context.connected = true;
+  h.context.startConnectionPoll("device-a");
+  h.recover("online");
+  await new Promise(resolve => setImmediate(resolve));
+  h.probes[0].resolve(h.snapshot());
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.threadReads.length, 1);
+  h.threadReads[0].reject(Object.assign(new Error("暂时无法读取会话设置"), { code: 503 }));
+  await new Promise(resolve => setImmediate(resolve));
+  const retry = h.poll();
+  h.probes[1].resolve(h.snapshot());
+  await retry;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.threadReads.length, 2, "首次恢复失败后不能永远只刷新连接和侧栏");
+  h.completeRead(1);
+  await new Promise(resolve => setImmediate(resolve));
+  const settled = h.poll();
+  h.probes[2].resolve(h.snapshot());
+  await settled;
+  assert.equal(h.threadReads.length, 2, "成功后不增加持续全文轮询");
+  assert.equal(h.context.pending, pending);
+  assert.equal(h.pendingWrite.signal.aborted, false);
+  assert.equal(h.writes.length, 0);
+});
+
+function sideCreationNavigationHarness() {
+  const creationReply = deferred(), writes = [], menuChanges = [], preparedStates = [], notices = [];
+  const disk = storage(), listeners = [], location = new URL("https://remote.test/#thread=main");
+  disk.removeItem = key => disk.records.delete(key);
+  const node = (tag, className = "", text = "") => ({
+    tag, className, textContent: text, children: [], inert: false,
+    classList: { add() {}, remove() {} }, setAttribute() {}, focus() {}, getBoundingClientRect: () => ({}),
+    append(...children) {
+      for (const child of children) { this.children.push(child); child.parent = this; }
+    },
+    remove() { this.parent.children = this.parent.children.filter(child => child !== this); },
+    replaceChildren(...children) { this.children = children; },
+  });
+  const body = node("body"), workspace = node("main"), prompt = { value: "M 的未发送草稿", disabled: false, focus() {} };
+  const nodes = new Map([
+    [".workspace", workspace], ["#prompt", prompt], ["#messages", node("section")],
+    ["#project-select", { value: "" }],
+    ["#project-select-slot", {}], ["#thread-title", {}], ["#thread-path", {}], ["#model-settings", { hidden: true }],
+  ]);
+  const historyEntries = [{ state: { keep: { source: "unrelated" }, position: 4 }, url: location.href }];
+  let position = 0, backCalls = 0, sequence = 0, attachments = [{ name: "main.png" }], sidebarOpen = false;
+  const history = {
+    get state() { return historyEntries[position].state; },
+    pushState(state, _title, url) {
+      location.href = new URL(url, location.href).href;
+      historyEntries.splice(++position, Infinity, { state: structuredClone(state), url: location.href });
+    },
+    replaceState(state, _title, url) {
+      location.href = new URL(url, location.href).href;
+      historyEntries[position] = { state: structuredClone(state), url: location.href };
+    },
+    back() {
+      backCalls++;
+      if (!position) return;
+      location.href = historyEntries[--position].url;
+      for (const listener of listeners) listener({ state: history.state });
+    },
+  };
+  const context = {
+    URLSearchParams, AbortController, clearTimeout, setTimeout, location, history, sessionStorage: disk,
+    session: { device: { id: "creation-device", createdAtMs: 1 },
+      capabilities: { serviceSideThreads: true, serviceSubagents: true } },
+    selectedId: "main", selectionVersion: 1, selectionToken: "main-selection",
+    relatedSelectionVersion: 0, relatedNavigationOwner: "current-page", relatedSessionView: null,
+    relatedThreadViews: new Map(), relatedThreadOperations: new Map(), sideCreationView: null,
+    sideCreationHistoryKey: "creation", relatedHistoryKey: "related", conversationHistoryKey: "position",
+    relatedOperationStorageKey: "operations", relatedReturnTranscript: null, relatedExitTransition: null,
+    relatedBackPending: false, relatedMenuTimer: null, relatedOperationTimer: null,
+    thread: { id: "main", title: "M" }, creating: false, connected: true, pageLeaving: false,
+    permissionWrites: new Map(), currentModelId: () => context.thread?.model || "",
+    currentEffort: () => context.thread?.reasoningEffort || "",
+    historyInitialized: true, historyLoading: false, selectionController: null, historyCursor: null,
+    threadRequest: null, historyRequest: null, threadReadFailed: false, latestHistoryReadFailed: false,
+    transcriptChecking: false, historyError: "", sideThreadExpired: () => false,
+    turns: new Map(), transcriptEvents: new Map(), threadReadVersion: 0,
+    tokenUsageVersion: 0, statusVersion: 0, questionVersion: 0, goalVersion: 0, compactionVersion: 0, queueVersion: 0, messageVersion: 0,
+    drafts: new Map([["other", "C 的原有草稿"]]),
+    skillDrafts: new Map([["other", [{ name: "C-skill", path: "/C/SKILL.md" }]]]),
+    attachmentDrafts: new Map([["other", [{ name: "other.png" }]]]), goalDrafts: new Map(),
+    selectedSkills: [{ name: "M-skill", path: "/M/SKILL.md" }], selectedGoal: null,
+    editingQueuedMessage: null, editingMessage: null, pendingSteer: null,
+    readScope: null, sidebar: null, sessionTools: null, recoveryErrorSilenceDepth: 0,
+    initialAuthenticationRequired: false, pendingNotificationOpen: null,
+    document: { body, hidden: false, querySelectorAll: () => [] },
+    window: { addEventListener: (_name, listener) => listeners.push(listener) },
+    matchMedia: () => ({ matches: true }), $: selector => nodes.get(selector),
+    element: node, button: (_text, _label, action) => Object.assign(node("button"), { action }),
+    randomId: () => `operation-${++sequence}`,
+    composerAttachmentSnapshot: () => structuredClone(attachments),
+    setComposerAttachments: value => { attachments = structuredClone(value); },
+    syncSelectedSkillsFromPrompt() {}, renderSelectedSkills() {}, persistInputDraft: async () => {},
+    sameSkills: (left, right) => JSON.stringify(left) === JSON.stringify(right),
+    threadDeleted: () => false, finishRelatedSessionExit() {}, stopGoalLiveTimer() {}, cancelMessageEdit() {},
+    closePopup() {}, closeComposerMenus() {}, closeMobileSidebar() { sidebarOpen = false; }, rememberTranscript() {},
+    settleSentMessageDisplays() {},
+    setSelectValue: (control, value) => { control.value = value; },
+    draftKey: () => context.selectedId || "$new:",
+    resetMessages() {}, resetComposerOptions() {}, restoreQueuedMessageEdit() {}, renderApprovals() {},
+    restoreTranscript: () => null, historyPlaceholder: () => node("p"), currentThreadDisplay: () => context.thread,
+    rememberReadingPosition() {}, renderSidebar() {}, rememberThreadDisplay() {},
+    mergeBlockingRequestsRead() {}, applyQueueRead() {}, reconcileCompaction() {}, renderMessages() {},
+    blockingRequestState: () => ({ generation: 0 }), loadHistory: async () => {},
+    applyRelatedThreadMetadata() {}, replaceTranscriptEvents() {}, refreshTranscriptEvents() {},
+    currentCompaction: () => null, syncEditableMessageMetadata() {}, scheduleMessages() {},
+    isActiveThread: () => false, markVisibleThreadRead: async () => {},
+    sessionMenuIsOpen: () => false, notice: message => notices.push(message),
+    sessionMenu: {
+      isOpen: () => false, isSuspended: () => false, close() {}, resume() {},
+      updateSideThread: (parent, item) => menuChanges.push({ parent, item }),
+    },
+    syncRelatedSessionLayout() {
+      if (context.relatedSessionView?.threadId === "created-side")
+        preparedStates.push({ view: context.sideCreationView, inert: workspace.inert });
+    },
+    updateComposer() { prompt.disabled = context.threadReadOnly(); },
+    mutate: async (action, payload, options) => {
+      writes.push({ action, payload, options });
+      return await creationReply.promise;
+    },
+    api: async (path, payload) => {
+      assert.equal(path, "/api/read/thread");
+      return { thread: { id: payload.threadId, title: payload.threadId, requests: [], transcriptEvents: [] } };
+    },
+  };
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  vm.runInContext([
+    sourceSection("function snapshotDraft()", "function inputDraftEmpty("),
+    sourceSection("function pri", "function isA"),
+    sourceSection("function rememberRelatedView(", "function syncRelatedSessionLayout("),
+    sourceSection("function conversationHis", "function sto"),
+    sourceSection("async function openRelatedThread(", "function updateSideCreationStatus("),
+    (sourceSection("function updateSideC", "function ren") + "\n" + sourceSection("function persistRela")),
+    (sourceSection("function rememberDra", "function persistQueuedEdits(") + "\n" + sourceSection("function restoreDraf", "function res")),
+    sourceSection("function filterS", "function res"),
+    (sourceSection("async function selec", "function sho") + "\n" + sourceSection("function syncThr", "function syn")),
+    sourceSection("function syncNewChatHash()", "function welcomeNode()"),
+    sourceSection("function showWel", "function sel"),
+    ((sourceSection("function selectedThreadP", "function syn") + "\n" + sourceSection("async function start", "async functi")) + (sourceSection("function mergeIn", "function set") + "\n" + sourceSection("function clientUnreadBad", "async function l") + "\n" + sourceSection("function clientUnreadThr", "function sid"))),
+    sourceSection("function selectedThreadR"),
+    sourceSection("function closeDialogsForNotification()", "function drainPendingNotificationOpen("),
+    sourceSection('window.addEventListener("popstate", event => {\n    const target =', "\n}\n"),
+    sourceSection('window.addEventListener("popstate", event => {\n    if (!session) return;', "\n}\n"),
+  ].join("\n"), context);
+  const result = { ok: true, parentThreadId: "main", threadId: "created-side",
+    thread: { id: "created-side", title: "S", viewKind: "side", sideHistoryVersion: 1, parentThreadId: "main" } };
+  const start = () => {
+    const promise = context.runRelatedOperation("createSideThread");
+    const record = [...context.relatedThreadOperations.values()][0], view = context.sideCreationView;
+    return { promise, record, view };
+  };
+  const settle = () => new Promise(resolve => setImmediate(resolve));
+  return { context, workspace, prompt, body, historyEntries, writes, menuChanges, preparedStates, notices,
+    disk, start, settle, get backCalls() { return backCalls; },
+    openSidebar: () => { sidebarOpen = true; }, isSidebarOpen: () => sidebarOpen,
+    async complete(operation) { creationReply.resolve(result); await operation.promise; await settle(); } };
+}
+
+test("PC 打开侧边会话交给右侧标签，不切换主会话、不改主草稿和历史", async () => {
+  const h = sideCreationNavigationHarness(), opened = [];
+  const beforeHistory = JSON.stringify(h.historyEntries), beforeDraft = h.prompt.value;
+  h.context.sessionTools = { openSideThread: item => { opened.push(item); return true; } };
+  let ready = false;
+  await h.context.openRelatedThread({ id: "side-one", title: "侧边一" }, "side", "main",
+    { onViewReady: () => { ready = true; } });
+  assert.equal(opened.length, 1);
+  assert.equal(opened[0].id, "side-one");
+  assert.equal(h.context.selectedId, "main");
+  assert.equal(h.context.relatedSessionView, null);
+  assert.equal(h.prompt.value, beforeDraft);
+  assert.equal(JSON.stringify(h.historyEntries), beforeHistory);
+  assert.equal(ready, true);
+});
+
+test("菜单及正文打开子智能体交给右侧只读标签，不切换主会话、草稿和历史", async () => {
+  const h = sideCreationNavigationHarness(), opened = [];
+  const beforeHistory = JSON.stringify(h.historyEntries), beforeDraft = h.prompt.value;
+  h.context.sessionTools = {
+    openSubagent: (item, options) => { opened.push({ item, options }); return true; },
+    openSideThread: () => assert.fail("子智能体不能被当成可写侧边会话"),
+  };
+  let ready = false;
+  await h.context.openRelatedThread({ id: "agent-one", name: "子智能体一", ephemeral: true }, "subagent", "main",
+    { onViewReady: () => { ready = true; } });
+  assert.equal(opened.length, 1);
+  assert.equal(opened[0].item.id, "agent-one");
+  assert.equal(opened[0].item.ephemeral, true);
+  assert.equal(opened[0].options.reveal, true);
+  assert.equal(h.context.selectedId, "main");
+  assert.equal(h.context.relatedSessionView, null);
+  assert.equal(h.prompt.value, beforeDraft);
+  assert.equal(JSON.stringify(h.historyEntries), beforeHistory);
+  assert.equal(ready, true);
+  h.context.subagentsEnabled = () => false;
+  await h.context.openRelatedThread({ id: "agent-two" }, "subagent", "main");
+  assert.equal(opened.length, 1, "能力关闭后不能打开子智能体标签");
+});
+
+test("新建侧边继承主会话尚未发送的模型和深度，创建后更改主会话不改原请求", async () => {
+  const h = sideCreationNavigationHarness();
+  h.context.thread.model = "parent-previous";
+  h.context.thread.reasoningEffort = "low";
+  h.context.currentModelId = () => "parent-selected";
+  h.context.currentEffort = () => "xhigh";
+  const operation = h.start();
+  assert.equal(h.writes.length, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.writes[0].payload)),
+    { threadId: "main", model: "parent-selected", reasoningEffort: "xhigh" });
+  h.context.currentModelId = () => "later-choice";
+  await h.complete(operation);
+  assert.equal(h.writes.length, 1);
+  assert.equal(h.writes[0].payload.model, "parent-selected");
+});
+
+test("侧边创建等待主会话权限保存，重复点击仅创建一次", async () => {
+  const h = sideCreationNavigationHarness();
+  let finish;
+  h.context.permissionWrites.set("main", { scope: h.context.privateInputScope(h.context.session),
+    completion: new Promise(resolve => { finish = resolve; }) });
+  const first = h.start(), second = h.start();
+  assert.equal(h.writes.length, 0);
+  assert.equal(h.context.relatedThreadOperations.size, 0);
+  finish(true);
+  await h.settle();
+  assert.equal(h.writes.length, 1);
+  await h.complete(first);
+  await second.promise;
+});
+
+test("等待主会话权限期间保存失败或切换会话，不创建侧边也不留待核对操作", async () => {
+  for (const changedThread of [false, true]) {
+    const h = sideCreationNavigationHarness();
+    let finish;
+    h.context.permissionWrites.set("main", { scope: h.context.privateInputScope(h.context.session),
+      completion: new Promise(resolve => { finish = resolve; }) });
+    const operation = h.start();
+    if (changedThread) h.context.selectedId = "other";
+    finish(changedThread);
+    await operation.promise;
+    assert.equal(h.writes.length, 0);
+    assert.equal(h.context.relatedThreadOperations.size, 0);
+    assert.equal(h.context.sideCreationView, null);
+  }
+});
+
+test("PC 新建侧边直接显示右侧等待标签，成功沿用原回执且主会话始终可操作", async () => {
+  const h = sideCreationNavigationHarness(), opened = [];
+  let closed = 0;
+  h.context.sessionTools = {
+    openSideCreation: () => ({ update() {}, close: () => closed++ }),
+    openSideThread: item => { opened.push(item); return true; },
+  };
+  const operation = h.start();
+  assert.ok(operation.view.dock);
+  assert.equal(h.workspace.inert, false);
+  assert.equal(h.body.children.length, 0);
+  assert.equal(h.historyEntries.length, 1);
+  await h.context.runRelatedOperation("createSideThread");
+  assert.equal(h.writes.length, 1, "同一待确认创建不能重复派发");
+  h.prompt.value = "等待期间继续编辑的主会话草稿";
+  await h.complete(operation);
+  assert.equal(h.context.selectedId, "main");
+  assert.equal(h.prompt.value, "等待期间继续编辑的主会话草稿");
+  assert.equal(h.historyEntries.length, 1);
+  assert.equal(opened.length, 1);
+  assert.equal(opened[0].id, "created-side");
+  assert.equal(closed, 1);
+  assert.equal(h.context.sideCreationView, null);
+  assert.equal(operation.record.autoOpen, true);
+});
+
+test("PC 关闭新建等待标签后，迟到成功只登记侧边关系，不强行再打开", async () => {
+  const h = sideCreationNavigationHarness(), opened = [];
+  let dismiss;
+  h.context.sessionTools = {
+    openSideCreation: options => { dismiss = options.onClose; return { update() {}, close() {} }; },
+    openSideThread: item => { opened.push(item); return true; },
+  };
+  const operation = h.start();
+  dismiss();
+  assert.equal(operation.record.autoOpen, false);
+  assert.equal(h.context.sideCreationView, null);
+  assert.equal(h.context.relatedThreadOperations.size, 1);
+  await h.complete(operation);
+  assert.equal(opened.length, 0);
+  assert.equal(h.context.relatedThreadViews.get("created-side").parentThreadId, "main");
+  assert.equal(h.context.selectedId, "main");
+  assert.equal(h.backCalls, 0);
+  assert.equal(h.writes.length, 1);
+});
+
+test("PC 只隐藏等待面板时仍登记并接替创建结果，保留面板隐藏状态", async () => {
+  const h = sideCreationNavigationHarness(), opened = [];
+  h.context.sessionTools = {
+    openSideCreation: () => ({ isVisible: () => false, update() {}, close() {} }),
+    openSideThread: (item, options) => { opened.push({ item, options }); return true; },
+  };
+  const operation = h.start();
+  await h.complete(operation);
+  assert.equal(opened.length, 1);
+  assert.equal(opened[0].options.reveal, false);
+  assert.equal(operation.record.autoOpen, true, "只隐藏面板不能取消原创建操作的接替");
+  assert.equal(h.context.selectedId, "main");
+  assert.equal(h.writes.length, 1);
+});
+
+test("新建侧边快捷键兼容 Ctrl+Alt+S 与 Cmd+Option+S，手机和不可写会话不触发", () => {
+  const calls = [], forwarded = [];
+  const context = nodeVm.createContext({ nativeConnectionVersion: 1,
+    workspaceSidePanel: false, isAndroidContainer: () => false, matchMedia: () => ({ matches: true }),
+    session: {}, creating: false, relatedSessionView: null, connected: true,
+    selectedId: "main", thread: { id: "main" }, sideThreadsEnabled: () => true, threadReadOnly: () => false,
+    document: { hidden: false, querySelector: () => null, documentElement: { dataset: {} } },
+    sessionMenu: { canCreateSideThread: () => true },
+    runRelatedOperation: async action => calls.push(action), notice() {},
+    window: { parent: { postMessage: (...args) => forwarded.push(args) } },
+    location: { origin: "http://127.0.0.1:45222" },
+  });
+  nodeVm.runInContext(sourceSection("function createDesktopSideThread(", "function showSideCreation("), context);
+  const key = changes => ({ key: "s", code: "KeyS", ctrlKey: true, altKey: true, metaKey: false,
+    preventDefault() { this.defaultPrevented = true; }, ...changes });
+  const windows = key();
+  assert.equal(context.handleSideThreadShortcut(windows), true);
+  assert.equal(windows.defaultPrevented, true);
+  assert.equal(context.handleSideThreadShortcut(key({ ctrlKey: false, metaKey: true, key: "ß" })), true);
+  for (const changes of [{ repeat: true }, { isComposing: true }, { shiftKey: true }, { altKey: false },
+    { getModifierState: () => true }, { code: "KeyA", key: "a" }])
+    assert.equal(context.handleSideThreadShortcut(key(changes)), false);
+  context.matchMedia = () => ({ matches: false });
+  assert.equal(context.handleSideThreadShortcut(key()), false);
+  context.matchMedia = () => ({ matches: true });
+  context.threadReadOnly = () => true;
+  assert.equal(context.handleSideThreadShortcut(key()), false);
+  context.threadReadOnly = () => false;
+  context.sessionMenu.canCreateSideThread = () => false;
+  assert.equal(context.handleSideThreadShortcut(key()), false);
+  assert.equal(calls.length, 2);
+  context.workspaceSidePanel = true;
+  assert.equal(context.handleSideThreadShortcut(key()), true);
+  assert.equal(forwarded.length, 1);
+  assert.equal(forwarded[0][0].type, "codex-elves-create-side-thread");
+  assert.equal(calls.length, 2, "侧边输入框只转交主页面，不从侧边再次派发");
+  context.document.documentElement.dataset.workspaceSidePanelVisible = "false";
+  assert.equal(context.handleSideThreadShortcut(key()), false);
+});
+
+test("隐藏的侧边标签即使请求打开确认也不标记已读，显示后沿用原确认流程", async () => {
+  const calls = [], document = { hidden: false, documentElement: { dataset: { workspaceSidePanelVisible: "false" } } };
+  const context = nodeVm.createContext({ nativeConnectionVersion: 1,
+    document, selectedId: "side-a", thread: { id: "side-a", hasUnreadTurn: true }, connected: true,
+    historyInitialized: true, historyError: "", transcriptChecking: false, followMessages: true,
+    threadActionReadOnly: () => false, threadDeletionLocked: () => false, threadDeleted: () => false,
+    readMarkRequests: new Map(), recentPrioritySelectionSuppressions: new Set(), sidebarReadRefreshSuppressions: new Set(),
+    session: { device: { id: "fixture-device" } }, messageVersion: 1, setTimeout() {},
+    mutate: async (...args) => calls.push(args), sessionMenu: { markSideThreadRead() {} },
+    markSidebarThreadReadLocally() {}, syncSideThreadUnread() {}, renderSidebar() {},
+  });
+  nodeVm.runInContext(sourceSection("async function markVisibleThreadRead("), context);
+  await context.markVisibleThreadRead("side-a", { opened: true });
+  assert.equal(calls.length, 0);
+  assert.equal(context.thread.hasUnreadTurn, true);
+  document.documentElement.dataset.workspaceSidePanelVisible = "true";
+  await context.markVisibleThreadRead("side-a");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], "markRead");
+  assert.equal(context.thread.hasUnreadTurn, false);
+});
+
+test("侧边页面只接收同源父页面的可见状态，其他来源不能触发已读", async () => {
+  const parent = {}, handlers = new Map(), marked = [], document = { documentElement: { dataset: {} } };
+  const context = nodeVm.createContext({ nativeConnectionVersion: 1,
+    workspaceSidePanel: true, window: { parent, addEventListener: (name, fn) => handlers.set(name, fn) },
+    location: { origin: "http://127.0.0.1:45222" }, document,
+    markVisibleThreadRead: async () => marked.push(true),
+    syncWorkspaceSidePanelState() {},
+  });
+  nodeVm.runInContext(sourceSection('window.addEventListener("message", event => {\n    if (!workspaceSidePanel', "\n}\n"), context);
+  const listener = handlers.get("message"), data = { type: "codex-elves-side-panel-visibility", visible: true };
+  listener({ source: {}, origin: context.location.origin, data });
+  listener({ source: parent, origin: "https://other.example", data });
+  assert.equal(marked.length, 0);
+  listener({ source: parent, origin: context.location.origin, data });
+  assert.equal(marked.length, 1);
+  assert.equal(document.documentElement.dataset.workspaceSidePanelVisible, "true");
+  listener({ source: parent, origin: context.location.origin, data: { ...data, visible: false } });
+  assert.equal(marked.length, 1);
+  assert.equal(document.documentElement.dataset.workspaceSidePanelVisible, "false");
+});
+
+test("侧边标签执行状态沿用原生状态并去重，排队占位和等待用户不显示执行中", () => {
+  const sent = [], parent = { postMessage: (data, origin) => sent.push({ ...data, origin }) };
+  const context = nodeVm.createContext({ nativeConnectionVersion: 1,
+    workspaceSidePanel: true, window: { parent }, location: { origin: "http://127.0.0.1:45222" },
+    workspaceSidePanelStateSignature: "", creating: false, selectedId: "side-a", connected: true, pageLeaving: false,
+    thread: { id: "side-a", status: { type: "active" } },
+  });
+  nodeVm.runInContext(sourceSection("function sidebarAttentionState(")
+    + sourceSection("function syncWorkspaceSidePanelState(", "function installSidePanelMessageListener("), context);
+  context.syncWorkspaceSidePanelState();
+  assert.equal(sent.at(-1).running, true);
+  assert.equal(sent.at(-1).threadId, "side-a");
+  assert.equal(sent.at(-1).origin, context.location.origin);
+  context.syncWorkspaceSidePanelState();
+  assert.equal(sent.length, 1);
+  context.thread.status = { type: "idle" };
+  context.thread.queuedMessages = [{ text: "尚未执行" }];
+  context.syncWorkspaceSidePanelState();
+  assert.equal(sent.at(-1).running, false);
+  context.thread.status = { type: "pending" };
+  context.syncWorkspaceSidePanelState();
+  assert.equal(sent.length, 2);
+  context.thread.status = { type: "running" };
+  context.syncWorkspaceSidePanelState();
+  assert.equal(sent.at(-1).running, true);
+  context.thread.status = { type: "active", activeFlags: ["waitingOnApproval"] };
+  context.syncWorkspaceSidePanelState();
+  assert.equal(sent.at(-1).running, false);
+  context.thread.status = "active";
+  context.syncWorkspaceSidePanelState();
+  assert.equal(sent.at(-1).running, true);
+  context.connected = false;
+  context.syncWorkspaceSidePanelState();
+  assert.equal(sent.at(-1).running, false);
+  const count = sent.length;
+  context.syncWorkspaceSidePanelState(true);
+  assert.equal(sent.length, count + 1, "父页面握手后补发当前状态，不依赖之前的推送是否到达");
+  context.workspaceSidePanel = false;
+  context.syncWorkspaceSidePanelState(true);
+  assert.equal(sent.length, count + 1);
+});
+
+test("自动进入新建页保留用户已经展开的侧栏，显式新建仍关闭侧栏", async () => {
+  const h = sideCreationNavigationHarness();
+  h.context.selectedId = null;
+  h.context.thread = null;
+  h.openSidebar();
+  h.context.showWelcome({ startNew: true });
+  await h.settle();
+  assert.equal(h.context.creating, true);
+  assert.equal(h.isSidebarOpen(), true, "自动初始化不能覆盖用户较新的展开操作");
+  await h.context.startNewChat("", { focus: false });
+  assert.equal(h.isSidebarOpen(), false, "用户明确点击新建时仍按原交互关闭侧栏");
+});
+
+test("切换会话等待缓存时重新展开侧栏，迟到缓存不得再关闭", async () => {
+  const h = sideCreationNavigationHarness(), cache = deferred();
+  Object.assign(h.context, {
+    readScope: "cache-scope", threadEphemeralState: () => false,
+    readCache: { get: () => cache.promise },
+    optionalCachedRead: task => task, persistentThreadDisplayAllowed: () => true,
+    notifiedQueue: null, notifiedQueueEdits: null, isMissingThreadError: () => false,
+  });
+  h.openSidebar();
+  const navigation = h.context.selectThread("other");
+  await h.settle();
+  h.openSidebar();
+  cache.resolve(null);
+  await navigation;
+  assert.equal(h.context.selectedId, "other");
+  assert.equal(h.isSidebarOpen(), true);
+  assert.equal(h.prompt.value, "C 的原有草稿");
+  assert.equal(h.writes.length, 0);
+});
+
+test("显式新建等待项目读取时重新展开侧栏，迟到读取不得再关闭", async () => {
+  const h = sideCreationNavigationHarness(), sidebarRead = deferred();
+  h.context.loadSidebar = () => sidebarRead.promise;
+  h.openSidebar();
+  const creating = h.context.startNewChat(undefined, { focus: false });
+  await h.settle();
+  h.openSidebar();
+  h.context.sidebar = { projects: [], recent: [], pinnedThreads: [] };
+  sidebarRead.resolve();
+  await creating;
+  assert.equal(h.context.creating, true);
+  assert.equal(h.isSidebarOpen(), true);
+});
+
+test("通知切换在侧边创建回执未到时立即解除面板，并保留两端草稿和原事务", async () => {
+  const h = sideCreationNavigationHarness(), { context, workspace, prompt, historyEntries, disk } = h;
+  const operation = h.start();
+  assert.equal(workspace.inert, true);
+  assert.equal(h.body.children.includes(operation.view.panel), true);
+  context.openNotificationThread("other");
+  await h.settle();
+  assert.equal(context.selectedId, "other");
+  assert.equal(prompt.value, "C 的原有草稿");
+  assert.equal(prompt.disabled, false);
+  assert.equal(workspace.inert, false, "创建回执未到时 C 就必须解除 inert，不能等收尾才关面板");
+  assert.equal(context.sideCreationView, null);
+  assert.equal(h.body.children.includes(operation.view.panel), false);
+  assert.equal(operation.record.autoOpen, false);
+  assert.equal(context.relatedThreadOperations.size, 1, "关闭面板不能取消或丢弃原创建事务");
+  assert.equal(JSON.parse(disk.getItem("operations"))[0].autoOpen, false);
+  assert.equal(context.drafts.get("main"), "M 的未发送草稿");
+  assert.equal(context.skillDrafts.get("main")[0].name, "M-skill");
+  assert.equal(context.attachmentDrafts.get("main")[0].name, "main.png");
+  assert.equal(context.selectedSkills[0].name, "C-skill");
+  assert.equal(context.composerAttachmentSnapshot()[0].name, "other.png");
+  assert.equal(historyEntries.length, 3);
+  for (const entry of historyEntries) {
+    assert.equal(entry.state.creation, undefined, "不能把创建标记留在原条目或复制到 C");
+    assert.deepEqual(entry.state.keep, { source: "unrelated" });
+  }
+  assert.equal(historyEntries[1].state.position, 4);
+  assert.equal(historyEntries[2].state.position, 5);
+  assert.equal(h.backCalls, 0);
+  assert.equal(h.writes.length, 1);
+  await h.complete(operation);
+});
+
+test("同一会话只有缓存历史但缺少设置时，再次选择会话会补读而非直接返回", async () => {
+  const h = sideCreationNavigationHarness(), before = h.prompt.value;
+  h.context.thread = null;
+  h.context.transcriptChecking = true;
+  let reads = 0;
+  h.context.reloadThread = async () => { reads++; h.context.thread = { id: "main", title: "M" }; };
+  await h.context.selectThread("main");
+  assert.equal(reads, 1);
+  assert.equal(h.prompt.value, before);
+  assert.equal(h.writes.length, 0);
+});
+
+test("侧边创建迟到回执只登记原父关系，不回退通知会话或覆盖继续编辑的草稿", async () => {
+  const h = sideCreationNavigationHarness(), { context, prompt } = h, operation = h.start();
+  context.openNotificationThread("other");
+  await h.settle();
+  prompt.value = "C 在等待期间继续编辑";
+  context.setComposerAttachments([{ name: "C-new.png" }]);
+  context.rememberDraft();
+  await h.complete(operation);
+  assert.equal(h.backCalls, 0, "迟到成功不能借用创建页返回动作回退当前历史");
+  assert.equal(context.location.hash, "#thread=other");
+  assert.equal(context.selectedId, "other");
+  assert.equal(prompt.value, "C 在等待期间继续编辑");
+  assert.equal(context.drafts.get("other"), prompt.value);
+  assert.equal(context.drafts.get("main"), "M 的未发送草稿");
+  assert.equal(context.composerAttachmentSnapshot()[0].name, "C-new.png");
+  assert.equal(context.attachmentDrafts.get("other")[0].name, "C-new.png");
+  assert.equal(context.selectedSkills[0].name, "C-skill");
+  assert.equal(context.sideCreationView, null);
+  assert.equal(context.relatedSessionView, null);
+  assert.equal(context.relatedThreadOperations.size, 0);
+  assert.equal(context.relatedThreadViews.get("created-side").parentThreadId, "main");
+  assert.equal(context.relatedThreadViews.get("created-side").kind, "side");
+  assert.deepEqual(h.menuChanges.map(change => [change.parent, change.item.id]), [["main", "created-side"]]);
+  assert.equal(h.writes.length, 1);
+  assert.equal(h.writes[0].options.receiptId, operation.record.id);
+});
+
+test("正常侧边创建仍保留 preparedView 过渡并自动进入新侧边", async () => {
+  const h = sideCreationNavigationHarness(), { context, workspace } = h, operation = h.start();
+  await h.complete(operation);
+  assert.equal(context.selectedId, "created-side");
+  assert.equal(context.location.hash, "#thread=created-side");
+  assert.equal(context.relatedSessionView.kind, "side");
+  assert.equal(context.relatedSessionView.parentThreadId, "main");
+  assert.equal(h.preparedStates[0].view, operation.view, "正常成功进入 S 时应保留面板到 onViewReady");
+  assert.equal(h.preparedStates[0].inert, true);
+  assert.equal(operation.record.autoOpen, true, "正常自动打开不能被误判为用户取消");
+  assert.equal(context.sideCreationView, null);
+  assert.equal(workspace.inert, false);
+  assert.equal(h.historyEntries.length, 2, "成功使用创建页条目，不额外增加一层历史");
+  assert.equal(context.history.state.creation, undefined);
+  assert.equal(h.backCalls, 0);
+  assert.equal(h.writes.length, 1);
+});
+
+test("侧边创建主动返回仍后退一次，迟到成功只登记关系且保留父会话草稿", async () => {
+  const h = sideCreationNavigationHarness(), { context, workspace, prompt } = h, operation = h.start();
+  context.requestSideCreationBack();
+  assert.equal(h.backCalls, 1);
+  assert.equal(context.sideCreationView, null);
+  assert.equal(workspace.inert, false);
+  assert.equal(operation.record.autoOpen, false);
+  assert.equal(context.selectedId, "main");
+  assert.equal(prompt.value, "M 的未发送草稿");
+  await h.complete(operation);
+  assert.equal(h.backCalls, 1);
+  assert.equal(context.selectedId, "main");
+  assert.equal(context.location.hash, "#thread=main");
+  assert.equal(prompt.value, "M 的未发送草稿");
+  assert.equal(context.relatedThreadViews.get("created-side").parentThreadId, "main");
+  assert.equal(h.writes.length, 1);
+});
+
+test("离开创建父会话仅清理本页本记录的历史键，不删除其他记录或其他页面的标记", async () => {
+  for (const mismatch of [{ owner: "other-page" }, { requestId: "other-operation" }]) {
+    const h = sideCreationNavigationHarness(), { context } = h, operation = h.start();
+    const foreign = { ...context.history.state.creation, ...mismatch };
+    context.history.replaceState({ ...context.history.state, creation: foreign }, "", context.location.href);
+    context.openNotificationThread("other");
+    await h.settle();
+    assert.equal(context.sideCreationView, null);
+    assert.equal(h.workspace.inert, false);
+    assert.deepEqual(context.history.state.creation, foreign);
+    assert.deepEqual(context.history.state.keep, { source: "unrelated" });
+    await h.complete(operation);
+    assert.equal(h.backCalls, 0);
+    assert.equal(context.selectedId, "other");
+  }
+});
+
+function approvalAreaHarness(preceding = [], viewport = { offsetTop: 0, height: 900 }, question = true) {
+  const styles = new Map(), anchor = { previousElementSibling: null,
+    getBoundingClientRect: () => ({ top: 735 }) };
+  for (const box of preceding) {
+    anchor.previousElementSibling = {
+      hidden: box.hidden === true, previousElementSibling: anchor.previousElementSibling,
+      getBoundingClientRect: () => box,
+    };
+  }
+  const root = { parentElement: anchor, childElementCount: 1, questionCard: question,
+    querySelector: selector => selector === ".question-card" && root.questionCard ? {} : null,
+    style: { setProperty: (key, value) => styles.set(key, value) } };
+  const context = { $: () => root, window: { visualViewport: viewport, innerHeight: 900 } };
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  vm.runInContext(sourceSection("function fitApprovalArea()", "function refitComposerMenus("), context);
+  return { context, root, anchor, styles, fit: () => context.fitApprovalArea(),
+    bottom: () => anchor.getBoundingClientRect().top - 8 - parseFloat(styles.get("--approval-lift")) };
+}
+
+test("问答卡紧贴输入栏上沿并覆盖队列，不再为队列菜单抬升", () => {
+  // 用户新要求参考原生问答：输入栏 top=735，卡片保留 8px 间隔，允许叠在队列 top=701 上方。
+  const queueContext = { top: 701, width: 760, height: 36 };
+  const h = approvalAreaHarness([queueContext]);
+  h.fit();
+  assert.equal(h.styles.get("--approval-lift"), "0px");
+  assert.equal(h.styles.get("--approval-available-height"), "719px");
+  assert.equal(h.bottom(), 727);
+  assert.ok(h.bottom() > queueContext.top, "问答弹层覆盖排队区域，不能抬到队列上方");
+});
+
+test("问答卡不因目标、pending 条或项目选择抬升，普通权限审批仍避让", () => {
+  for (const preceding of [
+    [{ top: 560, width: 760, height: 100 }, { top: 660, width: 760, height: 30 }],
+    [{ top: 640, width: 760, height: 40, childElementCount: 0 }],
+    [{ top: 610, width: 760, height: 80 }],
+  ]) {
+    const h = approvalAreaHarness(preceding);
+    h.fit();
+    assert.equal(h.bottom(), 727);
+    assert.equal(h.styles.get("--approval-available-height"), "719px");
+    h.root.questionCard = false; h.fit();
+    assert.equal(h.bottom(), preceding[0].top - 8);
+    assert.equal(h.styles.get("--approval-available-height"), `${preceding[0].top - 16}px`);
+  }
+});
+
+test("无前置内容、空容器或隐藏元素保留原问答卡位置与视口高度限制", () => {
+  const hidden = [
+    { top: 400, width: 760, height: 60, hidden: true },
+    { top: 500, width: 760, height: 0 },
+    { top: 600, width: 0, height: 34 },
+    { top: 0, width: 0, height: 0 },
+  ];
+  for (const preceding of [[], hidden]) {
+    const h = approvalAreaHarness(preceding);
+    h.fit();
+    assert.equal(h.styles.get("--approval-lift"), "0px");
+    assert.equal(h.styles.get("--approval-available-height"), "719px");
+    h.context.window.visualViewport = { offsetTop: 120, height: 400 };
+    h.fit();
+    assert.equal(h.bottom(), 512);
+    assert.equal(h.styles.get("--approval-available-height"), "384px");
+    h.context.window.visualViewport = null;
+    h.context.window.innerHeight = 600;
+    h.fit();
+    assert.equal(h.bottom(), 592);
+    assert.equal(h.styles.get("--approval-available-height"), "584px");
+  }
+});
+
+test("权限审批切换为问答后清理旧抬升，队列目标展开或收起都贴住输入栏", () => {
+  const content = { top: 701, width: 760, height: 36 }, h = approvalAreaHarness([content], undefined, false);
+  h.fit();
+  assert.equal(h.styles.get("--approval-lift"), "34px");
+  content.top = 560; content.height = 177;
+  h.fit();
+  assert.equal(h.styles.get("--approval-lift"), "175px");
+  h.root.questionCard = true; h.fit();
+  assert.equal(h.styles.get("--approval-lift"), "0px");
+  assert.equal(h.bottom(), 727);
+  content.height = 0;
+  h.fit();
+  assert.equal(h.styles.get("--approval-lift"), "0px");
+  h.anchor.previousElementSibling.hidden = true;
+  content.height = 177;
+  h.fit();
+  assert.equal(h.styles.get("--approval-lift"), "0px");
+  assert.equal(h.styles.get("--approval-available-height"), "719px");
+});
+
+test("问答卡无内容或没有定位锚点时不写布局，无可用视口空间时高度为零", () => {
+  const h = approvalAreaHarness([{ top: 100, width: 760, height: 80 }], { offsetTop: 200, height: 300 });
+  h.anchor.getBoundingClientRect = () => ({ top: 208 });
+  h.fit();
+  assert.equal(h.styles.get("--approval-available-height"), "0px");
+  assert.equal(h.bottom(), 200);
+  h.styles.clear(); h.root.childElementCount = 0;
+  h.fit();
+  assert.equal(h.styles.size, 0);
+  h.root.childElementCount = 1; h.root.parentElement = null;
+  h.fit();
+  assert.equal(h.styles.size, 0);
+});
+
+function sharedOrdinaryDraftHarness(initial = null) {
+  const empty = () => ({ text: "", skills: [], attachments: [], goalMode: null });
+  const disk = new Map(initial ? [["main", structuredClone(initial)]] : []), writes = [];
+  const scope = '["shared-device",1]';
+  const page = (name, loadedDraft = null) => {
+    const loaded = structuredClone(loadedDraft || empty()), prompt = { value: loaded.text, querySelector: () => null };
+    const context = {
+      selectedId: "main", creating: false, creationProject: "", session: { device: { id: "shared-device", createdAtMs: 1 } },
+      recoveryScope: scope, recoveryGeneration: 0, draftStorageError: "", draftWrites: new Map(),
+      drafts: new Map(), skillDrafts: new Map(), attachmentDrafts: new Map(), goalDrafts: new Map(),
+      selectedSkills: loaded.skills, selectedGoal: loaded.goalMode, currentAttachments: loaded.attachments,
+      editingQueuedMessage: null, pageLeaving: false, stream: null, streamRetry: null, sessionMenu: null,
+      queuedEdits: new Map(), threadEphemeralState: () => false,
+      $: () => prompt, clearTimeout, randomId: () => `${name}-changed-goal`,
+      composerAttachmentSnapshot: () => context.currentAttachments.map(image => ({ ...image })),
+      syncSelectedSkillsFromPrompt() {}, forgetPromptCanonicalText() {}, syncPromptTrailingBreak() {},
+      updateComposer() {}, closeSkillMenu() {}, updateSkillMenu: async () => {}, skillIndex: 0,
+      stopActivityTimer() {}, stopGoalLiveTimer() {}, finishQueueDrag() {}, stopRelatedSessionTimers() {},
+      rememberTranscript() {}, rememberReadingPosition() {}, closeContextUsageTip() {}, retireForegroundReads() {},
+      stopCatalogRefresh() {}, stopConnectionPoll() {}, cancelConnectionProbe() {},
+      stopClientUnreadBadgePolling() {},
+      notice() { assert.fail("内存恢复存储不应报错"); },
+      recoveryStorageMessage: error => error.message,
+      recoveryStore: {
+        async put(owner, records) {
+          assert.equal(owner, scope);
+          for (const record of records) {
+            assert.ok(["draft", "queue-edit"].includes(record.kind));
+            const value = structuredClone(record.value);
+            disk.set(record.kind === "queue-edit" ? `$queue-edit:${record.id}` : record.id, value);
+            writes.push({ page: name, kind: record.kind, value });
+          }
+        },
+        async remove(owner, kind, key) {
+          assert.equal(owner, scope); assert.ok(["draft", "queue-edit"].includes(kind));
+          disk.delete(kind === "queue-edit" ? `$queue-edit:${key}` : key);
+          writes.push({ page: name, kind: kind === "draft" ? "remove" : "remove-queue-edit" });
+        },
+      },
+    };
+    if (loadedDraft) {
+      context.drafts.set("main", loaded.text); context.skillDrafts.set("main", loaded.skills);
+      context.attachmentDrafts.set("main", loaded.attachments);
+      if (loaded.goalMode) context.goalDrafts.set("main", loaded.goalMode);
+    }
+    vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+    vm.runInContext([
+      sourceSection("const skillIdentity =", "const skillNodeKey ="),
+      sourceSection("function sna", "function res"),
+      sourceSection("function rememberDra", "function per"),
+      sourceSection("function handlePromptInput("),
+      (sourceSection("function suspendPage", "async functi") + "\n" + sourceSection("function recordR")),
+    ].join("\n"), context);
+    const settled = () => Promise.all([...context.draftWrites.values()].map(write => write.promise));
+    const input = async value => {
+      prompt.value = value;
+      context.handlePromptInput({ inputType: "insertText" });
+      await settled();
+    };
+    return { context, prompt, input, settled };
+  };
+  return { disk, writes, page, empty };
+}
+
+test("同scope旧空稿页面卸载或切换不删除另一页已持久化的新稿", async () => {
+  for (const leaving of ["unload", "switch"]) {
+    const shared = sharedOrdinaryDraftHarness(), a = shared.page("A"), b = shared.page("B");
+    await a.input("QUEUE_EDIT_UNSENT_AFTER_REFRESH_保留");
+    assert.equal(b.context.drafts.has("main"), false);
+    if (leaving === "unload") b.context.suspendPage();
+    else b.context.rememberDraft();
+    await b.settled();
+    assert.equal(shared.disk.get("main")?.text, "QUEUE_EDIT_UNSENT_AFTER_REFRESH_保留", leaving);
+    assert.equal(shared.writes.some(write => write.page === "B"), false, leaving);
+    assert.equal(a.prompt.value, "QUEUE_EDIT_UNSENT_AFTER_REFRESH_保留");
+  }
+});
+
+test("同scope旧非空稿页面未编辑时卸载或切换不覆盖另一页的新稿", async () => {
+  const original = { text: "两页最初共同恢复的原稿", skills: [], attachments: [], goalMode: null };
+  for (const leaving of ["unload", "switch"]) {
+    const shared = sharedOrdinaryDraftHarness(original), a = shared.page("A", original), b = shared.page("B", original);
+    await a.input("A后来编辑的新稿");
+    if (leaving === "unload") b.context.suspendPage();
+    else b.context.rememberDraft();
+    await b.settled();
+    assert.equal(shared.disk.get("main")?.text, "A后来编辑的新稿", leaving);
+    assert.equal(shared.writes.some(write => write.page === "B"), false, leaving);
+    assert.equal(b.prompt.value, original.text);
+  }
+});
+
+test("同scope页面主动清空自己的普通草稿仍删除持久记录，卸载不重复保存", async () => {
+  const original = { text: "用户准备主动清空的草稿", skills: [], attachments: [], goalMode: null };
+  const shared = sharedOrdinaryDraftHarness(original), b = shared.page("B", original);
+  await b.input("");
+  assert.equal(shared.disk.has("main"), false);
+  assert.deepEqual(shared.writes, [{ page: "B", kind: "remove" }]);
+  b.context.suspendPage();
+  await b.settled();
+  assert.equal(shared.writes.length, 1);
+});
+
+test("普通输入及Skill位置、附件和目标模式的实际改动继续持久化，未改动离开不重写", async () => {
+  const shared = sharedOrdinaryDraftHarness(), a = shared.page("A");
+  await a.input("普通输入");
+  assert.equal(shared.disk.get("main").text, "普通输入");
+  a.context.selectedSkills = [{ name: "chosen", path: "/test/SKILL.md", _offset: 0 }];
+  a.context.rememberDraft(); await a.settled();
+  a.context.selectedSkills = [{ ...a.context.selectedSkills[0], _offset: 2 }];
+  a.context.rememberDraft(); await a.settled();
+  assert.equal(shared.disk.get("main").skills[0]._offset, 2);
+  a.context.currentAttachments = [{ kind: "inline", name: "draft.png", mime: "image/png",
+    dataUrl: "data:image/png;base64,ZHJhZnQ=", size: 5 }];
+  a.context.rememberDraft(); await a.settled();
+  assert.equal(shared.disk.get("main").attachments[0].dataUrl, a.context.currentAttachments[0].dataUrl);
+  a.context.selectedGoal = "goal-draft";
+  a.context.rememberDraft(); await a.settled();
+  assert.equal(shared.disk.get("main").goalMode, "goal-draft");
+  const count = shared.writes.length;
+  a.context.rememberDraft(); a.context.suspendPage(); await a.settled();
+  assert.equal(shared.writes.length, count);
+});
+
+function threadDisplayCacheHarness(existing = null) {
+  const persisted = [];
+  const context = existing || vm.createContext({ nativeConnectionVersion: 1,
+    session: { device: { id: "display-device", createdAtMs: 1 } },
+    selectedId: "main", thread: null, relatedSessionView: null, recentHistoryPage: null,
+    relatedThreadViews: new Map(), normalizeRelatedView: () => null,
+    privateInputScope: value => JSON.stringify([value.device.id, value.device.createdAtMs]),
+    validRelatedThreadId: value => typeof value === "string" && /^[A-Za-z0-9_-]+$/.test(value),
+    threadDeleted: () => false,
+  });
+  Object.assign(context, {
+    sentMessageDisplays: new Map(), reconcileSentMessageDisplays: () => false,
+    threadDisplays: new Map(), contextUsage: () => null, syncRelatedModelDisplay() {},
+    readCache: { put: async (scope, kind, id, value) => {
+      persisted.push({ scope, kind, id, value: structuredClone(value) });
+    } },
+  });
+  context.recentHistoryPage ??= null;
+  context.notifiedQueue ??= null;
+  context.notifiedQueueEdits ??= null;
+  context.discardPersistentThreadDisplay ||= () => {};
+  if (!Object.hasOwn(context, "readScope")) context.readScope = context.privateInputScope(context.session);
+  vm.runInContext([
+    sourceSection("function threadEphemeralState(", "function discardPersistentThreadDisplay("),
+    sourceSection("function persistentT", "function own"),
+    sourceSection("function rememberThr", "async functi"),
+    sourceSection("function queueSnapshotIsVersioned(", "function queueMessageIdentity("),
+  ].join("\n"), context);
+  return { context, persisted };
+}
+
+function cachedControlsHarness(existing = null) {
+  const { context, persisted } = threadDisplayCacheHarness(existing);
+  const element = (tag, className = "", text = "") => ({
+    tag, className, text, dataset: {}, attributes: {}, children: [], hidden: false,
+    append(...children) { this.children.push(...children); },
+    replaceChildren(...children) { this.children = children; },
+    setAttribute(key, value) { this.attributes[key] = value; },
+    get firstElementChild() { return this.children[0] || null; },
+    querySelectorAll(selector) {
+      const className = selector.slice(1);
+      return this.children.flatMap(child => [
+        ...(child.className?.split(" ").includes(className) ? [child] : []),
+        ...(child.querySelectorAll?.(selector) || []),
+      ]);
+    },
+    querySelector(selector) { return this.querySelectorAll(selector)[0] || null; },
+  });
+  const goal = element("section"), queue = element("section");
+  Object.assign(context, {
+    element, icon: name => element("svg", name),
+    button: (text, label, action, className) => Object.assign(element("button", className, text), { action }),
+    $: (selector, root) => root ? root.querySelector(selector)
+      : selector === "#goal-area" ? goal : selector === "#queued-area" ? queue : null,
+    threadReadOnly: () => false, connected: true, busy: false, stopping: false, pending: null,
+    queuedActionBusy: new Set(), editingQueuedMessage: null, editingMessage: null, queueReorder: null,
+    queuedEditActions: new Set(["beginQueuedEdit", "editQueued", "cancelQueuedEdit", "dismissQueuedEdit"]),
+    queueDrag: null, queuedEditCheckVersion: 0, compactionLocked: () => false,
+    goalEditPending: null, goalEditDraft: null, renderGoalEditor() {}, updateGoalLiveView() {}, stopGoalLiveTimer() {},
+    syncPendingFeedbackTimer() {}, pendingFeedbackReady: () => true,
+    editableGoalStatuses: ["active", "paused", "blocked", "budgetLimited", "usageLimited"],
+    queueMessageText: message => message.text || message.context?.prompt || "",
+  });
+  vm.runInContext([
+    (sourceSection("function queueMe", "function queueMe") + "\n" + sourceSection("function reconcileQu", "function app")),
+    ((sourceSection("function queueRe", "function app") + "\n" + sourceSection("function moveQue", "function mov")) + sourceSection("function rememberSendDisplay(")),
+    sourceSection("function renderQueuedMessages(", "async function removeQueuedMessage("),
+    (sourceSection("function isActiveThread()") + sourceSection("let expandedClaudeGoalNotice")),
+    sourceSection("const goalStatusLabels =", "function formatGoalTokens("),
+    sourceSection("function renderGoalStatus()"),
+  ].join("\n"), context);
+  const display = { id: "main", model: "test-model", ephemeral: false,
+    goal: { objective: "已有目标立即显示", status: "active", createdAt: 1 },
+    queuedMessages: [{ id: "queued-a", text: "已有排队消息", clientUserMessageId: "client-a", createdAt: 1 }] };
+  const render = () => { context.renderGoalStatus(); context.renderQueueArea(); };
+  return { context, persisted, goal, queue, display, render };
+}
+
+test("队列内容不变时，运行状态切换仍立即刷新重试和引导按钮", () => {
+  const { context, queue, display, render } = cachedControlsHarness();
+  display.queuedMessages[0].pausedReason = "消息已暂停";
+  display.queuedMessages[0].submission = { status: "queued" };
+  context.rememberThreadDisplay(display);
+  context.thread = { ...display, status: { type: "idle" } };
+  const action = () => queue.querySelector(".queued-steer-button");
+  render();
+  assert.equal(action().children[1].text, "重试");
+  const initial = queue.firstElementChild;
+  render();
+  assert.equal(queue.firstElementChild, initial, "状态未变时仍复用已有队列区域");
+  context.thread.status = { type: "active" };
+  render();
+  assert.notEqual(queue.firstElementChild, initial);
+  assert.equal(action().children[1].text, "引导");
+  assert.equal(action().children[0].className, "steer");
+  context.thread.status = { type: "idle" };
+  render();
+  assert.equal(action().children[1].text, "重试");
+  assert.equal(action().children[0].className, "retry");
+  assert.equal(context.thread.queuedMessages[0].pausedReason, "消息已暂停");
+});
+
+test("会话尚未返回时立即渲染缓存目标和队列，相同内容不重建区域", () => {
+  const { context, goal, queue, display, render } = cachedControlsHarness();
+  context.rememberThreadDisplay(display);
+  render();
+  assert.equal(context.thread, null, "展示缓存不能伪装为已读取的实时会话");
+  assert.equal(goal.hidden, false);
+  assert.equal(goal.querySelector(".goal-preview").text, display.goal.objective);
+  assert.equal(queue.querySelector(".queued-message-text").text, display.queuedMessages[0].text);
+  assert.equal(queue.querySelector(".queued-steer-button").disabled, true);
+  assert.equal(goal.querySelector(".goal-edit-button").disabled, true);
+  const previousGoal = goal.firstElementChild, previousQueue = queue.firstElementChild;
+  render();
+  assert.equal(goal.firstElementChild, previousGoal);
+  assert.equal(queue.firstElementChild, previousQueue);
+  context.thread = structuredClone(display);
+  render();
+  assert.equal(queue.querySelector(".queued-steer-button").disabled, false);
+  assert.equal(goal.querySelector(".goal-edit-button").disabled, false);
+});
+
+test("详情缺少队列字段时保留展示，确认空队列和空目标后不能复活旧缓存", () => {
+  const { context, goal, queue, display, render } = cachedControlsHarness();
+  context.rememberThreadDisplay(display);
+  context.thread = { id: "main", model: "fresh-model" };
+  context.rememberThreadDisplay();
+  render();
+  assert.equal(context.currentThreadDisplay().model, "fresh-model");
+  assert.equal(goal.hidden, false);
+  assert.equal(queue.hidden, false);
+  context.thread = { id: "main", goal: null, queuedMessages: [] };
+  context.rememberThreadDisplay();
+  render();
+  assert.equal(goal.hidden, true);
+  assert.equal(queue.hidden, true);
+  context.thread = null;
+  render();
+  assert.equal(goal.hidden, true);
+  assert.equal(queue.hidden, true);
+});
+
+test("查看侧边期间更新父会话缓存，返回时显示最新目标与队列", () => {
+  const { context, goal, queue, display, render } = cachedControlsHarness();
+  context.rememberThreadDisplay(display);
+  context.selectedId = "side";
+  context.thread = { id: "side", ephemeral: true };
+  context.rememberBackgroundThreadDisplay({ method: "thread/queue/changed" }, {
+    threadId: "main", queuedMessages: [{ id: "queued-b", text: "后台新增排队消息" }],
+  });
+  context.rememberBackgroundThreadDisplay({ method: "thread/goal/updated" }, {
+    threadId: "main", goal: { ...display.goal, objective: "后台修改后的目标", status: "paused" },
+  });
+  assert.equal(context.currentThreadDisplay().id, "side");
+  context.selectedId = "main"; context.thread = null;
+  render();
+  assert.equal(goal.querySelector(".goal-preview").text, "后台修改后的目标");
+  assert.equal(queue.querySelector(".queued-message-text").text, "后台新增排队消息");
+  context.selectedId = "side";
+  context.rememberBackgroundThreadDisplay({ method: "thread/goal/cleared" }, { threadId: "main" });
+  context.rememberBackgroundThreadDisplay({ method: "thread/queue/changed" }, { threadId: "main", queuedMessages: [] });
+  context.selectedId = "main";
+  render();
+  assert.equal(goal.hidden, true);
+  assert.equal(queue.hidden, true);
+});
+
+test("后台迟到的旧队列事件不能覆盖已清空的较新展示快照", () => {
+  const { context, display } = cachedControlsHarness();
+  context.rememberThreadDisplay({ ...display, queuedMessages: [],
+    queueSnapshotVersion: { queueEpoch: "native-a", queueRevision: 20 } });
+  context.selectedId = "side";
+  for (const version of [{ queueEpoch: "native-a", queueRevision: 19 }, {}])
+    context.rememberBackgroundThreadDisplay({ method: "thread/queue/changed" }, {
+      threadId: "main", queuedMessages: display.queuedMessages, ...version,
+    });
+  context.selectedId = "main";
+  assert.equal(context.currentThreadDisplay().queuedMessages.length, 0);
+});
+
+// 操作反馈延迟：只验证 UI 提示时机，不调用真实会话或新增查询轮询。
+function delayFeedbackHarness() {
+  let now = 100000, nextTimer = 0;
+  const timers = new Map(), notices = [], disk = storage(), area = {
+    children: [], replaceChildren() { this.children = []; }, append(node) { this.children.push(node); },
+  };
+  disk.removeItem = key => disk.records.delete(key);
+  const element = (tag, className = "", text = "") => ({
+    tag, className, text, children: [], attributes: {},
+    get textContent() { return this.text; }, set textContent(value) { this.text = value; },
+    append(...nodes) { for (const node of nodes) { node.parent = this; this.children.push(node); } },
+    remove() { if (this.parent) this.parent.children = this.parent.children.filter(node => node !== this); },
+    setAttribute(key, value) { this.attributes[key] = value; },
+    querySelectorAll(selector) {
+      const matches = node => selector.startsWith(".") ? node.className?.split(" ").includes(selector.slice(1))
+        : selector.split(",").includes(node.tag);
+      return this.children.flatMap(node => [...(matches(node) ? [node] : []), ...(node.querySelectorAll?.(selector) || [])]);
+    },
+    querySelector(selector) { return this.querySelectorAll(selector)[0] || null; },
+  });
+  const context = {
+    Date: class extends Date { static now() { return now; } },
+    setTimeout(callback, delay) { const id = ++nextTimer; timers.set(id, { callback, at: now + delay }); return id; },
+    clearTimeout(id) { timers.delete(id); },
+    session: { device: { id: "device-a", createdAtMs: 1 }, capabilities: { compactionQueueSend: true }, allowApprovals: true },
+    selectedId: "main", selectionVersion: 1, pageLeaving: false, document: { hidden: false },
+    pending: null, pendingTimer: null, sending: null, connected: true, busy: false,
+    threadDeletions: new Map(), threadDeletionChecks: new Set(), goalEditPending: null, relatedThreadOperations: new Map(),
+    goalComposerRecoveries: new Map(), approvalReplies: new Map(), questionReplyReceipts: new Map(),
+    questionDrafts: new Map(), compactions: new Map(),
+    sideCreationView: null, relatedSessionView: null, unsupportedProjectless: false, goalMode: false, goalReason: "",
+    recoveryScope: null, sessionStorage: disk, approvalSignature: "previous",
+    queuedEditActions: new Set(["beginQueuedEdit", "editQueued", "cancelQueuedEdit", "dismissQueuedEdit"]),
+    privateInputScope: value => JSON.stringify([value?.device.id, value?.device.createdAtMs]),
+    threadDeletionKey: id => JSON.stringify(["device-a", id]),
+    currentCompaction: id => context.compactions.get(id || context.selectedId) || { state: "idle" },
+    compactionLocked: id => ["pending", "running", "unknown"].includes(context.currentCompaction(id).state),
+    ownsRelatedOperation: record => record.scope === context.privateInputScope(context.session),
+    goalRecordThreadId: record => record.payload.threadId,
+    goalComposerAction: (_action, payload) => payload?.goalMode === true,
+    goalComposerStorageRecord: record => record,
+    renderQueuedEditRecoveryControls: node => node.append({ label: "查回执" }),
+    compactionQueueSendReason: () => "", threadReadOnly: () => false,
+    // 这些用例针对 Codex 会话；Claude 压缩“迟迟不开始”提示另有专项用例。
+    isClaude: () => false, isActiveThread: () => false, thread: null,
+    element, button: (label, aria, action) => Object.assign(element("button", "", label), { label, aria, action }), $: () => area,
+    notice: (message, error = false) => notices.push({ message, error }),
+    renderApprovals() {}, reloadThread: async () => {}, reconcileCompaction() {},
+    resolvePending: () => assert.fail("显示提示不能查询回执"),
+    resolveRelatedOperation: () => assert.fail("显示提示不能查询侧边会话回执"),
+    resolveCompactionReceipt: () => assert.fail("显示提示不能查询压缩回执"),
+    setCompactionState: (id, value) => context.compactions.set(id, value),
+  };
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  vm.runInContext([
+    (sourceSection("const pendingFee", "function set") + "\n" + sourceSection("function pen", "async functi") + "\n" + sourceSection("function syncPen", "function upd")),
+    sourceSection("function savePen"),
+    sourceSection("function renderRelatedOperationStatus("),
+    sourceSection("function renderAsync", "function ren"),
+    sourceSection("function updateB"),
+    sourceSection("const nativeCompactionStartGraceMs", "function renderCompactionBanner("),
+    sourceSection("function renderCompactionBanner(", "async function applyCompactionReceipt("),
+    sourceSection("async function applyCompactionReceipt(", "async function resolveCompactionReceipt("),
+    `function renderFeedback(){${sourceSection("  const deletion = threadDeletions.get(threadDeletionKey(selectedId));",
+      "  renderFailedInputRecovery(")}}`,
+  ].join("\n"), context);
+  context.updateComposer = () => {
+    area.replaceChildren();
+    context.renderFeedback();
+    context.renderRelatedOperationStatus(area);
+    context.renderCompactionBanner(area, context.selectedId, context.currentCompaction());
+    context.syncPendingFeedbackTimer();
+  };
+  const advance = async milliseconds => {
+    const target = now + milliseconds;
+    while (true) {
+      const next = [...timers].filter(([, timer]) => timer.at <= target).sort((a, b) => a[1].at - b[1].at)[0];
+      if (!next) break;
+      now = next[1].at; timers.delete(next[0]); next[1].callback();
+      await Promise.resolve();
+    }
+    now = target;
+  };
+  const pending = action => {
+    const record = { id: `receipt-${action}`, action, deviceId: "device-a", time: now,
+      payload: { threadId: "main", messageId: "q", editId: "edit", ...(action === "setGoal" ? { goalMode: true } : {}) },
+      draft: { text: "保留草稿" } };
+    context.savePending(record);
+    context.updateComposer();
+    return record;
+  };
+  return { context, timers, notices, area, advance, pending, now: () => now };
+}
+
+test("快速操作完成不出现额外回执提示，也不留下延时刷新", async () => {
+  const h = delayFeedbackHarness();
+  const record = h.pending("steerQueued");
+  assert.equal(h.area.children.length, 0);
+  assert.equal(h.timers.size, 1);
+  await h.advance(100);
+  h.context.savePending(null);
+  h.context.updateComposer();
+  assert.equal(h.timers.size, 0);
+  await h.advance(9000);
+  assert.equal(h.area.children.length, 0);
+  assert.equal(record.draft.text, "保留草稿");
+  assert.deepEqual(h.notices, []);
+});
+
+test("队列未确认操作到八秒才提示，普通发送和目标仍为五秒，原草稿与回执锁保持", async () => {
+  for (const [action, delayMs] of [
+    ["send", 5000], ["setGoal", 5000],
+    ["steerQueued", 8000], ["removeQueued", 8000], ["reorderQueued", 8000],
+    ["beginQueuedEdit", 8000], ["editQueued", 8000], ["cancelQueuedEdit", 8000], ["dismissQueuedEdit", 8000],
+  ]) {
+    const h = delayFeedbackHarness(), record = h.pending(action);
+    await h.advance(4999);
+    assert.equal(h.area.children.length, 0, action);
+    await h.advance(1);
+    if (delayMs === 8000) {
+      assert.equal(h.area.children.length, 0, `${action} 五秒时不显示提示`);
+      await h.advance(2999);
+      assert.equal(h.area.children.length, 0, `${action} 八秒前不显示提示`);
+      await h.advance(1);
+    }
+    assert.equal(h.area.children.length, 1, action);
+    assert.match(h.area.children[0].text, /^正在确认.+结果。$/);
+    assert.equal(h.context.pending, record, "延时反馈不能解除未知回执锁");
+    assert.equal(record.draft.text, "保留草稿");
+    assert.equal(h.timers.size, 0, "只重绘一次，没有新增轮询");
+    assert.deepEqual(h.notices, []);
+  }
+});
+
+test("侧边操作、删除和压缩复用同一个五秒 UI 提示定时器", async () => {
+  for (const kind of ["side-create", "side-close", "delete", "compact"]) {
+    const h = delayFeedbackHarness(), record = { id: kind, time: h.now(), state: "pending",
+      deviceId: "device-a", threadId: "main" };
+    if (kind.startsWith("side")) h.context.relatedThreadOperations.set(kind, {
+      ...record, parentThreadId: "main", scope: h.context.privateInputScope(h.context.session),
+      action: kind === "side-create" ? "createSideThread" : "closeSideThread",
+    });
+    else if (kind === "delete") h.context.threadDeletions.set(h.context.threadDeletionKey("main"), record);
+    else h.context.compactions.set("main", { ...record, receiptId: "compact-receipt" });
+    h.context.updateComposer();
+    assert.equal(h.area.children.length, 0, kind);
+    assert.equal(h.timers.size, 1, kind);
+    await h.advance(5000);
+    assert.equal(h.area.children.length, 1, kind);
+    assert.match(h.area.children[0].text, /^正在确认.+结果。$/);
+    assert.equal(h.timers.size, 0, kind);
+  }
+});
+
+test("切换、离开页面或更换授权后旧定时器不能显示迟到提示", async () => {
+  for (const change of ["selection", "authorization", "page", "hidden"]) {
+    const h = delayFeedbackHarness(), record = h.pending("steerQueued");
+    if (change === "selection") ++h.context.selectionVersion;
+    else if (change === "authorization") h.context.session.device.createdAtMs = 2;
+    else if (change === "page") h.context.pageLeaving = true;
+    else h.context.document.hidden = true;
+    await h.advance(8000);
+    assert.equal(h.area.children.length, 0, change);
+    assert.equal(h.timers.size, 0, change);
+    assert.equal(h.context.pending, record);
+  }
+});
+
+test("明确失败在五秒内立即提示，已确认压缩不继续显示未确认横幅", async () => {
+  const h = delayFeedbackHarness();
+  h.context.compactions.set("main", { state: "pending", receiptId: "compact-receipt", time: h.now() });
+  h.context.updateComposer();
+  await h.context.applyCompactionReceipt("main", "compact-receipt", {
+    state: "failed", result: { message: "压缩请求明确失败" },
+  });
+  assert.deepEqual(h.notices, [{ message: "压缩请求明确失败", error: true }]);
+  assert.equal(h.timers.size, 0);
+  h.context.compactions.set("main", { state: "pending", receiptId: "other", time: h.now(), acknowledged: true });
+  h.context.updateComposer();
+  await h.advance(5000);
+  assert.equal(h.area.children.length, 0);
+});
+
+test("压缩完成的回执和实时事件静默解除锁定，失败仍给出错误提示", async () => {
+  const h = delayFeedbackHarness();
+  h.context.setCompactionState = (id, value) => { h.context.compactions.set(id, value); return value; };
+  h.context.reconcileCompaction = (id, value) => h.context.setCompactionState(id, value);
+  h.context.compactions.set("main", { state: "pending", receiptId: "compact-receipt", time: h.now() });
+  await h.context.applyCompactionReceipt("main", "compact-receipt", {
+    state: "completed", result: { compaction: { state: "idle", turnId: "turn", itemId: "compact" } },
+  });
+  assert.equal(h.context.compactionLocked("main"), false);
+  assert.deepEqual(h.notices, []);
+  vm.runInContext(sourceSection("function compactionEventMatches("), h.context);
+  for (const source of ["manual", "automatic"]) {
+    h.context.compactions.set("main", { state: "running", turnId: "turn", itemId: "compact" });
+    h.context.receiveCompactionLifecycle({ method: "item/completed" }, {
+      threadId: "main", turnId: "turn",
+      item: { type: "contextCompaction", id: "compact", source, completed: true, status: "completed" },
+    });
+    assert.equal(h.context.compactionLocked("main"), false);
+    assert.deepEqual(h.notices, []);
+  }
+  h.context.compactions.set("main", { state: "running", turnId: "turn", itemId: "compact" });
+  h.context.receiveCompactionLifecycle({ method: "turn/completed" }, {
+    threadId: "main", turn: { id: "turn", status: "completed", items: [] },
+  });
+  assert.equal(h.context.compactionLocked("main"), false);
+  assert.deepEqual(h.notices, []);
+  h.context.compactions.set("main", { state: "running", turnId: "turn", itemId: "compact" });
+  h.context.receiveCompactionLifecycle({ method: "item/completed" }, {
+    threadId: "main", turnId: "turn",
+    item: { type: "contextCompaction", id: "compact", completed: true, status: "failed" },
+  });
+  assert.deepEqual(h.notices, [{ message: "上下文压缩失败，请查看原生会话。", error: true }]);
+});
+
+test("问答先显示提交按钮状态，五秒后才增加中性说明且保留原回答回执", async () => {
+  for (const skip of [false, true]) {
+    const h = delayFeedbackHarness(), key = JSON.stringify(["device-a", "main", "question"]);
+    const request = { id: "question", params: { questions: [{ id: "field", question: "问题" }] } };
+    const record = { id: "answer-receipt", deviceId: "device-a", threadId: "main",
+      requestId: "question", state: "unknown", time: h.now(), skip };
+    h.context.questionReplyReceipts.set(key, record);
+    let card;
+    h.context.renderApprovals = () => {
+      card = h.context.element("section");
+      h.context.renderAsyncQuestion(card, request, "main");
+    };
+    h.context.renderApprovals(); h.context.updateComposer();
+    assert.equal(card.querySelector(".async-question-status").textContent, "");
+    assert.match(card.querySelectorAll("button").find(node => /中…$/.test(node.textContent)).textContent,
+      skip ? /^跳过中/ : /^提交中/);
+    await h.advance(5000);
+    assert.match(card.querySelector(".async-question-status").textContent, /^正在确认.+结果。$/);
+    assert.equal(h.context.questionReplyReceipts.get(key), record);
+  }
+});
+
+test("审批等待期间保留控件锁，五秒后增加核对入口，不解除原授权状态", async () => {
+  const h = delayFeedbackHarness(), key = "approval", card = h.context.element("section");
+  card.append(h.context.button("允许一次", "允许一次", () => assert.fail("不能重新提交")));
+  const record = { deviceId: "device-a", threadId: "main", state: "unknown", time: h.now() };
+  h.context.approvalReplies.set(key, record);
+  h.context.renderApprovals = () => h.context.updateBlockingApprovalControls(card, key);
+  h.context.renderApprovals(); h.context.updateComposer();
+  assert.equal(card.querySelector("button").disabled, true);
+  assert.equal(card.querySelector(".remote-approval-reply-status"), null);
+  await h.advance(5000);
+  assert.match(card.querySelector(".remote-approval-reply-status").children[0].textContent, /^正在确认操作结果。$/);
+  assert.equal(card.querySelector("button").disabled, true);
+  assert.equal(h.context.approvalReplies.get(key), record);
+});
+
+test("目标队列缓存按授权隔离，临时侧边仅留内存，缓存不携带审批和权限", () => {
+  const { context, persisted } = threadDisplayCacheHarness();
+  context.rememberThreadDisplay({ id: "main", goal: { objective: "目标", status: "paused" },
+    queuedMessages: [{ id: "q", text: "排队" }], requests: [{ id: "approval" }],
+    readOnly: false, status: { type: "active" } });
+  const saved = context.currentThreadDisplay();
+  assert.equal(saved.requests, undefined);
+  assert.equal(saved.readOnly, undefined);
+  assert.equal(saved.status, undefined);
+  assert.equal(persisted[0].value.queuedMessages[0].text, "排队");
+  context.rememberThreadDisplay({ id: "side", ephemeral: true, goal: null, queuedMessages: [] });
+  assert.equal(persisted.length, 1);
+  context.session = { device: { id: "other-device", createdAtMs: 2 } };
+  assert.equal(context.currentThreadDisplay(), null);
+});
+
+test("从侧边返回时不等待父会话网络响应，迟到侧边详情不能覆盖父会话缓存", async () => {
+  const h = sideCreationNavigationHarness(), { context } = threadDisplayCacheHarness(h.context);
+  const reads = [], frames = [];
+  context.thread = { id: "main", title: "M", goal: { objective: "主目标", status: "paused" },
+    queuedMessages: [{ id: "main-q", text: "主会话排队" }] };
+  context.rememberTranscript = () => context.rememberThreadDisplay();
+  context.prepareRelatedSessionExit = () => null;
+  context.updateComposer = () => frames.push(structuredClone(context.currentThreadDisplay()));
+  context.api = (path, payload) => {
+    const pending = deferred(); reads.push({ path, payload, ...pending }); return pending.promise;
+  };
+  const view = context.rememberRelatedView("side", "side", "main", "侧边", { ephemeral: true });
+  const opening = context.selectThread("side", { relatedView: view });
+  await h.settle();
+  const returning = context.returnToParentSession();
+  await h.settle();
+  assert.equal(context.selectedId, "main");
+  assert.equal(context.thread, null);
+  assert.equal(frames.at(-1).goal.objective, "主目标");
+  assert.equal(frames.at(-1).queuedMessages[0].text, "主会话排队");
+  assert.deepEqual(reads.map(read => read.payload.threadId), ["side", "main"]);
+  reads[1].resolve({ thread: { id: "main", title: "M", goal: null, queuedMessages: [] } });
+  await returning;
+  reads[0].resolve({ thread: { id: "side", title: "迟到侧边", goal: { objective: "不能覆盖", status: "active" },
+    queuedMessages: [{ id: "side-q", text: "不能覆盖" }] } });
+  await opening;
+  assert.equal(context.selectedId, "main");
+  assert.equal(context.currentThreadDisplay().goal, null);
+  assert.equal(context.currentThreadDisplay().queuedMessages.length, 0);
+});
+
+test("没有内存记录时先恢复本地展示缓存，再等待会话网络刷新", async () => {
+  const h = sideCreationNavigationHarness(), { context } = threadDisplayCacheHarness(h.context);
+  const response = deferred(), frames = [];
+  context.selectedId = "other"; context.thread = { id: "other" };
+  context.readScope = context.privateInputScope(context.session);
+  context.optionalCachedRead = task => task;
+  context.readCache.get = async (_scope, kind, id) => kind === "thread" && id === "main"
+    ? { id: "main", ephemeral: false, model: "cached-model",
+      goal: { objective: "本地保存的目标", status: "paused" },
+      queuedMessages: [{ id: "disk-q", text: "本地保存的排队消息" }] } : null;
+  context.updateComposer = () => frames.push(structuredClone(context.currentThreadDisplay()));
+  context.api = () => response.promise;
+  const opening = context.selectThread("main");
+  await h.settle();
+  assert.equal(context.thread, null);
+  assert.equal(frames.at(-1).goal.objective, "本地保存的目标");
+  assert.equal(frames.at(-1).queuedMessages[0].text, "本地保存的排队消息");
+  response.resolve({ thread: { id: "main", title: "M", goal: null, queuedMessages: [] } });
+  await opening;
+  assert.equal(context.currentThreadDisplay().goal, null);
+  assert.equal(context.currentThreadDisplay().queuedMessages.length, 0);
+});
+
+test("模型目录统一保存 Fast 档位、实例限制和缓存身份，Ultra 遵循实例开关", async () => {
+  const writes = [];
+  const context = {
+    models: [], modelsPromise: null, modelsLoadedAt: 0, modelsRetryAt: 0,
+    modelDefaults: {}, modelCatalogCacheVersion: currentModelCatalogCacheVersion, catalogFallbackMs: 10000,
+    session: { device: { id: "device-a" } }, privateInputScope: () => "device-a",
+    cacheDisplayData: (...args) => writes.push(args),
+    catalogUsable: () => false, scheduleCatalogRefresh() {}, updateComposer() {}, $: () => ({ hidden: true }),
+    api: async path => {
+      assert.equal(path, "/api/read/models");
+      return { defaultModel: "gpt-6.1-sol", defaultReasoningEffort: "xhigh", ultraReasoningEnabled: false,
+        fastModeAvailability: { available: true }, fastModelAliases: { "API别名": "gpt-6.1-sol" },
+        data: [{ model: "gpt-6.1-sol", requestModel: "gpt-6.1-sol",
+          serviceTiers: [{ id: "priority" }], fastModeSupported: true, supportedReasoningEfforts: [
+          { reasoningEffort: "xhigh" }, { reasoningEffort: "max" }, { reasoningEffort: "ultra" },
+        ] }] };
+    },
+  };
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  vm.runInContext(sourceSection("async function loadM", "async functi"), context);
+  const models = await context.loadModels(true);
+  assert.deepEqual(Array.from(models[0].supportedReasoningEfforts, effort => effort.reasoningEffort), ["xhigh", "max"]);
+  assert.equal(writes[0][2].version, currentModelCatalogCacheVersion);
+  assert.equal(context.modelDefaults.reasoningEffort, "xhigh");
+  assert.equal(writes[0][2].models[0].serviceTiers[0].id, "priority");
+  assert.equal(writes[0][2].models[0].fastModeSupported, true);
+  assert.equal(writes[0][2].models[0].requestModel, "gpt-6.1-sol");
+  assert.equal(writes[0][2].defaults.fastModeAvailability.available, true);
+  assert.equal(writes[0][2].defaults.fastModelAliases["API别名"], "gpt-6.1-sol");
+  assert.equal(writes[0][2].defaults.fastModeOwner,
+    JSON.stringify(["device-a", "codex:local", context.nativeConnectionVersion]));
+});
+
+test("模型目录恢复保留 Fast 元数据，缺失 Fast 或 Ultra 过滤的旧目录重新读取", async () => {
+  const owner = JSON.stringify(["device-a", "codex:local", 1]);
+  for (const version of [undefined, 1, 2, 3, currentModelCatalogCacheVersion]) {
+    const modelCatalog = { version, loadedAt: Date.now(),
+      defaults: { fastModeAvailability: { available: true }, fastModeOwner: owner,
+        fastModelAliases: { "API别名": "gpt-6.1-sol" } }, models: [
+      { model: "gpt-6.1-sol", requestModel: "gpt-6.1-sol", serviceTiers: [{ id: "priority" }],
+        fastModeSupported: true, supportedReasoningEfforts: [{ reasoningEffort: "xhigh" }] },
+    ] };
+    const context = {
+      URLSearchParams, location: { hash: "" }, session: { device: { id: "device-a" } },
+      readScope: null, readGeneration: 0, sidebar: null, privateInputScope: () => "device-a",
+      models: [], modelsLoadedAt: 0, modelDefaults: {}, modelCatalogCacheVersion: currentModelCatalogCacheVersion,
+      readCache: { activate: async () => {}, get: async (_scope, kind) => kind === "models" ? modelCatalog : null },
+      optionalCachedRead: value => value, catalogUsable: () => true,
+    };
+    vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+    vm.runInContext(sourceSection("async function restoreReadViews("), context);
+    await context.restoreReadViews(context.session);
+    assert.equal(context.models.length, version === currentModelCatalogCacheVersion ? 1 : 0);
+    if (version === currentModelCatalogCacheVersion) {
+      assert.equal(context.modelDefaults.fastModeAvailability.available, true);
+      assert.equal(context.modelDefaults.fastModeOwner, owner);
+      assert.equal(context.modelDefaults.fastModelAliases["API别名"], "gpt-6.1-sol");
+      assert.equal(context.models[0].serviceTiers[0].id, "priority");
+      assert.equal(context.models[0].requestModel, "gpt-6.1-sol");
+    }
+  }
+});
+
+test("Fast 环境暂不可读时复用目录重试，不清空模型；普通目录失败保留最后已确认能力", async () => {
+  const calls = [], delays = [], state = { now: 1000, available: null, fail: false };
+  const context = {
+    models: [], modelsPromise: null, modelsLoadedAt: 0, modelsRetryAt: 0, modelDefaults: {},
+    modelCatalogCacheVersion: currentModelCatalogCacheVersion, catalogFallbackMs: 604800000,
+    catalogRetryMs: 10000, catalogCacheMs: 600000, catalogRefreshAheadMs: 60000,
+    session: { device: { id: "device-a" }, runtime: { revision: 1 } },
+    privateInputScope: () => "device-a", Date: { now: () => state.now },
+    cacheDisplayData() {}, updateComposer() {}, $: () => null,
+    catalogUsable: value => value.loadedAt > 0, catalogFresh: () => true, catalogNeedsRefresh: () => false,
+    pageLeaving: false, document: { hidden: false }, navigator: { onLine: true },
+    stopCatalogRefresh() {}, activeSkillCatalogContext: () => null, skillCatalogs: new Map(),
+    catalogRefreshTimer: null, setTimeout: (_callback, delay) => { delays.push(delay); return 1; },
+    refreshCachedCatalogs() {},
+    api: async path => {
+      calls.push(path);
+      if (state.fail) throw Error("目录临时不可读");
+      return { data: [{ model: "gpt-6.1-sol", serviceTiers: [{ id: "priority" }] }],
+        fastModeAvailability: { available: state.available } };
+    },
+  };
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  vm.runInContext(sourceSection("async function loadM", "async functi")
+    + sourceSection("function scheduleCatalogRefresh(", "function refreshCachedCatalogs("), context);
+  await context.loadModels(true);
+  assert.equal(context.models.length, 1);
+  assert.equal(context.modelsRetryAt, 11000);
+  assert.equal(delays.at(-1), 10000, "Fast 失败沿用目录调度器稍后重试");
+  await context.loadModels();
+  assert.deepEqual(calls, ["/api/read/models"]);
+  state.available = true; state.now = 11000;
+  await context.loadModels();
+  assert.equal(calls.length, 2);
+  assert.equal(context.modelDefaults.fastModeAvailability.available, true);
+  assert.equal(context.modelsRetryAt, 0);
+  state.fail = true;
+  await assert.rejects(context.loadModels(true), /临时不可读/);
+  assert.equal(context.modelDefaults.fastModeAvailability.available, true);
+  assert.equal(context.models[0].serviceTiers[0].id, "priority");
+});
+
+function initialPageHarness({ readOnly = false, suppress = false } = {}) {
+  const h = sideCreationNavigationHarness(), sidebarRead = deferred();
+  const latest = { device: { id: "initial-device", createdAtMs: 1 }, readOnly,
+    capabilities: { projectlessCreation: true }, };
+  Object.assign(h.context, {
+    session: null, selectedId: null, thread: null, sidebar: null, creating: false,
+    recoveryGeneration: 0, recoveryStore: { observe: async () => null },
+    sessionRecoveryReads: new WeakMap(), restorePrivateInputs: async () => {},
+    restoreReadViews: async () => {}, setAuthenticationRequired() {}, restoreSmallInputRecoveries() {},
+    postPlatformMessage() {}, restoreGoalComposerDrafts() {}, setConnection() {}, openStream() {},
+    startConnectionPoll() {}, recoverQuestionReceipts() {}, resolvePending() {}, drainPendingNotificationOpen() {},
+    readConnectionSession: async () => latest, suppressAutomaticNewChat: suppress,
+    refreshRequest: null, foregroundReadGeneration: 0, clearComposerAttachments() {},
+    loadSidebar: () => sidebarRead.promise,
+    shell() {
+      h.context.$("#thread-title").textContent = "远程会话";
+      h.context.$("#project-select-slot").hidden = true;
+      h.context.updateComposer();
+    },
+    updateComposer() { h.prompt.disabled = readOnly || !h.context.creating && !h.context.selectedId; },
+    welcomeNode: () => ({ textContent: "欢迎页" }),
+  });
+  h.context.location.hash = "";
+  vm.runInContext([
+    sourceSection("async function refreshAl", "function rec"),
+    sourceSection("async function connectPage(", "function probeConnectionRecovery("),
+  ].join("\n"), h.context);
+  return { ...h, sidebarRead };
+}
+
+test("首次连接及恢复新建页时，慢侧栏不能阻塞标题、项目区、输入和已有草稿", async () => {
+  {
+    const h = initialPageHarness();
+    h.context.drafts.set("$new:", "尚未发送的新建草稿");
+    const connection = h.context.connectPage();
+    await h.settle();
+    assert.equal(h.context.creating, true);
+    assert.equal(h.context.$("#thread-title").textContent, "新建会话");
+    assert.equal(h.context.$("#project-select-slot").hidden, false);
+    assert.equal(h.prompt.disabled, false);
+    assert.equal(h.prompt.value, "尚未发送的新建草稿");
+    h.context.selectedId = "newer-selection";
+    h.context.creating = false;
+    h.context.$("#thread-title").textContent = "用户后来选择的会话";
+    h.sidebarRead.resolve();
+    await connection;
+    assert.equal(h.context.selectedId, "newer-selection");
+    assert.equal(h.context.$("#thread-title").textContent, "用户后来选择的会话");
+    assert.equal(h.writes.length, 0, "初始化只能恢复页面，不能实际新建或发送会话");
+  }
+});
+
+test("初始只读设备及明确禁止自动新建时保留欢迎页约束", async () => {
+  for (const options of [{ readOnly: true }, { suppress: true }]) {
+    const h = initialPageHarness(options);
+    const connection = h.context.connectPage();
+    await h.settle();
+    assert.equal(h.context.creating, false);
+    assert.equal(h.context.$("#project-select-slot").hidden, true);
+    assert.equal(h.prompt.disabled, true);
+    h.sidebarRead.resolve();
+    await connection;
+    assert.equal(h.writes.length, 0);
+  }
+});
+
+test("服务连接变化后，旧模型读取晚到不能覆盖新目录", async () => {
+  const reads = [];
+  const context = {
+    session: { device: { id: "model-device" }, },
+    models: [], modelsPromise: null, modelsLoadedAt: 0, modelsRetryAt: 0, modelDefaults: {},
+    modelCatalogCacheVersion: 1, catalogFallbackMs: 1000, catalogRetryMs: 1000,
+    privateInputScope: () => "model-device", catalogUsable: () => false,
+    api: (_path, payload) => { const response = deferred(); reads.push({ response, payload }); return response.promise; },
+    cacheDisplayData() {}, updateComposer() {}, scheduleCatalogRefresh() {}, $: () => null,
+  };
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  vm.runInContext(sourceSection("async function loadM", "async functi"), context);
+  const oldRead = context.loadModels(true);
+  ++context.nativeConnectionVersion;
+  context.modelsPromise = null;
+  const newRead = context.loadModels(true);
+  reads[1].response.resolve({ data: [{ model: "service-model" }], defaultModel: "service-model" });
+  await newRead;
+  reads[0].response.resolve({ data: [{ model: "old-connection-model" }], defaultModel: "old-connection-model" });
+  await oldRead;
+  assert.equal(context.models[0].model, "service-model");
+  assert.equal(context.modelDefaults.model, "service-model");
+  assert.equal(reads[1].payload.forceReload, true);
+});
+
+test("Claude 会话图标使用品牌色，间距仅由列表 gap 提供", async () => {
+  const css = await readFile(new URL("../assets/harness/style.css", import.meta.url), "utf8");
+  const rules = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+    .filter(([, selectors]) => selectors.split(",").some(selector => selector.trim() === ".thread-link>.claude-session-icon"))
+    .map(([, , declarations]) => declarations).join(";");
+  assert.match(rules, /(?:^|;)\s*color\s*:\s*#d97757\s*(?:;|$)/);
+  assert.doesNotMatch(rules, /\bmargin(?:-right)?\s*:/);
+});
+
+test("Claude 类型跟随已有会话身份，新建草稿和能力与 Codex 分开", () => {
+  const context = {
+    creating: true, creationBackend: "claude", creationProject: "shared-project",
+    session: { capabilities: { claudeSessions: true, goalComposer: true },
+      claudeAllowApprovals: true, },
+  };
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  vm.runInContext(sourceSection("function subagentsEnabled(", "function threadReadOnly("), context);
+  assert.equal(context.activeBackend(), "claude");
+  assert.equal(context.modelContext().projectId, "shared-project");
+  assert.equal(context.subagentsEnabled(), false);
+  assert.equal(context.sideThreadsEnabled(), false);
+  assert.notEqual(context.newDraftKey("shared-project", "claude"), context.newDraftKey("shared-project", "codex"));
+  context.creating = false;
+  context.creationBackend = "codex";
+  context.selectedId = "claude-01234567-89ab-4cde-8fab-0123456789ab";
+  assert.equal(context.activeBackend(), "claude");
+  assert.equal(context.approvalsAllowed(), true);
+  context.selectedId = "codex-existing";
+  assert.equal(context.activeBackend(), "codex");
+});
+
+function claudeExecutionFeedbackHarness(turn) {
+  const initialTurns = Array.isArray(turn) ? turn : [turn];
+  const makeNode = (textContent = "") => ({ dataset: {}, children: [], textContent,
+    scrollTop: 0, scrollHeight: 0, querySelector: () => null, append(...children) { this.children.push(...children); } });
+  const root = makeNode(), activities = [];
+  const context = nodeVm.createContext({ nativeConnectionVersion: 1,
+    selectedId: "claude-fixture", thread: { id: "claude-fixture", status: { type: "idle" } },
+    turns: new Map(initialTurns.map(value => [value.id, value])), renderedItems: new Map(), renderedTurns: new Map(), renderedActivities: new Map(),
+    messageFrame: null, followMessages: true, composerScroll: null, relatedSessionView: null, sessionPlan: null,
+    editingMessage: null, editingQueuedMessage: null, pending: null, busy: false, stopping: false, connected: true,
+    historyError: "", historyCursor: null, historyInitialized: true, historyScrollTop: 0, markdownRenderVersion: 0,
+    textContent: item => item.text || "", $: selector => selector === "#messages" ? root : null,
+    element: (_tag, _className, text = "") => makeNode(text), icon: () => makeNode(),
+    cancelAnimationFrame() {}, scheduleMermaidBlocks() {}, reconcileSentMessageDisplays: () => false,
+    currentThreadDisplay: () => context.thread, withSentMessageDisplays: () => [...context.turns.values()],
+    loadMessageSkillChoices() {}, visibleMessageAnchor: () => null,
+    historyGapIndex: () => 0, userMessageHasSkills: () => false, subagentsEnabled: () => false,
+    isSubagentItem: () => false, transcriptEventTypes: new Set(), reasoningPreviewText: () => "",
+    isActiveThread: () => context.thread.status.type === "active",
+    completedItem: item => item?.remoteItemCompleted === true || Number.isFinite(item?.completedAtMs)
+      || item?.type === "contextCompaction" && item.completed === true
+      || ["completed", "failed", "interrupted"].includes(item?.status),
+    threadReadOnly: () => false, threadSentMessageEditAllowed: () => false, compactionLocked: () => false,
+    renderItem: item => makeNode(item.text || item.type), renderMessageActions() {}, renderEditedFiles: () => null,
+    claudeQuestionReplies: () => null, renderClaudeQuestionReply: () => makeNode(),
+    renderActivity: (value, work, running) => {
+      const presentation = context.activityPresentation(value, running);
+      activities.push({ ...presentation, running, work: Array.from(work, item => item.id) });
+      const node = makeNode(presentation.text); node.dataset.activityKey = `${value.id}:activity`;
+      return node;
+    },
+    reconcileChildren: (node, children) => { node.children = children; },
+    resizeEditorInput() {}, syncActivityTimer() {}, syncHistoryButtons() {}, updateScrollControl() {}, scheduleHistoryLoad() {},
+  });
+  nodeVm.runInContext(sourceSection("function completedManualCompactionAfterReply(", "function enrichTurnTranscriptEvents(")
+    + sourceSection("function finalMessageIndex(", "function updateActivitySummary(")
+    + sourceSection("function renderMessa", "function res"), context);
+  return { context, activities, root, render() { activities.length = 0; context.renderMessages(); return activities; } };
+}
+
+test("Codex 引导按有序原生快照纠正位置，无原生锚点时保持现状", () => {
+  const { context } = sentDisplayWindowHarness();
+  const turn = { id: "turn", status: "inProgress", items: [] };
+  context.turns.set(turn.id, turn);
+  for (const clientUserMessageId of ["first", "second"]) {
+    context.confirmSendDisplay({ threadId: "main", clientUserMessageId, prompt: `引导-${clientUserMessageId}` },
+      { ok: true, threadId: "main", turnId: turn.id }, { steering: true });
+  }
+  const records = [...context.sentMessageDisplays.values()];
+  const process = { id: "process", type: "commandExecution", status: "completed" };
+  const commentary = { id: "commentary", type: "agentMessage", text: "过程回复", phase: "commentary" };
+  const final = { id: "final", type: "agentMessage", text: "最终回复", phase: "final_answer" };
+  const native = records.map((record, index) => ({ id: `native-${index + 1}`, type: "userMessage",
+    clientId: record.clientId, content: record.item.content }));
+  // 用户要求参考 Codex App 的原生位置接替：同时覆盖多条引导、工具过程、commentary 和最终回复。
+  turn.items = [process, commentary, final, records[0].item, native[0], records[1].item, native[1]];
+  const ordered = [native[0], process, native[1], commentary, final];
+  assert.equal(context.reconcileConfirmedInputOrder(turn, ordered), true);
+  assert.deepEqual(Array.from(context.withSentMessageDisplays()[0].items, item => item.id),
+    ["native-1", "process", "native-2", "commentary", "final"]);
+  for (const items of [[commentary, native[0], native[1]], [commentary, native[1], native[0]]]) {
+    turn.items = [...items];
+    context.reconcileConfirmedInputOrder(turn, [native[0], native[1], commentary]);
+    assert.deepEqual(turn.items.map(item => item.id), ["native-1", "native-2", "commentary"],
+      "连续及逆序引导必须从后向前归位");
+  }
+  const before = turn.items.map(item => item.id);
+  assert.equal(context.reconcileConfirmedInputOrder(turn, []), false);
+  assert.deepEqual(turn.items.map(item => item.id), before, "没有有序原生快照时不得按成功标记猜位置");
+});
+
+test("Codex 历史合并实际执行确认输入的原生顺序纠正", () => {
+  const { context } = sentDisplayWindowHarness();
+  Object.assign(context, { transcriptEvents: new Map(), itemVersions: new Map(), turnVersions: new Map(),
+    turnFieldVersions: new Map(), partialItems: new Set(), enrichTurnTranscriptEvents: value => value });
+  vm.runInContext((sourceSection("function normalizeDi") + "\n" + sourceSection("function mergeRe")
+    + "\n" + sourceSection("function mergeHi", "async functi")), context);
+  const turn = { id: "turn", status: "completed", items: [] };
+  context.turns.set(turn.id, turn);
+  context.confirmSendDisplay({ threadId: "main", clientUserMessageId: "guide", prompt: "引导" },
+    { ok: true, threadId: "main", turnId: turn.id }, { steering: true });
+  const preview = [...context.sentMessageDisplays.values()][0].item;
+  const native = { id: "native", type: "userMessage", clientId: "guide", content: preview.content };
+  const reply = { id: "reply", type: "agentMessage", text: "回复", phase: "final_answer" };
+  turn.items = [reply, preview, native];
+  const reconcile = context.reconcileConfirmedInputOrder;
+  let calls = 0;
+  context.reconcileConfirmedInputOrder = (...args) => { calls++; return reconcile(...args); };
+  const merged = context.mergeHistoryTurn({ id: turn.id, status: "completed",
+    items: [native, reply], itemsPageComplete: true, itemsComplete: true }, 0);
+  assert.equal(calls, 1, "历史合并必须调用原生顺序纠正，而不是只定义孤立函数");
+  assert.deepEqual(Array.from(merged.items, item => item.id), ["native", "reply"]);
+});
+
+test("Codex turn/completed 通过真实事件入口纠正引导位置", () => {
+  const context = nodeVm.createContext({ nativeConnectionVersion: 1,
+    session: { device: { id: "device" } }, selectedId: "main", privateInputScope: () => "scope",
+    sessionMenu: { invalidate: () => null }, relatedSessionView: null, relatedMenuTimer: null, connected: true,
+    thread: { id: "main", status: { type: "active" } }, turns: new Map(), pending: null, sending: false,
+    messageVersion: 0, statusVersion: 0, itemVersions: new Map(), turnVersions: new Map(), turnFieldVersions: new Map(),
+    partialItems: new Set(), transcriptEventTypes: new Set(), sidebarReadRefreshSuppressions: new Set(),
+    recentPrioritySelectionSuppressions: new Set(), threadDeleted: () => false,
+    handleRemoteChannelEvent: () => false, scheduleRelatedMenuRefresh() {}, rememberBackgroundThreadDisplay() {},
+    receiveCompactionLifecycle() {}, mergeTranscriptEvents() {},
+    mergeItemProjection: (previous, incoming) => ({ ...previous, ...incoming }), enrichTurnTranscriptEvents: value => value,
+    updateComposer() {}, scheduleReload() {}, markVisibleThreadRead: async () => {},
+    scheduleMessages() {}, rememberTranscript() {}, scheduleSidebarRefresh() {},
+  });
+  installSentMessageDisplayHarness(context);
+  const turn = { id: "turn", status: "inProgress", items: [] };
+  context.turns.set(turn.id, turn);
+  context.confirmSendDisplay({ threadId: "main", clientUserMessageId: "guide", prompt: "引导" },
+    { ok: true, threadId: "main", turnId: turn.id }, { steering: true });
+  const preview = [...context.sentMessageDisplays.values()][0].item;
+  const native = { id: "native", type: "userMessage", clientId: "guide", content: preview.content };
+  const reply = { id: "reply", type: "agentMessage", text: "回复", phase: "final_answer" };
+  turn.items = [reply, preview];
+  nodeVm.runInContext(sourceSection("function normalizeDi") + "\n" + sourceSection("function receive(event) {"), context);
+  context.receive({ method: "turn/completed", params: { threadId: "main",
+    turn: { id: turn.id, status: "completed", items: [native, reply] } } });
+  assert.deepEqual(Array.from(context.withSentMessageDisplays()[0].items, item => item.id), ["native", "reply"]);
+});
+
+test("Claude 恢复后单独压缩的状态行始终位于已经完成的回复之后", () => {
+  const turn = { id: "restored", _nativeUserId: "native-restored", _nativeDone: true,
+    status: "completed", durationMs: 59000, items: [
+      { id: "input", type: "userMessage" },
+      { id: "tool", type: "dynamicToolCall", status: "completed" },
+      { id: "reply", type: "agentMessage", text: "压缩前已经完成的回复" },
+    ] };
+  const h = claudeExecutionFeedbackHarness(turn);
+  h.context.transcriptEventTypes.add("contextCompaction");
+  for (const status of ["inProgress", "unknown", "completed", "failed", "interrupted"]) {
+    turn.items[3] = { id: "compact", type: "contextCompaction", backend: "claude", source: "manual",
+      remoteInlineEvent: true, remoteCompactionLifecycle: true, status,
+      completed: ["completed", "failed", "interrupted"].includes(status) };
+    h.render();
+    const order = Array.from(h.root.children[0].children, node => node.dataset.key || "activity");
+    assert.deepEqual(order, ["restored:input", "activity", "restored:reply", "restored:compact"],
+      `${status} 状态及重复重绘均须保留原生先后顺序，不能把旧回复挪到压缩提示后`);
+  }
+});
+
+test("Claude 正文渲染兜底把迟到的手动完成压缩放到最终回复之后", () => {
+  const turn = { id: "render-fallback", _nativeUserId: "native-render-fallback",
+    status: "completed", items: [
+      { id: "input", type: "userMessage" },
+      { id: "compact", type: "contextCompaction", source: "manual", status: "completed",
+        completed: true, remoteInlineEvent: true, remoteCompactionLifecycle: true },
+      { id: "reply", type: "agentMessage", text: "已完成回复", phase: "final_answer" },
+    ] };
+  const h = claudeExecutionFeedbackHarness(turn);
+  h.context.transcriptEventTypes.add("contextCompaction");
+  h.render();
+  assert.deepEqual(Array.from(h.root.children[0].children, node => node.dataset.key || "activity"),
+    ["render-fallback:input", "render-fallback:reply", "render-fallback:compact"]);
+});
+
+test("Claude 手动压缩位于已编辑文件之后，任务清单固定在正文末尾", () => {
+  const turn = { id: "render-tail", _nativeUserId: "native-render-tail",
+    status: "failed", plan: [{ step: "保留任务清单", status: "completed" }], items: [
+      { id: "input", type: "userMessage" },
+      { id: "reply", type: "agentMessage", text: "You've hit your 5-hour limit",
+        phase: "final_answer" },
+      { id: "compact", type: "contextCompaction", source: "manual", status: "completed",
+        completed: true, remoteInlineEvent: true, remoteCompactionLifecycle: true },
+    ] };
+  const h = claudeExecutionFeedbackHarness(turn);
+  const editedFiles = { dataset: { key: "edited-files" } };
+  const planTitle = { dataset: { key: "plan-title" } };
+  h.context.renderEditedFiles = () => editedFiles;
+  h.context.renderTurnPlanTitle = () => planTitle;
+  h.context.transcriptEventTypes.add("contextCompaction");
+  h.render();
+  const children = h.root.children[0].children;
+  const compact = children.find(node => node.dataset.key === "render-tail:compact");
+  assert.ok(compact, "手动压缩节点必须被渲染");
+  assert.ok(children.indexOf(editedFiles) < children.indexOf(compact),
+    "压缩提示必须位于已编辑文件卡片之后");
+  const plan = h.root.children.at(-1);
+  assert.equal(plan.dataset.planScope, "claude-session");
+  assert.equal(plan.children[0], planTitle);
+  assert.ok(h.root.children.indexOf(plan) > 0 && h.root.children.indexOf(plan) > h.root.children.indexOf(h.root.children[0]),
+    "Claude 任务清单必须位于所有轮次之后");
+});
+
+test("Claude 任务清单只显示最新快照并随正文刷新保持在最下方", () => {
+  const first = { id: "plan-first", _nativeUserId: "native-plan-first", status: "completed",
+    plan: [{ step: "旧任务", status: "completed" }],
+    items: [{ id: "input", type: "userMessage" }, { id: "reply", type: "agentMessage", text: "第一轮" }] };
+  const second = { id: "plan-second", _nativeUserId: "native-plan-second", status: "completed",
+    plan: [{ step: "新任务", status: "inProgress" }],
+    items: [{ id: "input", type: "userMessage" }, { id: "reply", type: "agentMessage", text: "第二轮" }] };
+  const h = claudeExecutionFeedbackHarness([first, second]);
+  h.context.renderTurnPlanTitle = plan => h.context.element("div", "turn-plan-title", `${plan.length} 个任务`);
+  h.render();
+  let plan = h.root.children.at(-1);
+  assert.equal(plan.dataset.planScope, "claude-session");
+  assert.deepEqual(Array.from(h.root.children, node => node.dataset.planScope || "turn"), ["turn", "turn", "claude-session"]);
+  assert.equal(plan.children[1].children[0].textContent, "◌ 新任务");
+  assert.equal(h.root.children[0].children.some(node => node.dataset.planScope), false,
+    "旧轮次不能继续显示过期清单");
+
+  second.plan = [
+    { step: "新任务", status: "completed" },
+    { step: "收尾", status: "pending" },
+  ];
+  h.render();
+  plan = h.root.children.at(-1);
+  assert.equal(plan.children[0].textContent, "2 个任务");
+  assert.deepEqual(Array.from(plan.children[1].children, node => node.textContent), ["✓ 新任务", "○ 收尾"]);
+
+  second.plan = [];
+  h.render();
+  assert.equal(h.root.children.at(-1).dataset.planScope, undefined,
+    "最新清单为空时不能继续显示旧快照");
+});
+
+test("Claude 新页面任务清单独立于正文分页，空快照优先于旧轮次且不影响 Codex", () => {
+  const turns = Array.from({ length: 12 }, (_,index) => ({ id: `turn-${index}`,
+    _nativeUserId: `native-${index}`, status: "completed",
+    items: [{ id: `input-${index}`, type: "userMessage" }] }));
+  turns[0].plan = [{ step: "较早轮次中的任务", status: "pending" }];
+  const h = claudeExecutionFeedbackHarness(turns.slice(-10));
+  h.context.renderTurnPlanTitle = plan => h.context.element("div", "turn-plan-title", `${plan.length} 个任务`);
+  h.context.sessionPlan = [{ step: "会话最新任务", status: "inProgress" }];
+  h.render();
+  assert.equal(h.root.children.at(-1).dataset.planScope, "claude-session");
+  assert.equal(h.root.children.at(-1).children[1].children[0].textContent, "◌ 会话最新任务");
+  h.context.turns = new Map(turns.map(turn => [turn.id, turn]));
+  h.render();
+  assert.equal(h.root.children.at(-1).children[1].children[0].textContent, "◌ 会话最新任务",
+    "加载旧页不能改变完整会话的最新任务");
+  h.context.sessionPlan = [];
+  h.render();
+  assert.equal(h.root.children.some(node => node.dataset.planScope), false,
+    "明确空清单必须覆盖仍在历史中的旧任务");
+  h.context.sessionPlan = null;
+  h.context.turns = new Map([["codex-turn", { id: "codex-turn", status: "inProgress",
+    plan: [{ step: "Codex 任务", status: "pending" }], items: [{ id: "input", type: "userMessage" }] }]]);
+  h.render();
+  assert.equal(h.root.children.some(node => node.dataset.planScope), false);
+  assert.equal(h.root.children[0].children.at(-1).children[0].textContent, "○ Codex 任务");
+});
+
+test("Codex 任务计划实时更新与重进历史共用快照，较旧版本和迟到读取不撤回新状态", () => {
+  const c = vm.createContext({ nativeConnectionVersion: 1,
+    session: { device: { id: "device" } }, selectedId: "main", privateInputScope: () => "scope",
+    sessionMenu: { invalidate: () => null }, relatedSessionView: null, relatedMenuTimer: null, connected: true,
+    thread: { id: "main", status: { type: "active" } }, turns: new Map(), pending: null, sending: false,
+    messageVersion: 0, statusVersion: 0, itemVersions: new Map(), turnVersions: new Map(), turnFieldVersions: new Map(),
+    partialItems: new Set(), transcriptEventTypes: new Set(), sidebarReadRefreshSuppressions: new Set(),
+    recentPrioritySelectionSuppressions: new Set(), threadDeleted: () => false,
+    handleRemoteChannelEvent: () => false, scheduleRelatedMenuRefresh() {}, rememberBackgroundThreadDisplay() {},
+    receiveCompactionLifecycle() {}, mergeTranscriptEvents() {}, reconcileConfirmedInputOrder() {},
+    mergeItemProjection: (previous, incoming) => ({ ...previous, ...incoming }), enrichTurnTranscriptEvents: value => value,
+    updateComposer() {}, scheduleReload() {}, markVisibleThreadRead: async () => {},
+    scheduleMessages() {}, rememberTranscript() {}, scheduleSidebarRefresh() {},
+  });
+  vm.runInContext(sourceSection("function normalizeDi") + "\n"
+    + sourceSection("function mergeHi", "async functi") + "\n" + sourceSection("function receive(event) {"), c);
+  const initial = { id: "turn", status: "inProgress", items: [], remotePlanEpoch: "engine",
+    remotePlanRevision: 2, plan: [{ step: "任务", status: "pending" }] };
+  let turn = c.mergeHistoryTurn(initial, 0);
+  assert.equal(turn.plan[0].status, "pending", "新页面仅凭历史快照即可恢复任务");
+  c.turns.set(turn.id, turn);
+  const receive = (revision, plan) => c.receive({ method: "turn/plan/updated",
+    params: { threadId: "main", turnId: "turn", remotePlanEpoch: "engine", remotePlanRevision: revision, plan } });
+  receive(4, [{ step: "任务", status: "inProgress" }]);
+  turn = c.mergeHistoryTurn(initial, c.messageVersion);
+  assert.equal(turn.plan[0].status, "inProgress", "服务版本较旧，即使请求较晚也不能倒退");
+  assert.equal(turn.remotePlanRevision, 4);
+  c.turns.set(turn.id, turn);
+  receive(3, initial.plan);
+  assert.equal(c.turns.get(turn.id).plan[0].status, "inProgress", "乱序旧事件不能倒退");
+  const beforeClear = c.messageVersion;
+  receive(5, []);
+  turn = c.mergeHistoryTurn(initial, beforeClear);
+  assert.equal(turn.plan.length, 0, "迟到 HTTP 不能撤回原生清空");
+  c.turns.set(turn.id, turn);
+  turn = c.mergeHistoryTurn({ id: turn.id, items: [], remotePlanEpoch: "engine" }, c.messageVersion);
+  assert.equal(turn.plan.length, 0, "字段缺失不改变已确认清单");
+  receive(6, initial.plan);
+  turn = c.mergeHistoryTurn({ id: turn.id, items: [], remotePlanEpoch: "new-engine" }, c.messageVersion);
+  assert.equal(turn.plan, undefined, "新引擎无恢复证据时不保留旧缓存计划");
+  c.turns.set(turn.id, { ...initial, remotePlanEpoch: undefined, remotePlanRevision: undefined });
+  turn = c.mergeHistoryTurn({ id: turn.id, items: [], remotePlanEpoch: "new-engine" }, c.messageVersion);
+  assert.equal(turn.plan, undefined, "升级前没有代次标识的缓存也不能冒充新引擎的计划");
+});
+
+test("Claude 提问回答保留未回答题目并按受鉴权地址显示截图，拒答回退工具卡片", () => {
+  const context = nodeVm.createContext({});
+  nodeVm.runInContext(sourceSection("function claudeQuestionReplies(", "function renderClaudeQuestionReply("), context);
+  const item = {
+    type: "dynamicToolCall", source: "claude", tool: "AskUserQuestion", status: "completed",
+    arguments: { questions: [
+      { question: "选择方案？", header: "方案" },
+      { question: "提交吗？", header: "提交" },
+    ] },
+    questionAnswers: [
+      { question: "选择方案？", answer: "方案一", images: [{ url: "inline:answer-image" }] },
+      { question: "提交吗？", answer: null, images: [] },
+    ],
+    remoteImages: [{ source: "inline:answer-image", url: "/api/images/answer-image-12345678901234567890" }],
+  };
+  const replies = context.claudeQuestionReplies(item);
+  assert.equal(replies.length, 2);
+  assert.equal(replies[0].answer, "方案一");
+  assert.equal(replies[0].images[0].source, "inline:answer-image");
+  assert.equal(replies[0].images[0].asset.url, "/api/images/answer-image-12345678901234567890");
+  assert.equal(replies[1].answer, null);
+  assert.equal(context.claudeQuestionReplies({
+    ...item, questionAnswers: [{ question: "选择方案？", answer: null, images: [] }],
+  }), null, "拒答或没有结构化答案时保留原生工具卡片");
+});
+
+test("Claude 回复生成前的压缩仍保留原位置，不统一移动到最终回复之后", () => {
+  const turn = { id: "during", _nativeUserId: "native-during", status: "completed", items: [
+    { id: "input", type: "userMessage" },
+    { id: "tool", type: "dynamicToolCall", status: "completed" },
+    { id: "compact", type: "contextCompaction", source: "automatic", status: "completed",
+      completed: true, remoteInlineEvent: true, remoteCompactionLifecycle: true },
+    { id: "reply", type: "agentMessage", text: "压缩后生成的回复" },
+  ] };
+  const h = claudeExecutionFeedbackHarness(turn);
+  h.context.transcriptEventTypes.add("contextCompaction");
+  h.render();
+  assert.deepEqual(Array.from(h.root.children[0].children, node => node.dataset.key || "activity"),
+    ["during:input", "activity", "during:compact", "during:reply"]);
+});
+
+test("Claude 回复后的压缩保持末尾位置，尾随工具完成记录仍按原逻辑归入活动", () => {
+  const turn = { id: "trailing", _nativeUserId: "native-trailing", status: "completed", items: [
+    { id: "input", type: "userMessage" },
+    { id: "tool-before", type: "dynamicToolCall", status: "completed" },
+    { id: "reply", type: "agentMessage", text: "已完成的最终回复", phase: "final_answer" },
+    { id: "tool-after", type: "dynamicToolCall", status: "completed" },
+    { id: "compact-first", type: "contextCompaction", source: "manual", status: "completed",
+      completed: true, remoteCompactionLifecycle: true },
+    { id: "compact-second", type: "contextCompaction", source: "manual", status: "completed",
+      completed: true, remoteCompactionLifecycle: true },
+  ] };
+  const h = claudeExecutionFeedbackHarness(turn);
+  h.context.transcriptEventTypes.add("contextCompaction");
+  h.render();
+  assert.deepEqual(h.activities[0].work, ["tool-before", "tool-after"]);
+  assert.deepEqual(Array.from(h.root.children[0].children, node => node.dataset.key || "activity"),
+    ["trailing:input", "activity", "trailing:reply", "trailing:compact-first", "trailing:compact-second"]);
+});
+
+test("Claude 实时问答等待不继续显示工具运行计时", () => {
+  const turn = { id: "asked", _nativeUserId: "native-asked", status: "inProgress",
+    turnStartedAtMs: Date.now() - 60000, items: [
+      { id: "input", type: "userMessage" },
+      { id: "read", type: "dynamicToolCall", status: "completed" },
+    ] };
+  const h = claudeExecutionFeedbackHarness(turn);
+  h.context.thread.status = { type: "waiting", activeFlags: ["waitingOnUserInput"] };
+  assert.ok(h.render().every(activity => !activity.running && !activity.ticking),
+    "原生等待回答时不能把已经完成的工具继续计时");
+});
+
+test("Claude 实时多问复用问答输入，完整发送选项及自由回答，缺答时保留草稿", () => {
+  const make = (tag, textContent = "") => ({ tag, textContent, children: [], attributes: {},
+    append(...items) { this.children.push(...items); },
+    setAttribute(key, value) { this.attributes[key] = value; } });
+  const answers = [], notices = [], draft = new Map();
+  const context = nodeVm.createContext({ nativeConnectionVersion: 1,
+    requestThreadId: "claude-question",
+    request: { params: { questions: [
+      { id: "branch", question: "选择分支？", options: [{ label: "test" }, { label: "pre-production" }] },
+      { id: "master", question: "主分支怎么处理？", options: [{ label: "master" }, { label: "跳过" }] },
+    ] } },
+    card: make("section"), actions: make("div"),
+    element: (tag, _className, text) => make(tag, text),
+    button: (text, _label, action) => Object.assign(make("button", text), { action }),
+    blockingApprovalDraft: () => draft, isClaude: () => true,
+    reply: (action, value) => answers.push({ action, value }),
+    notice: text => notices.push(text),
+  });
+  const source = sourceSection('    } else if (request.method === "item/tool/requestUserInput") {',
+    '    } else if (request.method === "item/permissions/requestApproval") {');
+  nodeVm.runInContext(`{${source.slice(source.indexOf("{") + 1)}}`, context);
+  const [first, second] = context.card.children, submit = context.actions.children[0];
+  first.children[0].children[1].action();
+  submit.action();
+  assert.equal(answers.length, 0);
+  assert.equal(notices[0], "请回答所有问题");
+  second.children[1].value = "保留 master，自定义回答";
+  second.children[1].oninput();
+  submit.action();
+  assert.equal(answers.length, 1);
+  assert.equal(answers[0].action, "answer");
+  assert.deepEqual(JSON.parse(JSON.stringify(answers[0].value)), {
+    response: { answers: { branch: { answers: ["pre-production"] },
+      master: { answers: ["保留 master，自定义回答"] } } },
+  });
+  assert.equal(draft.get("branch"), "pre-production");
+  assert.equal(draft.get("master"), "保留 master，自定义回答");
+});
+
+test("Claude 补齐多选显示不清除问答草稿，新问题和已提交状态仍有独立身份", () => {
+  const context = nodeVm.createContext({ nativeConnectionVersion: 1, session: { device: { id: "device" } },
+    blockingRequestState: () => ({ sourceVersion: 1 }), approvalDrafts: new Map() });
+  nodeVm.runInContext(sourceSection("function approvalRep", "function rep"), context);
+  const request = { id: "native-question-one", method: "item/tool/requestUserInput",
+    params: { nativeQuestion: { id: "native-question-one", state: "waiting" },
+      questions: [{ id: "q", question: "选择？", options: [{ label: "A" }, { label: "B" }] }] } };
+  const identity = context.blockingApprovalIdentity("thread", request);
+  const draft = context.blockingApprovalDraft("thread", request);
+  draft.set("q", "A");
+  request.params.questions[0].multiSelect = true;
+  assert.equal(context.blockingApprovalIdentity("thread", request), identity);
+  assert.equal(context.blockingApprovalDraft("thread", request).get("q"), "A");
+  request.params.nativeQuestion.state = "submitted";
+  assert.notEqual(context.blockingApprovalIdentity("thread", request), identity);
+  request.params.nativeQuestion.state = "waiting";
+  request.id = request.params.nativeQuestion.id = "native-question-two";
+  assert.notEqual(context.blockingApprovalIdentity("thread", request), identity);
+});
+
+test("Claude 已接收但未启动时显示等待提示，执行与完成后自然接替，不改变真实执行状态", () => {
+  const turn = { id: "accepted", _nativeUserId: "native-accepted", status: "pending",
+    turnStartedAtMs: Date.now() - 3000, items: [{ id: "input", type: "userMessage" }] };
+  const h = claudeExecutionFeedbackHarness(turn);
+  assert.deepEqual(h.render(), [{ text: "已接收，等待 Claude 开始", ticking: false, live: false, running: false, work: [] }]);
+  assert.equal(h.context.thread.status.type, "idle", "等待提示不能把未知/空闲改为执行或入队依据");
+  assert.equal(turn.status, "pending");
+  h.context.thread.nativeDialog = { kind: "model", state: "waiting" };
+  assert.equal(h.render()[0].text, "已接收，等待确认模型切换");
+  h.context.thread.nativeDialog = { kind: "unknown", state: "waiting" };
+  assert.equal(h.render()[0].text, "已接收，等待 Claude 本机确认");
+  delete h.context.thread.nativeDialog;
+  turn.status = "inProgress"; h.context.thread.status.type = "active";
+  assert.match(h.render()[0].text, /^已处理 /);
+  assert.equal(h.activities[0].running, true);
+  assert.equal(h.activities[0].ticking, true);
+  turn.items.push({ id: "reply", type: "agentMessage", text: "已完成", phase: "final_answer" });
+  turn.status = "completed"; turn._nativeDone = true; h.context.thread.status.type = "idle";
+  assert.equal(h.render().length, 0, "已完成后不能继续保留待启动占位");
+});
+
+test("Claude 等待提示只属于最新已接收轮次，不将旧历史、未知状态或未确认占位显示为等待执行", () => {
+  const accepted = { id: "accepted", _nativeUserId: "native-accepted", status: "pending",
+    items: [{ id: "input", type: "userMessage" }] };
+  for (const value of [
+    { ...accepted, _nativeUserId: undefined },
+    { ...accepted, status: "unknown" },
+    { ...accepted, _nativeDone: true },
+    { ...accepted, items: [{ id: "input", type: "userMessage", remotePendingInput: true }] },
+    { ...accepted, items: [...accepted.items, { id: "reply", type: "agentMessage", text: "已到达的回复" }] },
+  ]) {
+    const h = claudeExecutionFeedbackHarness(value);
+    assert.equal(h.context.claudeTurnAwaitingStart(value), false);
+    assert.equal(h.render().some(value => value.text.includes("等待 Claude")), false);
+  }
+  const h = claudeExecutionFeedbackHarness(accepted);
+  h.context.turns.set("latest", { id: "latest", status: "completed",
+    items: [{ id: "latest-reply", type: "agentMessage", text: "新轮次已结束" }] });
+  assert.equal(h.render().length, 0, "旧轮次不能恢复为当前等待提示");
+});
+
+test("Claude 原生已结束且无回复时保留消息并结束等待，不伪造用户停止", () => {
+  const turn = { id: "ended", _nativeUserId: "native-ended", status: "completed",
+    _nativeDone: true, _nativeEndedWithoutReply: true,
+    items: [{ id: "input", type: "userMessage", text: "已接收的消息" }] };
+  const h = claudeExecutionFeedbackHarness(turn);
+  assert.equal(h.render().some(value => value.text.includes("等待 Claude")), false);
+  const texts = h.root.children.flatMap(node => node.children).map(node => node.textContent);
+  assert.ok(texts.includes("已接收的消息"));
+  assert.ok(texts.includes("本轮已结束，未生成回复"));
+  assert.ok(!texts.includes("已停止"));
+  h.render();
+  assert.equal(h.context.turns.get("ended").items.length, 1, "重复渲染不删除或重复已接收正文");
+});
+
+test("Claude 原生队列允许执行中继续发送，仅提交期间防重复", () => {
+  const h = queuedEditFeedbackHarness(), context = h.context;
+  Object.assign(context, {
+    selectedId: "claude-01234567-89ab-4cde-8fab-0123456789ab",
+    thread: { id: "claude-01234567-89ab-4cde-8fab-0123456789ab",
+      backend: "claude", capabilities: { queue: true } },
+    active: true, prompt: "下一条消息", editing: false, editingQueuedMessage: null,
+    pending: null, busy: false, stopping: false, modelsLoadedAt: 1,
+  });
+  context.renderSendFeedback();
+  assert.equal(h.send.dataset.action, "send");
+  assert.equal(h.send.disabled, false);
+  context.busy = true;
+  context.renderSendFeedback();
+  assert.equal(h.send.disabled, true);
+  context.busy = false;
+  context.renderSendFeedback();
+  assert.equal(h.send.disabled, false);
+});
+
+test("Claude 实时历史投影接收 CLI 消息，重复快照不产生重复消息", () => {
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    selectedId: "claude-live", thread: { id: "claude-live", backend: "claude" },
+    turns: new Map(), turnVersions: new Map(), itemVersions: new Map(), partialItems: new Set(),
+    messageVersion: 0, statusVersion: 0, queueVersion: 0,
+    normalizeDisplayedTurnItems: value => value, enrichTurnTranscriptEvents: value => value,
+    rememberThreadDisplay() {}, rememberTranscript() {}, reconcileSentMessageDisplays() {},
+    updateComposer() {}, scheduleMessages() {}, scheduleSidebarRefresh() {},
+    markVisibleThreadRead: async () => {},
+  });
+  vm.runInContext(sourceSection("function receiveClaudeHistory(", "function receive(event)"), context);
+  const snapshot = { threadId: "claude-live",
+    thread: { id: "claude-live", backend: "claude", status: { type: "active" },
+      capabilities: { queue: true }, queuedMessages: [{ id: "web-next", text: "网页补充" }],
+      queuedEdits: [{ editId: "edit-active", messageId: "web-edit", state: "editing" }] },
+    turns: [{ id: "native-cli-user", status: "inProgress", items: [
+      { id: "native-cli-user", type: "userMessage", content: [{ type: "text", text: "CLI 发出的消息" }] },
+      { id: "native-reply", type: "agentMessage", text: "正在回复" },
+    ] }] };
+  context.receiveClaudeHistory(snapshot);
+  context.receiveClaudeHistory(structuredClone(snapshot));
+  assert.equal(context.turns.size, 1);
+  assert.equal(context.turns.get("native-cli-user").items.length, 2);
+  assert.equal(context.turns.get("native-cli-user").items[0].content[0].text, "CLI 发出的消息");
+  assert.equal(context.thread.queuedMessages[0].id, "web-next");
+  assert.equal(context.notifiedQueueEdits[0].editId, "edit-active", "实时快照必须保留队列编辑，供迟到读取合并");
+  context.receiveClaudeHistory({ ...snapshot, threadId: "another" });
+  assert.equal(context.turns.size, 1);
+});
+
+test("Claude 终端预览只更新当前临时气泡，迟到或缩短的片段不能覆盖正式正文", () => {
+  let renders = 0, cached = 0, sidebarReads = 0;
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    selectedId: "claude-preview", selectionVersion: 1, thread: { id: "claude-preview", backend: "claude" },
+    turns: new Map(), turnVersions: new Map(), itemVersions: new Map(), partialItems: new Set(),
+    messageVersion: 0, statusVersion: 0, queueVersion: 0,
+    normalizeDisplayedTurnItems: value => value, enrichTurnTranscriptEvents: value => value,
+    rememberThreadDisplay() {}, rememberTranscript() { cached++; }, reconcileSentMessageDisplays() {},
+    updateComposer() {}, scheduleMessages() { renders++; }, scheduleSidebarRefresh() { sidebarReads++; },
+    markVisibleThreadRead: async () => {},
+  });
+  vm.runInContext(sourceSection("function receiveClaudeHistory(", "function receive(event)"), context);
+  const canonical = { id: "turn", _nativeUserId: "native-user", _process: "generation",
+    _nativePreviewBasis: "b".repeat(64), status: "inProgress", items: [
+      { id: "user", type: "userMessage", text: "question" },
+      { id: "official", type: "agentMessage", text: "正式 **Markdown** 正文" },
+    ] };
+  const event = { threadId: "claude-preview", thread: { id: "claude-preview", status: { type: "active" },
+    queuedMessages: [], queuedEdits: [] }, turns: [canonical], turnIds: ["turn"] };
+  context.receiveClaudeHistory(event);
+  const previews = (basis, text) => context.receiveClaudeHistory({ ...event, preview: true,
+    turns: [{ ...canonical, _nativePreviewBasis: basis, items: [
+      { id: "user", type: "userMessage", text: "迟到副本不能覆盖的旧内容" },
+      { id: "native-live-native-user", type: "agentMessage", text, status: "inProgress", _nativePreview: true },
+    ] }] });
+  previews("a".repeat(64), "旧的终端片段");
+  assert.equal(context.turns.get("turn").items.length, 2);
+  assert.equal(context.turns.get("turn").items[1].id, "official", "迟到预览不能把正式回复替换掉");
+  assert.equal(renders, 1, "无效预览不触发页面重绘");
+  previews("b".repeat(64), "下一段回复");
+  assert.equal(context.turns.get("turn").items[0].text, "question");
+  assert.equal(context.turns.get("turn").items[1].text, "正式 **Markdown** 正文");
+  assert.equal(context.turns.get("turn").items[2].text, "下一段回复");
+  assert.equal(context.itemVersions.get("turn:official"), 1, "预览不能把旧正式正文标成比 HTTP 读取更新");
+  previews("b".repeat(64), "下一段");
+  assert.equal(context.turns.get("turn").items[2].text, "下一段回复");
+  assert.equal(cached, 1, "终端预览不写正式正文缓存");
+  context.receiveClaudeHistory({ ...event, turns: [{ ...canonical, _nativePreviewBasis: "c".repeat(64),
+    items: [...canonical.items, { id: "official-next", type: "agentMessage", text: "下一段**回复**" }] }] });
+  previews("b".repeat(64), "下一段回复的迟到片段");
+  assert.deepEqual(Array.from(context.turns.get("turn").items, item => item.id),
+    ["user", "official", "official-next"]);
+  const before = sidebarReads;
+  context.receiveClaudeHistory({ ...event, threadId: "another", preview: true });
+  assert.equal(sidebarReads, before, "其他会话的预览不触发重复侧栏读取");
+});
+
+test("Claude HTTP 完整历史接替预览且迟到读取不能复活旧预览", () => {
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    turns: new Map(), itemVersions: new Map(), turnVersions: new Map(), turnFieldVersions: new Map(),
+    partialItems: new Set(), enrichTurnTranscriptEvents: value => value,
+  });
+  vm.runInContext((sourceSection("function mergeLi") + "\n" + sourceSection("function mergeRe") + "\n" + sourceSection("function mergeHi", "async functi")), context);
+  const base = { id: "turn", _nativeUserId: "native-user", _process: "generation",
+    _nativePreviewBasis: "a".repeat(64), status: "inProgress", itemsComplete: true, itemsView: "full",
+    items: [{ id: "user", type: "userMessage", text: "question" }] };
+  const preview = { id: "native-live-native-user", type: "agentMessage", text: "partial reply",
+    status: "inProgress", _nativePreview: true };
+  context.turns.set("turn", { ...base, items: [...base.items, preview] });
+  context.itemVersions.set("turn:native-live-native-user", 2);
+  const metadata = context.mergeHistoryTurn(base, 1);
+  assert.equal(metadata.items.at(-1).text, preview.text, "正文基线未变时保留已显示预览");
+  const official = { ...base, _nativePreviewBasis: "b".repeat(64), items: [
+    ...base.items, { id: "official", type: "agentMessage", text: "partial **reply**", status: "completed" },
+  ] };
+  const replaced = context.mergeHistoryTurn(official, 1);
+  assert.deepEqual(Array.from(replaced.items, item => item.id), ["user", "official"],
+    "即使预览晚于 HTTP 发起，正式正文基线变化也必须使其退役");
+  context.turns.set("turn", replaced);
+  context.turnVersions.set("turn", 3);
+  const stale = context.mergeHistoryTurn({ ...base, items: [...base.items, preview] }, 1);
+  assert.deepEqual(Array.from(stale.items, item => item.id), ["user", "official"]);
+  assert.equal(stale._nativePreviewBasis, official._nativePreviewBasis);
+  context.turns.set("turn", { ...base, items: [...base.items, preview] });
+  context.turnVersions.set("turn", 0);
+  assert.equal(context.mergeHistoryTurn({ ...base, status: "completed", _nativeDone: true }, 0).items.length, 1);
+});
+
+test("Claude 长历史按原生顺序补齐实时快照，零散缓存不能跳过中间分页", () => {
+  const id = "claude-01234567-89ab-4cde-8fab-0123456789ab";
+  const ids = Array.from({ length: 30 }, (_, index) => `turn-${index + 1}`);
+  const turn = key => ({ id: key, _nativeUserId: key, items: [], status: "completed" });
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    selectedId: id, selectionVersion: 1, thread: { id, backend: "claude" },
+    turns: new Map(ids.slice(-10).map(key => [key, turn(key)])),
+    turnVersions: new Map(), itemVersions: new Map(), partialItems: new Set(),
+    messageVersion: 0, statusVersion: 0, queueVersion: 0,
+    normalizeDisplayedTurnItems: value => value, enrichTurnTranscriptEvents: value => value,
+    rememberThreadDisplay() {}, rememberTranscript() {}, reconcileSentMessageDisplays() {},
+    updateComposer() {}, scheduleMessages() {}, scheduleSidebarRefresh() {},
+    markVisibleThreadRead: async () => {},
+  });
+  vm.runInContext(sourceSection("function receiveClaudeHistory(", "function receive(event)"), context);
+  context.receiveClaudeHistory({ threadId: id, thread: { id, queuedMessages: [], queuedEdits: [] },
+    turnIds: ids, turns: ids.slice(-20).reverse().map(turn) });
+  assert.deepEqual([...context.turns.keys()], ids.slice(-20), "实时补入的旧轮次必须在最新轮次前面");
+  context.turns.set(ids[0], turn(ids[0]));
+  assert.equal(context.claudeHistoryCursor(ids), "10", "第一条已缓存不代表中间九轮已加载");
+  context.turns.set("live-new", turn("live-new"));
+  context.turnVersions.set("live-new", 3);
+  const newest = [...ids, "live-new"];
+  context.receiveClaudeHistory({ threadId: id, thread: { id, queuedMessages: [] },
+    turnIds: newest, turns: [turn("live-new")] });
+  context.orderClaudeHistoryTurns([...ids].reverse(), 0);
+  assert.deepEqual([...context.turns.keys()], [ids[0], ...ids.slice(-20), "live-new"],
+    "迟到 HTTP 顺序不能覆盖较新的原生顺序或移走新轮次");
+  assert.equal(context.claudeHistoryCursor(ids), "10");
+  for (const key of ids.slice(1, 10)) context.turns.set(key, turn(key));
+  context.orderClaudeHistoryTurns(newest);
+  assert.deepEqual([...context.turns.keys()], newest);
+  assert.equal(context.claudeHistoryCursor(newest), null);
+});
+
+test("新建类型切换后，迟到 Codex 模型不覆盖 Claude，项目 ID 保持共用", async () => {
+  const reads = [];
+  const context = {
+    creating: true, creationBackend: "codex", creationProject: "shared-project",
+    appearance: { sessionInstances: { "codex:local": true, "claude:wsl:test": true } },
+    session: { device: { id: "backend-device" }, runtime: { revision: 1 } },
+    models: [], modelsPromise: null, modelsLoadedAt: 0, modelsRetryAt: 0, modelDefaults: {},
+    modelCatalogCacheVersion: 1, catalogFallbackMs: 1000, catalogRetryMs: 1000,
+    privateInputScope: () => "backend-device", catalogUsable: () => false,
+    api: (_path, payload) => { const response = deferred(); reads.push({ payload, response }); return response.promise; },
+    cacheDisplayData() {}, scheduleCatalogRefresh() {}, updateComposer() {}, $: () => null,
+  };
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  vm.runInContext(sourceSection("async function loadM", "async functi"), context);
+  const codex = context.loadModels(true);
+  context.creationBackend = "claude";
+  context.creationInstanceId = "claude:wsl:test";
+  context.modelsPromise = null;
+  const claude = context.loadModels(true);
+  assert.equal(reads[1].payload.backend, "claude");
+  assert.equal(reads[1].payload.projectId, "shared-project");
+  reads[1].response.resolve({ data: [{ model: "haiku" }], defaultModel: "haiku" });
+  await claude;
+  reads[0].response.resolve({ data: [{ model: "codex-model" }], defaultModel: "codex-model" });
+  await codex;
+  assert.equal(context.models[0].model, "haiku");
+  assert.equal(context.modelDefaults.model, "haiku");
+});
+
+function claudeHistoryModelMenuHarness({ cached = false, stale = false } = {}) {
+  const reads = [], cacheWrites = [];
+  const catalog = { data: [
+    { model: "history-haiku", supportedReasoningEfforts: [{ reasoningEffort: "high" }] },
+    { model: "fixture-opus", supportedReasoningEfforts: [{ reasoningEffort: "max" }] },
+    { model: "fixture-sonnet", supportedReasoningEfforts: [{ reasoningEffort: "medium" }] },
+  ], defaultModel: "history-haiku", defaultReasoningEffort: "" };
+  function element(tag, className = "", textContent = "") {
+    return { tag, className, textContent, children: [], hidden: false,
+      append(...nodes) { this.children.push(...nodes); },
+      prepend(...nodes) { this.children.unshift(...nodes); },
+      replaceChildren(...nodes) { this.children = nodes; },
+      setAttribute() {} };
+  }
+  const menu = element("div"), trigger = element("button");
+  menu.hidden = true;
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    creating: false, selectedId: "claude-00000000-0000-4000-8000-000000000001",
+    thread: { id: "claude-00000000-0000-4000-8000-000000000001", backend: "claude",
+      instanceId: "claude:wsl:history", model: "history-haiku", reasoningEffort: "high" },
+    appearance: { sessionInstances: { "claude:wsl:history": true } },
+    session: { device: { id: "history-model-device" }, runtime: { revision: 1 } },
+    models: cached ? catalog.data : [],
+    modelsPromise: null, modelsLoadedAt: cached ? Date.now() - (stale ? 3600001 : 0) : 0, modelsRetryAt: 0,
+    modelDefaults: cached ? { model: catalog.defaultModel, reasoningEffort: "" } : {},
+    modelCatalogCacheVersion: 1, catalogFallbackMs: 1000, catalogRetryMs: 1000,
+    selectedModel: "", selectedEffort: "", modelQuery: "",
+    privateInputScope: value => value?.device?.id,
+    catalogUsable: value => value.loadedAt > 0,
+    catalogNeedsRefresh: value => Date.now() - value.loadedAt > 3600000,
+    api(path, payload) {
+      assert.equal(path, "/api/read/models", "模型菜单只允许模型读取，不能发送或恢复会话");
+      const response = deferred(); reads.push({ payload, response }); return response.promise;
+    },
+    cacheDisplayData(...args) { cacheWrites.push(args); }, scheduleCatalogRefresh() {}, updateComposer() {}, element,
+    $: selector => selector === "#model-settings" ? menu : selector === "#model-button" ? trigger : null,
+    threadReadOnly: () => false, closePopup() {}, closeComposerMenus() { menu.hidden = true; },
+    fitComposerMenu() {}, renderModelMenu() {
+      menu.replaceChildren(...Array.from(context.models, model => element("button", "", model.model)));
+    },
+  });
+  vm.runInContext(sourceSection("async function loadM", "async functi"), context);
+  vm.runInContext(sourceSection('  $("#model-button").onclick = async () => {', '  $("#model-settings").onkeydown ='), context);
+  return { context, reads, cacheWrites, menu, trigger, catalog, settle: () => new Promise(resolve => setImmediate(resolve)) };
+}
+
+function claudeAliasModelMenuHarness() {
+  class MenuNode {
+    constructor(tag, className = "", text = "") {
+      this.tag = tag; this.className = className; this.text = text;
+      this.children = []; this.dataset = {}; this.attributes = {}; this.hidden = false; this.scrollTop = 0;
+    }
+    get textContent() { return this.text + this.children.map(node => node.textContent).join(""); }
+    append(...nodes) { this.children.push(...nodes); }
+    prepend(...nodes) { this.children.unshift(...nodes); }
+    replaceChildren(...nodes) { this.children = nodes; }
+    setAttribute(name, value) { this.attributes[name] = value; }
+    contains(value) { return !!value && (this === value || this.children.some(node => node.contains(value))); }
+    querySelectorAll(selector) {
+      return this.children.flatMap(node => [
+        ...(selector === "button" ? node.tag === "button" : node.className.split(" ").includes(selector.slice(1))) ? [node] : [],
+        ...node.querySelectorAll(selector),
+      ]);
+    }
+    querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+    focus() {}
+  }
+  const menu = new MenuNode("div"), prompt = new MenuNode("input");
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    models: [
+      { model: "opus", resolvedModel: "claude-opus-5-5", displayName: "Opus 5.5",
+        supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"].map(reasoningEffort => ({ reasoningEffort })) },
+      { model: "sonnet", resolvedModel: "claude-sonnet-5-5", displayName: "Sonnet 5.5",
+        supportedReasoningEfforts: [{ reasoningEffort: "medium" }, { reasoningEffort: "high" }] },
+      { model: "legacy-haiku", resolvedModel: "claude-haiku-4-5", displayName: "Haiku 4.5",
+        supportedReasoningEfforts: [] },
+    ],
+    selectedId: "claude-00000000-0000-4000-8000-000000000001", creating: false,
+    thread: { backend: "claude", model: "claude-opus-5-5", reasoningEffort: "max" },
+    selectedModel: "", selectedEffort: "", modelQuery: "",
+    modelDefaults: { model: "opus", reasoningEffort: "high" },
+    document: { activeElement: prompt }, newChatModels: new Map(),
+    session: { device: { id: "model-device" } }, privateInputScope: () => "model-device",
+    localStorage: { getItem: () => "", setItem() {} },
+    currentThreadDisplay: () => context.thread,
+    effortLabels: { low: "轻度", medium: "中", high: "高", xhigh: "极高", max: "Max" },
+    element: (tag, className, text) => new MenuNode(tag, className, text),
+    button: (text, _label, action, className) => Object.assign(new MenuNode("button", className, text), { onclick: action }),
+    $: (selector, root) => root ? root.querySelector(selector)
+      : selector === "#model-settings" ? menu : selector === "#prompt" ? prompt : null,
+    updateComposer() {}, fitComposerMenu() {}, closeComposerMenus() { menu.hidden = true; },
+  });
+  vm.runInContext(((sourceSection("function rememberedN") + "\n" + sourceSection("function rememberNewChatMode")) + (sourceSection("function defaultMode") + "\n" + sourceSection("function currentMode") + "\n" + (sourceSection("function modelFo") + "\n" + sourceSection("function claudePendingSetting(")) + "\n" + sourceSection("async function t")) + sourceSection("function renderModelMenu(", "function fitComposerMenu(")), context);
+  const choices = group => menu.querySelector(`.${group}`).children.filter(node => node.tag === "button");
+  return { context, menu, choices };
+}
+
+function codexDefaultModelHarness(disk = storage()) {
+  const h = claudeAliasModelMenuHarness(), { context } = h;
+  Object.assign(context, {
+    creating: true, selectedId: null, thread: null, creationBackend: "codex",
+    creationInstanceId: "codex:local", selectedModel: "", selectedEffort: "",
+    isClaude: () => false, activeInstanceId: () => "codex:local",
+    session: { device: { id: "codex-default-device", createdAtMs: 1 }, capabilities: {} },
+    privateInputScope: value => JSON.stringify([value.device.id, value.device.createdAtMs]),
+    localStorage: disk, newChatModels: new Map(),
+    modelDefaults: { model: "gpt-fixture", reasoningEffort: "xhigh" },
+    models: [{ model: "gpt-fixture", defaultReasoningEffort: "xhigh",
+      supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"].map(reasoningEffort => ({ reasoningEffort })) }],
+  });
+  return { ...h, disk };
+}
+
+function claudeNewChatPreferenceHarness(disk = storage(), instanceId = "claude:wsl:codex-elves-claude-test") {
+  const h = claudeAliasModelMenuHarness(), c = h.context;
+  Object.assign(c, {
+    creating: true, selectedId: null, thread: null, creationBackend: "claude",
+    creationInstanceId: instanceId, selectedModel: "", selectedEffort: "",
+    isClaude: () => c.creationBackend === "claude", activeBackend: () => c.creationBackend,
+    activeInstanceId: () => c.creationInstanceId,
+    session: { device: { id: "claude-preferences-device", createdAtMs: 1 }, capabilities: {} },
+    privateInputScope: value => JSON.stringify([value.device.id, value.device.createdAtMs]),
+    localStorage: disk, newChatModels: new Map(),
+    modelDefaults: { model: "gpt-6.1-sol", reasoningEffort: "high" },
+    models: [
+      { model: "gpt-6.1-sol", defaultReasoningEffort: "medium",
+        supportedReasoningEfforts: ["low", "medium", "high", "max"].map(reasoningEffort => ({ reasoningEffort })) },
+      { model: "haiku", resolvedModel: "haiku-5.5", defaultReasoningEffort: "low",
+        supportedReasoningEfforts: [{ reasoningEffort: "low" }] },
+    ],
+  });
+  const scope = c.privateInputScope(c.session);
+  c.instancePermissionCatalogs.set(instanceId, { scope, defaultMode: "acceptEdits",
+    modes: ["default", "acceptEdits", "plan", "auto", "bypassPermissions"], loadedAt: Date.now() });
+  return { ...h, disk };
+}
+
+test("Claude 新建记住模型和思考深度，重复新建及刷新后继续使用 Max", () => {
+  const h = claudeNewChatPreferenceHarness(), c = h.context;
+  c.renderModelMenu();
+  h.choices("effort-options").find(node => node.dataset.choiceKey === "effort:max").onclick();
+  c.selectedModel = c.selectedEffort = "";
+  assert.equal(c.currentModelId(), "gpt-6.1-sol");
+  assert.equal(c.currentEffort(), "max");
+  const reopened = claudeNewChatPreferenceHarness(h.disk);
+  assert.equal(reopened.context.currentModelId(), "gpt-6.1-sol");
+  assert.equal(reopened.context.currentEffort(), "max");
+});
+
+test("Claude 模型、权限和等级按实例共享，Codex 偏好不串用", () => {
+  const a = claudeNewChatPreferenceHarness(), bId = "claude:wsl:other-fixture";
+  a.context.rememberNewChatSettings({ model: "gpt-6.1-sol", reasoningEffort: "max", permissionMode: "plan" });
+  const b = claudeNewChatPreferenceHarness(a.disk, bId);
+  assert.equal(b.context.currentEffort(), "high");
+  assert.equal(b.context.newClaudePermissionMode(), "");
+  b.context.rememberNewChatSettings({ model: "haiku", reasoningEffort: "low", permissionMode: "acceptEdits" });
+  const reopened = claudeNewChatPreferenceHarness(a.disk);
+  assert.equal(reopened.context.currentEffort(), "max");
+  assert.equal(reopened.context.newClaudePermissionMode(), "plan");
+  const codex = codexDefaultModelHarness(a.disk);
+  codex.context.session = a.context.session;
+  assert.equal(codex.context.rememberedNewChatModel(), null);
+  assert.equal(codex.context.rememberedNewChatSettings().permissionMode, undefined);
+  reopened.context.session.device.createdAtMs = 2;
+  assert.equal(reopened.context.rememberedNewChatModel().model, "gpt-6.1-sol");
+  assert.equal(reopened.context.newClaudePermissionMode(), "");
+});
+
+test("Claude 已有会话修改模型和等级不覆盖新建偏好，原生模型目录更新后校验旧选择", () => {
+  const h = claudeNewChatPreferenceHarness(), c = h.context;
+  c.rememberNewChatSettings({ model: "gpt-6.1-sol", reasoningEffort: "max", permissionMode: "plan" });
+  c.creating = false; c.selectedId = "claude-existing";
+  c.thread = { model: "gpt-6.1-sol", reasoningEffort: "high" };
+  c.renderModelMenu();
+  h.choices("effort-options").find(node => node.dataset.choiceKey === "effort:low").onclick();
+  assert.equal(c.currentEffort(), "low");
+  assert.equal(claudeNewChatPreferenceHarness(h.disk).context.currentEffort(), "max");
+  c.creating = true; c.selectedId = null; c.selectedModel = c.selectedEffort = "";
+  c.models[0].supportedReasoningEfforts = [{ reasoningEffort: "low" }];
+  c.models[0].defaultReasoningEffort = "low";
+  assert.equal(c.currentEffort(), "low", "已失效的 Max 及原生旧默认 High 均不能继续发送");
+  c.models.shift(); c.modelDefaults = { model: "haiku", reasoningEffort: "low" };
+  assert.equal(c.currentModelId(), "haiku");
+  assert.equal(c.currentEffort(), "low");
+});
+
+test("Claude 兼容旧模型记录和完整模型 ID，权限恢复按 CLI 模式及 manual 别名校验", () => {
+  const h = claudeNewChatPreferenceHarness(), c = h.context, scope = c.newChatPreferenceScope();
+  h.disk.setItem(`codex-elves-new-chat-model:${scope}`, "haiku-5.5");
+  assert.equal(c.rememberedNewChatModel(), c.models[1]);
+  c.rememberNewChatSettings({ model: "haiku-5.5", reasoningEffort: "low", permissionMode: "default" });
+  const reopened = claudeNewChatPreferenceHarness(h.disk), next = reopened.context;
+  assert.equal(next.rememberedNewChatModel(), next.models[1]);
+  assert.equal(next.currentEffort(), "low");
+  const catalog = next.instancePermissionCatalogs.get(next.activeInstanceId());
+  catalog.modes = ["manual", "acceptEdits"];
+  assert.equal(next.newClaudePermissionMode(), "manual");
+  next.rememberNewChatSettings({ permissionMode: "bypassPermissions" });
+  assert.equal(next.newClaudePermissionMode(), "", "CLI 未开放绕过时沿用实例默认，不恢复旧绕过选择");
+  next.rememberNewChatSettings({ permissionMode: "dontAsk" });
+  assert.equal(next.newClaudePermissionMode(), "", "旧兼容模式不作为新的自动权限覆盖");
+});
+
+test("Claude 权限按钮恢复新建记忆，已有会话切换权限不覆盖该偏好", async () => {
+  const disk = storage();
+  function open() {
+    const h = composerPermissionHarness({ creating: true, backend: "claude" }), c = h.context;
+    Object.assign(c, { localStorage: disk, newChatModels: new Map(), selectedId: null, thread: null });
+    nodeVm.runInContext(((sourceSection("function rememberedN") + "\n" + sourceSection("function rememberNewChatMode")) + (sourceSection("function defaultMode") + "\n" + sourceSection("function currentMode") + "\n" + (sourceSection("function modelFo") + "\n" + sourceSection("function claudePendingSetting(")) + "\n" + sourceSection("async function t")) + sourceSection("function renderModelMenu(", "function fitComposerMenu(")), c);
+    c.instancePermissionCatalogs.get(c.activeInstanceId()).defaultMode = "acceptEdits";
+    return h;
+  }
+  const first = open(), c = first.context;
+  c.updateComposerPermissions();
+  assert.equal(first.button.value, "acceptEdits");
+  first.button.value = "plan";
+  await c.changeComposerPermissions();
+  c.draftPermissionChoices.clear();
+  c.updateComposerPermissions();
+  assert.equal(first.button.value, "plan");
+  const reopened = open(), next = reopened.context;
+  next.updateComposerPermissions();
+  assert.equal(reopened.button.value, "plan");
+  assert.equal(next.instancePermissionCatalogs.get(next.activeInstanceId()).defaultMode, "acceptEdits");
+  assert.equal(reopened.requests.length, 0, "恢复选择不写入实例全局权限");
+  next.creating = false; next.selectedId = "claude-existing";
+  next.thread = { id: "claude-existing", nativeSettings: { permissionMode: "acceptEdits" } };
+  next.updateComposerPermissions();
+  assert.equal(reopened.button.value, "acceptEdits", "已有会话使用自身实际权限");
+  reopened.button.value = "default";
+  await next.changeComposerPermissions();
+  const later = open();
+  later.context.updateComposerPermissions();
+  assert.equal(later.button.value, "plan", "已有会话的权限选择不能覆盖新建默认值");
+});
+
+test("Codex 新建按模型记住思考深度，刷新和再次新建不恢复全局 xhigh", () => {
+  const h = codexDefaultModelHarness();
+  h.context.renderModelMenu();
+  h.choices("effort-options").find(node => node.dataset.choiceKey === "effort:high").onclick();
+  h.context.selectedModel = h.context.selectedEffort = "";
+  assert.equal(h.context.currentModelId(), "gpt-fixture");
+  assert.equal(h.context.currentEffort(), "high");
+  const reopened = codexDefaultModelHarness(h.disk);
+  assert.equal(reopened.context.currentEffort(), "high");
+  reopened.context.rememberNewChatSettings({ model: "gpt-fixture", reasoningEffort: "low" });
+  assert.equal(codexDefaultModelHarness(h.disk).context.currentEffort(), "low",
+    "未选择权限的空字段不能使第二次刷新时的模型深度记忆失效");
+  reopened.context.models[0].supportedReasoningEfforts = [{ reasoningEffort: "medium" }];
+  reopened.context.models[0].defaultReasoningEffort = "medium";
+  // 目录能力变化后不复用已失效的记忆等级，即使全局配置还保存着 xhigh。
+  reopened.context.session.capabilities.codexSessionDefaults = true;
+  reopened.context.creationProject = ""; reopened.context.selectionVersion = 1;
+  reopened.context.codexCreationDefaultsState = { key: reopened.context.codexCreationDefaultsKey(),
+    value: { model: "gpt-fixture", reasoningEffort: "medium" } };
+  assert.equal(reopened.context.currentEffort(), "medium");
+});
+
+test("Codex 新建偏好在同一服务共享，旧模型记录可迁移，已有会话保持自己的模型和深度", () => {
+  const h = codexDefaultModelHarness();
+  const scope = h.context.newChatPreferenceScope();
+  h.disk.setItem(`codex-elves-new-chat-model:${scope}`, "gpt-fixture");
+  assert.equal(h.context.rememberedNewChatModel(), h.context.models[0]);
+  h.context.rememberNewChatSettings({ model: "gpt-fixture", reasoningEffort: "low", permissionMode: "full-access" });
+  h.context.creating = false; h.context.selectedId = "existing";
+  h.context.thread = { id: "existing", model: "existing-model", reasoningEffort: "max" };
+  assert.equal(h.context.currentModelId(), "existing-model");
+  assert.equal(h.context.currentEffort(), "max");
+  h.context.creating = true; h.context.selectedId = null;
+  h.context.session.device.createdAtMs = 2;
+  assert.equal(h.context.rememberedNewChatModel().model, "gpt-fixture");
+  assert.equal(h.context.rememberedNewChatSettings().permissionMode, "full-access");
+});
+
+test("Codex 切换模型保留仍受支持的深度，目标模型不支持时才使用其默认值", () => {
+  const h = codexDefaultModelHarness(), c = h.context;
+  c.rememberNewChatSettings({ model: "gpt-fixture", reasoningEffort: "high" });
+  c.models.push(
+    { model: "gpt-second", defaultReasoningEffort: "xhigh",
+      supportedReasoningEfforts: [{ reasoningEffort: "high" }, { reasoningEffort: "xhigh" }] },
+    { model: "gpt-small", defaultReasoningEffort: "low", supportedReasoningEfforts: [{ reasoningEffort: "low" }] },
+  );
+  c.renderModelMenu();
+  h.choices("model-options").find(node => node.dataset.choiceKey === "model:gpt-second").onclick();
+  assert.equal(c.currentEffort(), "high");
+  h.choices("model-options").find(node => node.dataset.choiceKey === "model:gpt-small").onclick();
+  assert.equal(c.currentEffort(), "low");
+  c.selectedModel = c.selectedEffort = "";
+  assert.equal(c.currentModelId(), "gpt-small");
+  assert.equal(c.currentEffort(), "low");
+});
+
+test("Codex 新建权限优先显式草稿和有效记忆，再采用独立服务默认，管理员禁用后不会沿用旧权限", async () => {
+  const h = composerPermissionHarness({ creating: true }), c = h.context;
+  Object.assign(c, {
+    newChatModels: new Map(), localStorage: storage(), creationProject: "project-a", selectionVersion: 1,
+    selectedModel: "", selectedEffort: "", models: [], modelDefaults: {},
+  });
+  nodeVm.runInContext(((sourceSection("function rememberedN") + "\n" + sourceSection("function rememberNewChatMode")) + (sourceSection("function defaultMode") + "\n" + sourceSection("function currentMode") + "\n" + (sourceSection("function modelFo") + "\n" + sourceSection("function claudePendingSetting(")) + "\n" + sourceSection("async function t")) + sourceSection("function renderModelMenu(", "function fitComposerMenu(")), c);
+  c.session.capabilities.codexSessionDefaults = true;
+  c.codexCreationDefaultsState = { key: c.codexCreationDefaultsKey(), value: {
+    model: "gpt-fixture", reasoningEffort: "medium", permissionMode: "full-access",
+    permissionModes: ["auto", "guardian-approvals", "full-access", "configured"]
+  } };
+  c.updateComposerPermissions();
+  assert.equal(h.button.value, "full-access", "未选择时应显示 App 权限，不能固定为自定义");
+  h.button.value = "guardian-approvals";
+  await c.changeComposerPermissions();
+  c.draftPermissionChoices.clear();
+  c.updateComposerPermissions();
+  assert.equal(h.button.value, "guardian-approvals");
+  c.codexCreationDefaultsState.value.permissionModes = ["auto", "configured"];
+  c.codexCreationDefaultsState.value.permissionMode = "auto";
+  c.updateComposerPermissions();
+  assert.equal(h.button.value, "auto");
+  assert.equal(h.requests.length, 0);
+});
+
+test("Codex 默认设置的迟到响应不能覆盖后来选择的项目或授权", async () => {
+  const h = codexDefaultModelHarness(), c = h.context, reads = [];
+  Object.assign(c, { creationProject: "project-a", selectionVersion: 1, codexCreationDefaultsState: null,
+    connected: true, notice() {}, api: async (_path, payload) => {
+      const pending = deferred(); reads.push({ payload, ...pending }); return pending.promise;
+    } });
+  c.session.capabilities.codexSessionDefaults = true;
+  const first = c.loadCodexCreationDefaults();
+  c.creationProject = "project-b"; ++c.selectionVersion;
+  const second = c.loadCodexCreationDefaults();
+  const reply = model => ({ ok: true, model, reasoningEffort: "medium",
+    permissionMode: "auto", permissionModes: ["auto", "configured"] });
+  reads[1].resolve(reply("project-b-model"));
+  await second;
+  reads[0].resolve(reply("project-a-model"));
+  assert.equal(await first, null);
+  assert.equal(c.codexCreationDefaults().model, "project-b-model");
+  assert.equal(c.currentModelId(), "project-b-model");
+});
+
+test("队列编辑中选择模型和深度仅更新后续选择，不改写队列消息", () => {
+  const h = claudeAliasModelMenuHarness();
+  h.context.editingQueuedMessage = { state: "editing" };
+  h.context.renderModelMenu();
+  h.choices("model-options").find(node => node.dataset.choiceKey === "model:sonnet").onclick();
+  assert.equal(h.context.selectedModel, "sonnet");
+  assert.equal(h.context.selectedEffort, "medium");
+  h.choices("effort-options").find(node => node.dataset.choiceKey === "effort:high").onclick();
+  assert.equal(h.context.selectedEffort, "high");
+  assert.deepEqual(Object.keys(h.context.editingQueuedMessage), ["state"]);
+});
+
+test("Claude 完整模型 ID 匹配原生别名，重选和切换模型保留受支持的思考深度", () => {
+  const h = claudeAliasModelMenuHarness();
+  h.context.renderModelMenu();
+  assert.equal(h.context.currentModel(), h.context.models[0]);
+  assert.equal(h.context.currentEffort(), "max");
+  assert.deepEqual(h.choices("model-options").filter(node => node.attributes["aria-checked"] === "true")
+    .map(node => node.dataset.choiceKey), ["model:opus"]);
+  assert.deepEqual(h.choices("effort-options").map(node => node.dataset.choiceKey),
+    ["effort:low", "effort:medium", "effort:high", "effort:xhigh", "effort:max"]);
+  assert.equal(h.menu.textContent.includes("原生模型列表暂未提供"), false);
+  h.choices("model-options")[0].onclick();
+  assert.equal(h.context.selectedModel, "");
+  assert.equal(h.context.currentEffort(), "max");
+  h.choices("effort-options").find(node => node.dataset.choiceKey === "effort:high").onclick();
+  assert.equal(h.context.selectedEffort, "high");
+  h.choices("model-options").find(node => node.dataset.choiceKey === "model:sonnet").onclick();
+  assert.equal(h.context.selectedModel, "sonnet");
+  assert.equal(h.context.selectedEffort, "high", "目标模型支持当前深度时，切换不能重置为中");
+  h.choices("model-options").find(node => node.dataset.choiceKey === "model:opus").onclick();
+  assert.equal(h.context.currentEffort(), "high", "切回原模型也应沿用当前深度");
+  h.choices("effort-options").find(node => node.dataset.choiceKey === "effort:max").onclick();
+  h.context.models[1].supportedReasoningEfforts.push({ reasoningEffort: "max" });
+  h.context.renderModelMenu();
+  h.choices("model-options").find(node => node.dataset.choiceKey === "model:sonnet").onclick();
+  assert.equal(h.context.currentEffort(), "max", "目标模型报告支持 Max 时，切换必须保留 Max");
+});
+
+test("Claude 模型确认期间展示待切换选择，拒绝后恢复原模型并保留后来选择", () => {
+  const h = claudeAliasModelMenuHarness();
+  h.context.thread.model = "sonnet";
+  h.context.thread.nativeSettings = { changes: { model: {
+    id: "switch", requested: "opus", previous: "sonnet", state: "confirmation"
+  } } };
+  assert.equal(h.context.currentModelId(), "opus");
+  assert.equal(h.context.claudePendingSetting("model").state, "confirmation");
+  h.context.thread.nativeSettings.changes.model.state = "rejected";
+  assert.equal(h.context.currentModelId(), "sonnet");
+  h.context.selectedModel = "legacy-haiku";
+  h.context.thread.nativeSettings.changes.model.state = "applied";
+  h.context.thread.model = "opus";
+  assert.equal(h.context.currentModelId(), "legacy-haiku", "迟到的原生结果不能覆盖新草稿选择");
+});
+
+test("Claude 发送回执释放已提交的模型草稿，迟到回执不清除后来选择", () => {
+  const h = claudeAliasModelMenuHarness(), c = h.context;
+  const payload = { threadId: c.selectedId, model: "opus", prompt: "原消息" };
+  Object.assign(c, {
+    submittedDrafts: new WeakMap(), failedInputRecoveries: new Map(), recoveryScope: "",
+    persistSmallInputRecoveries() {}, composerAttachmentsLoading: () => false,
+    matchingDraft: () => false, storedDraft: () => null, snapshotDraft: () => ({}),
+    selectedModel: "opus", selectedEffort: "max", modelChoiceVersion: 3,
+  });
+  c.submittedDrafts.set(payload, { modelChoice: { version: 3, model: "opus", effort: "max" } });
+  vm.runInContext(sourceSection("function clearSu"), c);
+  c.clearSubmittedDraft(payload, true);
+  assert.equal(c.selectedModel, "");
+  assert.equal(c.selectedEffort, "");
+  c.selectedModel = "opus"; c.selectedEffort = "high"; c.modelChoiceVersion = 4;
+  c.clearSubmittedDraft(payload, true);
+  assert.equal(c.selectedModel, "opus");
+  assert.equal(c.selectedEffort, "high", "即使重新选择相同模型，旧回执也不能清掉新等级");
+});
+
+test("新建会话发送成功后，显式权限草稿和图片不会阻止编辑框清空", () => {
+  const key = "$new:project", prompt = { value: "原消息" };
+  const image = { kind: "inline", name: "附件.png", mime: "image/png",
+    dataUrl: "data:image/png;base64,AA==", size: 2, width: 10, height: 10 };
+  let cleared = 0;
+  const draftPermissionChoices = new Map([[key, "guardian-approvals"]]);
+  const drafts = new Map([[key, prompt.value]]), attachments = new Map([[key, [image]]]);
+  const context = vm.createContext({
+    nativeConnectionVersion: 1, session: { device: { id: "device-a", createdAtMs: 1 } },
+    selectedId: null, creating: true, creationProject: "project", creationBackend: "codex", creationInstanceId: "codex:local",
+    selectedSkills: [], selectedGoal: null, selectedModel: "", selectedEffort: "", modelChoiceVersion: 1,
+    draftPermissionChoices, drafts, skillDrafts: new Map(), attachmentDrafts: attachments, goalDrafts: new Map(),
+    failedInputRecoveries: new Map(), submittedDrafts: new WeakMap(), recoveryScope: "scope",
+    persistSmallInputRecoveries() {}, composerAttachmentsLoading: () => false,
+    composerPrompt: text => String(text).trim(), sameSkills: (left, right) =>
+      JSON.stringify(left.map(skill => `${skill.name || ""}\0${skill.path || ""}`))
+        === JSON.stringify(right.map(skill => `${skill.name || ""}\0${skill.path || ""}`)),
+    newDraftKey: project => `$new:${project || ""}`,
+    storedDraft: draftKey => ({ text: drafts.get(draftKey) || "", skills: [], attachments: attachments.get(draftKey) || [],
+      goalMode: null, ...(draftPermissionChoices.has(draftKey)
+        ? { permissionMode: draftPermissionChoices.get(draftKey) } : {}) }),
+    snapshotDraft: () => ({ text: prompt.value, skills: [], attachments: attachments.get(key) || [], goalMode: null,
+      ...(draftPermissionChoices.has(key) ? { permissionMode: draftPermissionChoices.get(key) } : {}) }),
+    deleteDraft: draftKey => {
+      drafts.delete(draftKey); attachments.delete(draftKey); draftPermissionChoices.delete(draftKey);
+    },
+    $: () => prompt, isClaude: () => false,
+    clearComposerAttachments: () => { ++cleared; attachments.delete(key); },
+    renderSelectedSkills() {}, recoveryStore: { remove() {} }, notice() {},
+  });
+  const payload = { projectId: "project", backend: "codex", instanceId: "codex:local",
+    prompt: prompt.value, permissionMode: "guardian-approvals",
+    images: [{ name: image.name, mime: image.mime, dataUrl: image.dataUrl, size: image.size }] };
+  context.submittedDrafts.set(payload, { text: prompt.value, skills: [], attachments: [image],
+    goalMode: null, permissionMode: "guardian-approvals" });
+  context.payload = payload;
+  vm.runInContext((sourceSection("function mat") + "\n" + sourceSection("function clearSu")), context);
+  context.clearSubmittedDraft(payload, true);
+  assert.equal(prompt.value, "", "清理草稿前删除权限选择不能阻止编辑框清空");
+  assert.equal(cleared, 1);
+  assert.equal(context.draftPermissionChoices.has(key), false);
+});
+
+test("Claude 模型匹配优先精确值，未知或未报告等级不猜测，Codex 不扩展别名规则", () => {
+  const h = claudeAliasModelMenuHarness();
+  h.context.models.push({ model: "claude-opus-5-5", supportedReasoningEfforts: [{ reasoningEffort: "low" }] });
+  assert.equal(h.context.currentModel(), h.context.models[3]);
+  h.context.renderModelMenu();
+  assert.deepEqual(h.choices("effort-options").map(node => node.dataset.choiceKey), ["effort:low"]);
+  h.context.models.pop();
+  h.context.thread.model = "claude-opus-unreported";
+  h.context.renderModelMenu();
+  assert.equal(h.context.currentModel(), null);
+  assert.ok(h.menu.textContent.includes("原生模型列表暂未提供"));
+  assert.equal(h.choices("effort-options").length, 0);
+  h.context.thread.model = "claude-haiku-4-5";
+  h.context.renderModelMenu();
+  assert.equal(h.choices("effort-options").length, 0);
+  h.context.thread = { backend: "codex", model: "claude-opus-5-5" };
+  assert.equal(h.context.currentModel(), null);
+  assert.equal(h.context.modelForId(""), null);
+  assert.equal(h.context.modelForId(undefined), null);
+});
+
+test("Claude 新建默认等级与记住的完整模型 ID 复用同一别名目录", () => {
+  const h = claudeAliasModelMenuHarness();
+  Object.assign(h.context, { creating: true, selectedId: null, creationBackend: "claude",
+    creationInstanceId: "claude:wsl:fixture", selectedModel: "claude-opus-5-5" });
+  h.context.sharedSettingsState.settings.newChat["claude:wsl:fixture"] = { model: "claude-opus-5-5" };
+  assert.equal(h.context.rememberedNewChatModel(), h.context.models[0]);
+  assert.equal(h.context.currentEffort(), "high");
+});
+
+test("历史当前模型不进入共用目录，点击选择器时读取完整模型和思考深度", async () => {
+  const h = claudeHistoryModelMenuHarness();
+  const history = h.context.loadModels();
+  assert.equal(h.reads[0].payload.includeAvailable, false, "单纯显示历史不能触发能力初始化");
+  h.reads[0].response.resolve({ data: [h.catalog.data[0]], catalogComplete: false,
+    defaultModel: "history-haiku", defaultReasoningEffort: "high" });
+  await history;
+  assert.equal(h.context.modelsLoadedAt, 0);
+  assert.equal(h.context.models.length, 0);
+  assert.equal(h.cacheWrites.length, 0, "单个历史模型不能污染实例的共用目录缓存");
+  const opened = h.trigger.onclick();
+  assert.equal(h.reads.length, 2, "当前模型展示不能阻止显式读取可用选项");
+  assert.deepEqual({ ...h.reads[1].payload }, { backend: "claude", instanceId: "claude:wsl:history",
+    threadId: h.context.selectedId, forceReload: false, includeAvailable: true });
+  assert.ok(h.menu.children.some(node => /正在读取/.test(node.textContent)));
+  h.reads[1].response.resolve(h.catalog);
+  await opened;
+  assert.deepEqual(Array.from(h.context.models, model => model.model), ["history-haiku", "fixture-opus", "fixture-sonnet"]);
+  assert.equal(h.context.models[1].supportedReasoningEfforts[0].reasoningEffort, "max");
+  assert.deepEqual(h.menu.children.map(node => node.textContent), ["history-haiku", "fixture-opus", "fixture-sonnet"]);
+  assert.equal(h.context.thread.model, "history-haiku");
+  assert.equal(h.context.selectedModel, "", "读取完整目录不能自行切换历史会话模型");
+  assert.equal(h.cacheWrites[0][1], "claude:wsl:history");
+});
+
+test("同一实例的新建与多个历史会话共用完整模型缓存，不逐会话请求目录", async () => {
+  const h = claudeHistoryModelMenuHarness({ cached: true });
+  const key = h.context.modelContextKey();
+  await h.trigger.onclick();
+  h.context.selectedId = "claude-00000000-0000-4000-8000-000000000002";
+  h.context.thread = { ...h.context.thread, id: h.context.selectedId, model: "fixture-opus", reasoningEffort: "max" };
+  assert.equal(h.context.modelContextKey(), key);
+  await h.context.loadModels();
+  h.context.creating = true; h.context.selectedId = null; h.context.thread = null;
+  h.context.creationBackend = "claude"; h.context.creationInstanceId = "claude:wsl:history";
+  h.context.creationProject = "another-project";
+  assert.equal(h.context.modelContextKey(), key);
+  await h.context.loadModels();
+  assert.equal(h.context.models.length, 3);
+  assert.equal(h.reads.length, 0);
+  assert.equal(h.context.modelDefaults.reasoningEffort, "", "历史会话的等级不能污染新建默认值");
+});
+
+test("点击模型菜单会在进行中的历史读取后补读完整目录，并合并重复选择请求", async () => {
+  const h = claudeHistoryModelMenuHarness({ cached: false });
+  const history = h.context.loadModels();
+  const opened = h.trigger.onclick();
+  assert.equal(h.reads.length, 1);
+  assert.equal(h.reads[0].payload.includeAvailable, false);
+  h.reads[0].response.resolve({ data: [h.catalog.data[0]], catalogComplete: false });
+  await history; await h.settle();
+  assert.equal(h.reads.length, 2);
+  assert.equal(h.reads[1].payload.includeAvailable, true);
+  const repeated = h.context.loadModels(false, { includeAvailable: true });
+  assert.equal(h.reads.length, 2);
+  h.reads[1].response.resolve(h.catalog);
+  await Promise.all([opened, repeated]);
+  assert.equal(h.context.models.length, 3);
+});
+
+test("历史模型读取期间切换会话后，旧菜单不能替新实例发起能力探测", async () => {
+  const h = claudeHistoryModelMenuHarness({ cached: false });
+  const history = h.context.loadModels(), opened = h.trigger.onclick();
+  h.context.selectedId = "claude-00000000-0000-4000-8000-000000000002";
+  h.context.thread = { ...h.context.thread, id: h.context.selectedId, instanceId: "claude:wsl:other" };
+  h.context.appearance.sessionInstances["claude:wsl:other"] = true;
+  h.context.models = [{ model: "other-instance-model" }];
+  h.reads[0].response.resolve({ data: [h.catalog.data[0]] });
+  await Promise.all([history, opened]);
+  assert.equal(h.reads.length, 1);
+  assert.equal(h.context.models[0].model, "other-instance-model");
+});
+
+test("历史模型目录读取失败时显示错误并保留旧目录，重新打开可重试", async () => {
+  const h = claudeHistoryModelMenuHarness({ cached: true, stale: true });
+  const opened = h.trigger.onclick();
+  h.reads[0].response.reject(new Error("模拟原生模型目录读取失败"));
+  await opened;
+  assert.ok(h.menu.children.some(node => /模拟原生模型目录读取失败/.test(node.textContent)));
+  assert.equal(h.context.models[0].model, "history-haiku");
+  assert.equal(h.context.modelLoadError, "模拟原生模型目录读取失败");
+  await h.trigger.onclick();
+  const retried = h.trigger.onclick();
+  assert.equal(h.reads.length, 2);
+  h.reads[1].response.resolve(h.catalog);
+  await retried;
+  assert.equal(h.context.models.length, 3);
+  assert.equal(h.context.modelLoadError, "");
+  assert.ok(h.menu.children.every(node => !node.className.includes("error-text")));
+});
+
+test("服务部分侧栏保留旧会话展示，完整目录及其他后端不合并旧记录", () => {
+  const previous = { nativeBridge: "harness", recent: [{ id: "old" }, { id: "known", title: "旧名" },
+    { id: "loose", projectId: "workspace-old" }],
+    pinnedThreads: [{ id: "unpin" }, { id: "old-pin" }],
+    projects: [{ id: "p", threads: [{ id: "old" }, { id: "known", title: "旧名" }] },
+      { id: "workspace-old", synthetic: true, threads: [{ id: "loose", projectId: "workspace-old" }] }] };
+  const current = { nativeBridge: "harness", complete: false,
+    recent: [{ id: "known", title: "新名" }, { id: "unpin", pinned: false }], pinnedThreads: [],
+    projects: [{ id: "p", threads: [{ id: "known", title: "新名" }] }] };
+  const context = {};
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  vm.runInContext((sourceSection("function mergeIn", "function set") + "\n" + sourceSection("function clientUnreadBad", "async function l") + "\n" + sourceSection("function clientUnreadThr", "function sid")), context);
+  const merged = context.mergeIncompleteSidebar(previous, current);
+  assert.deepEqual(Array.from(merged.recent, row => row.id), ["known", "unpin", "old", "loose"]);
+  assert.equal(merged.recent[0].title, "新名");
+  assert.equal(merged.recent[3].projectId, null);
+  assert.deepEqual(Array.from(merged.pinnedThreads, row => row.id), ["old-pin"]);
+  assert.deepEqual(Array.from(merged.projects, project => project.id), ["p"]);
+  assert.deepEqual(Array.from(merged.projects[0].threads, row => row.id), ["known", "old"]);
+  for (const input of [{ ...current, complete: true }, { ...current, nativeBridge: "cdp" }])
+    assert.equal(context.mergeIncompleteSidebar(previous, input), input);
+});
+
+test("原生置顶完整时不被部分最近目录恢复，取消的旧会话仍保留在普通列表", () => {
+  const previous = { nativeBridge: "harness",
+    recent: [{ id: "unpin", projectId: "p", pinned: true }],
+    pinnedThreads: [{ id: "unpin", projectId: "p", pinned: true }, { id: "pin-only", pinned: true }],
+    projects: [{ id: "p", threads: [{ id: "unpin", projectId: "p", pinned: true }] }] };
+  const current = { nativeBridge: "harness", complete: false, pinnedThreadsComplete: true,
+    recent: [{ id: "new-pin", pinned: true }], pinnedThreads: [{ id: "new-pin", pinned: true }],
+    projects: [{ id: "p", threads: [] }] };
+  const context = {};
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  vm.runInContext((sourceSection("function mergeIn", "function set") + "\n" + sourceSection("function clientUnreadBad", "async function l") + "\n" + sourceSection("function clientUnreadThr", "function sid")), context);
+  const merged = context.mergeIncompleteSidebar(previous, current);
+  assert.deepEqual(Array.from(merged.pinnedThreads, row => row.id), ["new-pin"]);
+  assert.equal(merged.recent.find(row => row.id === "unpin").pinned, false);
+  assert.equal(merged.recent.find(row => row.id === "pin-only").pinned, false);
+  assert.equal(merged.projects[0].threads[0].pinned, false);
+  assert.equal(new Set(merged.recent.map(row => row.id)).size, merged.recent.length);
+  const empty = context.mergeIncompleteSidebar(previous, { ...current, recent: [], pinnedThreads: [] });
+  assert.equal(empty.pinnedThreads.length, 0, "原生取消全部置顶后不能复活旧置顶");
+});
+
+test("旧服务缓存去除合成项目后仍保留无项目会话及已有项目名称和顺序", () => {
+  const context = {};
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  vm.runInContext(sourceSection("function sidebarSnapshot(", "function clearReadViews("), context);
+  const snapshot = context.sidebarSnapshot({
+    nativeBridge: "harness",
+    recent: [{ id: "loose", projectId: "workspace-old" }, { id: "assigned", projectId: "saved-z" }],
+    pinnedThreads: [{ id: "pinned-loose", projectId: "workspace-old" }],
+    projects: [
+      { id: "saved-z", name: "已保存项目", threads: [{ id: "assigned", projectId: "saved-z" }] },
+      { id: "workspace-old", name: "new-chat", synthetic: true, threads: [{ id: "loose" }] },
+      { id: "saved-a", name: "空项目", threads: [] }
+    ]
+  });
+  assert.deepEqual(Array.from(snapshot.projects, project => project.id), ["saved-z", "saved-a"]);
+  assert.equal(snapshot.recent[0].projectId, null);
+  assert.equal(snapshot.recent[1].projectId, "saved-z");
+  assert.equal(snapshot.pinnedThreads[0].projectId, null);
+  assert.equal(snapshot.projects[0].name, "已保存项目");
+});
+
+test("项目选择只保留已保存项目，真实同名项目显示路径，合成项目不参与重名判断", () => {
+  const context = {};
+  vm.createContext(context);
+  context.nativeConnectionVersion ??= 1;
+  vm.runInContext(sourceSection("function newChatProjectOptions(", "function syncNewChatProjectPicker("), context);
+  const projects = [
+    { id: "saved-z", name: "同名项目", roots: ["C:\\repo\\one"] },
+    { id: "saved-a", name: "同名项目", roots: ["D:\\repo\\two"] },
+    { id: "saved-unique", name: "唯一项目", roots: ["E:\\repo\\unique"] },
+    { id: "workspace-old", name: "唯一项目", roots: ["C:\\tmp\\unique"], synthetic: true }
+  ];
+  const options = context.newChatProjectOptions(projects);
+  assert.deepEqual(Array.from(options, option => option.value), ["saved-z", "saved-a", "saved-unique", ""]);
+  assert.deepEqual(Array.from(options.slice(0, 3), option => option.description),
+    ["C:\\repo\\one", "D:\\repo\\two", ""]);
+  assert.equal(options.at(-1).label, "不在项目中工作");
+  assert.deepEqual(options, context.newChatProjectOptions(projects.filter(project => !project.synthetic)));
+});
+
+function workspaceChangeContract() {
+  const context = vm.createContext({ nativeConnectionVersion: 1,});
+  vm.runInContext(sessionFiles.slice(sessionFiles.indexOf("export function displayWorkspacePath("),
+    sessionFiles.indexOf("export function workspaceBranchLabel(")).replace(/^export /gm, "")
+    + "\n" + sessionTools.slice(sessionTools.indexOf("const sections ="), sessionTools.indexOf("export function mountSessionTools"))
+    + "\nglobalThis.contract = { detailKey, displayedPath, listResponse, detailResponse, uiState };", context);
+  return context.contract;
+}
+
+test("多仓库变更按仓库隔离同名路径，保留分组信息和各仓库折叠状态", () => {
+  const contract = workspaceChangeContract();
+  const alpha = { repository: "web/alpha", path: "src/app.ts", section: "unstaged", status: "M" };
+  const beta = { ...alpha, repository: "web/beta" };
+  assert.notEqual(contract.detailKey(alpha), contract.detailKey(beta));
+  assert.equal(contract.displayedPath(beta), "web/beta/src/app.ts");
+  const response = contract.listResponse({
+    ok: true, root: "D:/workspace", revision: "a".repeat(64), truncated: false,
+    git: { branch: "main", detachedHead: null },
+    repositories: ["web/alpha", "web/beta"].map(path => ({
+      path, root: `D:/workspace/${path}`, fileCount: 1, truncated: false, error: null,
+      git: { branch: path === "web/alpha" ? "feature/alpha" : "release/beta", detachedHead: null }
+    })),
+    files: [alpha, beta],
+  });
+  assert.equal(response.repositories.length, 2);
+  assert.equal(response.files[1].repository, "web/beta");
+  assert.equal(response.files[1].path, "src/app.ts");
+  assert.equal(response.git.branch, "main");
+  assert.equal(response.repositories[0].git.branch, "feature/alpha");
+  assert.equal(response.repositories[1].git.branch, "release/beta");
+  const alphaGroup = JSON.stringify(["web/alpha", "unstaged"]);
+  const betaGroup = JSON.stringify(["web/beta", "unstaged"]);
+  const ui = contract.uiState({ collapsed: { [alphaGroup]: true, [betaGroup]: false } });
+  assert.equal(ui.collapsed[alphaGroup], true);
+  assert.notEqual(ui.collapsed[betaGroup], true);
+});
+
+test("多仓库变更拒绝越界、重复仓库和错误仓库的详情，同时兼容单仓库旧响应", () => {
+  const contract = workspaceChangeContract();
+  const file = { repository: "alpha", path: "same.txt", section: "untracked", status: "A" };
+  const repository = { path: "alpha", root: "D:/workspace/alpha", fileCount: 1, truncated: false, error: null };
+  const response = { ok: true, root: "D:/workspace", revision: "b".repeat(64), truncated: false,
+    repositories: [repository], files: [file] };
+  for (const path of ["../outside", "/outside", "C:/outside", "alpha/.git/objects"]) {
+    assert.equal(contract.listResponse({ ...response, files: [{ ...file, repository: path }] }), null);
+  }
+  assert.equal(contract.listResponse({ ...response, repositories: [repository, repository] }), null);
+  const detail = { ...file, root: response.root, revision: response.revision, kind: "text", truncated: false, diff: "+alpha" };
+  assert.ok(contract.detailResponse(detail, file));
+  assert.equal(contract.detailResponse({ ...detail, repository: "beta" }, file), null);
+  const { repository: _repository, ...legacyFile } = file;
+  const legacy = contract.listResponse({ ok: true, root: response.root, revision: response.revision,
+    truncated: false, files: [legacyFile] });
+  assert.ok(legacy);
+  assert.equal(legacy.repositories, undefined);
+  assert.equal(legacy.files[0].repository, undefined);
+});
+
+test("新版多仓库页面连接旧后台时仅对旧白名单拒绝回退，并暂时记住旧能力", async () => {
+  const calls = [];
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    legacyChangesUntil: 0,
+    request: async (path, payload) => {
+      calls.push({ path, payload });
+      if (payload.allRepositories) throw Object.assign(new Error("只能通过会话或项目标识读取变更"), { code: 400 });
+      return { ok: true, legacy: true };
+    },
+  });
+  vm.runInContext(sessionTools.slice(sessionTools.indexOf("  async function requestChanges("), sessionTools.indexOf("  function status(")), context);
+  assert.equal((await context.requestChanges({ threadId: "thread" })).legacy, true);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].payload.allRepositories, true);
+  assert.equal(calls[1].payload.allRepositories, undefined);
+  await context.requestChanges({ threadId: "thread" });
+  assert.equal(calls.length, 3);
+  assert.equal(calls[2].payload.allRepositories, undefined);
+  context.legacyChangesUntil = 0;
+  context.request = async () => { throw Object.assign(new Error("访问已撤销"), { code: 403 }); };
+  await assert.rejects(context.requestChanges({ threadId: "thread" }), error => error.code === 403);
+});
+
+test("主会话保留背景透明度与铺法，侧边页不重绘图片或叠加透明度", () => {
+  const attributes = new Map();
+  const image = {
+    hidden: true, style: {},
+    getAttribute: name => attributes.get(name) ?? null,
+    removeAttribute: name => attributes.delete(name),
+    set src(value) { attributes.set("src", value); },
+  };
+  const context = nodeVm.createContext({ nativeConnectionVersion: 1,
+    $: () => image, workspaceSidePanel: false,
+    remoteBackground: { dataUrl: "data:image/png;base64,cHJldmlldw==" },
+    appearance: { backgroundOpacity: 30, backgroundFit: "cover" },
+  });
+  nodeVm.runInContext(sourceSection("function syncRem", "function app"), context);
+  context.syncRemoteBackground();
+  assert.equal(image.hidden, false);
+  assert.equal(image.style.opacity, "0.3");
+  assert.equal(image.style.objectFit, "cover");
+  assert.equal(image.getAttribute("src"), context.remoteBackground.dataUrl);
+  context.appearance.backgroundOpacity = 3;
+  context.appearance.backgroundFit = "contain";
+  context.syncRemoteBackground();
+  assert.equal(image.style.opacity, "0.03");
+  assert.equal(image.style.objectFit, "contain");
+  context.workspaceSidePanel = true;
+  context.syncRemoteBackground();
+  assert.equal(image.hidden, true);
+  assert.equal(image.getAttribute("src"), null);
+  context.workspaceSidePanel = false;
+  context.remoteBackground.dataUrl = "";
+  context.syncRemoteBackground();
+  assert.equal(image.hidden, true);
+});
+
+test("外观表面与原生 Codex 默认调色一致，并区分输入框、控件及浅色普通提示", () => {
+  const context = nodeVm.createContext();
+  nodeVm.runInContext(sourceSection("function mix"), context);
+  const dark = context.appearanceSurfaceColors("dark", { background: "#181818", foreground: "#ffffff" });
+  assert.equal(dark["composer-bg"], "#363636");
+  assert.equal(dark["control-bg"], "#2d2d2d");
+  assert.equal(dark["control-hover"], "#3d3d3d");
+  assert.equal(dark["tooltip-bg"], dark["control-bg"]);
+  assert.equal(dark["tooltip-text"], "#ffffff");
+  const light = context.appearanceSurfaceColors("light", { background: "#ffffff", foreground: "#1a1c1f" });
+  assert.equal(light["composer-bg"], "#ffffff");
+  assert.equal(light["control-bg"], "#ffffff");
+  assert.equal(light["tooltip-bg"], "#1a1c1f");
+  assert.equal(light["tooltip-text"], "#ffffff");
+});
+
+test("自定义背景和前景分别参与明暗调色，不复用默认主题色或透明表面", () => {
+  const context = nodeVm.createContext();
+  nodeVm.runInContext(sourceSection("function mix"), context);
+  const dark = context.appearanceSurfaceColors("dark", { background: "#102030", foreground: "#f0e0d0" });
+  assert.equal(dark["control-bg"], "#24313e");
+  assert.equal(dark["composer-bg"], "#2d3944");
+  assert.equal(dark["control-hover"], "#343f49");
+  const light = context.appearanceSurfaceColors("light", { background: "#f0e0d0", foreground: "#182838" });
+  assert.equal(light["control-bg"], "#f2e3d5");
+  assert.equal(light["composer-bg"], "#f3e7da");
+  assert.equal(light["tooltip-bg"], "#182838");
+  assert.equal(light["tooltip-text"], "#f0e0d0");
+  for (const value of [...Object.values(dark), ...Object.values(light)]) assert.match(value, /^#[0-9a-f]{6}$/);
+});
+
+test("模型按钮 hover 在输入框上合成，深色分组线增强，浅色仍沿用原线色", () => {
+  const context = nodeVm.createContext();
+  nodeVm.runInContext(sourceSection("function mix"), context);
+  const dark = context.appearanceSurfaceColors("dark", { background: "#1e1e1e", foreground: "#d4d4d4" });
+  assert.equal(dark["composer-bg"], "#353535");
+  assert.equal(dark["composer-hover"], "#414141", "模型按钮应高亮，不能变成更暗的页面 hover");
+  assert.equal(dark["control-bg"], "#2e2e2e");
+  assert.equal(dark["menu-divider"], "#484848");
+  assert.notEqual(dark["composer-hover"], dark["control-hover"], "按钮和弹出菜单有不同的底色");
+  const light = context.appearanceSurfaceColors("light", { background: "#ffffff", foreground: "#1f1f1f" });
+  assert.equal(light["composer-hover"], "#f3f3f3");
+  assert.equal(light["menu-divider"], "#e0e0e0", "浅色不附带加深分组线");
+  const custom = context.appearanceSurfaceColors("dark", { background: "#102030", foreground: "#f0e0d0" });
+  assert.notEqual(custom["composer-hover"], dark["composer-hover"]);
+  assert.notEqual(custom["menu-divider"], dark["menu-divider"]);
+});
+
+test("设置 HEX 可独立编辑，非法草稿不保存，失焦或 Escape 恢复实际颜色", () => {
+  let color = "#16a34a", saves = 0;
+  const attributes = new Map(), document = { activeElement: null };
+  const input = { value: "", setAttribute: (key, value) => attributes.set(key, value),
+    getAttribute: key => attributes.get(key) ?? null,
+    blur() { document.activeElement = null; this.onblur(); } };
+  const context = nodeVm.createContext({ nativeConnectionVersion: 1, document });
+  nodeVm.runInContext(sourceSection("function bindAppearanceColorValue(", "function appearanceHexToHsv("), context);
+  const sync = context.bindAppearanceColorValue(input, () => color, value => { color = value; saves++; sync(); });
+  sync();
+  assert.equal(input.value, "#16A34A");
+  document.activeElement = input; input.value = "#12"; input.oninput();
+  assert.equal(input.getAttribute("aria-invalid"), "true");
+  assert.equal(color, "#16a34a"); assert.equal(saves, 0);
+  sync(); assert.equal(input.value, "#12", "同步其它设置不能覆盖正在编辑的颜色草稿");
+  input.onblur(); assert.equal(input.value, "#16A34A");
+  input.value = "#ABCDEF"; input.oninput();
+  assert.equal(color, "#abcdef"); assert.equal(saves, 1);
+  input.value = "#bad";
+  const event = { key: "Escape", preventDefault() { this.prevented = true; }, stopPropagation() {} };
+  input.onkeydown(event);
+  assert.equal(event.prevented, true);
+  assert.equal(input.value, "#ABCDEF");
+  assert.equal(saves, 1);
+  color = "#2563eb"; document.activeElement = null; sync();
+  assert.equal(input.value, "#2563EB", "换主题或通过取色器选择后显示当前真实色值");
+});
+
+test("三类字号输入在确认后保存整数，空值、小数和越界值恢复，重复失焦不重复保存", () => {
+  const context = nodeVm.createContext();
+  nodeVm.runInContext(sourceSection("function bindAppearanceFontSize(", "function appearanceHexToHsv("), context);
+  for (const [min, max, initial] of [[10, 20, 14], [8, 24, 14], [6, 14, 12]]) {
+    let size = initial, saves = 0;
+    const attributes = new Map(), input = { value: String(initial),
+      setAttribute: (key, value) => attributes.set(key, value),
+      getAttribute: key => attributes.get(key) ?? null, blur() { this.onblur(); } };
+    context.bindAppearanceFontSize(input, min, max, () => size, value => { size = value; saves++; });
+    for (const invalid of ["", "not-a-number", "12.5", String(min - 1), String(max + 1)]) {
+      input.value = invalid; input.oninput();
+      assert.equal(input.getAttribute("aria-invalid"), "true");
+      assert.equal(size, initial);
+      input.onblur();
+      assert.equal(input.value, String(initial));
+      assert.equal(saves, 0);
+    }
+    input.value = String(max); input.oninput();
+    assert.equal(size, initial, "输入过程中不应用半成品数字");
+    input.onchange(); input.onblur();
+    assert.equal(size, max); assert.equal(saves, 1);
+    input.value = String(min);
+    input.onkeydown({ key: "Enter", preventDefault() {}, stopPropagation() {} });
+    assert.equal(size, min); assert.equal(saves, 2);
+    input.value = String(max);
+    input.onkeydown({ key: "Escape", preventDefault() {}, stopPropagation() {} });
+    assert.equal(input.value, String(min));
+    assert.equal(size, min); assert.equal(saves, 2);
+  }
+});
+
+test("外观切换会重新写入全部表面变量，保存时不修改用户选定的颜色", () => {
+  const styles = new Map(), saved = [];
+  const appearance = { theme: "dark", colors: {
+    dark: { background: "#102030", foreground: "#f0e0d0", accent: "#339cff" },
+    light: { background: "#f0e0d0", foreground: "#182838", accent: "#0078d4" },
+  } };
+  const initial = JSON.stringify(appearance.colors);
+  const context = nodeVm.createContext({ nativeConnectionVersion: 1,
+    appearance, appearanceTransitionTimer: null, editingMessage: null, document: {
+      documentElement: { dataset: {}, style: { setProperty: (name, value) => styles.set(name, value) },
+        classList: { add() {}, remove() {} } },
+    },
+    $: () => null, fontStack: () => "fixture", defaultUiFont: "", defaultCodeFont: "",
+    currentFileReadingFontSize: () => 14, syncRemoteBackground() {}, resizeComposerInput() {},
+    resizeEditorInput() {}, refitComposerMenus() {}, clearTimeout() {}, setTimeout: () => 1,
+    localStorage: { setItem: (_key, value) => saved.push(JSON.parse(value)) },
+  });
+  nodeVm.runInContext((sourceSection("function mix") + "\n" + sourceSection("function applyAp", "function sta")), context);
+  context.applyAppearance(true);
+  assert.equal(styles.get("--control-bg"), "#24313e");
+  appearance.theme = "light";
+  context.applyAppearance(true);
+  assert.equal(styles.get("--control-bg"), "#f2e3d5");
+  assert.equal(styles.get("--tooltip-bg"), "#182838");
+  assert.equal(styles.get("--tooltip-text"), "#f0e0d0");
+  assert.equal(JSON.stringify(appearance.colors), initial);
+  assert.equal(saved.length, 2);
+  assert.deepEqual(saved[1].colors, appearance.colors);
+});
+
+test("编辑区主题提示接管并恢复 title，保留无障碍说明，触屏不弹出，隐藏目标后清理", () => {
+  const listeners = new Map(), timers = new Map(), nodes = [], observers = [];
+  let timerId = 0;
+  function element(_tag, className = "", textContent = "") {
+    const attrs = new Map();
+    return { id: "", className, textContent, style: {}, isConnected: true, inScope: true, hidden: false,
+      setAttribute: (name, value) => attrs.set(name, value),
+      getAttribute: name => attrs.get(name) ?? null,
+      hasAttribute: name => attrs.has(name), removeAttribute: name => attrs.delete(name),
+      contains(other) { return other === this; },
+      closest(selector) { return selector === "[title]" ? attrs.has("title") ? this : null
+        : selector === "[hidden],[inert]" ? this.hidden ? this : null : this.inScope ? this : null; },
+      getBoundingClientRect: () => ({ left: 100, top: 200, bottom: 228, width: 120, height: 28 }),
+      showPopover() {}, remove() { const index = nodes.indexOf(this); if (index >= 0) nodes.splice(index, 1); },
+    };
+  }
+  const document = { documentElement: { dataset: { inputModality: "pointer" } },
+    body: { append: node => nodes.push(node) },
+    addEventListener: (name, handler) => listeners.set(name, handler) };
+  const context = nodeVm.createContext({ nativeConnectionVersion: 1, document, element,
+    window: { innerWidth: 800, innerHeight: 600, addEventListener() {} },
+    setTimeout: fn => { timers.set(++timerId, fn); return timerId; }, clearTimeout: id => timers.delete(id),
+    MutationObserver: class {
+      constructor(callback) { this.callback = callback; observers.push(this); }
+      observe() {} disconnect() {}
+    },
+  });
+  nodeVm.runInContext(sourceSection("function installComposerTooltips(", "\nlet composerTooltips ="), context);
+  const tooltip = context.installComposerTooltips();
+  const trigger = element("button");
+  trigger.setAttribute("title", "选择模型"); trigger.setAttribute("aria-describedby", "existing-help");
+  listeners.get("pointerover")({ target: trigger, pointerType: "touch" });
+  assert.equal(timers.size, 0);
+  listeners.get("pointerover")({ target: trigger, pointerType: "mouse" });
+  assert.equal(trigger.hasAttribute("title"), false, "等待期间也不出现浏览器原生提示");
+  const flush = () => { const callbacks = [...timers.values()]; timers.clear(); for (const callback of callbacks) callback(); };
+  flush();
+  assert.equal(nodes.length, 1);
+  assert.equal(nodes[0].textContent, "选择模型");
+  assert.equal(trigger.getAttribute("aria-describedby"), "existing-help composer-hover-tooltip");
+  listeners.get("pointerout")({ target: trigger, relatedTarget: null });
+  assert.equal(nodes.length, 0);
+  assert.equal(trigger.getAttribute("title"), "选择模型");
+  assert.equal(trigger.getAttribute("aria-describedby"), "existing-help");
+  document.documentElement.dataset.inputModality = "keyboard";
+  listeners.get("focusin")({ target: trigger }); flush();
+  assert.equal(nodes.length, 1);
+  trigger.hidden = true; observers.at(-1).callback();
+  assert.equal(nodes.length, 0);
+  assert.equal(trigger.getAttribute("title"), "选择模型");
+  trigger.hidden = false;
+  trigger.setAttribute("title", "正在读取 Fast 能力");
+  listeners.get("pointerover")({ target: trigger, pointerType: "mouse" });
+  tooltip.update(trigger, "本会话 Fast 已关闭，点击开启");
+  flush();
+  assert.equal(nodes[0].textContent, "本会话 Fast 已关闭，点击开启", "200ms 等待期间也采用最新状态");
+  tooltip.update(trigger, "本会话 Fast 已开启，点击关闭");
+  assert.equal(nodes[0].textContent, "本会话 Fast 已开启，点击关闭", "保持悬停时及时接替旧提示");
+  listeners.get("pointerout")({ target: trigger, relatedTarget: null });
+  assert.equal(trigger.getAttribute("title"), "本会话 Fast 已开启，点击关闭");
+  const metrics = element("span");
+  metrics.id = "session-metrics"; metrics.setAttribute("title", "首 Token 时间 1.24 秒 · 缓存命中率 96.8%");
+  listeners.get("pointerover")({ target: metrics, pointerType: "mouse" }); flush();
+  assert.equal(nodes[0].className, "composer-tooltip composer-metrics-tooltip");
+});
+
+function composerMetricsHarness({ animate = false, reducedMotion = false } = {}) {
+  const requests = [], timers = new Map(), properties = new Map(), remembered = [], animations = [];
+  let now = 100000, timer = 0;
+  const element = (tag, className = "", text = "") => {
+    let ownText = text;
+    const classes = new Set(className.split(" ").filter(Boolean));
+    const item = { tag, className, dataset: {}, children: [], attributes: {}, parentNode: null,
+      get textContent() { return ownText + this.children.map(child => child.textContent).join(""); },
+      set textContent(value) { ownText = value; this.children = []; },
+      append(...children) {
+        for (const child of children) {
+          child.remove(); child.parentNode = this; this.children.push(child);
+        }
+      },
+      remove() {
+        if (this.parentNode) this.parentNode.children = this.parentNode.children.filter(child => child !== this);
+        this.parentNode = null;
+      },
+      setAttribute(key, value) { this.attributes[key] = value; },
+      classList: { add: value => classes.add(value), remove: value => classes.delete(value), contains: value => classes.has(value) }
+    };
+    if (animate) item.animate = (frames, options) => {
+      let finish, fail;
+      const finished = new Promise((resolve, reject) => { finish = resolve; fail = reject; });
+      const animation = { target: item, frames, options, finished, cancelled: false, finish,
+        cancel() { this.cancelled = true; fail(new Error("动画取消")); } };
+      animations.push(animation); return animation;
+    };
+    return item;
+  };
+  const node = { hidden: true, dataset: {}, attributes: {}, children: [],
+    style: { setProperty: (key, value) => properties.set(key, value) },
+    replaceChildren(...children) { this.children = children; },
+    setAttribute(key, value) { this.attributes[key] = value; } };
+  const quota = { hidden: false, getBoundingClientRect: () => ({ width: 118 }) };
+  const context = nodeVm.createContext({ nativeConnectionVersion: 1,
+    composerTooltips: null,
+    composerMetricsState: null, session: { device: { id: "metrics-device", createdAtMs: 1 },
+      capabilities: { sessionMetrics: true }, runtime: { revision: 1 } },
+    thread: { id: "thread-a" }, selectedId: "thread-a", selectionVersion: 1, messageVersion: 0,
+    instance: "codex:local", backend: "codex", active: true, creating: false,
+    connected: true, pageLeaving: false, document: { hidden: false }, AbortController,
+    reducedMotion, matchMedia: () => ({ matches: context.reducedMotion }),
+    turns: new Map([["turn-current", { id: "turn-current", status: "inProgress" }]]),
+    privateInputScope: value => JSON.stringify(value.device),
+    activeInstanceId: () => context.instance, activeBackend: () => context.backend,
+    currentThreadDisplay: () => context.thread, isActiveThread: () => context.active,
+    rememberThreadDisplay: (value, options) => remembered.push({ value, options }),
+    element,
+    $: selector => selector === "#session-metrics" ? node : selector === "#claude-usage" ? quota : null,
+    Date: class extends Date { static now() { return now; } },
+    setTimeout(callback, delay) { const id = ++timer; timers.set(id, { callback, delay }); return id; },
+    clearTimeout(id) { timers.delete(id); },
+    api(path, payload, id, signal, options) {
+      let resolve, reject;
+      const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+      requests.push({ path, payload, signal, options, resolve, reject }); return promise;
+    },
+  });
+  nodeVm.runInContext((sourceSection("function composerMet", "function tok") + "\n" + sourceSection("function syncCom")), context);
+  const value = overrides => ({ source: "codex-rollout", turnId: "turn-current",
+    inputTokens: 999952, outputTokens: 48, turnTokens: 1000000, steps: 20, totalTokens: 5000000,
+    durationMs: 18620, tokensPerSecond: 48, firstTokenMs: 1240, cacheHitRate: 0.968, ...overrides });
+  return { context, requests, timers, node, quota, properties, remembered, value, animations,
+    text: () => node.children.map(child => child.textContent).join("  "),
+    advance: amount => { now += amount; },
+    complete(index = 0, overrides = {}) {
+      requests[index].resolve({ ok: true, threadId: requests[index].payload.threadId,
+        backend: requests[index].payload.backend, metrics: value(overrides) });
+    },
+    flush: () => new Promise(resolve => setImmediate(resolve)) };
+}
+
+test("会话底栏统计按步数在前展示，百万与千单位一致，未知和非法字段不伪装为零", async () => {
+  const h = composerMetricsHarness(), c = h.context;
+  assert.equal(c.composerMetricsCompact(1000000), "1m");
+  assert.equal(c.composerMetricsCompact(12400), "12.4k");
+  assert.equal(c.composerMetricsCompact(null), "—");
+  c.syncComposerMetrics();
+  assert.equal(h.node.hidden, true, "尚无实测数据时不显示统计底栏");
+  assert.equal(h.text(), "");
+  h.complete(); await h.flush();
+  assert.equal(h.text(), "48tk/s  本轮 20步 1m  总 5m");
+  assert.equal(h.node.hidden, false);
+  for (const invalid of [-1, NaN, Infinity, "20", true, Number.MAX_SAFE_INTEGER + 1])
+    assert.equal(c.normalizeComposerMetrics(h.value({ steps: invalid })).steps, null);
+  assert.equal(c.normalizeComposerMetrics(h.value({ steps: 0 })).steps, 0);
+  assert.equal(c.normalizeComposerMetrics(h.value({ cacheHitRate: 0 })).cacheHitRate, 0);
+  assert.equal(c.normalizeComposerMetrics(h.value({ source: "codex-side" })).source, "codex-side");
+  for (const invalid of [-0.1, 1.1, NaN, Infinity, "0.5", true])
+    assert.equal(c.normalizeComposerMetrics(h.value({ cacheHitRate: invalid })).cacheHitRate, null);
+  assert.equal(c.normalizeComposerMetrics(h.value({ source: "estimated" })), null);
+});
+
+test("Token hover 按当前轮次单行展示实测字段，未返回字段整项隐藏", async () => {
+  const h = composerMetricsHarness(), c = h.context;
+  c.syncComposerMetrics(); h.complete(); await h.flush();
+  assert.equal(h.node.title, "首 Token 时间 1.24 秒 · 本轮耗时 18.62 秒 · 缓存命中率 96.8%");
+  assert.doesNotMatch(h.node.title, /输入：|输出：|模型调用|会话累计/);
+  h.advance(2001); c.syncComposerMetrics();
+  h.complete(1, { firstTokenMs: 1, durationMs: null, cacheHitRate: null }); await h.flush();
+  assert.equal(h.node.title, "首 Token 时间 1 毫秒");
+  h.advance(2001); c.syncComposerMetrics();
+  h.complete(2, { firstTokenMs: null, durationMs: null, cacheHitRate: null }); await h.flush();
+  assert.equal(h.node.title, "");
+});
+
+test("侧边会话按自身身份读取 Token 统计，主会话迟到回执不能覆盖", async () => {
+  const h = composerMetricsHarness(), c = h.context;
+  c.syncComposerMetrics();
+  c.selectedId = "side-session"; c.thread = { id: "side-session", viewKind: "side" };
+  c.turns = new Map([["side-turn", { id: "side-turn", status: "completed" }]]); ++c.selectionVersion;
+  c.syncComposerMetrics();
+  assert.equal(h.requests.length, 2);
+  assert.equal(h.requests[1].payload.threadId, "side-session");
+  h.complete(0); await h.flush();
+  assert.equal(c.composerMetricsState.value, null);
+  h.complete(1, { source: "codex-side", turnId: "side-turn", steps: 2, turnTokens: 400, totalTokens: 400,
+    tokensPerSecond: 25, firstTokenMs: 1000, durationMs: 4000, cacheHitRate: 0.4 }); await h.flush();
+  assert.equal(h.text(), "25tk/s  本轮 2步 400  总 400");
+  assert.equal(h.node.title, "首 Token 时间 1 秒 · 本轮耗时 4 秒 · 缓存命中率 40%");
+});
+
+test("会话底栏统计重复输入不增加读取，后台优先级且与发送状态无依赖", async () => {
+  const h = composerMetricsHarness(), c = h.context;
+  for (let index = 0; index < 10; ++index) c.syncComposerMetrics();
+  assert.equal(h.requests.length, 1);
+  assert.equal(h.requests[0].path, "/api/read/sessionMetrics");
+  assert.equal(h.requests[0].options.resourcePriority, "background");
+  h.complete(); await h.flush();
+  assert.equal(h.requests.length, 1);
+  assert.equal(h.properties.get("--composer-quota-width"), "126px");
+  h.quota.hidden = true; c.fitComposerMetrics();
+  assert.equal(h.properties.get("--composer-quota-width"), "0px");
+  assert.equal(h.timers.size, 1);
+  h.advance(2001); c.syncComposerMetrics();
+  assert.equal(h.requests.length, 2);
+});
+
+test("会话底栏统计切换实例和授权后中止旧请求，迟到结果不能覆盖新会话", async () => {
+  const h = composerMetricsHarness(), c = h.context;
+  c.syncComposerMetrics();
+  c.selectedId = "claude-thread-b"; c.thread = { id: c.selectedId };
+  c.instance = "claude:wsl:test"; c.backend = "claude"; ++c.selectionVersion;
+  c.session.device.id = "new-device";
+  c.syncComposerMetrics();
+  assert.equal(h.requests[0].signal.aborted, true);
+  h.complete(0); await h.flush();
+  assert.equal(c.composerMetricsState.value, null);
+  h.complete(1, { source: "claude-native" }); await h.flush();
+  assert.equal(h.text(), "48tk/s  本轮 20步 1m  总 5m");
+  assert.equal(h.remembered.length, 1);
+  assert.equal(h.remembered[0].value.id, "claude-thread-b");
+});
+
+test("会话底栏统计新轮次保留上一轮数据，拒绝错会话响应，实测数据返回后更新", async () => {
+  const h = composerMetricsHarness(), c = h.context;
+  c.syncComposerMetrics(); h.complete(); await h.flush();
+  c.turns.set("next", { id: "next", status: "inProgress" }); ++c.messageVersion;
+  c.syncComposerMetrics();
+  assert.equal(h.text(), "48tk/s  本轮 20步 1m  总 5m");
+  assert.equal(h.node.title, "", "新轮次尚未返回时不把上一轮摘要标成本轮");
+  h.requests[1].resolve({ ok: true, backend: "codex", threadId: "other-thread", metrics: h.value({ turnId: "next" }) });
+  await h.flush();
+  assert.equal(c.composerMetricsState.value.turnId, "turn-current");
+  assert.equal(h.text(), "48tk/s  本轮 20步 1m  总 5m");
+  h.advance(2001); c.syncComposerMetrics();
+  h.complete(2, { turnId: "next", inputTokens: null, outputTokens: null, turnTokens: null, steps: null,
+    durationMs: 500, tokensPerSecond: null });
+  await h.flush();
+  assert.equal(c.composerMetricsState.value.turnId, "turn-current", "仅有累计值不能覆盖上一轮统计");
+  assert.equal(h.text(), "48tk/s  本轮 20步 1m  总 5m");
+  h.advance(2001); c.syncComposerMetrics();
+  h.complete(3, { turnId: "next", inputTokens: 1200, outputTokens: 100, turnTokens: 1300,
+    steps: 1, totalTokens: 5001300, tokensPerSecond: 100 });
+  await h.flush();
+  assert.equal(c.composerMetricsState.value.turnId, "next");
+  assert.equal(h.text(), "100tk/s  本轮 1步 1.3k  总 5m");
+  assert.equal(h.node.title, "首 Token 时间 1.24 秒 · 本轮耗时 18.62 秒 · 缓存命中率 96.8%");
+});
+
+test("会话底栏统计空数据保持隐藏，部分数据仅展示已知项且保留真实零值", async () => {
+  const h = composerMetricsHarness(), c = h.context;
+  const empty = { inputTokens: null, outputTokens: null, turnTokens: null, steps: null,
+    totalTokens: null, durationMs: 200, tokensPerSecond: null };
+  c.syncComposerMetrics(); h.complete(0, empty); await h.flush();
+  assert.equal(h.node.hidden, true);
+  assert.equal(c.composerMetricsState.value, null, "仅有时长不算 Token 统计");
+  assert.equal(h.remembered.length, 0, "空值不能写入统计展示缓存");
+  h.advance(2001); c.syncComposerMetrics();
+  h.complete(1, { ...empty, turnTokens: 1234 }); await h.flush();
+  assert.equal(h.node.hidden, false);
+  assert.equal(h.text(), "本轮 1.2k");
+  assert.doesNotMatch(h.text(), /[—–]/);
+  h.advance(2001); c.syncComposerMetrics();
+  h.complete(2, { inputTokens: 0, outputTokens: 0, turnTokens: 0, steps: 0, totalTokens: 0, tokensPerSecond: 0 });
+  await h.flush();
+  assert.equal(h.text(), "0tk/s  本轮 0步 0  总 0");
+});
+
+test("Codex 和 Claude 新轮次的空响应及失败都保留上一轮统计，不写入空快照", async () => {
+  for (const [backend, source] of [["codex", "codex-rollout"], ["claude", "claude-native"]]) {
+    const h = composerMetricsHarness(), c = h.context;
+    c.backend = backend; c.instance = `${backend}:fixture`;
+    c.syncComposerMetrics(); h.complete(0, { source }); await h.flush();
+    c.turns.set("next", { id: "next", status: "inProgress" }); ++c.messageVersion;
+    c.syncComposerMetrics();
+    h.requests[1].resolve({ ok: true, threadId: c.selectedId, backend, metrics: null }); await h.flush();
+    assert.equal(h.text(), "48tk/s  本轮 20步 1m  总 5m");
+    assert.equal(h.remembered.length, 1);
+    h.advance(2001); c.syncComposerMetrics();
+    h.requests[2].reject(new Error("新轮次统计暂不可用")); await h.flush();
+    assert.equal(h.node.hidden, false);
+    assert.equal(h.text(), "48tk/s  本轮 20步 1m  总 5m");
+    assert.equal(c.composerMetricsState.value.turnId, "turn-current");
+  }
+});
+
+test("会话底栏统计读取失败保留最后实测值，离页停止轮询且旧服务不请求新接口", async () => {
+  const h = composerMetricsHarness(), c = h.context;
+  c.syncComposerMetrics(); h.complete(); await h.flush();
+  h.advance(2001); c.syncComposerMetrics();
+  h.requests[1].reject(new Error("暂时不可用")); await h.flush();
+  assert.equal(h.text(), "48tk/s  本轮 20步 1m  总 5m");
+  c.document.hidden = true; c.syncComposerMetrics();
+  assert.equal(h.node.hidden, true);
+  assert.equal(h.timers.size, 0);
+  c.document.hidden = false; c.session.capabilities.sessionMetrics = false; c.syncComposerMetrics();
+  assert.equal(h.requests.length, 2);
+});
+
+test("会话底栏统计离线中止读取，旧回执不回写且重新连接立即补读", async () => {
+  const h = composerMetricsHarness(), c = h.context;
+  c.syncComposerMetrics();
+  c.connected = false; c.syncComposerMetrics();
+  assert.equal(h.requests[0].signal.aborted, true);
+  h.complete(); await h.flush();
+  assert.equal(c.composerMetricsState.value, null);
+  assert.equal(h.requests.length, 1);
+  c.connected = true; c.syncComposerMetrics();
+  assert.equal(h.requests.length, 2);
+  h.complete(1); await h.flush();
+  assert.equal(h.text(), "48tk/s  本轮 20步 1m  总 5m");
+});
+
+test("Token 数字从个位开始向上滚动到 11，下降时反向经过数字且首次显示不补零", async () => {
+  const h = composerMetricsHarness({ animate: true }), state = {}, c = h.context;
+  const node = c.composerMetricNumber(state, "tokens", 0);
+  assert.equal(node.textContent, "0");
+  assert.equal(h.animations.length, 0, "首次真实值不从虚构的零滚入");
+  c.composerMetricNumber(state, "tokens", 11);
+  assert.equal(node.textContent, "11", "动画轨道不污染真实文本、复制或读屏内容");
+  const tracks = h.animations.filter(animation => animation.target.className === "composer-metric-track");
+  const ones = tracks.find(animation => animation.options.delay === 0);
+  assert.equal(ones.target.dataset.digits, "0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n0\n1");
+  assert.equal(ones.frames[0].transform, "translateY(0em)");
+  assert.equal(ones.frames[1].transform, "translateY(-11em)");
+  assert.ok(tracks.some(animation => animation.options.delay > 0), "个位先动，高位随后启动");
+  for (const animation of h.animations) animation.finish();
+  await h.flush();
+  assert.equal(node.classList.contains("composer-metric-animating"), false);
+  const before = h.animations.length;
+  c.composerMetricNumber(state, "tokens", 9);
+  const down = h.animations.slice(before).find(animation => animation.target.className === "composer-metric-track");
+  assert.equal(down.target.dataset.digits, "9\n0\n1");
+  assert.equal(down.frames[0].transform, "translateY(-2em)");
+  assert.equal(down.frames[1].transform, "translateY(0em)");
+  assert.equal(node.textContent, "9");
+});
+
+test("Token 大跳变滚动圈数和时长有上限，单位切换过渡且数值格式不回退", () => {
+  const h = composerMetricsHarness({ animate: true }), c = h.context, state = {};
+  c.composerMetricNumber(state, "tokens", 0);
+  c.composerMetricNumber(state, "tokens", Number.MAX_SAFE_INTEGER);
+  for (const animation of h.animations) {
+    assert.ok(animation.options.delay + animation.options.duration <= 700);
+    if (animation.target.className === "composer-metric-track")
+      assert.ok(animation.target.dataset.digits.split("\n").length <= 20);
+  }
+  const compact = {}, start = h.animations.length;
+  const node = c.composerMetricNumber(compact, "total", 999, c.composerMetricsCompact);
+  c.composerMetricNumber(compact, "total", 1000, c.composerMetricsCompact);
+  assert.equal(node.textContent, "1k");
+  assert.equal(h.animations.length, start + 1);
+  assert.equal(h.animations.at(-1).target, node, "跨单位时整体过渡，不显示混用单位的中间数");
+  c.composerMetricNumber(compact, "total", 1001, c.composerMetricsCompact);
+  assert.equal(h.animations.length, start + 1, "格式化结果未变化不重复启动动画");
+  c.composerMetricNumber(compact, "total", 980, c.composerMetricsCompact);
+  assert.equal(h.animations.at(-1).frames[0].transform, "translateY(-.4em)");
+});
+
+test("Token 新数值取消旧动画，迟到完成不清理新动画，切换会话会释放全部轨道", async () => {
+  const h = composerMetricsHarness({ animate: true }), c = h.context, state = {};
+  c.composerMetricNumber(state, "tokens", 0);
+  const node = c.composerMetricNumber(state, "tokens", 11), old = [...h.animations];
+  c.composerMetricNumber(state, "tokens", 12);
+  assert.ok(old.every(animation => animation.cancelled));
+  await h.flush();
+  assert.equal(node.textContent, "12");
+  assert.equal(node.classList.contains("composer-metric-animating"), true, "旧 Promise 不能清理最新动画");
+  c.composerMetricsState = state;
+  c.resetComposerMetrics();
+  await h.flush();
+  assert.ok(h.animations.every(animation => animation.cancelled));
+  assert.equal(node.classList.contains("composer-metric-animating"), false);
+  assert.equal(node.children.length, 1, "释放动画层，只留下真实数值");
+  assert.equal(h.node.hidden, true);
+});
+
+test("Token 减少动态效果时直接更新，等待新轮次数据也不会重复触发滚动", async () => {
+  const reduced = composerMetricsHarness({ animate: true, reducedMotion: true }), state = {};
+  reduced.context.composerMetricNumber(state, "tokens", 0);
+  reduced.context.composerMetricNumber(state, "tokens", 11);
+  assert.equal(reduced.animations.length, 0);
+  assert.equal(state.metricNumbers.get("tokens").node.textContent, "11");
+  const h = composerMetricsHarness({ animate: true }), c = h.context;
+  c.syncComposerMetrics(); h.complete(); await h.flush();
+  assert.equal(h.animations.length, 0);
+  c.turns.set("next", { id: "next", status: "inProgress" }); ++c.messageVersion;
+  c.syncComposerMetrics();
+  assert.equal(h.animations.length, 0, "保留上一轮时不重播旧数字");
+  h.complete(1, { turnId: "next", steps: 21, turnTokens: 1100000 }); await h.flush();
+  assert.ok(h.animations.length > 0);
+  assert.equal(h.text(), "48tk/s  本轮 21步 1.1m  总 5m");
+});
+
+test("独立客户端切回前台时恢复编辑框焦点和光标，其他控件不抢焦点", () => {
+  const selection = { start: 4, end: 4, startTokens: new Set(), endTokens: new Set() }, restores = [];
+  const prompt = { isConnected: true, disabled: false, focusCalls: 0,
+    focus(options) { this.focusCalls += 1; this.focusOptions = options; } };
+  const document = { activeElement: prompt, hidden: false, focused: true, hasFocus() { return this.focused; } };
+  const context = nodeVm.createContext({ nativeConnectionVersion: 1, document,
+    $: selector => selector === "#prompt" ? prompt : null, promptSelection: () => selection,
+    setPromptSelection: (...args) => restores.push(args) });
+  nodeVm.runInContext(sourceSection("let promptFocusSnapshot", "function resumePage"), context);
+  context.rememberPromptFocus(); document.activeElement = null; context.restorePromptFocus();
+  assert.equal(prompt.focusCalls, 1);
+  assert.equal(prompt.focusOptions.preventScroll, true);
+  assert.equal(restores.length, 1);
+  assert.equal(restores[0][0], prompt);
+  assert.equal(restores[0][1], 4);
+  assert.equal(restores[0][2], 4);
+  context.restorePromptFocus();
+  assert.equal(prompt.focusCalls, 1, "focus 与 visible 连续触发不能重复恢复");
+  document.activeElement = {}; context.rememberPromptFocus(); context.restorePromptFocus();
+  assert.equal(prompt.focusCalls, 1, "后台前使用其他控件时不能抢走焦点");
+  document.activeElement = prompt; context.rememberPromptFocus(); document.focused = false; context.restorePromptFocus();
+  assert.equal(prompt.focusCalls, 1, "窗口尚未取得前台焦点时保留快照等待");
+  document.focused = true; context.restorePromptFocus();
+  assert.equal(prompt.focusCalls, 2);
+  assert.match(app, /window\.addEventListener\("focus", restorePromptFocus\)/);
+});
+
+test("编辑器末尾换行滚动到底部，中间编辑保持原滚动位置", () => {
+  const input = { isConnected: true, style: {}, value: "line\n", selectionStart: 5, selectionEnd: 5,
+    scrollHeight: 240, scrollTop: 0 };
+  const context = nodeVm.createContext({ nativeConnectionVersion: 1, document: { activeElement: input },
+    getComputedStyle: () => ({ minHeight: "80", maxHeight: "180" }) });
+  nodeVm.runInContext(sourceSection("function resizeEditorInput(", "function resizeComposerInput("), context);
+  context.resizeEditorInput(input);
+  assert.equal(input.style.height, "180px");
+  assert.equal(input.style.overflowY, "auto");
+  assert.equal(input.scrollTop, 240, "末尾回车后跟随到最新内容底部");
+  input.selectionStart = input.selectionEnd = 1; input.scrollTop = 72; context.resizeEditorInput(input);
+  assert.equal(input.scrollTop, 72, "编辑中间内容不能强制跳到底部");
+  input.selectionStart = input.selectionEnd = 5; input.scrollHeight = 80; context.resizeEditorInput(input);
+  assert.equal(input.scrollTop, 0, "内容无需滚动时沿用原顶部位置");
+});
+
+test("编辑区图标恢复正常前景色，加号悬停和点击显示模型同款背景", async () => {
+  const css = await readFile(new URL("../assets/harness/style.css", import.meta.url), "utf8");
+  assert.match(css, /\.composer-add-button\{[^}]*color:var\(--text\)/);
+  assert.match(css, /\.prompt-optimize-button\{[^}]*color:var\(--text\)/);
+  assert.ok(css.includes(".composer-toolbar .composer-add-button:is(:focus-visible,:active,[aria-expanded=true]){background:var(--composer-hover,var(--hover))}"));
+  assert.ok(css.includes(".composer-toolbar .composer-add-button:hover:not(:disabled){background:var(--composer-hover,var(--hover))}"));
+  assert.match(css, /\.composer-add-button:active:not\(:disabled\)\{opacity:1\}/);
+  assert.ok(app.includes('$("#prompt-optimize").replaceChildren(icon("sparkles"))'));
+});
+
+function claudeSlashMenuHarness() {
+  const calls = [], writes = [];
+  function element(tag, className = "", text = "") {
+    return { tagName: tag, className, textContent: text, children: [], dataset: {}, attributes: {}, hidden: false,
+      style: { setProperty() {} }, scrollTop: 0,
+      append(...children) { this.children.push(...children); },
+      replaceChildren(...children) { this.children = children; },
+      setAttribute(key, value) { this.attributes[key] = value; },
+      getAttribute(key) { return this.attributes[key] ?? null; },
+      removeAttribute(key) { delete this.attributes[key]; },
+      scrollIntoView() {}, focus() {}, classList: { add() {} } };
+  }
+  const prompt = Object.assign(element("div"), { value: "/", selectionStart: 1, selectionEnd: 1,
+    setRangeText(text, start, end) {
+      this.value = this.value.slice(0, start) + text + this.value.slice(end);
+      this.selectionStart = this.selectionEnd = start + text.length;
+    } });
+  const menu = element("div"), project = { value: "project-a" };
+  const optimize = Object.assign(element("button"), { disabled: false });
+  const roots = { "#prompt": prompt, "#skill-menu": menu, "#project-select": project, "#prompt-optimize": optimize,
+    "#model-settings": element("div"), "#model-button": element("button") };
+  const flatten = node => [node, ...(node.children || []).flatMap(flatten)];
+  const $ = (selector, root) => roots[selector] || flatten(root || menu).find(node => selector.startsWith(".")
+    ? String(node.className || "").split(" ").includes(selector.slice(1)) : node.id === selector.slice(1)) || null;
+  const context = vm.createContext({ nativeConnectionVersion: 1,
+    $, element, button: (text, title, click, className) => Object.assign(element("button", className, text), { title, onclick: click }),
+    creating: true, creationBackend: "claude", creationInstanceId: "claude:wsl:test", selectedId: null,
+    session: { device: { id: "device" }, capabilities: { claudeSessions: true, projectlessCreation: true } },
+    sidebar: { projects: [{ id: "project-a", roots: ["E:/project-a"] }] },
+    modelsScope: "claude:wsl:test", modelsLoadedAt: 0, modelsPromise: null, modelsRetryAt: 0,
+    modelDefaults: { nativeCapabilities: { goal: true, compact: true } },
+    document: { activeElement: prompt, hidden: false }, navigator: { onLine: true }, pageLeaving: false,
+    selectedSkills: [], selectedGoal: null, skillChoices: [], skillIndex: 0, skillScope: "", skillLoadVersion: 0,
+    skillRenderVersion: 0, skillLoading: null, appliedSkillCatalog: null, appliedGlobalSkills: null,
+    skillCatalogs: new Map(), skillScopeAliases: new Map(), skillCatalogRequests: new Map(), skillCatalogRetryAt: new Map(),
+    globalSkillChoices: [{ name: "codex-only", path: "C:/codex/SKILL.md", scope: "user" }],
+    globalSkillsLoadedAt: Date.now(), globalSkillsInvalidated: false, globalSkillEpoch: "epoch", skillCatalogRevision: 0,
+    catalogCacheMs: 3600000, catalogFallbackMs: 604800000, catalogRefreshAheadMs: 60000, catalogRetryMs: 15000,
+    catalogRefreshTimer: null, readScope: "device", readCache: { get: async () => null },
+    privateInputScope: value => value?.device.id, optionalCachedRead: promise => promise,
+    cacheDisplayData: (...values) => writes.push(values), setTimeout: () => 1, clearTimeout() {},
+    editingMessage: null, editingQueuedMessage: null, threadReadOnly: () => false,
+    compactCommandAvailable: () => true, goalComposerReason: () => "",
+    compactCommandMatches: query => ["compact", "压缩"].some(value => value.includes(query)),
+    goalCommandMatches: query => ["goal", "目标"].some(value => value.includes(query)),
+    skillIdentity: skill => `${skill.name}\0${skill.path}`, skillVisibleName: skill => skill.name,
+    currentThreadDisplay: () => null, contextUsage: () => null, compactUsageDescription: () => "",
+    compactCommandIcon: () => element("span"), goalComposerIcon: () => element("span"),
+    promptOptimizationCommandIcon: () => element("span"), activatePromptOptimization() {},
+    selectCompactCommand() {}, selectGoalCommand() {},
+    closePopup() {}, closeContextUsageTip() {}, fitComposerMenu() {},
+    closeSkillMenu: () => { menu.hidden = true; },
+    closeComposerMenus: () => { menu.hidden = true; },
+    updateComposer() {}, scheduleMessages() {}, rememberDraft() {}, notice() {},
+    api: (path, payload) => {
+      const request = { ...deferred(), path, payload };
+      calls.push(request); return request.promise;
+    },
+  });
+  vm.runInContext(sourceSection("function slashQu", "function com")
+    + sourceSection("function promptOptimizationCommandMatches(", "function compactCommandIcon(")
+    + sourceSection("function slashMe", "function ren")
+    + (sourceSection("function normalizeSl", "function cat") + "\n" + sourceSection("function renderSkillMenu", "function act"))
+    + (sourceSection("function cat") + "\n" + sourceSection("function activeS", "function sel") + "\n" + sourceSection("function selectS", "function rem"))
+    + sourceSection("function selectPromptOptimizationCommand(", "function handlePromptInput("), context);
+  const skill = name => ({ name, command: name, path: `claude-skill:${name}`, backend: "claude",
+    scope: "native", description: `说明 ${name}`, argumentHint: "[参数]" });
+  const response = (name, instanceId = "claude:wsl:test") => ({ ok: true, backend: "claude", instanceId,
+    cwd: "E:/project-a", data: [skill(name)], nativeCapabilities: { compact: true, goal: true } });
+  return { context, prompt, menu, project, optimize, calls, writes, skill, response };
+}
+
+test("Claude 斜杠菜单复用 Skill 列表与压缩目标底栏，支持搜索、键盘和原生命令插入", () => {
+  const h = claudeSlashMenuHarness(), c = h.context;
+  c.skillChoices = [h.skill("review"), h.skill("plugin:check")];
+  c.renderSkillMenu();
+  assert.equal(h.menu.hidden, false);
+  assert.equal(h.menu.children[0].children.length, 2);
+  assert.equal(h.menu.children[1].className, "skill-menu-footer");
+  assert.equal(h.menu.children[1].children.length, 3);
+  assert.deepEqual(Array.from(c.slashMenuEntries(), entry => entry.type), ["skill", "skill", "compact", "goal", "promptOptimize"]);
+  c.moveSlashIndex(c.slashMenuEntries(), 1);
+  assert.equal(c.skillIndex, 1);
+  h.prompt.value = "/rev"; h.prompt.selectionStart = h.prompt.selectionEnd = 4;
+  assert.deepEqual(Array.from(c.slashMenuEntries(), entry => entry.skill?.name), ["review"]);
+  c.selectSkill(h.skill("review"));
+  assert.equal(h.prompt.value, "/review ");
+  assert.equal(c.selectedSkills.length, 0, "Claude 不发送 Codex 的 Skill 路径");
+  assert.equal(h.menu.hidden, true);
+  h.prompt.value = "解释 /"; h.prompt.selectionStart = h.prompt.selectionEnd = h.prompt.value.length;
+  assert.ok(c.slashMenuEntries().every(entry => entry.type !== "skill"), "原生 Skill 仅在消息开头调用");
+  c.modelDefaults.nativeCapabilities = { compact: false, goal: false };
+  assert.deepEqual(Array.from(c.slashMenuEntries(), entry => entry.type), ["promptOptimize"],
+    "原生压缩和目标能力不影响独立提示词优化");
+  c.modelDefaults.nativeCapabilities = { compact: true, goal: true };
+  h.prompt.value = "/"; h.prompt.selectionStart = h.prompt.selectionEnd = 1; c.skillChoices = [];
+  c.renderSkillMenu("Skill 暂不可用");
+  assert.equal(h.menu.children[1].children.length, 3, "Skill 读取失败不能隐藏压缩、目标和提示词优化");
+});
+
+test("斜杠菜单提供提示词优化，支持搜索并保留命令外输入", () => {
+  const h = claudeSlashMenuHarness(), c = h.context;
+  for (const query of ["提示", "optimize", "prompt"]) {
+    h.prompt.value = `/${query}`; h.prompt.selectionStart = h.prompt.selectionEnd = h.prompt.value.length;
+    assert.deepEqual(Array.from(c.slashMenuEntries(), entry => entry.type), ["promptOptimize"]);
+  }
+  h.prompt.value = "请整理需求 /prompt"; h.prompt.selectionStart = h.prompt.selectionEnd = h.prompt.value.length;
+  let activated = 0, drafts = 0;
+  c.activatePromptOptimization = () => { activated += 1; }; c.rememberDraft = () => { drafts += 1; };
+  c.renderSkillMenu();
+  const option = h.menu.children[1].children[0];
+  assert.equal(option.children[1].children[0].textContent, "提示词优化");
+  option.onclick();
+  assert.equal(h.prompt.value, "请整理需求 ");
+  assert.equal(activated, 1);
+  assert.equal(drafts, 1);
+  h.prompt.value = "/optimize"; h.prompt.selectionStart = h.prompt.selectionEnd = h.prompt.value.length;
+  h.optimize.disabled = true;
+  assert.equal(c.slashMenuEntries()[0].enabled, false);
+  c.selectPromptOptimizationCommand();
+  assert.equal(activated, 1, "工具栏优化不可用时不从斜杠菜单绕过限制");
+  assert.match(app, /entry\?\.type === "promptOptimize"\) selectPromptOptimizationCommand\(\)/);
+});
+
+test("Claude Skill 目录与 Codex 全局目录隔离，同一实例项目复用缓存", async () => {
+  const h = claudeSlashMenuHarness(), c = h.context;
+  const active = c.activeSkillCatalogContext();
+  const loading = c.loadSkillChoices(active.scope, active.payload);
+  await new Promise(setImmediate);
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls[0].payload.backend, "claude");
+  assert.equal(h.calls[0].payload.instanceId, "claude:wsl:test");
+  h.calls[0].resolve(h.response("review")); await loading;
+  assert.deepEqual(Array.from(c.skillChoices, skill => skill.name), ["review"]);
+  assert.equal(c.globalSkillChoices[0].name, "codex-only");
+  assert.ok(h.writes.every(([, key]) => key !== "global"));
+  await c.loadSkillChoices(active.scope, active.payload);
+  assert.equal(h.calls.length, 1);
+  c.creationBackend = "codex"; c.creationInstanceId = "codex:local";
+  const codex = c.activeSkillCatalogContext();
+  assert.notEqual(c.skillScopeKey(active.scope), c.skillScopeKey(codex.scope));
+});
+
+test("Claude Skill 读取迟到时不覆盖另一实例，授权切换后不写入旧目录", async () => {
+  const h = claudeSlashMenuHarness(), c = h.context;
+  const first = c.activeSkillCatalogContext(), a = c.loadSkillChoices(first.scope, first.payload);
+  await new Promise(setImmediate);
+  c.creationInstanceId = "claude:wsl:other"; c.modelsScope = "claude:wsl:other"; c.selectionVersion++;
+  const second = c.activeSkillCatalogContext(), b = c.loadSkillChoices(second.scope, second.payload);
+  await new Promise(setImmediate);
+  h.calls[0].resolve(h.response("old-instance")); await a;
+  assert.equal(c.skillChoices.length, 0);
+  h.calls[1].resolve(h.response("new-instance", "claude:wsl:other")); await b;
+  assert.equal(c.skillChoices[0].name, "new-instance");
+  const pending = c.loadSkillChoices(second.scope, second.payload, { force: true });
+  await new Promise(setImmediate);
+  const writes = h.writes.length;
+  c.session.device.id = "new-device";
+  h.calls[2].resolve(h.response("wrong-owner", "claude:wsl:other")); await pending;
+  assert.equal(h.writes.length, writes);
+  assert.equal(c.skillChoices[0].name, "new-instance");
+});
+
+test("Claude 无项目 Skill 目录刷新保持同一缓存键", async () => {
+  const h = claudeSlashMenuHarness(), c = h.context;
+  h.project.value = "";
+  const active = c.activeSkillCatalogContext();
+  const first = c.loadSkillChoices(active.scope, active.payload);
+  await new Promise(setImmediate);
+  h.calls[0].resolve({ ...h.response("review"), cwd: "" }); await first;
+  const key = c.skillScopeKey(active.scope);
+  const refreshed = c.loadSkillChoices(active.scope, active.payload, { force: true });
+  await new Promise(setImmediate);
+  h.calls[1].resolve({ ...h.response("simplify"), cwd: "" }); await refreshed;
+  assert.equal(c.skillScopeKey(active.scope), key);
+  assert.equal(c.skillCatalogs.size, 1);
+  assert.equal(c.skillChoices[0].name, "simplify");
+});
+
+test("Claude 压缩命令受理后的正常等待保持静默，空闲超过宽限才提示，执行中排队与原生弹窗不提示", () => {
+  // 用户要求压缩没有异常时不显示提示：已受理等待原生开始是正常过渡，只有会话空闲且迟迟不开始才提示。
+  const element = (tag, className = "", text = "") => ({ tag, className, text, children: [],
+    append(...children) { this.children.push(...children); } });
+  let now = 1_000_000, reloads = 0;
+  const compaction = { state: "pending", receiptId: "receipt", acknowledged: true, time: now };
+  const context = vm.createContext({
+    element, button: (text, label, action) => ({ tag: "button", text, click: action }),
+    Date: { now: () => now }, session: { device: { id: "device" } }, selectedId: "claude-fixture", connected: true,
+    isClaude: () => true, isActiveThread: () => context.thread.status.type === "active",
+    compactionLocked: () => true, compactionQueueSendReason: () => "", pendingFeedbackReady: () => true,
+    currentCompaction: () => compaction, recoverCompaction: () => { reloads += 1; },
+    thread: { id: "claude-fixture", backend: "claude", status: { type: "idle" }, requests: [],
+      nativeCommands: [{ name: "compact", state: "pending" }] },
+  });
+  vm.runInContext(sourceSection("const nativeCompactionStartGraceMs", "function renderCompactionBanner(")
+    + sourceSection("function renderCompactionBanner(", "async function applyCompactionReceipt("), context);
+  const render = () => {
+    const root = element("div");
+    context.renderCompactionBanner(root, "claude-fixture", compaction);
+    return root.children;
+  };
+  const grace = vm.runInContext("nativeCompactionStartGraceMs", context);
+  assert.equal(grace, 20000);
+  assert.equal(vm.runInContext(sourceSection("function pendingFeedbackDelay(", "function pendingFeedbackReady(")
+    + '; pendingFeedbackDelay({ action: "nativeCompactionStart" })', context), grace, "延时刷新与提示宽限一致");
+  assert.equal(render().length, 0, "刚受理时静默");
+  now += grace - 1;
+  assert.equal(render().length, 0, "宽限内静默");
+  now += 1;
+  const overdue = render();
+  assert.equal(overdue.length, 1, "空闲且超过宽限仍未开始才提示");
+  assert.match(overdue[0].text, /原生一直没有开始压缩/);
+  overdue[0].children.find(child => child.text === "重新读取").click();
+  assert.equal(reloads, 1);
+
+  // 会话仍在执行本轮时压缩由原生排队，属于正常等待：不计时、不提示；执行结束后重新计时。
+  context.thread.status = { type: "active" };
+  now += 10 * grace;
+  assert.equal(render().length, 0, "执行中排队不提示");
+  context.thread.status = { type: "idle" };
+  assert.equal(render().length, 0, "执行刚结束重新计时");
+  now += grace - 1;
+  assert.equal(render().length, 0);
+  now += 1;
+  assert.equal(render().length, 1);
+
+  // 原生已有待处理弹窗时由弹窗卡片说明，不再叠加压缩提示。
+  context.thread.requests = [{ method: "remote/nativeDialog" }];
+  assert.equal(render().length, 0);
+  context.thread.requests = [];
+
+  // 原生已开始压缩（running）或命令已结束后，不再属于“等待开始”。
+  context.thread.nativeCommands = [{ name: "compact", state: "running" }];
+  assert.equal(context.nativeCompactionStartBaseline("claude-fixture", compaction), null);
+  assert.equal(render().length, 0);
+
+  const composer = sourceSection("function syncPendingFeedbackTimer()", "function updateComposer(");
+  assert.match(composer, /nativeCompactionStartBaseline\(selectedId, compaction\)/);
+  assert.match(composer, /action: "nativeCompactionStart"/);
+});
+
+test("Claude 压缩与发送消息一样触发所选模型切换，选择未变化时不带多余设置", async () => {
+  const calls = [], notices = [];
+  const context = nodeVm.createContext({
+    isClaude: () => true, selectedModel: "", selectedEffort: "", modelChoiceVersion: 0, selectedId: "claude-thread",
+    setSelectedModel: value => (context.selectedModel = value), setSelectedEffort: value => (context.selectedEffort = value),
+    currentThreadDisplay: () => ({ model: "claude-opus-5-5", reasoningEffort: "xhigh" }),
+    modelIdentityMatches: (left, right) => !!left && !!right && left === right,
+    stopping: false, busy: false, pending: null, connected: true, thread: { id: "claude-thread", compaction: {} },
+    threadReadOnly: () => false, compactionLocked: () => false, normalizeCompaction: value => value || {},
+    randomId: () => "receipt-1", session: { device: { id: "device-1" } }, compactions: new Map(),
+    setCompactionState() {}, updateComposer() {}, notice: (message, error) => notices.push([message, error]),
+    applyCompactionReceipt: async () => {},
+    api: async (path, body) => { calls.push([path, body]); return { ok: true }; }
+  });
+  nodeVm.runInContext(sourceSection("function compactionModelChoice(", "function compactionEventMatches("), context);
+  const run = async (state = {}) => {
+    calls.length = 0;
+    Object.assign(context, { selectedModel: "", selectedEffort: "", modelChoiceVersion: 0, isClaude: () => true }, state);
+    await context.compactContext();
+    return calls.at(-1)?.[1];
+  };
+  // 没有本地选择：普通压缩，不带模型，服务端不会因模型目录不可用而阻断。
+  assert.deepEqual({ ...await run() }, { threadId: "claude-thread" });
+  // 选了 haiku：随压缩请求带上模型和深度；送达后清掉本地覆盖值，交给原生设置状态展示。
+  assert.deepEqual({ ...await run({ selectedModel: "claude-haiku-5-5", selectedEffort: "high" }) },
+    { threadId: "claude-thread", model: "claude-haiku-5-5", reasoningEffort: "high" });
+  assert.equal(context.selectedModel, "");
+  assert.equal(context.selectedEffort, "");
+  // 选择与会话当前设置相同：不发切换，也不清除选择。
+  assert.deepEqual({ ...await run({ selectedModel: "claude-opus-5-5", selectedEffort: "xhigh" }) }, { threadId: "claude-thread" });
+  // 只改思考深度。
+  assert.deepEqual({ ...await run({ selectedEffort: "max" }) }, { threadId: "claude-thread", reasoningEffort: "max" });
+  // 换模型时深度一并带上，即使数值恰好与旧模型当前深度相同，避免服务端按“换模型即清空深度”处理。
+  assert.deepEqual({ ...await run({ selectedModel: "claude-haiku-5-5", selectedEffort: "xhigh" }) },
+    { threadId: "claude-thread", model: "claude-haiku-5-5", reasoningEffort: "xhigh" });
+  // 非 Claude 不带模型字段。
+  assert.deepEqual({ ...await run({ selectedModel: "gpt-x", isClaude: () => false }) }, { threadId: "claude-thread" });
+  // 请求期间菜单又做了新选择：迟到回执不能清掉新选择。
+  context.api = async (path, body) => {
+    calls.push([path, body]);
+    context.modelChoiceVersion += 1; context.selectedModel = "claude-sonnet-5-5";
+    return { ok: true };
+  };
+  await run({ selectedModel: "claude-haiku-5-5" });
+  assert.equal(context.selectedModel, "claude-sonnet-5-5");
+  // 服务端拒绝切换：提示原因、不清除选择，压缩状态回到空闲，不会静默按旧模型压缩。
+  context.api = async () => { throw Object.assign(new Error("所选模型未在当前 Claude 的可用模型列表中"), { code: 400 }); };
+  context.compactions.set("claude-thread", { receiptId: "receipt-1", state: "pending" });
+  Object.assign(context, { selectedModel: "claude-haiku-5-5", selectedEffort: "", modelChoiceVersion: 0, isClaude: () => true });
+  await context.compactContext();
+  assert.equal(context.selectedModel, "claude-haiku-5-5");
+  assert.deepEqual(notices.at(-1), ["所选模型未在当前 Claude 的可用模型列表中", true]);
+});

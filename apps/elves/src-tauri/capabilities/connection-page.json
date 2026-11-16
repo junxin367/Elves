@@ -1,0 +1,7 @@
+{
+  "identifier": "connection-page",
+  "description": "仅 Elves 内置启动页可查看本机 Harness 启动状态并重试，不提供远程连接功能。",
+  "local": true,
+  "webviews": ["elves-content"],
+  "permissions": ["remote-connection"]
+}

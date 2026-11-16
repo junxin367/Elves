@@ -6,11 +6,11 @@ on:
     branches: [main]
     tags: ["android-v*"]
     paths:
-      - "apps/codex-elves-android/**"
-      - "!apps/codex-elves-android/**/build/**"
-      - "!apps/codex-elves-android/.gradle/**"
-      - "!apps/codex-elves-android/local.properties"
-      - "assets/remote-access/**"
+      - "apps/elves-android/**"
+      - "!apps/elves-android/**/build/**"
+      - "!apps/elves-android/.gradle/**"
+      - "!apps/elves-android/local.properties"
+      - "assets/harness/**"
       - "scripts/*android*.ps1"
       - "build.ps1"
       - ".github/workflows/android-apk.yml"
@@ -62,8 +62,8 @@ jobs:
       - name: Upload debug APK
         uses: actions/upload-artifact@v6
         with:
-          name: CodexElves-android-debug
-          path: dist/android/CodexElves-*-android-debug.apk
+          name: Elves-android-debug
+          path: dist/android/Elves-*-android-debug.apk
           if-no-files-found: error
 
   release:
@@ -126,7 +126,7 @@ jobs:
             throw "CODEX_ELVES_ANDROID_KEYSTORE_BASE64 不是有效的 Base64 内容。"
           }
           if ($keystoreBytes.Length -eq 0) { throw "签名 keystore 内容为空。" }
-          $keystorePath = Join-Path $env:RUNNER_TEMP "codex-elves-android-signing-$($env:GITHUB_RUN_ID)-$($env:GITHUB_RUN_ATTEMPT).jks"
+          $keystorePath = Join-Path $env:RUNNER_TEMP "elves-android-signing-$($env:GITHUB_RUN_ID)-$($env:GITHUB_RUN_ATTEMPT).jks"
           [System.IO.File]::WriteAllBytes($keystorePath, $keystoreBytes)
           "CODEX_ELVES_ANDROID_KEYSTORE=$keystorePath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Build signed release APK, lint and update manifest
@@ -139,9 +139,9 @@ jobs:
       - name: Upload release APK and update manifest
         uses: actions/upload-artifact@v6
         with:
-          name: CodexElves-android-release
+          name: Elves-android-release
           path: |
-            dist/android/CodexElves-*-android.apk
+            dist/android/Elves-*-android.apk
             dist/android/android-update.json
             dist/android/build-state.json
           if-no-files-found: error
@@ -149,7 +149,7 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          $keystorePath = Join-Path $env:RUNNER_TEMP "codex-elves-android-signing-$($env:GITHUB_RUN_ID)-$($env:GITHUB_RUN_ATTEMPT).jks"
+          $keystorePath = Join-Path $env:RUNNER_TEMP "elves-android-signing-$($env:GITHUB_RUN_ID)-$($env:GITHUB_RUN_ATTEMPT).jks"
           if (Test-Path -LiteralPath $keystorePath -PathType Leaf) {
             Remove-Item -LiteralPath $keystorePath -Force
           }
@@ -170,7 +170,7 @@ jobs:
       - name: Download signed release artifacts
         uses: actions/download-artifact@v6
         with:
-          name: CodexElves-android-release
+          name: Elves-android-release
           path: dist/android
       - name: Validate and publish APK with update manifest
         shell: pwsh

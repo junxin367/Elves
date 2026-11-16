@@ -11,7 +11,7 @@ param(
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "android-build-common.ps1")
 $repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
-$androidProject = Join-Path $repositoryRoot "apps\codex-elves-android"
+$androidProject = Join-Path $repositoryRoot "apps\elves-android"
 $outputDirectory = Join-Path $repositoryRoot "dist\android"
 $gradleVersion = "8.11.1"
 $gradleSha256 = "f397b287023acdba1e9f6fc5ea72d22dd63669d59ed4a289a29b1a76eee151c6"
@@ -32,6 +32,7 @@ $hasSigning = @($signingVariableNames | Where-Object {
 }).Count -eq 0
 if ($releaseRequested -and -not $hasSigning) {
     $signingHelper = if ($env:LOCALAPPDATA) {
+        # 签名材料沿用既有目录，产品更名不得换证书或遗漏正式签名配置。
         Join-Path $env:LOCALAPPDATA "CodexElves/signing/android/Build-Release.ps1"
     } else { "" }
     if (-not $signingHelper -or -not (Test-Path -LiteralPath $signingHelper -PathType Leaf) -or
@@ -166,7 +167,7 @@ New-Item -Path $outputDirectory -ItemType Directory -Force | Out-Null
 $artifacts = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
 if ($Configuration -eq "Debug" -or $Configuration -eq "All") {
     $debugSource = Join-Path $androidProject "app\build\outputs\apk\debug\app-debug.apk"
-    $debugTarget = Join-Path $outputDirectory "CodexElves-$($androidVersion.VersionName)-android-debug.apk"
+    $debugTarget = Join-Path $outputDirectory "Elves-$($androidVersion.VersionName)-android-debug.apk"
     Copy-Item -LiteralPath $debugSource -Destination $debugTarget -Force
     $artifacts.Add((Get-Item -LiteralPath $debugTarget))
 }

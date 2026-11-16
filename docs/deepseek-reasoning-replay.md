@@ -57,14 +57,14 @@
 
 ## 验证结果
 
-- `cargo test -p codex-elves-core --test protocol_proxy -- --test-threads=1`：252 项通过。
+- `cargo test -p elves-core --test protocol_proxy -- --test-threads=1`：252 项通过。
 - 原任务压缩历史真实重放：26 条 assistant、缺失 reasoning 为 0；最终 HTTP 200，收到 `response.completed`。
 - `cargo fmt --check`、`git diff --check`：通过。
-- `.\build.ps1`：退出码 0；生成 `dist/windows/CodexElves-0.4.1-windows-x64-setup.exe`，大小 36,019,420 字节。
+- `.\build.ps1`：退出码 0；生成 `dist/windows/Elves-0.4.1-windows-x64-setup.exe`，大小 36,019,420 字节。
 - launcher、manager、task-board 三个程序的 `target/release` 与 `dist/windows/app` 副本 SHA256 一致。
 
 ## 未闭环项与下一步
 
 - 供应商内部具体丢失位置仍不可见；如需修复供应商自身，需要其请求转换和历史缓存日志。本地补救的正确性不依赖确定具体内部模块。
 - 真实验证使用当前供应商，其 Chat Completions 入口可用；其他供应商若不支持该入口，兼容重试仍会失败并返回实际错误，不会无限重试。
-- 源码和安装包更新不会替换已运行进程；安装并重新启动 CodexElves 后，原任务的后续请求才会使用该恢复逻辑。
+- 源码和安装包更新不会替换已运行进程；安装并重新启动 Elves 后，原任务的后续请求才会使用该恢复逻辑。

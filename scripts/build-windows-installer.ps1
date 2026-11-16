@@ -103,18 +103,18 @@ function Start-CargoCacheCleanup {
 
 $RepoRoot = Resolve-RepoRoot
 $ResolvedVersion = Resolve-WorkspaceVersion -RepoRoot $RepoRoot
-$ManagerDir = Join-Path $RepoRoot "apps\codex-elves-manager"
+$ManagementDir = Join-Path $RepoRoot "apps\elves-management"
 $DistAppDir = Join-Path $RepoRoot "dist\windows\app"
 $InstallerScriptDir = Join-Path $RepoRoot "scripts\installer\windows"
-$InstallerScript = Join-Path $InstallerScriptDir "CodexElves.nsi"
-$InstallerPath = Join-Path $RepoRoot "dist\windows\CodexElves-$ResolvedVersion-windows-x64-setup.exe"
+$InstallerScript = Join-Path $InstallerScriptDir "Elves.nsi"
+$InstallerPath = Join-Path $RepoRoot "dist\windows\Elves-$ResolvedVersion-windows-x64-setup.exe"
 if ($env:CARGO_TARGET_DIR) {
     if ([System.IO.Path]::IsPathRooted($env:CARGO_TARGET_DIR)) {
         $CargoTargetDir = [System.IO.Path]::GetFullPath($env:CARGO_TARGET_DIR)
     }
     else {
         $CargoTargetDir = [System.IO.Path]::GetFullPath(
-            (Join-Path $ManagerDir $env:CARGO_TARGET_DIR)
+            (Join-Path $ManagementDir $env:CARGO_TARGET_DIR)
         )
     }
 }
@@ -147,15 +147,15 @@ $ToolRuntimeVerifier = Join-Path $RepoRoot "scripts\verify-tool-runtime.mjs"
 # 用户要求已修复功能不能因构建基线回退；编译前核对服务协议及压缩恢复，复制前后再核对完整资源。
 Invoke-Checked -FilePath $NodePath -Arguments @($BuildInputVerifier, $RepoRoot, "--source-only") -WorkingDirectory $RepoRoot
 Invoke-Checked -FilePath $NodePath -Arguments @($ToolRuntimeVerifier, $RepoRoot, "--source-only") -WorkingDirectory $RepoRoot
-Invoke-Checked -FilePath $NpmPath -Arguments @("run", "build") -WorkingDirectory $ManagerDir
+Invoke-Checked -FilePath $NpmPath -Arguments @("run", "build") -WorkingDirectory $ManagementDir
 Invoke-Checked -FilePath $NodePath -Arguments @($BuildInputVerifier, $RepoRoot, $ReleaseDir) -WorkingDirectory $RepoRoot
 
 New-Item -ItemType Directory -Path $DistAppDir -Force | Out-Null
 New-Item -ItemType Directory -Path $ReleaseMirrorDir -Force | Out-Null
-$RemoteClientExe = Join-Path $ReleaseDir "codex-elves-remote.exe"
+$ClientExe = Join-Path $ReleaseDir "elves.exe"
 
-# 用户要求安装程序只安装远程客户端；后台与管理功能已内置该 EXE，不再构建或打包独立管理器。
-foreach ($obsoleteName in @("codex-elves.exe", "codex-elves-manager.exe", "codex-elves-task-board.exe")) {
+# 用户要求只安装一个 Elves 程序；后台与管理功能已内置该 EXE，不再构建或打包独立管理器。
+foreach ($obsoleteName in @("codex-elves.exe", "codex-elves-manager.exe", "codex-elves-task-board.exe", "codex-elves-remote.exe", "elves-management.exe")) {
     Remove-Item -LiteralPath (Join-Path $DistAppDir $obsoleteName) -Force -ErrorAction SilentlyContinue
 }
 # 旧版构建目录可能留下分散工具；它们已内嵌客户端，安装输入只保留单个程序。
@@ -168,7 +168,7 @@ if (Test-Path -LiteralPath $obsoleteTools) {
     }
     Remove-Item -LiteralPath $resolvedTools -Recurse -Force
 }
-foreach ($artifact in @($RemoteClientExe)) {
+foreach ($artifact in @($ClientExe)) {
     if (!(Test-Path -LiteralPath $artifact)) {
         throw "Expected release artifact not found: $artifact"
     }
@@ -180,12 +180,12 @@ foreach ($artifact in @($RemoteClientExe)) {
 }
 
 # 单客户端须自带本机后台的工具，安装输入不再附带独立工具程序。
-Invoke-Checked -FilePath $NodePath -Arguments @($ToolRuntimeVerifier, $RepoRoot, "--embedded", $RemoteClientExe) -WorkingDirectory $RepoRoot
-Invoke-Checked -FilePath $NodePath -Arguments @($ToolRuntimeVerifier, $RepoRoot, "--embedded", (Join-Path $DistAppDir "codex-elves-remote.exe")) -WorkingDirectory $RepoRoot
+Invoke-Checked -FilePath $NodePath -Arguments @($ToolRuntimeVerifier, $RepoRoot, "--embedded", $ClientExe) -WorkingDirectory $RepoRoot
+Invoke-Checked -FilePath $NodePath -Arguments @($ToolRuntimeVerifier, $RepoRoot, "--embedded", (Join-Path $DistAppDir "elves.exe")) -WorkingDirectory $RepoRoot
 Invoke-Checked -FilePath $NodePath -Arguments @($BuildInputVerifier, $RepoRoot, $DistAppDir) -WorkingDirectory $RepoRoot
 
 # 校验独立客户端为 x64 GUI 程序，并保留单独交付的便携 EXE；安装包同时嵌入上述同一份客户端。
-& (Join-Path $RepoRoot "scripts\build-windows-remote.ps1") `
+& (Join-Path $RepoRoot "scripts\build-windows-client.ps1") `
     -Version $ResolvedVersion -Profile "release-fast" -SkipBuild -BinaryDirectory $ReleaseDir
 
 Invoke-Checked `

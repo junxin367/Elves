@@ -1,11 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-  "crates/codex-elves-core",
-  "crates/codex-elves-data",
-  "apps/codex-elves-launcher",
-  "apps/codex-elves-manager/src-tauri",
-  "apps/codex-elves-remote/src-tauri",
+  "crates/elves-core",
+  "crates/elves-data",
+  "crates/elves-harness",
+  "apps/elves/src-tauri",
 ]
 
 [workspace.package]
@@ -13,7 +12,7 @@ members = [
 version = "0.8.0"
 edition = "2024"
 license = "MIT"
-# 用户要求 GitHub 仓库迁移至 Elves，crate 和产品产物仍沿用 CodexElves 命名。
+# 用户要求 GitHub 仓库迁移至 Elves，crate 和产品产物仍沿用 Elves 命名。
 repository = "https://github.com/junxin367/Elves"
 
 [workspace.dependencies]

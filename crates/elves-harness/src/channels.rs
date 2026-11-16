@@ -1,0 +1,354 @@
+use super::*;
+use axum::http::Method;
+
+const TICKET_LIFETIME_MS: u64 = 10 * 60 * 1000;
+const JOURNAL_SIZE: usize = 1024;
+
+struct Ticket {
+    device_id: String,
+    expires_at: u64,
+    media_only: bool,
+}
+
+struct Journal {
+    sequence: u64,
+    entries: VecDeque<Value>,
+}
+
+#[derive(Default)]
+struct Configuration {
+    revision: u64,
+    secondary_enabled: bool,
+}
+
+pub(super) struct Channels {
+    pub secondary: Arc<RwLock<Option<String>>>,
+    pub primary: RwLock<Option<String>>,
+    pub(super) epoch: String,
+    journal: std::sync::Mutex<Journal>,
+    tickets: std::sync::Mutex<HashMap<String, Ticket>>,
+    configuration: RwLock<Configuration>,
+}
+
+impl Channels {
+    pub fn new() -> Self {
+        Self {
+            secondary: Arc::new(RwLock::new(None)),
+            primary: RwLock::new(None),
+            epoch: uuid::Uuid::new_v4().to_string(),
+            journal: std::sync::Mutex::new(Journal {
+                sequence: 0,
+                entries: VecDeque::new(),
+            }),
+            tickets: std::sync::Mutex::new(HashMap::new()),
+            configuration: RwLock::new(Configuration::default()),
+        }
+    }
+
+    fn configuration(&self) -> (u64, bool) {
+        let configuration = self.configuration.read().unwrap_or_else(|e| e.into_inner());
+        (configuration.revision, configuration.secondary_enabled)
+    }
+
+    pub fn origins(&self) -> Vec<String> {
+        self.secondary
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    pub fn device_id(&self, headers: &HeaderMap) -> Option<String> {
+        let token = bearer(headers)?;
+        if token.len() != 64 {
+            return None;
+        }
+        self.tickets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&hash(token))
+            .filter(|ticket| {
+                ticket.expires_at > now_ms() && ticket.media_only == media_authorization(headers)
+            })
+            .map(|ticket| ticket.device_id.clone())
+    }
+
+    fn issue(&self, device: &Device, media_only: bool) -> (String, u64) {
+        let token = random_token();
+        let expires_at = (now_ms() + TICKET_LIFETIME_MS).min(device.expires_at_ms);
+        let mut tickets = self.tickets.lock().unwrap_or_else(|e| e.into_inner());
+        tickets.retain(|_, ticket| ticket.expires_at > now_ms());
+        // Bound renewals even when a compromised authorized client polls discovery.
+        if tickets.len() >= MAX_DEVICES * 16 {
+            if let Some(oldest) = tickets
+                .iter()
+                .min_by_key(|(_, ticket)| ticket.expires_at)
+                .map(|(key, _)| key.clone())
+            {
+                tickets.remove(&oldest);
+            }
+        }
+        tickets.insert(
+            hash(&token),
+            Ticket {
+                device_id: device.id.clone(),
+                expires_at,
+                media_only,
+            },
+        );
+        (token, expires_at)
+    }
+}
+
+pub(super) fn bearer(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.strip_prefix("Bearer ")
+                .or_else(|| v.strip_prefix("Media "))
+        })
+        .or_else(|| {
+            headers
+                .get("sec-websocket-protocol")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| {
+                    v.split(',')
+                        .map(str::trim)
+                        .find_map(|v| v.strip_prefix("codex-channel."))
+                })
+        })
+}
+
+pub(super) fn media_authorization(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("Media "))
+}
+
+pub(super) fn read_path(method: &Method, path: &str) -> bool {
+    if media_path(method, path) {
+        return true;
+    }
+    match method {
+        &Method::GET => {
+            matches!(
+                path,
+                "/api/channels"
+                    | "/api/session"
+                    | "/api/settings/shared"
+                    | "/api/settings/conversation-naming"
+                    | "/api/events"
+                    | "/api/events/ws"
+                    | "/api/channel-events"
+            ) || path.starts_with("/api/receipts/")
+        }
+        &Method::POST => {
+            path.starts_with("/api/read/")
+                || matches!(
+                    path,
+                    "/api/workspace/context"
+                        | "/api/workspace/changes"
+                        | "/api/workspace/change"
+                        | "/api/workspace/files"
+                        | "/api/workspace/file"
+                        | "/api/workspace/open-in-targets"
+                        | "/api/settings/environments"
+                )
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn request_path(method: &Method, path: &str) -> bool {
+    read_path(method, path)
+        || method == Method::POST
+            && (matches!(
+                path,
+                "/api/logout"
+                    | "/api/diagnostics"
+                    | "/api/settings/instructions"
+                    // 实例设置包含写操作，只能走提交通道，不能按只读请求自动重试。
+                    | "/api/settings/instance"
+                    | "/api/settings/shared"
+                    // 打开本机浏览器有副作用，不能归入允许自动重试的文件读取。
+                    | "/api/workspace/open-browser"
+                    // 打开工作区同样只提交一次；不能因超时或换线路再次启动应用。
+                    | "/api/workspace/open-in"
+            ) || path.strip_prefix("/api/action/").is_some_and(|action| {
+                !action.is_empty()
+                    && action.len() <= 64
+                    && action.bytes().all(|byte| byte.is_ascii_alphabetic())
+            }))
+}
+
+pub(super) fn media_path(method: &Method, path: &str) -> bool {
+    if !matches!(*method, Method::GET | Method::HEAD) {
+        return false;
+    }
+    let (id, video) = if let Some(path) = path.strip_prefix("/api/images/") {
+        (path.strip_suffix("/thumbnail").unwrap_or(path), false)
+    } else if let Some(path) = path.strip_prefix("/api/videos/") {
+        (path.strip_suffix("/poster").unwrap_or(path), true)
+    } else {
+        return false;
+    };
+    if video {
+        id.len() == 64
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    } else {
+        (20..=128).contains(&id.len())
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    }
+}
+
+pub(super) fn media_token(uri: &Uri) -> Option<String> {
+    let mut url = reqwest::Url::parse("http://localhost").ok()?;
+    url.set_query(uri.query());
+    let tokens = url
+        .query_pairs()
+        .filter(|(key, _)| key == "channel_token")
+        .map(|(_, value)| value.into_owned())
+        .collect::<Vec<_>>();
+    (tokens.len() == 1
+        && tokens[0].len() == 64
+        && tokens[0].bytes().all(|byte| byte.is_ascii_hexdigit()))
+    .then(|| tokens[0].clone())
+}
+
+impl HarnessController {
+    pub(super) fn configure_secondary_channel(&self, enabled: bool) {
+        let revision = {
+            let mut configuration = self
+                .channels
+                .configuration
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            if configuration.secondary_enabled == enabled {
+                return;
+            }
+            configuration.secondary_enabled = enabled;
+            configuration.revision += 1;
+            configuration.revision
+        };
+        self.publish_event(json!({
+            "method":"remote/channelsChanged",
+            "params":{"revision":revision,"secondaryEnabled":enabled}
+        }));
+    }
+
+    pub(super) fn publish_event(&self, mut event: Value) {
+        self.conversation_naming.observe(&event);
+        let mut journal = self
+            .channels
+            .journal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        journal.sequence += 1;
+        event["channelEpoch"] = json!(self.channels.epoch);
+        event["channelSequence"] = json!(journal.sequence);
+        journal.entries.push_back(event.clone());
+        if journal.entries.len() > JOURNAL_SIZE {
+            journal.entries.pop_front();
+        }
+        // Send under the same lock so all subscribers see one canonical order.
+        let _ = self.events.send(event);
+    }
+}
+
+pub(super) async fn discover(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let device = authorized(&state, &headers).await?;
+    let (token, expires_at) = state.controller.channels.issue(&device, false);
+    let (media_token, _) = state.controller.channels.issue(&device, true);
+    let (revision, remote_secondary_enabled) = state.controller.channels.configuration();
+    // Elves 的 SharedWorker 同样只能使用本机 Harness，不能被网页/Android 的公网链路配置切走。
+    let secondary_enabled = remote_secondary_enabled && !state.desktop;
+    let origins = if state.desktop {
+        Vec::new()
+    } else {
+        state
+            .controller
+            .public_origin()
+            .into_iter()
+            .chain(if secondary_enabled {
+                state.controller.channels.origins()
+            } else {
+                Vec::new()
+            })
+            .collect::<Vec<_>>()
+    };
+    state
+        .controller
+        .authorization(device.clone(), None)
+        .check()
+        .await
+        .map_err(authorization_error)?;
+    Ok(Json(
+        json!({"ok":true,"schemaVersion":1,"deviceId":device.id,"serverId":state.controller.channels.epoch,
+        "primaryProvider":state.controller.primary.provider(),"primaryOrigin":if state.desktop {None} else {state.controller.public_origin()},
+        "origins":origins,"token":token,"mediaToken":media_token,"expiresAtMs":expires_at,"sendActions":["send","create","setGoal"],"requestRoutingVersion":2,
+        "revision":revision,"secondaryEnabled":secondary_enabled}),
+    ))
+}
+
+pub(super) fn replay(controller: &HarnessController, uri: &Uri) -> Value {
+    let mut url = reqwest::Url::parse("http://localhost").expect("static URL");
+    url.set_query(uri.query());
+    let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
+    let epoch = query.get("epoch").map(String::as_str).unwrap_or("");
+    let after = query.get("after").and_then(|v| v.parse::<u64>().ok());
+    let journal = controller
+        .channels
+        .journal
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let reset = epoch != controller.channels.epoch
+        || after.is_none_or(|after| {
+            after > journal.sequence
+                || journal
+                    .entries
+                    .front()
+                    .is_some_and(|entry| after + 1 < entry["channelSequence"].as_u64().unwrap_or(0))
+        });
+    let entries: Vec<_> = if reset {
+        Vec::new()
+    } else {
+        journal
+            .entries
+            .iter()
+            .filter(|entry| entry["channelSequence"].as_u64().unwrap_or(0) > after.unwrap())
+            .cloned()
+            .collect()
+    };
+    json!({"method":"remote/streamReady","channelEpoch":controller.channels.epoch,
+        "cursor":if reset { journal.sequence } else { after.unwrap() },"reset":reset,
+        "events":entries,"latest":journal.sequence})
+}
+
+pub(super) async fn catch_up(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<Json<Value>, ApiError> {
+    let device = authorized(&state, &headers).await?;
+    let value = state
+        .controller
+        .replay_for_device(&device.id, replay(&state.controller, &uri))
+        .await;
+    state
+        .controller
+        .authorization(device, None)
+        .check()
+        .await
+        .map_err(authorization_error)?;
+    Ok(Json(value))
+}

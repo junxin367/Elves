@@ -3,7 +3,7 @@ Set-StrictMode -Version Latest
 function Get-AndroidVersion {
     param([Parameter(Mandatory)][string]$RepositoryRoot)
 
-    $versionPath = Join-Path $RepositoryRoot "apps/codex-elves-android/version.properties"
+    $versionPath = Join-Path $RepositoryRoot "apps/elves-android/version.properties"
     $values = @{}
     foreach ($line in Get-Content -LiteralPath $versionPath -Encoding utf8 -ErrorAction Stop) {
         if ($line -match '^\s*(?:#.*)?$') { continue }
@@ -31,7 +31,7 @@ function Get-AndroidVersion {
         VersionCode = $versionCode
         ApplicationId = "com.junxin367.codexelves"
         MinSdk = 26
-        ApkName = "CodexElves-$($values.versionName)-android.apk"
+        ApkName = "Elves-$($values.versionName)-android.apk"
         Tag = "android-v$($values.versionName)"
     }
 }
@@ -42,7 +42,7 @@ function Get-AndroidBuildInputs {
     $root = [System.IO.Path]::GetFullPath($RepositoryRoot)
     $files = [System.Collections.Generic.List[string]]::new()
     $excludedDirectories = @("build", ".gradle", ".idea", ".git", "node_modules", ".pnpm", "target", "dist", "temp", "test-results", "toolchains")
-    foreach ($relativeDirectory in @("apps/codex-elves-android", "assets/remote-access")) {
+    foreach ($relativeDirectory in @("apps/elves-android", "assets/harness")) {
         $directory = Join-Path $root $relativeDirectory
         if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
             throw "Android 构建输入目录不存在：$relativeDirectory"

@@ -1,0 +1,8 @@
+{
+  "identifier": "content-appearance",
+  "description": "远程内容可同步配色与未读角标、管理公开网页缓存、打开同来源窗口及接收用户选取/粘贴的本机附件，原生逐次复核来源。",
+  "local": true,
+  "remote": {"urls": ["http://*:*/*", "https://*:*/*"]},
+  "webviews": ["elves-content", "elves-content-session-*"],
+  "permissions": ["remote-appearance", "remote-resource-cache", "remote-session-window", "remote-taskbar-badge", "remote-local-inputs"]
+}

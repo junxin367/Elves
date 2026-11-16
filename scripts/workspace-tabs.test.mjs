@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
 
-const source = await readFile(new URL("../assets/remote-access/session-tools.js", import.meta.url), "utf8");
+const source = await readFile(new URL("../assets/harness/session-tools.js", import.meta.url), "utf8");
 const wrapper = source.slice(source.indexOf("export function mountSessionTools("),
   source.indexOf("function mountSessionToolPages(")).replace(/^export /gm, "");
 

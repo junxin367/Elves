@@ -4,69 +4,39 @@ import { readFile } from "node:fs/promises";
 import vm from "node:vm";
 import { setImmediate as nextTurn } from "node:timers/promises";
 
-const client = await readFile(new URL("../apps/codex-elves-remote/web/app.js", import.meta.url), "utf8");
-const pwa = await readFile(new URL("../assets/remote-access/pwa.js", import.meta.url), "utf8");
+const client = await readFile(new URL("../apps/elves/web/app.js", import.meta.url), "utf8");
+const pwa = await readFile(new URL("../assets/harness/pwa.js", import.meta.url), "utf8");
 
-function connectionPage() {
-  const calls = [], nodes = new Map();
-  for (const id of ["connection-form", "server-url", "connect", "status", "version"]) {
-    const classes = new Set();
-    nodes.set(`#${id}`, {
-      value: "", textContent: "", disabled: true, events: {}, focused: false, selected: false,
-      addEventListener(name, callback) { this.events[name] = callback; },
-      focus() { this.focused = true; }, select() { this.selected = true; },
-      classList: {
-        add: name => classes.add(name), remove: name => classes.delete(name),
-        toggle: (name, active) => active ? classes.add(name) : classes.delete(name),
-        contains: name => classes.has(name),
-      },
-    });
+function startupPage() {
+  const calls=[],nodes=new Map(),timers=[];
+  for(const id of ["retry","status","version"]) {
+    const classes=new Set();nodes.set(`#${id}`,{textContent:"",hidden:false,disabled:false,events:{},addEventListener(name,callback){this.events[name]=callback;},classList:{add:name=>classes.add(name),toggle:(name,on)=>on?classes.add(name):classes.delete(name),contains:name=>classes.has(name)}});
   }
-  let resolveSettings;
-  const settings = new Promise(resolve => { resolveSettings = resolve; });
-  const context = vm.createContext({
-    document: { querySelector: selector => nodes.get(selector) },
-    window: { __TAURI__: { core: { invoke: (command, payload) => {
-      if (command === "remote_client_state") return settings;
-      calls.push({ command, payload }); return Promise.resolve();
-    } } } },
-  });
-  const ready = vm.runInContext(`(async () => { ${client}\n })()`, context);
-  return {
-    nodes, calls,
-    async load(values) { resolveSettings({ version: "0.7.0", error: null, autoConnect: false, ...values }); await ready; await nextTurn(); },
-    input(value) { nodes.get("#server-url").value = value; nodes.get("#server-url").events.input(); },
-  };
+  let resolveState;const pending=new Promise(resolve=>resolveState=resolve);
+  const context=vm.createContext({document:{querySelector:selector=>nodes.get(selector)},setInterval:callback=>timers.push(callback),clearInterval(){},window:{addEventListener(){},__TAURI__:{core:{invoke:(command,payload)=>{calls.push({command,payload});return command==="client_startup_state"?pending:Promise.resolve();}}}}});
+  vm.runInContext(client,context);
+  return {nodes,calls,timers,async load(value){resolveState({version:"0.8.0",starting:false,error:null,...value});await nextTurn();}};
 }
-
-test("首次发现本机服务只预填，已有成功连接则自动打开", async () => {
-  const detected = connectionPage();
-  await detected.load({ serverUrl: "http://127.0.0.1:49123/", detected: true });
-  assert.equal(detected.nodes.get("#server-url").value, "http://127.0.0.1:49123/");
-  assert.match(detected.nodes.get("#status").textContent, /已发现本机/);
-  assert.equal(detected.calls.length, 0);
-  const saved = connectionPage();
-  await saved.load({ serverUrl: "https://remote.example/", autoConnect: true });
-  assert.equal(saved.calls.length, 1);
-  assert.equal(saved.calls[0].command, "connect_remote");
-  assert.equal(saved.calls[0].payload.serverUrl, "https://remote.example/");
+test("Elves 启动页不读取旧远程地址，也不要求连接或访问密钥",async()=>{
+  const page=startupPage();await page.load({serverUrl:"https://old.example/",autoConnect:true});
+  assert.deepEqual(page.calls.map(call=>call.command),["client_startup_state"]);
+  assert.equal(page.nodes.get("#retry").hidden,true);
+  const html=await readFile(new URL("../apps/elves/web/index.html",import.meta.url),"utf8");
+  assert.doesNotMatch(html,/server-url|connection-form|access-key/);
 });
-
-test("服务探测迟到时不覆盖手动地址，也不自动连接旧地址", async () => {
-  const page = connectionPage();
-  page.input("http://127.0.0.1:49200/");
-  await page.load({ serverUrl: "https://previous.example/", autoConnect: true, detected: true });
-  assert.equal(page.nodes.get("#server-url").value, "http://127.0.0.1:49200/");
-  assert.equal(page.calls.length, 0);
+test("远程会话关闭不阻挡 Elves 打开本机 Harness",async()=>{
+  const page=startupPage();await page.load({remoteAccessEnabled:false,starting:true});
+  assert.match(page.nodes.get("#status").textContent,/Elves 工作区/);
+  assert.equal(page.nodes.get("#retry").hidden,true);
+  assert.ok(page.calls.every(call=>call.command!=="connect_remote"));
 });
-
-test("上次连接失败仍停留在可编辑地址页，不因自动恢复再次陷入错误页", async () => {
-  const page = connectionPage();
-  await page.load({ serverUrl: "https://bad.example.invalid/", autoConnect: true, error: "无法连接此服务" });
-  assert.equal(page.calls.length, 0);
-  assert.equal(page.nodes.get("#server-url").selected, true);
-  assert.equal(page.nodes.get("#connect").disabled, false);
-  assert.equal(page.nodes.get("#status").classList.contains("error"), true);
+test("本机初始化失败只显示具体原因和重试，不自动重复启动",async()=>{
+  const page=startupPage();await page.load({error:"Harness 端口被占用"});
+  assert.equal(page.nodes.get("#status").textContent,"Harness 端口被占用");
+  assert.equal(page.nodes.get("#retry").hidden,false);
+  assert.equal(page.calls.filter(call=>call.command==="client_retry_startup").length,0);
+  await page.nodes.get("#retry").events.click();
+  assert.equal(page.calls.filter(call=>call.command==="client_retry_startup").length,1);
 });
 
 test("Windows 普通 HTTP 使用原生资源缓存，并在前台请求结束后恢复后台检查", async () => {
@@ -82,7 +52,7 @@ test("Windows 普通 HTTP 使用原生资源缓存，并在前台请求结束后
     __TAURI__: { core: { invoke: (command, payload) => {
       calls.push({ command, payload });
       return Promise.resolve({
-        status: command === "remote_cache_refresh" ? "waiting" : "ready",
+        status: command === "client_cache_refresh" ? "waiting" : "ready",
         version: "a".repeat(64), message: "客户端网页资源已缓存",
       });
     } } },
@@ -100,9 +70,9 @@ test("Windows 普通 HTTP 使用原生资源缓存，并在前台请求结束后
   assert.equal(context.getPwaCacheState().status, "ready");
   windowEvents.get("codex-elves-app-ready")();
   await nextTurn();
-  assert.equal(calls[0].command, "remote_cache_status");
+  assert.equal(calls[0].command, "client_cache_status");
   const release = context.beginPwaForegroundWork();
-  assert.equal(calls.at(-1).command, "remote_cache_activity");
+  assert.equal(calls.at(-1).command, "client_cache_activity");
   assert.equal(calls.at(-1).payload.busy, true);
   release();
   now += 2100;
@@ -110,5 +80,5 @@ test("Windows 普通 HTTP 使用原生资源缓存，并在前台请求结束后
   assert.equal(calls.at(-1).payload.busy, false);
   await context.retryPwaCache();
   assert.equal(context.getPwaCacheState().status, "waiting");
-  assert.ok(calls.some(call => call.command === "remote_cache_refresh"));
+  assert.ok(calls.some(call => call.command === "client_cache_refresh"));
 });

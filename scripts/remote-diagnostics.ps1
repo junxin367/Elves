@@ -8,24 +8,24 @@ param(
     [string]$OutputPath = ""
 )
 $ErrorActionPreference = "Stop"
-$stateDirectory = Join-Path ([Environment]::GetFolderPath("UserProfile")) ".codex-session-delete"
-$endpointPath = Join-Path $stateDirectory "remote-access-service.json"
-if ($Action -notin @("List", "Execution") -and [string]::IsNullOrWhiteSpace($DeviceId)) {
+$stateDirectory = if ($env:ELVES_STATE_DIR) { $env:ELVES_STATE_DIR } else { Join-Path ([Environment]::GetFolderPath("UserProfile")) ".codex-session-delete" }
+$endpointPath = Join-Path $stateDirectory "harness-service.json"
+if ($Action -notin @("List", "Audit") -and [string]::IsNullOrWhiteSpace($DeviceId)) {
     throw "请先用 -Action List 查看设备，再指定 -DeviceId。"
 }
 function Invoke-DiagnosticsCommand([hashtable]$Payload) {
     $endpoint = Get-Content -Raw -LiteralPath $endpointPath | ConvertFrom-Json
     if ($endpoint.protocolVersion -lt 2 -or $endpoint.port -lt 1 -or $endpoint.port -gt 65535 -or
         $endpoint.token -notmatch "^[a-f0-9]{64}$") {
-        throw "本机远程后台状态无效。"
+        throw "本机 Harness 后台状态无效。"
     }
     if ($Payload.mode -eq "audit" -and $endpoint.protocolVersion -lt 6) {
-        throw "服务审计诊断需要管理协议 6，请先更新并重新启动远程访问后台。"
+        throw "服务审计诊断需要管理协议 6，请先更新并重新启动 Elves。"
     }
     $result = Invoke-RestMethod -Uri "http://127.0.0.1:$($endpoint.port)/admin/diagnostics" `
         -Method Post -ContentType "application/json" -Headers @{ Authorization = "Bearer $($endpoint.token)" } `
         -Body ($Payload | ConvertTo-Json -Compress) -TimeoutSec 15
-    if ($result.status -ne "ok") { throw "本机远程后台未确认诊断操作。" }
+    if ($result.status -ne "ok") { throw "本机 Harness 后台未确认诊断操作。" }
     return $result
 }
 function Save-DiagnosticsReport($Report) {

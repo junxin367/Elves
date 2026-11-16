@@ -84,7 +84,7 @@ try {
     }
     if ($null -eq $currentRelease) {
         & gh release create $Tag --repo $Repository --verify-tag --draft --title "Android $($version.VersionName)" `
-            --notes "CodexElves Android $($version.VersionName)，请下载正式 APK 安装或在应用中检查更新。" --latest=false
+            --notes "Elves Android $($version.VersionName)，请下载正式 APK 安装或在应用中检查更新。" --latest=false
         if ($LASTEXITCODE -ne 0) { throw "创建 Android Release 草稿失败。" }
     }
     $apkPath = Join-Path $RepositoryRoot "dist/android/$($manifest.apk.name)"

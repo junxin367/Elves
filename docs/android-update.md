@@ -1,12 +1,12 @@
 # Android 版本与应用更新
 
-Android 使用独立的 `apps/codex-elves-android/version.properties`。当前为 `versionName=0.1.1`、`versionCode=25`；桌面管理器版本来自根 `Cargo.toml`。普通编译不递增 Android 版本。准备正式 Android 发布时，按发布规则将 `versionName` 修订号加 1，并使 `versionCode` 大于当前值和已公开 Android 版本中的最大值。
+Android 使用独立的 `apps/elves-android/version.properties`。当前为 `versionName=0.1.1`、`versionCode=25`；桌面管理器版本来自根 `Cargo.toml`。普通编译不递增 Android 版本。准备正式 Android 发布时，按发布规则将 `versionName` 修订号加 1，并使 `versionCode` 大于当前值和已公开 Android 版本中的最大值。
 
 ## 设置页与原生桥
 
 Android 设置弹窗显示 APK 内的版本号。版本值取自当前已安装 APK 的 `BuildConfig`，网页资源版本和桌面版本都不能替代它。普通浏览器和 PWA 不显示 Android 版本。
 
-网页通过当前受信任来源的 `CodexElvesAndroid` 桥发送：
+网页通过当前受信任来源的 `ElvesAndroid` 桥发送：
 
 ```json
 {"type":"app-info"}
@@ -34,7 +34,7 @@ Debug APK 的 `updateSupported` 为 `false`。旧 APK 没有回复时，网页�
 
 每个 Android Release 必须包含：
 
-- `CodexElves-<versionName>-android.apk`
+- `Elves-<versionName>-android.apk`
 - `android-update.json`
 
 清单字段如下。APK 大小和 SHA-256 必须从最终签名 APK 计算；以下当前版本值只用于说明字段，示例摘要不可用于发布。
@@ -47,7 +47,7 @@ Debug APK 的 `updateSupported` 为 `false`。旧 APK 没有回复时，网页�
   "versionCode": 25,
   "minSdk": 26,
   "apk": {
-    "name": "CodexElves-0.1.1-android.apk",
+    "name": "Elves-0.1.1-android.apk",
     "size": 1024,
     "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
   }

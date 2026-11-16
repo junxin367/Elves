@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 
-source = Path(__file__).resolve().parents[1] / "crates/codex-elves-core/src/remote_access/claude_shared.py"
+source = Path(__file__).resolve().parents[1] / "crates/elves-harness/src/claude_shared.py"
 namespace = {"__name__": "claude_shared_history_test"}
 exec(compile(source.read_text(encoding="utf-8"), str(source), "exec"), namespace)
 NativeSession = namespace["NativeSession"]
@@ -960,7 +960,7 @@ class SharedQueueHistoryTests(unittest.TestCase):
         output = io.StringIO()
         with patch.dict(namespace, {"NativeSession": lambda *args: native}), \
                 patch.object(namespace["argparse"].ArgumentParser, "parse_args",
-                             return_value=SimpleNamespace(cli="unused", native_id="", job_id="", discover=False, cleanup=False)), \
+                             return_value=SimpleNamespace(cli="unused", native_id="", job_id="", discover=False, cleanup=False, autocompact=None)), \
                 patch.object(namespace["queue"], "Queue", return_value=incoming), \
                 patch.object(namespace["threading"], "Thread"), contextlib.redirect_stdout(output):
             namespace["main"]()

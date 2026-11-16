@@ -1,0 +1,36 @@
+{
+  "name": "elves-management",
+  "version": "0.8.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 1420",
+    "build": "npm run check:harness && npm run vite:build && cargo build --profile release-fast -p elves --bin elves",
+    "check": "npm run check:harness && tsc --noEmit -p tsconfig.json",
+    "check:harness": "node ../../scripts/check-harness-assets.mjs",
+    "vite:dev": "vite --host 127.0.0.1 --port 1420",
+    "vite:build": "vite build"
+  },
+  "dependencies": {
+    "@dnd-kit/core": "^6.3.1",
+    "@dnd-kit/sortable": "^10.0.0",
+    "@dnd-kit/utilities": "^3.2.2",
+    "@radix-ui/react-slot": "^1.1.2",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.468.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "tailwind-merge": "^2.5.5",
+    "typescript": "^5.8.0",
+    "vite": "^6.0.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.0.0",
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "tailwindcss": "^4.0.0"
+  }
+}

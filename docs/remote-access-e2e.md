@@ -21,7 +21,7 @@
 - 永久删除与不可恢复的侧边关闭保留动作当时的人类批准门禁。普通授权、初始消息、恒定 `true` 均不替代具体对象预览后的批准。
 - 不自动删除真实测试会话或项目。报告保留遗留对象。只读检查不触发构建、安装、发布、提交或推送。
 
-默认输出为仓库 `temp/remote-access-e2e/<runId>/`。CUA 运行目录可能不同，实际调用传入仓库内绝对 `outputDir`。输出含可见会话内容和本机路径，仅保留在本机，不提交。URL 中名称含 key/token/auth/secret/password 的凭据参数会遮蔽。
+默认输出为仓库 `temp/harness-e2e/<runId>/`。CUA 运行目录可能不同，实际调用传入仓库内绝对 `outputDir`。输出含可见会话内容和本机路径，仅保留在本机，不提交。URL 中名称含 key/token/auth/secret/password 的凭据参数会遮蔽。
 
 ## 覆盖矩阵
 
@@ -204,11 +204,11 @@ runner 会执行固定步骤、保存远程页观察并读取 rawFacts 自行断
 
 租约获取必须用原始 JSON 同时确认 leaseKey、leaseOwnerRunId、instanceId、scopeKind、processId、workspace、servicePort，以及适用的 nativeProcessId/tabId；不能只检查调用方输入。所有后续环境步骤绑定同一份租约。获取前登记恢复责任，驱动先保存 originalState；故障 perform 已执行而证据/截图失败时，仍逐资源尝试恢复，并核对实际 currentState 等于原状态。某个恢复失败不跳过其他恢复；CLI 原来关闭则保持关闭。资源恢复调用也转为按租约恢复资源，不会无条件启用服务。
 
-`scripts/remote-access-e2e-environment.mjs` 的本机控制流测试覆盖“真实状态先改变、随后取证失败”“首项恢复失败”“租约获取取证失败”“原服务关闭”“保护用户服务”“tab 越界”和“进程结束后的冷恢复”。这些辅助 mock 测试验证恢复调度，不算真实故障 E2E。
+`scripts/harness-e2e-environment.mjs` 的本机控制流测试覆盖“真实状态先改变、随后取证失败”“首项恢复失败”“租约获取取证失败”“原服务关闭”“保护用户服务”“tab 越界”和“进程结束后的冷恢复”。这些辅助 mock 测试验证恢复调度，不算真实故障 E2E。
 
 ### 已提供的问答回执浏览器自动化驱动
 
-`scripts/remote-access-e2e-receipt-driver.mjs` 提供 `createQuestionReceiptRecoveryDriver`。调用方传入已经明确绑定的浏览器标签页及其网络自动化句柄、输出目录、`authorized-tab` scope、真实 `readClientMetadata` 和新标签创建记录；该驱动只用于浏览器网络取证，不属于远程 Codex 执行路径。驱动不发现浏览器、不读取登录密钥、不代替 UI 发送业务请求。创建记录必须保留实际 tab ID、runId、创建时间、初始 URL，以及没有既有 Fetch 拦截的明确所有权。
+`scripts/harness-e2e-receipt-driver.mjs` 提供 `createQuestionReceiptRecoveryDriver`。调用方传入已经明确绑定的浏览器标签页及其网络自动化句柄、输出目录、`authorized-tab` scope、真实 `readClientMetadata` 和新标签创建记录；该驱动只用于浏览器网络取证，不属于远程 Codex 执行路径。驱动不发现浏览器、不读取登录密钥、不代替 UI 发送业务请求。创建记录必须保留实际 tab ID、runId、创建时间、初始 URL，以及没有既有 Fetch 拦截的明确所有权。
 
 ```js
 const environment = createQuestionReceiptRecoveryDriver({
@@ -323,7 +323,7 @@ const resumed = await remoteE2E.createRemoteAccessE2EContext({
 每个案例均保存 passed/failed/blocked/not_run、执行尝试、耗时、实际 URL/身份、DOM、原始截图、阶段 request 与原始回执引用。截图按字节识别 PNG/JPEG/WebP，保留原始格式和对应后缀；不能假定浏览器工具总返回 PNG。证据模块不依赖宿主全局 `process` 或 `Buffer`；绝对路径直接使用，相对路径优先按调用方 `baseDir` 解析，未传时使用仓库根目录。未选的必测仍为 not_run，任一缺项都不能 overall=passed。离线验收：
 
 ```powershell
-node scripts/remote-access-e2e.mjs --verify-report temp/remote-access-e2e/<runId>/report.json
+node scripts/harness-e2e.mjs --verify-report temp/harness-e2e/<runId>/report.json
 ```
 
 只有 73 项均通过、全部固定驱动步骤/语义/文件哈希有效、无 unknown 操作且源码指纹仍匹配才返回 0。没有文件、文件被改、旧代码指纹、只写 passed 或仅有布尔 verified 都返回 1；该门禁通过仍不代表 73 条业务基线的全部分支已经完成。
@@ -331,16 +331,16 @@ node scripts/remote-access-e2e.mjs --verify-report temp/remote-access-e2e/<runId
 ## 可重复的源码回归命令
 
 ```powershell
-node --check scripts/remote-access-e2e.mjs
-node --check scripts/remote-access-e2e-evidence.mjs
-node --check scripts/remote-access-e2e-environment.mjs
-node --check scripts/remote-access-e2e-receipt-driver.mjs
-node --test scripts/remote-access-e2e-evidence.test.mjs
-node --test scripts/remote-access-e2e-environment.test.mjs
-node --test scripts/remote-access-e2e-receipt-driver.test.mjs
-node --test scripts/remote-access-ui-state.test.mjs
+node --check scripts/harness-e2e.mjs
+node --check scripts/harness-e2e-evidence.mjs
+node --check scripts/harness-e2e-environment.mjs
+node --check scripts/harness-e2e-receipt-driver.mjs
+node --test scripts/harness-e2e-evidence.test.mjs
+node --test scripts/harness-e2e-environment.test.mjs
+node --test scripts/harness-e2e-receipt-driver.test.mjs
+node --test scripts/harness-ui-state.test.mjs
 cargo test --workspace -- --skip remote_access::tests::
-cargo test -p codex-elves-core --lib remote_access::tests:: -- --test-threads=1
+cargo test -p elves-core --lib remote_access::tests:: -- --test-threads=1
 git diff --check
 ```
 
