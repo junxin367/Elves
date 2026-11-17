@@ -94,6 +94,9 @@ pub(super) struct Deletion {
     pub request_id: Option<String>,
     #[serde(default)]
     pub cleanup_pending: bool,
+    // 原生客户端创建的持久侧边也要保留父关联；结果未知后退出列表仍须保护父会话删除。
+    #[serde(default)]
+    pub attached_to_thread_id: Option<String>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -325,6 +328,7 @@ mod tests {
                             device_id: "device".into(),
                             request_id: Some(format!("delete-{state}")),
                             cleanup_pending: false,
+                            attached_to_thread_id: Some("parent".into()),
                         },
                     );
                 }
@@ -333,6 +337,7 @@ mod tests {
             .unwrap();
         let reopened = Store::open(directory.path()).unwrap();
         assert_eq!(reopened.data.deletions["pending"].state, "unknown");
+        assert_eq!(reopened.data.deletions["pending"].attached_to_thread_id.as_deref(), Some("parent"));
         assert_eq!(
             reopened.data.deletions["pending"].request_id.as_deref(),
             Some("delete-pending")

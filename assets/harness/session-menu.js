@@ -28,6 +28,8 @@ function menuResponse(value, threadId) {
       || value.subagentsComplete != null && typeof value.subagentsComplete !== "boolean"
       || value.subagentsLoading != null && typeof value.subagentsLoading !== "boolean"
       || value.subagentsError != null && typeof value.subagentsError !== "string"
+      || value.sideThreadsComplete != null && typeof value.sideThreadsComplete !== "boolean"
+      || value.sideThreadsError != null && typeof value.sideThreadsError !== "string"
       || !Number.isInteger(value.completedSubagentCount) || value.completedSubagentCount < 0) {
     throw new Error("会话菜单数据格式无效，请重试。");
   }
@@ -144,11 +146,19 @@ export function mountSessionMenu({
         { version: 3, ...entry.snapshot,
           data: { ...data, subagents: data.subagents.filter(item => item.ephemeral === false),
             completedSubagents, completedSubagentCount: completedSubagents.length, sideThreads: [],
-            subagentsComplete: false, subagentsLoading: false, subagentsError: null, subagentsStale: true } })).catch(() => {});
+            subagentsComplete: false, subagentsLoading: false, subagentsError: null, subagentsStale: true,
+            sideThreadsComplete: false, sideThreadsError: null } })).catch(() => {});
     } catch {}
   }
   function applySnapshot(entry, snapshot, persist = false) {
     const previous = entry.snapshot;
+    if (snapshot.data.sideThreadsComplete === false && previous) {
+      // 读取失败时保留上次明确为持久的侧边行；成功的完整列表才可移除，不让失败快照清空标签关系。
+      const current = new Set(snapshot.data.sideThreads.map(item => item.id));
+      snapshot = { ...snapshot, data: { ...snapshot.data,
+        sideThreads: [...snapshot.data.sideThreads,
+          ...previous.data.sideThreads.filter(item => item.ephemeral === false && !current.has(item.id))] } };
+    }
     if (snapshot.data.subagentsError && previous
         && !snapshot.data.subagents.length && !snapshot.data.completedSubagentCount) {
       snapshot = { ...snapshot, data: { ...snapshot.data,
@@ -455,6 +465,12 @@ export function mountSessionMenu({
         button.append(unread);
       }
       button.dataset.menuKey = `side:${item.id}`; sides.append(button);
+    }
+    if (context?.sideThreadsEnabled !== false && data?.sideThreadsComplete === false) {
+      const status = element("p", "session-related-menu-status", data.sideThreadsError
+        ? `持久侧边读取不完整，保留已知记录：${data.sideThreadsError}`
+        : "持久侧边列表尚未完整，请重新读取。");
+      status.setAttribute("role", "status"); sides.append(status);
     }
     let status = message;
     // 用户要求新建会话时不显示选会话提示；已有会话仍保留授权异常说明。

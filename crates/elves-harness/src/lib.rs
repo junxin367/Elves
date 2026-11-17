@@ -6646,9 +6646,12 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
    result={data:nativePins.missingSection?[]:[{id:pinnedSection,name:'已改名的置顶分区'}],nextCursor:null};break;
  case 'thread/list':
    if(p.attachedToThreadId){
+     if(Object.hasOwn(sidePolicy,'attachedResponse')){result=sidePolicy.attachedResponse;break;}
      const rows=[...threads.values(),...related.rows];
-     result={data:rows.filter(row=>!row.ephemeral&&!!row.archived===!!p.archived
-       &&(row.attachedToThreadId===p.attachedToThreadId||sidePolicy.attachedUnrelated)),nextCursor:null};
+     const data=rows.filter(row=>!row.ephemeral&&!!row.archived===!!p.archived
+       &&(row.attachedToThreadId===p.attachedToThreadId||sidePolicy.attachedUnrelated));
+     const start=Number(p.cursor||0),end=start+(sidePolicy.attachedPageSize||100);
+     result={data:data.slice(start,end),nextCursor:sidePolicy.attachedCursorLoop?'1':end<data.length?String(end):null};
    }else if(p.ancestorThreadId){
      if(related.listFailure){output({id:q.id,error:{code:-32000,message:'related lookup failed'}});return;}
      const all=new Map([...threads.values(),...related.rows].map(row=>[row.id,row]));
@@ -6708,6 +6711,9 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
  }
  case 'thread/inject_items':{
    if(!t){output({id:q.id,error:{code:-32600,message:'unknown thread'}});return;}
+   if(sidePolicy.boundaryDelayMs){
+     setTimeout(()=>{modelContexts.get(p.threadId)?.items.push(...p.items);output({id:q.id,result:{}});},sidePolicy.boundaryDelayMs);return;
+   }
    if(!sidePolicy.boundaryError||sidePolicy.acceptBoundaryBeforeError)modelContexts.get(p.threadId).items.push(...p.items);
    if(sidePolicy.boundaryError){output({id:q.id,error:{code:sidePolicy.boundaryError,message:'side boundary fixture failure'}});return;}
    break;
@@ -6718,6 +6724,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
    if(t.ephemeral){threads.delete(p.threadId);modelContexts.delete(p.threadId);}else t.status={type:'notLoaded'};
    event('thread/closed',{threadId:p.threadId});result={status:'unsubscribed'};break;
  case 'thread/read': if(!t){output({id:q.id,error:{code:-32600,message:'unknown thread'}});return;}
+   if(sidePolicy.readFailures?.includes(p.threadId)){output({id:q.id,error:{code:-32000,message:'isolated side read failure'}});return;}
    if(fastPolicy.finishCompactionRead){
      const count=(boundaryReads.get(p.threadId)||0)+1;boundaryReads.set(p.threadId,count);
      if(count===2){const snapshot=structuredClone(t);finish(p.threadId);
@@ -6727,7 +6734,8 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
    if(t.ephemeral&&p.includeTurns&&related.snapshotError){output({id:q.id,error:related.snapshotError});return;}
    const sectionId=nativePins?.ids.includes(p.threadId)?pinnedSection:nativePins?.sections?.[p.threadId];
    const readThread=related.rows.includes(t)?{...t,turns:p.includeTurns?t.turns||[]:[]}:t;
-   result={thread:nativePins?{...readThread,section:sectionId?{id:sectionId,name:'Section'}:null}:readThread,
+   result={thread:nativePins?{...readThread,section:sectionId?{id:sectionId,name:'Section'}:null}
+     :{...readThread,...sidePolicy.readOverrides?.[p.threadId]},
      readState:{firstUnread:null,revision:'r1'}};break;
  case 'thread/resume':
    if(t?.name==='external-writer'){output({id:q.id,error:{code:-32600,message:`thread ${p.threadId} already has an active writer`}});return;}
@@ -11179,6 +11187,206 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
             );
             controller.harness.release().await;
         }
+    }
+
+    #[tokio::test]
+    async fn harness_service_side_boundary_initialization_holds_child_lock() {
+        let (directory, authorization) = harness_fixture().await;
+        let controller = &authorization.controller;
+        let parent = controller.call_authorized("create", json!({"projectId":"project-a","prompt":"父上下文"}),
+            &authorization).await.unwrap()["threadId"].as_str().unwrap().to_owned();
+        std::fs::write(directory.path().join("remote-instance-preferences.json"),
+            r#"{"instances":{"codex:local":{"persistentSideThreads":true}}}"#).unwrap();
+        std::fs::write(directory.path().join("side-policy.json"), r#"{"boundaryDelayMs":500}"#).unwrap();
+        let create_auth = authorization.clone();
+        let creating = tokio::spawn(async move {
+            create_auth.controller.call_authorized("createSideThread", json!({"threadId":parent}), &create_auth).await
+        });
+        let id = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(frame) = harness_engine_requests(directory.path()).iter()
+                    .find(|frame| frame["method"] == "thread/inject_items")
+                { return frame["params"]["threadId"].as_str().unwrap().to_owned(); }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        let delete_auth = authorization.clone();
+        let deleted_id = id.clone();
+        let deleting = tokio::spawn(async move {
+            delete_auth.controller.call_authorized("deleteThread", json!({"threadId":deleted_id}), &delete_auth).await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!deleting.is_finished(), "边界注入尚未结束，删除必须等待该侧边初始化完成");
+        assert!(!harness_engine_requests(directory.path()).iter().any(|frame| frame["method"] == "thread/delete"));
+        let created = creating.await.unwrap().unwrap();
+        assert_eq!(created["threadId"], id);
+        assert_eq!(deleting.await.unwrap().unwrap()["deleted"], true);
+        let saved: Value = serde_json::from_slice(&std::fs::read(directory.path().join("remote-harness-state.json")).unwrap()).unwrap();
+        assert!(saved["persistentSides"].get(&id).is_none());
+        controller.harness.enabled.store(false, Ordering::Release);
+        controller.harness.release().await;
+    }
+
+    #[tokio::test]
+    async fn harness_service_side_boundary_external_unknown_delete_keeps_parent_relation() {
+        let (directory, authorization) = harness_fixture().await;
+        let controller = &authorization.controller;
+        let parent = json!({"id":"external-parent","cwd":directory.path(),"ephemeral":false,
+            "status":{"type":"idle"},"turns":[]});
+        controller.harness.seed_test_subagents(json!({"rows":[parent,{
+            "id":"external-child","cwd":directory.path(),"ephemeral":false,"attachedToThreadId":"external-parent",
+            "status":{"type":"idle"},"turns":[]
+        }]})).await.unwrap();
+        std::fs::write(directory.path().join("delete-policy.json"),
+            r#"{"error":{"code":-32000,"message":"unknown child deletion"}}"#).unwrap();
+        assert!(controller.call_authorized("deleteThread", json!({"threadId":"external-parent"}), &authorization).await.is_err());
+        let saved: Value = serde_json::from_slice(&std::fs::read(directory.path().join("remote-harness-state.json")).unwrap()).unwrap();
+        assert_eq!(saved["deletions"]["external-child"]["attachedToThreadId"], "external-parent");
+        assert_eq!(saved["deletions"]["external-child"]["state"], "unknown");
+        assert!(saved["persistentSides"].get("external-child").is_none(), "外部侧边不能伪造创建权限快照");
+        controller.harness.seed_test_subagents(json!({"rows":[parent]})).await.unwrap();
+        let failure = controller.call_authorized("deleteThread", json!({"threadId":"external-parent"}), &authorization).await.unwrap_err();
+        assert!(failure.to_string().contains("尚未确认的删除"), "{failure}");
+        assert!(!harness_engine_requests(directory.path()).iter().any(|frame|
+            frame["method"] == "thread/delete" && frame["params"]["threadId"] == "external-parent"));
+        controller.harness.enabled.store(false, Ordering::Release);
+        controller.harness.release().await;
+    }
+
+    #[tokio::test]
+    async fn harness_service_side_boundary_invalid_snapshot_stays_read_only() {
+        let snapshot = json!({"parent":"snapshot-parent","permissions":{"approvalPolicy":"never",
+            "approvalsReviewer":"user","sandboxPolicy":{"type":"readOnly"}},
+            "collaborationMode":{"mode":"default","settings":{"developer_instructions":null}},
+            "permissionMode":"read-only","initialized":true});
+        for invalid in [json!({"permissions":{}}), json!({"collaborationMode":"bad"}),
+            json!({"collaborationMode":{"mode":"default","settings":[]}})]
+        {
+            let mut side = snapshot.clone();
+            side.as_object_mut().unwrap().extend(invalid.as_object().unwrap().clone());
+            let (directory, authorization) = harness_fixture_with_store(Some(json!({"persistentSides":{"snapshot-side":side}}))).await;
+            let controller = &authorization.controller;
+            controller.harness.seed_test_subagents(json!({"rows":[{
+                "id":"snapshot-side","cwd":directory.path(),"ephemeral":false,"attachedToThreadId":"snapshot-parent",
+                "status":{"type":"idle"},"turns":[]
+            }]})).await.unwrap();
+            let view = controller.call_authorized("thread", json!({"threadId":"snapshot-side"}), &authorization).await.unwrap();
+            assert_eq!(view["thread"]["readOnly"], true);
+            assert!(controller.call_authorized("send", json!({"threadId":"snapshot-side","prompt":"不能扩大权限",
+                "clientUserMessageId":"invalid-snapshot"}), &authorization).await.is_err());
+            assert!(!harness_engine_requests(directory.path()).iter().any(|frame|
+                matches!(frame["method"].as_str(), Some("turn/start" | "thread/resume"))));
+            controller.harness.enabled.store(false, Ordering::Release);
+            controller.harness.release().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn harness_service_side_boundary_malformed_attached_pages_never_delete() {
+        let (directory, authorization) = harness_fixture().await;
+        let controller = &authorization.controller;
+        for response in [json!({}), json!({"data":null,"nextCursor":null}),
+            json!({"data":[],"nextCursor":7}), json!({"data":[]})]
+        {
+            controller.harness.seed_test_subagents(json!({"rows":[{
+                "id":"page-parent","cwd":directory.path(),"ephemeral":false,"status":{"type":"idle"},
+                "attachedToThreadId":null,"turns":[]
+            }]})).await.unwrap();
+            std::fs::write(directory.path().join("side-policy.json"), json!({"attachedResponse":response}).to_string()).unwrap();
+            let result = controller.call_authorized("deleteThread", json!({"threadId":"page-parent"}), &authorization).await;
+            assert!(result.is_err(), "不完整的原生关联分页不能作为无侧边的证据：{response}");
+            assert!(!harness_engine_requests(directory.path()).iter().any(|frame| frame["method"] == "thread/delete"));
+        }
+        controller.harness.enabled.store(false, Ordering::Release);
+        controller.harness.release().await;
+    }
+
+    #[tokio::test]
+    async fn harness_service_side_boundary_delete_rechecks_relation_and_unknown_status() {
+        let (directory, authorization) = harness_fixture().await;
+        let controller = &authorization.controller;
+        for changed in [json!({"status":null}), json!({"status":{"type":"future-status"}}),
+            json!({"attachedToThreadId":"different-parent"}), json!({"id":"different-id"})]
+        {
+            controller.harness.seed_test_subagents(json!({"rows":[
+                {"id":"relation-parent","cwd":directory.path(),"ephemeral":false,"status":{"type":"idle"},"turns":[]},
+                {"id":"relation-child","cwd":directory.path(),"ephemeral":false,"attachedToThreadId":"relation-parent",
+                    "status":{"type":"idle"},"turns":[]}
+            ]})).await.unwrap();
+            std::fs::write(directory.path().join("side-policy.json"),
+                json!({"readOverrides":{"relation-child":changed}}).to_string()).unwrap();
+            let result = controller.call_authorized("deleteThread", json!({"threadId":"relation-parent"}), &authorization).await;
+            assert!(result.is_err(), "删除前必须核对准确关联及明确安全状态：{changed}");
+            assert!(!harness_engine_requests(directory.path()).iter().any(|frame| frame["method"] == "thread/delete"));
+        }
+        controller.harness.enabled.store(false, Ordering::Release);
+        controller.harness.release().await;
+    }
+
+    #[tokio::test]
+    async fn harness_service_side_boundary_read_failure_preserves_other_sessions() {
+        let (directory, authorization) = harness_fixture().await;
+        let controller = &authorization.controller;
+        let parent = controller.call_authorized("create", json!({"projectId":"project-a","prompt":"父会话"}),
+            &authorization).await.unwrap()["threadId"].as_str().unwrap().to_owned();
+        let temporary = controller.call_authorized("createSideThread", json!({"threadId":parent}),
+            &authorization).await.unwrap()["threadId"].clone();
+        std::fs::write(directory.path().join("remote-instance-preferences.json"),
+            r#"{"instances":{"codex:local":{"persistentSideThreads":true}}}"#).unwrap();
+        let persistent = controller.call_authorized("createSideThread", json!({"threadId":parent}),
+            &authorization).await.unwrap()["threadId"].as_str().unwrap().to_owned();
+        std::fs::write(directory.path().join("side-policy.json"),
+            json!({"readFailures":[persistent]}).to_string()).unwrap();
+        // 让已有的 200ms 只读缓存过期，避免把故障前的成功快照当成故障验证。
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let related = controller.call_authorized("relatedThreads", json!({"threadId":parent}), &authorization).await.unwrap();
+        assert_eq!(related["sideThreadsComplete"], false);
+        assert!(related["sideThreadsError"].as_str().is_some_and(|text| text.contains("read failure")));
+        assert!(related["sideThreads"].as_array().unwrap().iter().any(|row| row["id"] == temporary));
+        let sidebar = controller.call_authorized("sidebar", json!({}), &authorization).await.unwrap();
+        assert!(sidebar["recent"].as_array().unwrap().iter().any(|row| row["id"] == parent));
+        assert!(sidebar["sideThreadsError"].is_string());
+        controller.harness.enabled.store(false, Ordering::Release);
+        controller.harness.release().await;
+    }
+
+    #[tokio::test]
+    async fn harness_service_side_boundary_overlapping_deletes_do_not_deadlock() {
+        let (directory, authorization) = harness_fixture().await;
+        let controller = &authorization.controller;
+        controller.harness.seed_test_subagents(json!({"rows":[
+            {"id":"root","cwd":directory.path(),"ephemeral":false,"status":{"type":"idle"},"turns":[]},
+            {"id":"z-child","cwd":directory.path(),"ephemeral":false,"attachedToThreadId":"root",
+                "status":{"type":"idle"},"turns":[]},
+            {"id":"a-grandchild","cwd":directory.path(),"ephemeral":false,"attachedToThreadId":"z-child",
+                "status":{"type":"idle"},"turns":[]}
+        ]})).await.unwrap();
+        let blocked = controller.harness.thread_lock("a-grandchild").await.lock_owned().await;
+        let root_auth = authorization.clone();
+        let mut root = tokio::spawn(async move {
+            root_auth.controller.call_authorized("deleteThread", json!({"threadId":"root"}), &root_auth).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !harness_engine_requests(directory.path()).iter().any(|frame|
+                frame["method"] == "thread/read" && frame["params"]["threadId"] == "a-grandchild")
+            { tokio::time::sleep(Duration::from_millis(10)).await; }
+        }).await.unwrap();
+        let child_auth = authorization.clone();
+        let mut child = tokio::spawn(async move {
+            child_auth.controller.call_authorized("deleteThread", json!({"threadId":"z-child"}), &child_auth).await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(blocked);
+        let result = tokio::time::timeout(Duration::from_secs(3), async {
+            let root_result = (&mut root).await.unwrap();
+            let child_result = (&mut child).await.unwrap();
+            assert!(root_result.is_ok(), "{root_result:?}");
+            assert!(child_result.is_ok(), "{child_result:?}");
+        }).await;
+        if result.is_err() { root.abort(); child.abort(); }
+        controller.harness.enabled.store(false, Ordering::Release);
+        controller.harness.release().await;
+        assert!(result.is_ok(), "祖先与后代删除不能互相持锁等待");
     }
 
     #[tokio::test]

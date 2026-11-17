@@ -488,9 +488,12 @@ export function mountSessionTools(options) {
   updateContext();
   return {
     open, openFile, openSideThread, openSubagent, openSideCreation, updateContext,
-    closeThread(threadId, kind = "side") {
-      if (!disposed && currentContext?.key === identity())
-        closeTab(tabKey({ kind, threadId }));
+    closeThread(threadId, kind = "side", parentThreadId = getContext()?.threadId) {
+      if (disposed || authorizationKey !== authorizationIdentity()) return;
+      // 关闭回执可能在用户切换主会话后到达，只释放原所属主会话的标签，不能借用当前上下文。
+      for (const context of contexts.values())
+        if (context.value.threadId === parentThreadId && authorizationIdentity(context.value) === authorizationKey)
+          closeTab(tabKey({ kind, threadId }), context === currentContext, context);
     },
     close: () => desktop() ? hidePanel() : mobile?.close(),
     dispose() {

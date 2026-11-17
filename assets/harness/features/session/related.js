@@ -352,6 +352,9 @@ export async function loadRelatedThreads(parentThreadId) {
   if (scope !== privateInputScope(session)) throw new Error("当前授权已变化");
   if (result?.threadId !== parentThreadId || !Array.isArray(result.subagents) || !Array.isArray(result.sideThreads))
     throw new Error("关联会话返回内容无效");
+  if (result.sideThreadsComplete != null && typeof result.sideThreadsComplete !== "boolean"
+      || result.sideThreadsError != null && typeof result.sideThreadsError !== "string")
+    throw new Error("侧边会话完整性字段无效");
   return {
     ...result,
     sideThreads: result.sideThreads.map(item => sidebarReadRefreshSuppressions.has(item.id)
@@ -364,6 +367,8 @@ export function adoptRelatedMenu(result) {
   const openSideIds = new Set(result.sideThreads.map(item => item.id));
   const closedIds = [...relatedThreadViews.values()].filter(view => view.kind === "side"
     && (view.parentThreadId || view.openedFromThreadId) === parentThreadId
+    // 持久侧边读取不完整时，缺失行不能作为关闭证据；临时侧边仍按本次完整的内存列表处理。
+    && (result.sideThreadsComplete !== false || view.ephemeral !== false)
     && !openSideIds.has(view.threadId)).map(view => view.threadId);
   if (closedIds.length) void retireNativeSideThreads(closedIds, { notify: false });
   for (const item of [...result.subagents, ...(result.completedSubagents || [])])
@@ -601,7 +606,7 @@ async function finishRelatedOperation(record, result, { allowSelection = false }
       notice(`侧边会话已创建。${result.warning.trim()}`, true);
   } else if (result.ephemeral === false && result.historyRetained === true) {
     // 用户要求关闭持久侧边只卸载标签，关联列表和历史仍可重开；临时侧边继续终态释放。
-    sessionTools?.closeThread?.(result.threadId, "side");
+    sessionTools?.closeThread?.(result.threadId, "side", record.parentThreadId);
   } else {
     sessionMenu?.updateSideThread(record.parentThreadId, { id: result.threadId }, { remove: true });
     await retireNativeSideThreads([result.threadId], { notify: false });

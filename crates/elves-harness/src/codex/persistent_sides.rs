@@ -78,7 +78,27 @@ impl CodexHarness {
             .data
             .persistent_sides
             .get(id)
-            .filter(|side| side.parent == parent && side.initialized)
+            .filter(|side| {
+                // 恢复数据虽为合法 JSON，也必须保有可执行的权限与模式快照；缺失或损坏时只读，不能回落到全局权限。
+                let permissions = &side.permissions;
+                let mode = &side.collaboration_mode;
+                side.parent == parent
+                    && side.initialized
+                    && (permissions["approvalPolicy"].is_string()
+                        || permissions["approvalPolicy"].is_object())
+                    && permissions["approvalsReviewer"].is_string()
+                    && (permissions["permissions"]
+                        .as_str()
+                        .is_some_and(|profile| !profile.is_empty())
+                        || matches!(
+                            permissions["sandboxPolicy"]["type"].as_str(),
+                            Some("readOnly" | "workspaceWrite" | "dangerFullAccess")
+                        ))
+                    && matches!(mode["mode"].as_str(), Some("default" | "plan"))
+                    && mode["settings"].is_object()
+                    && (mode["settings"]["developer_instructions"].is_null()
+                        || mode["settings"]["developer_instructions"].is_string())
+            })
             .cloned()
             .ok_or_else(|| {
                 error(
@@ -121,6 +141,7 @@ impl CodexHarness {
         &self,
         parent: &str,
         archived: bool,
+        fresh: bool,
     ) -> anyhow::Result<Vec<Value>> {
         if !self.persistent_sides_supported().await? {
             // 旧引擎没有 attached 列表接口；已有持久侧边时必须明确失败，不能漏删已有历史。
@@ -137,24 +158,94 @@ impl CodexHarness {
             }
             return Ok(Vec::new());
         }
-        let rows = self
-            .list_all(
-                "thread/list",
-                json!({"attachedToThreadId":parent,
-            "archived":archived,"limit":100,"useStateDbOnly":true}),
-            )
-            .await?;
-        for row in &rows {
-            // 旧版可能忽略过滤字段；每行必须保有精确原生关联，绝不把普通主会话当成侧边。
-            if attached_parent_id(row) != Some(parent) {
-                return Err(error(503, "原生持久侧边列表返回了不匹配的父会话关系"));
+        let mut rows = Vec::new();
+        // 每页 100 条，单父会话最多累计 4096 条/游标，防止异常分页无限占用服务；
+        // 总后代上限仍由 deletion::persistent_descendants 的 4096 个会话（含根）再次约束。
+        let mut ids = std::collections::HashSet::new();
+        let mut cursors = std::collections::HashSet::new();
+        let mut cursor = Value::Null;
+        loop {
+            let params = json!({"attachedToThreadId":parent,"archived":archived,
+                "limit":100,"useStateDbOnly":true,"cursor":cursor});
+            let page = if fresh {
+                self.runtime.request("thread/list", params, None).await?
+            } else {
+                self.runtime.read("thread/list", params).await?
+            };
+            // 删除必须取得完整原生关联证据；字段缺失、非法游标和重复行不能被解释成完整空列表。
+            let entries = page["data"]
+                .as_array()
+                .ok_or_else(|| error(503, "原生持久侧边分页缺少有效 data"))?;
+            // 游标最多 4096 字节，与普通历史读取边界相同；缺失游标不能当作已完整读取。
+            let next = match page.get("nextCursor") {
+                Some(Value::Null) => None,
+                Some(Value::String(next)) if !next.is_empty() && next.len() <= 4096 => Some(next),
+                _ => return Err(error(503, "原生持久侧边分页游标无效或缺失")),
+            };
+            for row in entries {
+                // 旧版可能忽略过滤字段；逐行核对精确关联，绝不把普通主会话当成侧边。
+                if attached_parent_id(row) != Some(parent) {
+                    return Err(error(503, "原生持久侧边列表返回了不匹配的父会话关系"));
+                }
+                normalize_session_response(&json!({"thread":row}))?;
+                if !ids.insert(row["id"].as_str().unwrap().to_owned()) || ids.len() > 4096 {
+                    return Err(error(503, "原生持久侧边分页重复或超出单次读取范围"));
+                }
+                rows.push(row.clone());
             }
-            normalize_session_response(&json!({"thread":row}))?;
+            let Some(next) = next else { break };
+            if !cursors.insert(next.to_owned()) || cursors.len() > 4096 {
+                return Err(error(503, "原生持久侧边分页游标未前进"));
+            }
+            cursor = json!(next);
         }
         Ok(rows)
     }
 
-    pub(super) async fn persistent_sidebar_rows(&self) -> anyhow::Result<Vec<Value>> {
+    pub(super) async fn persistent_views(&self, parent: &str) -> (Vec<Value>, Vec<String>) {
+        let rows = match self.attached_sides(parent, false, false).await {
+            Ok(rows) => rows,
+            Err(failure) => {
+                let projection = self.projection.lock().await;
+                let retained = projection
+                    .persistent_sides
+                    .iter()
+                    .filter(|(_, source)| source.as_str() == parent)
+                    .filter_map(|(id, _)| {
+                        projection
+                            .threads
+                            .get(id)
+                            .filter(|view| view["id"] == id.as_str())
+                            .map(|view| projection.thread(id, view.clone()))
+                    })
+                    .collect();
+                return (retained, vec![failure.to_string()]);
+            }
+        };
+        let mut views = Vec::new();
+        let mut failures = Vec::new();
+        for raw in rows {
+            match self.persistent_summary(&raw).await {
+                Ok(view) => views.push(view),
+                Err(failure) => {
+                    failures.push(format!("{}：{failure}", raw["id"].as_str().unwrap_or("")));
+                    // 一个侧边暂时读不到时保留已核对的列表记录；不能阻断其他会话，或伪造为已关闭。
+                    if let Ok(mut view) = normalize_session_response(&json!({"thread":raw})) {
+                        view["sideThreadReadError"] = json!(failure.to_string());
+                        let id = raw["id"].as_str().unwrap();
+                        let mut projection = self.projection.lock().await;
+                        projection
+                            .persistent_sides
+                            .insert(id.to_owned(), parent.to_owned());
+                        views.push(projection.thread(id, view));
+                    }
+                }
+            }
+        }
+        (views, failures)
+    }
+
+    pub(super) async fn persistent_sidebar_rows(&self) -> (Vec<Value>, Vec<String>) {
         let parents: std::collections::BTreeSet<_> = self
             .projection
             .lock()
@@ -164,12 +255,13 @@ impl CodexHarness {
             .cloned()
             .collect();
         let mut views = Vec::new();
+        let mut failures = Vec::new();
         for parent in parents {
-            for raw in self.attached_sides(&parent, false).await? {
-                views.push(self.persistent_summary(&raw).await?);
-            }
+            let (rows, errors) = self.persistent_views(&parent).await;
+            views.extend(rows);
+            failures.extend(errors);
         }
-        Ok(views)
+        (views, failures)
     }
 
     pub(super) async fn persistent_summary(&self, raw: &Value) -> anyhow::Result<Value> {
@@ -203,6 +295,10 @@ impl CodexHarness {
     ) -> anyhow::Result<Value> {
         let raw = &fork["thread"];
         let id = raw["id"].as_str().unwrap();
+        // 原生 started 会先于创建回执暴露 ID；初始化必须与该侧边的发送、改名和删除使用同一写锁。
+        let lock = self.thread_lock(id).await;
+        let _serial = lock.lock().await;
+        self.check_deletion_barrier(id).await?;
         let permissions = super::sides::side_permissions(fork)?;
         // 先保存未初始化记录；崩溃或边界结果未知时不能恢复成可发送会话，也不能自动重放边界。
         self.store.lock().await.commit(|data| {
@@ -232,10 +328,6 @@ impl CodexHarness {
                 authorization,
             )
             .await?;
-        self.store.lock().await.commit(|data| {
-            data.persistent_sides.get_mut(id).unwrap().initialized = true;
-            Ok(())
-        })?;
         let named = self
             .runtime
             .request_in_generation(
@@ -246,6 +338,13 @@ impl CodexHarness {
             )
             .await;
         self.remember_settings(id, fork).await?;
+        self.store.lock().await.commit(|data| {
+            data.persistent_sides
+                .get_mut(id)
+                .ok_or_else(|| error(409, "持久侧边创建记录已变化，初始化未确认"))?
+                .initialized = true;
+            Ok(())
+        })?;
         self.loaded
             .lock()
             .await
@@ -253,6 +352,12 @@ impl CodexHarness {
         let mut view = normalize_session_response(fork)?;
         self.decorate_persistent_side(raw, &mut view).await;
         let mut projection = self.projection.lock().await;
+        if projection.is_deleted(id) || projection.generation != generation {
+            return Err(error(
+                503,
+                "持久侧边初始化期间会话或引擎连接已变化，请核对原回执",
+            ));
+        }
         view["title"] = json!("侧边聊天");
         projection.threads.insert(id.to_owned(), view.clone());
         projection

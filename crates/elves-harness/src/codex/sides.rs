@@ -864,11 +864,10 @@ impl CodexHarness {
                 "subagentsError":failure.to_string()})
             }
         };
-        let persistent_rows = self.attached_sides(parent, false).await?;
-        let mut persistent_views = Vec::new();
-        for raw in &persistent_rows {
-            persistent_views.push(self.persistent_summary(raw).await?);
-        }
+        let (persistent_views, persistent_errors) = self.persistent_views(parent).await;
+        related["sideThreadsComplete"] = json!(persistent_errors.is_empty());
+        related["sideThreadsError"] = if persistent_errors.is_empty() { Value::Null }
+            else { json!(persistent_errors.join("；")) };
         let persistent_enabled = self.persistent_sides_enabled().await?;
         let projection = self.projection.lock().await;
         let mut rows = Vec::new();
@@ -899,11 +898,6 @@ impl CodexHarness {
                 .count()
                 < MAX_OPEN_SIDES
         );
-        drop(projection);
-        let mut projection = self.projection.lock().await;
-        for raw in persistent_rows {
-            projection.persistent_sides.insert(raw["id"].as_str().unwrap().to_owned(), parent.to_owned());
-        }
         Ok(related)
     }
 

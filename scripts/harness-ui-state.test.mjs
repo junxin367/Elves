@@ -12077,6 +12077,68 @@ test("PC 打开侧边会话交给右侧标签，不切换主会话、不改主�
   assert.equal(ready, true);
 });
 
+test("侧边关联读取不完整时保留持久标签，完整列表才确认已移除", () => {
+  const h = sideCreationNavigationHarness(), c = h.context, retired = [];
+  const scope = c.privateInputScope(c.session);
+  c.retireNativeSideThreads = ids => { retired.push(...ids); };
+  c.relatedThreadViews.set("saved", { scope, threadId: "saved", kind: "side",
+    parentThreadId: "main", ephemeral: false });
+  c.relatedThreadViews.set("temporary", { scope, threadId: "temporary", kind: "side",
+    parentThreadId: "main", ephemeral: true });
+  vm.runInContext(sourceSection("function adoptRelatedMenu(", "async function retireNativeSideThreads("), c);
+  c.adoptRelatedMenu({ threadId: "main", subagents: [], sideThreads: [], sideThreadsComplete: false });
+  assert.deepEqual(retired, ["temporary"]);
+  retired.length = 0;
+  c.adoptRelatedMenu({ threadId: "main", subagents: [], sideThreads: [], sideThreadsComplete: true });
+  assert.ok(retired.includes("saved"));
+});
+
+test("菜单失败快照保留上次持久侧边行，临时侧边不由旧快照复活", () => {
+  const entry = { snapshot: { data: { sideThreads: [
+    { id: "saved", ephemeral: false }, { id: "temporary", ephemeral: true }
+  ] } }, context: { owner: "main" } };
+  const c = vm.createContext({
+    menuSignature: JSON.stringify, owns: () => false, save() {},
+  });
+  vm.runInContext(sessionMenuSource.slice(sessionMenuSource.indexOf("  function applySnapshot("),
+    sessionMenuSource.indexOf("  function restore(")), c);
+  c.applySnapshot(entry, { data: { sideThreadsComplete: false, sideThreads: [{ id: "new", ephemeral: false }] } });
+  assert.deepEqual(Array.from(entry.snapshot.data.sideThreads, item => item.id), ["new", "saved"]);
+  c.applySnapshot(entry, { data: { sideThreadsComplete: true, sideThreads: [] } });
+  assert.equal(entry.snapshot.data.sideThreads.length, 0);
+});
+
+test("持久侧边关闭的迟到回执绑定原主会话，关闭隐藏标签不操作当前会话", async () => {
+  const h = sideCreationNavigationHarness(), c = h.context, calls = [];
+  const record = { id: "close-record", action: "closeSideThread", parentThreadId: "main",
+    threadId: "saved-side", scope: c.privateInputScope(c.session) };
+  c.relatedThreadOperations.set(c.relatedOperationKey(record), record);
+  c.selectedId = "other";
+  c.sessionTools = { closeThread: (...values) => calls.push(values) };
+  await c.finishRelatedOperation(record, { ok: true, threadId: "saved-side", parentThreadId: "main",
+    closed: true, ephemeral: false, historyRetained: true });
+  assert.deepEqual(calls, [["saved-side", "side", "main"]]);
+  assert.equal(c.selectedId, "other");
+  const original = { value: { threadId: "main", deviceId: "device" } };
+  const current = { value: { threadId: "other", deviceId: "device" } };
+  const closed = [];
+  const tools = vm.createContext({
+    disposed: false, authorizationKey: "device", authorizationIdentity: value => value?.deviceId || "device",
+    getContext: () => current.value, contexts: new Map([["main", original], ["other", current]]),
+    currentContext: current, tabKey: value => value.threadId,
+    closeTab: (key, focus, context) => closed.push({ key, focus, context }),
+  });
+  const start = sessionTools.indexOf("    closeThread("), end = sessionTools.indexOf("    close: ", start);
+  vm.runInContext(`globalThis.tools = {${sessionTools.slice(start, end)}}`, tools);
+  tools.tools.closeThread("saved-side", "side", "main");
+  assert.equal(closed.length, 1);
+  assert.equal(closed[0].context, original);
+  assert.equal(closed[0].focus, false);
+  tools.authorizationKey = "old-device";
+  tools.tools.closeThread("saved-side", "side", "main");
+  assert.equal(closed.length, 1, "更换授权后不得应用旧关闭回执");
+});
+
 test("菜单及正文打开子智能体交给右侧只读标签，不切换主会话、草稿和历史", async () => {
   const h = sideCreationNavigationHarness(), opened = [];
   const beforeHistory = JSON.stringify(h.historyEntries), beforeDraft = h.prompt.value;

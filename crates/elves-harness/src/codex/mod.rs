@@ -540,6 +540,10 @@ impl CodexHarness {
             "relatedThreads" => self.related_sides(&payload).await,
             _ => {
                 let authorization = authorization.context("会话写操作缺少设备授权")?;
+                // 祖先删除会同时锁住全部后代；先串行化删除再取会话锁，避免两个删除各持一端互相等待。
+                let _deletion_serial = if action == "deleteThread" {
+                    Some(self.thread_lock("$persistent-side-delete").await.lock_owned().await)
+                } else { None };
                 let id = payload["threadId"].as_str().unwrap_or("$workspace");
                 let lock = self.thread_lock(id).await;
                 let _serial = lock.lock().await;

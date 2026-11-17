@@ -178,7 +178,7 @@ impl CodexHarness {
             rows.extend(pins);
         }
         let mut recent = Vec::new();
-        let persistent = self.persistent_sidebar_rows().await?;
+        let (persistent, persistent_errors) = self.persistent_sidebar_rows().await;
         let projection = self.projection.lock().await;
         let mut side_ids = Vec::new();
         let mut unread_sides = Vec::new();
@@ -277,6 +277,8 @@ impl CodexHarness {
             json!({"ok":true,"nativeBridge":"harness","complete":complete,"projects":projects,
             "recent":recent,"pinnedThreads":pins,"pinnedThreadsComplete":pinned_threads_complete,
             "nextCursor":null,"sideThreadIds":side_ids,"projectPreferencesWarning":project_warning,
+            "sideThreadsComplete":persistent_errors.is_empty(),
+            "sideThreadsError":if persistent_errors.is_empty() {Value::Null} else {json!(persistent_errors.join("；"))},
             "unreadSideThreads":unread_sides,"creationAvailable":true,"preferences":preferences}),
         )
     }
