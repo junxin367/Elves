@@ -2412,6 +2412,15 @@ export function RelayProfileDetail({
   actions: Actions;
 }) {
   const [draft, setDraft] = useState<RelayProfile>(profile);
+  const detailPageRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const scroller = detailPageRef.current?.closest<HTMLElement>(".management-content");
+    if (!scroller) return;
+    // 用户要求二级页与父页共用宽度及滚动容器；进入时从顶部显示，返回时恢复父页阅读位置，不重置日志筛选。
+    const previousScrollTop = scroller.scrollTop;
+    scroller.scrollTop = 0;
+    return () => { scroller.scrollTop = previousScrollTop; };
+  }, []);
   const isActive = !isNew && profile.id === form.activeRelayId;
   const profileUsesLiveFiles = relayProfileUsesLiveFiles(profile);
   useEffect(() => {
@@ -2454,7 +2463,7 @@ export function RelayProfileDetail({
     void actions.switchRelayProfile(next, previousActiveRelayId);
   };
   return (
-    <div className="relay-detail-page" key={profile.id}>
+    <div className="relay-detail-page" key={profile.id} ref={detailPageRef}>
       <div className="relay-detail-sticky">
         <Toolbar>
           <Button onClick={onBack} variant="secondary">

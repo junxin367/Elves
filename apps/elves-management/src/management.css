@@ -11,8 +11,26 @@ html,body,#app{width:100%;height:100%;min-width:0;margin:0;overflow:hidden}
 .management-content{flex:1;min-width:0;min-height:0;overflow:auto;scrollbar-gutter:stable both-edges;padding:24px 28px;display:flex;flex-direction:column;gap:20px}
 .management-content>.management-page-width{display:flex;flex-direction:column;gap:inherit;flex-shrink:0}
 .management-content>.management-page-width>.card{flex-shrink:0;min-width:0}
+/* 用户要求代理二级页沿用父级 1000px 上限：回到内容流并共用父级滚动，不能再以 absolute/inset 覆盖整个管理窗口。
+ * 详情期间只隐藏同容器内的父页内容，保留日志筛选等组件状态；返回后恢复，不能靠提高 z-index 遮住仍可操作的父页。 */
+.management-content>.management-page-width:has(>.relay-detail-page)>:not(.relay-detail-page){display:none}
+.management-content .relay-detail-page{position:relative;inset:auto;grid-template-columns:minmax(0,1fr);width:100%;max-width:100%;min-width:0;overflow:visible;scrollbar-gutter:auto;isolation:isolate;background:hsl(var(--background))}
+/* 二级工具栏、表单和配置预览共用父页边界；不再叠加旧独立窗口的 20px 外边距。 */
+.management-content .relay-detail-sticky{z-index:var(--z-topbar);background:hsl(var(--background))}
+.management-content .relay-detail-sticky .toolbar{padding:0}
+.management-content .relay-detail-page>.relay-profile-editor{min-width:0;margin:0}
+.management-content .relay-detail-page>.relay-file-grid{min-width:0;margin:0}
 .management-notice{padding:12px 28px;background:hsl(var(--secondary));font-size:13px;flex-shrink:0;overflow-wrap:anywhere}
 .management-notice.error{color:hsl(var(--destructive))}
 .management-content .session-summary-grid{grid-template-columns:repeat(3,minmax(0,1fr));margin-bottom:16px}
 .management-content .session-management-grid{display:none}
+/* 窄屏二级页沿用单列布局：同时清除旧字段的第 2 列定位，避免隐式列把标题和输入挤窄；操作按钮按可用宽度换行。 */
+@media(max-width:860px){
+  .management-content .relay-editor-head{flex-wrap:wrap;align-items:flex-start}
+  .management-content .relay-editor-title{flex:1 1 100%}
+  .management-content .relay-editor-actions{max-width:100%;flex-wrap:wrap}
+  .management-content .relay-fields,.management-content .relay-api-fields,.management-content .relay-advanced-fields{grid-template-columns:minmax(0,1fr)}
+  .management-content .relay-fields>.field,.management-content .relay-api-fields>.field,.management-content .relay-advanced-fields>.field{grid-column:1/-1}
+  .management-content .relay-field-model-list .field-label-row{flex-wrap:wrap}
+}
 @media(max-width:760px){.management-header{padding:18px 16px 14px}.management-header>.management-page-width{gap:10px}.management-header h1{font-size:19px}.management-header p{max-width:24ch}.management-content{padding:16px 12px;gap:14px;scrollbar-gutter:auto}.management-notice{padding:10px 16px}.management-content .session-summary-grid{grid-template-columns:1fr}.management-content .session-row{flex-wrap:wrap}}
