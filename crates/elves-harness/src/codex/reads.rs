@@ -340,6 +340,10 @@ impl CodexHarness {
         // 用户要求 Codex 任意历史轮次可编辑；逐条标记由 history 提供，不能再只暴露最后一条。
         thread["capabilities"]["messageEdit"] = json!(true);
         thread["capabilities"]["messageEditHistory"] = json!(true);
+        // 用户要求临时侧边和只读子智能体不出现分支入口；只有此持久主会话路径发布能力。
+        thread["capabilities"]["forkThread"] = json!(true);
+        thread["forkedFrom"] = self.store.lock().await.data.fork_sources.get(id).cloned()
+            .unwrap_or(Value::Null);
         thread["editHistoryHead"] = super::message_edit::history_head(latest.as_ref());
         thread["messageEditReady"] =
             json!(latest.is_some() && self.message_edit_ready(id, &thread).await);

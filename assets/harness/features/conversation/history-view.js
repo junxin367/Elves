@@ -5,7 +5,7 @@ import { copyText } from "../../ui/clipboard.js";
 import { $, element } from "../../ui/dom.js";
 import { icon } from "../../ui/icons.js";
 import { notice } from "../../ui/notice.js";
-import { renderItem, renderQueueArea } from "../../core/actions.js";
+import { renderItem, renderQueueArea, selectThread } from "../../core/actions.js";
 import {
   busy, connected, creating, selectedId, selectionVersion, session, setTurns, stopping, thread,
   turns
@@ -15,6 +15,7 @@ import { setSelectedEffort, setSelectedModel } from "../composer/options-state.j
 import { resizeEditorInput } from "../composer/prompt-editor.js";
 import { skillRenderVersion } from "../composer/skill-catalog.js";
 import { compactionLocked } from "./compaction.js";
+import { forkAvailable, forkThread } from "./fork.js";
 import {
   followMessages, historyCursor, historyError, historyInitialized, historyLoadButton,
   legacySentDisplayTurn, messageFrame, renderTurnPlanTitle, renderedItems, renderedTurns,
@@ -46,7 +47,7 @@ import { reconcileSentMessageDisplays, withSentMessageDisplays } from "../queue/
 import { editingQueuedMessage } from "../queue/state.js";
 import { threadSentMessageEditAllowed } from "../session/action-capabilities.js";
 import {
-  isActiveThread, normalizeRelatedView, privateInputScope, subagentsEnabled, threadReadOnly
+  isActiveThread, normalizeRelatedView, privateInputScope, subagentsEnabled, threadForkAllowed, threadReadOnly
 } from "../session/capabilities.js";
 import { relatedSessionView, relatedThreadViews, setRelatedSessionView } from "../session/related-state.js";
 import { syncRelatedSessionLayout } from "../session/related.js";
@@ -77,6 +78,16 @@ export function renderMessages(keepScroll = true) {
   const relatedViewKind = relatedSessionView?.kind || "";
   if (reconcileSentMessageDisplays(selectedId, currentThreadDisplay()?.queuedMessages)) renderQueueArea();
   const sorted = withSentMessageDisplays();
+  const origin = currentThreadDisplay()?.forkedFrom;
+  if (origin?.threadId && origin.threadId !== selectedId) {
+    const source = element("button", "fork-source text-button", `继续自聊天：${origin.title || "原会话"}`);
+    source.type = "button"; source.prepend(icon("fork"));
+    const scope = privateInputScope(session), sourceId = selectedId;
+    source.onclick = () => {
+      if (scope === privateInputScope(session) && selectedId === sourceId) void selectThread(origin.threadId);
+    };
+    children.push(source);
+  }
   const lastRealTurn = [...sorted].reverse().find(turn => turns.has(turn.id));
   // 用户要求 Claude 原生任务清单属于整个会话：完整清单或原生轮次标记识别 Claude，
   // 统一放到正文所有轮次之后，旧服务才从已加载轮次寻找最新快照。
@@ -128,14 +139,19 @@ export function renderMessages(keepScroll = true) {
           editSupported: !item.remoteDirectSend && thread?.id === selectedId && connected && !busy && !stopping && !pending
             && !editingMessage && !editingQueuedMessage && !compactionLocked()
             && threadSentMessageEditAllowed(threadId),
-          completed: turn.status !== "inProgress" || item.status === "completed"
+          completed: turn.status !== "inProgress" || item.status === "completed",
+          turnId: turn.id,
+          forkSupported: threadForkAllowed(threadId) && !inActivity
+            && ["completed", "failed", "interrupted"].includes(turn.status),
+          forkDisabled: !forkAvailable(threadId) || !!editingMessage || !!editingQueuedMessage
         }, {
           icon,
           copy: message => {
             const text = messageCopyText(message);
             if (text) void copyText(text); else notice("这条消息没有可复制的文字");
           },
-          edit: message => beginMessageEdit(threadId, message)
+          edit: message => beginMessageEdit(threadId, message),
+          fork: turnId => void forkThread(turnId, threadId)
         });
       }
       return node;

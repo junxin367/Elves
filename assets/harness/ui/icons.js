@@ -26,6 +26,7 @@ export function icon(name) {
     chat: '<path d="M20 11.5a8.5 8.5 0 0 1-8.5 8.5 9 9 0 0 1-4-.9L3 21l1.9-4.5A9 9 0 0 1 4 12.5 8.5 8.5 0 0 1 12.5 4h.5a8.5 8.5 0 0 1 7 7.5Z"/>',
     recent: '<path d="M8 3a5 5 0 1 1-4.4 2.6"/><path d="M1.5 3.5v3h3"/><path d="M8 5v3l2 1.5"/>',
     more: '<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>',
+    fork: '<circle cx="6" cy="5" r="2"/><circle cx="18" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><path d="M6 7v10M18 7v1a6 6 0 0 1-6 6H6"/>',
     menu: '<path d="M4 6h16M4 12h16M4 18h16"/>',
     // 用户指定优先事项右侧使用参考图中的双横向滑杆：上方滑块靠右、下方靠左。
     slidersHorizontal: '<path d="M3 7h8m6 0h4M3 17h4m6 0h8"/><rect x="11" y="4.5" width="6" height="5" rx="1.5"/><rect x="7" y="14.5" width="6" height="5" rx="1.5"/>',

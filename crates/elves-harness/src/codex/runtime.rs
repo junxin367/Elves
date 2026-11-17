@@ -487,7 +487,7 @@ impl Connection {
             });
         }
         let result = frame.get("result").cloned().unwrap_or(Value::Null);
-        if method == "thread/start"
+        if matches!(method, "thread/start" | "thread/fork")
             && result["thread"]["ephemeral"] != true
             && let Some(id) = result["thread"]["id"].as_str().filter(|id| !id.is_empty())
         {

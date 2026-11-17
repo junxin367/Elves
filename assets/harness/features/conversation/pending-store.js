@@ -14,7 +14,10 @@ export function restoreStoredPending() {
   try {
     const stored = hydrateGoalComposerRecord(JSON.parse(sessionStorage.getItem("codex-elves-pending") || "null"));
     if (stored) setPending(typeof stored.id === "string" && /^[a-zA-Z0-9-]{1,100}$/.test(stored.id)
-      && (stored.action === "reorderQueued"
+      && (stored.action === "forkThread"
+        ? typeof stored.payload?.threadId === "string"
+          && (stored.payload.turnId == null || typeof stored.payload.turnId === "string")
+        : stored.action === "reorderQueued"
         ? typeof stored.payload?.threadId === "string" && Array.isArray(stored.payload.messageIds)
           && Array.isArray(stored.payload.expectedMessageIds)
           && stored.payload.messageIds.length > 0

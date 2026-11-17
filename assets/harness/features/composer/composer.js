@@ -238,8 +238,9 @@ export function updateComposer({ followEnd = false } = {}) {
     { value: "compact", label: "压缩", icon: "compactContext",
       description: compactUsageDescription(usage),
       disabled: !compactCommandAvailable(), action: compactContext }
-  ].filter(option => !isClaude() || !["compact", "goal"].includes(option.value)
-    || claudeCommandSupported(option.value));
+  // 用户要求临时侧边直接移除“目标”按钮，/ 菜单需同步隐藏，不能仅保留禁用项。
+  ].filter(option => (option.value !== "goal" || !serviceSideThread())
+    && (!isClaude() || !["compact", "goal"].includes(option.value) || claudeCommandSupported(option.value)));
   add.disabled = add.menuOptions.every(option => option.disabled);
   if (activePopup?.trigger === add) renderPopup();
   const queuedEditAction = queuedEditSubmittingAction();
@@ -357,6 +358,7 @@ export function updateComposer({ followEnd = false } = {}) {
     const pendingQueueItem = ["steerQueued", "removeQueued"].includes(pending.action);
     const box = element("div", "pending-banner", unavailable ? "回执损坏或属于旧授权。请检查原生会话后人工解除锁定，不会自动重发。"
       : pending.action === "reorderQueued" ? "正在确认队列排序结果。"
+      : pending.action === "forkThread" ? "正在确认新聊天分支创建结果；不会重复创建。"
       : pendingGoal ? "正在确认目标提交结果。"
       : pendingQueueItem && pending.receiptMissing ? "未找到队列操作回执，请核对原生会话；不会自动重发。"
       : pendingQueueItem ? pending.action === "steerQueued"
@@ -366,7 +368,8 @@ export function updateComposer({ followEnd = false } = {}) {
     if (!unavailable && queuedEditActions.has(pending.action))
       renderQueuedEditRecoveryControls(box, pending.payload.threadId, pending.payload.editId);
     else if (!unavailable) box.append(button("查回执", pendingGoal ? "查询原目标提交回执，不会再次提交"
-      : pendingQueueItem ? "只查询原队列操作回执，不会重复引导或删除" : "查询此消息的送达回执", () => void resolvePending(), "text-button"));
+      : pendingQueueItem ? "只查询原队列操作回执，不会重复引导或删除"
+      : pending.action === "forkThread" ? "查询原分支回执，不会重复创建" : "查询此消息的送达回执", () => void resolvePending(), "text-button"));
     const createdGoalThreadId = pendingGoal && goalRecordThreadId(pending);
     if (!unavailable && createdGoalThreadId && selectedId !== createdGoalThreadId)
       box.append(button("打开已创建会话", "打开已创建的会话，只读取数据",

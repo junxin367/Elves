@@ -105,6 +105,8 @@ pub(super) struct Data {
     pub local_projects: BTreeMap<String, Value>,
     pub preferences: Value,
     pub settings: BTreeMap<String, Value>,
+    // 持久分支保留可点击的来源和家族标题；临时侧边不写入此表。
+    pub fork_sources: BTreeMap<String, Value>,
     pub answered_questions: BTreeMap<String, Value>,
     pub thread_devices: BTreeMap<String, String>,
     pub queue_gates: BTreeMap<String, QueueGate>,

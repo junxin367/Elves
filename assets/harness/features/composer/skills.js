@@ -1,6 +1,7 @@
 // 斜杠命令与 Skill：命令菜单渲染与更新、Skill 目录的读取与刷新调度、选择压缩命令及输入事件处理；目录状态与缓存判断在 skill-catalog.js，选择 Skill 在 selected-skills.js。
 
 import { $, button, element } from "../../ui/dom.js";
+import { icon } from "../../ui/icons.js";
 import { closePopup } from "../../ui/popup.js";
 import { closeComposerMenus, loadModels, scheduleMessages, updateComposer } from "../../core/actions.js";
 import {
@@ -39,13 +40,14 @@ import {
   validCachedSkill
 } from "./skill-catalog.js";
 import { compactContext, compactionLocked } from "../conversation/compaction.js";
+import { forkAvailable, forkThread } from "../conversation/fork.js";
 import { pending } from "../conversation/pending-state.js";
 import { goalComposerReason, selectGoalCommand } from "../goal/composer.js";
 import { goalCommandMatches, selectedGoal } from "../goal/state.js";
 import { editingMessage } from "../messages/message-edit.js";
 import { editingQueuedMessage } from "../queue/state.js";
 import { claudeCommandSupported } from "../session/action-capabilities.js";
-import { backendCapability, isClaude, privateInputScope, threadReadOnly } from "../session/capabilities.js";
+import { backendCapability, isClaude, privateInputScope, serviceSideThread, threadForkAllowed, threadReadOnly } from "../session/capabilities.js";
 import { activeInstanceId } from "../session/instances.js";
 import { cacheDisplayData, currentThreadDisplay, optionalCachedRead, readScope } from "../session/thread-cache.js";
 
@@ -53,6 +55,12 @@ export function compactCommandAvailable() {
   if (isClaude() && !claudeCommandSupported("compact")) return false;
   return !!session && !creating && !!selectedId && thread?.id === selectedId && !threadReadOnly() && connected
     && !busy && !stopping && !pending && !editingMessage && !editingQueuedMessage && !compactionLocked(selectedId);
+}
+export function forkCommandAvailable(query = slashQuery()) {
+  // /fork 沿用 Codex 的空编辑框语义；已有文字/Skill/目标时不带入新分支，也不清除它们。
+  const text = $("#prompt")?.value || "";
+  return !!query && forkAvailable() && !editingMessage && !editingQueuedMessage && !selectedGoal
+    && !selectedSkills.length && !(text.slice(0, query.start) + text.slice(query.end)).trim();
 }
 export function slashMenuEntries(query = slashQuery()) {
   if (!query) return [];
@@ -64,7 +72,10 @@ export function slashMenuEntries(query = slashQuery()) {
     .map(skill => ({ type: "skill", enabled: true, skill })));
   if (compactCommandMatches(query.query) && (!isClaude() || claudeCommandSupported("compact")))
     entries.push({ type: "compact", enabled: compactCommandAvailable() });
-  if (goalCommandMatches(query.query) && (!isClaude() || claudeCommandSupported("goal")))
+  // 用户要求分支紧接“压缩”，临时侧边及其他不支持的实例直接移除，不显示禁用占位。
+  if (threadForkAllowed() && ["fork", "分支", "在新聊天中分支"].some(value => value.includes(query.query)))
+    entries.push({ type: "fork", enabled: forkCommandAvailable(query) });
+  if (!serviceSideThread() && goalCommandMatches(query.query) && (!isClaude() || claudeCommandSupported("goal")))
     entries.push({ type: "goal", enabled: !goalComposerReason() });
   // 用户要求在 / 菜单提供提示词优化；独立优化服务不依赖 Claude 原生压缩或目标能力。
   if (promptOptimizationCommandMatches(query.query)) {
@@ -93,21 +104,22 @@ export function renderSkillMenu(message) {
   const skills = entries.filter(entry => entry.type === "skill");
   const appendOption = (entry, index, root) => {
     if (entry.type !== "skill") {
-      const goal = entry.type === "goal", optimize = entry.type === "promptOptimize";
+      const goal = entry.type === "goal", optimize = entry.type === "promptOptimize", fork = entry.type === "fork";
       const usage = entry.type === "compact" ? contextUsage(currentThreadDisplay()?.tokenUsage) : null;
-      const label = optimize ? "提示词优化" : goal ? "目标" : "压缩";
+      const label = fork ? "在新聊天中分支" : optimize ? "提示词优化" : goal ? "目标" : "压缩";
       const reason = goal ? goalComposerReason() : "";
-      const action = optimize ? selectPromptOptimizationCommand : goal ? () => selectGoalCommand() : selectCompactCommand;
+      const action = fork ? selectForkCommand : optimize ? selectPromptOptimizationCommand : goal ? () => selectGoalCommand() : selectCompactCommand;
       const node = button("", reason || label, action,
         `skill-option slash-command-option${index === active ? " active" : ""}${goal ? " slash-goal-option" : ""}`);
       node.id = `skill-option-${index}`; node.disabled = !entry.enabled;
       node.setAttribute("role", "option"); node.setAttribute("aria-selected", String(index === active));
       const copy = element("span", "slash-command-copy");
       copy.append(element("strong", "", label));
-      const description = optimize ? "使用已配置的模型改写当前输入"
+      const description = fork ? "在当前工作区继续最新会话历史"
+        : optimize ? "使用已配置的模型改写当前输入"
         : goal ? reason || "设置要持续追求的目标" : compactUsageDescription(usage);
       if (description) copy.append(element("small", "muted slash-command-usage", description));
-      const commandIcon = optimize ? promptOptimizationCommandIcon() : goal ? goalComposerIcon() : compactCommandIcon();
+      const commandIcon = fork ? icon("fork") : optimize ? promptOptimizationCommandIcon() : goal ? goalComposerIcon() : compactCommandIcon();
       node.append(commandIcon, copy);
       node.onmousedown = event => event.preventDefault();
       root.append(node);
@@ -367,6 +379,14 @@ export function selectCompactCommand() {
   prompt.setRangeText("", query.start, query.end, "end");
   closeComposerMenus(); updateComposer(); prompt.focus();
   void compactContext();
+}
+export function selectForkCommand() {
+  const query = slashQuery();
+  if (!forkCommandAvailable(query)) return;
+  const prompt = $("#prompt");
+  prompt.setRangeText("", query.start, query.end, "end");
+  rememberDraft(); closeComposerMenus(); updateComposer();
+  void forkThread();
 }
 export function selectPromptOptimizationCommand() {
   const query = slashQuery(), control = $("#prompt-optimize");

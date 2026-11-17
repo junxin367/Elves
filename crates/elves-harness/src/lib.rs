@@ -1408,7 +1408,7 @@ impl HarnessController {
         }
         if matches!(
             action,
-            "send" | "setGoal" | "editMessage" | "steerQueued" | "createSideThread"
+            "send" | "setGoal" | "editMessage" | "steerQueued" | "createSideThread" | "forkThread"
         ) {
             if let Some(selection) = match payload["threadId"].as_str() {
                 Some(id) if claude::Claude::owns_id(id) => {
@@ -1472,7 +1472,7 @@ impl HarnessController {
             .as_str()
             .filter(|id| action == "thread" && !claude::Claude::owns_id(id))
             .map(str::to_owned);
-        let codex_creation = action == "create"
+        let codex_creation = matches!(action, "create" | "forkThread")
             && payload["backend"] != "claude"
             && !payload["instanceId"]
                 .as_str()
@@ -4672,6 +4672,7 @@ async fn action(
             | "setGoal"
             | "create"
             | "createSideThread"
+            | "forkThread"
             | "closeSideThread"
             | "pinProject"
             | "pinThread"
@@ -6668,15 +6669,22 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
  }
  case 'thread/fork':{
    if(!t||t.ephemeral){output({id:q.id,error:{code:-32600,message:'invalid fork parent'}});return;}
-   const id=crypto.randomUUID(),thread={...t,id,ephemeral:true,path:null,forkedFromId:p.threadId,
-     parentThreadId:null,turns:[],status:{type:'idle'}};
+   const cutoff=p.lastTurnId?t.turns.findIndex(turn=>turn.id===p.lastTurnId):t.turns.length-1;
+   if(p.lastTurnId&&(cutoff<0||t.turns[cutoff].status==='inProgress')){
+     output({id:q.id,error:{code:-32600,message:'invalid fork turn'}});return;
+   }
+   const id=crypto.randomUUID(),ephemeral=p.ephemeral===true;
+   const turns=ephemeral?[]:structuredClone(t.turns.slice(0,cutoff+1));
+   if(!p.lastTurnId&&turns.at(-1)?.status==='inProgress')turns.at(-1).status='interrupted';
+   const thread={...t,id,ephemeral,path:ephemeral?null:__dirname+'/'+id+'.jsonl',forkedFromId:p.threadId,
+     parentThreadId:null,turns,status:{type:'idle'}};
    // fork 的界面轮次可以为空，但模型历史必须保留父上下文，避免测试漏掉主任务被继续执行的问题。
    const inherited=modelContexts.get(p.threadId)||{items:[],developerInstructions:''};
    const permissions={...permissionSnapshot(p,inherited.permissions),...sidePolicy.forkPermissions};
    const model=p.model??inherited.model??'gpt-6.1-sol',reasoningEffort=p.config?.model_reasoning_effort??inherited.reasoningEffort??'high';
    modelContexts.set(id,{...inherited,items:[...inherited.items],developerInstructions:p.developerInstructions??inherited.developerInstructions,
      model,reasoningEffort,permissions});
-   threads.set(id,thread);result={thread,model,reasoningEffort,cwd:t.cwd,...permissions};
+   threads.set(id,thread);result={thread:{...thread,turns:p.excludeTurns?[]:thread.turns},model,reasoningEffort,cwd:t.cwd,...permissions};
    event('thread/started',{thread});break;
  }
  case 'thread/inject_items':{
@@ -6747,7 +6755,9 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
  case 'turn/interrupt':finish(p.threadId,'interrupted');break;
  case 'thread/compact/start':event('item/started',{threadId:p.threadId,turnId:'compact',item:{id:'compact',type:'contextCompaction'}});
    setTimeout(()=>event('item/completed',{threadId:p.threadId,turnId:'compact',item:{id:'compact',type:'contextCompaction'}}),fastPolicy.compactDelayMs||20);break;
- case 'thread/name/set':t.name=p.name;break;
+ case 'thread/name/set':
+   if(t.forkedFromId&&t.name==='reject-fork-name'){output({id:q.id,error:{code:-32000,message:'name fixture failure'}});return;}
+   t.name=p.name;break;
  case 'thread/revert':{
    const index=t.turns.findIndex(turn=>turn.id===p.beforeTurnId);
    if(index<0||t.turns.some(turn=>turn.status==='inProgress')){
@@ -6980,6 +6990,271 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
             .into_iter()
             .filter(|frame| frame["method"] == "thread/items/list")
             .collect()
+    }
+
+    #[tokio::test]
+    async fn harness_fork_history_is_persistent_inclusive_paginated_and_idempotent() {
+        let (directory, authorization, id) =
+            harness_history_fixture("completed", false, false).await;
+        let controller = &authorization.controller;
+        let turns: Vec<_> = (0..105).map(|index| json!({
+            "id":format!("fork-turn-{index}"),"status":"completed",
+            "items":[{"id":format!("fork-user-{index}"),"type":"userMessage",
+                "content":[{"type":"text","text":format!("问题 {index}")}]},
+                {"id":format!("fork-agent-{index}"),"type":"agentMessage","text":format!("回复 {index}")}]
+        })).collect();
+        controller
+            .harness
+            .seed_test_history(json!({"threadId":id,"turns":turns}))
+            .await
+            .unwrap();
+        let payload = json!({"threadId":id,"turnId":"fork-turn-1"});
+        let mut receipt = controller
+            .execute(
+                authorization.device.clone(),
+                "fork-once".into(),
+                "forkThread".into(),
+                payload.clone(),
+            )
+            .await
+            .unwrap();
+        // HTTP 等待窗口可能先返回 pending；后续只能核对同一请求，不能重新生成分支操作 ID。
+        tokio::time::timeout(Duration::from_secs(90), async {
+            while receipt["state"] == "pending" {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                receipt = controller
+                    .execute(
+                        authorization.device.clone(),
+                        "fork-once".into(),
+                        "forkThread".into(),
+                        payload.clone(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(receipt["state"], "completed");
+        let result = &receipt["result"];
+        let branch = result["threadId"].as_str().unwrap();
+        assert_ne!(branch, id);
+        assert_eq!(result["sourceThreadId"], id);
+        let replay = controller
+            .execute(
+                authorization.device.clone(),
+                "fork-once".into(),
+                "forkThread".into(),
+                payload,
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay, receipt);
+        let history = controller
+            .call_authorized("history", json!({"threadId":branch}), &authorization)
+            .await
+            .unwrap();
+        assert_eq!(history["data"].as_array().unwrap().len(), 2);
+        assert_eq!(history["data"][0]["id"], "fork-turn-1");
+        assert_eq!(history["data"][1]["id"], "fork-turn-0");
+        let detail = controller
+            .call_authorized("thread", json!({"threadId":branch}), &authorization)
+            .await
+            .unwrap();
+        assert_eq!(detail["thread"]["ephemeral"], false);
+        assert_eq!(detail["thread"]["capabilities"]["forkThread"], true);
+        assert_eq!(detail["thread"]["forkedFrom"]["threadId"], id);
+        assert_eq!(detail["thread"]["title"], "隔离会话 (2)");
+        assert_eq!(
+            std::fs::canonicalize(detail["thread"]["cwd"].as_str().unwrap()).unwrap(),
+            std::fs::canonicalize(directory.path()).unwrap()
+        );
+        let original = controller
+            .call_authorized("history", json!({"threadId":id}), &authorization)
+            .await
+            .unwrap();
+        assert_eq!(original["data"][0]["id"], "fork-turn-104");
+        let persisted: Value = serde_json::from_slice(
+            &std::fs::read(directory.path().join("remote-harness-state.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted["forkSources"][branch]["threadId"], id);
+        let before_latest = harness_engine_requests(directory.path());
+        let write_count = before_latest
+            .iter()
+            .filter(|frame| frame["method"] == "turn/start")
+            .count();
+        let latest = controller
+            .call_authorized("forkThread", json!({"threadId":id}), &authorization)
+            .await
+            .unwrap();
+        let latest_detail = controller
+            .call_authorized(
+                "thread",
+                json!({"threadId":latest["threadId"]}),
+                &authorization,
+            )
+            .await
+            .unwrap();
+        assert_eq!(latest_detail["thread"]["title"], "隔离会话 (3)");
+        let latest_history = controller
+            .call_authorized(
+                "history",
+                json!({"threadId":latest["threadId"]}),
+                &authorization,
+            )
+            .await
+            .unwrap();
+        assert_eq!(latest_history["data"][0]["id"], "fork-turn-104");
+        let requests = harness_engine_requests(directory.path());
+        let forks: Vec<_> = requests
+            .iter()
+            .filter(|frame| frame["method"] == "thread/fork")
+            .collect();
+        assert_eq!(forks.len(), 2);
+        assert_eq!(forks[0]["params"]["lastTurnId"], "fork-turn-1");
+        assert_eq!(forks[0]["params"]["ephemeral"], false);
+        assert_eq!(forks[0]["params"]["excludeTurns"], true);
+        assert!(forks[1]["params"].get("lastTurnId").is_none());
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|frame| frame["method"] == "turn/start")
+                .count(),
+            write_count
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|frame| frame["method"] == "thread/revert")
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|frame| frame["method"] == "thread/turns/list"
+                    && frame["params"]["cursor"] == "turns:100")
+        );
+        controller.harness.release().await;
+    }
+
+    #[tokio::test]
+    async fn harness_fork_guards_side_running_foreign_turn_and_destination() {
+        let (directory, authorization, id) =
+            harness_history_fixture("inProgress", false, false).await;
+        let controller = &authorization.controller;
+        for payload in [
+            json!({"threadId":id,"turnId":"history-turn"}),
+            json!({"threadId":id,"turnId":"foreign-turn"}),
+            json!({"threadId":id,"cwd":"C:/other"}),
+            json!({"threadId":id,"worktree":true}),
+            json!({"threadId":id,"ephemeral":true}),
+        ] {
+            assert!(
+                controller
+                    .call_authorized("forkThread", payload, &authorization)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            !harness_engine_requests(directory.path())
+                .iter()
+                .any(|frame| frame["method"] == "thread/fork")
+        );
+        // 最新分支不停止源会话；只有新分支中的执行轮次变成中断快照。
+        let latest = controller
+            .call_authorized("forkThread", json!({"threadId":id}), &authorization)
+            .await
+            .unwrap();
+        let original = controller
+            .call_authorized("history", json!({"threadId":id}), &authorization)
+            .await
+            .unwrap();
+        assert_eq!(original["data"][0]["status"], "inProgress");
+        let branch = controller
+            .call_authorized(
+                "history",
+                json!({"threadId":latest["threadId"]}),
+                &authorization,
+            )
+            .await
+            .unwrap();
+        assert_eq!(branch["data"][0]["status"], "interrupted");
+        let side = controller
+            .call_authorized("createSideThread", json!({"threadId":id}), &authorization)
+            .await
+            .unwrap();
+        let side_id = side["threadId"].as_str().unwrap();
+        assert!(
+            controller
+                .call_authorized("forkThread", json!({"threadId":side_id}), &authorization)
+                .await
+                .is_err()
+        );
+        let requests = harness_engine_requests(directory.path());
+        assert!(!requests.iter().any(
+            |frame| frame["method"] == "thread/fork" && frame["params"]["threadId"] == side_id
+        ));
+        assert!(
+            !requests
+                .iter()
+                .any(|frame| frame["method"] == "turn/interrupt")
+        );
+        controller.harness.release().await;
+    }
+
+    #[tokio::test]
+    async fn harness_fork_name_failure_keeps_created_thread_and_inherits_permissions() {
+        let (directory, authorization, id) =
+            harness_history_fixture("completed", false, false).await;
+        let controller = &authorization.controller;
+        controller
+            .call_authorized(
+                "rename",
+                json!({"threadId":id,"title":"reject-fork-name"}),
+                &authorization,
+            )
+            .await
+            .unwrap();
+        controller
+            .call_authorized(
+                "setPermissions",
+                json!({"threadId":id,"permissionMode":"full-access"}),
+                &authorization,
+            )
+            .await
+            .unwrap();
+        let result = controller
+            .call_authorized("forkThread", json!({"threadId":id}), &authorization)
+            .await
+            .unwrap();
+        assert_eq!(result["ok"], true);
+        assert!(
+            result["warning"]
+                .as_str()
+                .unwrap()
+                .contains("标题设置未确认")
+        );
+        let branch = result["threadId"].as_str().unwrap();
+        let detail = controller
+            .call_authorized("thread", json!({"threadId":branch}), &authorization)
+            .await
+            .unwrap();
+        assert_eq!(detail["thread"]["permissionMode"], "full-access");
+        let requests = harness_engine_requests(directory.path());
+        let fork = requests
+            .iter()
+            .find(|frame| frame["method"] == "thread/fork")
+            .unwrap();
+        assert_eq!(fork["params"]["sandbox"], "danger-full-access");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|frame| frame["method"] == "thread/fork")
+                .count(),
+            1
+        );
+        controller.harness.release().await;
     }
 
     #[tokio::test]

@@ -1,3 +1,5 @@
+import { activePopup, closePopup, togglePopup } from "./ui/popup.js";
+
 export function nativeMessageSentAtMs(item) {
   const value = item?.sentAtMs ?? item?.messageMetadata?.sentAtMs;
   return Number.isFinite(value) && value > 0 ? value : null;
@@ -9,7 +11,10 @@ export function messageActionState({
   readOnly = false,
   turnInProgress = false,
   editSupported = true,
-  completed = false
+  completed = false,
+  forkSupported = false,
+  forkDisabled = false,
+  turnId = null
 }) {
   const user = item?.type === "userMessage";
   const assistant = item?.type === "agentMessage";
@@ -18,6 +23,9 @@ export function messageActionState({
   return {
     canCopy: user || assistant && (completed || item?.completed === true || item?.status === "completed"),
     canEdit: user && editable && !readOnly && !turnInProgress && editSupported,
+    canFork: assistant && forkSupported && !!turnId,
+    forkDisabled,
+    forkTurnId: turnId,
     sentAtMs: nativeMessageSentAtMs(item),
     messageId: typeof metadata?.messageId === "string" ? metadata.messageId : null,
     turnId: typeof metadata?.turnId === "string" ? metadata.turnId : null
@@ -50,6 +58,7 @@ export function renderMessageActions(root, item, options, callbacks) {
   const binding = {
     item, signature, trigger, space, panel,
     dispose() {
+      if (activePopup?.trigger === binding.more) closePopup();
       space.remove();
       if (root.messageActionBinding === binding) delete root.messageActionBinding;
     }
@@ -79,6 +88,16 @@ export function renderMessageActions(root, item, options, callbacks) {
   if (user && time) panel.append(time);
   if (state.canCopy) panel.append(action("copy", user ? "复制用户消息" : "复制回复", callbacks.copy));
   if (state.canEdit) panel.append(action("edit", "编辑并再次发送", callbacks.edit));
+  if (state.canFork) {
+    // 用户要求回复下方 ⋯ 菜单；不支持的侧边/子智能体不创建按钮，不能仅置灰。
+    const more = action("more", "更多操作", () => togglePopup(more));
+    more.classList.add("message-more-button");
+    more.setAttribute("aria-haspopup", "menu"); more.setAttribute("aria-expanded", "false");
+    more.menuOptions = [{ value: "fork", label: "在新聊天中分支", icon: "fork",
+      disabled: state.forkDisabled, action: () => callbacks.fork(state.forkTurnId) }];
+    binding.more = more;
+    panel.append(more);
+  }
   if (!user && time) panel.append(time);
   space.append(panel); root.append(space);
 }

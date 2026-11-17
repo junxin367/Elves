@@ -362,6 +362,7 @@ impl Data {
         self.edits.retain(|_, edit| edit.thread_id != id);
         self.thread_pins.remove(id);
         self.settings.remove(id);
+        self.fork_sources.remove(id);
         self.thread_devices.remove(id);
         self.queue_gates.remove(id);
         let prefix = format!("{id}:");

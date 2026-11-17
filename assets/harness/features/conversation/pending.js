@@ -9,6 +9,7 @@ import { creating, selectedId, selectionToken, selectionVersion, session, thread
 import { recoveryStore } from "../../core/stores.js";
 import { randomId } from "../../core/util.js";
 import { api } from "../api.js";
+import { openForkResult, validForkResult } from "./fork.js";
 import { clearSubmittedDraft, recoverFailedInput, restorePrivateInputs } from "../composer/draft-restore.js";
 import {
   recoveryGeneration, setRecoveryScope, smallInputStorageRecord, snapshotDraft, submittedDrafts
@@ -35,7 +36,7 @@ export async function mutate(action, payload, { reliable = false, receiptId = nu
   const queueAction = ["steerQueued", "removeQueued"].includes(action);
   if (queueAction && pending)
     throw Object.assign(new Error("队列操作仍待确认，请先查询原回执，不要重复引导或删除。"), { notSubmitted: true });
-  const trackedOperation = queueAction || ["deleteThread", "createSideThread", "closeSideThread"].includes(action);
+  const trackedOperation = queueAction || ["deleteThread", "createSideThread", "closeSideThread", "forkThread"].includes(action);
   const version = selectionVersion;
   const deviceId = session?.device.id, generation = recoveryGeneration;
   const operationScope = privateInputScope(session);
@@ -46,7 +47,7 @@ export async function mutate(action, payload, { reliable = false, receiptId = nu
   if (reliable && !pending) {
     try {
       const record = {
-        id, action, payload, deviceId: session.device.id, selectionToken, time: Date.now(),
+        id, action, payload, deviceId: session.device.id, selectionToken, operationScope, time: Date.now(),
         ...(["send", "create", "setGoal", "editMessage"].includes(action) ? {
           // 历史回退事件会重新加载正文；先保存编辑文字，失败或刷新后不能随旧消息节点一起丢失。
           draft: action === "editMessage"
@@ -183,6 +184,11 @@ export async function mutate(action, payload, { reliable = false, receiptId = nu
       });
     }
   }
+  if (action === "forkThread" && result.state === "completed" && !validForkResult(result.result, payload.threadId)) {
+    if (ownsPending()) void resolvePending();
+    throw Object.assign(new Error("分支回执不完整或身份不匹配，请核对原请求，不要重复创建"),
+      { receiptId: id, outcomeUnknown: true });
+  }
   if (ownsPending() && result.state === "failed") await recoverFailedInput(pending);
   if (ownsPending()) savePending(null);
   if (result.state === "failed") {
@@ -208,7 +214,8 @@ export async function resolvePending() {
   const current = pending;
   const deviceId = session.device.id;
   const queueAction = ["steerQueued", "removeQueued"].includes(current.action);
-  const operationScope = queueAction ? privateInputScope(session) : null, generation = recoveryGeneration;
+  const scopedOperation = queueAction || current.action === "forkThread";
+  const operationScope = scopedOperation ? privateInputScope(session) : null, generation = recoveryGeneration;
   const version = selectionVersion;
   const queueReadVersion = queueVersion;
   if (current.invalid || (current.deviceId && current.deviceId !== deviceId)) {
@@ -216,7 +223,7 @@ export async function resolvePending() {
     updateComposer(); return;
   }
   const stillCurrent = () => pending === current && session?.device.id === deviceId
-    && (!queueAction || generation === recoveryGeneration && operationScope === privateInputScope(session));
+    && (!scopedOperation || generation === recoveryGeneration && operationScope === privateInputScope(session));
   const retry = delay => {
     clearTimeout(pendingTimer);
     setPendingTimer(setTimeout(() => { if (stillCurrent()) void resolvePending(); }, delay));
@@ -265,6 +272,16 @@ export async function resolvePending() {
         && (receipt.result?.threadId !== current.payload.threadId
           || receipt.result?.messageId !== current.payload.messageId)) {
       notice("队列操作回执的会话或消息不匹配，原请求标识已保留，请继续核对原回执。", true);
+      updateComposer(); return;
+    }
+    if (current.action === "forkThread") {
+      if (receipt.state === "completed" && !validForkResult(receipt.result, current.payload.threadId)) {
+        notice("分支回执身份不匹配，原请求已保留，不会重复创建", true);
+        updateComposer(); return;
+      }
+      savePending(null);
+      if (receipt.state === "completed") await openForkResult(current, receipt.result);
+      else notice(receipt.result?.message || "分支未创建", true);
       updateComposer(); return;
     }
     savePending(null);

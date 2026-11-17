@@ -47,7 +47,7 @@ import { activatePromptOptimization, openPromptOptimizationSettings } from "./co
 import { removeAdjacentPromptToken, selectSkill } from "./composer/selected-skills.js";
 import { moveSlashIndex, skillIndex } from "./composer/skill-catalog.js";
 import {
-  handlePromptInput, renderSkillMenu, selectCompactCommand, selectPromptOptimizationCommand, slashMenuEntries, updateSkillMenu
+  handlePromptInput, renderSkillMenu, selectCompactCommand, selectForkCommand, selectPromptOptimizationCommand, slashMenuEntries, updateSkillMenu
 } from "./composer/skills.js";
 import {
   followMessages, historyScrollTop, setFollowMessages, setHistoryScrollTop, updateScrollControl
@@ -500,6 +500,7 @@ export function shell() {
         else {
           const entry = entries[skillIndex];
           if (entry?.type === "compact") selectCompactCommand();
+          else if (entry?.type === "fork") selectForkCommand();
           else if (entry?.type === "goal") selectGoalCommand();
           else if (entry?.type === "promptOptimize") selectPromptOptimizationCommand();
           else if (entry?.type === "skill") selectSkill(entry.skill);

@@ -67,6 +67,13 @@ export function sideThreadsEnabled() {
 export function serviceSideThread() {
   return thread?.id === selectedId && thread?.serviceSide === true;
 }
+export function threadForkAllowed(id = selectedId) {
+  // 用户要求不支持的侧边直接移除分支入口；能力必须来自当前持久 Codex 主会话。
+  return !!id && !creating && thread?.id === id && !isClaude() && !threadReadOnly(id)
+    && thread.capabilities?.forkThread === true && thread.ephemeral !== true
+    && !["side", "subagent"].includes(thread.viewKind) && !normalizeRelatedView(relatedThreadViews.get(id), id)
+    && relatedSessionView?.threadId !== id;
+}
 export function threadReadOnly(id = selectedId) {
   return !!session?.readOnly || !!id && (
     thread?.id === id && (thread.readOnly === true || thread.viewKind === "subagent")

@@ -72,6 +72,10 @@ impl CodexHarness {
             return self.answer_async(&id, &payload, authorization).await;
         }
         match action {
+            "forkThread" => {
+                self.fork_thread(&id, &identity["thread"], &payload, authorization)
+                    .await
+            }
             "send" => {
                 self.enqueue(&id, payload, &identity["thread"], authorization)
                     .await

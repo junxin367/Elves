@@ -12,6 +12,7 @@ import { copyLocalInput, isLocalInput, localInputBridge, validateLocalInputs } f
 import { captureTransferInputs, hasTransferFiles, readTransferInputs } from "../assets/harness/transfer-inputs.js";
 import { marked, Renderer } from "../assets/harness/vendor/marked.esm.js";
 import { defaultSharedSettings } from "../assets/harness/features/settings/shared-state.js";
+import { messageActionState, renderMessageActions } from "../assets/harness/message-actions.js";
 
 async function navigationFixture(native = false, transport = native ? "desktop" : "remote",
   { mobile = false, android = false } = {}) {
@@ -8600,6 +8601,7 @@ function independentPromptOptimizationHarness(backend = "claude") {
     currentThreadDisplay: () => ({ tokenUsage: null }), contextUsage: () => null,
     compactUsageDescription: () => "", compactCommandAvailable: () => false, compactContext() {},
     claudeCommandSupported: () => false,
+    serviceSideThread: () => false,
     goalComposerReason: () => "当前原生会话不提供目标", selectGoalCommand() {},
     deleting: false, composerCanAddImages: () => true, chooseComposerImages() {},
     activePopup: null, renderPopup() {}, closePopup() {}, closeComposerMenus() {},
@@ -13500,6 +13502,7 @@ function claudeExecutionFeedbackHarness(turn) {
       || item?.type === "contextCompaction" && item.completed === true
       || ["completed", "failed", "interrupted"].includes(item?.status),
     threadReadOnly: () => false, threadSentMessageEditAllowed: () => false, compactionLocked: () => false,
+    threadForkAllowed: () => false, forkAvailable: () => false,
     renderItem: item => makeNode(item.text || item.type), renderMessageActions() {}, renderEditedFiles: () => null,
     claudeQuestionReplies: () => null, renderClaudeQuestionReply: () => makeNode(),
     renderActivity: (value, work, running) => {
@@ -15747,6 +15750,7 @@ function claudeSlashMenuHarness() {
     cacheDisplayData: (...values) => writes.push(values), setTimeout: () => 1, clearTimeout() {},
     editingMessage: null, editingQueuedMessage: null, threadReadOnly: () => false,
     compactCommandAvailable: () => true, goalComposerReason: () => "",
+    threadForkAllowed: () => false, forkAvailable: () => false, serviceSideThread: () => false,
     compactCommandMatches: query => ["compact", "压缩"].some(value => value.includes(query)),
     goalCommandMatches: query => ["goal", "目标"].some(value => value.includes(query)),
     skillIdentity: skill => `${skill.name}\0${skill.path}`, skillVisibleName: skill => skill.name,
@@ -16058,5 +16062,153 @@ test("只读及独立会话窗口不消费主窗口菜单选择", async () => {
     await h.context.openPendingNativeProject();
     assert.deepEqual(h.calls, []);
     assert.ok(h.pending());
+  }
+});
+
+test("回复更多菜单只在可分支的已结束主会话回复上生成，并绑定所属轮次", () => {
+  const forks = [];
+  const node = (tag = "div", className = "") => ({
+    tag, className, children: [], attributes: {}, isConnected: true,
+    classList: { add() {} }, setAttribute(key, value) { this.attributes[key] = value; },
+    querySelector: () => null,
+    append(...values) { for (const value of values) { value.parent = this; this.children.push(value); } },
+    remove() { if (this.parent) this.parent.children = this.parent.children.filter(value => value !== this); this.isConnected = false; },
+    ownerDocument: { createElement: tag => node(tag) },
+  });
+  const root = node(), item = { id: "reply", type: "agentMessage", status: "completed" };
+  const options = { threadId: "main", turnId: "old-turn", completed: true, forkSupported: true };
+  const callbacks = { icon: () => node("svg"), copy() {}, fork: turn => forks.push(turn) };
+  renderMessageActions(root, item, options, callbacks);
+  const more = root.messageActionBinding.more;
+  assert.equal(more.attributes["aria-haspopup"], "menu");
+  assert.equal(more.menuOptions[0].label, "在新聊天中分支");
+  more.menuOptions[0].action();
+  assert.deepEqual(forks, ["old-turn"]);
+  renderMessageActions(root, item, { ...options, forkSupported: false }, callbacks);
+  assert.equal(root.messageActionBinding.more, undefined, "侧边不创建 disabled 分支占位");
+  assert.equal(messageActionState({ item, ...options, forkDisabled: true }).forkDisabled, true);
+  assert.equal(messageActionState({ item: { type: "userMessage" }, ...options }).canFork, false);
+});
+
+test("分支能力只属于持久 Codex 主会话，侧边、子智能体和其他实例直接隐藏", () => {
+  const c = vm.createContext({
+    selectedId: "main", creating: false, thread: { id: "main", viewKind: "main", capabilities: { forkThread: true } },
+    relatedSessionView: null, relatedThreadViews: new Map(), normalizeRelatedView: value => value,
+    isClaude: () => false, threadReadOnly: () => false,
+  });
+  vm.runInContext(sourceSection("function threadForkAllowed(", "function threadReadOnly("), c);
+  assert.equal(c.threadForkAllowed(), true);
+  for (const flags of [{ viewKind: "side" }, { viewKind: "subagent" }, { ephemeral: true }, { capabilities: {} }]) {
+    const original = c.thread;
+    c.thread = { ...original, ...flags };
+    assert.equal(c.threadForkAllowed(), false);
+    c.thread = original;
+  }
+  c.relatedSessionView = { threadId: "main", kind: "side" };
+  assert.equal(c.threadForkAllowed(), false);
+  c.relatedSessionView = null; c.relatedThreadViews.set("main", { kind: "side" });
+  assert.equal(c.threadForkAllowed(), false);
+  c.relatedThreadViews.clear(); c.isClaude = () => true;
+  assert.equal(c.threadForkAllowed(), false);
+  c.isClaude = () => false; c.threadReadOnly = () => true;
+  assert.equal(c.threadForkAllowed(), false);
+});
+
+test("斜杠分支紧随压缩，支持中文和 fork 筛选，侧边同时移除分支与目标", () => {
+  const h = claudeSlashMenuHarness(), c = h.context, calls = [];
+  c.threadForkAllowed = () => true; c.forkAvailable = () => true;
+  c.forkThread = () => calls.push("fork"); c.icon = () => ({});
+  vm.runInContext(sourceSection("function forkCommandAvailable(", "function slashMenuEntries(")
+    + sourceSection("function selectForkCommand(", "function selectPromptOptimizationCommand("), c);
+  assert.deepEqual(Array.from(c.slashMenuEntries(), entry => entry.type), ["compact", "fork", "goal", "promptOptimize"]);
+  for (const query of ["/fork", "/分支", "/在新聊天"]) {
+    h.prompt.value = query; h.prompt.selectionStart = h.prompt.selectionEnd = query.length;
+    assert.deepEqual(Array.from(c.slashMenuEntries(), entry => entry.type), ["fork"]);
+    c.renderSkillMenu();
+    assert.equal(h.menu.children[1].children[0].children[1].children[0].textContent, "在新聊天中分支");
+  }
+  c.selectForkCommand();
+  assert.equal(h.prompt.value, "");
+  assert.deepEqual(calls, ["fork"]);
+  h.prompt.value = "保留文字 /fork"; h.prompt.selectionStart = h.prompt.selectionEnd = h.prompt.value.length;
+  assert.equal(c.slashMenuEntries()[0].enabled, false);
+  c.selectForkCommand(); assert.equal(h.prompt.value, "保留文字 /fork");
+  c.threadForkAllowed = () => false; c.serviceSideThread = () => true;
+  h.prompt.value = "/"; h.prompt.selectionStart = h.prompt.selectionEnd = 1;
+  assert.deepEqual(Array.from(c.slashMenuEntries(), entry => entry.type), ["compact", "promptOptimize"]);
+  const tools = independentPromptOptimizationHarness("codex");
+  tools.context.serviceSideThread = () => true; tools.context.updateComposer();
+  assert.equal(tools.add.menuOptions.some(option => option.value === "goal"), false);
+});
+
+function installForkReceiptHarness(h) {
+  const c = h.context, selections = [], focused = [];
+  Object.assign(c, {
+    threadForkAllowed: () => true, validRelatedThreadId: id => typeof id === "string" && /^[A-Za-z0-9_-]+$/.test(id),
+    closeComposerMenus() {}, loadSidebar: async () => { h.refreshes.push("sidebar"); },
+    selectThread: async id => { selections.push(id); c.selectedId = id; },
+    $: () => ({ focus: () => focused.push(c.selectedId) }),
+  });
+  vm.runInContext(sourceSection("function forkAvailable("), c);
+  return { c, selections, focused, result: {
+    ok: true, status: "created", sourceThreadId: "main", threadId: "fork-new", conversationId: "fork-new",
+  } };
+}
+
+test("分支创建只提交一次，不发送旧消息，成功后打开新会话并聚焦，保留源草稿", async () => {
+  const h = queuedReceiptHarness(), { c, selections, focused, result } = installForkReceiptHarness(h);
+  const original = h.draft.text;
+  const request = c.forkThread("old-turn");
+  assert.equal(h.requests.length, 1);
+  assert.equal(h.requests[0].path, "/api/action/forkThread");
+  assert.deepEqual(JSON.parse(JSON.stringify(h.requests[0].payload)), { threadId: "main", turnId: "old-turn" });
+  assert.equal(JSON.parse(h.disk.getItem("codex-elves-pending")).action, "forkThread");
+  await c.forkThread();
+  assert.equal(h.requests.length, 1);
+  h.receipt(0, "completed", result); await request;
+  assert.deepEqual(selections, ["fork-new"]); assert.deepEqual(focused, ["fork-new"]);
+  assert.equal(h.draft.text, original);
+  assert.equal(h.clearedDrafts.length, 0);
+  await c.openForkResult({ payload: { threadId: "main" }, deviceId: c.session.device.id,
+    operationScope: c.privateInputScope(c.session), selectionToken: c.selectionToken },
+  { ...result, permissionWarning: "分支已创建，权限保存失败" });
+  assert.ok(h.notices.some(value => value.error && value.message.includes("权限保存失败")));
+});
+
+test("分支结果未知或刷新后只查原回执，切换会话和授权后不强制跳转", async () => {
+  const h = queuedReceiptHarness(), { c, selections, result } = installForkReceiptHarness(h);
+  const operation = c.forkThread();
+  h.receipt(0, "unknown", { outcomeUnknown: true, message: "创建结果待核对" }); await operation;
+  assert.ok(c.pending);
+  const restored = queuedReceiptHarness({ disk: h.disk });
+  const next = installForkReceiptHarness(restored);
+  assert.equal(next.c.pending.action, "forkThread", "分支回执在页面重开后有效");
+  next.c.selectedId = "another"; next.c.selectionToken = "selected-b";
+  const check = next.c.resolvePending();
+  assert.match(restored.requests[0].path, /^\/api\/receipts\//);
+  restored.receipt(0, "completed", result); await check;
+  assert.equal(next.c.pending, null);
+  assert.deepEqual(next.selections, []);
+  assert.equal(next.c.selectedId, "another");
+  assert.equal(restored.clearedDrafts.length, 0);
+  assert.deepEqual(selections, []);
+  const stale = queuedReceiptHarness(), old = installForkReceiptHarness(stale);
+  const request = old.c.forkThread();
+  old.c.session = { device: { id: "new-device", createdAtMs: 2 } };
+  stale.receipt(0, "completed", result); await request;
+  assert.deepEqual(old.selections, []);
+});
+
+test("分支回执串会话时保留原请求，不导航、不重新创建", async () => {
+  const h = queuedReceiptHarness(), { c, selections, result } = installForkReceiptHarness(h);
+  const operation = c.forkThread();
+  h.receipt(0, "completed", { ...result, sourceThreadId: "foreign" });
+  await operation;
+  assert.ok(c.pending);
+  assert.deepEqual(selections, []);
+  assert.equal(h.requests.filter(request => request.path.startsWith("/api/action/")).length, 1);
+  if (h.requests[1]) {
+    h.receipt(1, "unknown", { outcomeUnknown: true });
+    await new Promise(setImmediate);
   }
 });
