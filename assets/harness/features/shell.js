@@ -136,8 +136,10 @@ export function shell() {
   setWorkspaceOpenIn(mountWorkspaceOpenIn({ anchor: $("#open-session-tools"),
     beforeOpen: () => { sessionMenu?.close(); closeComposerMenus(); } }));
   $("#related-session-back").onclick = () => void returnToParentSession().catch(error => notice(error.message, true));
-  // 用户要求提示词优化图标恢复正常前景色；矢量图标与 / 菜单共用 sparkles，避免 emoji 在 WebView2 中发灰。
-  $("#prompt-optimize").replaceChildren(icon("sparkles"));
+  // 用户要求恢复原来的彩色 ✨；显式请求 Emoji 呈现，优化完成后仍切换为绿色 sparkles 表示可恢复原文。
+  const optimizeEmoji = element("span", "prompt-optimize-emoji", "\u2728\uFE0F");
+  optimizeEmoji.setAttribute("aria-hidden", "true");
+  $("#prompt-optimize").replaceChildren(optimizeEmoji, icon("sparkles"));
   $("#prompt-optimize").onclick = () => void activatePromptOptimization();
   $("#fast-button").onclick = () => void toggleRemoteFast();
   $("#prompt-optimize").oncontextmenu = event => {

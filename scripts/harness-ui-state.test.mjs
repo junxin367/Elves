@@ -15590,14 +15590,14 @@ test("编辑器末尾换行滚动到底部，中间编辑保持原滚动位置",
   assert.equal(input.scrollTop, 0, "内容无需滚动时沿用原顶部位置");
 });
 
-test("编辑区图标恢复正常前景色，加号悬停和点击显示模型同款背景", async () => {
+test("编辑区加号保持正常前景色和交互背景，提示词优化保留彩色与绿色完成图标", async () => {
   const css = await readFile(new URL("../assets/harness/style.css", import.meta.url), "utf8");
   assert.match(css, /\.composer-add-button\{[^}]*color:var\(--text\)/);
   assert.match(css, /\.prompt-optimize-button\{[^}]*color:var\(--text\)/);
   assert.ok(css.includes(".composer-toolbar .composer-add-button:is(:focus-visible,:active,[aria-expanded=true]){background:var(--composer-hover,var(--hover))}"));
   assert.ok(css.includes(".composer-toolbar .composer-add-button:hover:not(:disabled){background:var(--composer-hover,var(--hover))}"));
   assert.match(css, /\.composer-add-button:active:not\(:disabled\)\{opacity:1\}/);
-  assert.ok(app.includes('$("#prompt-optimize").replaceChildren(icon("sparkles"))'));
+  assert.ok(app.includes('$("#prompt-optimize").replaceChildren(optimizeEmoji, icon("sparkles"))'));
 });
 
 function claudeSlashMenuHarness() {
