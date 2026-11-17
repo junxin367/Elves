@@ -7546,13 +7546,29 @@ test("Claude 压缩沿用同一正文行，状态和说明不写死执行器且�
   render({ ...base, status: "completed", completed: true, source: "automatic",
     preTokens: 21279, postTokens: 5086, durationMs: 105521 }, node);
   assert.match(node.textContent, /上下文已自动压缩/);
-  assert.match(node.attributes["aria-label"], /21,279.*5,086.*105.521/);
+  assert.match(node.attributes["aria-label"], /21,279[\s\S]*5,086[\s\S]*1 分 45.521 秒/);
   render({ ...base, status: "interrupted", completed: true }, node);
   assert.match(node.textContent, /已中断/);
   render({ ...base, status: "failed", completed: true }, node);
   assert.match(node.textContent, /失败/);
   render({ ...base, status: "completed", completed: true, outcome: "noop" }, node);
   assert.match(node.textContent, /无需压缩/);
+});
+
+test("压缩提示分行保留同次实际模型和统计，缺失字段不借用当前模型", () => {
+  const render = compactionRenderer();
+  const node = render({ id: "compact", type: "contextCompaction", completed: true,
+    compactionModel: "actual-compression-model", preTokens: 283393, postTokens: 9878, durationMs: 198244 });
+  assert.match(node.attributes["aria-label"], /\n压缩模型：actual-compression-model\n/);
+  assert.match(node.attributes["aria-label"], /\n压缩前：283,393 Token\n压缩后：9,878 Token\n缩减：96.5%\n用时：3 分 18.244 秒/);
+  const missing = render({ id: "missing", type: "contextCompaction", completed: true, postTokens: 0, durationMs: 0 });
+  assert.match(missing.attributes["aria-label"], /压缩模型：原生未提供/);
+  assert.match(missing.attributes["aria-label"], /压缩后：0 Token/);
+  assert.doesNotMatch(missing.attributes["aria-label"], /压缩前：|缩减：/);
+  const invalid = render({ id: "invalid", type: "contextCompaction", completed: true,
+    compactionModel: "invalid\nmodel", preTokens: 10, postTokens: 20, durationMs: -1 });
+  assert.match(invalid.attributes["aria-label"], /压缩模型：原生未提供/);
+  assert.doesNotMatch(invalid.attributes["aria-label"], /缩减：|用时：/);
 });
 
 test("Claude 目标统计只显示显式返回值，等待期间不自行累计耗时", () => {
@@ -7692,7 +7708,7 @@ test("切回会话的迟到快照不能抹掉压缩完成事件或把它恢复�
     (sourceSection("function completedIt") + "\n" + sourceSection("function mergeRe")),
   ].join("\n"), context);
   const completed = { turnId: "compact-turn", item: {
-    type: "contextCompaction", id: "compact", completed: true, completedAtMs: 2000,
+    type: "contextCompaction", id: "compact", completed: true, completedAtMs: 2000, compactionModel: "actual-compact-model",
   } };
   context.mergeTranscriptEvents([completed]);
   context.itemVersions.set("compact-turn:compact", 2);
@@ -7703,6 +7719,9 @@ test("切回会话的迟到快照不能抹掉压缩完成事件或把它恢复�
   assert.equal(restored.items.length, 1);
   assert.equal(restored.items[0].completed, true);
   assert.match(compactionRenderer()(restored.items[0]).textContent, /上下文已压缩/);
+  context.mergeTranscriptEvents([{ ...completed, item: { ...completed.item, compactionModel: null } }]);
+  assert.equal(context.enrichTurnTranscriptEvents({ id: "compact-turn", items: [] }).items[0].compactionModel,
+    "actual-compact-model", "同一压缩的旧历史空字段不能抹去已确认型号");
   // 新选择用另一会话的快照时仍必须隔离，不能把上一会话的事件带过去。
   context.replaceTranscriptEvents([]);
   assert.equal(context.transcriptEvents.size, 0);
@@ -14882,7 +14901,8 @@ test("编辑区主题提示接管并恢复 title，保留无障碍说明，触�
       hasAttribute: name => attrs.has(name), removeAttribute: name => attrs.delete(name),
       contains(other) { return other === this; },
       closest(selector) { return selector === "[title]" ? attrs.has("title") ? this : null
-        : selector === "[hidden],[inert]" ? this.hidden ? this : null : this.inScope ? this : null; },
+        : selector === "[hidden],[inert]" ? this.hidden ? this : null
+          : selector === ".context-compaction" ? this.isCompaction ? this : null : this.inScope ? this : null; },
       getBoundingClientRect: () => ({ left: 100, top: 200, bottom: 228, width: 120, height: 28 }),
       showPopover() {}, remove() { const index = nodes.indexOf(this); if (index >= 0) nodes.splice(index, 1); },
     };
@@ -14935,6 +14955,12 @@ test("编辑区主题提示接管并恢复 title，保留无障碍说明，触�
   metrics.id = "session-metrics"; metrics.setAttribute("title", "首 Token 时间 1.24 秒 · 缓存命中率 96.8%");
   listeners.get("pointerover")({ target: metrics, pointerType: "mouse" }); flush();
   assert.equal(nodes[0].className, "composer-tooltip composer-metrics-tooltip");
+  listeners.get("pointerout")({ target: metrics, relatedTarget: null });
+  const compaction = element("button");
+  compaction.isCompaction = true; compaction.setAttribute("title", "压缩模型：actual-model\n压缩前：1,000 Token");
+  listeners.get("pointerover")({ target: compaction, pointerType: "mouse" }); flush();
+  assert.equal(nodes[0].className, "composer-tooltip compaction-tooltip");
+  assert.match(nodes[0].textContent, /\n压缩前：/);
 });
 
 function composerMetricsHarness({ animate = false, reducedMotion = false } = {}) {

@@ -4095,6 +4095,14 @@ fn project_shared_history(frame: &Value, generation: &str) -> Vec<Value> {
             for key in ["preTokens", "postTokens", "durationMs"] {
                 event[key] = row["compactMetadata"][key].clone();
             }
+            // 刷新历史时同样只读取这条压缩边界的显式型号；不能把后续消息或当前会话模型当作压缩模型。
+            if let Some(model) = ["compactionModel", "model"].iter().find_map(|key| {
+                row["compactMetadata"][*key].as_str()
+                    .filter(|model| !model.trim().is_empty() && model.len() <= 200 && !model.chars().any(char::is_control))
+            })
+            {
+                event["compactionModel"] = json!(model.trim());
+            }
             let Some(item) = native_controls::compaction_item(&event) else {
                 continue;
             };
@@ -6909,7 +6917,7 @@ mod tests {
             {"type":"user","uuid":"goal-output","nativeControlOutput":{"name":"goal","value":"完成验收"},"message":{"content":"Goal set"}},
             {"type":"assistant","uuid":"reply","message":{"id":"reply","content":[{"type":"text","text":"开始执行"}]}},
             {"type":"system","uuid":"compact-done","subtype":"compact_boundary","timestampMs":2000,
-                "compactMetadata":{"trigger":"manual","preTokens":10000,"postTokens":2000}},
+                "compactMetadata":{"trigger":"manual","preTokens":10000,"postTokens":2000,"model":"actual-compression-model"}},
             {"type":"user","uuid":"next","message":{"content":"下一条"}}
         ]});
         let turns = project_shared_history(&frame, "generation");
@@ -6923,6 +6931,7 @@ mod tests {
             .collect();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["postTokens"], 2000);
+        assert_eq!(events[0]["compactionModel"], "actual-compression-model");
         assert_eq!(turns[1]["items"][0]["content"][0]["text"], "下一条");
     }
 

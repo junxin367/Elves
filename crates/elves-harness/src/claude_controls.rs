@@ -17,6 +17,9 @@ pub(super) fn compaction_item(event: &Value) -> Option<Value> {
         "nativeId":event["nativeId"],"phase":event["phase"],"outcome":event["outcome"],
         "startedAtMs":event["startedAtMs"],"completedAtMs":event["completedAtMs"],
         "preTokens":event["preTokens"],"postTokens":event["postTokens"],"durationMs":event["durationMs"],
+        // 实际模型只来自当前压缩的原生记录；缺失时保留空值，由界面明确说明原生未提供。
+        "compactionModel":event["compactionModel"].as_str()
+            .filter(|model| !model.trim().is_empty() && model.len() <= 200 && !model.chars().any(char::is_control)),
         "remoteInlineEvent":true,"remoteCompactionLifecycle":true}),
     )
 }
@@ -320,6 +323,17 @@ fn setting_switch_state(before: &str, change: &Value) -> SettingSwitch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compaction_item_preserves_only_explicit_native_model() {
+        let event = json!({"id":"compact","status":"completed","compactionModel":"actual-compression-model"});
+        assert_eq!(compaction_item(&event).unwrap()["compactionModel"], "actual-compression-model");
+        for model in [Value::Null, json!(""), json!("invalid\nmodel"), json!("x".repeat(201))] {
+            let mut invalid = event.clone();
+            invalid["compactionModel"] = model;
+            assert!(compaction_item(&invalid).unwrap()["compactionModel"].is_null());
+        }
+    }
 
     #[test]
     fn compact_applies_the_selected_model_only_when_the_request_chooses_one() {

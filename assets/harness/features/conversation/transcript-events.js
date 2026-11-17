@@ -33,8 +33,9 @@ export function mergeTranscriptEvents(entries) {
         || !transcriptEventTypes.has(item.type)) continue;
     const key = `${entry.turnId}:${item.id}`, previous = transcriptEvents.get(key);
     // 已收到的完成证据不能被迟到的进行中历史覆盖；失败和中断状态也随完成记录一起保留。
+    const projected = item.type === "contextCompaction" ? mergeItemProjection(previous?.item, item) : item;
     const merged = item.type === "contextCompaction" && completedItem(previous?.item) && !completedItem(item)
-      ? mergeItemProjection(item, previous.item) : item;
+      ? mergeItemProjection(projected, previous.item) : projected;
     transcriptEvents.set(key, {
       turnId: entry.turnId,
       item: merged,
@@ -172,6 +173,11 @@ export function mergeItemProjection(previous, item) {
   for (const field of ["messageMetadata", "sentAtMs", "startedAtMs", "completedAtMs", "completed",
     "remoteImages", "remoteVideos", "clientId", "remoteCompactionInput", "remoteHistoryContext", "remoteItemCompleted"])
     if (!Object.hasOwn(item, field) && Object.hasOwn(previous || {}, field)) projection[field] = previous[field];
-  const merged = mergeRemoteImageProjection(previous, null, { ...projection, ...item });
+  // 用户要求压缩模型对应同一条原生记录；较旧历史缺字段时保留已确认型号，不能跨条目或跨会话补模型。
+  const compaction = {};
+  if (previous?.id === item.id && previous.type === "contextCompaction" && item.type === "contextCompaction")
+    for (const field of ["compactionModel", "model"])
+      if (item[field] == null && typeof previous[field] === "string") compaction[field] = previous[field];
+  const merged = mergeRemoteImageProjection(previous, null, { ...projection, ...item, ...compaction });
   return previous && JSON.stringify(previous) === JSON.stringify(merged) ? previous : merged;
 }

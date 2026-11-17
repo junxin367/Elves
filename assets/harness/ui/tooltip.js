@@ -1,11 +1,11 @@
-// 主题化悬停提示：替代浏览器原生 title，使提示跟随网页配色；当前仅接管输入区及其关联菜单。
+// 主题化悬停提示：替代浏览器原生 title，使输入区、关联菜单及正文压缩提示跟随网页配色。
 
 import { element } from "./dom.js";
 
 export function installComposerTooltips() {
   // 用户要求 hover 信息跟随 Codex 配色；浏览器原生 title 无法应用网页主题，编辑区改用可访问的普通提示层。
-  // 仅接管编辑区和关联菜单的 title，保留原 aria-label；触屏及已有独立上下文提示继续沿用原交互。
-  const scope = ".composer-area,.composer-popover,.composer-add-popup,.queued-message-popup";
+  // 压缩信息沿用同一提示层，保留原 aria-label；触屏及已有独立上下文提示继续沿用原交互。
+  const scope = ".composer-area,.composer-popover,.composer-add-popup,.queued-message-popup,.context-compaction";
   let pending = null, timer = null, node = null, observer = null;
   function position() {
     if (!pending || !node) return;
@@ -55,8 +55,9 @@ export function installComposerTooltips() {
     // 原生 Codex 普通提示默认延迟 200ms，避免移动鼠标经过工具栏时连续闪烁。
     timer = setTimeout(() => {
       if (!trigger.isConnected || trigger.closest("[hidden],[inert]")) { close(); return; }
-      // 用户确认 Token 统计使用单行摘要；其他编辑区提示仍保留原有自动换行。
-      const className = trigger.id === "session-metrics" ? "composer-tooltip composer-metrics-tooltip" : "composer-tooltip";
+      // Token 统计仍为单行；用户要求压缩提示按模型、前后 Token、缩减及耗时分行，不能再显示成长条原生 title。
+      const className = trigger.id === "session-metrics" ? "composer-tooltip composer-metrics-tooltip"
+        : trigger.closest(".context-compaction") ? "composer-tooltip compaction-tooltip" : "composer-tooltip";
       node = element("div", className, pending.title);
       node.id = "composer-hover-tooltip"; node.setAttribute("role", "tooltip");
       const descriptions = (trigger.getAttribute("aria-describedby") || "").split(/\s+/).filter(Boolean);

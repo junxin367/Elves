@@ -531,16 +531,34 @@ class SharedQueueHistoryTests(unittest.TestCase):
                          ("operation", "inProgress", "active-user"))
         native.observe_control_record({"type": "system", "subtype": "compact_boundary",
             "uuid": "boundary", "timestamp": 3000,
-            "compactMetadata": {"trigger": "auto", "preTokens": 2000, "postTokens": 500, "durationMs": 1000}})
+            "compactMetadata": {"trigger": "auto", "preTokens": 2000, "postTokens": 500, "durationMs": 1000,
+                                "compactionModel": "actual-compact-model"}})
         event = native.control_projection()["compactionEvents"][0]
         self.assertEqual((event["id"], event["nativeId"], event["status"], event["source"]),
                          ("operation", "boundary", "completed", "automatic"))
+        self.assertEqual(event["compactionModel"], "actual-compact-model")
         restored = NativeSession("unused", "test-session")
         restored.restore_compaction_events(native.control_projection())
         restored.observe_control_record({"type": "system", "subtype": "compact_boundary",
             "uuid": "boundary", "timestamp": 3000, "compactMetadata": {"trigger": "auto"}})
         self.assertEqual(len(restored.compaction_events), 1)
         self.assertEqual(next(iter(restored.compaction_events)), "operation")
+        self.assertEqual(restored.compaction_events["operation"]["compactionModel"], "actual-compact-model")
+
+    def test_compaction_model_never_uses_current_session_selection(self):
+        native = self.native_active()
+        native.model = "current-session-model"
+        native.observe_control_record({"type": "system", "subtype": "compact_boundary",
+            "uuid": "without-model", "timestamp": 3000, "compactMetadata": {"trigger": "manual"}})
+        self.assertNotIn("compactionModel", native.compaction_events["without-model"])
+        native.observe_control_record({"type": "system", "subtype": "compact_boundary",
+            "uuid": "explicit-model", "timestamp": 4000,
+            "compactMetadata": {"trigger": "manual", "model": "explicit-compression-model"}})
+        self.assertEqual(native.compaction_events["explicit-model"]["compactionModel"], "explicit-compression-model")
+        native.observe_control_record({"type": "system", "subtype": "compact_boundary",
+            "uuid": "invalid-model", "timestamp": 5000,
+            "compactMetadata": {"trigger": "manual", "compactionModel": "bad\nmodel"}})
+        self.assertNotIn("compactionModel", native.compaction_events["invalid-model"])
 
     def test_compaction_terminal_results_survive_next_command_and_reconnect(self):
         native = self.native_active()

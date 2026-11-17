@@ -314,6 +314,8 @@ html{scrollbar-color:var(--muted) transparent}
 .composer-tooltip{position:fixed;inset:auto;margin:0;max-width:min(320px,calc(100vw - 16px));max-height:calc(100dvh - 16px);padding:6px 10px;border:1px solid color-mix(in srgb,var(--tooltip-text) 18%,var(--tooltip-bg));border-radius:12px;background:var(--tooltip-bg);color:var(--tooltip-text);box-shadow:0 4px 16px #0002;font-size:calc(var(--font-size)*.85);line-height:1.5;white-space:normal;overflow-wrap:anywhere;overflow:hidden;pointer-events:none;user-select:none;z-index:calc(var(--layer-menu,200) + 1)}
 /* 用户确认 Token hover 为一行描述，仅显示已返回字段；复用现有主题、定位和 200ms 延迟，窄屏边缘仍保留 8px。 */
 .composer-tooltip.composer-metrics-tooltip{max-width:calc(100vw - 16px);white-space:nowrap;font-variant-numeric:tabular-nums;text-overflow:ellipsis}
+/* 用户要求压缩 hover 分行展示模型与实测统计；宽度最多 420px，继续使用通用提示层的 8px 视口边距。 */
+.composer-tooltip.compaction-tooltip{max-width:min(420px,calc(100vw - 16px));padding:10px 12px;white-space:pre-line;font-variant-numeric:tabular-nums;line-height:1.65}
 /* 用户要求上下文用量文字使用主题正文色；兼容旧标签页仍保有 muted 类时加载到这份样式。 */
 .context-usage-value{color:var(--text);font-weight:600;font-variant-numeric:tabular-nums}
 @media(pointer:coarse){.context-info{flex-basis:32px;width:32px;height:36px}}

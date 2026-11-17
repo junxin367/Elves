@@ -81,11 +81,20 @@ export function renderTranscriptEvent(item, previous) {
         || "可继续编辑并发送普通消息，消息会加入原生队列，在压缩完成后执行。"}`
       : ended ? "已缩短较早的会话上下文，以便继续处理后续消息。"
       : "尚未收到明确的压缩完成状态，请以原生会话为准。";
-    // 沿用现有信息提示展示原生统计，不额外增加正文卡片或改动间距。
+    // 用户要求压缩 hover 分行展示实际模型和统计；只用同次原生压缩的显式型号，不能借用当前模型或实例默认值。
+    const model = [item.compactionModel, item.model].find(value => typeof value === "string"
+      && value.trim() && value.length <= 200 && !/[\u0000-\u001f\u007f-\u009f]/u.test(value));
+    const details = [description, `压缩模型：${item.outcome === "noop" ? "未执行压缩" : model?.trim() || "原生未提供"}`];
     const validCount = value => Number.isSafeInteger(value) && value >= 0;
-    if (validCount(item.preTokens) && validCount(item.postTokens))
-      description += ` 压缩前 ${item.preTokens.toLocaleString("zh-CN")} Token，压缩后 ${item.postTokens.toLocaleString("zh-CN")} Token。`;
-    if (validCount(item.durationMs)) description += ` 用时 ${(item.durationMs / 1000).toLocaleString("zh-CN")} 秒。`;
+    if (validCount(item.preTokens)) details.push(`压缩前：${item.preTokens.toLocaleString("zh-CN")} Token`);
+    if (validCount(item.postTokens)) details.push(`压缩后：${item.postTokens.toLocaleString("zh-CN")} Token`);
+    if (validCount(item.preTokens) && validCount(item.postTokens) && item.preTokens > 0 && item.postTokens <= item.preTokens)
+      details.push(`缩减：${((item.preTokens - item.postTokens) / item.preTokens * 100).toLocaleString("zh-CN", { maximumFractionDigits: 1 })}%`);
+    if (validCount(item.durationMs)) {
+      const minutes = Math.floor(item.durationMs / 60000), seconds = (item.durationMs % 60000) / 1000;
+      details.push(`用时：${minutes ? `${minutes.toLocaleString("zh-CN")} 分 ` : ""}${seconds.toLocaleString("zh-CN")} 秒`);
+    }
+    description = details.join("\n");
   } else if (notification) {
     ({ label, description } = claudeTaskNotificationText(item));
   } else if (claudeEvent) {

@@ -2191,6 +2191,13 @@ class NativeSession:
             metadata = row.get("compactMetadata") or {}
             fields = {key: metadata[key] for key in ("preTokens", "postTokens", "durationMs")
                       if type(metadata.get(key)) is int and 0 <= metadata[key] <= 9007199254740991}
+            # 用户要求显示实际压缩模型；只接收同次原生压缩元数据，不能用 self.model 或当前设置推断历史压缩型号。
+            model = next((metadata[key] for key in ("compactionModel", "model")
+                          if isinstance(metadata.get(key), str) and metadata[key].strip()
+                          and len(metadata[key]) <= 200
+                          and not any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in metadata[key])), None)
+            if model is not None:
+                fields["compactionModel"] = model.strip()
             if "durationMs" in fields and at >= fields["durationMs"]:
                 fields["startedAtMs"] = at - fields["durationMs"]
             self.record_compaction_event(identity, "completed", at, nativeId=row["uuid"],
