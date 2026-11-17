@@ -4,7 +4,7 @@ import { subscribeAndroidAmbientLight } from "../../platform.js";
 import { $, element } from "../../ui/dom.js";
 import { notice } from "../../ui/notice.js";
 import {
-  ambientLightStatus, appearance, appearanceThemeColors,
+  ambientLightStatus, appearance, appearanceButtonColor, appearanceThemeColors,
   appearanceTransitionTimer, automaticAppearanceTheme, automaticThemeAtNight,
   automaticThemeCandidate, automaticThemeLightLuxMax, automaticThemeLightLuxMin,
   automaticThemeLuxShift, automaticThemeShiftProbe, automaticThemeStableMs,
@@ -143,6 +143,8 @@ export function applyAppearance(save = false) {
   const palette = appearance.colors[appearance.theme];
   const { background } = palette;
   root.dataset.theme = appearance.theme;
+  // 管理页只在用户明确选择按钮颜色时覆盖常规按钮，旧设置继续使用原有默认/hover。
+  root.dataset.customButtonColor = String(appearanceButtonColor(palette) !== null);
   root.style.colorScheme = appearance.theme;
   const values = {
     // 所有入口、侧边页面及管理页继承同一套派生色；每次完整写入，不能残留上一主题的强调色或主按钮色。

@@ -83,7 +83,7 @@
 }
 
 :root {
-  /* 用户要求管理页与 Harness 共用外观：中性主按钮、实色选中控件和文字选区分别继承；旧缓存用现有变量回退。 */
+  /* 用户要求管理页与 Harness 共用外观：primary 默认色、实色选中控件及文字选区分别继承；自定义按钮另用 managed-button。 */
   --control-accent: var(--brand-accent);
   --control-accent-foreground: var(--primary-foreground);
   --managed-selection: var(--accent);
@@ -7272,8 +7272,13 @@ body {
   }
 }
 
-/* 用户要求管理页表单与主按钮分色：开关、复选框和选区跟随 Harness，主按钮继续使用中性色。 */
+/* 用户要求管理页表单与普通按钮分色：开关、复选框和选区沿用 Harness 原强调色，不继承自定义按钮色。 */
 ::selection{background:hsl(var(--managed-selection));color:hsl(var(--managed-selection-text))}
 input[type="checkbox"],input[type="radio"]{accent-color:hsl(var(--control-accent))}
 :is(.context-enabled-switch,.codex-update-toggle,.session-sync-toggle-control).active .context-switch-track{background:hsl(var(--control-accent))}
 :is(.context-enabled-switch,.codex-update-toggle,.session-sync-toggle-control).active .context-switch-thumb{background:hsl(var(--control-accent-foreground))}
+/* 用户要求按钮颜色只影响普通操作；不改 primary 语义变量，避免同时染色徽标、导航、开关及危险操作。
+   仅在明确自定义时覆盖三个状态，沿用 Harness 的 Codex 状态派生值；未设置和旧缓存保持原样。 */
+:root[data-custom-button-color="true"] .normal-button{background:hsl(var(--managed-button));color:hsl(var(--managed-button-text))}
+:root[data-custom-button-color="true"] .normal-button:hover:not(:disabled){background:hsl(var(--managed-button-hover))}
+:root[data-custom-button-color="true"] .normal-button:active:not(:disabled){background:hsl(var(--managed-button-active))}

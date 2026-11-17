@@ -71,7 +71,7 @@ export function readAppearance() {
     if (Number.isInteger(saved.fileReadingFontSize))
       value.fileReadingFontSize = Math.min(fileReadingFontMax, Math.max(fileReadingFontMin, saved.fileReadingFontSize));
     for (const preset of Object.keys(appearanceThemes)) for (const theme of ["light", "dark"]) {
-      for (const name of ["background", "foreground", "accent"]) {
+      for (const name of ["background", "foreground", "accent", "button"]) {
         const color = saved.palettes?.[preset]?.[theme]?.[name]
           ?? (preset === value.themePreset ? saved.colors?.[theme]?.[name] : null);
         if (/^#[0-9a-f]{6}$/i.test(color)) value.palettes[preset][theme][name] = color;
@@ -370,6 +370,10 @@ function appearanceAccessibleColor(color, background, minimum = 4.5) {
   }
   return mixColor(color, target, high);
 }
+export function appearanceButtonColor(palette) {
+  // 用户要求普通按钮独立配色；旧设置和未自定义的主题不填固定值，继续沿用原来的前景色派生。
+  return /^#[0-9a-f]{6}$/i.test(palette.button) ? palette.button : null;
+}
 export function appearanceThemeColors(theme, palette) {
   const { background, foreground, contrast: setting } = palette;
   const accent = /^#[0-9a-f]{6}$/i.test(palette.accent) ? palette.accent : foreground;
@@ -392,6 +396,18 @@ export function appearanceThemeColors(theme, palette) {
     ? mixColor("#000000", accent, .22 + .12 * contrast)
     : mixColor(background, accent, .13 + .05 * contrast);
   const primaryText = appearanceReadableForeground(foreground, surfaces["control-bg"]);
+  const primaryHover = appearanceAccessibleColor(mixColor(foreground, background, .08), primaryText);
+  const primaryActive = appearanceAccessibleColor(mixColor(foreground, background, .14), primaryText);
+  const customButton = appearanceButtonColor(palette), buttonColor = customButton ?? foreground;
+  const buttonText = customButton ? appearanceReadableForeground(buttonColor, surfaces["control-bg"]) : primaryText;
+  // 用户要求按钮颜色只控制确认、保存等普通主操作，不改变发送/停止、强调及危险操作。
+  // 状态叠加比例参考 Codex 26.1111.2228：浅色 hover=.05+.06c、active=.1+.12c，
+  // 深色 hover=.04+.03c、active=.07+.05c；c 复用同一对比度曲线，并保证三个状态文字均至少 4.5:1。
+  // 未设置按钮颜色时保留现有状态值；只修正派生色，不回写用户填写的 HEX。
+  const buttonHover = customButton ? appearanceAccessibleColor(mixColor(buttonColor, background,
+    dark ? .04 + .03 * contrast : .05 + .06 * contrast), buttonText) : primaryHover;
+  const buttonActive = customButton ? appearanceAccessibleColor(mixColor(buttonColor, background,
+    dark ? .07 + .05 * contrast : .1 + .12 * contrast), buttonText) : primaryActive;
   return {
     bg: background, text: foreground, accent, "on-accent": onAccent,
     ...appearanceTextColors(theme, palette), ...surfaces,
@@ -414,8 +430,9 @@ export function appearanceThemeColors(theme, palette) {
     "selection-bg": selection, "selection-text": appearanceReadableForeground(selection, foreground),
     // 当前外观通过 HEX 独立配置，不借用 Codex 账号强调色来源；按原生自定义配色路径保留中性发送按钮和用户气泡。
     "primary-bg": foreground, "primary-text": primaryText,
-    "primary-hover": appearanceAccessibleColor(mixColor(foreground, background, .08), primaryText),
-    "primary-active": appearanceAccessibleColor(mixColor(foreground, background, .14), primaryText),
+    "primary-hover": primaryHover, "primary-active": primaryActive,
+    "button-bg": buttonColor, "button-text": buttonText,
+    "button-hover": buttonHover, "button-active": buttonActive,
     "user-message-bg": appearanceAlphaColor(foreground, .05), "user-message-text": foreground,
     "notice-bg": surfaces["control-bg"], "notice-text": foreground,
     danger: dark ? "#ff9c97" : "#b42318", "on-danger": dark ? "#171717" : "#ffffff",

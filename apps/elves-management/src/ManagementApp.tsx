@@ -329,12 +329,19 @@ export function App() {
         setTheme(event.data.theme);
         document.documentElement.classList.toggle("dark", event.data.theme === "dark");
         document.documentElement.classList.toggle("light", event.data.theme === "light");
+        // 仅普通按钮接收用户自定义颜色；旧页面和未自定义的主题保留原配色，不能残留上一个主题的按钮色。
+        document.documentElement.dataset.customButtonColor = String(event.data.customButtonColor === true);
         // 外观仍按当前客户端保存；管理页只继承主工作区已确认的配色和字体，不另建一套主题偏好。
-        // 主按钮使用中性前景，品牌强调与表单选中分别继承派生文字色/实色；旧网页包缺少字段时按同一前景/背景降级。
+        // 原有 primary 语义保持中性前景；普通按钮单独继承按钮色，品牌与表单继续使用原强调色。
+        // 旧网页包缺少字段时按同一前景/背景降级，不将按钮颜色传播到其他控件。
         for (const [token, sources] of Object.entries({
           background: ["bg"], foreground: ["text"], card: ["composer-bg", "bg"], "card-foreground": ["text"],
           popover: ["control-bg", "side"], "popover-foreground": ["text"],
           primary: ["primary-bg", "text"], "primary-foreground": ["primary-text", "bg"],
+          "managed-button": ["button-bg", "primary-bg", "text"],
+          "managed-button-text": ["button-text", "primary-text", "bg"],
+          "managed-button-hover": ["button-hover", "primary-bg", "text"],
+          "managed-button-active": ["button-active", "primary-bg", "text"],
           secondary: ["side"], "secondary-foreground": ["text"], muted: ["hover"],
           "muted-foreground": ["text-secondary", "muted"], accent: ["hover"], "accent-foreground": ["text"],
           border: ["line"], input: ["line"], ring: ["focus-ring", "accent"], destructive: ["danger"],

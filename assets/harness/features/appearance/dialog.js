@@ -21,7 +21,7 @@ import {
   applyAppearance, mountAutomaticThemeLightSetting, setAppearanceThemeMode, syncRemoteBackground
 } from "./apply.js";
 import {
-  appearance, appearanceThemeColors, appearanceThemes, conversationWidthMax, conversationWidthMin,
+  appearance, appearanceButtonColor, appearanceThemeColors, appearanceThemes, conversationWidthMax, conversationWidthMin,
   currentFileReadingFontSize, defaultAppearance, deleteRemoteBackground, fileReadingFontDefault,
   fileReadingFontMax, fileReadingFontMin, projectThreadLimits, readRemoteBackgroundFile,
   remoteBackground, remoteBackgroundBusy, remoteBackgroundError, remoteBackgroundOperation,
@@ -830,21 +830,26 @@ export function openAppearance() {
   $("#appearance-background-fit-slot").append(selectControl("appearance-background-fit", "图片铺法", [
     { value: "cover", label: "铺满裁切" }, { value: "contain", label: "完整不裁" }
   ], appearance.backgroundFit));
-  const colorFields = [["accent", "强调色"], ["background", "背景"], ["foreground", "前景"]];
+  // 用户要求只增加普通按钮配色，复用现有色盘、HEX 校验和主题/明暗隔离，不改其他设置项。
+  const colorFields = [["accent", "强调色"], ["background", "背景"], ["foreground", "前景"], ["button", "按钮颜色"]];
+  const getColor = name => name === "button"
+    ? appearanceButtonColor(appearance.colors[appearance.theme]) ?? appearance.colors[appearance.theme].foreground
+    : appearance.colors[appearance.theme][name];
   const setColor = (name, color) => { appearance.colors[appearance.theme][name] = color; applyAppearance(true); sync(); };
   const colorValueSync = new Map();
   for (const [name, label] of colorFields) {
     const row = element("div", "appearance-field");
     const control = element("div", "appearance-color-control");
-    const swatch = button("", `${label}颜色`, () => openAppearanceColorPicker(swatch, label,
-      appearance.colors[appearance.theme][name], color => setColor(name, color)), "color-swatch");
+    const swatch = button("", name === "button" ? label : `${label}颜色`, () => openAppearanceColorPicker(swatch, label,
+      getColor(name), color => setColor(name, color)), "color-swatch");
     swatch.id = `appearance-${name}`;
     swatch.setAttribute("aria-haspopup", "dialog"); swatch.setAttribute("aria-expanded", "false");
     swatch.append(element("span", "appearance-color-dot"));
     const hex = element("input", "color-hex appearance-color-value");
     hex.id = `appearance-${name}-hex`; hex.type = "text"; hex.maxLength = 7;
-    hex.spellcheck = false; hex.autocomplete = "off"; hex.setAttribute("aria-label", `${label}色值`);
-    colorValueSync.set(name, bindAppearanceColorValue(hex, () => appearance.colors[appearance.theme][name], color => setColor(name, color)));
+    hex.spellcheck = false; hex.autocomplete = "off";
+    hex.setAttribute("aria-label", name === "button" ? "按钮色值" : `${label}色值`);
+    colorValueSync.set(name, bindAppearanceColorValue(hex, () => getColor(name), color => setColor(name, color)));
     control.append(swatch, hex);
     row.append(element("span", "", label), control); $("#appearance-colors").append(row);
   }
@@ -893,7 +898,7 @@ export function openAppearance() {
     $("#appearance-background-status").hidden = !remoteBackgroundError;
     $("#appearance-background-status").textContent = remoteBackgroundError;
     for (const [name] of colorFields) {
-      const color = appearance.colors[appearance.theme][name], swatch = $(`#appearance-${name}`);
+      const color = getColor(name), swatch = $(`#appearance-${name}`);
       swatch.style.setProperty("--swatch", color);
       colorValueSync.get(name)?.();
       swatch.setAttribute("aria-description", color.toUpperCase());

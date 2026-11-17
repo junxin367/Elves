@@ -31,19 +31,24 @@
 @property --primary-text{syntax:"<color>";inherits:true;initial-value:#ffffff}
 @property --primary-hover{syntax:"<color>";inherits:true;initial-value:#303030}
 @property --primary-active{syntax:"<color>";inherits:true;initial-value:#404040}
+@property --button-bg{syntax:"<color>";inherits:true;initial-value:#1f1f1f}
+@property --button-text{syntax:"<color>";inherits:true;initial-value:#ffffff}
+@property --button-hover{syntax:"<color>";inherits:true;initial-value:#303030}
+@property --button-active{syntax:"<color>";inherits:true;initial-value:#404040}
 @property --user-message-bg{syntax:"<color>";inherits:true;initial-value:#eeeeee}
 @property --user-message-text{syntax:"<color>";inherits:true;initial-value:#1f1f1f}
 @property --notice-bg{syntax:"<color>";inherits:true;initial-value:#ffffff}
 @property --notice-text{syntax:"<color>";inherits:true;initial-value:#1f1f1f}
 @property --danger{syntax:"<color>";inherits:true;initial-value:#b42318}
 @property --green{syntax:"<color>";inherits:true;initial-value:#168350}
-/* 用户要求统一外观逻辑：明暗过渡同时覆盖派生强调色、选区及中性按钮，避免只切背景时残留上一模式的颜色。 */
-html.theme-transition{transition:--bg 300ms linear,--composer-bg 300ms linear,--composer-hover 300ms linear,--control-bg 300ms linear,--control-hover 300ms linear,--menu-divider 300ms linear,--tooltip-bg 300ms linear,--tooltip-text 300ms linear,--side 300ms linear,--text 300ms linear,--text-secondary 300ms linear,--muted 300ms linear,--line 300ms linear,--hover 300ms linear,--code 300ms linear,--accent 300ms linear,--on-accent 300ms linear,--accent-text 300ms linear,--accent-text-hover 300ms linear,--accent-solid 300ms linear,--accent-solid-hover 300ms linear,--accent-solid-active 300ms linear,--accent-soft 300ms linear,--accent-soft-hover 300ms linear,--accent-soft-active 300ms linear,--accent-indicator 300ms linear,--focus-ring 300ms linear,--selection-bg 300ms linear,--selection-text 300ms linear,--primary-bg 300ms linear,--primary-text 300ms linear,--primary-hover 300ms linear,--primary-active 300ms linear,--user-message-bg 300ms linear,--user-message-text 300ms linear,--notice-bg 300ms linear,--notice-text 300ms linear,--danger 300ms linear,--green 300ms linear}
+/* 用户要求统一外观逻辑：明暗过渡覆盖派生强调色、选区、发送按钮与独立普通按钮色，避免残留上一模式的颜色。 */
+html.theme-transition{transition:--bg 300ms linear,--composer-bg 300ms linear,--composer-hover 300ms linear,--control-bg 300ms linear,--control-hover 300ms linear,--menu-divider 300ms linear,--tooltip-bg 300ms linear,--tooltip-text 300ms linear,--side 300ms linear,--text 300ms linear,--text-secondary 300ms linear,--muted 300ms linear,--line 300ms linear,--hover 300ms linear,--code 300ms linear,--accent 300ms linear,--on-accent 300ms linear,--accent-text 300ms linear,--accent-text-hover 300ms linear,--accent-solid 300ms linear,--accent-solid-hover 300ms linear,--accent-solid-active 300ms linear,--accent-soft 300ms linear,--accent-soft-hover 300ms linear,--accent-soft-active 300ms linear,--accent-indicator 300ms linear,--focus-ring 300ms linear,--selection-bg 300ms linear,--selection-text 300ms linear,--primary-bg 300ms linear,--primary-text 300ms linear,--primary-hover 300ms linear,--primary-active 300ms linear,--button-bg 300ms linear,--button-text 300ms linear,--button-hover 300ms linear,--button-active 300ms linear,--user-message-bg 300ms linear,--user-message-text 300ms linear,--notice-bg 300ms linear,--notice-text 300ms linear,--danger 300ms linear,--green 300ms linear}
 @media(prefers-reduced-motion:reduce){html.theme-transition{transition:none}}
 :root{font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;color-scheme:light dark;--bg:#fff;--side:#f9f9f9;--text:#1f1f1f;--muted:#717171;--line:#e8e8e8;--hover:#eee;--code:#f7f7f7;--accent:#171717;--on-accent:#fff;--danger:#b42318;--green:#168350;--skill:#3f86c7;--font-size:1rem;font-size:var(--font-size)}
 /* 页面启动或旧缓存尚未写入派生变量时仍使用当前前景/背景；正常运行由 appearanceThemeColors 完整覆盖。 */
 :root{--text-secondary:var(--muted);--accent-text:var(--accent);--accent-text-hover:var(--accent);--accent-solid:var(--accent);--accent-solid-hover:var(--accent);--accent-solid-active:var(--accent);--accent-soft:var(--hover);--accent-soft-hover:var(--hover);--accent-soft-active:var(--hover);--accent-indicator:var(--accent);--focus-ring:var(--accent);--selection-bg:var(--hover);--selection-text:var(--text);--primary-bg:var(--text);--primary-text:var(--bg);--primary-hover:color-mix(in srgb,var(--text) 92%,var(--bg));--primary-active:color-mix(in srgb,var(--text) 86%,var(--bg));--user-message-bg:var(--hover);--user-message-text:var(--text);--notice-bg:var(--control-bg,var(--side));--notice-text:var(--text)}
 :root{--control-icon-size:32px;--control-inline-size:28px;--control-toolbar-size:32px;--control-menu-height:36px;--prompt-editor-max-height:180px;--popup-max-height:80dvh}
+:root{--button-bg:var(--primary-bg);--button-text:var(--primary-text);--button-hover:var(--primary-hover);--button-active:var(--primary-active)}
 /* 用户要求输入框发送/停止共用按钮固定为 28px；桌面、手机共用此值，独立于工具栏的 32px/36px 尺寸。 */
 :root{--composer-send-size:28px}
 /* 用户要求 PC 主导航为 52px：36px 按钮加左右各 8px；手机网页与 Android 由 data-mobile-navigation 取消整列占位。 */
@@ -101,10 +106,13 @@ button:disabled{opacity:.45;cursor:not-allowed}
 input,textarea,select{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:9px 11px;min-width:0}
 input:focus,textarea:focus,select:focus,button:focus-visible{outline:2px solid var(--focus-ring);outline-offset:2px}
 textarea{resize:none;line-height:1.7}.muted{color:var(--muted)}
-/* 用户要求参考 Codex 自定义配色：普通主操作及发送/停止保持中性色；显式强调操作才使用彩色底，不改变按钮尺寸和动作。 */
-.primary,.send-button{background:var(--primary-bg);color:var(--primary-text);border-color:var(--primary-bg)}
-.primary:hover:not(:disabled),.send-button:hover:not(:disabled){background:var(--primary-hover)}
-.primary:active:not(:disabled),.send-button:active:not(:disabled){background:var(--primary-active)}
+/* 用户要求“按钮颜色”仅作用普通主操作；发送/停止保留原中性色，强调与危险按钮继续使用各自语义色。 */
+.primary{background:var(--button-bg);color:var(--button-text);border-color:var(--button-bg)}
+.primary:hover:not(:disabled){background:var(--button-hover)}
+.primary:active:not(:disabled){background:var(--button-active)}
+.send-button{background:var(--primary-bg);color:var(--primary-text);border-color:var(--primary-bg)}
+.send-button:hover:not(:disabled){background:var(--primary-hover)}
+.send-button:active:not(:disabled){background:var(--primary-active)}
 .accent-button{background:var(--accent-solid);color:var(--on-accent);border-color:var(--accent-solid)}
 .accent-button:hover:not(:disabled){background:var(--accent-solid-hover)}
 .accent-button:active:not(:disabled){background:var(--accent-solid-active)}
