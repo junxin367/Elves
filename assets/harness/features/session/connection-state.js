@@ -54,7 +54,8 @@ export function setConnectionLatencyFloor(value) { return connectionLatencyFloor
 export function setConnectionRouteSignature(value) { return connectionRouteSignature = value; }
 export function setConnectionLatencyRefresh(value) { return connectionLatencyRefresh = value; }
 export const channelRtts = new Map();
-export const connectionRttDescription = "点击探测连接并刷新会话。网页到接入服务的 /api/session HTTP 完整往返时长；存在两条已授权线路时分别测量，不代表模型响应耗时或端到端原生执行延迟。消息使用此处可用线路中延迟最低的一路发送，发出后不自动换路重发。";
+// 用户要求简化连接状态的悬停说明，只保留延迟含义和点击操作。
+export const connectionRttDescription = "连接往返延迟，点击探测并刷新会话。";
 export function cancelConnectionProbe() {
   connectionLatencyFloor = ++connectionLatencyVersion;
   channelRtts.clear();
