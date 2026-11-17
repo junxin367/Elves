@@ -3546,12 +3546,16 @@ fn shared_history_has_new_content(previous: &[Value], current: &[Value]) -> bool
         previous.get(&key).is_none_or(|old| {
             item.as_object().is_some_and(|fields| {
                 fields.iter().any(|(field, value)| {
-                    !matches!(field.as_str(), "id" | "clientId" | "status" | "sentAtMs")
-                        && if key.1 == "userMessage" && field == "content" {
-                            user_content_changed(old, item)
-                        } else {
-                            old.get(field) != Some(value)
-                        }
+                    // 用户要求已读不因离线、重连恢复蓝点；后台运行/未知状态是观察元数据，不是新增正文。
+                    // 仅忽略状态字段，真实新增工具输出及任务完成通知仍沿用内容与消息身份判断。
+                    !matches!(
+                        field.as_str(),
+                        "id" | "clientId" | "status" | "sentAtMs" | "backgroundStatus"
+                    ) && if key.1 == "userMessage" && field == "content" {
+                        user_content_changed(old, item)
+                    } else {
+                        old.get(field) != Some(value)
+                    }
                 })
             })
         })
@@ -6070,6 +6074,94 @@ mod tests {
         assert!(
             restored.conversation(&c.id).await.unwrap().unread,
             "同一消息新增正文也不能漏报"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_unread_background_state_changes_remain_read_after_restart() {
+        let (directory, service, mut c) = fixture();
+        let (_auth_directory, auth) = crate::tests::service_dispatch_fixture().await;
+        c.shared = true;
+        c.turns.clear();
+        service
+            .change(|saved| {
+                saved.conversations.insert(c.id.clone(), c.clone());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let mut frame = json!({"native_id":c.native_id,"job_id":&c.native_id[..8],
+        "native_status":{"tempo":"idle","sessionAlive":true},
+        "clients":{"native-user":"web-client"},"pending":[],"requests":{},
+        "messages":[
+            {"type":"user","uuid":"native-user","timestampMs":1,
+                "message":{"content":"执行后台构建"}},
+            {"type":"assistant","message":{"id":"reply","content":[
+                {"type":"tool_use","id":"background-command","name":"Bash",
+                    "input":{"command":"make","run_in_background":true}}]}},
+            {"type":"user","uuid":"tool-result",
+                "nativeToolResult":{"toolUseId":"background-command","backgroundTaskId":"bg1"},
+                "message":{"content":[{"type":"tool_result","tool_use_id":"background-command",
+                    "content":"后台构建已启动"}]}},
+            {"type":"system","uuid":"turn-done","subtype":"turn_duration","timestampMs":10}
+        ]});
+        service
+            .apply_shared_snapshot(&c.id, "connected", &frame, json!({}), true)
+            .await
+            .unwrap();
+        service
+            .command("markRead", &json!({"threadId":c.id}), &auth)
+            .await
+            .unwrap();
+
+        frame["native_status"]["sessionAlive"] = json!(false);
+        service
+            .apply_shared_snapshot(&c.id, "disconnected", &frame, json!({}), true)
+            .await
+            .unwrap();
+        let offline = service.conversation(&c.id).await.unwrap();
+        assert_eq!(offline.turns[0]["items"][1]["backgroundStatus"], "unknown");
+        assert!(
+            !offline.unread,
+            "离线补齐后台状态不能将已读历史重新标成未读"
+        );
+
+        let restored = Claude::new(directory.path()).unwrap();
+        assert!(!restored.conversation(&c.id).await.unwrap().unread);
+        frame["native_status"]["sessionAlive"] = json!(true);
+        restored
+            .apply_shared_snapshot(&c.id, "reconnected", &frame, json!({}), true)
+            .await
+            .unwrap();
+        let online = restored.conversation(&c.id).await.unwrap();
+        assert_eq!(online.turns[0]["items"][1]["backgroundStatus"], "running");
+        assert!(!online.unread, "重启后恢复后台运行状态仍须保持已读");
+
+        frame["messages"][2]["message"]["content"][0]["content"] = json!("后台构建新增输出");
+        restored
+            .apply_shared_snapshot(&c.id, "reconnected", &frame, json!({}), true)
+            .await
+            .unwrap();
+        assert!(
+            restored.conversation(&c.id).await.unwrap().unread,
+            "真正新增工具输出仍须提示未读"
+        );
+        restored
+            .command("markRead", &json!({"threadId":c.id}), &auth)
+            .await
+            .unwrap();
+        frame["messages"].as_array_mut().unwrap().push(json!({
+            "type":"user","uuid":"task-notification","timestampMs":20,
+            "nativeTaskNotification":{"taskId":"bg1","toolUseId":"background-command",
+                "status":"completed","summary":"后台构建完成"}
+        }));
+        restored
+            .apply_shared_snapshot(&c.id, "reconnected", &frame, json!({}), true)
+            .await
+            .unwrap();
+        assert!(
+            restored.conversation(&c.id).await.unwrap().unread,
+            "新的后台任务完成通知仍须提示未读"
         );
     }
 
