@@ -410,7 +410,11 @@ unsafe fn draw_button(hwnd: HWND, item: &DRAWITEMSTRUCT) {
             ..
         } = (*data).appearance.theme;
         let pressed = item.itemState & ODS_SELECTED != 0;
-        let hot = hover == item.CtlID as i32;
+        let menu = matches!(item.CtlID as i32, FILE_MENU | HELP_MENU);
+        // 用户要求文件、帮助菜单点击后不显示焦点边框；键盘焦点改用悬停底色提示，保留原生焦点和操作。
+        let keyboard_focus =
+            item.itemState & ODS_FOCUS != 0 && item.itemState & ODS_NOFOCUSRECT == 0;
+        let hot = hover == item.CtlID as i32 || menu && keyboard_focus;
         let (background, foreground) = if item.CtlID as i32 == CLOSE && (hot || pressed) {
             ([196, 43, 28], [255; 3])
         } else {
@@ -428,7 +432,7 @@ unsafe fn draw_button(hwnd: HWND, item: &DRAWITEMSTRUCT) {
             )
         };
         fill(item.hDC, &item.rcItem, background);
-        if matches!(item.CtlID as i32, FILE_MENU | HELP_MENU) {
+        if menu {
             let previous = if (*data).font.is_null() {
                 null_mut()
             } else {
@@ -453,10 +457,6 @@ unsafe fn draw_button(hwnd: HWND, item: &DRAWITEMSTRUCT) {
             );
             if !previous.is_null() {
                 SelectObject(item.hDC, previous);
-            }
-            if item.itemState & ODS_FOCUS != 0 {
-                InflateRect(&mut rect, -px(3.0, scale), -px(3.0, scale));
-                DrawFocusRect(item.hDC, &rect);
             }
             return;
         }
