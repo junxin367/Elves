@@ -150,8 +150,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     };
     controls.add(control); card.append(row);
   }
-  function addSelect(card, key, label, description, options, value, transform = apiValue, unsupported = false) {
-    const row = element("div", "appearance-field");
+  function settingSelect(key, label, options, value, transform = apiValue, unsupported = false) {
     if (!options.some(option => option.value === value))
       options = [...options, { value, label: `${value}（当前配置）`, disabled: true }];
     const control = selectControl(`settings-${name}-${key}`, label, options, value);
@@ -166,7 +165,13 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
       }
       void save(settings);
     };
-    row.append(fieldCopy(label, description), control); controls.add(control); card.append(row);
+    controls.add(control);
+    return control;
+  }
+  function addSelect(card, key, label, description, options, value, transform = apiValue, unsupported = false) {
+    const row = element("div", "appearance-field");
+    row.append(fieldCopy(label, description), settingSelect(key, label, options, value, transform, unsupported));
+    card.append(row);
   }
   function renderGeneral() {
     const backend = record.backend, values = record.settings;
@@ -209,7 +214,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     const card = section(content, "实例默认值");
     const models = record.models || [];
     const hidden = record.backend === "claude" ? values.hiddenModelIds || [] : [];
-    addSelect(card, "model", "默认模型", record.backend === "codex" ? "切换默认模型后，默认思考深度恢复为“使用模型默认”。" : "",
+    const modelControl = settingSelect("model", "默认模型",
       [inherit,
         ...models.filter(model => !hidden.includes(model.model))
           .map(model => ({ value: model.model, label: model.displayName || model.model }))],
@@ -221,13 +226,19 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
       .filter(effort => effort.reasoningEffort !== "ultra" || values.ultraReasoningEnabled === true);
     // 用户要求 Claude 也在会话实例设置默认思考深度；按原生模型能力列出等级，保存为同一实例的 Harness 默认值。
     const claudeEffortUnsupported = record.backend === "claude" && record.capabilities?.defaultReasoningEffort !== true;
-    addSelect(card, "reasoningEffort",
-        "默认思考深度", record.backend === "claude"
-          ? "用于此实例后续新会话；输入区已记住的有效选择优先，已有会话保持原深度。"
-          : "可选深度由当前模型能力决定。",
+    const effortControl = settingSelect("reasoningEffort", "默认思考深度",
         [{ value: "", label: "使用模型默认" }, ...efforts.map(effort =>
           ({ value: effort.reasoningEffort, label: effortLabels[effort.reasoningEffort] || effort.reasoningEffort }))],
         values.reasoningEffort || "", apiValue, !model || claudeEffortUnsupported);
+    effortControl.classList.add("instance-model-default-effort");
+    // 用户要求 Codex、Claude 的默认模型与思考深度合为一行：模型在前、深度在后，保留各自的能力校验及保存行为。
+    const row = element("div", "appearance-field instance-model-defaults-row");
+    const selectors = element("div", "instance-model-defaults-selectors");
+    selectors.append(modelControl, effortControl);
+    row.append(fieldCopy("默认模型与思考深度", record.backend === "codex"
+      ? "切换默认模型后，思考深度恢复为“使用模型默认”；可选深度由模型能力决定。"
+      : "用于此实例后续新会话；输入区已记住的有效选择优先，已有会话保持原深度。"), selectors);
+    card.append(row);
     if (claudeEffortUnsupported) content.append(element("p", "appearance-hint",
       "所选实例的 Claude CLI 尚未确认提供 --effort，默认思考深度暂不可修改。"));
     if (!model) content.append(element("p", "appearance-hint",
