@@ -1,5 +1,3 @@
-当前项目 fork 自 [BigPizzaV3/CodexPlusPlus](https://github.com/BigPizzaV3/CodexPlusPlus)
-
 # Elves
 
 <p align="center"><img src="assets/harness/icons/elves-logo.svg" alt="Elves 图标" width="128"></p>

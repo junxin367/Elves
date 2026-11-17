@@ -1,5 +1,3 @@
-Forked from [BigPizzaV3/CodexPlusPlus](https://github.com/BigPizzaV3/CodexPlusPlus).
-
 # Elves
 
 <p align="center"><img src="assets/harness/icons/elves-logo.svg" alt="Elves icon" width="128"></p>

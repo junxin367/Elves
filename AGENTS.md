@@ -53,7 +53,7 @@
 - 项目不再提供 Codex App 注入。禁止恢复 launcher、CDP、renderer 脚本、桌面桥接或其功能开关；允许通过独立原生 CLI / app-server 执行、只读解析项目元数据和检查会话占用。
 - 旧数据目录、已发布协议字段、设备 Cookie、Android applicationId 与签名材料可保留兼容名称，不作为当前产品名；升级清理旧程序和快捷方式，保留设置、历史、授权和缓存。
 - Windows 产物为 `target/release/elves.exe`、`dist/windows/app/elves.exe`、`dist/windows/Elves-<version>-windows-x64-setup.exe` 和同一程序的便携副本 `dist/windows/Elves-<version>-windows-x64.exe`。
-- 保留 README 顶部原 fork 来源说明；历史发布与验收记录按当时事实保留，不批量重写历史。
+- 历史发布与验收记录按当时事实保留，不批量重写历史。
 
 ## 产品行为约束
 

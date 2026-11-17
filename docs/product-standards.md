@@ -8,7 +8,7 @@
 
 当前 GitHub 仓库为 `https://github.com/junxin367/Elves`。项目主页、问题反馈、仓库元数据及桌面和 Android 应用更新均使用该仓库；Android 发布脚本的固定仓库校验须与客户端更新来源一致。产品名统一为 `Elves`，执行和管理产品独立命名为 `Harness`，远程会话只是其网页及 Android 能力。当前 crate 和产物使用 `elves-*`；旧数据目录、协议字段、Android applicationId 和签名材料按兼容需要保留。
 
-README 的 fork 来源说明保持原值。历史发布说明、签名配置回执及验收记录保留当时的仓库归属；迁移代码不表示旧仓库的 Release、Issues 或 Secrets 已迁移。
+历史发布说明、签名配置回执及验收记录保留当时的仓库归属；迁移代码不表示旧仓库的 Release、Issues 或 Secrets 已迁移。
 
 ## 产品 logo 与图标
 

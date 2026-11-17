@@ -22,7 +22,7 @@
 | --- | --- | --- |
 | 产品形态 | 保留 CodexElves 的本地产品形态。 | PROJ-001 |
 | 品牌 | 产品名：`CodexElves`；Rust crate / workspace 包名：`codex-elves-*`。 | PROJ-001 |
-| 禁止回流 | 不能恢复已移除功能，不能把项目改回 CodexPlusPlus / Codex++ / codex-plus 命名，不能破坏本地代理和管理器交互改造。 | PROJ-001 |
+| 禁止回流 | 不能恢复已移除功能，不能破坏本地代理和管理器交互改造。 | PROJ-001 |
 | 注入增强 | 不得破坏当前 Codex App 注入增强。 | PROJ-001 |
 | 既有交互 | 插件入口、工具与插件、会话管理、模型配置等现有交互不能因上游 UI patch 回退。 | PROJ-001 |
 | 数据边界 | 不修改 Codex SQLite schema，不向 Codex SQLite 写任务数据。 | SPEC-001 |
