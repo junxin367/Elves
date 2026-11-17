@@ -37,3 +37,8 @@ commands.allow = ["client_choose_inputs", "client_paste_inputs"]
 identifier = "remote-project-navigation"
 description = "仅本机主工作区可读取和确认原生菜单已登记的项目 ID，不能提交文件路径、打开选择器或登记项目。"
 commands.allow = ["client_project_navigation"]
+
+[[permission]]
+identifier = "about-close"
+description = "仅内置关于页可以关闭自身，不允许指定或操作其他窗口。"
+commands.allow = ["client_close_about"]

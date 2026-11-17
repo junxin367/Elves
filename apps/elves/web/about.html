@@ -5,14 +5,21 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>关于 Elves</title>
   <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="about.css">
   <script src="about.js" defer></script>
 </head>
-<body><main>
+<body class="about-page"><main>
   <img class="brand-icon" src="elves-about-logo.svg" alt="">
   <h1>Elves</h1>
   <p id="about-version"></p>
   <p id="status">由独立 Harness 提供会话与管理能力</p>
   <p><a href="https://github.com/junxin367/Elves">项目主页</a></p>
   <footer>开源协议：MIT</footer>
-</main></body>
+</main>
+<!-- 用户要求右下角提供确认按钮，与标题栏关闭具有相同效果，不退出主窗口或后台。 -->
+<div class="about-actions">
+  <p id="about-error" class="error" role="alert" hidden></p>
+  <button id="about-confirm" type="button">确认</button>
+</div>
+</body>
 </html>

@@ -135,8 +135,8 @@ test("外观连续变化合并为最新颜色并串行同步，模式来自实�
 
 test("原生顶栏不授予网页窗口控制权限，项目跳转仅接收原生已选项目", async () => {
   const capability = async file => JSON.parse(await readFile(new URL(`src-tauri/capabilities/${file}.json`, base), "utf8"));
-  const [appearance, connection, configuration] = await Promise.all([
-    capability("content-appearance"), capability("connection-page"),
+  const [appearance, connection, about, configuration] = await Promise.all([
+    capability("content-appearance"), capability("connection-page"), capability("about-page"),
     readFile(new URL("src-tauri/tauri.conf.json", base), "utf8").then(JSON.parse),
   ]);
   assert.deepEqual(appearance.webviews, ["elves-content", "elves-content-session-*"]);
@@ -146,8 +146,12 @@ test("原生顶栏不授予网页窗口控制权限，项目跳转仅接收原�
   assert.equal(connection.remote, undefined);
   assert.deepEqual(connection.webviews, ["elves-content"]);
   assert.deepEqual(connection.permissions, ["remote-connection"]);
-  assert.deepEqual(configuration.app.security.capabilities, ["connection-page", "content-appearance"]);
-  for (const value of [appearance, connection]) {
+  assert.equal(about.local, true);
+  assert.equal(about.remote, undefined);
+  assert.deepEqual(about.webviews, ["elves-about"]);
+  assert.deepEqual(about.permissions, ["about-close"]);
+  assert.deepEqual(configuration.app.security.capabilities, ["connection-page", "content-appearance", "about-page"]);
+  for (const value of [appearance, connection, about]) {
     assert.ok(value.permissions.every(permission => !permission.startsWith("core:window:")));
   }
   const desktop = await readFile(new URL("src-tauri/src/desktop.rs", base), "utf8");

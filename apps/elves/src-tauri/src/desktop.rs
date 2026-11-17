@@ -1093,9 +1093,56 @@ fn add_folder(app: &tauri::AppHandle) {
     });
 }
 
+fn center_about_window(window: &tauri::WebviewWindow, parent: &tauri::Window) -> tauri::Result<()> {
+    let parent_position = parent.outer_position()?;
+    let parent_size = parent.outer_size()?;
+    // 用户要求关于弹窗位于软件中央；先移到主窗口所在屏幕，让跨屏 DPI 更新后再读取实际外框尺寸。
+    // 全程使用物理像素，标题栏和边框一并计入；新窗口在定位完成前保持隐藏，避免闪到默认位置。
+    window.set_position(parent_position)?;
+    let size = window.outer_size()?;
+    let mut x =
+        i64::from(parent_position.x) + (i64::from(parent_size.width) - i64::from(size.width)) / 2;
+    let mut y =
+        i64::from(parent_position.y) + (i64::from(parent_size.height) - i64::from(size.height)) / 2;
+    if let Some(monitor) = parent.current_monitor()? {
+        // 主窗口部分移出屏幕时，仅平移必要距离，保证弹窗仍可在同屏工作区操作。
+        let area = monitor.work_area();
+        let left = i64::from(area.position.x);
+        let top = i64::from(area.position.y);
+        x = x.clamp(
+            left,
+            left + i64::from(area.size.width.saturating_sub(size.width)),
+        );
+        y = y.clamp(
+            top,
+            top + i64::from(area.size.height.saturating_sub(size.height)),
+        );
+    }
+    window.set_position(PhysicalPosition::new(x as i32, y as i32))
+}
+
+#[tauri::command]
+fn client_close_about(webview: tauri::Webview) -> Result<(), String> {
+    let url = webview.url().map_err(|error| error.to_string())?;
+    // “确认”仅关闭内置关于窗口自身，不接受目标标签，也不向会话页开放主窗口控制权限。
+    if webview.label() != "elves-about"
+        || webview.window().label() != "elves-about"
+        || url.origin().ascii_serialization() != "http://tauri.localhost"
+        || url.path() != "/about.html"
+    {
+        return Err("只有 Elves 内置关于页可以关闭自身。".into());
+    }
+    webview.window().close().map_err(|error| error.to_string())
+}
+
 fn open_about(app: &tauri::AppHandle) -> tauri::Result<()> {
     show_window(app);
+    let parent = app
+        .get_window(WINDOW_LABEL)
+        .ok_or(tauri::Error::WindowNotFound)?;
     if let Some(window) = app.get_webview_window("elves-about") {
+        window.hide()?;
+        center_about_window(&window, &parent)?;
         window.show()?;
         return window.set_focus();
     }
@@ -1106,10 +1153,14 @@ fn open_about(app: &tauri::AppHandle) -> tauri::Result<()> {
     let mut builder =
         tauri::WebviewWindowBuilder::new(app, "elves-about", WebviewUrl::External(address))
             .title("关于 Elves")
-            .inner_size(360.0, 360.0)
+            // 360×420 为逻辑像素：原有信息区下方增加固定操作区，确认按钮不挤占或遮挡内容。
+            .inner_size(360.0, 420.0)
             .resizable(false)
+            // 用户要求关于弹窗标题栏只保留关闭，不提供最小化、最大化或拖边缩放。
             .minimizable(false)
+            .maximizable(false)
             .skip_taskbar(true)
+            .visible(false)
             .on_navigation(|url| {
                 if matches!(url.host_str(), Some("tauri.localhost")) {
                     return true;
@@ -1117,11 +1168,11 @@ fn open_about(app: &tauri::AppHandle) -> tauri::Result<()> {
                 open_external(url.clone());
                 false
             });
-    if let Some(parent) = app.get_window(WINDOW_LABEL) {
-        builder = builder.owner_raw(parent.hwnd()?);
-    }
-    builder.build()?;
-    Ok(())
+    builder = builder.owner_raw(parent.hwnd()?);
+    let window = builder.build()?;
+    center_about_window(&window, &parent)?;
+    window.show()?;
+    window.set_focus()
 }
 
 fn check_update(app: &tauri::AppHandle) {
@@ -1563,7 +1614,8 @@ pub fn run() -> anyhow::Result<()> {
             client_open_session_window,
             client_choose_inputs,
             client_paste_inputs,
-            client_project_navigation
+            client_project_navigation,
+            client_close_about
         ])
         .on_menu_event(handle_menu_event)
         .setup(|app| {

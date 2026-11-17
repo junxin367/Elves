@@ -1,0 +1,7 @@
+{
+  "identifier": "about-page",
+  "description": "内置关于页的确认按钮只可关闭关于窗口自身。",
+  "local": true,
+  "webviews": ["elves-about"],
+  "permissions": ["about-close"]
+}
