@@ -556,6 +556,100 @@ test("文件引用绑定忽略旧缓存中的纯文件名，只给真实路径�
   }
 });
 
+function fileReferenceClickHarness({ path = "src/VolcengineTtsHttpClient.java#L12", legacy = false, allowFilename = false } = {}) {
+  const opened = [], menus = [], closed = [], queries = [], timers = new Map(), state = { disabled: false };
+  let timer = 0;
+  const link = { dataset: { localFilePath: path }, textContent: "VolcengineTtsHttpClient.java", isConnected: true,
+    events: new Map(), getBoundingClientRect: () => ({ left: 10, bottom: 30 }),
+    addEventListener(name, callback) {
+      this.events.set(name, [...(this.events.get(name) || []), callback]);
+    } };
+  const context = rawVm.createContext({ localFileReference,
+    setTimeout: callback => { timers.set(++timer, callback); return timer; },
+    clearTimeout: id => timers.delete(id),
+    showLocalFileMenu: (...args) => menus.push(args), closeLocalFileMenu: () => closed.push(true),
+  });
+  rawVm.runInContext(markdownSource.slice(markdownSource.indexOf("export function bindLocalFileReferences("),
+    markdownSource.indexOf('\ndocument.addEventListener("click"')).replace(/^export /, ""), context);
+  const options = { allowFilename, openFile: (...args) => opened.push(["fallback", ...args]),
+    ...(!legacy ? { getMenuOptions: (path, line) => {
+      queries.push([path, line]);
+      return [{ value: "openFile", disabled: state.disabled, action: () => opened.push(["menu", path, line]) }];
+    } } : {}) };
+  const bind = () => context.bindLocalFileReferences({ querySelectorAll: () => [link] }, options);
+  bind();
+  const fire = (name, data = {}) => {
+    const event = { button: 0, isPrimary: true, pointerId: 1, clientX: 10, clientY: 20,
+      preventDefault() { this.prevented = true; }, stopPropagation() { this.stopped = true; },
+      stopImmediatePropagation() { this.immediate = true; }, ...data };
+    for (const action of link.events.get(name) || []) { action(event); if (event.immediate) break; }
+    return event;
+  };
+  return { opened, menus, closed, queries, timers, state, link, bind, fire };
+}
+
+test("正文文件引用左键执行右键菜单的打开文件动作，保留路径行号和禁用校验", () => {
+  const h = fileReferenceClickHarness();
+  h.bind();
+  h.fire("click", { button: 2 });
+  assert.equal(h.opened.length, 0);
+  let otherClicks = 0;
+  h.link.addEventListener("click", () => ++otherClicks);
+  const click = h.fire("click");
+  assert.equal(click.prevented, true);
+  assert.equal(click.immediate, true);
+  assert.equal(otherClicks, 0, "文件默认动作不再同时触发同一链接上的其他预览或跳转");
+  assert.deepEqual(h.opened, [["menu", "src/VolcengineTtsHttpClient.java", 12]]);
+  assert.equal(h.menus.length, 0, "普通左键不打开右键菜单");
+  assert.equal(h.closed.length, 1);
+  h.link.dataset.localFileLine = "31";
+  h.fire("click");
+  assert.deepEqual(h.opened.at(-1), ["menu", "src/VolcengineTtsHttpClient.java", 31]);
+  h.state.disabled = true;
+  h.fire("click");
+  assert.equal(h.opened.length, 2, "菜单禁用时不能回退到独立 openFile 回调绕过限制");
+  h.fire("contextmenu");
+  h.fire("keydown", { key: "F10", shiftKey: true });
+  assert.equal(h.menus.length, 2);
+  assert.equal(h.opened.length, 2);
+});
+
+test("正文文件长按和拖动不误打开，下一次主动左键立即生效", () => {
+  const h = fileReferenceClickHarness();
+  h.fire("pointerdown");
+  [...h.timers.values()].at(-1)();
+  h.fire("pointerup");
+  h.fire("click");
+  assert.equal(h.menus.length, 1);
+  assert.equal(h.opened.length, 0, "长按后的合成 click 不能打开文件");
+  h.fire("pointerdown");
+  [...h.timers.values()].at(-1)();
+  h.fire("pointerup");
+  h.fire("pointerdown");
+  h.fire("pointerup");
+  h.fire("click");
+  assert.equal(h.opened.length, 1, "新的主动点击不等待上次长按抑制超时");
+  h.fire("pointerdown");
+  h.fire("pointermove", { clientX: 40 });
+  h.fire("pointerup");
+  h.fire("click");
+  assert.equal(h.opened.length, 1, "拖动不打开文件");
+  h.fire("pointerdown");
+  h.fire("pointerup");
+  h.fire("click");
+  assert.equal(h.opened.length, 2);
+});
+
+test("文件阅读链接保留原打开回调，正文纯文件名不新增点击行为", () => {
+  const document = fileReferenceClickHarness({ legacy: true, allowFilename: true, path: "README.md#L8" });
+  document.fire("click");
+  assert.deepEqual(document.opened, [["fallback", "README.md", 8]]);
+  const plain = fileReferenceClickHarness({ path: "README.md" });
+  plain.fire("click");
+  assert.equal(plain.link.events.size, 0);
+  assert.equal(plain.opened.length, 0);
+});
+
 test("正文文件菜单固定五项且浏览器打开位于第二，相对路径预览基于会话 cwd，旧会话不能借用当前身份", () => {
   const opened = [], copied = [], native = [], browsers = [];
   const context = nodeVm.createContext({ creating: false, pageLeaving: false, selectedId: "main",

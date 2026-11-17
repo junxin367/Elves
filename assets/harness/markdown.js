@@ -264,8 +264,8 @@ function showLocalFileMenu(link, position, { openFile, openBrowser, getMenuOptio
   if (!reference) return;
   closeLocalFileMenu();
   const path = reference.path;
-  const line = Number(link.dataset.localFileLine) || null;
-  // 正文菜单由所属会话提供四项操作，复用通用弹层的 Open in 子菜单、键盘与边缘避让；文件预览页保留原操作。
+  const line = Number(link.dataset.localFileLine) || reference.line || null;
+  // 正文菜单由所属会话提供文件操作，复用通用弹层的 Open in 子菜单、键盘与边缘避让；文件预览页保留原操作。
   link.menuOptions = getMenuOptions ? getMenuOptions(path, line) : [
     { value: "openFile", label: "文件", icon: "folder", disabled: typeof openFile !== "function",
       action: () => openFile(path, line) },
@@ -298,6 +298,8 @@ export function bindLocalFileReferences(root, { openFile, openBrowser, getMenuOp
     link.addEventListener("pointerdown", event => {
       if (event.isPrimary === false || event.button !== 0) return;
       cancel(false);
+      // 新的主动点击可以立即打开文件；长按结束后的合成 click 没有新的 pointerdown，仍须抑制。
+      delete link.dataset.localFileClickSuppressedUntil;
       const current = press = {
         pointerId: event.pointerId,
         x: event.clientX,
@@ -340,6 +342,7 @@ export function bindLocalFileReferences(root, { openFile, openBrowser, getMenuOp
       showLocalFileMenu(link, { x: rect.left, y: rect.bottom + 6 }, { openFile, openBrowser, getMenuOptions, allowFilename });
     });
     link.addEventListener("click", event => {
+      if (event.button > 0) return;
       const suppressedUntil = Number(link.dataset.localFileClickSuppressedUntil) || 0;
       if (suppressedUntil > Date.now()) {
         delete link.dataset.localFileClickSuppressedUntil;
@@ -348,8 +351,18 @@ export function bindLocalFileReferences(root, { openFile, openBrowser, getMenuOp
         return;
       }
       event.preventDefault();
-      event.stopPropagation();
-      try { void openFile?.(link.dataset.localFilePath, Number(link.dataset.localFileLine) || null); } catch {}
+      event.stopImmediatePropagation();
+      const reference = localFileReference(link.dataset.localFilePath, true, allowFilename);
+      if (!reference) return;
+      closeLocalFileMenu();
+      const line = Number(link.dataset.localFileLine) || reference.line || null;
+      try {
+        // 用户要求能触发文件右键菜单的引用左键默认“打开文件”；点击时复用同一菜单动作及禁用、会话和授权校验。
+        if (getMenuOptions) {
+          const option = getMenuOptions(reference.path, line)?.find(option => option.value === "openFile");
+          if (option && !option.disabled) void option.action?.();
+        } else void openFile?.(reference.path, line);
+      } catch {}
     });
   }
 }
