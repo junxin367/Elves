@@ -8015,7 +8015,7 @@ function recentSidebarHarness({ disk = storage(), showPinned = false } = {}) {
     openPopup: trigger => { context.activePopup = { trigger, node: { id: "active-popup" } }; },
     claudeThreadId: id => id.startsWith("claude-"), threadReadOnly: () => true,
     selectThread: async id => { selected.push(id); context.selectedId = id; context.thread = { id }; },
-    notice() {}, markVisibleThreadRead() {},
+    notice() {}, markVisibleThreadRead() {}, syncWorkspaceSidePanelState() {},
   });
   vm.runInContext([
     sidebarPreferenceSource,
@@ -8034,6 +8034,24 @@ function recentSidebarHarness({ disk = storage(), showPinned = false } = {}) {
   context.renderSidebar();
   return { context, root, sections, section, ids, node, selected, renders, running, pinned, unread, regular, disk };
 }
+
+test("当前主会话收到问答立即显示未读提醒，处理完成后恢复图标且不切换会话", () => {
+  const h = recentSidebarHarness();
+  h.context.selectedId = h.regular.id;
+  h.context.thread = { ...h.regular, requests: [{ id: "question", method: "remote/requestUserInputAsync" }] };
+  let syncs = 0;
+  h.context.syncWorkspaceSidePanelState = () => ++syncs;
+  h.context.renderSidebar();
+  const row = () => h.root.querySelectorAll(".thread-row").find(node => node.dataset.threadId === h.regular.id);
+  assert.equal(row().querySelector(".thread-state").classList.contains("unread"), true);
+  assert.equal(row().querySelector(".thread-state").title, "等待你的回复");
+  h.context.thread.requests = [];
+  h.context.renderSidebar();
+  assert.equal(row().querySelector(".thread-state"), null);
+  assert.equal(syncs, 2, "包括已读刷新在内的侧栏渲染同步侧边状态");
+  assert.equal(h.context.selectedId, h.regular.id);
+  assert.deepEqual(h.selected, []);
+});
 
 test("最近会话更名优先事项，双滑杆固定为最后一个操作，清除已读位于其左侧", async () => {
   const h = recentSidebarHarness();
@@ -11865,6 +11883,86 @@ test("侧边页面只接收同源父页面的可见状态，其他来源不能�
   assert.equal(document.documentElement.dataset.workspaceSidePanelVisible, "false");
 });
 
+test("主会话和侧边的完整请求快照同步审批与异步问答，旧快照不恢复已处理请求", () => {
+  const sent = [], refreshes = [], states = new Map();
+  const row = { id: "side-a", hasUnreadTurn: false, priority: { active: true, attentionState: "active" } };
+  const other = { id: "other-main", hasUnreadTurn: false, priority: { active: false, attentionState: "idle" } };
+  const parent = { postMessage: data => sent.push(data) };
+  const context = nodeVm.createContext({
+    workspaceSidePanel: true, window: { parent }, location: { origin: "http://127.0.0.1:45222" },
+    workspaceSidePanelStateSignature: "", creating: false, selectedId: row.id, connected: true, pageLeaving: false,
+    session: { device: { id: "device" } }, thread: { ...row, status: { type: "active" }, requests: [] },
+    sidebar: { recent: [row, other], pinnedThreads: [{ ...row }], projects: [{ threads: [{ ...row }] }] },
+    blockingRequestStates: states, approvalReplies: new Map(), questionVersion: 0, notifiedQuestions: null,
+    renderSidebar: () => refreshes.push(true),
+    renderApprovals: () => { context.syncWorkspaceSidePanelState(); context.renderSidebar(); },
+  });
+  nodeVm.runInContext([
+    sourceSection("function blockingRequestState(", "function approvalReplyKey("),
+    sourceSection("function replaceAsyncQuestions(", "function setQuestionReceipt("),
+    sourceSection("function replaceRequestSnapshot(", "async function submitBlockingRequest("),
+    sourceSection("function sidebarAttentionState("),
+    sourceSection("function syncWorkspaceSidePanelState(", "function installSidePanelMessageListener("),
+  ].join("\n"), context);
+  const snapshot = requestsRevision => ({ requestsEpoch: "native-epoch", requestsRevision });
+  const approval = { id: "approve", method: "item/commandExecution/requestApproval" };
+  const question = { id: "ask", method: "remote/requestUserInputAsync" };
+  context.applyBlockingRequestsSnapshot(row.id, [approval, question], snapshot(1));
+  assert.equal(context.thread.requests.length, 2);
+  assert.equal(context.notifiedQuestions[0].id, question.id);
+  assert.equal(context.sidebarAttentionState(row), "waiting");
+  assert.equal(sent.at(-1).unread, true);
+  assert.equal(sent.at(-1).running, false);
+  assert.equal(context.sidebarAttentionState(context.sidebar.pinnedThreads[0]), "waiting");
+  assert.equal(context.sidebarAttentionState(context.sidebar.projects[0].threads[0]), "waiting");
+  context.thread.hasUnreadTurn = false;
+  context.syncWorkspaceSidePanelState(true);
+  assert.equal(sent.at(-1).unread, true, "正文已读不能消除审批、问答提醒");
+  context.applyBlockingRequestsSnapshot(row.id, [question], snapshot(2));
+  const late = { id: row.id, requests: [approval, question], ...snapshot(1) };
+  context.mergeBlockingRequestsRead(row.id, late, 0);
+  assert.deepEqual(Array.from(late.requests, request => request.id), [question.id]);
+  context.thread.priority = { active: true, attentionState: "waiting" };
+  context.applyBlockingRequestsSnapshot(row.id, [], snapshot(3));
+  assert.equal(context.thread.requests.length, 0);
+  assert.equal(context.notifiedQuestions.length, 0);
+  assert.equal(context.sidebarAttentionState(row), "active");
+  assert.equal(sent.at(-1).unread, false);
+  assert.equal(sent.at(-1).running, true);
+  const before = sent.length;
+  context.applyBlockingRequestsSnapshot(other.id, [question], snapshot(1));
+  assert.equal(context.sidebarAttentionState(other), "waiting", "后台主会话的问答立即提醒");
+  assert.equal(context.thread.id, row.id);
+  assert.equal(sent.length, before, "其他主会话请求不能覆盖侧边标签");
+  context.applyBlockingRequestsSnapshot(other.id, [], snapshot(2));
+  assert.equal(context.sidebarAttentionState(other), "idle");
+  context.applyBlockingRequestsSnapshot(row.id, [question], snapshot(4));
+  context.invalidateBlockingRequests(row.id, question.id, true);
+  assert.equal(context.thread.requests.length, 0, "原生 resolved 也移除完整快照中的异步问答");
+  assert.equal(sent.at(-1).unread, false);
+  context.mergeBlockingRequestsRead(row.id, { ...row, requests: [question], ...snapshot(4) }, 0);
+  assert.equal(context.thread.requests.length, 0, "相同版本的迟到读取不恢复已处理问答");
+  assert.ok(refreshes.length >= 5);
+});
+
+test("审批面板变化立即同步侧边未读和主侧栏，原卡片复用时仍补齐侧边状态", () => {
+  const calls = [], root = { children: [] };
+  const context = nodeVm.createContext({
+    syncPendingFeedbackTimer() {}, syncWorkspaceSidePanelState: () => calls.push("side"),
+    renderSidebar: () => calls.push("sidebar"), $: () => root,
+    session: { device: { id: "device" } }, thread: { id: "main", requests: [] },
+    connected: true, threadReadOnly: () => false, approvalsAllowed: () => true,
+    blockingRequestState: () => ({ epoch: "epoch", sourceVersion: 1 }),
+    approvalReplies: new Map(), questionReplyReceipts: new Map(), approvalSignature: null,
+    pendingFeedbackReady: () => false,
+  });
+  nodeVm.runInContext(sourceSection("function renderApprovals() {", "  approvalResizeObserver?.disconnect();") + "\n}", context);
+  context.renderApprovals();
+  assert.deepEqual(calls, ["side", "sidebar"]);
+  context.renderApprovals();
+  assert.deepEqual(calls, ["side", "sidebar", "side"]);
+});
+
 test("侧边标签执行状态沿用原生状态并去重，排队占位和等待用户不显示执行中", () => {
   const sent = [], parent = { postMessage: (data, origin) => sent.push({ ...data, origin }) };
   const context = nodeVm.createContext({ nativeConnectionVersion: 1,
@@ -11884,6 +11982,7 @@ test("侧边标签执行状态沿用原生状态并去重，排队占位和等�
   context.thread.queuedMessages = [{ text: "尚未执行" }];
   context.syncWorkspaceSidePanelState();
   assert.equal(sent.at(-1).running, false);
+  assert.equal(sent.at(-1).unread, false);
   context.thread.status = { type: "pending" };
   context.syncWorkspaceSidePanelState();
   assert.equal(sent.length, 2);
@@ -11899,6 +11998,13 @@ test("侧边标签执行状态沿用原生状态并去重，排队占位和等�
   context.connected = false;
   context.syncWorkspaceSidePanelState();
   assert.equal(sent.at(-1).running, false);
+  context.thread.hasUnreadTurn = true;
+  context.syncWorkspaceSidePanelState();
+  assert.equal(sent.at(-1).unread, true, "执行状态不变时正文未读变化也要推送");
+  context.thread.hasUnreadTurn = false;
+  context.thread.priority = { attentionState: "unread" };
+  context.syncWorkspaceSidePanelState();
+  assert.equal(sent.at(-1).unread, false, "明确的已读回执优先于尚未更新的 priority");
   const count = sent.length;
   context.syncWorkspaceSidePanelState(true);
   assert.equal(sent.length, count + 1, "父页面握手后补发当前状态，不依赖之前的推送是否到达");

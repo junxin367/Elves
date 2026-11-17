@@ -19,7 +19,7 @@ import { foregroundReadGeneration, initialAuthenticationRequired } from "../sess
 import { enabledInstanceIds } from "../session/instances.js";
 import { threadOpenInMenu } from "../session/open-in.js";
 import { syncSideThreadUnread } from "../session/related-state.js";
-import { workspaceSidePanel } from "../session/side-panel.js";
+import { syncWorkspaceSidePanelState, workspaceSidePanel } from "../session/side-panel.js";
 import { cacheDisplayData, sidebarSnapshot } from "../session/thread-cache.js";
 import {
   bindSidebarRowMenu, changeSidebar, filterSideThreadSidebar, independentThreadWindowAvailable,
@@ -238,10 +238,15 @@ export function recentPriorityMenuOptions(showPinned, togglePinnedSection) {
     selected: showPinned === true, checkmark: "√", keepOpen: true, action: togglePinnedSection }];
 }
 export function renderSidebar() {
+  // 侧边确认正文已读也沿用此刷新入口，立即通知外层标签；待处理请求仍由原生请求快照保留提醒。
+  syncWorkspaceSidePanelState();
   renderSessionFilter();
   syncSideThreadUnread();
   const root = $("#sidebar-content");
   if (!root || !sidebar) return;
+  // 用户要求当前主会话收到审批或问答立即提醒；正文里的新请求优先于尚未刷新的目录快照。
+  const attentionFor = item => sidebarAttentionState(item.id === thread?.id && Array.isArray(thread.requests)
+    ? { ...item, requests: thread.requests, priority: thread.priority || item.priority } : item);
   restoreSidebarPreferences();
   filterDeletedSidebar(sidebar);
   filterSideThreadSidebar(sidebar);
@@ -310,7 +315,7 @@ export function renderSidebar() {
       title.replaceChildren(copy);
     } else title.replaceChildren(element("span", "thread-label", item.title));
     if (selectedId === item.id) title.setAttribute("aria-current", "page");
-    const attention = sidebarAttentionState(item);
+    const attention = attentionFor(item);
     const active = attention !== "waiting" && sidebarThreadActive(item);
     // 用户要求 Codex 与 Claude 列表均显示对应品牌，置顶不再用通用聊天图标；
     // 最近列表仅在标题行放图标，与项目/置顶列表共用 1em 尺寸、3px 间距和文字居中对齐规则。
@@ -428,13 +433,13 @@ export function renderSidebar() {
       mergedIds.add(item.id); mergedRecent.push(item);
     }
     const eligible = item => item.priority?.eligible !== false;
-    const needsPriority = item => eligible(item) && sidebarAttentionState(item) !== "idle";
+    const needsPriority = item => eligible(item) && attentionFor(item) !== "idle";
     const attentionOrder = { waiting: 0, unread: 1, active: 2, idle: 3 };
     // Keep an already-promoted thread sticky, but do not promote the selected
     // thread from a selection-only refresh until a real activity event arrives.
     const candidates = mergedRecent.filter(item => needsPriority(item)
       && !(item.id === selectedId && recentPrioritySelectionSuppressions.has(item.id))).sort((left, right) =>
-      attentionOrder[sidebarAttentionState(left)] - attentionOrder[sidebarAttentionState(right)]
+      attentionOrder[attentionFor(left)] - attentionOrder[attentionFor(right)]
       || sidebarUpdatedAt(right) - sidebarUpdatedAt(left));
     if (recentPriorityIds === null) {
       setRecentPriorityOpenedAt(Date.now());

@@ -138,10 +138,13 @@ export function markSidebarThreadReadLocally(id, value = sidebar) {
 }
 export function sidebarAttentionState(item) {
   const side = item.sideThreadAttention;
+  const requests = Array.isArray(item.requests) && item.requests.length > 0;
+  // 用户要求主会话和侧边会话的审批、问答均触发未读提示，不能等待下一次目录状态更新。
+  // 正文已读不能撤销仍存在的请求。
   const own = item.priority?.attentionState;
   const status = item.status?.status || item.status;
   const type = typeof status === "string" ? status : status?.type;
-  if (side?.waiting || own === "waiting" || !own && (type === "waiting" || (status?.activeFlags || []).some(flag =>
+  if (requests || side?.waiting || own === "waiting" || !own && (type === "waiting" || (status?.activeFlags || []).some(flag =>
     flag === "waitingOnApproval" || flag === "waitingOnUserInput"))) return "waiting";
   if (side?.unread || own === "unread" || item.hasUnreadTurn) return "unread";
   return side?.active || own === "active" || !own && (type === "active" || type === "inProgress") ? "active" : "idle";

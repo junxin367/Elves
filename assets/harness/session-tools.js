@@ -321,13 +321,18 @@ export function mountSessionTools(options) {
         ? '<rect x="4" y="2.5" width="12" height="15" rx="2"/><path d="M7 7h6M10 4v6M7 13h6"/>'
         : '<path d="M11.5 2.5H5a1 1 0 0 0-1 1v13a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V7z"/><path d="M11 2.5V7h5"/>'}</svg>`;
     symbol.setAttribute("aria-hidden", "true");
-    const updateRunning = running => {
-      // 用户要求侧边会话执行时原位换成已有旋转图标，完成/停止后恢复原 SVG；隐藏标签也继续同步原生状态。
-      symbol.classList.toggle("spinner", running);
-      button.title = running ? `${title}，正在执行` : title;
+    let threadRunning = false, threadUnread = false;
+    const updateThreadState = state => {
+      if (typeof state.running === "boolean") threadRunning = state.running;
+      if (typeof state.unread === "boolean") threadUnread = state.unread;
+      // 用户要求未读时以蓝点原位替换图标；蓝点优先于执行旋转，已读后恢复真实执行状态或原 SVG。
+      // 隐藏标签继续接收所属 iframe 状态，不能因选中或收起标签而在父页面直接清除未读。
+      symbol.classList.toggle("unread", threadUnread);
+      symbol.classList.toggle("spinner", threadRunning && !threadUnread);
+      button.title = threadUnread ? `${title}，有未读消息或待处理请求` : threadRunning ? `${title}，正在执行` : title;
       button.setAttribute("aria-label", button.title);
     };
-    if (threadTab) updateRunning(item.running === true);
+    if (threadTab) updateThreadState({ running: item.running === true, unread: item.unread === true });
     button.append(symbol, node("span", "workspace-reader-tab-label", label));
     const remove = control("×", `关闭${label}`, () => { if (ownsTab()) closeTab(key); }, "workspace-reader-tab-close");
     tab.append(button, remove);
@@ -356,8 +361,8 @@ export function mountSessionTools(options) {
     const renderer = threadTab ? mountWorkspaceSideThread(view, item, () => {
       // 仅可写侧边 iframe 的快捷键可从当前主会话创建；子智能体复用标签不能获得新建会话写入能力。
       if (item.kind === "side" && ownsTab() && desktop() && context.active === key) options.createSideThread?.();
-    }, running => {
-      if (retainsTab()) updateRunning(running);
+    }, state => {
+      if (retainsTab()) updateThreadState(state);
     }, (trigger, resource) => {
       if (!ownsTab() || !desktop() || context.active !== key) return;
       return resource.kind === "video"
@@ -397,6 +402,8 @@ export function mountSessionTools(options) {
     // 按会话类型和 ID 复用已有标签，不切换主会话、不重载或重发，手机和 Android 继续走整页。
     const title = kind === "subagent" ? item.name || item.title || "子智能体" : item.title || item.name || "侧边会话";
     openTab({ kind, threadId: item.id, title: String(title),
+      unread: item.hasUnreadTurn === true || item.unread === true || item.requests?.length > 0
+        || ["waiting", "unread"].includes(item.priority?.attentionState),
       running: item.running === true || kind === "subagent" && item.status === "active" }, { reveal });
     return true;
   }
@@ -507,7 +514,7 @@ function mountWorkspaceSideCreation(workspace) {
   };
 }
 
-function mountWorkspaceSideThread(workspace, item, createSideThread, updateRunning, openMediaPreview) {
+function mountWorkspaceSideThread(workspace, item, createSideThread, updateThreadState, openMediaPreview) {
   // 每个侧边会话/子智能体使用独立页面上下文，隔离输入、选中会话、滚动和实时连接，不能借用主聊天的全局发送状态。
   // 子智能体沿用原生读取返回的只读身份，不创建会话副本或开放发送。
   // 专用入口仅允许同源嵌入，不修改普通首页的禁止嵌入策略；关闭标签只卸载页面，不关闭服务端会话。
@@ -525,7 +532,8 @@ function mountWorkspaceSideThread(workspace, item, createSideThread, updateRunni
   const onMessage = event => {
     if (event.source !== frame.contentWindow || event.origin !== address.origin) return;
     if (event.data?.type === "codex-elves-side-panel-state" && event.data.threadId === item.threadId
-        && typeof event.data.running === "boolean") updateRunning?.(event.data.running);
+        && typeof event.data.running === "boolean"
+        && (event.data.unread === undefined || typeof event.data.unread === "boolean")) updateThreadState?.(event.data);
     else if (visible && event.data?.type === "codex-elves-create-side-thread") createSideThread?.();
     else if (visible && event.data?.type === "codex-elves-workspace-media-preview"
         && ["image", "video"].includes(event.data.kind) && typeof event.data.source === "string"

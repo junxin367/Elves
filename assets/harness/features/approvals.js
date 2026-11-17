@@ -4,6 +4,7 @@ import { confirmAction } from "../ui/dialog.js";
 import { $, button, element } from "../ui/dom.js";
 import { notice } from "../ui/notice.js";
 import { connected, session, thread } from "../core/state.js";
+import { renderSidebar } from "../core/actions.js";
 import { submitAsyncQuestion, submitBlockingRequest } from "./approval-requests.js";
 import {
   approvalDrafts, approvalReplies, approvalReplyKey, approvalResizeObserver, approvalSignature,
@@ -19,6 +20,7 @@ import { pendingFeedbackReady } from "./composer/send-state.js";
 import { reconcileChildren } from "./messages/item-presentation.js";
 import { setMarkdown } from "./messages/media.js";
 import { approvalsAllowed, isClaude, threadReadOnly } from "./session/capabilities.js";
+import { syncWorkspaceSidePanelState } from "./session/side-panel.js";
 
 function renderAsyncQuestion(card, request, requestThreadId) {
   const key = JSON.stringify([session.device.id, requestThreadId, request.id]);
@@ -95,6 +97,8 @@ function renderAsyncQuestion(card, request, requestThreadId) {
 }
 export function renderApprovals() {
   syncPendingFeedbackTimer();
+  // 用户要求请求出现和处理完成时同步主侧栏与侧边标签，不能仅刷新审批卡片或等待执行状态变化。
+  syncWorkspaceSidePanelState();
   const root = $("#approval-area"); if (!root) return;
   const requests = thread?.requests || [];
   const signature = JSON.stringify([session?.device.id, thread?.id, requests, threadReadOnly(), approvalsAllowed(), connected,
@@ -105,6 +109,7 @@ export function renderApprovals() {
       .map(([key, reply]) => [key, reply.state, pendingFeedbackReady(reply)])]);
   if (signature === approvalSignature) return;
   setApprovalSignature(signature);
+  renderSidebar();
   approvalResizeObserver?.disconnect(); setApprovalResizeObserver(null);
   const previousCards = new Map([...root.children].filter(card => card.remoteRequestSignature)
     .map(card => [card.remoteRequestSignature, card]));

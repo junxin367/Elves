@@ -1305,6 +1305,10 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .workspace-reader-tab-icon>svg{width:100%;height:100%}
 /* 用户要求侧边执行时替换标签图标；复用 spinner 的旋转与主题配色，保持原标签图标的 14px 占位。 */
 .workspace-reader-tab-icon.spinner>svg{display:none}
+/* 用户要求侧边未读以 6px 蓝点替换原图标；保留 14px 占位避免标题跳动，颜色与会话栏未读蓝点一致。 */
+.workspace-reader-tab-icon.unread{align-items:center;justify-content:center}
+.workspace-reader-tab-icon.unread>svg{display:none}
+.workspace-reader-tab-icon.unread::before{content:"";width:6px;height:6px;border-radius:50%;background:#3076df}
 .workspace-reader-tab-close{display:grid;place-items:center;flex:0 0 auto;width:28px;height:28px;min-height:0;padding:0;border:0;border-radius:5px;color:var(--muted);font-size:18px;font-weight:400;line-height:1}
 /* 用户要求关闭按钮仅在对应标签悬停时显示；保留原 24px 占位，避免悬停时标题宽度跳动。键盘仍可用 Delete 关闭。 */
 .workspace-reader-tab-close{margin-right:3px;width:24px;height:24px;font-size:16px;visibility:hidden}

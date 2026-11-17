@@ -553,6 +553,58 @@ test("侧边标签只接受自身原生执行状态，隐藏后仍同步旋转�
   assert.equal(h.messageListeners.size, 0);
 });
 
+test("侧边未读蓝点替换原图标，隐藏标签和切换主会话保持独立并只接受自身已读确认", async () => {
+  const h = harness();
+  h.api.openSideThread({ id: "side-a", title: "侧边 A", running: true, hasUnreadTurn: true });
+  const button = h.tablist.children[0].children[0], symbol = button.children[0];
+  const original = symbol.innerHTML, frame = h.views.children[0].children[0];
+  frame.contentWindow = { postMessage() {} };
+  const event = { source: frame.contentWindow, origin: "http://127.0.0.1:45222",
+    data: { type: "codex-elves-side-panel-state", threadId: "side-a", running: true, unread: false } };
+  assert.equal(symbol.classList.contains("unread"), true);
+  assert.equal(symbol.classList.contains("spinner"), false);
+  assert.equal(button.children[1].textContent, "侧边 A");
+  assert.match(button.getAttribute("aria-label"), /未读消息或待处理请求/);
+  h.api.openSideThread({ id: "side-b", title: "侧边 B" });
+  h.api.close();
+  h.message({ ...event, source: {} });
+  h.message({ ...event, origin: "https://other.example" });
+  h.message({ ...event, data: { ...event.data, threadId: "side-b" } });
+  h.message({ ...event, data: { ...event.data, unread: "false" } });
+  assert.equal(symbol.classList.contains("unread"), true);
+  h.state.threadId = "thread-b"; h.api.updateContext();
+  h.message(event);
+  assert.equal(symbol.classList.contains("unread"), false);
+  assert.equal(symbol.classList.contains("spinner"), true);
+  assert.equal(symbol.innerHTML, original);
+  h.message({ ...event, data: { ...event.data, running: false, unread: true } });
+  h.state.threadId = "thread-a"; h.api.updateContext();
+  assert.equal(symbol.classList.contains("unread"), true);
+  const otherSymbol = h.tablist.children[1].children[0].children[0];
+  assert.equal(otherSymbol.classList.contains("unread"), false);
+  h.message({ ...event, data: { ...event.data, running: false, unread: false } });
+  assert.equal(symbol.classList.contains("unread"), false);
+  assert.equal(symbol.classList.contains("spinner"), false);
+  assert.equal(button.getAttribute("aria-label"), "侧边 A");
+  const css = await readFile(new URL("../assets/harness/style.css", import.meta.url), "utf8");
+  assert.match(css, /\.workspace-reader-tab-icon\.unread>svg\{display:none\}/);
+  assert.match(css, /\.workspace-reader-tab-icon\.unread::before\{[^}]*width:6px;[^}]*height:6px;[^}]*background:#3076df/);
+  h.api.dispose();
+  assert.equal(h.messageListeners.size, 0);
+});
+
+test("侧边初次打开已有审批或问答时直接显示未读蓝点，普通文件标签保持图标", () => {
+  for (const extra of [{ priority: { attentionState: "waiting" } },
+    { requests: [{ id: "question", method: "remote/requestUserInputAsync" }] }]) {
+    const h = harness();
+    h.api.openSideThread({ id: "side-a", title: "待处理", ...extra });
+    assert.equal(h.tablist.children[0].children[0].children[0].classList.contains("unread"), true);
+    h.api.openFile("src/app.js");
+    assert.equal(h.tablist.children[1].children[0].children[0].classList.contains("unread"), false);
+    h.api.dispose();
+  }
+});
+
 test("手机、Android 和侧边页面本身不嵌套会话标签，非法目标不创建页面", () => {
   for (const options of [{ desktop: false }, { android: true }, { sidePanel: true }]) {
     const h = harness(options);

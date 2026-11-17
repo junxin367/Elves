@@ -2,7 +2,7 @@
 
 import { notice } from "../ui/notice.js";
 import { mutate, reloadThread, renderApprovals, renderSidebar } from "../core/actions.js";
-import { connected, pageLeaving, selectedId, session, thread } from "../core/state.js";
+import { connected, pageLeaving, selectedId, session, sidebar, thread } from "../core/state.js";
 import { randomId } from "../core/util.js";
 import { api } from "./api.js";
 import {
@@ -13,6 +13,21 @@ import {
 } from "./approval-state.js";
 import { approvalsAllowed, privateInputScope, threadReadOnly } from "./session/capabilities.js";
 
+function replaceRequestSnapshot(target, state) {
+  replaceBlockingRequests(target, state.requests);
+  if (!state.includesAsyncQuestions) return;
+  replaceAsyncQuestions(target, state.requests);
+  // 完整请求快照已确认全部处理后撤销旧 waiting，避免蓝点等待另一条状态事件才消失。
+  if (!target.requests.length && target.priority?.attentionState === "waiting")
+    target.priority = { ...target.priority,
+      attentionState: target.priority.active === true ? "active" : target.hasUnreadTurn ? "unread" : "idle" };
+}
+function updateSidebarRequestSnapshot(id, state) {
+  // 用户要求未打开的主会话同样提醒；更新同一授权下最近、置顶和项目中的同一会话，不新增角标计数。
+  for (const item of [...(sidebar?.recent || []), ...(sidebar?.pinnedThreads || []),
+    ...(sidebar?.projects || []).flatMap(project => project.threads || [])])
+    if (item.id === id) replaceRequestSnapshot(item, state);
+}
 export function applyBlockingRequestsSnapshot(id, requests, snapshot = null, { readVersion = null, render = true } = {}) {
   if (typeof id !== "string" || !Array.isArray(requests) || snapshot?.requestsKnown === false) return false;
   const state = blockingRequestState(id);
@@ -32,25 +47,32 @@ export function applyBlockingRequestsSnapshot(id, requests, snapshot = null, { r
   } else {
     if (state.epoch || readVersion !== null && readVersion !== state.generation) return true;
   }
-  state.requests = requests.filter(request => request.method !== "remote/requestUserInputAsync"
-    && (state.epoch && (readVersion === null || readVersion === state.generation)
-      || !state.completed.has(JSON.stringify(request.id))));
+  // 用户要求审批和问答均及时提醒：独立服务的带版本/明确已知快照包含全部请求，
+  // 必须连同异步问答保存并核对，不能在阻塞请求筛选时丢掉；旧的未声明完整快照仍只替换阻塞部分。
+  state.includesAsyncQuestions = requestsSnapshotIsVersioned(snapshot) || snapshot?.requestsKnown === true;
+  state.requests = requests.filter(request => state.epoch && (readVersion === null || readVersion === state.generation)
+    || !state.completed.has(JSON.stringify(request.id)));
   ++state.generation;
   for (const [key, reply] of approvalReplies) {
     if (reply.deviceId === session?.device.id && reply.threadId === id
         && !state.requests.some(request => request.id === reply.requestId && request.method === reply.method))
       approvalReplies.delete(key);
   }
+  updateSidebarRequestSnapshot(id, state);
   if (selectedId === id && thread?.id === id) {
-    replaceBlockingRequests(thread, state.requests);
+    replaceRequestSnapshot(thread, state);
+    if (state.includesAsyncQuestions && readVersion === null) {
+      setNotifiedQuestions(thread.requests.filter(request => request.method === "remote/requestUserInputAsync"));
+      setQuestionVersion(questionVersion + 1);
+    }
     if (render) renderApprovals();
-  }
+  } else if (render) renderSidebar();
   return true;
 }
 export function mergeBlockingRequestsRead(id, latest, readVersion) {
   applyBlockingRequestsSnapshot(id, latest.requests, latest, { readVersion, render: false });
   const state = blockingRequestState(id);
-  if (state.requests) replaceBlockingRequests(latest, state.requests);
+  if (state.requests) replaceRequestSnapshot(latest, state);
   else if (readVersion !== state.generation) replaceBlockingRequests(latest, []);
 }
 export function invalidateBlockingRequests(id, requestId, resolved = false) {
@@ -65,9 +87,15 @@ export function invalidateBlockingRequests(id, requestId, resolved = false) {
     if (reply.deviceId === session?.device.id && reply.threadId === id && reply.requestId === requestId)
       approvalReplies.delete(key);
   }
+  if (state.requests) updateSidebarRequestSnapshot(id, state);
   if (selectedId === id && thread?.id === id && state.requests) {
-    replaceBlockingRequests(thread, state.requests); renderApprovals();
-  }
+    replaceRequestSnapshot(thread, state);
+    if (state.includesAsyncQuestions) {
+      setNotifiedQuestions(thread.requests.filter(request => request.method === "remote/requestUserInputAsync"));
+      setQuestionVersion(questionVersion + 1);
+    }
+    renderApprovals();
+  } else renderSidebar();
 }
 export async function submitBlockingRequest(requestThreadId, request, action, value, identity = blockingApprovalIdentity(requestThreadId, request)) {
   if (!connected || threadReadOnly(requestThreadId) || !approvalsAllowed() || thread?.id !== requestThreadId) return;
