@@ -6331,6 +6331,42 @@ test("普通队列仍按待执行显示，保留引导、编辑、删除及排�
   }
 });
 
+test("主会话与侧边压缩期间只禁用引导，队列编辑、删除和排序保持可用", () => {
+  for (const serviceSide of [false, true]) {
+    const messages = ["a", "b"].map((id, index) => ({
+      id, clientUserMessageId: `client-${id}`, createdAt: index + 1, text: `待执行-${id}`,
+      submission: { status: "queued" },
+    }));
+    const { context } = queueDeliveryHarness(messages);
+    context.thread.serviceSide = serviceSide;
+    context.compactionLocked = () => true;
+    assert.equal(context.queueReorderAvailable(), true);
+    for (const row of context.renderQueuedMessages(messages).children) {
+      assert.equal(row.children.find(node => node.className === "queued-steer-button").disabled, true);
+      assert.equal(row.children.find(node => node.className.includes("queued-drag-handle")).disabled, false);
+      const menu = row.children.find(node => node.className === "queued-menu-button");
+      assert.equal(menu.disabled, false);
+      assert.equal(menu.menuOptions.find(option => option.label === "编辑消息").disabled, false);
+      assert.equal(menu.menuOptions.find(option => option.value === "remove").disabled, undefined);
+    }
+  }
+});
+
+test("侧边已确认压缩可排队发送，未知回执和旧授权仍要求核对", () => {
+  const context = nodeVm.createContext({
+    selectedId: "side", session: { device: { id: "device" }, capabilities: { compactionQueueSend: true } },
+    isClaude: () => false, serviceSideThread: () => true, compactionLocked: () => true,
+    compaction: { state: "running", nativeConfirmed: true },
+    currentCompaction: () => context.compaction,
+  });
+  nodeVm.runInContext(sourceSection("function compactionQueueSendReason(", "function persistCompactions("), context);
+  assert.equal(context.compactionQueueSendReason(), "");
+  context.compaction = { state: "unknown" };
+  assert.match(context.compactionQueueSendReason(), /结果仍待确认/);
+  context.compaction = { state: "running", deviceId: "old-device" };
+  assert.match(context.compactionQueueSendReason(), /旧设备授权/);
+});
+
 test("Claude 仅按原生能力提供一次整队立即执行，不开放逐条编辑、删除或排序", () => {
   const messages = ["a", "b"].map(id => ({ id, text: `待执行-${id}` }));
   const { context } = queueDeliveryHarness(messages), calls = [];
@@ -6602,6 +6638,16 @@ test("队列编辑保存只持久化一次最新草稿，再提交可靠写入",
   assert.equal(context.busy, false);
 });
 
+test("压缩期间编辑后的队列消息可按原 editId 重新提交", async () => {
+  const { context, edit, submissions } = queuedEditPersistenceHarness();
+  context.compactionLocked = () => true;
+  await context.submitQueuedMessageEdit();
+  assert.equal(submissions.length, 1);
+  assert.equal(submissions[0].action, "editQueued");
+  assert.equal(submissions[0].payload.editId, edit.editId);
+  assert.equal(context.busy, false);
+});
+
 test("取回队列消息重新发送只更新输入，不携带另选的模型和思考深度", async () => {
   const { context, submissions } = queuedEditPersistenceHarness();
   context.selectedModel = "gpt-6.1-other";
@@ -6613,21 +6659,21 @@ test("取回队列消息重新发送只更新输入，不携带另选的模型�
   assert.equal(context.selectedEffort, "high");
 });
 
-test("Codex 活动期间发送不把新模型冻结进队列，停止或完成后新发送才使用保留的选择", () => {
+test("Codex 执行或压缩期间发送不把新模型冻结进队列，停止或完成后新发送才使用保留的选择", () => {
   const code = sourceSection("  const rememberedModel = creating && !selectedModel",
     "  if (creating && !payload.projectId") + "\nglobalThis.actualPayload = payload;";
-  for (const active of [true, false]) {
+  for (const [active, queueOnly] of [[true, false], [false, true], [false, false]]) {
     const context = nodeVm.createContext({ nativeConnectionVersion: 1,
       creating: false, selectedModel: "gpt-new", selectedEffort: "high",
       rememberedNewChatModel: () => null, isClaude: () => false, isActiveThread: () => active,
       currentModelId: () => "gpt-new", activeInstanceId: () => "codex:local",
-      prompt: "后续消息", id: "thread", goalMode: false, queueOnly: false,
+      prompt: "后续消息", id: "thread", goalMode: false, queueOnly,
       session: { capabilities: { queueSendRecovery: true } }, randomId: () => "same-message",
       draft: { skills: [] }, images: [], files: []
     });
     nodeVm.runInContext(code, context);
-    assert.equal(context.actualPayload.model, active ? undefined : "gpt-new");
-    assert.equal(context.actualPayload.reasoningEffort, active ? undefined : "high");
+    assert.equal(context.actualPayload.model, active || queueOnly ? undefined : "gpt-new");
+    assert.equal(context.actualPayload.reasoningEffort, active || queueOnly ? undefined : "high");
     assert.equal(context.selectedModel, "gpt-new");
     assert.equal(context.selectedEffort, "high");
   }
@@ -6712,6 +6758,15 @@ test("未完成队列编辑在重新打开后直接恢复原输入和 editId，�
   assert.deepEqual(h.notices, []);
 });
 
+test("压缩期间重开会话仍恢复已确认的队列编辑，不自动提交或引导", () => {
+  const h = unfinishedQueueEditHarness();
+  h.context.compacting = true;
+  assert.equal(h.context.restoreUnfinishedQueuedMessageEdit(), true);
+  assert.equal(h.prompt.value, h.summary.originalText);
+  assert.equal(h.context.editingQueuedMessage.editId, h.summary.editId);
+  assert.deepEqual(h.writes, []);
+});
+
 test("普通队列消息恢复编辑不显示图片保留提示，原消息有图片时才显示资格", () => {
   const context = vm.createContext({});
   vm.runInContext(sourceSection("function queuedEditH", "async functi"), context);
@@ -6771,7 +6826,7 @@ test("自动恢复队列编辑遇到未知回执、其他编辑、只读、离�
     h => { h.context.busy = true; }, h => { h.context.stopping = true; },
     h => { h.context.editingMessage = { id: "history-message" }; },
     h => { h.context.readonly = true; }, h => { h.context.connected = false; },
-    h => { h.context.compacting = true; }, h => { h.context.thread.id = "another-thread"; },
+    h => { h.context.thread.id = "another-thread"; },
     h => { h.summary.state = "unknown"; },
     h => { h.context.queuedEdits.set("main", { editId: h.summary.editId, deviceId: "another-device" }); },
   ]) {
@@ -6985,6 +7040,20 @@ function compactionComposerHarness() {
   context.updateComposer();
   return h;
 }
+
+test("压缩期间的队列编辑保留发送按钮、输入框和附件操作", () => {
+  const h = queuedEditFeedbackHarness();
+  h.context.compacting = true;
+  h.context.compaction = { state: "running", nativeConfirmed: true };
+  h.context.updateComposer();
+  assert.equal(h.send.disabled, false);
+  assert.equal(h.send.dataset.action, "send");
+  nodeVm.runInContext(sourceSection('  $("#prompt").disabled =', '  $("#new-chat").disabled ='), h.context);
+  assert.equal(h.prompt.disabled, false);
+  h.context.setComposerAttachmentsDisabled = value => { h.context.attachmentsDisabled = value; };
+  nodeVm.runInContext(sourceSection("  setComposerAttachmentsDisabled(", '  const add = $("#composer-add");'), h.context);
+  assert.equal(h.context.attachmentsDisabled, false);
+});
 
 test("已确认压缩先于线程执行状态到达时，空输入显示可用停止按钮，有内容仍可排队发送", () => {
   const h = compactionComposerHarness();

@@ -13,7 +13,7 @@ import {
 } from "../composer/options-state.js";
 import { pendingFeedbackReady } from "../composer/send-state.js";
 import { pending } from "./pending-state.js";
-import { claudeNativeQueue, isActiveThread, isClaude, serviceSideThread, threadReadOnly } from "../session/capabilities.js";
+import { claudeNativeQueue, isActiveThread, isClaude, threadReadOnly } from "../session/capabilities.js";
 import { currentThreadDisplay } from "../session/thread-cache.js";
 
 export let compactionVersion = 0;
@@ -63,7 +63,7 @@ export function compactionInProgress(value = currentCompaction()) {
 export function compactionQueueSendReason(id = selectedId) {
   // Claude 普通发送继续由原生实际执行状态决定是否排队；压缩回执不能阻塞聊天主流程。
   if (isClaude() && claudeNativeQueue()) return "";
-  if (serviceSideThread()) return "临时侧边会话压缩期间不能排队发送，请等待压缩完成";
+  // 用户要求主会话与临时侧边在已确认压缩期间均可排队；只保留回执、授权及服务能力校验。
   const current = currentCompaction(id);
   if (!compactionLocked(id)) return "";
   if (current.deviceId && current.deviceId !== session?.device.id)

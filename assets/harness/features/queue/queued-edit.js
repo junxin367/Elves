@@ -22,7 +22,6 @@ import {
 import { setPromptSelection } from "../composer/prompt-editor.js";
 import { renderSelectedSkills } from "../composer/selected-skills.js";
 import { setSelectedSkills } from "../composer/skill-catalog.js";
-import { compactionLocked } from "../conversation/compaction.js";
 import { pending, reportMutationError, validQueuedImageSources } from "../conversation/pending-state.js";
 import { setSelectedGoal } from "../goal/state.js";
 import { editingMessage } from "../messages/message-edit.js";
@@ -33,8 +32,9 @@ import {
 import { queueCapability, threadReadOnly } from "../session/capabilities.js";
 
 export function restoreUnfinishedQueuedMessageEdit() {
+  // 用户要求压缩不锁定排队编辑：取回、草稿恢复与再次提交均保持可用，仍保留未知回执及授权保护。
   if (busy || pending || editingMessage || editingQueuedMessage && editingQueuedMessage.state !== "starting" || !connected || threadReadOnly()
-      || stopping || compactionLocked() || !selectedId || thread?.id !== selectedId) return false;
+      || stopping || !selectedId || thread?.id !== selectedId) return false;
   const summary = thread.queuedEdits?.find(edit => edit.state === "editing"
     && typeof edit.editId === "string" && typeof edit.messageId === "string" && typeof edit.originalText === "string");
   if (!summary) return false;
@@ -73,7 +73,7 @@ export async function beginQueuedMessageEdit(threadId, message) {
   const messageId = message?.id;
   if (!threadId || !messageId || selectedId !== threadId || thread?.id !== threadId
       || typeof message.clientUserMessageId !== "string" || !Number.isFinite(message.createdAt)
-      || threadReadOnly(threadId) || !connected || busy || stopping || pending || compactionLocked(threadId)
+      || threadReadOnly(threadId) || !connected || busy || stopping || pending
       || queuedActionBusy.has(`${threadId}:${messageId}`)) return;
   if (editingMessage || editingQueuedMessage) { $("#prompt").focus(); return; }
   const version = selectionVersion;
@@ -83,8 +83,7 @@ export async function beginQueuedMessageEdit(threadId, message) {
   catch (error) { notice(error.message || "无法读取排队消息的图片，请刷新后重试", true); return; }
   finally { setBusy(false); updateComposer(); }
   if (selectionVersion !== version || selectedId !== threadId || thread?.id !== threadId
-      || editingMessage || editingQueuedMessage || pending || !connected || threadReadOnly(threadId)
-      || compactionLocked(threadId)) return;
+      || editingMessage || editingQueuedMessage || pending || !connected || threadReadOnly(threadId)) return;
   rememberDraft();
   const originalImageSources = attachments.map(attachment => attachment.source);
   const imageCount = Array.isArray(message.context?.imageAttachments) ? message.context.imageAttachments.length
@@ -109,7 +108,7 @@ export async function beginQueuedMessageEdit(threadId, message) {
 }
 async function requestQueuedMessageEdit(edit) {
   if (!edit || edit.state !== "starting" || busy || pending || !connected || threadReadOnly(edit.threadId)
-      || edit.deviceId !== session?.device.id || compactionLocked(edit.threadId)) return;
+      || edit.deviceId !== session?.device.id) return;
   const payload = {
     threadId: edit.threadId, messageId: edit.message.id, editId: edit.editId, originalText: edit.originalText,
     clientUserMessageId: edit.message.clientUserMessageId, createdAt: edit.message.createdAt,
@@ -172,7 +171,7 @@ export function completeQueuedEditAction(action, payload, result, readVersion) {
 export async function submitQueuedMessageEdit() {
   const edit = editingQueuedMessage;
   if (!edit || edit.state !== "editing" || busy || stopping || pending || threadReadOnly(edit.threadId) || !connected
-      || edit.threadId !== selectedId || thread?.id !== selectedId || compactionLocked()) return;
+      || edit.threadId !== selectedId || thread?.id !== selectedId) return;
   const prompt = $("#prompt").value.trim();
   if (composerAttachmentsLoading()) { notice("附件正在读取，请稍后发送"); return; }
   if (!prompt && !composerHasAttachments()) { notice("请输入消息或保留至少一张图片", true); return; }

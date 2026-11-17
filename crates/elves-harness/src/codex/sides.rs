@@ -147,6 +147,53 @@ mod tests {
     }
 
     #[test]
+    fn harness_service_side_compaction_queue_waits_for_success_and_preserves_edit_drafts() {
+        for status in ["completed", "failed", "interrupted"] {
+            let mut side = side();
+            side.observe(&json!({"method":"turn/started","params":{
+                "turn":{"id":"turn","status":"inProgress","items":[]}}}));
+            side.queue.queues.insert(
+                "side".into(),
+                ["queued", "editing"]
+                    .into_iter()
+                    .map(|state| Queued {
+                        id: state.into(),
+                        payload: json!({"prompt":"保留的队列内容"}),
+                        created_at: 1,
+                        device_id: "device".into(),
+                        key_id: "key".into(),
+                        state: state.into(),
+                        request_id: None,
+                    })
+                    .collect(),
+            );
+            side.observe(&json!({"method":"item/started","params":{"turnId":"turn",
+                "item":{"id":"compact","type":"contextCompaction"}}}));
+            assert_eq!(side.queue.queue_gates["side"].phase, "waiting");
+            assert_eq!(side.queue.queue_gates["side"].kind, "compaction");
+            side.observe(&json!({"method":"item/completed","params":{"turnId":"turn",
+                "item":{"id":"compact","type":"contextCompaction","status":status}}}));
+            assert_eq!(
+                side.queue.queue_gates["side"].phase,
+                if status == "completed" {
+                    "ready"
+                } else {
+                    "paused"
+                }
+            );
+            assert_eq!(
+                side.queue.queues["side"][0].state,
+                if status == "completed" {
+                    "queued"
+                } else {
+                    "paused"
+                }
+            );
+            assert_eq!(side.queue.queues["side"][1].state, "editing");
+        }
+    }
+
+    #[test]
     fn harness_service_side_plan_retains_own_snapshot_after_expiry() {
         let mut side = side();
         side.observe(&json!({"method":"turn/started","params":{"turn":{
@@ -509,6 +556,27 @@ impl SideThread {
             "item/started" | "item/completed" => {
                 if let Some(id) = params["turnId"].as_str() {
                     self.upsert_item(id, params["item"].clone());
+                    if params["item"]["type"] == "contextCompaction" {
+                        let thread = self.metadata["id"].as_str().unwrap_or("");
+                        // 用户要求压缩期间可维护侧边队列；只在原生确认正常完成后放行，失败仍暂停待发消息。
+                        if frame["method"] == "item/started" {
+                            self.queue.wait_queue(thread, Some(id.to_owned()), true);
+                        } else {
+                            self.queue.finish_queue(
+                                thread,
+                                id,
+                                if matches!(
+                                    params["item"]["status"].as_str(),
+                                    Some("failed" | "interrupted")
+                                ) {
+                                    "failed"
+                                } else {
+                                    "completed"
+                                },
+                            );
+                        }
+                        self.queue_revision += 1;
+                    }
                 }
             }
             method if method.ends_with("/delta") || method.ends_with("Delta") => {
@@ -1200,11 +1268,9 @@ impl CodexHarness {
         let permit = authorization.prepare_dispatch().await?;
         let mut projection = self.projection.lock().await;
         let active = projection.active.get(id).cloned();
-        if projection.compactions.contains_key(id) || payload["queueOnly"] == true {
-            return Err(error(
-                409,
-                "临时侧边会话压缩期间不能排队发送，请等待压缩完成",
-            ));
+        let compaction = projection.compactions.get(id).cloned();
+        if compaction.is_some() && steer {
+            return Err(error(409, "侧边会话压缩期间不能引导消息"));
         }
         let side = projection.sides.threads.get_mut(id).unwrap();
         if side.closed || side.expired || side.generation != generation {
@@ -1246,7 +1312,12 @@ impl CodexHarness {
         if side.sent.len() >= 4096 {
             return Err(error(429, "临时侧边会话消息已达上限，请新建侧边会话"));
         }
-        if let Some(turn) = active.as_ref().filter(|_| !steer) {
+        // 用户要求侧边压缩期间普通消息照常入队；以服务端执行/压缩状态为准，旧 queueOnly 不能让空闲消息滞留。
+        if !steer && (active.is_some() || compaction.is_some()) {
+            let anchor = compaction
+                .as_ref()
+                .and_then(|value| value["turnId"].as_str().map(str::to_owned))
+                .or_else(|| active.clone());
             let mut message = Queued::new(payload.clone(), authorization);
             // Fast 在实际派发时读取当前会话档位；队列本身不冻结模型、思考深度或 Fast。
             for key in ["model", "reasoningEffort", "serviceTier"] {
@@ -1274,7 +1345,7 @@ impl CodexHarness {
                     .entry(id.to_owned())
                     .or_default()
                     .push(message.clone());
-                side.queue.wait_queue(id, Some(turn.clone()), false);
+                side.queue.wait_queue(id, anchor, compaction.is_some());
                 side.queue_revision += 1;
                 let receipt = json!({"ok":true,"threadId":id,"messageId":message.id,
                     "clientUserMessageId":client,"deliveryState":"queued","confirmed":true});

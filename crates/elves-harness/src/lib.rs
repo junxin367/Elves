@@ -10438,6 +10438,175 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     }
 
     #[tokio::test]
+    async fn harness_service_side_compaction_allows_queue_changes_and_resumes_fifo() {
+        for active in [false, true] {
+            let (directory, authorization, id) = harness_active_side_fixture().await;
+            let controller = &authorization.controller;
+            let history = controller
+                .call_authorized("history", json!({"threadId":id}), &authorization)
+                .await
+                .unwrap();
+            let turn = history["data"][0]["id"].as_str().unwrap();
+            if !active {
+                controller
+                    .harness
+                    .seed_test_history(json!({"threadId":id,"finish":true}))
+                    .await
+                    .unwrap();
+            }
+            controller
+                .harness
+                .seed_test_history(json!({"threadId":id,"events":[{
+                "method":"item/started","params":{"threadId":id,"turnId":turn,
+                    "item":{"id":"compact-side","type":"contextCompaction"}}}]}))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let view = controller
+                        .call_authorized("thread", json!({"threadId":id}), &authorization)
+                        .await
+                        .unwrap();
+                    if view["thread"]["compaction"]["state"] == "running" {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let mut messages = Vec::new();
+            for index in 0..3 {
+                let payload = json!({"threadId":id,"prompt":format!("wait compact queued {index}"),
+                    "clientUserMessageId":format!("compact-queued-{index}"),"queueOnly":true});
+                let queued = controller
+                    .call_authorized("send", payload.clone(), &authorization)
+                    .await
+                    .unwrap();
+                assert_eq!(queued["deliveryState"], "queued");
+                assert_eq!(
+                    queued["queuedMessages"].as_array().unwrap().len(),
+                    index + 1
+                );
+                assert_eq!(
+                    controller
+                        .call_authorized("send", payload, &authorization)
+                        .await
+                        .unwrap(),
+                    queued,
+                    "压缩期间重复提交不能生成第二份队列消息"
+                );
+                messages.push(queued["queuedMessages"][index].clone());
+            }
+            let ids: Vec<_> = messages
+                .iter()
+                .map(|message| message["id"].clone())
+                .collect();
+            controller
+                .call_authorized(
+                    "reorderQueued",
+                    json!({"threadId":id,
+                "messageIds":[ids[2],ids[1],ids[0]],"expectedMessageIds":ids}),
+                    &authorization,
+                )
+                .await
+                .unwrap();
+            let message = &messages[2];
+            let editing = controller.call_authorized("beginQueuedEdit", json!({"threadId":id,
+                "editId":"compact-edit","messageId":message["id"],"originalText":message["text"],
+                "clientUserMessageId":message["clientUserMessageId"],"createdAt":message["createdAt"]}),
+                &authorization).await.unwrap();
+            assert_eq!(editing["editState"], "editing");
+            let edited = controller
+                .call_authorized(
+                    "editQueued",
+                    json!({"threadId":id,
+                "editId":"compact-edit","prompt":"wait edited during compaction"}),
+                    &authorization,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                edited["queuedMessages"][0]["text"],
+                "wait edited during compaction"
+            );
+            let removed = controller
+                .call_authorized(
+                    "removeQueued",
+                    json!({"threadId":id,
+                "messageId":messages[1]["id"]}),
+                    &authorization,
+                )
+                .await
+                .unwrap();
+            assert_eq!(removed["queuedMessages"].as_array().unwrap().len(), 2);
+            let failure = controller
+                .call_authorized(
+                    "steerQueued",
+                    json!({"threadId":id,
+                "messageId":messages[0]["id"]}),
+                    &authorization,
+                )
+                .await
+                .unwrap_err();
+            assert!(failure.to_string().contains("压缩期间不能引导"));
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            let starts = || {
+                harness_engine_requests(directory.path())
+                    .into_iter()
+                    .filter(|frame| {
+                        frame["method"] == "turn/start" && frame["params"]["threadId"] == id
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(starts().len(), 1, "压缩期间不能派发排队消息");
+            controller.harness.seed_test_history(json!({"threadId":id,"events":[{
+                "method":"item/completed","params":{"threadId":id,"turnId":turn,
+                    "item":{"id":"compact-side","type":"contextCompaction","status":"completed"}}}]}))
+                .await.unwrap();
+            if active {
+                controller
+                    .harness
+                    .seed_test_history(json!({"threadId":id,"finish":true}))
+                    .await
+                    .unwrap();
+            }
+            harness_wait_side_starts(directory.path(), &id, 2).await;
+            assert_eq!(
+                starts()[1]["params"]["clientUserMessageId"],
+                "compact-queued-2"
+            );
+            assert_eq!(
+                starts()[1]["params"]["input"][0]["text"],
+                "wait edited during compaction"
+            );
+            controller
+                .harness
+                .seed_test_history(json!({"threadId":id,"finish":true}))
+                .await
+                .unwrap();
+            harness_wait_side_starts(directory.path(), &id, 3).await;
+            assert_eq!(
+                starts()[2]["params"]["clientUserMessageId"],
+                "compact-queued-0"
+            );
+            assert!(
+                !harness_engine_requests(directory.path())
+                    .iter()
+                    .any(|frame| frame["method"] == "turn/steer"
+                        && frame["params"]["threadId"] == id)
+            );
+            assert!(
+                !std::fs::read_to_string(directory.path().join("remote-harness-state.json"))
+                    .unwrap()
+                    .contains(&id),
+                "侧边压缩队列仍只保留在内存"
+            );
+            controller.harness.release().await;
+        }
+    }
+
+    #[tokio::test]
     async fn harness_service_side_queue_unknown_delivery_pauses_followers_without_replay() {
         let (directory, authorization, id) = harness_active_side_fixture().await;
         let controller = &authorization.controller;

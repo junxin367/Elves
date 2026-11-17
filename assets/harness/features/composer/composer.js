@@ -216,7 +216,8 @@ export function updateComposer() {
       : queueImageNote;
     attachmentNote.hidden = !unsupportedFiles && !unsupportedImages && !queueImageNote;
   }
-  setComposerAttachmentsDisabled(threadReadOnly() || deleting || compacting && editing || busy || stopping
+  // 用户要求压缩期间队列编辑与普通草稿一样可修改和发送，不能联动锁住输入框、附件或发送按钮。
+  setComposerAttachmentsDisabled(threadReadOnly() || deleting || busy || stopping
     || !!editingMessage || editing && !!pending || editingQueuedMessage?.state === "starting" || (!creating && !selectedId));
   const add = $("#composer-add");
   const usage = contextUsage(currentThreadDisplay()?.tokenUsage);
@@ -272,7 +273,7 @@ export function updateComposer() {
     : deleting ? "delete" : busy ? "busy" : stopping ? "stopping"
     // 保存档位仅防止新消息抢先提交，停止当前任务无需等待 Fast 请求。
     : action !== "stop" && $("#permission-button")?.dataset?.saving === "true" ? "permissions-saving"
-    : action !== "stop" && remoteFastWriting?.key === remoteFastKey() ? "fast-saving" : compacting && editing ? "compaction-edit"
+    : action !== "stop" && remoteFastWriting?.key === remoteFastKey() ? "fast-saving"
     : action !== "stop" && compactionSendReason ? compaction.deviceId && compaction.deviceId !== session?.device.id ? "compaction-scope"
       : compaction.state === "unknown" ? "compaction-unknown" : compaction.state === "pending" && !compaction.acknowledged && !compaction.nativeConfirmed
         ? "compaction-pending" : "compaction-unsupported"
@@ -289,7 +290,7 @@ export function updateComposer() {
     recordRuntimeDiagnostic("composer.state", { blockedBy, draftChars: prompt.length,
       attachmentCount: composerAttachmentSnapshot().length });
   }
-  $("#prompt").disabled = !sessionTypeEnabled || threadReadOnly() || deleting || compacting && editing || !!editingMessage || editing && (busy || !!pending)
+  $("#prompt").disabled = !sessionTypeEnabled || threadReadOnly() || deleting || !!editingMessage || editing && (busy || !!pending)
     || editingQueuedMessage?.state === "starting" || (!creating && !selectedId);
   $("#new-chat").disabled = threadReadOnly() || !connected && !(session?.capabilities?.claudeSessions && stream?.readyState === EventSource.OPEN);
   // 用户要求主会话和侧边队列编辑时仍可选择后续模型；执行中选择不写进排队消息，后续新发送才应用。
@@ -499,8 +500,8 @@ export async function sendMessage() {
   const model = selectedModel || rememberedModel?.model
     || (selectedEffort || nativeCodexDefaults || creating && selectedDraftFast ? currentModelId() : ""),
     reasoningEffort = selectedEffort || (rememberedModel || nativeCodexDefaults ? currentEffort() : "");
-  // 用户要求 Codex 执行期间仅保留模型/深度选择，排队消息不携带新设置；停止或完成后的新发送才应用。
-  const modelChoiceApplies = creating || isClaude() || !isActiveThread();
+  // 用户要求 Codex 执行或压缩期间仅保留模型/深度选择，排队消息不携带新设置；停止或完成后的新发送才应用。
+  const modelChoiceApplies = creating || isClaude() || !isActiveThread() && !queueOnly;
   const payload = {
     prompt, instanceId: activeInstanceId(), ...(creating ? { projectId: $("#project-select").value, backend: activeBackend() } : {
       threadId: id,

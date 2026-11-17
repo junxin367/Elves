@@ -39,7 +39,7 @@ function queueReorderAvailable() {
   const messages = thread?.queuedMessages;
   return (thread?.backend !== "claude" || thread.capabilities?.remoteQueue === true)
     && !!selectedId && thread?.id === selectedId && connected && !threadReadOnly()
-    && !busy && !stopping && !pending && !compactionLocked() && !queuedActionBusy.size
+    && !busy && !stopping && !pending && !queuedActionBusy.size
     && editingQueuedMessage?.state !== "starting"
     && Array.isArray(messages) && messages.length > 1
     && messages.every(message => message?.id && message.remoteDeliveryState !== "accepted"
@@ -340,7 +340,7 @@ function renderQueuedMessages(messages, previous = null) {
       element("p", "queued-message-text", queueMessageText(message) || "待执行消息"));
     const unavailable = !threadId || !messageId || thread?.id !== threadId
       || !Array.isArray(thread.queuedMessages) || threadReadOnly(threadId) || !connected
-      || busy || stopping || !!pending || queuedActionBusy.has(key) || compactionLocked(threadId)
+      || busy || stopping || !!pending || queuedActionBusy.has(key)
       || !!message.submission?.status && message.submission.status !== "queued";
     const steering = queuedActionBusy.has(key) && pending?.action === "steerQueued"
       && pending.payload?.threadId === threadId && pending.payload?.messageId === messageId;
@@ -351,7 +351,8 @@ function renderQueuedMessages(messages, previous = null) {
       element("span", "", accepted ? "已发送" : steering ? "引导中" : awaitingReceipt ? "待确认" : retryable ? "重试" : "引导"));
     // 异常恢复沿用原有手动重试入口；显示服务端暂停原因，不能因重新打开页面自动恢复或重发。
     if (retryable) steer.title = message.pausedReason;
-    steer.disabled = accepted || awaitingReceipt || unavailable || message.canSendNow === false;
+    // 用户要求压缩期间仅限制引导；编辑、删除及排序继续按各自的队列状态判断。
+    steer.disabled = accepted || awaitingReceipt || unavailable || compactionLocked(threadId) || message.canSendNow === false;
     const menu = button("", "排队消息操作", () => togglePopup(menu), "queued-menu-button");
     menu.id = `queued-menu-${messageId}`;
     menu.append(icon("more"));
@@ -392,7 +393,7 @@ function renderQueuedMessages(messages, previous = null) {
         && message === messages[0] && !threadReadOnly(threadId)) {
       const sendAll = button("立即执行全部", "停止当前回复并执行全部排队消息，保留原版 CLI 未发送草稿",
         () => void steerQueuedMessage(threadId, messageId), "queued-steer-button");
-      sendAll.disabled = !active || unavailable || awaitingReceipt || accepted;
+      sendAll.disabled = !active || unavailable || compactionLocked(threadId) || awaitingReceipt || accepted;
       row.append(sendAll);
     }
     if (!threadReadOnly(threadId) && (thread?.backend !== "claude" || thread.capabilities?.remoteQueue === true))
