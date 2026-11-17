@@ -116,8 +116,9 @@ async function dismissQueuedMessageEdit(threadId, editId) {
       || selectedId !== threadId || thread?.id !== threadId) return;
   if (pending && (!queuedEditActions.has(pending.action) || pending.payload.editId !== editId
       || pending.payload.threadId !== threadId || pending.deviceId !== deviceId)) return;
+  // 精简确认文字，仍要求核对、备份，并明确不改动或重发队列消息。
   if (!await confirmAction("结束待确认编辑",
-    "请先核对会话和当前队列。此操作只结束编辑标记，不会保存、恢复、删除或重发队列消息。结束后恢复编辑前的草稿；本次修改及附件不会重新提交，需要保留请先复制或备份。",
+    "先核对会话和队列、备份修改及附件。仅结束编辑并恢复编辑前草稿，不改动或重发队列消息。",
     "已核对，结束编辑", true)) return;
   if (session?.device.id !== deviceId || selectedId !== threadId || !connected || threadReadOnly(threadId) || busy) return;
   if (pending && (!queuedEditActions.has(pending.action) || pending.payload.editId !== editId

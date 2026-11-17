@@ -4781,7 +4781,8 @@ test("Claude 权限待生效时说明实际权限和原因，不阻断消息或�
   assert.equal(h.button.disabled, false);
   assert.match(h.button.title, /待生效/);
   assert.match(h.button.title, /接受编辑/);
-  assert.match(h.button.title, /已选择“计划”，待生效；当前原生权限为“接受编辑”/);
+  assert.match(h.button.title, /已选“计划”/);
+  assert.match(h.button.title, /当前“接受编辑”/);
   assert.match(h.button.popupNote, /原生正在等待审批/);
   assert.equal(h.context.permissionWrites.size, 0);
   h.context.thread.nativeSettings = { permissionMode: "plan",

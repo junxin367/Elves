@@ -96,7 +96,7 @@
     "backend": "claude", "section": "general", "id": "switchModelsOnFlag",
     "path": ["switchModelsOnFlag"], "kind": "boolean",
     "group": "原生启动选项", "label": "跟随模型参数切换",
-    "description": "保存原生 switchModelsOnFlag 开关；新启动的 CLI 读取此配置，不切换已有远程会话的模型。"
+    "description": "仅对后续启动的 CLI 生效，不切换已有会话模型。"
   },
   {
     "backend": "claude", "section": "general", "id": "nativePromptCacheTtl",

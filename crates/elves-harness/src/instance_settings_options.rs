@@ -29,6 +29,7 @@ struct Definition {
 }
 
 fn definitions() -> &'static [Definition] {
+    // 原生设置说明按用户要求保持简短，保留生效范围和对已有会话的影响。
     static OPTIONS: OnceLock<Vec<Definition>> = OnceLock::new();
     OPTIONS.get_or_init(|| {
         serde_json::from_str(include_str!("instance-setting-options.json"))

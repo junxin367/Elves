@@ -133,9 +133,10 @@ export async function applyGoalComposerReceipt(record, receipt, { allowSelection
 export async function manuallyResolveGoalComposer(record) {
   if (pending?.id !== record.id || record.deviceId !== session?.device.id || busy || !connected) return;
   const id = goalRecordThreadId(record);
+  // 精简解锁说明，保留本机核对、草稿处理和结果未知时禁止重发的边界。
   const description = id
-    ? "请先在本机核对首条输入和目标。本操作只解除本次锁定；已创建会话只允许继续设置目标，不会重新创建或重发首条。若已有未完成目标，请从目标栏编辑。"
-    : "请先在本机确认本次操作没有创建会话、首条输入也没有执行。解除锁定后仍保留草稿；若无法确认，请继续保留原回执，不要再次提交。";
+    ? "本机核对首条消息和目标后，仅继续设置目标，不重建会话或重发。未完成目标请从目标栏编辑。"
+    : "本机确认未创建会话、未执行首条消息后解锁，草稿保留。无法确认时保留回执，勿重复提交。";
   if (!await confirmAction("核对目标提交", description, "已在本机核对，解除锁定", true)
       || pending?.id !== record.id || record.deviceId !== session?.device.id || busy || !connected) return;
   if (id) {

@@ -1495,11 +1495,12 @@ export function RelayScreen({
                   ) : null}
                 </div>
               </div>
+              {/* 精简开关说明，保留配置同步及停用代理的影响范围。 */}
               <button
                 aria-checked={normalized.relayProfilesEnabled}
                 aria-label="启用供应商功能"
                 className={`context-enabled-switch compact-enabled-switch ${normalized.relayProfilesEnabled ? "active" : ""}`}
-                data-tooltip="开启后允许切换供应商，并在启动 ChatGPT/Codex 时按当前供应商同步 config.toml / auth.json；需要本地代理或聚合供应商时也会随启动启用。关闭后只保存供应商列表，不写入 Codex live 配置、不启动本地代理。"
+                data-tooltip="开启供应商切换与配置同步；关闭后仅保存列表，不同步配置或启动代理。"
                 disabled={actions.relaySwitching}
                 onClick={() => {
                   const next = { ...normalized, relayProfilesEnabled: !normalized.relayProfilesEnabled };
@@ -2040,9 +2041,10 @@ export function RelayProfileSpeedTestDialog({
                       <span>{formatSpeedTestDurationMs(item.elapsedMs)}</span>
                       <span className="speed-test-result-metric-label">耗时</span>
                     </span>
+                    {/* 速率提示只保留计算口径，不展示响应字段名。 */}
                     <span
                       className="speed-test-result-metric speed-test-result-token-rate"
-                      title="按上游 usage.output_tokens ÷ 完整请求耗时计算，与本地代理模型速率一致"
+                      title="速率＝上游输出 Token ÷ 请求总耗时。"
                     >
                       <span>{formatSpeedTestTokenRate(
                         item.status === "ok" ? item.outputTokens : null,
@@ -2786,10 +2788,11 @@ export function RelayProfileEditor({
           <span>{relayProfileEditorStatus(profile, form, isNew)}</span>
         </div>
         <div className="relay-editor-actions">
+          {/* 代理随 Elves 启动，提示只说明启动行为及续接用途。 */}
           {showApiFields ? (
             <label
               className="inline-check local-proxy-toggle"
-              data-tooltip="启动 ChatGPT/Codex 后会拉起本地协议代理；配合「GPT 推理续接」可解决 GPT 516 降智问题：推理被截断时自动续接，减少长任务中途降智。"
+              data-tooltip="随 Elves 启动，可配合「GPT 推理续接」补全被截断的思考。"
             >
               <input
                 checked={profile.localProxyEnabled}
@@ -3157,9 +3160,10 @@ export function SystemPromptOverrideModal({
         <div className="modal-head">
           <div>
             <h2 id="system-prompt-title">{modelName ? `${modelName} · 系统提示词` : "替换系统提示词"}</h2>
+            {/* 精简提示，仍明确继承顺序、再次保存供应商和不同接入方式的生效时机。 */}
             <p>{modelName
-              ? "仅对当前模型生效；留空继承供应商配置，供应商也为空时恢复模型默认提示词。保存后请保存供应商配置。本地代理的后续请求立即生效。"
-              : "保存后请保存供应商配置。本地代理的后续请求立即生效，留空恢复模型默认提示词；单模型配置优先。直连配置在重启 Elves 后用于新会话。"}</p>
+              ? "留空继承供应商；供应商为空则用模型默认。需再保存供应商，代理下次请求生效。"
+              : "留空用模型默认，单模型设置优先。保存供应商后，代理下次请求生效；直连需重启 Elves 后新建会话。"}</p>
           </div>
           <Button onClick={onClose} size="icon" title="关闭" variant="ghost">
             <X className="h-4 w-4" />
@@ -4394,19 +4398,20 @@ export function AggregateRelayImpactPanel({ profile, form, isNew = false }: { pr
       tone: aggregate.strategy === "weightedRoundRobin" ? "write" : "file",
     },
   ];
+  // 用户要求移除说明中的内部状态字段名，只描述保存和启用的实际结果。
   const switchRows: RelayActivationImpactRow[] = [
     {
       file: "设为当前后",
       field: "activeRelayId / activeAggregateRelayId",
       value: profile.id,
-      detail: "回列表点击“使用”后会一并保存当前编辑内容，切换 activeRelayId，并把当前聚合 ID 写入 settings payload。",
+      detail: "点击“使用”后保存修改并启用此聚合供应商。",
       tone: "write",
     },
     {
       file: "设为当前后",
       field: "config.toml",
       value: "本地协议代理",
-      detail: "回列表点击“使用”后会把当前 provider 的 base_url 写成本地协议代理地址，由代理按聚合策略转发。",
+      detail: "启用后由本地代理按聚合策略转发请求。",
       tone: "file",
     },
     {
@@ -4434,10 +4439,10 @@ export function AggregateRelayImpactPanel({ profile, form, isNew = false }: { pr
             <strong>{canSwitchToThis ? "保存 / 设为当前影响" : "保存影响"}</strong>
             <span>
               {canSwitchToThis
-                ? "保存只写 settings payload；回列表点击“使用”才会更新 Codex config.toml / auth.json。"
+                ? "保存配置后，点击“使用”切换供应商。"
                 : isActive
-                  ? "保存只更新聚合 settings payload；当前 Codex config.toml / auth.json 不会因保存动作重新写入。"
-                  : "保存只写 settings payload，不复制成员 Key，也不直接写 Codex config.toml / auth.json。"}
+                  ? "仅保存聚合配置，不改写 Codex 配置。"
+                  : "仅保存聚合配置，不复制成员密钥或改写 Codex 配置。"}
             </span>
           </div>
         </div>

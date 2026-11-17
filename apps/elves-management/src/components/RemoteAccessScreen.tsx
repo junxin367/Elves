@@ -487,7 +487,8 @@ export function RemoteAccessScreen({
               </div>
               <p id="remote-service-guidance" className="remote-access-hint" role="status" aria-live="polite">{serviceGuidance}</p>
               {zrokToken && fixedNameValue && !fixedNameValid ? <small className="remote-access-inline-error">固定公网名称需为 3–63 位小写字母、数字或连字符，且首尾必须是字母或数字。</small> : null}
-              {!zrokToken && !normalizedFixedName ? <small>输入邮箱时发送注册邮件；输入 token 时同时填写固定公网名称。点击右侧按钮后，当前邮箱或 token 会保存到本机 Elves 设置并在下次打开时回显。</small> : null}
+              {/* 精简注册说明，保留邮件、必填名称和本机保存的要求。 */}
+              {!zrokToken && !normalizedFixedName ? <small>填写邮箱接收注册邮件，或填写 token 和固定公网名称；提交后保存至本机并回显。</small> : null}
             </div>
             <div className="remote-access-wide">
               <Label htmlFor="remote-zrok-url">固定公网地址</Label>
@@ -617,7 +618,9 @@ export function RemoteAccessScreen({
               onSuccess(result.loginLocked === true
                 ? "访问密钥已保存，登录仍处于锁定状态。请生成不同的新密钥并保存。"
                 : "访问密钥已保存并生效；更换密钥后，原有设备需使用新密钥重新登录。");
-            })}>保存</Button></div><small>支持 8–64 个非空格 ASCII 字符；点击「保存」后以明文保存在本机，输入框默认使用圆点遮挡，可点击小眼睛查看。</small></div>
+            })}>保存</Button></div>
+              {/* 密钥说明保留字符限制及本机明文存储事实。 */}
+              <small>8–64 位非空格 ASCII 字符；保存后以明文存于本机。</small></div>
           </div>
           <div className="remote-access-devices">
             {(status?.devices || []).map(device => <div className="remote-access-device" key={device.id}>

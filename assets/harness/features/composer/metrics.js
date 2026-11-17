@@ -238,20 +238,21 @@ export function contextUsage(info) {
   // 用户要求沿用 Codex 原有百分比：统一按用量除以所用容量四舍五入，不另用实例特有的原生百分比。
   return { used, total, percent: Math.round(used / total * 100) };
 }
+// 精简用量提示，保留上次请求的统计口径及容量未知状态。
 function contextUsageText() {
   const info = currentThreadDisplay()?.tokenUsage, usage = contextUsage(info);
   if (usage) {
     return {
       value: `${tokenCount(usage.used)} / ${usage.percent}%，${tokenCount(usage.total)}`,
-      description: `最后一次请求的上下文占用：${usage.used.toLocaleString()} / ${usage.total.toLocaleString()} Token，不是累计用量。`
+      description: `上次请求占用 ${usage.used.toLocaleString()} / ${usage.total.toLocaleString()} Token。`
     };
   }
   // 用户允许容量未知时诚实降级：显示原生已知用量，但不估算容量或百分比；环形指示仍保持“—”。
   const value = info?.last?.totalTokens;
   return typeof value === "number" && Number.isFinite(value) && value >= 0
     ? { value: `${tokenCount(value)} Token，容量尚未提供`,
-      description: `最后一次请求的上下文占用：${value.toLocaleString()} Token，不是累计用量；尚未提供可用容量，无法计算百分比。` }
-    : { value: "上下文信息尚未提供", description: "会话尚未提供有效的上下文容量或最后一次请求用量。" };
+      description: `上次请求占用 ${value.toLocaleString()} Token；容量未知。` }
+    : { value: "上下文信息尚未提供", description: "暂无上下文用量数据。" };
 }
 export function closeContextUsageTip() {
   if (!contextUsageTip) return;

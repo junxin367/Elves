@@ -88,8 +88,9 @@ export function mountConversationNaming(page) {
   const reload = button("重新读取", "重新读取会话命名设置", () => void show(true), "text-button");
   const save = button("保存", "保存会话命名设置", () => void persist(), "primary");
   actions.append(reload, save);
+  // 命名说明只保留共享范围、标题作用及失败时保留原标题。
   page.append(card, promptSection, element("p", "appearance-hint",
-    "同一 Harness的各客户端共用会话命名设置。命名实例和命名模型根据会话文字生成标题，不改动正文；生成失败时保留原标题。"),
+    "同一 Harness 的各客户端共用设置；仅更新标题，失败时保留原标题。"),
   status, recent, actions);
 
   function sync() {

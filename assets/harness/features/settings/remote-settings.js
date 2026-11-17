@@ -58,7 +58,8 @@ export function mountRemoteSettings(dialog) {
         environments = result.environments;
         instances = result.instances;
         renderInstances();
-        if (detectionStatus) detectionStatus.textContent = "检测安装位置，未配置的 Claude 离开期间回顾默认关闭；实例配置与显示此实例开关由同一 Harness的各客户端共用。";
+        // 检测结果只说明当前操作和共享范围，各能力的默认值由对应设置项说明。
+        if (detectionStatus) detectionStatus.textContent = "检测实例安装位置；实例设置由同一 Harness 共用。";
         if (current) status.textContent = instanceAvailable(current.instanceId)
           ? dirty() ? "未保存的草稿" : ""
           : "所选实例暂不可用，草稿已保留。";
