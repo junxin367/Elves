@@ -1184,11 +1184,12 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .appearance-nav-group{flex:none}
 .appearance-nav-group+.appearance-nav-group{margin-top:28px}
 .appearance-nav-group[hidden]{display:none}
+/* 用户要求设置子导航参考 Codex：普通项及图标使用完整主题前景色，分组标题保留辅助色；悬停和选中仅用背景区分，明暗及自定义主题共用。 */
 .appearance-nav-group-title{margin:0 0 7px;padding:0 10px;color:var(--muted);font-size:.92857rem;font-weight:500;line-height:1.53846}
-.appearance-nav-item{display:flex;align-items:center;gap:10px;width:100%;min-height:34px;padding:7px 10px;border:0;border-radius:10px;background:transparent;color:var(--muted);font:inherit;line-height:1.42857;text-align:left;white-space:nowrap}
-.appearance-nav-item:hover,.appearance-nav-item:focus-visible{background:var(--hover);color:var(--text)}
+.appearance-nav-item{display:flex;align-items:center;gap:10px;width:100%;min-height:34px;padding:7px 10px;border:0;border-radius:10px;background:transparent;color:var(--text);font:inherit;line-height:1.42857;text-align:left;white-space:nowrap}
+.appearance-nav-item:hover,.appearance-nav-item:focus-visible{background:var(--hover)}
 /* 选中态采用效果稿的中性圆角底色，不加粗或显示强调色竖线；颜色由当前主题文字与侧栏背景派生。 */
-.appearance-nav-item[aria-selected=true]{background:color-mix(in srgb,var(--text) 8%,var(--side));color:var(--text)}
+.appearance-nav-item[aria-selected=true]{background:color-mix(in srgb,var(--text) 8%,var(--side))}
 .appearance-nav-item[hidden]{display:none}
 .appearance-nav-icon{display:grid;place-items:center;flex:0 0 1.14286rem;width:1.14286rem;height:1.14286rem}
 .appearance-nav-icon>.ui-icon{width:100%;height:100%}
