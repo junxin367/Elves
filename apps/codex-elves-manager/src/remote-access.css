@@ -1,0 +1,132 @@
+.remote-access-hint { color: hsl(var(--muted-foreground)); }
+.remote-public-title-row { display: flex; align-items: center; gap: 20px; min-width: 0; }
+.remote-public-title-row > h3 { flex-shrink: 0; }
+.remote-primary-breadcrumbs { display: inline-flex; align-items: center; gap: 12px; }
+.remote-primary-crumb { display: inline-flex; align-items: center; gap: 4px; }
+.remote-primary-breadcrumbs > span, .remote-primary-crumb > span { color: hsl(var(--muted-foreground)); font-size: 12px; }
+.remote-primary-crumb > span[aria-hidden="true"] { align-self: center; }
+.remote-primary-crumb .remote-primary-label { align-self: center; margin-top: 0; padding: 2px 6px; border: 1px solid transparent; border-radius: 9999px; font-size: 10px; font-weight: 600; line-height: 1.2; white-space: nowrap; }
+.remote-primary-label-zrok { border-color: rgba(22, 134, 83, 0.25); background: rgba(22, 134, 83, 0.1); color: #168653; }
+.remote-primary-label-frp { border-color: rgba(234, 154, 38, 0.3); background: rgba(234, 154, 38, 0.12); color: #b45309; }
+.remote-primary-crumb button { display: inline-flex; align-items: center; gap: 4px; border: 0; border-bottom: 2px solid transparent; background: transparent; padding: 5px 1px 7px; color: hsl(var(--muted-foreground)); font-size: 14px; cursor: pointer; }
+.remote-primary-crumb button[aria-selected="true"] { color: hsl(var(--primary)); font-weight: 600; border-bottom-color: hsl(var(--primary)); }
+.remote-primary-crumb button:focus-visible { outline: 2px solid hsl(var(--ring)); outline-offset: 3px; }
+.remote-primary-crumb button:disabled { cursor: wait; opacity: .5; }
+.remote-frp-fields { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(180px, 1fr) 80px 80px; gap: 14px 18px; }
+.remote-frp-port { width: 80px; }
+.remote-frp-port input[type="number"] { appearance: textfield; -moz-appearance: textfield; }
+.remote-frp-port input[type="number"]::-webkit-inner-spin-button,
+.remote-frp-port input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+.remote-frp-fields > div { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.remote-frp-fields label { font-size: 12px; font-weight: 600; }
+.remote-frp-fields small { color: hsl(var(--muted-foreground)); font-size: 11px; line-height: 1.7; }
+.remote-frp-target { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin: 12px 0; font-size: 11px; color: hsl(var(--muted-foreground)); }
+.remote-primary-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 16px; }
+.remote-primary-actions > p { flex: 1; min-width: 0; margin: 0; font-size: 11px; line-height: 1.8; overflow-wrap: anywhere; }
+.remote-primary-buttons { display: flex; gap: 8px; flex-shrink: 0; }
+.remote-frp-download { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 8px; flex: 1; min-width: 0; max-width: 360px; margin-left: auto; font-size: 11px; color: hsl(var(--muted-foreground)); }
+.remote-frp-download > span { overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.remote-frp-download-track { grid-column: 1 / -1; position: relative; height: 5px; overflow: hidden; border-radius: 999px; background: hsl(var(--muted)); }
+.remote-frp-download-fill { height: 100%; background: hsl(var(--primary)); border-radius: inherit; transition: width 180ms ease; }
+.remote-frp-download-fill.indeterminate { width: 38%; position: absolute; animation: zrok-download 1.1s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) { .remote-frp-download-fill { transition: none; }.remote-frp-download-fill.indeterminate { animation: none; } }
+.remote-primary-feedback { color: hsl(var(--primary)); }
+.remote-primary-feedback.warning { color: #a87620; }
+.remote-primary-feedback.error { color: #dc4444; }
+@media (max-width: 900px) {
+  .remote-frp-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+.remote-access-hint { font-size: 11px; line-height: 1.8; margin: 4px 0 12px; }
+.remote-access-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 18px; margin-top: 14px; }
+.remote-access-fields-top { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-top: 10px; }
+.remote-access-fields-flush { margin-top: 0; }
+.remote-access-fields > div { display: flex; flex-direction: column; gap: 6px; }
+.remote-access-fields label { font-size: 12px; font-weight: 600; }
+.remote-access-fields small { font-size: 11px; color: hsl(var(--muted-foreground)); line-height: 1.6; }
+.remote-access-service-fields > div > label,
+.remote-access-expiry-heading { min-height: 18px; }
+.remote-access-service-fields > div > label { display: flex; align-items: center; }
+.remote-access-expiry-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.remote-access-fields .remote-access-expiry-switch {
+  width: auto;
+  height: 18px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 0;
+  gap: 6px;
+}
+.remote-access-field-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-width: 0; min-height: 18px; }
+.remote-access-wide { grid-column: 1 / -1; }
+.remote-access-input-row { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.remote-access-input-row input { flex: 1; min-width: 0; }
+.remote-access-input-row button { flex-shrink: 0; }
+.remote-access-key-input { position: relative; display: flex; align-items: center; flex: 1; min-width: 0; }
+.remote-access-key-input input { padding-right: 64px; }
+.remote-access-key-input input::-ms-reveal { display: none; }
+.remote-access-public-input input { padding-right: 36px; }
+.remote-access-key-actions { position: absolute; right: 4px; top: 50%; transform: translateY(-50%); display: flex; align-items: center; gap: 2px; }
+.remote-access-key-actions button { color: hsl(var(--muted-foreground)); }
+.remote-access-key-actions button:hover { color: hsl(var(--foreground)); }
+.remote-access-devices { margin-top: 16px; }
+.remote-access-device { display: flex; gap: 12px; align-items: center; border-top: 1px solid hsl(var(--border)); padding: 12px 0; }
+.remote-access-device > div { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
+.remote-access-device small { color: hsl(var(--muted-foreground)); font-size: 11px; }
+.remote-access-error { color: #dc4444; font-size: 12px; margin-bottom: 8px; }
+.remote-access-message { font-size: 12px; color: hsl(var(--muted-foreground)); min-height: 20px; }
+.zrok-download-progress { display: flex; flex: 0 1 260px; align-items: center; justify-content: flex-end; gap: 8px; min-width: 180px; }
+.zrok-download-progress span { flex: 0 0 auto; color: hsl(var(--muted-foreground)); font-size: 11px; }
+.zrok-download-track { position: relative; flex: 1; height: 5px; min-width: 72px; overflow: hidden; border-radius: 999px; background: hsl(var(--muted)); }
+.zrok-download-fill { height: 100%; border-radius: inherit; background: hsl(var(--primary)); transition: width 180ms ease; }
+.zrok-download-fill.indeterminate { position: absolute; width: 38%; animation: zrok-download 1.1s ease-in-out infinite; }
+@keyframes zrok-download {
+  from { transform: translateX(-110%); }
+  to { transform: translateX(300%); }
+}
+.zrok-setup-row { flex-wrap: nowrap; }
+.zrok-setup-row.with-fixed-name > input:first-child { flex: 1 1 58%; }
+.zrok-setup-row.with-fixed-name > input:nth-child(2) { flex: 1 1 42%; }
+.remote-access-inline-error { color: #dc4444 !important; }
+@media (max-width: 900px) { .remote-access-fields { grid-template-columns: minmax(0, 1fr); } }
+
+.zrok-status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 9999px;
+  font-size: 12px;
+  font-weight: 500;
+  border: 1px solid hsl(var(--border));
+  background: hsl(var(--card));
+  color: hsl(var(--muted-foreground));
+  line-height: 1.4;
+  white-space: nowrap;
+}
+.zrok-status-badge.connected {
+  border-color: rgba(22, 134, 83, 0.35);
+  background: rgba(22, 134, 83, 0.08);
+  color: #168653;
+}
+.zrok-status-badge.connecting {
+  border-color: rgba(234, 154, 38, 0.35);
+  background: rgba(234, 154, 38, 0.08);
+  color: #d97706;
+}
+.zrok-status-badge.error {
+  border-color: rgba(220, 68, 68, 0.35);
+  background: rgba(220, 68, 68, 0.08);
+  color: #dc4444;
+}
+.zrok-status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 9999px;
+  background-color: currentColor;
+}
+@media (max-width: 640px) {
+  .remote-access-field-heading { align-items: flex-start; }
+  .zrok-download-progress { flex-basis: 220px; min-width: 0; }
+  .remote-access-public-row { align-items: stretch; flex-wrap: wrap; }
+  .remote-access-public-row .remote-access-public-input { flex-basis: 100%; }
+}

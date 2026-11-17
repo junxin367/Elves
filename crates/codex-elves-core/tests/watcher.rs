@@ -1,0 +1,307 @@
+use codex_elves_core::watcher::{
+    build_spawn_launcher_command, build_watcher_install_plan, cdp_listening, codex_process_ids,
+    disable_watcher_at, enable_watcher_at, filter_killable_launcher_processes,
+    find_macos_codex_processes_from_ps, process_ids_still_running, should_recover_stale_launcher,
+    watcher_disabled_flag,
+};
+
+#[cfg(windows)]
+use codex_elves_core::watcher::{WindowsProcessInfo, find_codex_processes_from_snapshot};
+
+#[test]
+fn cdp_listening_returns_true_for_bound_loopback_port() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    assert!(cdp_listening(port));
+}
+
+#[test]
+fn cdp_listening_returns_true_for_bound_ipv6_loopback_port() {
+    let listener = std::net::TcpListener::bind("[::1]:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    assert!(cdp_listening(port));
+}
+
+#[test]
+fn cdp_listening_returns_false_for_closed_port() {
+    let port = {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.local_addr().unwrap().port()
+    };
+
+    assert!(!cdp_listening(port));
+}
+
+#[test]
+fn watcher_enable_and_disable_toggle_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let flag = watcher_disabled_flag(dir.path());
+
+    disable_watcher_at(dir.path()).unwrap();
+    assert!(flag.exists());
+
+    enable_watcher_at(dir.path()).unwrap();
+    assert!(!flag.exists());
+}
+
+#[test]
+fn watcher_install_plan_registers_rust_launcher_at_logon() {
+    let plan = build_watcher_install_plan("C:/Tools/codex-elves.exe".into(), 9333);
+
+    assert_eq!(plan.run_value_name, "CodexElvesWatcher");
+    assert_eq!(
+        plan.run_value,
+        "\"C:/Tools/codex-elves.exe\" --debug-port 9333"
+    );
+    assert_eq!(plan.shortcut_name, "CodexElvesWatcher.lnk");
+    assert_eq!(plan.shortcut_target, "C:/Tools/codex-elves.exe");
+    assert_eq!(plan.shortcut_arguments, "--debug-port 9333");
+}
+
+#[test]
+fn spawn_launcher_command_points_to_silent_binary_only() {
+    let command = build_spawn_launcher_command("C:/Tools/codex-elves.exe", 9444);
+
+    assert_eq!(command[0], "C:/Tools/codex-elves.exe");
+    assert!(command.contains(&"--debug-port".to_string()));
+    assert!(command.contains(&"9444".to_string()));
+    assert!(!command.iter().any(|part| part.contains("manager")));
+}
+
+#[test]
+fn codex_process_filter_keeps_only_windowsapps_codex_processes() {
+    let processes = [
+        (
+            11,
+            r"C:\Program Files\WindowsApps\OpenAI.Codex_1.0.0.0_x64__abc\app\Codex.exe",
+        ),
+        (12, r"C:\Tools\Codex.exe"),
+        (
+            13,
+            r"C:\Program Files\WindowsApps\Other.App_1.0.0.0_x64__abc\app\Codex.exe",
+        ),
+        (
+            14,
+            r"C:\Program Files\WindowsApps\OpenAI.Codex_26.707.3563.0_x64__abc\app\ChatGPT.exe",
+        ),
+        (
+            15,
+            r"C:/Program Files/WindowsApps/OpenAI.CodexBeta_26.707.3563.0_x64__abc/app/ChatGPT.exe",
+        ),
+        (
+            16,
+            r"C:\Program Files\WindowsApps\OpenAI.Codex_26.707.3563.0_x64__abc\app\resources\codex.exe",
+        ),
+    ];
+
+    assert_eq!(codex_process_ids(processes), vec![11, 14, 15]);
+}
+
+#[test]
+fn launcher_process_filter_protects_current_process_ancestry() {
+    let processes = [
+        (10, 0, "codex-elves.exe"),
+        (20, 10, "codex-elves.exe"),
+        (30, 20, "codex-elves.exe"),
+        (40, 10, "codex-elves.exe"),
+        (50, 10, "codex-elves-manager.exe"),
+    ];
+
+    assert_eq!(filter_killable_launcher_processes(processes, 30), vec![40]);
+}
+
+#[test]
+fn stale_launcher_recovery_only_runs_when_codex_and_cdp_are_absent() {
+    assert!(should_recover_stale_launcher(false, false));
+    assert!(!should_recover_stale_launcher(true, false));
+    assert!(!should_recover_stale_launcher(false, true));
+    assert!(!should_recover_stale_launcher(true, true));
+}
+
+#[test]
+fn stop_wait_tracks_only_expected_process_ids() {
+    assert_eq!(
+        process_ids_still_running(&[10, 20, 30], [5, 20, 40, 30]),
+        vec![20, 30]
+    );
+}
+
+#[test]
+fn macos_process_parser_finds_codex_and_chatgpt_main_processes_only() {
+    let output = r#"
+  501 /Applications/OpenAI Codex.app/Contents/MacOS/Codex --remote-debugging-port=9229
+  502 /Applications/OpenAI Codex.app/Contents/Frameworks/Codex Helper.app/Contents/MacOS/Codex Helper
+  503 /Users/me/Applications/ChatGPT.app/Contents/MacOS/ChatGPT
+  504 /usr/local/bin/codex
+  501 /Applications/OpenAI Codex.app/Contents/MacOS/Codex --duplicate
+  505 /bin/sh -c /Applications/OpenAI Codex.app/Contents/MacOS/Codex
+  506 /Applications/MyCodex.app/Contents/MacOS/Codex
+  507 /Applications/Not Codex.app/Contents/MacOS/Codex
+"#;
+
+    assert_eq!(find_macos_codex_processes_from_ps(output), vec![501, 503]);
+}
+
+#[cfg(windows)]
+#[test]
+fn find_codex_processes_finds_portable_install_with_capital_c() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = temp.path().join("app");
+    std::fs::create_dir_all(app.join("resources")).unwrap();
+    let executable = app.join("Codex.exe");
+    std::fs::write(&executable, "").unwrap();
+    std::fs::write(app.join("resources").join("app.asar"), "").unwrap();
+    let processes = [WindowsProcessInfo {
+        process_id: 42,
+        parent_process_id: 0,
+        exe_file: "Codex.exe".to_string(),
+        executable_path: Some(executable),
+    }];
+
+    assert_eq!(find_codex_processes_from_snapshot(&processes), vec![42]);
+}
+
+#[cfg(windows)]
+#[test]
+fn find_codex_processes_finds_portable_install_case_insensitively() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = temp.path().join("app");
+    std::fs::create_dir_all(app.join("resources")).unwrap();
+    let executable = app.join("codex.exe");
+    std::fs::write(&executable, "").unwrap();
+    std::fs::write(app.join("resources").join("app.asar"), "").unwrap();
+    let processes = [WindowsProcessInfo {
+        process_id: 43,
+        parent_process_id: 0,
+        exe_file: "codex.exe".to_string(),
+        executable_path: Some(executable),
+    }];
+
+    assert_eq!(find_codex_processes_from_snapshot(&processes), vec![43]);
+}
+
+#[cfg(windows)]
+#[test]
+fn find_codex_processes_finds_store_chatgpt_processes() {
+    let processes = [WindowsProcessInfo {
+        process_id: 44,
+        parent_process_id: 0,
+        exe_file: "ChatGPT.exe".to_string(),
+        executable_path: Some(std::path::PathBuf::from(
+            r"C:\Program Files\WindowsApps\OpenAI.Codex_26.707.3563.0_x64__abc\app\ChatGPT.exe",
+        )),
+    }];
+
+    assert_eq!(find_codex_processes_from_snapshot(&processes), vec![44]);
+}
+
+#[cfg(windows)]
+#[test]
+fn find_codex_processes_finds_portable_chatgpt_with_codex_runtime() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = temp.path().join("app");
+    std::fs::create_dir_all(app.join("resources")).unwrap();
+    let executable = app.join("ChatGPT.exe");
+    std::fs::write(&executable, "").unwrap();
+    std::fs::write(app.join("resources").join("codex.exe"), "").unwrap();
+    let processes = [WindowsProcessInfo {
+        process_id: 45,
+        parent_process_id: 0,
+        exe_file: "ChatGPT.exe".to_string(),
+        executable_path: Some(executable),
+    }];
+
+    assert_eq!(find_codex_processes_from_snapshot(&processes), vec![45]);
+}
+
+#[cfg(windows)]
+#[test]
+fn find_codex_processes_combines_store_and_portable_installs() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = temp.path().join("app");
+    std::fs::create_dir_all(app.join("resources")).unwrap();
+    let portable_executable = app.join("Codex.exe");
+    std::fs::write(&portable_executable, "").unwrap();
+    std::fs::write(app.join("resources").join("app.asar"), "").unwrap();
+    let processes = [
+        WindowsProcessInfo {
+            process_id: 11,
+            parent_process_id: 0,
+            exe_file: "Codex.exe".to_string(),
+            executable_path: Some(std::path::PathBuf::from(
+                r"C:\Program Files\WindowsApps\OpenAI.Codex_1.0.0.0_x64__abc\app\Codex.exe",
+            )),
+        },
+        WindowsProcessInfo {
+            process_id: 42,
+            parent_process_id: 0,
+            exe_file: "Codex.exe".to_string(),
+            executable_path: Some(portable_executable),
+        },
+    ];
+
+    assert_eq!(find_codex_processes_from_snapshot(&processes), vec![11, 42]);
+}
+
+#[cfg(windows)]
+#[test]
+fn find_codex_processes_ignores_non_codex_main_processes() {
+    let processes = [
+        WindowsProcessInfo {
+            process_id: 10,
+            parent_process_id: 0,
+            exe_file: "notepad.exe".to_string(),
+            executable_path: Some(std::path::PathBuf::from(r"C:\Windows\notepad.exe")),
+        },
+        WindowsProcessInfo {
+            process_id: 20,
+            parent_process_id: 0,
+            exe_file: "codex-elves.exe".to_string(),
+            executable_path: Some(std::path::PathBuf::from(r"D:\Tools\codex-elves.exe")),
+        },
+        WindowsProcessInfo {
+            process_id: 21,
+            parent_process_id: 0,
+            exe_file: "codex-elves-manager.exe".to_string(),
+            executable_path: Some(std::path::PathBuf::from(
+                r"D:\Tools\codex-elves-manager.exe",
+            )),
+        },
+        WindowsProcessInfo {
+            process_id: 22,
+            parent_process_id: 0,
+            exe_file: "helper.exe".to_string(),
+            executable_path: Some(std::path::PathBuf::from(
+                r"C:\Program Files\WindowsApps\OpenAI.Codex_1.0.0.0_x64__abc\app\helper.exe",
+            )),
+        },
+        WindowsProcessInfo {
+            process_id: 23,
+            parent_process_id: 0,
+            exe_file: "ChatGPT.exe".to_string(),
+            executable_path: Some(std::path::PathBuf::from(
+                r"C:\Users\me\AppData\Local\Programs\ChatGPT Classic\ChatGPT.exe",
+            )),
+        },
+        WindowsProcessInfo {
+            process_id: 24,
+            parent_process_id: 0,
+            exe_file: "codex.exe".to_string(),
+            executable_path: Some(std::path::PathBuf::from(
+                r"C:\Program Files\WindowsApps\OpenAI.Codex_1.0.0.0_x64__abc\app\resources\codex.exe",
+            )),
+        },
+        WindowsProcessInfo {
+            process_id: 25,
+            parent_process_id: 0,
+            exe_file: "codex.exe".to_string(),
+            executable_path: Some(std::path::PathBuf::from(
+                r"C:\Users\me\AppData\Roaming\npm\codex.exe",
+            )),
+        },
+    ];
+
+    assert!(find_codex_processes_from_snapshot(&processes).is_empty());
+}

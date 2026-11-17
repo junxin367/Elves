@@ -1,0 +1,84 @@
+mod anthropic_images;
+pub mod app_paths;
+pub mod assets;
+pub mod bridge;
+pub mod ccs_import;
+pub mod cdp;
+pub mod cli_wrapper;
+pub mod codex_home;
+pub mod codex_service;
+pub mod codex_sqlite;
+pub mod codex_update_policy;
+mod compaction_cache;
+mod computer_use_guard;
+pub mod continue_thinking;
+mod desktop_owner_ipc;
+pub mod diagnostic_log;
+pub mod env_conflicts;
+pub mod http_client;
+mod image_generation;
+pub mod install;
+pub mod lan_proxy;
+pub mod launcher;
+pub mod layered_compaction;
+mod log_limits;
+pub mod model_capabilities;
+pub mod model_catalog;
+pub mod models;
+pub mod paths;
+pub mod plugin_marketplace;
+pub mod ports;
+pub mod prompt_optimize;
+pub mod protocol_proxy;
+pub mod proxy;
+pub mod proxy_log;
+pub mod relay_config;
+pub mod relay_rotation;
+pub mod relay_switch;
+pub mod remote_access;
+pub mod remote_ssh;
+pub mod request_headers;
+pub mod responses_websocket;
+pub mod responses_websocket_bridge;
+mod responses_websocket_checkpoint;
+pub mod routes;
+pub mod script_market;
+pub mod session_transport;
+pub mod settings;
+pub mod skin;
+pub mod status;
+pub mod suppressed_threads;
+pub mod task_board;
+pub mod update;
+pub mod upstream_worktree;
+pub mod user_scripts;
+pub mod version;
+pub mod watcher;
+#[cfg(windows)]
+mod windows_integration;
+pub mod workspace_checkpoint;
+
+#[cfg(windows)]
+pub fn windows_create_no_window() -> u32 {
+    windows_integration::CREATE_NO_WINDOW
+}
+
+#[cfg(windows)]
+pub fn windows_create_hidden_process() -> u32 {
+    windows_integration::HIDDEN_PROCESS_FLAGS
+}
+
+#[cfg(not(windows))]
+pub fn windows_create_hidden_process() -> u32 {
+    0
+}
+
+#[cfg(windows)]
+pub fn windows_open_url(url: &str) -> anyhow::Result<()> {
+    windows_integration::open_url(url)
+}
+
+#[cfg(windows)]
+pub fn windows_activate_process_window(process_id: u32) -> bool {
+    windows_integration::activate_process_window(process_id)
+}

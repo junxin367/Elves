@@ -1,0 +1,222 @@
+name: PR build artifacts
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  ARTIFACT_VERSION: 0.0.0-${{ github.run_number }}
+
+permissions:
+  contents: read
+
+jobs:
+  android-changes:
+    name: Detect Android changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      changed: ${{ steps.changes.outputs.changed }}
+    steps:
+      - name: Detect Android build inputs
+        id: changes
+        uses: actions/github-script@v8
+        with:
+          script: |
+            if (context.eventName === "workflow_dispatch") {
+              core.setOutput("changed", "true");
+              return;
+            }
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              per_page: 100
+            });
+            const relevant = (path) =>
+              (path.startsWith("apps/codex-elves-android/") &&
+                !/(?:^|\/)(?:build|\.gradle|\.idea)\//.test(path) &&
+                !path.endsWith("/local.properties")) ||
+              path.startsWith("assets/remote-access/") ||
+              /^scripts\/[^/]*android[^/]*\.ps1$/.test(path) ||
+              path === "build.ps1" ||
+              path === ".github/workflows/android-apk.yml" ||
+              path === ".github/workflows/pr-build.yml";
+            core.setOutput("changed", String(files.some(file =>
+              relevant(file.filename) || (file.previous_filename && relevant(file.previous_filename)))));
+
+  android-debug:
+    name: Android debug APK and lint
+    needs: android-changes
+    if: ${{ needs.android-changes.outputs.changed == 'true' }}
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Setup Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: "platform-tools platforms;android-35 build-tools;35.0.0"
+      - name: Build debug APK and lint without signing secrets
+        shell: pwsh
+        run: .\scripts\build-android.ps1 -Configuration Debug
+      - name: Upload Android debug APK
+        uses: actions/upload-artifact@v6
+        with:
+          name: codex-elves-android-pr-debug
+          path: dist/android/CodexElves-*-android-debug.apk
+          if-no-files-found: error
+
+  windows-artifacts:
+    name: Windows artifacts
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install NSIS
+        run: choco install nsis -y
+
+      - name: Install frontend dependencies
+        working-directory: apps/codex-elves-manager
+        run: npm ci
+
+      - name: TypeScript check
+        working-directory: apps/codex-elves-manager
+        run: npm run check
+
+      - name: Build frontend
+        working-directory: apps/codex-elves-manager
+        run: npm run vite:build
+
+      - name: Rust tests
+        run: |
+          cargo test --workspace -- --skip remote_access::tests::
+
+      - name: 远程访问集成测试（串行）
+        # 多个测试使用不同密钥，共享进程内单项 KDF 缓存；串行避免缓存抖动耗尽临时授权时间。
+        run: |
+          cargo test -p codex-elves-core --lib remote_access::tests:: -- --test-threads=1
+
+      - name: 远程会话回归证据校验测试
+        run: node --test scripts/remote-access-e2e-evidence.test.mjs scripts/remote-access-e2e-environment.test.mjs scripts/remote-access-e2e-receipt-driver.test.mjs scripts/remote-access-ui-state.test.mjs
+
+      - name: Build release binaries
+        run: cargo build --release
+
+      - name: Stage Windows app files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/windows/app | Out-Null
+          Copy-Item target/release/codex-elves.exe dist/windows/app/
+          Copy-Item target/release/codex-elves-manager.exe dist/windows/app/
+          Copy-Item target/release/codex-elves-task-board.exe dist/windows/app/
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          $version = "${{ env.ARTIFACT_VERSION }}"
+          $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+          if (-not (Test-Path $makensis)) {
+            $makensis = "makensis"
+          }
+          Push-Location scripts/installer/windows
+          & $makensis "/INPUTCHARSET" "UTF8" "/DVERSION=$version" CodexElves.nsi
+          Pop-Location
+
+      - name: Upload Windows binaries
+        uses: actions/upload-artifact@v6
+        with:
+          name: codex-elves-windows-binaries
+          path: dist/windows/app/*
+          if-no-files-found: error
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v6
+        with:
+          name: codex-elves-windows-installer
+          path: dist/windows/*.exe
+          if-no-files-found: error
+
+  macos-dmg:
+    name: macOS DMG (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - arch: arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install frontend dependencies
+        working-directory: apps/codex-elves-manager
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: apps/codex-elves-manager
+        run: npm run vite:build
+
+      - name: Build release binaries
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build macOS DMG
+        run: |
+          VERSION="${ARTIFACT_VERSION}"
+          BINARY_DIR="$PWD/target/${{ matrix.target }}/release" bash scripts/installer/macos/package-dmg.sh "$VERSION" "${{ matrix.arch }}"
+
+      - name: Verify macOS bundle structure
+        run: |
+          set -euo pipefail
+          test -L "dist/macos/stage/Applications"
+          test "$(readlink "dist/macos/stage/Applications")" = "/Applications"
+          for app in "dist/macos/stage/CodexElves.app" "dist/macos/stage/CodexElves 管理工具.app" "dist/macos/stage/CodexElves 任务看板.app"; do
+            test -f "$app/Contents/Info.plist"
+            test -f "$app/Contents/PkgInfo"
+            test -x "$app/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
+            plutil -lint "$app/Contents/Info.plist" >/dev/null
+            codesign -dv "$app" >/dev/null 2>&1
+            echo "verified: $app"
+          done
+
+      - name: Upload macOS DMG
+        uses: actions/upload-artifact@v6
+        with:
+          name: codex-elves-macos-${{ matrix.arch }}-dmg
+          path: dist/macos/*.dmg
+          if-no-files-found: error

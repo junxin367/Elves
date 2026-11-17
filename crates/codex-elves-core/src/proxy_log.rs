@@ -1,0 +1,3541 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use fs2::FileExt;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+use crate::settings::LayeredCompactionModelUsage;
+
+pub const MAX_CAPTURED_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+const DEFAULT_CAPTURED_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const CAPTURE_HEAD_BYTES: usize = 64 * 1024;
+const FULL_CAPTURE_ENV: &str = "CODEX_ELVES_FULL_PROXY_CAPTURE";
+pub const RUNTIME_RETAINED_RECORDS: usize = 500;
+const PROXY_INDEX_HEADER: &str = r#"{"format":"codex-elves-proxy-index","version":1}"#;
+const PROXY_INDEX_COMPACT_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_PROXY_INDEX_UPDATES: usize = RUNTIME_RETAINED_RECORDS * 3;
+const LARGE_LOG_RECORD_SAFETY_BYTES: usize = 1024;
+const MAX_RETAINED_REQUEST_BODY_BYTES: usize = 64 * 1024;
+const MAX_SUMMARY_ERROR_BYTES: usize = 4 * 1024;
+const PROXY_LOG_QUEUE_CAPACITY: usize = 512;
+const PROXY_LOG_BATCH_SIZE: usize = 64;
+
+static PROXY_LOG_SENDER: OnceLock<SyncSender<ProxyLogCommand>> = OnceLock::new();
+static PROXY_LOG_DROPPED_INTERMEDIATE: AtomicU64 = AtomicU64::new(0);
+static PROXY_LOG_WORKER_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static PROXY_LOG_COMPLETED_ENQUEUE_FENCE: OnceLock<(Mutex<CompletedEnqueueFence>, Condvar)> =
+    OnceLock::new();
+static LEGACY_OUTPUT_TOKEN_CACHE: OnceLock<Mutex<HashMap<PathBuf, HashMap<String, Option<u64>>>>> =
+    OnceLock::new();
+static LEGACY_REQUEST_RESULT_CACHE: OnceLock<
+    Mutex<HashMap<PathBuf, HashMap<String, ProxyRequestSummary>>>,
+> = OnceLock::new();
+
+#[derive(Default)]
+struct CompletedEnqueueFence {
+    pending_before_flush: usize,
+    flushing: bool,
+}
+
+enum ProxyLogCommand {
+    Record {
+        path: PathBuf,
+        record: ProxyRequestRecord,
+    },
+    Flush(std::sync::mpsc::Sender<std::io::Result<()>>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProxyRequestOutcome {
+    Succeeded,
+    Failed,
+    Incomplete,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyRequestAudit {
+    #[serde(default)]
+    pub upstream_status_code: Option<u16>,
+    #[serde(default)]
+    pub outcome: Option<ProxyRequestOutcome>,
+    #[serde(default)]
+    pub error_code: Option<String>,
+    #[serde(default)]
+    pub upstream_attempts: Vec<ProxyRequestAttempt>,
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    #[serde(default)]
+    pub turn_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyRequestAttempt {
+    pub attempt: u32,
+    pub model: String,
+    #[serde(default)]
+    pub transport: Option<ProxyRequestTransport>,
+    #[serde(default)]
+    pub upstream_response_model: Option<String>,
+    pub status_code: Option<u16>,
+    pub outcome: Option<ProxyRequestOutcome>,
+    pub error_code: Option<String>,
+    pub error: Option<String>,
+}
+
+impl ProxyRequestAudit {
+    pub(crate) fn record_attempt(
+        &mut self,
+        model: &str,
+        status_code: Option<u16>,
+        error: Option<String>,
+    ) {
+        self.upstream_status_code = status_code;
+        self.upstream_attempts.push(ProxyRequestAttempt {
+            attempt: self.upstream_attempts.len() as u32 + 1,
+            model: model.to_string(),
+            transport: Some(ProxyRequestTransport::Http),
+            upstream_response_model: None,
+            status_code,
+            outcome: (error.is_some()
+                || status_code.is_some_and(|status| !(200..300).contains(&status)))
+            .then_some(ProxyRequestOutcome::Failed),
+            error_code: status_code
+                .filter(|status| !(200..300).contains(status))
+                .map(|status| format!("upstream_http_{status}")),
+            error,
+        });
+    }
+
+    pub(crate) fn observe_response(&mut self, observer: &UpstreamResponseModelObserver) {
+        self.outcome = self.outcome.or(observer.outcome);
+        self.error_code = self
+            .error_code
+            .clone()
+            .or_else(|| observer.error_code.clone());
+        if let Some(attempt) = self.upstream_attempts.last_mut() {
+            if attempt.outcome.is_none() {
+                attempt.upstream_response_model = attempt
+                    .upstream_response_model
+                    .clone()
+                    .or_else(|| observer.model());
+                attempt.outcome = observer.outcome;
+                attempt.error_code = observer.error_code.clone();
+                attempt.error = observer.error.clone();
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyRequestRecord {
+    pub id: String,
+    #[serde(flatten, default)]
+    pub audit: ProxyRequestAudit,
+    #[serde(default = "default_proxy_request_state")]
+    pub state: ProxyRequestState,
+    #[serde(default = "default_proxy_request_transport")]
+    pub transport: ProxyRequestTransport,
+    pub timestamp_ms: u64,
+    pub method: String,
+    pub path: String,
+    pub remote_addr: Option<String>,
+    pub model: Option<String>,
+    #[serde(default)]
+    pub upstream_request_model: Option<String>,
+    #[serde(default)]
+    pub upstream_response_model: Option<String>,
+    #[serde(default, alias = "cacheMissCompactionModel")]
+    pub independent_compaction_model: Option<String>,
+    #[serde(default)]
+    pub independent_compaction_usage: Option<LayeredCompactionModelUsage>,
+    #[serde(default)]
+    pub reasoning_tokens: Option<u64>,
+    pub reasoning_effort: Option<String>,
+    pub reasoning_source: Option<String>,
+    #[serde(default)]
+    pub continue_thinking_triggered: bool,
+    #[serde(default)]
+    pub continue_thinking_rounds: u32,
+    #[serde(default)]
+    pub continue_thinking_request_body: Option<String>,
+    #[serde(default)]
+    pub continue_thinking_before_response_body: Option<String>,
+    #[serde(default)]
+    pub continue_thinking_after_response_body: Option<String>,
+    #[serde(default)]
+    pub remote_compaction_triggered: bool,
+    #[serde(default)]
+    pub compaction_requested: bool,
+    #[serde(default)]
+    pub layered_compaction_triggered: bool,
+    #[serde(default)]
+    pub layered_compaction_retain_tokens: Option<u32>,
+    #[serde(default)]
+    pub layered_compaction_retained_items: Option<u32>,
+    #[serde(default)]
+    pub layered_compaction_retained_chars: Option<u32>,
+    #[serde(default)]
+    pub layered_compaction_before_response_body: Option<String>,
+    pub service_tier: Option<String>,
+    pub relay_id: Option<String>,
+    pub relay_name: Option<String>,
+    pub endpoint: Option<String>,
+    pub response_protocol: Option<String>,
+    #[serde(default)]
+    pub status_code: Option<u16>,
+    #[serde(default)]
+    pub first_token_ms: Option<u64>,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    pub stream: bool,
+    pub request_bytes: usize,
+    #[serde(default)]
+    pub response_bytes: Option<usize>,
+    #[serde(default)]
+    pub response_captured_bytes: Option<usize>,
+    #[serde(default)]
+    pub response_truncated: bool,
+    pub request_body: String,
+    pub response_body: String,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyRequestSummary {
+    pub id: String,
+    #[serde(flatten, default)]
+    pub audit: ProxyRequestAudit,
+    #[serde(default = "default_proxy_request_state")]
+    pub state: ProxyRequestState,
+    #[serde(default = "default_proxy_request_transport")]
+    pub transport: ProxyRequestTransport,
+    pub timestamp_ms: u64,
+    pub method: String,
+    pub path: String,
+    pub remote_addr: Option<String>,
+    pub model: Option<String>,
+    #[serde(default)]
+    pub upstream_request_model: Option<String>,
+    #[serde(default)]
+    pub upstream_response_model: Option<String>,
+    #[serde(default, alias = "cacheMissCompactionModel")]
+    pub independent_compaction_model: Option<String>,
+    #[serde(default)]
+    pub independent_compaction_usage: Option<LayeredCompactionModelUsage>,
+    #[serde(default)]
+    pub reasoning_tokens: Option<u64>,
+    #[serde(default)]
+    pub output_tokens: Option<u64>,
+    pub reasoning_effort: Option<String>,
+    pub reasoning_source: Option<String>,
+    #[serde(default)]
+    pub continue_thinking_triggered: bool,
+    #[serde(default)]
+    pub continue_thinking_rounds: u32,
+    #[serde(default)]
+    pub remote_compaction_triggered: bool,
+    // None identifies indexes written before request-level compaction tracking.
+    #[serde(default)]
+    pub compaction_requested: Option<bool>,
+    #[serde(default)]
+    pub layered_compaction_triggered: bool,
+    #[serde(default)]
+    pub layered_compaction_retain_tokens: Option<u32>,
+    #[serde(default)]
+    pub layered_compaction_retained_items: Option<u32>,
+    #[serde(default)]
+    pub layered_compaction_retained_chars: Option<u32>,
+    pub service_tier: Option<String>,
+    pub relay_id: Option<String>,
+    pub relay_name: Option<String>,
+    pub endpoint: Option<String>,
+    pub response_protocol: Option<String>,
+    #[serde(default)]
+    pub status_code: Option<u16>,
+    #[serde(default)]
+    pub first_token_ms: Option<u64>,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    pub stream: bool,
+    pub request_bytes: usize,
+    #[serde(default)]
+    pub response_bytes: Option<usize>,
+    #[serde(default)]
+    pub response_captured_bytes: Option<usize>,
+    #[serde(default)]
+    pub response_truncated: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProxyRequestState {
+    Pending,
+    Completed,
+}
+
+fn default_proxy_request_state() -> ProxyRequestState {
+    ProxyRequestState::Completed
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyRequestTransport {
+    Http,
+    Ws,
+}
+
+fn default_proxy_request_transport() -> ProxyRequestTransport {
+    ProxyRequestTransport::Http
+}
+
+#[derive(Debug, Clone)]
+pub struct RequestMetadata {
+    pub audit: ProxyRequestAudit,
+    pub compaction_requested: bool,
+    pub model: Option<String>,
+    pub upstream_request_model: Option<String>,
+    pub upstream_response_model: Option<String>,
+    pub independent_compaction_model: Option<String>,
+    pub independent_compaction_usage: Option<LayeredCompactionModelUsage>,
+    pub reasoning_effort: Option<String>,
+    pub reasoning_source: Option<String>,
+    pub service_tier: Option<String>,
+}
+
+impl From<&ProxyRequestRecord> for ProxyRequestSummary {
+    fn from(record: &ProxyRequestRecord) -> Self {
+        let (audit, error) = request_result(record);
+        Self {
+            id: record.id.clone(),
+            audit,
+            state: record.state,
+            transport: record.transport,
+            timestamp_ms: record.timestamp_ms,
+            method: record.method.clone(),
+            path: record.path.clone(),
+            remote_addr: record.remote_addr.clone(),
+            model: record.model.clone(),
+            upstream_request_model: record.upstream_request_model.clone(),
+            upstream_response_model: record.upstream_response_model.clone(),
+            independent_compaction_model: record.independent_compaction_model.clone(),
+            independent_compaction_usage: record.independent_compaction_usage,
+            reasoning_tokens: record
+                .reasoning_tokens
+                .or_else(|| infer_reasoning_tokens_for_summary(record)),
+            output_tokens: (record.state == ProxyRequestState::Completed)
+                .then(|| extract_output_tokens_from_response_body(record.response_body.as_bytes()))
+                .flatten(),
+            reasoning_effort: record.reasoning_effort.clone(),
+            reasoning_source: record.reasoning_source.clone(),
+            continue_thinking_triggered: record.continue_thinking_triggered,
+            continue_thinking_rounds: record.continue_thinking_rounds,
+            remote_compaction_triggered: record.remote_compaction_triggered,
+            compaction_requested: Some(
+                record.compaction_requested
+                    || record.remote_compaction_triggered
+                    || record.layered_compaction_triggered
+                    || request_body_uses_compaction(&record.request_body),
+            ),
+            layered_compaction_triggered: record.layered_compaction_triggered,
+            layered_compaction_retain_tokens: record.layered_compaction_retain_tokens,
+            layered_compaction_retained_items: record.layered_compaction_retained_items,
+            layered_compaction_retained_chars: record.layered_compaction_retained_chars,
+            service_tier: record.service_tier.clone(),
+            relay_id: record.relay_id.clone(),
+            relay_name: record.relay_name.clone(),
+            endpoint: record.endpoint.clone(),
+            response_protocol: record.response_protocol.clone(),
+            status_code: record.status_code,
+            first_token_ms: record.first_token_ms,
+            duration_ms: record.duration_ms,
+            stream: record.stream,
+            request_bytes: record.request_bytes,
+            response_bytes: record.response_bytes,
+            response_captured_bytes: record.response_captured_bytes,
+            response_truncated: record.response_truncated,
+            error: error
+                .as_deref()
+                .map(|error| truncate_to_utf8_byte_limit(error, MAX_SUMMARY_ERROR_BYTES)),
+        }
+    }
+}
+
+pub fn request_uses_remote_compaction_v2(request_json: Option<&Value>) -> bool {
+    crate::layered_compaction::is_remote_compaction_v2_request(request_json)
+}
+
+pub fn request_body_uses_remote_compaction_v2(request_body: &str) -> bool {
+    serde_json::from_str::<Value>(request_body)
+        .ok()
+        .as_ref()
+        .is_some_and(|request| request_uses_remote_compaction_v2(Some(request)))
+}
+
+fn request_uses_compaction(request: &Value) -> bool {
+    if crate::layered_compaction::is_any_compaction_request(request) {
+        return true;
+    }
+    // Logs can contain the upstream Anthropic/Chat request, after prompt replacement.
+    let Some(last) = request
+        .get("input")
+        .or_else(|| request.get("messages"))
+        .and_then(Value::as_array)
+        .and_then(|items| items.last())
+    else {
+        return false;
+    };
+    if last.get("role").and_then(Value::as_str) != Some("user") {
+        return false;
+    }
+    let content = &last["content"];
+    let text = content.as_str().map(str::to_owned).unwrap_or_else(|| {
+        content
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n")
+    });
+    let text = text.trim_start();
+    text.starts_with(crate::layered_compaction::COMPACTION_PROMPT_PREFIX)
+        || (text.starts_with(crate::layered_compaction::COMPACTION_INSTRUCTION_PREFIX)
+            && text.contains(crate::layered_compaction::COMPACTION_INSTRUCTION_SUFFIX))
+}
+
+fn request_body_uses_compaction(body: &str) -> bool {
+    if !body.contains("compaction_trigger")
+        && !body.contains(crate::layered_compaction::COMPACTION_PROMPT_PREFIX)
+        && !body.contains("[Handoff checkpoint]")
+    {
+        return false;
+    }
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .as_ref()
+        .is_some_and(request_uses_compaction)
+}
+
+fn infer_reasoning_tokens_for_summary(record: &ProxyRequestRecord) -> Option<u64> {
+    if record.response_body.is_empty()
+        || !response_body_may_contain_reasoning(&record.response_body)
+    {
+        return None;
+    }
+    extract_reasoning_tokens_from_response_body(record.response_body.as_bytes())
+}
+
+fn response_body_may_contain_reasoning(response_body: &str) -> bool {
+    response_body.contains("reasoning_tokens")
+        || response_body.contains("thinking_tokens")
+        || response_body.contains("reasoning_content")
+        || response_body.contains("reasoning_summary")
+        || response_body.contains("\"thinking\"")
+}
+
+pub fn current_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+pub fn extract_request_metadata(request_json: Option<&Value>) -> RequestMetadata {
+    let model = request_json
+        .and_then(|value| value.get("model"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string);
+    let service_tier = request_json
+        .and_then(|value| value.get("service_tier"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string);
+    let reasoning = request_json.and_then(|value| value.get("reasoning"));
+    let reasoning_effort = reasoning
+        .and_then(|value| value.get("effort"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            request_json
+                .and_then(|value| value.get("reasoning_effort"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            request_json
+                .and_then(|value| value.pointer("/output_config/effort"))
+                .and_then(Value::as_str)
+        })
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string);
+    let reasoning_source = if reasoning
+        .and_then(|value| value.get("effort"))
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        Some("reasoning.effort".to_string())
+    } else if request_json
+        .and_then(|value| value.get("reasoning_effort"))
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        Some("reasoning_effort".to_string())
+    } else if request_json
+        .and_then(|value| value.pointer("/output_config/effort"))
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        Some("output_config.effort".to_string())
+    } else {
+        None
+    };
+
+    RequestMetadata {
+        audit: ProxyRequestAudit {
+            thread_id: request_json
+                .and_then(|request| {
+                    request
+                        .pointer("/metadata/thread_id")
+                        .or_else(|| request.pointer("/metadata/session_id"))
+                })
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string),
+            turn_id: request_json
+                .and_then(|request| request.pointer("/metadata/turn_id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string),
+            ..Default::default()
+        },
+        compaction_requested: request_json.is_some_and(request_uses_compaction),
+        model,
+        upstream_request_model: None,
+        upstream_response_model: None,
+        independent_compaction_model: None,
+        independent_compaction_usage: None,
+        reasoning_effort,
+        reasoning_source,
+        service_tier,
+    }
+}
+
+pub(crate) fn extract_request_metadata_with_context(
+    request_json: Option<&Value>,
+    context: &crate::request_headers::RequestContext,
+) -> RequestMetadata {
+    let mut metadata = extract_request_metadata(request_json);
+    if let Some(thread_id) = context.log_thread_id() {
+        metadata.audit.thread_id = Some(thread_id.to_string());
+    }
+    metadata.audit.turn_id = metadata.audit.turn_id.or_else(|| context.turn_id());
+    metadata
+}
+
+fn request_result(record: &ProxyRequestRecord) -> (ProxyRequestAudit, Option<String>) {
+    let mut audit = record.audit.clone();
+    if record.state == ProxyRequestState::Pending {
+        audit.outcome = None;
+        audit.error_code = None;
+        return (audit, record.error.clone());
+    }
+    let mut observer = UpstreamResponseModelObserver::default();
+    let protocol = match record.response_protocol.as_deref() {
+        Some("chatCompletions" | "chat_completions") => {
+            crate::protocol_proxy::UpstreamResponseProtocol::ChatCompletions
+        }
+        Some("anthropic") => crate::protocol_proxy::UpstreamResponseProtocol::Anthropic,
+        _ => crate::protocol_proxy::UpstreamResponseProtocol::Responses,
+    };
+    observer.observe_json(record.response_body.as_bytes(), protocol);
+    observer.observe_sse_chunk(record.response_body.as_bytes(), protocol);
+    observer.finish_sse(protocol);
+    if record.transport == ProxyRequestTransport::Ws {
+        for line in record.response_body.lines() {
+            observer.observe_json(line.as_bytes(), protocol);
+        }
+    }
+    audit.observe_response(&observer);
+    audit.outcome = observer.outcome.or(audit.outcome);
+    audit.error_code = observer.error_code.clone().or(audit.error_code);
+    let error = record.error.clone().or(observer.error).or_else(|| {
+        (audit.outcome == Some(ProxyRequestOutcome::Failed))
+            .then(|| {
+                audit
+                    .upstream_attempts
+                    .last()
+                    .and_then(|attempt| attempt.error.clone())
+            })
+            .flatten()
+    });
+    audit.outcome = if record.status_code == Some(499) {
+        Some(ProxyRequestOutcome::Incomplete)
+    } else if error.is_some()
+        || record
+            .status_code
+            .is_some_and(|status| !(200..300).contains(&status))
+    {
+        Some(ProxyRequestOutcome::Failed)
+    } else {
+        audit.outcome.or_else(|| {
+            (record.stream && !audit.upstream_attempts.is_empty())
+                .then_some(ProxyRequestOutcome::Incomplete)
+        })
+    };
+    if let Some(attempt) = audit.upstream_attempts.last_mut()
+        && attempt.outcome.is_none()
+    {
+        attempt.outcome = audit.outcome;
+        attempt.error_code = audit.error_code.clone();
+        attempt.error = error.clone();
+    }
+    (audit, error)
+}
+
+const MAX_OBSERVED_MODEL_CHARS: usize = 200;
+const MAX_SSE_MODEL_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Default)]
+pub(crate) struct UpstreamResponseModelObserver {
+    first: Option<String>,
+    terminal: Option<String>,
+    pub(crate) outcome: Option<ProxyRequestOutcome>,
+    pub(crate) error_code: Option<String>,
+    pub(crate) error: Option<String>,
+    pending_line: Vec<u8>,
+    event_type: String,
+    data: String,
+    skipping_line: bool,
+    skipping_frame: bool,
+}
+
+impl UpstreamResponseModelObserver {
+    pub(crate) fn model(&self) -> Option<String> {
+        self.terminal.clone().or_else(|| self.first.clone())
+    }
+
+    pub(crate) fn observe_json(
+        &mut self,
+        body: &[u8],
+        protocol: crate::protocol_proxy::UpstreamResponseProtocol,
+    ) {
+        if let Ok(value) = serde_json::from_slice::<Value>(body) {
+            self.observe_value(&value, protocol, None);
+        }
+    }
+
+    pub(crate) fn observe_value(
+        &mut self,
+        value: &Value,
+        protocol: crate::protocol_proxy::UpstreamResponseProtocol,
+        event_type: Option<&str>,
+    ) {
+        use crate::protocol_proxy::UpstreamResponseProtocol;
+        let event_type = event_type
+            .filter(|event| !event.is_empty())
+            .or_else(|| value.get("type").and_then(Value::as_str))
+            .unwrap_or_default();
+        let response = value
+            .get("response")
+            .filter(|value| value.is_object())
+            .unwrap_or(value);
+        let error = response.get("error").filter(|error| !error.is_null());
+        let status = response.get("status").and_then(Value::as_str);
+        if error.is_some()
+            || matches!(event_type, "response.failed" | "error")
+            || status == Some("failed")
+        {
+            self.outcome = Some(ProxyRequestOutcome::Failed);
+            self.error_code = error
+                .and_then(|error| error.get("code").or_else(|| error.get("type")))
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            self.error = error
+                .and_then(|error| error.get("message"))
+                .or_else(|| response.get("message"))
+                .and_then(Value::as_str)
+                .map(|message| truncate_to_utf8_byte_limit(message, MAX_SUMMARY_ERROR_BYTES))
+                .or_else(|| Some("上游返回失败".to_string()));
+        } else if matches!(
+            event_type,
+            "response.incomplete" | "response.cancelled" | "response.canceled"
+        ) || matches!(status, Some("incomplete" | "cancelled" | "canceled"))
+        {
+            self.outcome = Some(ProxyRequestOutcome::Incomplete);
+            self.error_code = response
+                .pointer("/incomplete_details/reason")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+        } else if !matches!(
+            self.outcome,
+            Some(ProxyRequestOutcome::Failed | ProxyRequestOutcome::Incomplete)
+        ) && (status == Some("completed")
+            || matches!(event_type, "response.completed" | "message_stop")
+            || value.get("object").and_then(Value::as_str) == Some("chat.completion")
+            || value.get("object").and_then(Value::as_str) == Some("response.compaction")
+            || (matches!(protocol, UpstreamResponseProtocol::ChatCompletions)
+                && value
+                    .get("choices")
+                    .and_then(Value::as_array)
+                    .is_some_and(|choices| {
+                        choices.iter().any(|choice| {
+                            choice
+                                .get("finish_reason")
+                                .is_some_and(|reason| !reason.is_null())
+                        })
+                    }))
+            || (matches!(protocol, UpstreamResponseProtocol::Anthropic)
+                && value.get("type").and_then(Value::as_str) == Some("message")))
+        {
+            self.outcome = Some(ProxyRequestOutcome::Succeeded);
+        }
+        let candidates = match protocol {
+            UpstreamResponseProtocol::Responses => {
+                [value.pointer("/response/model"), value.get("model")]
+            }
+            UpstreamResponseProtocol::ChatCompletions => {
+                [value.get("model"), value.pointer("/response/model")]
+            }
+            UpstreamResponseProtocol::Anthropic => {
+                [value.pointer("/message/model"), value.get("model")]
+            }
+        };
+        let model = candidates
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .find(|model| !model.is_empty());
+        let Some(model) = model else {
+            return;
+        };
+        let model = model.chars().take(MAX_OBSERVED_MODEL_CHARS).collect();
+        if matches!(
+            event_type,
+            "response.completed"
+                | "response.done"
+                | "response.failed"
+                | "response.incomplete"
+                | "response.cancelled"
+                | "response.canceled"
+        ) {
+            self.terminal = Some(model);
+        } else if self.first.is_none() {
+            self.first = Some(model);
+        }
+    }
+
+    pub(crate) fn observe_sse_chunk(
+        &mut self,
+        chunk: &[u8],
+        protocol: crate::protocol_proxy::UpstreamResponseProtocol,
+    ) {
+        for segment in chunk.split_inclusive(|byte| *byte == b'\n') {
+            if self.skipping_line {
+                if segment.ends_with(b"\n") {
+                    self.skipping_line = false;
+                }
+                continue;
+            }
+            if self.pending_line.len() + segment.len() > MAX_SSE_MODEL_LINE_BYTES {
+                self.pending_line.clear();
+                self.skipping_line = !segment.ends_with(b"\n");
+                self.skipping_frame = true;
+                continue;
+            }
+            self.pending_line.extend_from_slice(segment);
+            if self.pending_line.ends_with(b"\n") {
+                let line = self.pending_line[..self.pending_line.len() - 1].to_vec();
+                self.pending_line.clear();
+                self.observe_sse_line(&line, protocol);
+            }
+        }
+    }
+
+    pub(crate) fn finish_sse(&mut self, protocol: crate::protocol_proxy::UpstreamResponseProtocol) {
+        if !self.pending_line.is_empty() && !self.skipping_line {
+            let line = std::mem::take(&mut self.pending_line);
+            self.observe_sse_line(&line, protocol);
+        }
+        self.flush_sse_frame(protocol);
+    }
+
+    fn observe_sse_line(
+        &mut self,
+        line: &[u8],
+        protocol: crate::protocol_proxy::UpstreamResponseProtocol,
+    ) {
+        let line = String::from_utf8_lossy(line);
+        let line = line.trim_end_matches('\r');
+        if self.skipping_frame {
+            if line.is_empty() {
+                self.skipping_frame = false;
+                self.data.clear();
+                self.event_type.clear();
+            }
+            return;
+        }
+        if line.is_empty() {
+            self.flush_sse_frame(protocol);
+        } else if let Some(event) = line.strip_prefix("event:") {
+            self.event_type = event.trim().to_string();
+        } else if let Some(data) = line.strip_prefix("data:") {
+            if self.data.len() + data.len() > MAX_SSE_MODEL_LINE_BYTES {
+                self.skipping_frame = true;
+                self.data.clear();
+                return;
+            }
+            if !self.data.is_empty() {
+                self.data.push('\n');
+            }
+            self.data.push_str(data.trim_start());
+        }
+    }
+
+    fn flush_sse_frame(&mut self, protocol: crate::protocol_proxy::UpstreamResponseProtocol) {
+        if self.data.trim() == "[DONE]"
+            && protocol == crate::protocol_proxy::UpstreamResponseProtocol::ChatCompletions
+            && self.outcome.is_none()
+        {
+            self.outcome = Some(ProxyRequestOutcome::Succeeded);
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(&self.data) {
+            let event_type = self.event_type.clone();
+            self.observe_value(&value, protocol, Some(&event_type));
+        }
+        self.data.clear();
+        self.event_type.clear();
+    }
+}
+
+pub fn append_capture(buffer: &mut Vec<u8>, bytes: &[u8]) -> bool {
+    append_capture_with_limit(buffer, bytes, captured_response_limit())
+}
+
+fn captured_response_limit() -> usize {
+    static CAPTURE_LIMIT: OnceLock<usize> = OnceLock::new();
+    *CAPTURE_LIMIT.get_or_init(|| {
+        std::env::var(FULL_CAPTURE_ENV)
+            .ok()
+            .filter(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .map(|_| MAX_CAPTURED_RESPONSE_BYTES)
+            .unwrap_or(DEFAULT_CAPTURED_RESPONSE_BYTES)
+    })
+}
+
+fn append_capture_with_limit(buffer: &mut Vec<u8>, bytes: &[u8], limit: usize) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    if limit == 0 {
+        return true;
+    }
+    if buffer.len().saturating_add(bytes.len()) <= limit {
+        buffer.extend_from_slice(bytes);
+        return false;
+    }
+
+    let head_limit = CAPTURE_HEAD_BYTES.min(limit / 2);
+    let mut remaining_bytes = bytes;
+    if buffer.len() < head_limit {
+        let head_take = (head_limit - buffer.len()).min(remaining_bytes.len());
+        buffer.extend_from_slice(&remaining_bytes[..head_take]);
+        remaining_bytes = &remaining_bytes[head_take..];
+    }
+
+    let tail_limit = limit.saturating_sub(head_limit);
+    if tail_limit == 0 {
+        buffer.truncate(head_limit);
+        return true;
+    }
+    if remaining_bytes.len() >= tail_limit {
+        buffer.truncate(head_limit);
+        buffer.extend_from_slice(&remaining_bytes[remaining_bytes.len() - tail_limit..]);
+        return true;
+    }
+
+    let retained_old_tail = tail_limit.saturating_sub(remaining_bytes.len());
+    let old_tail_start = buffer
+        .len()
+        .saturating_sub(retained_old_tail)
+        .max(head_limit);
+    let old_tail = buffer[old_tail_start..].to_vec();
+    buffer.truncate(head_limit);
+    buffer.extend_from_slice(&old_tail);
+    buffer.extend_from_slice(remaining_bytes);
+    true
+}
+
+pub fn extract_reasoning_tokens_from_response_body(body: &[u8]) -> Option<u64> {
+    let text = String::from_utf8_lossy(body);
+    if let Ok(value) = serde_json::from_str::<Value>(&text) {
+        return find_reasoning_tokens(&value)
+            .filter(|tokens| *tokens > 0)
+            .or_else(|| estimate_reasoning_tokens_from_value(&value))
+            .or_else(|| find_reasoning_tokens(&value));
+    }
+
+    let mut exact_tokens = None;
+    let mut terminal_texts = Vec::new();
+    let mut done_texts = BTreeMap::new();
+    let mut delta_texts = BTreeMap::new();
+    let mut fallback_texts = Vec::new();
+
+    for value in text.lines().filter_map(parse_sse_data_line) {
+        if let Some(tokens) = find_reasoning_tokens(&value) {
+            exact_tokens = Some(exact_tokens.unwrap_or(0).max(tokens));
+        }
+        collect_sse_reasoning_texts(
+            &value,
+            &mut terminal_texts,
+            &mut done_texts,
+            &mut delta_texts,
+            &mut fallback_texts,
+        );
+    }
+
+    exact_tokens
+        .filter(|tokens| *tokens > 0)
+        .or_else(|| estimate_reasoning_tokens_from_texts(&terminal_texts))
+        .or_else(|| estimate_reasoning_tokens_from_texts(done_texts.values()))
+        .or_else(|| estimate_reasoning_tokens_from_texts(delta_texts.values()))
+        .or_else(|| estimate_reasoning_tokens_from_texts(&fallback_texts))
+        .or(exact_tokens)
+}
+
+pub(crate) fn extract_output_tokens_from_response_body(body: &[u8]) -> Option<u64> {
+    let text = String::from_utf8_lossy(body);
+    if let Ok(value) = serde_json::from_str::<Value>(&text) {
+        return output_tokens_from_usage(&value);
+    }
+    text.lines()
+        .filter_map(|line| {
+            parse_sse_data_line(line).or_else(|| serde_json::from_str::<Value>(line.trim()).ok())
+        })
+        .filter_map(|event| output_tokens_from_usage(&event))
+        .max()
+}
+
+fn output_tokens_from_usage(value: &Value) -> Option<u64> {
+    value
+        .get("usage")
+        .and_then(|usage| {
+            usage
+                .get("output_tokens")
+                .or_else(|| usage.get("completion_tokens"))
+        })
+        .and_then(value_to_u64)
+        .or_else(|| value.get("response").and_then(output_tokens_from_usage))
+        .or_else(|| value.get("message").and_then(output_tokens_from_usage))
+}
+
+pub fn append_record(record: &ProxyRequestRecord) -> std::io::Result<()> {
+    let path = default_log_path();
+    append_record_at_path(&path, record)
+}
+
+pub fn enqueue_record(record: &ProxyRequestRecord) -> std::io::Result<()> {
+    if crate::paths::proxy_log_path_for_tests().is_some() {
+        return append_record(record);
+    }
+    let command = ProxyLogCommand::Record {
+        path: default_log_path(),
+        record: record.clone(),
+    };
+    let sender = proxy_log_sender();
+    if record.state == ProxyRequestState::Completed {
+        sender
+            .send(command)
+            .map_err(|_| std::io::Error::other("proxy log worker stopped"))
+    } else {
+        match sender.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                let dropped = PROXY_LOG_DROPPED_INTERMEDIATE.fetch_add(1, Ordering::Relaxed) + 1;
+                if dropped.is_power_of_two() {
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "helper.local_proxy_log_intermediate_dropped",
+                        serde_json::json!({
+                            "dropped_intermediate": dropped,
+                            "queue_capacity": PROXY_LOG_QUEUE_CAPACITY
+                        }),
+                    );
+                }
+                Ok(())
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                Err(std::io::Error::other("proxy log worker stopped"))
+            }
+        }
+    }
+}
+
+pub fn enqueue_record_nonblocking(record: &ProxyRequestRecord) -> std::io::Result<()> {
+    if let Some(path) = crate::paths::proxy_log_path_for_tests() {
+        return append_record_at_path(&path, record);
+    }
+    enqueue_record_nonblocking_at_path(record, default_log_path())
+}
+
+fn enqueue_record_nonblocking_at_path(
+    record: &ProxyRequestRecord,
+    path: PathBuf,
+) -> std::io::Result<()> {
+    if record.state != ProxyRequestState::Completed {
+        return enqueue_record(record);
+    }
+    let record = record.clone();
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return enqueue_record(&record);
+    };
+    let sender = proxy_log_sender();
+    let tracked_before_flush = {
+        let (lock, _) = completed_enqueue_fence();
+        let mut fence = lock.lock().unwrap();
+        if fence.flushing {
+            false
+        } else {
+            fence.pending_before_flush += 1;
+            true
+        }
+    };
+    runtime.spawn_blocking(move || {
+        let result = sender
+            .send(ProxyLogCommand::Record {
+                path,
+                record: record.clone(),
+            })
+            .map_err(|_| std::io::Error::other("proxy log worker stopped"));
+        if tracked_before_flush {
+            complete_completed_enqueue_fence();
+        }
+        if let Err(error) = result {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "helper.local_proxy_log_background_enqueue_failed",
+                serde_json::json!({
+                    "id": record.id,
+                    "error": error.to_string()
+                }),
+            );
+        }
+    });
+    Ok(())
+}
+
+pub fn dropped_intermediate_record_count() -> u64 {
+    PROXY_LOG_DROPPED_INTERMEDIATE.load(Ordering::Relaxed)
+}
+
+pub fn flush_pending_records() -> std::io::Result<()> {
+    let Some(sender) = PROXY_LOG_SENDER.get() else {
+        return Ok(());
+    };
+    wait_for_completed_enqueue_fence();
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    let send_result = sender
+        .send(ProxyLogCommand::Flush(reply_tx))
+        .map_err(|_| std::io::Error::other("proxy log worker stopped"));
+    release_completed_enqueue_fence();
+    send_result?;
+    reply_rx
+        .recv()
+        .map_err(|_| std::io::Error::other("proxy log worker stopped"))?
+}
+
+fn completed_enqueue_fence() -> &'static (Mutex<CompletedEnqueueFence>, Condvar) {
+    PROXY_LOG_COMPLETED_ENQUEUE_FENCE
+        .get_or_init(|| (Mutex::new(CompletedEnqueueFence::default()), Condvar::new()))
+}
+
+fn complete_completed_enqueue_fence() {
+    let (lock, ready) = completed_enqueue_fence();
+    let mut fence = lock.lock().unwrap();
+    fence.pending_before_flush = fence.pending_before_flush.saturating_sub(1);
+    ready.notify_all();
+}
+
+fn wait_for_completed_enqueue_fence() {
+    let (lock, ready) = completed_enqueue_fence();
+    let mut fence = lock.lock().unwrap();
+    while fence.flushing || fence.pending_before_flush > 0 {
+        fence = ready.wait(fence).unwrap();
+    }
+    fence.flushing = true;
+}
+
+fn release_completed_enqueue_fence() {
+    let (lock, ready) = completed_enqueue_fence();
+    let mut fence = lock.lock().unwrap();
+    fence.flushing = false;
+    ready.notify_all();
+}
+
+fn append_record_at_path(path: &Path, record: &ProxyRequestRecord) -> std::io::Result<()> {
+    append_records_at_path(path, std::slice::from_ref(record))
+}
+
+fn append_records_at_path(path: &Path, records: &[ProxyRequestRecord]) -> std::io::Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let lock = open_index_lock(path)?;
+    lock.lock_exclusive()?;
+    let result: std::io::Result<()> = (|| {
+        let index = read_proxy_index(path)?;
+        let recovered_index =
+            index.needs_repair && (index.size_bytes > 0 || !index.updates.is_empty());
+        for record in index.legacy_records.iter().rev() {
+            if !detail_record_path(path, &record.id).exists() {
+                write_detail_record(path, record)?;
+            }
+        }
+        let mut updates = index.updates;
+        let mut appended = Vec::new();
+        for record in records {
+            write_detail_record(path, record)?;
+            let summary = ProxyRequestSummary::from(record);
+            serde_json::to_writer(&mut appended, &summary).map_err(std::io::Error::other)?;
+            appended.push(b'\n');
+            updates.push(summary);
+        }
+        let update_count = updates.len();
+        let mut summaries = dedupe_summaries(updates);
+        sort_summaries(&mut summaries);
+        let before_count = summaries.len();
+        let mut completed_count = 0;
+        let mut removed = Vec::new();
+        summaries.retain(|summary| {
+            if summary.state == ProxyRequestState::Completed {
+                completed_count += 1;
+                if completed_count > RUNTIME_RETAINED_RECORDS {
+                    removed.push(summary.clone());
+                    return false;
+                }
+            }
+            true
+        });
+        let size_triggered =
+            index.size_bytes.saturating_add(appended.len() as u64) > PROXY_INDEX_COMPACT_BYTES;
+        let updates_triggered = update_count > MAX_PROXY_INDEX_UPDATES;
+        let after_bytes = if index.needs_repair
+            || !removed.is_empty()
+            || size_triggered
+            || updates_triggered
+            || records.len() > 1
+        {
+            write_summaries_to_index(path, &summaries)?
+        } else {
+            let mut file = OpenOptions::new().append(true).open(path)?;
+            file.write_all(&appended)?;
+            file.flush()?;
+            index.size_bytes + appended.len() as u64
+        };
+        if !removed.is_empty() || size_triggered || updates_triggered || recovered_index {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "helper.local_proxy_log_maintenance",
+                serde_json::json!({
+                    "recovered_index": recovered_index,
+                    "size_triggered": size_triggered,
+                    "updates_triggered": updates_triggered,
+                    "before_count": before_count,
+                    "after_count": summaries.len(),
+                    "removed_count": removed.len(),
+                    "before_bytes": index.size_bytes,
+                    "after_bytes": after_bytes,
+                    "over_compaction_threshold": after_bytes > PROXY_INDEX_COMPACT_BYTES
+                }),
+            );
+        }
+        remove_detail_records(path, &removed)?;
+        Ok(())
+    })();
+    let unlock_result = lock.unlock();
+    result?;
+    unlock_result
+}
+
+pub fn read_summaries(limit: usize) -> std::io::Result<Vec<ProxyRequestSummary>> {
+    flush_pending_records()?;
+    let path = default_log_path();
+    read_summaries_at_path(&path, limit)
+}
+
+pub fn find_record(id: &str) -> std::io::Result<Option<ProxyRequestRecord>> {
+    flush_pending_records()?;
+    let path = default_log_path();
+    find_record_at_path(&path, id)
+}
+
+pub fn clear_records() -> std::io::Result<()> {
+    flush_pending_records()?;
+    let path = default_log_path();
+    clear_records_at_path(&path)
+}
+
+fn clear_records_at_path(path: &Path) -> std::io::Result<()> {
+    let lock = open_index_lock(path)?;
+    lock.lock_exclusive()?;
+    let result = (|| {
+        write_summaries_to_index(path, &[])?;
+        clear_detail_directory(path)
+    })();
+    let unlock_result = lock.unlock();
+    result?;
+    unlock_result
+}
+
+fn proxy_log_sender() -> &'static SyncSender<ProxyLogCommand> {
+    PROXY_LOG_SENDER.get_or_init(|| {
+        let (sender, receiver) = sync_channel(PROXY_LOG_QUEUE_CAPACITY);
+        std::thread::Builder::new()
+            .name("codex-elves-proxy-log".to_string())
+            .spawn(move || run_proxy_log_worker(receiver))
+            .expect("proxy log worker should start");
+        sender
+    })
+}
+
+fn run_proxy_log_worker(receiver: Receiver<ProxyLogCommand>) {
+    while let Ok(command) = receiver.recv() {
+        match command {
+            ProxyLogCommand::Record { path, record } => {
+                let mut batch = vec![(path, record)];
+                let mut flush_replies = Vec::new();
+                while batch.len() < PROXY_LOG_BATCH_SIZE {
+                    match receiver.try_recv() {
+                        Ok(ProxyLogCommand::Record { path, record }) => {
+                            batch.push((path, record));
+                        }
+                        Ok(ProxyLogCommand::Flush(reply)) => flush_replies.push(reply),
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => break,
+                    }
+                }
+                let result = write_proxy_log_batch(batch);
+                if let Err(error) = &result {
+                    *proxy_log_worker_error().lock().unwrap() = Some(error.to_string());
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "helper.local_proxy_log_worker_failed",
+                        serde_json::json!({ "error": error.to_string() }),
+                    );
+                }
+                for reply in flush_replies {
+                    let _ = reply.send(clone_io_result(&result));
+                }
+            }
+            ProxyLogCommand::Flush(reply) => {
+                let result = proxy_log_worker_error()
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .map_or(Ok(()), |error| Err(std::io::Error::other(error)));
+                let _ = reply.send(result);
+            }
+        }
+    }
+}
+
+fn write_proxy_log_batch(batch: Vec<(PathBuf, ProxyRequestRecord)>) -> std::io::Result<()> {
+    let mut grouped = BTreeMap::<PathBuf, HashMap<String, ProxyRequestRecord>>::new();
+    for (path, record) in batch {
+        grouped
+            .entry(path)
+            .or_default()
+            .insert(record.id.clone(), record);
+    }
+    for (path, records) in grouped {
+        append_records_at_path(&path, &records.into_values().collect::<Vec<_>>())?;
+    }
+    Ok(())
+}
+
+fn proxy_log_worker_error() -> &'static Mutex<Option<String>> {
+    PROXY_LOG_WORKER_ERROR.get_or_init(|| Mutex::new(None))
+}
+
+fn clone_io_result(result: &std::io::Result<()>) -> std::io::Result<()> {
+    result
+        .as_ref()
+        .map(|_| ())
+        .map_err(|error| std::io::Error::new(error.kind(), error.to_string()))
+}
+
+pub fn default_log_path() -> PathBuf {
+    crate::paths::default_proxy_log_path()
+}
+
+fn read_summaries_at_path(path: &Path, limit: usize) -> std::io::Result<Vec<ProxyRequestSummary>> {
+    let lock = open_index_lock(path)?;
+    lock.lock_shared()?;
+    let result: std::io::Result<Vec<ProxyRequestSummary>> = (|| {
+        let mut summaries = dedupe_summaries(read_proxy_index(path)?.updates);
+        sort_summaries(&mut summaries);
+        summaries.truncate(limit);
+        Ok(summaries)
+    })();
+    let unlock_result = lock.unlock();
+    let mut summaries = result?;
+    unlock_result?;
+    backfill_legacy_output_tokens(path, &mut summaries);
+    backfill_legacy_request_result(path, &mut summaries);
+    Ok(summaries)
+}
+
+fn backfill_legacy_request_result(path: &Path, summaries: &mut [ProxyRequestSummary]) {
+    if !summaries.iter().any(needs_legacy_request_result) {
+        return;
+    }
+    let cache = LEGACY_REQUEST_RESULT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().unwrap();
+    if cache.len() > 4 && !cache.contains_key(path) {
+        cache.clear();
+    }
+    let path_cache = cache.entry(path.to_path_buf()).or_default();
+    let completed_ids: HashSet<_> = summaries
+        .iter()
+        .filter(|summary| summary.state == ProxyRequestState::Completed)
+        .map(|summary| summary.id.as_str())
+        .collect();
+    path_cache.retain(|id, _| completed_ids.contains(id.as_str()));
+    for summary in summaries
+        .iter_mut()
+        .filter(|summary| needs_legacy_request_result(summary))
+    {
+        let result = if let Some(cached) = path_cache.get(&summary.id) {
+            cached.clone()
+        } else {
+            let Ok(Some(record)) = read_detail_record_at_path(path, &summary.id) else {
+                continue;
+            };
+            let result = ProxyRequestSummary::from(&record);
+            if summary.state == ProxyRequestState::Completed {
+                path_cache.insert(summary.id.clone(), result.clone());
+            }
+            result
+        };
+        summary.compaction_requested = result.compaction_requested;
+        summary.audit = result.audit;
+        summary.error = result.error;
+    }
+}
+
+fn needs_legacy_request_result(summary: &ProxyRequestSummary) -> bool {
+    summary.compaction_requested.is_none()
+        || (summary.state == ProxyRequestState::Completed && summary.audit.outcome.is_none())
+}
+
+fn backfill_legacy_output_tokens(path: &Path, summaries: &mut [ProxyRequestSummary]) {
+    if !summaries.iter().any(needs_legacy_output_tokens) {
+        return;
+    }
+    let cache = LEGACY_OUTPUT_TOKEN_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().unwrap();
+    if cache.len() > 4 && !cache.contains_key(path) {
+        cache.clear();
+    }
+    let path_cache = cache.entry(path.to_path_buf()).or_default();
+    let visible_ids: HashSet<_> = summaries
+        .iter()
+        .map(|summary| summary.id.as_str())
+        .collect();
+    path_cache.retain(|id, _| visible_ids.contains(id.as_str()));
+
+    for summary in summaries
+        .iter_mut()
+        .filter(|summary| needs_legacy_output_tokens(summary))
+    {
+        if let Some(tokens) = path_cache.get(&summary.id) {
+            summary.output_tokens = *tokens;
+            continue;
+        }
+        if let Ok(record) = read_detail_record_at_path(path, &summary.id) {
+            let tokens = record.and_then(|record| {
+                (record.state == ProxyRequestState::Completed)
+                    .then(|| {
+                        extract_output_tokens_from_response_body(record.response_body.as_bytes())
+                    })
+                    .flatten()
+            });
+            path_cache.insert(summary.id.clone(), tokens);
+            summary.output_tokens = tokens;
+        }
+    }
+}
+
+fn needs_legacy_output_tokens(summary: &ProxyRequestSummary) -> bool {
+    summary.state == ProxyRequestState::Completed
+        && summary.output_tokens.is_none()
+        && summary.duration_ms.is_some()
+        && summary
+            .status_code
+            .is_some_and(|status| (200..300).contains(&status))
+}
+
+fn find_record_at_path(path: &Path, id: &str) -> std::io::Result<Option<ProxyRequestRecord>> {
+    let lock = open_index_lock(path)?;
+    lock.lock_shared()?;
+    let result = (|| {
+        let index = read_proxy_index(path)?;
+        Ok::<_, std::io::Error>(read_detail_record_at_path(path, id)?.or_else(|| {
+            index
+                .legacy_records
+                .into_iter()
+                .rev()
+                .find(|record| record.id == id)
+        }))
+    })();
+    let unlock_result = lock.unlock();
+    let mut record = result?;
+    unlock_result?;
+
+    if let Some(record) = record.as_mut() {
+        record.compaction_requested |= record.remote_compaction_triggered
+            || record.layered_compaction_triggered
+            || request_body_uses_compaction(&record.request_body);
+        let (audit, error) = request_result(record);
+        record.audit = audit;
+        record.error = error;
+    }
+    Ok(record)
+}
+
+fn read_detail_record_at_path(
+    path: &Path,
+    id: &str,
+) -> std::io::Result<Option<ProxyRequestRecord>> {
+    let detail_path = detail_record_path(path, id);
+    let mut detail_file = match fs::File::open(detail_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    detail_file.lock_shared()?;
+    let mut text = String::new();
+    let read_result = detail_file.read_to_string(&mut text);
+    let unlock_result = detail_file.unlock();
+    read_result?;
+    unlock_result?;
+    serde_json::from_str::<ProxyRequestRecord>(&text)
+        .map(Some)
+        .map_err(std::io::Error::other)
+}
+
+fn open_index_lock(path: &Path) -> std::io::Result<fs::File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        // The lock must survive atomic replacement of the index.
+        .open(path.with_extension("lock"))
+}
+
+struct ProxyIndex {
+    updates: Vec<ProxyRequestSummary>,
+    legacy_records: Vec<ProxyRequestRecord>,
+    needs_repair: bool,
+    size_bytes: u64,
+}
+
+fn read_proxy_index(path: &Path) -> std::io::Result<ProxyIndex> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    let mut index = ProxyIndex {
+        updates: Vec::new(),
+        legacy_records: Vec::new(),
+        needs_repair: bytes.is_empty(),
+        size_bytes: bytes.len() as u64,
+    };
+    let mut has_header = false;
+    for line in bytes.split(|byte| *byte == b'\n') {
+        let Ok(line) = std::str::from_utf8(line) else {
+            index.needs_repair = true;
+            continue;
+        };
+        let line = line.trim().trim_start_matches('\u{feff}');
+        if line.is_empty() {
+            continue;
+        }
+        if !has_header {
+            if let Ok(header) = serde_json::from_str::<Value>(line) {
+                if header.get("format").is_some() || header.get("version").is_some() {
+                    if header.get("format").and_then(Value::as_str)
+                        != Some("codex-elves-proxy-index")
+                        || header.get("version").and_then(Value::as_u64) != Some(1)
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "代理日志索引格式或版本不受支持，原文件已保留",
+                        ));
+                    }
+                    has_header = true;
+                    continue;
+                }
+            }
+        }
+        if !has_header {
+            if let Ok(record) = serde_json::from_str::<ProxyRequestRecord>(line) {
+                index.updates.push(ProxyRequestSummary::from(&record));
+                index.legacy_records.push(record);
+                continue;
+            }
+        }
+        match serde_json::from_str::<ProxyRequestSummary>(line) {
+            Ok(summary) => index.updates.push(summary),
+            Err(_) => index.needs_repair = true,
+        }
+    }
+    index.needs_repair |= !has_header;
+
+    if index.needs_repair {
+        let entries = match fs::read_dir(detail_directory(path)) {
+            Ok(entries) => Some(entries),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let mut found_details = false;
+        if let Some(entries) = entries {
+            for entry in entries {
+                let entry = entry?;
+                if !entry.file_type()?.is_file()
+                    || entry.path().extension().and_then(|value| value.to_str()) != Some("json")
+                {
+                    continue;
+                }
+                found_details = true;
+                if let Ok(record) =
+                    serde_json::from_slice::<ProxyRequestRecord>(&fs::read(entry.path())?)
+                {
+                    index.updates.push(ProxyRequestSummary::from(&record));
+                }
+            }
+        }
+        if index.updates.is_empty() && (!bytes.is_empty() || found_details) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "代理日志索引无法恢复，原索引和详情已保留",
+            ));
+        }
+    }
+    Ok(index)
+}
+
+fn write_summaries_to_index(
+    path: &Path,
+    summaries: &[ProxyRequestSummary],
+) -> std::io::Result<u64> {
+    let mut bytes = format!("{PROXY_INDEX_HEADER}\n").into_bytes();
+    for summary in summaries {
+        serde_json::to_writer(&mut bytes, summary).map_err(std::io::Error::other)?;
+        bytes.push(b'\n');
+    }
+    crate::settings::atomic_write(path, &bytes).map_err(std::io::Error::other)?;
+    Ok(bytes.len() as u64)
+}
+
+fn dedupe_summaries(updates: Vec<ProxyRequestSummary>) -> Vec<ProxyRequestSummary> {
+    let mut seen_ids = HashSet::new();
+    let mut summaries = Vec::new();
+    for summary in updates.into_iter().rev() {
+        if seen_ids.insert(summary.id.clone()) {
+            summaries.push(summary);
+        }
+    }
+    summaries
+}
+
+fn sort_summaries(summaries: &mut [ProxyRequestSummary]) {
+    summaries.sort_by(|left, right| {
+        right
+            .timestamp_ms
+            .cmp(&left.timestamp_ms)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+}
+
+fn detail_directory(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("proxy-requests");
+    path.parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(format!("{stem}-details"))
+}
+
+fn detail_record_path(path: &Path, id: &str) -> PathBuf {
+    let digest = Sha256::digest(id.as_bytes());
+    let mut name = String::with_capacity(digest.len() * 2 + 5);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(name, "{byte:02x}");
+    }
+    name.push_str(".json");
+    detail_directory(path).join(name)
+}
+
+fn write_detail_record(path: &Path, record: &ProxyRequestRecord) -> std::io::Result<()> {
+    let line = serialize_record_for_log(record).map_err(std::io::Error::other)?;
+    crate::settings::atomic_write(&detail_record_path(path, &record.id), line.as_bytes())
+        .map_err(std::io::Error::other)
+}
+
+fn remove_detail_records(path: &Path, summaries: &[ProxyRequestSummary]) -> std::io::Result<()> {
+    for summary in summaries {
+        let detail_path = detail_record_path(path, &summary.id);
+        match fs::remove_file(detail_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn clear_detail_directory(path: &Path) -> std::io::Result<()> {
+    let directory = detail_directory(path);
+    match fs::remove_dir_all(directory) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn serialize_record_for_log(record: &ProxyRequestRecord) -> serde_json::Result<String> {
+    let (audit, error) = request_result(record);
+    let record = &ProxyRequestRecord {
+        audit,
+        error,
+        ..record.clone()
+    };
+    let line = serde_json::to_string(record)?;
+    if line.len() as u64 + 1 <= crate::log_limits::MAX_LOG_FILE_BYTES {
+        return Ok(line);
+    }
+
+    let mut trimmed = record.clone();
+    trimmed.request_body.clear();
+    trimmed.response_body.clear();
+    trimmed.continue_thinking_request_body = None;
+    trimmed.continue_thinking_before_response_body = None;
+    trimmed.continue_thinking_after_response_body = None;
+    trimmed.response_truncated = true;
+    trimmed.response_captured_bytes = Some(0);
+
+    let empty_line = serde_json::to_string(&trimmed)?;
+    let max_bytes = crate::log_limits::MAX_LOG_FILE_BYTES as usize;
+    if empty_line.len() + 1 >= max_bytes {
+        return Ok(empty_line);
+    }
+
+    let available_body_bytes = max_bytes
+        .saturating_sub(empty_line.len() + 1)
+        .saturating_sub(LARGE_LOG_RECORD_SAFETY_BYTES);
+    let mut request_budget = available_body_bytes
+        .min(MAX_RETAINED_REQUEST_BODY_BYTES)
+        .min(record.request_body.len());
+    let mut response_budget = available_body_bytes
+        .saturating_sub(request_budget)
+        .min(record.response_body.len());
+
+    loop {
+        trimmed.request_body = truncate_to_utf8_byte_limit(&record.request_body, request_budget);
+        trimmed.response_body = truncate_to_utf8_byte_limit(&record.response_body, response_budget);
+        trimmed.response_truncated = true;
+        trimmed.response_captured_bytes = Some(trimmed.response_body.len());
+
+        let line = serde_json::to_string(&trimmed)?;
+        if line.len() as u64 + 1 <= crate::log_limits::MAX_LOG_FILE_BYTES {
+            return Ok(line);
+        }
+
+        if response_budget > 0 {
+            response_budget /= 2;
+        } else if request_budget > 0 {
+            request_budget /= 2;
+        } else {
+            return Ok(line);
+        }
+    }
+}
+
+fn truncate_to_utf8_byte_limit(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+
+    let mut end = max_bytes.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
+fn find_reasoning_tokens(value: &Value) -> Option<u64> {
+    match value {
+        Value::Object(map) => {
+            if let Some(tokens) = map.get("reasoning_tokens").and_then(value_to_u64) {
+                return Some(tokens);
+            }
+            if let Some(tokens) = map.get("thinking_tokens").and_then(value_to_u64) {
+                return Some(tokens);
+            }
+            for child in map.values() {
+                if let Some(tokens) = find_reasoning_tokens(child) {
+                    return Some(tokens);
+                }
+            }
+            None
+        }
+        Value::Array(items) => items.iter().filter_map(find_reasoning_tokens).max(),
+        _ => None,
+    }
+}
+
+fn parse_sse_data_line(line: &str) -> Option<Value> {
+    let data = line.trim().strip_prefix("data:")?.trim();
+    if data.is_empty() || data == "[DONE]" {
+        return None;
+    }
+    serde_json::from_str::<Value>(data).ok()
+}
+
+fn collect_sse_reasoning_texts(
+    value: &Value,
+    terminal_texts: &mut Vec<String>,
+    done_texts: &mut BTreeMap<String, String>,
+    delta_texts: &mut BTreeMap<String, String>,
+    fallback_texts: &mut Vec<String>,
+) {
+    match value.get("type").and_then(Value::as_str) {
+        Some("response.completed" | "response.incomplete" | "response.failed") => {
+            if let Some(response) = value.get("response") {
+                let texts = response_output_reasoning_texts(response);
+                if !texts.is_empty() {
+                    *terminal_texts = texts;
+                    return;
+                }
+            }
+        }
+        Some("response.output_item.done") => {
+            if let Some(item) = value.get("item") {
+                if let Some(text) = reasoning_item_text(item) {
+                    done_texts.insert(reasoning_event_key(value), text);
+                    return;
+                }
+            }
+        }
+        Some("response.reasoning_summary_text.done") => {
+            if let Some(text) = value.get("text").and_then(Value::as_str) {
+                if !text.is_empty() {
+                    done_texts.insert(reasoning_event_key(value), text.to_string());
+                    return;
+                }
+            }
+        }
+        Some("response.reasoning_summary_part.done") => {
+            if let Some(text) = value
+                .get("part")
+                .and_then(|part| part.get("text"))
+                .and_then(Value::as_str)
+            {
+                if !text.is_empty() {
+                    done_texts.insert(reasoning_event_key(value), text.to_string());
+                    return;
+                }
+            }
+        }
+        Some("response.reasoning_summary_text.delta") => {
+            if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                if !delta.is_empty() {
+                    delta_texts
+                        .entry(reasoning_event_key(value))
+                        .or_default()
+                        .push_str(delta);
+                    return;
+                }
+            }
+        }
+        Some("content_block_start") => {
+            if let Some(text) = value
+                .get("content_block")
+                .and_then(|block| block.get("thinking"))
+                .and_then(Value::as_str)
+            {
+                if !text.is_empty() {
+                    delta_texts
+                        .entry(reasoning_event_key(value))
+                        .or_default()
+                        .push_str(text);
+                    return;
+                }
+            }
+        }
+        Some("content_block_delta") => {
+            if let Some(text) = value
+                .get("delta")
+                .and_then(|delta| delta.get("thinking"))
+                .and_then(Value::as_str)
+            {
+                if !text.is_empty() {
+                    delta_texts
+                        .entry(reasoning_event_key(value))
+                        .or_default()
+                        .push_str(text);
+                    return;
+                }
+            }
+        }
+        _ => {}
+    }
+
+    collect_chat_delta_reasoning_texts(value, delta_texts);
+    if fallback_texts.is_empty() {
+        fallback_texts.extend(reasoning_texts_from_value(value));
+    }
+}
+
+fn reasoning_event_key(value: &Value) -> String {
+    let item = value
+        .get("item_id")
+        .or_else(|| value.get("index"))
+        .and_then(|value| {
+            value
+                .as_str()
+                .map(ToString::to_string)
+                .or_else(|| value.as_u64().map(|number| number.to_string()))
+        })
+        .unwrap_or_else(|| "reasoning".to_string());
+    let output_index = value
+        .get("output_index")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let summary_index = value
+        .get("summary_index")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    format!("{item}:{output_index}:{summary_index}")
+}
+
+fn estimate_reasoning_tokens_from_value(value: &Value) -> Option<u64> {
+    estimate_reasoning_tokens_from_texts(reasoning_texts_from_value(value))
+}
+
+fn reasoning_texts_from_value(value: &Value) -> Vec<String> {
+    let mut texts = response_output_reasoning_texts(value);
+    if !texts.is_empty() {
+        return texts;
+    }
+
+    if let Some(response) = value.get("response") {
+        texts = response_output_reasoning_texts(response);
+        if !texts.is_empty() {
+            return texts;
+        }
+    }
+
+    collect_chat_message_reasoning_texts(value, &mut texts);
+    if !texts.is_empty() {
+        return texts;
+    }
+
+    collect_anthropic_reasoning_texts(value, &mut texts);
+    if !texts.is_empty() {
+        return texts;
+    }
+
+    collect_generic_reasoning_texts(value, &mut texts);
+    texts
+}
+
+fn response_output_reasoning_texts(value: &Value) -> Vec<String> {
+    value
+        .get("output")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(reasoning_item_text)
+                .filter(|text| !text.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn reasoning_item_text(item: &Value) -> Option<String> {
+    let is_reasoning_item = item.get("type").and_then(Value::as_str) == Some("reasoning")
+        || item.get("reasoning_content").is_some();
+    if !is_reasoning_item {
+        return None;
+    }
+
+    item.get("reasoning_content")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| summary_text(item.get("summary")))
+        .or_else(|| {
+            item.get("content")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            item.get("text")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(ToString::to_string)
+        })
+}
+
+fn summary_text(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    match value {
+        Value::String(text) => (!text.is_empty()).then(|| text.to_string()),
+        Value::Array(parts) => {
+            let text = parts
+                .iter()
+                .filter_map(|part| {
+                    part.get("text")
+                        .and_then(Value::as_str)
+                        .or_else(|| part.get("content").and_then(Value::as_str))
+                        .or_else(|| part.as_str())
+                })
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            (!text.is_empty()).then_some(text)
+        }
+        Value::Object(_) => value
+            .get("text")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("content").and_then(Value::as_str))
+            .filter(|text| !text.is_empty())
+            .map(ToString::to_string),
+        _ => None,
+    }
+}
+
+fn collect_chat_delta_reasoning_texts(value: &Value, texts: &mut BTreeMap<String, String>) {
+    let Some(choices) = value.get("choices").and_then(Value::as_array) else {
+        return;
+    };
+    for (index, choice) in choices.iter().enumerate() {
+        let Some(text) = choice
+            .get("delta")
+            .and_then(reasoning_text_from_object)
+            .filter(|text| !text.is_empty())
+        else {
+            continue;
+        };
+        texts
+            .entry(format!("chat-choice-{index}"))
+            .or_default()
+            .push_str(&text);
+    }
+}
+
+fn collect_chat_message_reasoning_texts(value: &Value, texts: &mut Vec<String>) {
+    let Some(choices) = value.get("choices").and_then(Value::as_array) else {
+        return;
+    };
+    for choice in choices {
+        if let Some(text) = choice
+            .get("message")
+            .and_then(reasoning_text_from_object)
+            .filter(|text| !text.is_empty())
+        {
+            texts.push(text);
+        }
+    }
+}
+
+fn collect_anthropic_reasoning_texts(value: &Value, texts: &mut Vec<String>) {
+    let Some(content) = value.get("content").and_then(Value::as_array) else {
+        return;
+    };
+    for block in content {
+        if block.get("type").and_then(Value::as_str) == Some("thinking") {
+            if let Some(text) = block
+                .get("thinking")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+            {
+                texts.push(text.to_string());
+            }
+        }
+    }
+}
+
+fn collect_generic_reasoning_texts(value: &Value, texts: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(text) = reasoning_text_from_object(value) {
+                texts.push(text);
+                return;
+            }
+            if let Some(text) = summary_text(map.get("summary")) {
+                texts.push(text);
+                return;
+            }
+            for child in map.values() {
+                collect_generic_reasoning_texts(child, texts);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_generic_reasoning_texts(item, texts);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn reasoning_text_from_object(value: &Value) -> Option<String> {
+    for key in ["reasoning_content", "reasoning"] {
+        if let Some(text) = value.get(key).and_then(Value::as_str) {
+            if !text.is_empty() {
+                return Some(text.to_string());
+            }
+        }
+    }
+
+    value
+        .get("reasoning")
+        .and_then(|reasoning| {
+            reasoning
+                .get("content")
+                .and_then(Value::as_str)
+                .or_else(|| reasoning.get("text").and_then(Value::as_str))
+                .or_else(|| reasoning.get("summary").and_then(Value::as_str))
+        })
+        .filter(|text| !text.is_empty())
+        .map(ToString::to_string)
+}
+
+fn estimate_reasoning_tokens_from_texts(
+    texts: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Option<u64> {
+    let mut total = 0_u64;
+    for text in texts {
+        total = total.saturating_add(estimate_reasoning_tokens_from_text(text.as_ref()));
+    }
+    (total > 0).then_some(total)
+}
+
+fn estimate_reasoning_tokens_from_text(text: &str) -> u64 {
+    let mut tokens = 0_u64;
+    let mut ascii_word_len = 0_u64;
+
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            ascii_word_len += 1;
+            continue;
+        }
+
+        tokens = tokens.saturating_add(ascii_word_tokens(ascii_word_len));
+        ascii_word_len = 0;
+
+        if ch.is_whitespace() {
+            continue;
+        }
+        if is_cjk_or_kana_or_hangul(ch) {
+            tokens += 1;
+        } else if ch.is_ascii_punctuation() {
+            tokens += 1;
+        } else {
+            tokens += 1;
+        }
+    }
+
+    tokens.saturating_add(ascii_word_tokens(ascii_word_len))
+}
+
+fn ascii_word_tokens(len: u64) -> u64 {
+    if len == 0 { 0 } else { len.div_ceil(4) }
+}
+
+fn is_cjk_or_kana_or_hangul(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x3040..=0x30ff
+            | 0x3400..=0x4dbf
+            | 0x4e00..=0x9fff
+            | 0xac00..=0xd7af
+            | 0xf900..=0xfaff
+            | 0x20000..=0x2a6df
+            | 0x2a700..=0x2b73f
+            | 0x2b740..=0x2b81f
+            | 0x2b820..=0x2ceaf
+    )
+}
+
+fn value_to_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ProxyRequestRecord, ProxyRequestState, UpstreamResponseModelObserver,
+        append_record_at_path, clear_records_at_path, current_timestamp_ms,
+        extract_reasoning_tokens_from_response_body, extract_request_metadata, find_record_at_path,
+        read_summaries_at_path, serialize_record_for_log,
+    };
+    use crate::protocol_proxy::UpstreamResponseProtocol;
+
+    fn temp_proxy_log_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "codex-elves-{name}-{}-{}.jsonl",
+            std::process::id(),
+            super::current_timestamp_ms()
+        ))
+    }
+
+    fn remove_proxy_log_artifacts(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("lock"));
+        let _ = std::fs::remove_file(path.with_extension("jsonl.tmp"));
+        let _ = std::fs::remove_dir_all(super::detail_directory(path));
+    }
+
+    #[test]
+    fn bounded_capture_retains_response_head_and_tail() {
+        let mut capture = Vec::new();
+        let limit = 16;
+
+        assert!(!super::append_capture_with_limit(
+            &mut capture,
+            b"abcdefgh",
+            limit
+        ));
+        assert!(super::append_capture_with_limit(
+            &mut capture,
+            b"ijklmnopqrstuvwxyz",
+            limit
+        ));
+
+        assert_eq!(capture.len(), limit);
+        assert_eq!(&capture[..8], b"abcdefgh");
+        assert_eq!(&capture[8..], b"stuvwxyz");
+    }
+
+    #[test]
+    fn extracts_reasoning_tokens_from_responses_usage() {
+        let body = br#"{
+            "id": "resp_1",
+            "usage": {
+                "output_tokens": 760,
+                "output_tokens_details": {
+                    "reasoning_tokens": 516
+                }
+            }
+        }"#;
+
+        assert_eq!(extract_reasoning_tokens_from_response_body(body), Some(516));
+    }
+
+    #[test]
+    fn extracts_anthropic_output_config_effort_from_request_metadata() {
+        let request = serde_json::json!({
+            "model": "claude-opus-4-8",
+            "thinking": { "type": "adaptive" },
+            "output_config": { "effort": "high" }
+        });
+
+        let metadata = extract_request_metadata(Some(&request));
+
+        assert_eq!(metadata.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            metadata.reasoning_source.as_deref(),
+            Some("output_config.effort")
+        );
+    }
+
+    #[test]
+    fn extracts_reasoning_tokens_from_chat_completions_usage() {
+        let body = br#"{
+            "id": "chatcmpl_1",
+            "usage": {
+                "completion_tokens": 760,
+                "completion_tokens_details": {
+                    "reasoning_tokens": 516
+                }
+            }
+        }"#;
+
+        assert_eq!(extract_reasoning_tokens_from_response_body(body), Some(516));
+    }
+
+    #[test]
+    fn extracts_reasoning_tokens_from_sse_data_lines() {
+        let body = br#"event: response.completed
+data: {"type":"response.completed","response":{"usage":{"output_tokens_details":{"reasoning_tokens":516}}}}
+
+data: [DONE]
+"#;
+
+        assert_eq!(extract_reasoning_tokens_from_response_body(body), Some(516));
+    }
+
+    #[test]
+    fn extracts_output_tokens_from_supported_usage_shapes() {
+        for (body, expected) in [
+            (
+                r#"{"usage":{"output_tokens":760,"input_tokens":40}}"#,
+                Some(760),
+            ),
+            (
+                r#"{"usage":{"completion_tokens":120,"prompt_tokens":80}}"#,
+                Some(120),
+            ),
+            (r#"{"message":{"usage":{"output_tokens":52}}}"#, Some(52)),
+            (r#"{"output":[{"text":"hello"}]}"#, None),
+        ] {
+            assert_eq!(
+                super::extract_output_tokens_from_response_body(body.as_bytes()),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn extracts_final_output_tokens_from_streamed_responses_and_anthropic() {
+        for (body, expected) in [
+            (
+                "data: {\"type\":\"response.created\",\"response\":{\"usage\":{\"output_tokens\":0}}}\n\n\
+                 data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"output_tokens\":125}}}\n\n",
+                Some(125),
+            ),
+            (
+                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"output_tokens\":0}}}\n\n\
+                 data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":73}}\n\n",
+                Some(73),
+            ),
+            (
+                "data: {\"choices\":[],\"usage\":{\"completion_tokens\":32}}\n\n\
+                 data: [DONE]\n\n",
+                Some(32),
+            ),
+        ] {
+            assert_eq!(
+                super::extract_output_tokens_from_response_body(body.as_bytes()),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn extracts_output_tokens_from_websocket_json_lines() {
+        let body = concat!(
+            "{\"type\":\"response.created\",\"response\":{\"model\":\"gpt-6-sol\"}}\n",
+            "{\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n",
+            "{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":200,\"output_tokens\":183}}}\n"
+        );
+        assert_eq!(
+            super::extract_output_tokens_from_response_body(body.as_bytes()),
+            Some(183)
+        );
+
+        let mut record = sample_proxy_record("websocket-usage");
+        record.transport = super::ProxyRequestTransport::Ws;
+        record.response_body = body.to_string();
+        assert_eq!(
+            super::ProxyRequestSummary::from(&record).output_tokens,
+            Some(183)
+        );
+
+        let no_usage = concat!(
+            "{\"type\":\"response.created\",\"response\":{\"model\":\"gpt-6-sol\"}}\n",
+            "{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n"
+        );
+        assert_eq!(
+            super::extract_output_tokens_from_response_body(no_usage.as_bytes()),
+            None
+        );
+    }
+
+    #[test]
+    fn extracts_thinking_tokens_from_anthropic_usage() {
+        let body = br#"{
+            "id": "msg_1",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 760,
+                "output_tokens_details": {
+                    "thinking_tokens": 516
+                }
+            }
+        }"#;
+
+        assert_eq!(extract_reasoning_tokens_from_response_body(body), Some(516));
+    }
+
+    #[test]
+    fn estimates_reasoning_tokens_from_chat_reasoning_content() {
+        let body = br#"{
+            "id": "chatcmpl_1",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "reasoning_content": "abcd efgh",
+                    "content": "done"
+                }
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15
+            }
+        }"#;
+
+        assert_eq!(extract_reasoning_tokens_from_response_body(body), Some(2));
+    }
+
+    #[test]
+    fn estimates_reasoning_tokens_from_responses_sse_reasoning_content() {
+        let body = br#"event: response.reasoning_summary_text.delta
+data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_1","output_index":0,"summary_index":0,"delta":"abcd "}
+
+event: response.reasoning_summary_text.delta
+data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_1","output_index":0,"summary_index":0,"delta":"efgh"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_1","output":[{"type":"reasoning","reasoning_content":"abcd efgh","summary":[{"type":"summary_text","text":"abcd efgh"}]}],"usage":{"output_tokens":5}}}
+
+data: [DONE]
+"#;
+
+        assert_eq!(extract_reasoning_tokens_from_response_body(body), Some(2));
+    }
+
+    #[test]
+    fn keeps_reported_reasoning_tokens_before_text_estimate() {
+        let body = br#"{
+            "id": "chatcmpl_1",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "reasoning_content": "abcd efgh ijkl mnop",
+                    "content": "done"
+                }
+            }],
+            "usage": {
+                "completion_tokens_details": {
+                    "reasoning_tokens": 3
+                }
+            }
+        }"#;
+
+        assert_eq!(extract_reasoning_tokens_from_response_body(body), Some(3));
+    }
+
+    #[test]
+    fn summary_backfills_reasoning_tokens_from_existing_response_body() {
+        let mut record = sample_proxy_record("existing-log");
+        record.reasoning_tokens = None;
+        record.response_body = r#"{
+            "id": "chatcmpl_1",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "reasoning_content": "abcd efgh",
+                    "content": "done"
+                }
+            }]
+        }"#
+        .to_string();
+
+        let summary = super::ProxyRequestSummary::from(&record);
+
+        assert_eq!(record.reasoning_tokens, None);
+        assert_eq!(summary.reasoning_tokens, Some(2));
+    }
+
+    #[test]
+    fn summary_records_output_usage_only_after_completion() {
+        let mut record = sample_proxy_record("output-usage");
+        record.response_body = r#"{"usage":{"output_tokens":180}}"#.to_string();
+        let completed = super::ProxyRequestSummary::from(&record);
+        assert_eq!(completed.output_tokens, Some(180));
+
+        record.state = ProxyRequestState::Pending;
+        let pending = super::ProxyRequestSummary::from(&record);
+        assert_eq!(pending.output_tokens, None);
+
+        let mut legacy = serde_json::to_value(completed).unwrap();
+        legacy.as_object_mut().unwrap().remove("outputTokens");
+        let legacy: super::ProxyRequestSummary = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.output_tokens, None);
+    }
+
+    #[test]
+    fn read_summaries_backfills_legacy_output_usage_without_rewriting_index() {
+        let path = temp_proxy_log_path("legacy-output-usage");
+        let mut record = sample_proxy_record("legacy-output-usage");
+        record.transport = super::ProxyRequestTransport::Ws;
+        record.response_body = concat!(
+            "{\"type\":\"response.created\",\"response\":{\"model\":\"gpt-6-sol\"}}\n",
+            "{\"type\":\"response.completed\",\"response\":{\"usage\":{\"output_tokens\":180}}}\n"
+        )
+        .to_string();
+        append_record_at_path(&path, &record).unwrap();
+
+        let mut legacy = serde_json::to_value(super::ProxyRequestSummary::from(&record)).unwrap();
+        legacy.as_object_mut().unwrap().remove("outputTokens");
+        let index = format!("{}\n{}\n", super::PROXY_INDEX_HEADER, legacy);
+        std::fs::write(&path, &index).unwrap();
+
+        let summaries = read_summaries_at_path(&path, 1).unwrap();
+        assert_eq!(summaries[0].output_tokens, Some(180));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), index);
+        remove_proxy_log_artifacts(&path);
+    }
+
+    #[test]
+    fn summary_trims_large_error_without_changing_detail_record() {
+        let mut record = sample_proxy_record("large-error");
+        record.error = Some("x".repeat(super::MAX_SUMMARY_ERROR_BYTES + 128));
+
+        let summary = super::ProxyRequestSummary::from(&record);
+
+        assert_eq!(
+            summary.error.as_deref().map(str::len),
+            Some(super::MAX_SUMMARY_ERROR_BYTES)
+        );
+        assert_eq!(
+            record.error.as_deref().map(str::len),
+            Some(super::MAX_SUMMARY_ERROR_BYTES + 128)
+        );
+    }
+
+    #[test]
+    fn legacy_record_without_transport_defaults_to_http() {
+        let mut value = serde_json::to_value(sample_proxy_record("legacy-transport")).unwrap();
+        value.as_object_mut().unwrap().remove("transport");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("upstreamResponseModel");
+
+        let record: ProxyRequestRecord = serde_json::from_value(value).unwrap();
+
+        assert_eq!(record.transport, super::ProxyRequestTransport::Http);
+        assert_eq!(record.upstream_response_model, None);
+    }
+
+    #[test]
+    fn observes_raw_models_for_supported_response_protocols() {
+        for (protocol, body, expected) in [
+            (
+                UpstreamResponseProtocol::Responses,
+                r#"{"response":{"model":"gpt-5.6-luna"},"model":"ignored"}"#,
+                "gpt-5.6-luna",
+            ),
+            (
+                UpstreamResponseProtocol::ChatCompletions,
+                r#"{"model":"qwen3-coder","choices":[]}"#,
+                "qwen3-coder",
+            ),
+            (
+                UpstreamResponseProtocol::Anthropic,
+                r#"{"message":{"model":"claude-opus-4-8"}}"#,
+                "claude-opus-4-8",
+            ),
+        ] {
+            let mut observer = UpstreamResponseModelObserver::default();
+            observer.observe_json(body.as_bytes(), protocol);
+            assert_eq!(observer.model().as_deref(), Some(expected));
+        }
+        let mut observer = UpstreamResponseModelObserver::default();
+        observer.observe_json(
+            br#"{"output":[{"model":"not-the-response"}]}"#,
+            UpstreamResponseProtocol::Responses,
+        );
+        assert_eq!(observer.model(), None);
+    }
+
+    #[test]
+    fn observes_split_sse_and_prefers_terminal_model() {
+        let mut observer = UpstreamResponseModelObserver::default();
+        let chunks = [
+            b"event: response.created\r\ndata: {\"response\":{\"model\":\"gpt-6-astra\"}}\r\n\r\nevent: response.com".as_slice(),
+            b"pleted\r\ndata: {\"response\":{\"model\":\"gpt-5.6-luna\"}}\r\n\r\n".as_slice(),
+        ];
+        for chunk in chunks {
+            observer.observe_sse_chunk(chunk, UpstreamResponseProtocol::Responses);
+        }
+        observer.finish_sse(UpstreamResponseProtocol::Responses);
+        assert_eq!(observer.model().as_deref(), Some("gpt-5.6-luna"));
+
+        let mut anthropic = UpstreamResponseModelObserver::default();
+        anthropic.observe_sse_chunk(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-4-6\"}}\n\n",
+            UpstreamResponseProtocol::Anthropic,
+        );
+        assert_eq!(anthropic.model().as_deref(), Some("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn observes_terminal_model_in_large_sse_event() {
+        let mut observer = UpstreamResponseModelObserver::default();
+        observer.observe_sse_chunk(
+            b"data: {\"type\":\"response.created\",\"response\":{\"model\":\"gpt-6-astra\"}}\n\n",
+            UpstreamResponseProtocol::Responses,
+        );
+        let large_event = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "model": "gpt-5.6-luna",
+                "output": [{"content": "x".repeat(80 * 1024)}]
+            }
+        });
+        observer.observe_sse_chunk(
+            format!("data: {large_event}\n\n").as_bytes(),
+            UpstreamResponseProtocol::Responses,
+        );
+        assert_eq!(observer.model().as_deref(), Some("gpt-5.6-luna"));
+    }
+
+    #[test]
+    fn ignores_malformed_and_bounded_sse_model_declarations() {
+        let mut observer = UpstreamResponseModelObserver::default();
+        observer.observe_sse_chunk(
+            b"data: {\"response\":{\"model\":\"incomplete\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"model\":\"  gpt-5.6-luna  \"}}\n\n",
+            UpstreamResponseProtocol::Responses,
+        );
+        assert_eq!(observer.model().as_deref(), Some("gpt-5.6-luna"));
+
+        let long_model = "x".repeat(super::MAX_OBSERVED_MODEL_CHARS + 5);
+        let mut bounded = UpstreamResponseModelObserver::default();
+        bounded.observe_json(
+            format!(r#"{{"model":"{long_model}"}}"#).as_bytes(),
+            UpstreamResponseProtocol::ChatCompletions,
+        );
+        assert_eq!(
+            bounded.model().unwrap().len(),
+            super::MAX_OBSERVED_MODEL_CHARS
+        );
+    }
+
+    #[test]
+    fn compaction_request_marker_is_independent_of_enhancement_and_success() {
+        let prompt = crate::layered_compaction::COMPACTION_PROMPT_PREFIX;
+        for state in [ProxyRequestState::Pending, ProxyRequestState::Completed] {
+            let mut record = sample_proxy_record("ordinary-compaction");
+            record.state = state;
+            record.status_code = Some(500);
+            record.request_body = serde_json::json!({
+                "input": [{"role":"user","content":[{"type":"input_text","text":prompt}]}]
+            })
+            .to_string();
+            let summary = super::ProxyRequestSummary::from(&record);
+            assert_eq!(summary.compaction_requested, Some(true));
+            assert!(!summary.layered_compaction_triggered);
+            assert!(!summary.remote_compaction_triggered);
+        }
+    }
+
+    #[test]
+    fn compaction_marker_detects_converted_requests_without_matching_old_history() {
+        let prompt = crate::layered_compaction::compaction_instruction("custom checkpoint");
+        for field in ["input", "messages"] {
+            for content in [
+                serde_json::json!(prompt),
+                serde_json::json!([{"type":"text","text":prompt}]),
+            ] {
+                let mut request = serde_json::json!({
+                    field: [{"role":"user","content":content}]
+                });
+                assert!(super::request_uses_compaction(&request));
+                request[field]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({"role":"user","content":"continue the actual work"}));
+                assert!(!super::request_uses_compaction(&request));
+            }
+        }
+        assert!(!super::request_body_uses_compaction(r#"{"messages":["#));
+        assert!(!super::request_uses_compaction(&serde_json::json!({
+            "messages":[{"role":"assistant","content":prompt}]
+        })));
+        assert!(super::request_uses_compaction(&serde_json::json!({
+            "input":[{"type":"compaction_trigger"}]
+        })));
+    }
+
+    #[test]
+    fn compaction_marker_survives_body_truncation_and_backfills_old_indexes() {
+        let path = temp_proxy_log_path("compaction-marker-backfill");
+        let mut record = sample_proxy_record("legacy-compaction");
+        record.request_body = serde_json::json!({
+            "messages":[{"role":"user","content":crate::layered_compaction::compaction_instruction("checkpoint")}]
+        }).to_string();
+        append_record_at_path(&path, &record).unwrap();
+        let mut legacy = serde_json::to_value(super::ProxyRequestSummary::from(&record)).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("compactionRequested");
+        std::fs::write(
+            &path,
+            format!("{}\n{}\n", super::PROXY_INDEX_HEADER, legacy),
+        )
+        .unwrap();
+        let summaries = super::read_summaries_at_path(&path, 10).unwrap();
+        assert_eq!(summaries[0].compaction_requested, Some(true));
+        assert!(
+            find_record_at_path(&path, &record.id)
+                .unwrap()
+                .unwrap()
+                .compaction_requested
+        );
+        // Reading repairs presentation without rewriting the user's historical log.
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("compactionRequested")
+        );
+
+        record.compaction_requested = true;
+        record.request_body = r#"{"input":["#.to_string();
+        assert_eq!(
+            super::ProxyRequestSummary::from(&record).compaction_requested,
+            Some(true)
+        );
+        record.compaction_requested = false;
+        assert_eq!(
+            super::ProxyRequestSummary::from(&record).compaction_requested,
+            Some(false)
+        );
+        clear_records_at_path(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn detects_remote_compaction_v2_from_request_body() {
+        let request = serde_json::json!({
+            "model": "gpt-5.4",
+            "input": [
+                { "role": "user", "content": "compact this context" },
+                { "type": "compaction_trigger" }
+            ]
+        });
+
+        assert!(super::request_body_uses_remote_compaction_v2(
+            &request.to_string()
+        ));
+        assert!(!super::request_body_uses_remote_compaction_v2(
+            r#"{"model":"gpt-5.4","input":[]}"#
+        ));
+    }
+
+    #[test]
+    fn append_record_writes_locked_jsonl_file() {
+        let path = temp_proxy_log_path("append-record");
+        let record = ProxyRequestRecord {
+            audit: Default::default(),
+            id: "test-record".to_string(),
+            state: ProxyRequestState::Completed,
+            transport: super::ProxyRequestTransport::Http,
+            timestamp_ms: current_timestamp_ms(),
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            remote_addr: Some("127.0.0.1:1".to_string()),
+            model: Some("gpt-5.4".to_string()),
+            upstream_request_model: Some("deepseek-v4.1-flash".to_string()),
+            upstream_response_model: Some("gpt-5.6-luna".to_string()),
+            independent_compaction_model: Some("deepseek-v4.1-flash".to_string()),
+            independent_compaction_usage: Some(
+                crate::settings::LayeredCompactionModelUsage::Default,
+            ),
+            reasoning_tokens: Some(516),
+            reasoning_effort: Some("medium".to_string()),
+            reasoning_source: Some("reasoning.effort".to_string()),
+            continue_thinking_triggered: false,
+            continue_thinking_rounds: 0,
+            continue_thinking_request_body: None,
+            continue_thinking_before_response_body: None,
+            continue_thinking_after_response_body: None,
+            remote_compaction_triggered: false,
+            layered_compaction_triggered: false,
+            compaction_requested: false,
+            layered_compaction_retain_tokens: None,
+            layered_compaction_retained_items: None,
+            layered_compaction_retained_chars: None,
+            layered_compaction_before_response_body: None,
+            service_tier: Some("auto".to_string()),
+            relay_id: Some("relay-test".to_string()),
+            relay_name: Some("Test".to_string()),
+            endpoint: Some("https://example.test/v1/responses".to_string()),
+            response_protocol: Some("responses".to_string()),
+            status_code: Some(200),
+            first_token_ms: Some(4),
+            duration_ms: Some(10),
+            stream: false,
+            request_bytes: 2,
+            response_bytes: Some(2),
+            response_captured_bytes: Some(2),
+            response_truncated: false,
+            request_body: "{}".to_string(),
+            response_body: "{}".to_string(),
+            error: None,
+        };
+
+        append_record_at_path(&path, &record).expect("append proxy log record");
+        let found = find_record_at_path(&path, "test-record")
+            .expect("read proxy log record")
+            .expect("record should exist");
+
+        assert_eq!(found.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(
+            found.upstream_request_model.as_deref(),
+            Some("deepseek-v4.1-flash")
+        );
+        assert_eq!(
+            found.upstream_response_model.as_deref(),
+            Some("gpt-5.6-luna")
+        );
+        assert_eq!(
+            found.independent_compaction_model.as_deref(),
+            Some("deepseek-v4.1-flash")
+        );
+        assert_eq!(
+            found.independent_compaction_usage,
+            Some(crate::settings::LayeredCompactionModelUsage::Default)
+        );
+        assert_eq!(found.transport, super::ProxyRequestTransport::Http);
+        assert_eq!(found.reasoning_tokens, Some(516));
+        assert_eq!(found.request_body, "{}");
+        assert_eq!(found.response_body, "{}");
+
+        let mut legacy_json = serde_json::to_value(&record).expect("serialize proxy log record");
+        let legacy_object = legacy_json
+            .as_object_mut()
+            .expect("proxy log record should serialize as an object");
+        let legacy_model = legacy_object
+            .remove("independentCompactionModel")
+            .expect("new independent model field");
+        legacy_object.remove("upstreamRequestModel");
+        legacy_object.remove("independentCompactionUsage");
+        legacy_object.insert("cacheMissCompactionModel".to_string(), legacy_model);
+        let legacy_record: ProxyRequestRecord =
+            serde_json::from_value(legacy_json).expect("deserialize legacy proxy log record");
+        assert_eq!(
+            legacy_record.independent_compaction_model.as_deref(),
+            Some("deepseek-v4.1-flash")
+        );
+        assert_eq!(legacy_record.upstream_request_model, None);
+        assert_eq!(legacy_record.independent_compaction_usage, None);
+
+        let index_text = std::fs::read_to_string(&path).expect("read proxy log index");
+        assert!(index_text.starts_with(super::PROXY_INDEX_HEADER));
+        assert!(!index_text.contains("requestBody"));
+        assert!(!index_text.contains("responseBody"));
+
+        for index in 0..12 {
+            let mut next = record.clone();
+            next.id = format!("test-record-{index}");
+            next.timestamp_ms += index as u64 + 1;
+            append_record_at_path(&path, &next).expect("append proxy log record");
+        }
+        let summaries = read_summaries_at_path(&path, 20).expect("read proxy log summaries");
+        assert_eq!(summaries.len(), 13);
+        assert_eq!(
+            summaries[0].upstream_request_model.as_deref(),
+            Some("deepseek-v4.1-flash")
+        );
+        assert_eq!(
+            summaries[0].upstream_response_model.as_deref(),
+            Some("gpt-5.6-luna")
+        );
+        assert_eq!(
+            summaries[0].independent_compaction_model.as_deref(),
+            Some("deepseek-v4.1-flash")
+        );
+        assert_eq!(
+            summaries[0].independent_compaction_usage,
+            Some(crate::settings::LayeredCompactionModelUsage::Default)
+        );
+        assert_eq!(
+            summaries.first().map(|entry| entry.id.as_str()),
+            Some("test-record-11")
+        );
+        assert_eq!(
+            summaries.last().map(|entry| entry.id.as_str()),
+            Some("test-record")
+        );
+
+        remove_proxy_log_artifacts(&path);
+    }
+
+    #[test]
+    fn read_summaries_deduplicates_pending_record_by_latest_entry() {
+        let path = temp_proxy_log_path("dedupe-pending");
+        let mut pending = sample_proxy_record("same-request");
+        pending.state = ProxyRequestState::Pending;
+        pending.status_code = None;
+        pending.first_token_ms = None;
+        pending.duration_ms = None;
+        pending.response_bytes = None;
+        pending.response_captured_bytes = None;
+        pending.response_body.clear();
+
+        let mut completed = pending.clone();
+        completed.state = ProxyRequestState::Completed;
+        completed.timestamp_ms += 1;
+        completed.status_code = Some(200);
+        completed.duration_ms = Some(12);
+        completed.response_bytes = Some(2);
+        completed.response_captured_bytes = Some(2);
+        completed.response_body = "{}".to_string();
+
+        append_record_at_path(&path, &pending).expect("append pending proxy log record");
+        append_record_at_path(&path, &completed).expect("append completed proxy log record");
+
+        let summaries = read_summaries_at_path(&path, 10).expect("read proxy log summaries");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, "same-request");
+        assert_eq!(summaries[0].state, ProxyRequestState::Completed);
+        assert_eq!(summaries[0].status_code, Some(200));
+        assert_eq!(summaries[0].duration_ms, Some(12));
+        let detail = find_record_at_path(&path, "same-request")
+            .expect("read proxy log detail")
+            .expect("detail should exist");
+        assert_eq!(detail.state, ProxyRequestState::Completed);
+        assert_eq!(detail.response_body, "{}");
+
+        remove_proxy_log_artifacts(&path);
+    }
+
+    #[test]
+    fn read_summaries_keeps_latest_pending_first_token_update() {
+        let path = temp_proxy_log_path("dedupe-first-token");
+        let mut pending = sample_proxy_record("stream-request");
+        pending.state = ProxyRequestState::Pending;
+        pending.status_code = None;
+        pending.first_token_ms = None;
+        pending.duration_ms = None;
+        pending.response_bytes = None;
+        pending.response_captured_bytes = None;
+        pending.response_body.clear();
+
+        let mut first_token = pending.clone();
+        first_token.timestamp_ms += 1;
+        first_token.status_code = Some(200);
+        first_token.first_token_ms = Some(345);
+        first_token.response_protocol = Some("responses".to_string());
+
+        append_record_at_path(&path, &pending).expect("append pending proxy log record");
+        append_record_at_path(&path, &first_token).expect("append first token proxy log record");
+
+        let summaries = read_summaries_at_path(&path, 10).expect("read proxy log summaries");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, "stream-request");
+        assert_eq!(summaries[0].state, ProxyRequestState::Pending);
+        assert_eq!(summaries[0].status_code, Some(200));
+        assert_eq!(summaries[0].first_token_ms, Some(345));
+        assert_eq!(summaries[0].duration_ms, None);
+        let detail = find_record_at_path(&path, "stream-request")
+            .expect("read proxy log detail")
+            .expect("detail should exist");
+        assert_eq!(detail.response_body, "");
+
+        remove_proxy_log_artifacts(&path);
+    }
+
+    #[test]
+    fn proxy_log_batch_coalesces_intermediate_updates_to_final_state() {
+        let path = temp_proxy_log_path("batch-coalesce");
+        let mut pending = sample_proxy_record("batched-request");
+        pending.state = ProxyRequestState::Pending;
+        pending.status_code = None;
+        pending.duration_ms = None;
+        pending.response_body.clear();
+        let mut first_token = pending.clone();
+        first_token.status_code = Some(200);
+        first_token.first_token_ms = Some(25);
+        let mut completed = first_token.clone();
+        completed.state = ProxyRequestState::Completed;
+        completed.duration_ms = Some(100);
+        completed.response_body = "{}".to_string();
+
+        super::write_proxy_log_batch(vec![
+            (path.clone(), pending),
+            (path.clone(), first_token),
+            (path.clone(), completed),
+        ])
+        .expect("write batched proxy records");
+
+        let summaries = read_summaries_at_path(&path, 10).expect("read batched summaries");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].state, ProxyRequestState::Completed);
+        assert_eq!(summaries[0].first_token_ms, Some(25));
+        assert_eq!(summaries[0].duration_ms, Some(100));
+        let detail = find_record_at_path(&path, "batched-request")
+            .expect("read batched detail")
+            .expect("batched detail should exist");
+        assert_eq!(detail.state, ProxyRequestState::Completed);
+        assert_eq!(detail.response_body, "{}");
+
+        remove_proxy_log_artifacts(&path);
+    }
+
+    #[tokio::test]
+    async fn completed_nonblocking_enqueue_is_visible_after_flush_fence() {
+        let path = temp_proxy_log_path("completed-enqueue-fence");
+        let record = sample_proxy_record("completed-enqueue-fence");
+
+        super::enqueue_record_nonblocking_at_path(&record, path.clone())
+            .expect("schedule completed proxy log record");
+        super::flush_pending_records().expect("flush completed proxy log record");
+
+        let detail = find_record_at_path(&path, "completed-enqueue-fence")
+            .expect("read completed proxy log record")
+            .expect("completed proxy log record should be visible after flush");
+        assert_eq!(detail.state, ProxyRequestState::Completed);
+
+        remove_proxy_log_artifacts(&path);
+    }
+
+    #[test]
+    fn read_summaries_orders_by_request_timestamp_not_update_order() {
+        let path = temp_proxy_log_path("request-time-order");
+        let mut older = sample_proxy_record("older-request");
+        older.state = ProxyRequestState::Pending;
+        older.timestamp_ms = 100;
+        older.status_code = None;
+        older.first_token_ms = None;
+        older.duration_ms = None;
+        older.response_bytes = None;
+        older.response_captured_bytes = None;
+        older.response_body.clear();
+
+        let mut newer = sample_proxy_record("newer-request");
+        newer.state = ProxyRequestState::Pending;
+        newer.timestamp_ms = 200;
+        newer.status_code = None;
+        newer.first_token_ms = None;
+        newer.duration_ms = None;
+        newer.response_bytes = None;
+        newer.response_captured_bytes = None;
+        newer.response_body.clear();
+
+        let mut older_first_token = older.clone();
+        older_first_token.status_code = Some(200);
+        older_first_token.first_token_ms = Some(345);
+
+        append_record_at_path(&path, &older).expect("append older pending record");
+        append_record_at_path(&path, &newer).expect("append newer pending record");
+        append_record_at_path(&path, &older_first_token).expect("append older first token update");
+
+        let summaries = read_summaries_at_path(&path, 10).expect("read proxy log summaries");
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].id, "newer-request");
+        assert_eq!(summaries[0].timestamp_ms, 200);
+        assert_eq!(summaries[1].id, "older-request");
+        assert_eq!(summaries[1].timestamp_ms, 100);
+        assert_eq!(summaries[1].first_token_ms, Some(345));
+
+        remove_proxy_log_artifacts(&path);
+    }
+
+    #[test]
+    fn append_record_migrates_legacy_single_file_log() {
+        let path = temp_proxy_log_path("migrate-legacy-log");
+        let legacy = sample_proxy_record("legacy-record");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                serde_json::to_string(&legacy).expect("serialize legacy proxy log")
+            ),
+        )
+        .expect("seed legacy proxy log");
+        let record = sample_proxy_record("fresh-record");
+
+        append_record_at_path(&path, &record).expect("append proxy log record");
+
+        let summaries = read_summaries_at_path(&path, 10).expect("read proxy log summaries");
+        assert_eq!(summaries.len(), 2);
+        assert!(
+            find_record_at_path(&path, "legacy-record")
+                .expect("read migrated legacy detail")
+                .is_some()
+        );
+        assert!(
+            find_record_at_path(&path, "fresh-record")
+                .expect("read fresh detail")
+                .is_some()
+        );
+
+        remove_proxy_log_artifacts(&path);
+    }
+
+    #[test]
+    fn read_summaries_preserves_legacy_single_file_log() {
+        let path = temp_proxy_log_path("read-legacy-log");
+        let legacy = sample_proxy_record("legacy-record");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                serde_json::to_string(&legacy).expect("serialize legacy proxy log")
+            ),
+        )
+        .expect("seed legacy proxy log");
+
+        let original = std::fs::read(&path).unwrap();
+        let summaries = read_summaries_at_path(&path, 10).expect("read proxy log summaries");
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, legacy.id);
+        assert_eq!(
+            find_record_at_path(&path, &legacy.id)
+                .unwrap()
+                .unwrap()
+                .request_body,
+            legacy.request_body
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(!super::detail_directory(&path).exists());
+        remove_proxy_log_artifacts(&path);
+    }
+
+    #[test]
+    fn index_size_and_update_thresholds_compact_without_deleting_requests() {
+        for size_triggered in [false, true] {
+            let path = temp_proxy_log_path(if size_triggered {
+                "compact-bytes"
+            } else {
+                "compact-updates"
+            });
+            let mut old = sample_proxy_record("old");
+            if size_triggered {
+                old.audit.error_code = Some("x".repeat(8 * 1024));
+            }
+            append_record_at_path(&path, &old).unwrap();
+            let summary = serde_json::to_string(&super::ProxyRequestSummary::from(&old)).unwrap();
+            let count = if size_triggered {
+                super::PROXY_INDEX_COMPACT_BYTES as usize / summary.len() + 1
+            } else {
+                super::MAX_PROXY_INDEX_UPDATES
+            };
+            let original = format!(
+                "{}\n{}",
+                super::PROXY_INDEX_HEADER,
+                format!("{summary}\n").repeat(count)
+            );
+            std::fs::write(&path, &original).unwrap();
+
+            assert_eq!(read_summaries_at_path(&path, 10).unwrap().len(), 1);
+            assert!(find_record_at_path(&path, "old").unwrap().is_some());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+            append_record_at_path(&path, &sample_proxy_record("fresh")).unwrap();
+            assert_eq!(read_summaries_at_path(&path, 10).unwrap().len(), 2);
+            assert!(find_record_at_path(&path, "old").unwrap().is_some());
+            assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 3);
+            remove_proxy_log_artifacts(&path);
+        }
+    }
+
+    #[test]
+    fn compacted_index_can_exceed_size_threshold_without_losing_requests() {
+        let path = temp_proxy_log_path("large-unique-summary");
+        let mut record = sample_proxy_record("large-summary");
+        record.audit.error_code = Some("x".repeat(super::PROXY_INDEX_COMPACT_BYTES as usize));
+        append_record_at_path(&path, &record).unwrap();
+        append_record_at_path(&path, &sample_proxy_record("fresh")).unwrap();
+
+        assert!(std::fs::metadata(&path).unwrap().len() > super::PROXY_INDEX_COMPACT_BYTES);
+        assert_eq!(read_summaries_at_path(&path, 10).unwrap().len(), 2);
+        assert!(find_record_at_path(&path, &record.id).unwrap().is_some());
+        remove_proxy_log_artifacts(&path);
+    }
+
+    #[test]
+    fn damaged_index_recovers_from_rows_and_details_without_mutating_reads() {
+        let path = temp_proxy_log_path("recover-damaged-index");
+        let from_index = sample_proxy_record("index-only");
+        let from_detail = sample_proxy_record("detail-only");
+        super::write_detail_record(&path, &from_detail).unwrap();
+        let original = format!(
+            "broken header\n{}\n{{partial",
+            serde_json::to_string(&super::ProxyRequestSummary::from(&from_index)).unwrap()
+        );
+        std::fs::write(&path, &original).unwrap();
+
+        assert_eq!(read_summaries_at_path(&path, 10).unwrap().len(), 2);
+        assert!(
+            find_record_at_path(&path, &from_detail.id)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        append_record_at_path(&path, &sample_proxy_record("fresh")).unwrap();
+        assert_eq!(read_summaries_at_path(&path, 10).unwrap().len(), 3);
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .starts_with(super::PROXY_INDEX_HEADER)
+        );
+        assert!(
+            find_record_at_path(&path, &from_detail.id)
+                .unwrap()
+                .is_some()
+        );
+        remove_proxy_log_artifacts(&path);
+    }
+
+    #[test]
+    fn missing_index_recovers_details_only_when_writing() {
+        let path = temp_proxy_log_path("recover-missing-index");
+        super::write_detail_record(&path, &sample_proxy_record("old")).unwrap();
+
+        assert_eq!(read_summaries_at_path(&path, 10).unwrap().len(), 1);
+        assert!(find_record_at_path(&path, "old").unwrap().is_some());
+        assert!(!path.exists());
+        append_record_at_path(&path, &sample_proxy_record("fresh")).unwrap();
+        assert_eq!(read_summaries_at_path(&path, 10).unwrap().len(), 2);
+        remove_proxy_log_artifacts(&path);
+    }
+
+    #[test]
+    fn unknown_index_version_preserves_index_and_details() {
+        let path = temp_proxy_log_path("unknown-index-version");
+        append_record_at_path(&path, &sample_proxy_record("old")).unwrap();
+        let original =
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .replacen("\"version\":1", "\"version\":2", 1);
+        std::fs::write(&path, &original).unwrap();
+        let old_detail = std::fs::read(super::detail_record_path(&path, "old")).unwrap();
+
+        assert!(read_summaries_at_path(&path, 10).is_err());
+        assert!(find_record_at_path(&path, "old").is_err());
+        assert!(append_record_at_path(&path, &sample_proxy_record("fresh")).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(
+            std::fs::read(super::detail_record_path(&path, "old")).unwrap(),
+            old_detail
+        );
+        assert!(!super::detail_record_path(&path, "fresh").exists());
+        remove_proxy_log_artifacts(&path);
+    }
+
+    #[test]
+    fn unrecoverable_index_preserves_original_files() {
+        let path = temp_proxy_log_path("unrecoverable-index");
+        std::fs::write(&path, b"unreadable index").unwrap();
+        std::fs::create_dir_all(super::detail_directory(&path)).unwrap();
+        let detail = super::detail_record_path(&path, "broken");
+        std::fs::write(&detail, b"unreadable detail").unwrap();
+
+        assert!(read_summaries_at_path(&path, 10).is_err());
+        assert!(append_record_at_path(&path, &sample_proxy_record("fresh")).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"unreadable index");
+        assert_eq!(std::fs::read(&detail).unwrap(), b"unreadable detail");
+        remove_proxy_log_artifacts(&path);
+    }
+
+    #[test]
+    fn failed_index_replacement_does_not_delete_old_records() {
+        let path = temp_proxy_log_path("failed-index-replacement");
+        let records: Vec<_> = (0..super::RUNTIME_RETAINED_RECORDS)
+            .map(|number| {
+                let mut record = sample_proxy_record(&format!("record-{number}"));
+                record.timestamp_ms = number as u64;
+                record
+            })
+            .collect();
+        super::append_records_at_path(&path, &records).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let blocked_temp_path = path.with_extension("jsonl.tmp");
+        std::fs::create_dir(&blocked_temp_path).unwrap();
+        let mut fresh = sample_proxy_record("fresh");
+        fresh.timestamp_ms = super::RUNTIME_RETAINED_RECORDS as u64 + 1;
+
+        assert!(append_record_at_path(&path, &fresh).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(super::detail_record_path(&path, "record-0").exists());
+        assert_eq!(
+            read_summaries_at_path(&path, 1000).unwrap().len(),
+            super::RUNTIME_RETAINED_RECORDS
+        );
+        std::fs::remove_dir(&blocked_temp_path).unwrap();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let reader = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0x3)
+                .open(&path)
+                .unwrap();
+            assert!(append_record_at_path(&path, &fresh).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert!(super::detail_record_path(&path, "record-0").exists());
+            drop(reader);
+        }
+        append_record_at_path(&path, &fresh).unwrap();
+        assert!(find_record_at_path(&path, "record-0").unwrap().is_none());
+        assert!(find_record_at_path(&path, "fresh").unwrap().is_some());
+        remove_proxy_log_artifacts(&path);
+    }
+
+    #[test]
+    fn retention_protects_pending_requests_until_they_complete() {
+        let path = temp_proxy_log_path("retain-pending-requests");
+        let mut pending = sample_proxy_record("old-pending");
+        pending.timestamp_ms = 0;
+        pending.state = ProxyRequestState::Pending;
+        append_record_at_path(&path, &pending).unwrap();
+        let records: Vec<_> = (1..=super::RUNTIME_RETAINED_RECORDS + 2)
+            .map(|number| {
+                let mut record = sample_proxy_record(&format!("completed-{number}"));
+                record.timestamp_ms = number as u64;
+                record
+            })
+            .collect();
+        super::append_records_at_path(&path, &records).unwrap();
+
+        let summaries = read_summaries_at_path(&path, 1000).unwrap();
+        assert_eq!(summaries.len(), super::RUNTIME_RETAINED_RECORDS + 1);
+        assert!(find_record_at_path(&path, "old-pending").unwrap().is_some());
+        assert!(find_record_at_path(&path, "completed-1").unwrap().is_none());
+        assert!(find_record_at_path(&path, "completed-2").unwrap().is_none());
+
+        pending.state = ProxyRequestState::Completed;
+        append_record_at_path(&path, &pending).unwrap();
+        assert_eq!(
+            read_summaries_at_path(&path, 1000).unwrap().len(),
+            super::RUNTIME_RETAINED_RECORDS
+        );
+        assert!(find_record_at_path(&path, "old-pending").unwrap().is_none());
+        remove_proxy_log_artifacts(&path);
+    }
+
+    #[test]
+    fn concurrent_reads_and_index_replacements_keep_complete_records() {
+        let path = temp_proxy_log_path("concurrent-index-replacement");
+        append_record_at_path(&path, &sample_proxy_record("old")).unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for number in 0..30 {
+                    super::append_records_at_path(
+                        &path,
+                        &[
+                            sample_proxy_record("old"),
+                            sample_proxy_record(&format!("fresh-{number}")),
+                        ],
+                    )
+                    .unwrap();
+                }
+            });
+            for _ in 0..3 {
+                scope.spawn(|| {
+                    for _ in 0..30 {
+                        assert!(!read_summaries_at_path(&path, 100).unwrap().is_empty());
+                        assert!(find_record_at_path(&path, "old").unwrap().is_some());
+                    }
+                });
+            }
+        });
+        assert_eq!(read_summaries_at_path(&path, 100).unwrap().len(), 31);
+        remove_proxy_log_artifacts(&path);
+    }
+
+    #[test]
+    fn append_record_retains_recent_runtime_record_limit() {
+        let path = temp_proxy_log_path("runtime-retain-records");
+        let record = sample_proxy_record("record-0");
+
+        for index in 0..=super::RUNTIME_RETAINED_RECORDS {
+            let mut next = record.clone();
+            next.id = format!("record-{index}");
+            next.timestamp_ms += index as u64;
+            append_record_at_path(&path, &next).expect("append proxy log record");
+        }
+
+        let text = std::fs::read_to_string(&path).expect("read proxy log");
+        let lines = text.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), super::RUNTIME_RETAINED_RECORDS + 1);
+        assert_eq!(lines[0], super::PROXY_INDEX_HEADER);
+        assert!(!text.contains("\"id\":\"record-0\""));
+        assert!(text.contains("\"id\":\"record-1\""));
+        assert!(text.contains(&format!(
+            "\"id\":\"record-{}\"",
+            super::RUNTIME_RETAINED_RECORDS
+        )));
+        assert!(
+            find_record_at_path(&path, "record-0")
+                .expect("read evicted detail")
+                .is_none()
+        );
+        assert!(
+            find_record_at_path(
+                &path,
+                &format!("record-{}", super::RUNTIME_RETAINED_RECORDS)
+            )
+            .expect("read retained detail")
+            .is_some()
+        );
+
+        remove_proxy_log_artifacts(&path);
+    }
+
+    #[test]
+    fn large_proxy_record_is_trimmed_to_fit_single_log_file_limit() {
+        let mut record = sample_proxy_record("large-record");
+        record.request_body = "q".repeat(128 * 1024);
+        record.response_body = "r".repeat(crate::log_limits::MAX_LOG_FILE_BYTES as usize + 1);
+        record.response_captured_bytes = Some(record.response_body.len());
+        record.response_truncated = false;
+
+        let line = serialize_record_for_log(&record).expect("serialize trimmed proxy log record");
+        let parsed: ProxyRequestRecord =
+            serde_json::from_str(&line).expect("parse trimmed proxy log record");
+
+        assert!(line.len() as u64 + 1 <= crate::log_limits::MAX_LOG_FILE_BYTES);
+        assert_eq!(parsed.id, "large-record");
+        assert!(parsed.response_truncated);
+        assert!(parsed.response_body.len() < record.response_body.len());
+        assert!(parsed.request_body.len() <= super::MAX_RETAINED_REQUEST_BODY_BYTES);
+    }
+
+    #[test]
+    fn clear_records_uses_locked_index_replacement() {
+        let path = temp_proxy_log_path("clear-records");
+        append_record_at_path(&path, &sample_proxy_record("old")).expect("seed proxy log");
+
+        clear_records_at_path(&path).expect("clear proxy logs");
+
+        let text = std::fs::read_to_string(&path).expect("read cleared proxy log");
+        assert_eq!(text, format!("{}\n", super::PROXY_INDEX_HEADER));
+        assert!(
+            find_record_at_path(&path, "old")
+                .expect("read cleared detail")
+                .is_none()
+        );
+
+        remove_proxy_log_artifacts(&path);
+    }
+
+    #[test]
+    fn summary_reads_failed_response_even_with_http_200() {
+        let mut record = sample_proxy_record("failed-stream");
+        record.response_body = concat!(
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",",
+            "\"error\":{\"code\":\"layered_compaction_summary_tag_missing\",",
+            "\"message\":\"摘要缺少必要标记\"}}}\n\n"
+        )
+        .to_string();
+        let summary = super::ProxyRequestSummary::from(&record);
+        assert_eq!(summary.status_code, Some(200));
+        assert_eq!(summary.error.as_deref(), Some("摘要缺少必要标记"));
+        assert_eq!(
+            summary.audit.outcome,
+            Some(super::ProxyRequestOutcome::Failed)
+        );
+        assert_eq!(
+            summary.audit.error_code.as_deref(),
+            Some("layered_compaction_summary_tag_missing")
+        );
+        assert_eq!(summary.audit.upstream_status_code, None);
+
+        let path = temp_proxy_log_path("legacy-failed-result");
+        append_record_at_path(&path, &record).unwrap();
+        let mut legacy = serde_json::to_value(&summary).unwrap();
+        for field in [
+            "outcome",
+            "errorCode",
+            "upstreamStatusCode",
+            "upstreamAttempts",
+            "threadId",
+            "turnId",
+            "error",
+        ] {
+            legacy.as_object_mut().unwrap().remove(field);
+        }
+        let index = format!("{}\n{}\n", super::PROXY_INDEX_HEADER, legacy);
+        std::fs::write(&path, &index).unwrap();
+        let summaries = read_summaries_at_path(&path, 1).unwrap();
+        assert_eq!(
+            summaries[0].audit.outcome,
+            Some(super::ProxyRequestOutcome::Failed)
+        );
+        assert_eq!(summaries[0].audit.upstream_status_code, None);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), index);
+        remove_proxy_log_artifacts(&path);
+    }
+
+    #[test]
+    fn summary_ignores_errors_embedded_in_successful_output() {
+        let mut record = sample_proxy_record("successful-output");
+        record.response_body = serde_json::json!({
+            "status": "completed",
+            "output": [{"type": "message", "content": [{
+                "type": "output_text",
+                "text": "{\"error\":{\"message\":\"historical tool error\"}}"
+            }]}]
+        })
+        .to_string();
+        let summary = super::ProxyRequestSummary::from(&record);
+        assert!(summary.error.is_none());
+        assert_eq!(
+            summary.audit.outcome,
+            Some(super::ProxyRequestOutcome::Succeeded)
+        );
+        assert_eq!(summary.audit.upstream_status_code, None);
+    }
+
+    #[test]
+    fn request_result_distinguishes_incomplete_unknown_and_pending() {
+        let mut record = sample_proxy_record("request-outcome");
+        assert_eq!(
+            super::ProxyRequestSummary::from(&record).audit.outcome,
+            None
+        );
+        record.response_body =
+            r#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}"#
+                .to_string();
+        let summary = super::ProxyRequestSummary::from(&record);
+        assert_eq!(
+            summary.audit.outcome,
+            Some(super::ProxyRequestOutcome::Incomplete)
+        );
+        assert_eq!(
+            summary.audit.error_code.as_deref(),
+            Some("max_output_tokens")
+        );
+        record.state = ProxyRequestState::Pending;
+        assert_eq!(
+            super::ProxyRequestSummary::from(&record).audit.outcome,
+            None
+        );
+        record.state = ProxyRequestState::Completed;
+        record.status_code = Some(499);
+        record.error = Some("客户端已断开".to_string());
+        assert_eq!(
+            super::ProxyRequestSummary::from(&record).audit.outcome,
+            Some(super::ProxyRequestOutcome::Incomplete)
+        );
+    }
+
+    #[test]
+    fn ws_backed_http_logs_read_sse_terminal_result() {
+        let mut record = sample_proxy_record("ws-backed-http");
+        record.transport = super::ProxyRequestTransport::Ws;
+        record.response_protocol = Some("responses".to_string());
+        record.stream = true;
+        record.response_body = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n".to_string();
+        record.audit.record_attempt("gpt-test", None, None);
+        record.audit.upstream_attempts[0].transport = Some(super::ProxyRequestTransport::Ws);
+        let summary = super::ProxyRequestSummary::from(&record);
+        assert_eq!(
+            summary.audit.outcome,
+            Some(super::ProxyRequestOutcome::Succeeded)
+        );
+        assert_eq!(summary.audit.upstream_status_code, None);
+        assert_eq!(summary.audit.upstream_attempts[0].status_code, None);
+    }
+
+    #[test]
+    fn request_metadata_records_context_ids_without_using_cache_or_request_ids() {
+        let request = serde_json::json!({"model":"claude-test","prompt_cache_key":"not-a-session"});
+        let context = crate::request_headers::RequestContext::from_http_request(
+            b"POST /v1/responses HTTP/1.1\r\nthread-id: thread-test\r\nx-codex-turn-metadata: {\"turn_id\":\"turn-test\"}\r\n\r\n"
+        );
+        let metadata = super::extract_request_metadata_with_context(Some(&request), &context);
+        assert_eq!(metadata.audit.thread_id.as_deref(), Some("thread-test"));
+        assert_eq!(metadata.audit.turn_id.as_deref(), Some("turn-test"));
+        let context = crate::request_headers::RequestContext::from_http_request(
+            b"POST /v1/responses HTTP/1.1\r\nx-client-request-id: request-only\r\n\r\n",
+        );
+        assert_eq!(
+            super::extract_request_metadata_with_context(Some(&request), &context)
+                .audit
+                .thread_id,
+            None
+        );
+    }
+
+    fn sample_proxy_record(id: &str) -> ProxyRequestRecord {
+        ProxyRequestRecord {
+            audit: Default::default(),
+            id: id.to_string(),
+            state: ProxyRequestState::Completed,
+            transport: super::ProxyRequestTransport::Http,
+            timestamp_ms: current_timestamp_ms(),
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            remote_addr: Some("127.0.0.1:1".to_string()),
+            model: Some("glm-5.2".to_string()),
+            upstream_request_model: None,
+            upstream_response_model: None,
+            independent_compaction_model: None,
+            independent_compaction_usage: None,
+            reasoning_tokens: None,
+            reasoning_effort: None,
+            reasoning_source: None,
+            continue_thinking_triggered: false,
+            continue_thinking_rounds: 0,
+            continue_thinking_request_body: None,
+            continue_thinking_before_response_body: None,
+            continue_thinking_after_response_body: None,
+            remote_compaction_triggered: false,
+            layered_compaction_triggered: false,
+            compaction_requested: false,
+            layered_compaction_retain_tokens: None,
+            layered_compaction_retained_items: None,
+            layered_compaction_retained_chars: None,
+            layered_compaction_before_response_body: None,
+            service_tier: None,
+            relay_id: Some("relay-test".to_string()),
+            relay_name: Some("Test".to_string()),
+            endpoint: Some("https://example.test/v1/chat/completions".to_string()),
+            response_protocol: Some("chatCompletions".to_string()),
+            status_code: Some(200),
+            first_token_ms: None,
+            duration_ms: Some(10),
+            stream: false,
+            request_bytes: 2,
+            response_bytes: Some(2),
+            response_captured_bytes: Some(2),
+            response_truncated: false,
+            request_body: "{}".to_string(),
+            response_body: "{}".to_string(),
+            error: None,
+        }
+    }
+}

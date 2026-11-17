@@ -1,0 +1,1607 @@
+mod support;
+
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use codex_elves_core::launcher::{
+    CodexLaunch, LaunchHooks, LaunchOptions, ProcessWaitStrategy, launch_and_inject_with_hooks,
+};
+use codex_elves_core::models::{
+    DeleteResult, DeleteStatus, ExportResult, ExportStatus, SessionRef,
+};
+use codex_elves_core::routes::{
+    BridgeContext, BridgeDataService, BridgeRuntimeService, BridgeSettingsService,
+    CoreRuntimeService, handle_bridge_request,
+};
+use codex_elves_core::settings::BackendSettings;
+use codex_elves_core::status::StatusStore;
+use codex_elves_core::user_scripts::UserScriptManager;
+use codex_elves_core::workspace_checkpoint::WorkspaceCheckpointService;
+use serde_json::{Value, json};
+use support::DiagnosticLogCapture;
+
+#[tokio::test]
+async fn bridge_routes_cover_all_current_paths() {
+    let ctx = test_context();
+
+    let cases = [
+        ("/settings/get", json!({})),
+        ("/settings/set", json!({"providerSyncEnabled": true})),
+        ("/user-scripts/list", json!({})),
+        ("/user-scripts/set-enabled", json!({"enabled": false})),
+        (
+            "/user-scripts/set-script-enabled",
+            json!({"key": "user:a.js", "enabled": false}),
+        ),
+        ("/user-scripts/delete", json!({"key": "user:a.js"})),
+        ("/user-scripts/reload", json!({})),
+        ("/devtools/open", json!({})),
+        ("/manager/open", json!({})),
+        ("/backend/status", json!({})),
+        ("/backend/repair", json!({})),
+        ("/runtime/install-renderer-features", json!({})),
+        ("/codex-model-catalog", json!({})),
+        ("/codex-config-model", json!({})),
+        ("/prompt-optimize", json!({})),
+        ("/prompt-optimize/cancel", json!({"requestId": "missing"})),
+        ("/upstream-worktree/status", json!({})),
+        ("/upstream-worktree/defaults", json!({"repoPath": "/repo"})),
+        (
+            "/upstream-worktree/prepare",
+            json!({"repoPath": "/repo", "remote": "upstream", "baseBranch": "main"}),
+        ),
+        (
+            "/upstream-worktree/create",
+            json!({"repoPath": "/repo", "branchName": "feature/demo"}),
+        ),
+        ("/workspace-checkpoint/create", json!({})),
+        (
+            "/workspace-checkpoint/session-context",
+            json!({"session_id": "s1", "title": "First"}),
+        ),
+        ("/workspace-checkpoint/bind-turn", json!({})),
+        ("/workspace-checkpoint/complete-turn", json!({})),
+        ("/workspace-checkpoint/list", json!({})),
+        ("/workspace-checkpoint/restore", json!({})),
+        ("/workspace-checkpoint/preview-revert", json!({})),
+        ("/workspace-checkpoint/restore-for-revert", json!({})),
+        ("/delete", json!({"session_id": "s1", "title": "First"})),
+        (
+            "/export-markdown",
+            json!({"session_id": "s1", "title": "First"}),
+        ),
+        (
+            "/thread-usage-history",
+            json!({"session_id": "s1", "title": "First"}),
+        ),
+        (
+            "/thread-usage-summary",
+            json!({"session_id": "s1", "title": "First"}),
+        ),
+        ("/archived-thread", json!({"title": "Archived"})),
+        (
+            "/move-thread-workspace",
+            json!({"session_id": "s1", "title": "First", "target_cwd": "/new"}),
+        ),
+        (
+            "/thread-sort-key",
+            json!({"session_id": "s1", "title": "First"}),
+        ),
+        (
+            "/thread-sort-keys",
+            json!({"sessions": [{"session_id": "s1", "title": "First"}]}),
+        ),
+    ];
+
+    for (path, payload) in cases {
+        let result = handle_bridge_request(ctx.clone(), path, payload).await;
+        assert_ne!(
+            result["message"], "Unknown bridge path",
+            "{path} should be routed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn settings_get_includes_runtime_codex_app_version() {
+    let ctx = BridgeContext::new(
+        Arc::new(FakeSettings::with_codex_app_version("26.601.21317")),
+        Arc::new(FakeRuntime::default()),
+        Arc::new(FakeData::default()),
+    );
+
+    let result = handle_bridge_request(ctx, "/settings/get", json!({})).await;
+
+    assert_eq!(result["codexAppVersion"], json!("26.601.21317"));
+    assert_eq!(result["codexAppPluginEntryUnlock"], json!(true));
+    assert_eq!(result["codexAppPluginMarketplaceUnlock"], json!(true));
+    assert_eq!(result["codexAppWorkspaceCheckpoint"], json!(false));
+    assert_eq!(result["codexAppWorkspaceCheckpointStoragePath"], json!(""));
+    assert_eq!(
+        result["codexAppWorkspaceCheckpointRetentionRounds"],
+        json!(20)
+    );
+    assert!(result.get("codexAppForcePluginInstall").is_none());
+    assert!(result.get("codexAppConversationTimeline").is_none());
+    assert!(result.get("codexAppThreadIdBadge").is_none());
+}
+
+#[tokio::test]
+async fn settings_set_does_not_persist_runtime_codex_app_version() {
+    let settings = Arc::new(FakeSettings::with_codex_app_version("26.601.21317"));
+    let ctx = BridgeContext::new(
+        settings.clone(),
+        Arc::new(FakeRuntime::default()),
+        Arc::new(FakeData::default()),
+    );
+
+    let result = handle_bridge_request(
+        ctx,
+        "/settings/set",
+        json!({
+            "codexAppVersion": "1.2.3",
+            "codexAppPluginMarketplaceUnlock": false
+        }),
+    )
+    .await;
+
+    assert_eq!(result["codexAppVersion"], json!("26.601.21317"));
+    assert_eq!(result["codexAppPluginMarketplaceUnlock"], json!(false));
+
+    let persisted = settings.settings.lock().unwrap().clone();
+    let persisted_value = serde_json::to_value(persisted).unwrap();
+    assert!(persisted_value.get("codexAppVersion").is_none());
+}
+
+#[tokio::test]
+async fn bridge_context_core_with_app_dir_exposes_runtime_codex_app_version() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp
+        .path()
+        .join("OpenAI.Codex_26.601.21317.0_x64__abc")
+        .join("app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::write(app_dir.join("Codex.exe"), "").unwrap();
+    let ctx = BridgeContext::core_with_data_and_app_dir(
+        Arc::new(FakeRuntime::default()),
+        Arc::new(FakeData::default()),
+        app_dir,
+    );
+
+    let result = handle_bridge_request(ctx, "/settings/get", json!({})).await;
+
+    assert_eq!(result["codexAppVersion"], json!("26.601.21317.0"));
+}
+
+#[tokio::test]
+async fn upstream_worktree_routes_are_dispatched_to_runtime() {
+    let ctx = test_context();
+
+    assert_eq!(
+        handle_bridge_request(ctx.clone(), "/upstream-worktree/status", json!({})).await,
+        json!({"status": "ok", "feature": "upstream-worktree"})
+    );
+    assert_eq!(
+        handle_bridge_request(
+            ctx.clone(),
+            "/upstream-worktree/defaults",
+            json!({"repoPath": "/repo"}),
+        )
+        .await,
+        json!({
+            "status": "ok",
+            "repoRoot": "/repo",
+            "defaultRemote": "upstream",
+            "defaultBaseBranch": "main",
+        })
+    );
+    assert_eq!(
+        handle_bridge_request(
+            ctx.clone(),
+            "/upstream-worktree/create",
+            json!({"repoPath": "/repo", "branchName": "feature/demo"}),
+        )
+        .await,
+        json!({
+            "status": "ok",
+            "repoRoot": "/repo",
+            "branchName": "feature/demo",
+            "worktreePath": "/repo-feature-demo",
+        })
+    );
+    assert_eq!(
+        handle_bridge_request(
+            ctx,
+            "/upstream-worktree/prepare",
+            json!({"repoPath": "/repo", "remote": "upstream", "baseBranch": "main"}),
+        )
+        .await,
+        json!({
+            "status": "ok",
+            "repoRoot": "/repo",
+            "sourceRef": "upstream/main",
+            "qualifiedSourceRef": "refs/remotes/upstream/main",
+        })
+    );
+}
+
+#[tokio::test]
+async fn unknown_bridge_path_preserves_empty_session_id_shape() {
+    let result = handle_bridge_request(
+        test_context(),
+        "/missing",
+        json!({"session_id": "should-not-leak"}),
+    )
+    .await;
+
+    assert_eq!(
+        result,
+        json!({
+            "status": "failed",
+            "session_id": "",
+            "message": "Unknown bridge path"
+        })
+    );
+}
+
+#[tokio::test]
+async fn workspace_checkpoint_session_context_route_uses_exact_thread_cwd() {
+    let result = handle_bridge_request(
+        test_context(),
+        "/workspace-checkpoint/session-context",
+        json!({"session_id": "thread-1", "title": "First"}),
+    )
+    .await;
+
+    assert_eq!(result["status"], "ok");
+    assert_eq!(result["session_id"], "thread-1");
+    assert_eq!(result["cwd"], "C:/workspace/exact");
+    assert_eq!(result["host_id"], "local");
+}
+
+#[tokio::test]
+async fn settings_routes_use_settings_service() {
+    let ctx = test_context();
+
+    let updated = handle_bridge_request(
+        ctx.clone(),
+        "/settings/set",
+        json!({"providerSyncEnabled": true, "codexAppSessionDelete": false, "codexAppNativeFastUnlock": true, "codexAppWorkspaceCheckpoint": false, "cliWrapperApiKeyEnv": ""}),
+    )
+    .await;
+    let loaded = handle_bridge_request(ctx, "/settings/get", json!({})).await;
+
+    assert_eq!(updated["providerSyncEnabled"], true);
+    assert_eq!(updated["codexAppSessionDelete"], false);
+    assert_eq!(updated["codexAppNativeFastUnlock"], true);
+    assert_eq!(updated["codexAppWorkspaceCheckpoint"], false);
+    assert_eq!(updated["cliWrapperApiKeyEnv"], "CUSTOM_OPENAI_API_KEY");
+    assert_eq!(loaded, updated);
+}
+
+#[tokio::test]
+async fn workspace_checkpoint_routes_create_bind_complete_list_and_restore() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(workspace.join("value.txt"), "before").unwrap();
+    let ctx = test_context().with_workspace_checkpoint_service(WorkspaceCheckpointService::new(
+        temp.path().join("checkpoint-state"),
+    ));
+    let enabled = handle_bridge_request(
+        ctx.clone(),
+        "/settings/set",
+        json!({"codexAppWorkspaceCheckpoint": true}),
+    )
+    .await;
+    assert_eq!(enabled["codexAppWorkspaceCheckpoint"], json!(true));
+
+    let created = handle_bridge_request(
+        ctx.clone(),
+        "/workspace-checkpoint/create",
+        json!({
+            "cwd": workspace,
+            "threadId": "thread-1",
+            "requestId": "request-1",
+            "promptPreview": "prompt"
+        }),
+    )
+    .await;
+    assert_eq!(created["status"], "ok");
+    assert_eq!(created["checkpoint"]["initialization"], true);
+    assert_eq!(created["checkpoint"]["initialFileCount"], 1);
+    assert_eq!(created["checkpoint"]["changeScope"], "turn");
+    assert_eq!(created["checkpoint"]["changedFileCount"], 0);
+    assert_eq!(created["checkpoint"]["changedFiles"], json!([]));
+    let checkpoint_id = created["checkpoint"]["id"].as_str().unwrap().to_string();
+
+    let bound = handle_bridge_request(
+        ctx.clone(),
+        "/workspace-checkpoint/bind-turn",
+        json!({
+            "cwd": workspace,
+            "checkpointId": checkpoint_id,
+            "threadId": "thread-1",
+            "turnId": "turn-1"
+        }),
+    )
+    .await;
+    assert_eq!(bound["checkpoint"]["turnId"], "turn-1");
+    assert_eq!(bound["checkpoint"]["accepted"], true);
+
+    let unchanged = handle_bridge_request(
+        ctx.clone(),
+        "/workspace-checkpoint/preview-revert",
+        json!({
+            "cwd": workspace,
+            "threadId": "thread-1",
+            "beforeTurnId": "",
+            "numTurns": 1
+        }),
+    )
+    .await;
+    assert_eq!(unchanged["status"], "ok");
+    assert_eq!(unchanged["hasChanges"], false);
+    assert_eq!(unchanged["changedPaths"], json!([]));
+
+    std::fs::write(workspace.join("value.txt"), "after").unwrap();
+    let completed = handle_bridge_request(
+        ctx.clone(),
+        "/workspace-checkpoint/complete-turn",
+        json!({
+            "cwd": workspace,
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "status": "completed"
+        }),
+    )
+    .await;
+    assert_eq!(completed["status"], "ok");
+    assert_eq!(completed["checkpoint"]["id"], checkpoint_id);
+    assert_eq!(completed["checkpoint"]["turnStatus"], "completed");
+    assert_eq!(completed["checkpoint"]["changedFileCount"], 1);
+    assert_eq!(
+        completed["checkpoint"]["changedFiles"][0]["path"],
+        "value.txt"
+    );
+    assert_eq!(completed["checkpoint"]["changedFiles"][0]["status"], "M");
+
+    let listed = handle_bridge_request(
+        ctx.clone(),
+        "/workspace-checkpoint/list",
+        json!({
+            "cwd": workspace,
+            "threadId": "thread-1"
+        }),
+    )
+    .await;
+    assert_eq!(listed["checkpoints"][0], completed["checkpoint"]);
+
+    let changed = handle_bridge_request(
+        ctx.clone(),
+        "/workspace-checkpoint/preview-revert",
+        json!({
+            "cwd": workspace,
+            "threadId": "thread-1",
+            "beforeTurnId": "",
+            "numTurns": 1
+        }),
+    )
+    .await;
+    assert_eq!(changed["status"], "ok");
+    assert_eq!(changed["hasChanges"], true);
+    assert_eq!(changed["changedPaths"], json!(["value.txt"]));
+
+    let restored = handle_bridge_request(
+        ctx,
+        "/workspace-checkpoint/restore",
+        json!({
+            "cwd": workspace,
+            "checkpointId": checkpoint_id,
+            "threadId": "thread-1"
+        }),
+    )
+    .await;
+    assert_eq!(restored["status"], "ok");
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("value.txt")).unwrap(),
+        "before"
+    );
+}
+
+#[tokio::test]
+async fn workspace_checkpoint_routes_use_configured_storage_retention_and_feature_gate() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    let checkpoint_root = temp.path().join("checkpoint-state");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(workspace.join("value.txt"), "before").unwrap();
+    let settings = Arc::new(FakeSettings::default());
+    let ctx = BridgeContext::new(
+        settings,
+        Arc::new(FakeRuntime::default()),
+        Arc::new(FakeData::default()),
+    );
+
+    let configured = handle_bridge_request(
+        ctx.clone(),
+        "/settings/set",
+        json!({
+            "codexAppWorkspaceCheckpoint": true,
+            "codexAppWorkspaceCheckpointStoragePath": checkpoint_root,
+            "codexAppWorkspaceCheckpointRetentionRounds": 1
+        }),
+    )
+    .await;
+    assert_eq!(
+        configured["codexAppWorkspaceCheckpointRetentionRounds"],
+        json!(1)
+    );
+
+    let mut first_checkpoint_id = String::new();
+    for (index, value) in ["before", "after"].into_iter().enumerate() {
+        std::fs::write(workspace.join("value.txt"), value).unwrap();
+        let created = handle_bridge_request(
+            ctx.clone(),
+            "/workspace-checkpoint/create",
+            json!({
+                "cwd": workspace,
+                "threadId": "thread-1",
+                "requestId": format!("request-{}", index + 1),
+                "promptPreview": value
+            }),
+        )
+        .await;
+        assert_eq!(created["status"], "ok");
+        let checkpoint_id = created["checkpoint"]["id"].as_str().unwrap().to_string();
+        if index == 0 {
+            first_checkpoint_id = checkpoint_id.clone();
+        }
+        let bound = handle_bridge_request(
+            ctx.clone(),
+            "/workspace-checkpoint/bind-turn",
+            json!({
+                "cwd": workspace,
+                "checkpointId": checkpoint_id,
+                "threadId": "thread-1",
+                "turnId": format!("turn-{}", index + 1)
+            }),
+        )
+        .await;
+        assert_eq!(bound["status"], "ok");
+    }
+
+    let listed = handle_bridge_request(
+        ctx.clone(),
+        "/workspace-checkpoint/list",
+        json!({
+            "cwd": workspace,
+            "threadId": "thread-1"
+        }),
+    )
+    .await;
+    assert_eq!(listed["checkpoints"].as_array().unwrap().len(), 1);
+    assert_ne!(listed["checkpoints"][0]["id"], first_checkpoint_id);
+    assert!(checkpoint_root.is_dir());
+
+    handle_bridge_request(
+        ctx.clone(),
+        "/settings/set",
+        json!({"codexAppWorkspaceCheckpoint": false}),
+    )
+    .await;
+    let disabled = handle_bridge_request(
+        ctx.clone(),
+        "/workspace-checkpoint/list",
+        json!({"cwd": workspace, "threadId": "thread-1"}),
+    )
+    .await;
+    assert_eq!(disabled["status"], "failed");
+    assert!(
+        disabled["message"]
+            .as_str()
+            .unwrap()
+            .contains("Checkpoint 功能已关闭")
+    );
+
+    handle_bridge_request(
+        ctx.clone(),
+        "/settings/set",
+        json!({
+            "codexAppWorkspaceCheckpoint": true,
+            "enhancementsEnabled": false
+        }),
+    )
+    .await;
+    let master_disabled = handle_bridge_request(
+        ctx,
+        "/workspace-checkpoint/list",
+        json!({"cwd": workspace, "threadId": "thread-1"}),
+    )
+    .await;
+    assert_eq!(master_disabled["status"], "failed");
+    assert!(
+        master_disabled["message"]
+            .as_str()
+            .unwrap()
+            .contains("Checkpoint 功能已关闭")
+    );
+}
+
+#[tokio::test]
+async fn runtime_routes_keep_user_script_inventory_shape() {
+    let ctx = test_context();
+
+    let listed = handle_bridge_request(ctx.clone(), "/user-scripts/list", json!({})).await;
+    let global = handle_bridge_request(
+        ctx.clone(),
+        "/user-scripts/set-enabled",
+        json!({"enabled": false}),
+    )
+    .await;
+    let script = handle_bridge_request(
+        ctx.clone(),
+        "/user-scripts/set-script-enabled",
+        json!({"key": "user:a.js", "enabled": false}),
+    )
+    .await;
+    let reloaded = handle_bridge_request(ctx, "/user-scripts/reload", json!({})).await;
+
+    assert_eq!(listed["enabled"], true);
+    assert_eq!(listed["scripts"][0]["key"], "builtin:demo.js");
+    assert_eq!(global["enabled"], false);
+    assert_eq!(script["scripts"][1]["enabled"], false);
+    assert_eq!(reloaded["reloaded"], true);
+    assert_eq!(reloaded["scripts"][0]["key"], "builtin:demo.js");
+}
+
+#[tokio::test]
+async fn runtime_status_devtools_and_repair_routes_are_dispatched() {
+    let ctx = test_context();
+
+    assert_eq!(
+        handle_bridge_request(ctx.clone(), "/devtools/open", json!({})).await,
+        json!({"status": "ok", "opened": true})
+    );
+    assert_eq!(
+        handle_bridge_request(ctx.clone(), "/manager/open", json!({})).await,
+        json!({"status": "ok", "opened": "manager"})
+    );
+    assert_eq!(
+        handle_bridge_request(ctx.clone(), "/backend/status", json!({})).await,
+        json!({"status": "ok", "message": "后端已连接", "version": codex_elves_core::version::VERSION})
+    );
+    assert_eq!(
+        handle_bridge_request(ctx.clone(), "/backend/repair", json!({})).await,
+        json!({"status": "ok", "message": "后端已修复", "version": codex_elves_core::version::VERSION})
+    );
+}
+
+#[tokio::test]
+async fn data_routes_forward_payloads_to_data_service() {
+    let ctx = test_context();
+
+    assert_eq!(
+        handle_bridge_request(
+            ctx.clone(),
+            "/delete",
+            json!({"session_id": "s1", "title": "First"}),
+        )
+        .await,
+        json!({
+            "status": "failed",
+            "session_id": "s1",
+            "message": "旧删除接口已停用，请使用 Codex 原生永久删除入口"
+        })
+    );
+    assert_eq!(
+        handle_bridge_request(
+            ctx.clone(),
+            "/export-markdown",
+            json!({"session_id": "s1", "title": "First"}),
+        )
+        .await["filename"],
+        "First.md"
+    );
+    assert_eq!(
+        handle_bridge_request(
+            ctx.clone(),
+            "/thread-usage-history",
+            json!({"session_id": "s1", "title": "First"}),
+        )
+        .await,
+        json!({
+            "status": "ok",
+            "session_id": "s1",
+            "history": [
+                {
+                    "source": "rollout-history",
+                    "conversation_id": "local:s1",
+                    "turn_id": "turn-1",
+                    "observed_at": "2026-06-02T05:00:00Z",
+                    "usage": {
+                        "inputTokens": 1200,
+                        "outputTokens": 120,
+                        "totalTokens": 1320,
+                        "cachedTokens": 900,
+                        "cacheReadTokens": 0,
+                        "cacheCreationTokens": 0,
+                        "contextUsed": 1320,
+                        "contextLimit": 258400,
+                        "hasBreakdown": true
+                    }
+                }
+            ]
+        })
+    );
+    assert_eq!(
+        handle_bridge_request(
+            ctx.clone(),
+            "/thread-usage-summary",
+            json!({"session_id": "s1", "title": "First"}),
+        )
+        .await,
+        json!({
+            "status": "ok",
+            "session_id": "s1",
+            "summary": {
+                "totalUsage": {
+                    "inputTokens": 1200,
+                    "outputTokens": 120,
+                    "totalTokens": 1320
+                }
+            }
+        })
+    );
+    assert_eq!(
+        handle_bridge_request(
+            ctx.clone(),
+            "/archived-thread",
+            json!({"title": "Archived"})
+        )
+        .await,
+        json!({"session_id": "archived-1", "title": "Archived"})
+    );
+    assert_eq!(
+        handle_bridge_request(
+            ctx.clone(),
+            "/move-thread-workspace",
+            json!({"session_id": "s1", "title": "First", "target_cwd": "/new"}),
+        )
+        .await,
+        json!({"status": "moved", "session_id": "s1", "target_cwd": "/new"})
+    );
+    assert_eq!(
+        handle_bridge_request(
+            ctx.clone(),
+            "/thread-sort-key",
+            json!({"session_id": "s1", "title": "First"}),
+        )
+        .await,
+        json!({"status": "ok", "session_id": "s1", "updated_at": 123})
+    );
+    assert_eq!(
+        handle_bridge_request(
+            ctx,
+            "/thread-sort-keys",
+            json!({"sessions": [{"session_id": "s1", "title": "First"}, null, {"session_id": "s2"}]}),
+        )
+        .await,
+        json!({"status": "ok", "sort_keys": [{"session_id": "s1"}, {"session_id": "s2"}]})
+    );
+}
+
+#[tokio::test]
+async fn bridge_context_rejects_legacy_delete_even_with_data_service() {
+    let ctx = BridgeContext::core_with_data(
+        Arc::new(CoreRuntimeService::new(9229, StatusStore::default())),
+        Arc::new(FakeData::default()),
+    );
+
+    let result = handle_bridge_request(
+        ctx,
+        "/delete",
+        json!({"session_id": "s1", "title": "First"}),
+    )
+    .await;
+
+    assert_eq!(result["status"], "failed");
+    assert!(result.get("undo_token").is_none());
+    assert!(result.get("backup_path").is_none());
+    assert_eq!(
+        result["message"],
+        "旧删除接口已停用，请使用 Codex 原生永久删除入口"
+    );
+}
+
+#[tokio::test]
+async fn user_script_manager_scans_and_persists_inventory_shape() {
+    let temp = tempfile::tempdir().unwrap();
+    let builtin_dir = temp.path().join("builtin");
+    let user_dir = temp.path().join("user");
+    std::fs::create_dir_all(&builtin_dir).unwrap();
+    std::fs::write(builtin_dir.join("demo.js"), "window.demo = true;").unwrap();
+    std::fs::create_dir_all(&user_dir).unwrap();
+    std::fs::write(user_dir.join("a.js"), "window.a = true;").unwrap();
+    std::fs::write(user_dir.join("ignore.txt"), "not js").unwrap();
+    let manager = UserScriptManager::new(
+        builtin_dir.clone(),
+        user_dir.clone(),
+        temp.path().join("user_scripts.json"),
+    );
+
+    let listed = manager.inventory().unwrap();
+    manager.set_global_enabled(false).unwrap();
+    let disabled = manager.inventory().unwrap();
+    manager.set_script_enabled("user:a.js", false).unwrap();
+    let script_disabled = manager.inventory().unwrap();
+    manager.delete_user_script("user:a.js").unwrap();
+    let deleted = manager.inventory().unwrap();
+
+    assert_eq!(listed["enabled"], true);
+    assert_eq!(
+        listed["builtin_dir"].as_str().unwrap(),
+        builtin_dir.to_string_lossy()
+    );
+    assert_eq!(
+        listed["user_dir"].as_str().unwrap(),
+        user_dir.to_string_lossy()
+    );
+    assert_eq!(listed["scripts"][0]["key"], "builtin:demo.js");
+    assert_eq!(listed["scripts"][0]["source"], "builtin");
+    assert_eq!(listed["scripts"][0]["enabled"], true);
+    assert_eq!(listed["scripts"][0]["status"], "not_loaded");
+    assert_eq!(listed["scripts"][0]["error"], "");
+    assert_eq!(listed["scripts"][1]["key"], "user:a.js");
+    assert_eq!(disabled["enabled"], false);
+    assert_eq!(disabled["scripts"][0]["status"], "disabled");
+    assert_eq!(script_disabled["scripts"][1]["enabled"], false);
+    assert_eq!(deleted["scripts"].as_array().unwrap().len(), 1);
+    assert!(!user_dir.join("a.js").exists());
+    assert_eq!(
+        serde_json::from_str::<Value>(
+            &std::fs::read_to_string(temp.path().join("user_scripts.json")).unwrap()
+        )
+        .unwrap(),
+        json!({"enabled": false, "scripts": {}})
+    );
+}
+
+#[tokio::test]
+async fn user_script_manager_deletes_market_script_metadata_and_rejects_builtin_delete() {
+    let temp = tempfile::tempdir().unwrap();
+    let builtin_dir = temp.path().join("builtin");
+    let user_dir = temp.path().join("user");
+    std::fs::create_dir_all(&builtin_dir).unwrap();
+    std::fs::write(builtin_dir.join("demo.js"), "window.demo = true;").unwrap();
+    std::fs::create_dir_all(&user_dir).unwrap();
+    let manager = UserScriptManager::new(
+        builtin_dir,
+        user_dir.clone(),
+        temp.path().join("user_scripts.json"),
+    );
+    let script = codex_elves_core::script_market::MarketScript {
+        id: "demo".to_string(),
+        name: "Demo".to_string(),
+        description: String::new(),
+        version: "1.0.0".to_string(),
+        author: String::new(),
+        tags: Vec::new(),
+        homepage: "https://example.com/demo".to_string(),
+        script_url: "https://example.com/demo.js".to_string(),
+        sha256: String::new(),
+    };
+
+    codex_elves_core::script_market::install_market_script_content(
+        &manager,
+        &script,
+        b"window.demo = true;",
+    )
+    .unwrap();
+    manager
+        .set_script_enabled("user:market-demo.js", false)
+        .unwrap();
+
+    let error = manager.delete_user_script("builtin:demo.js").unwrap_err();
+    assert!(error.to_string().contains("only user scripts"));
+    manager.delete_user_script("user:market-demo.js").unwrap();
+
+    assert!(!user_dir.join("market-demo.js").exists());
+    assert!(
+        manager.inventory().unwrap()["scripts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|script| script["market_id"] != "demo")
+    );
+    let saved = serde_json::from_str::<Value>(
+        &std::fs::read_to_string(temp.path().join("user_scripts.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(saved.get("market").is_none());
+    assert_eq!(saved["scripts"], json!({}));
+}
+
+#[tokio::test]
+async fn core_runtime_reload_evaluates_enabled_user_bundle_and_status_is_ok() {
+    let temp = tempfile::tempdir().unwrap();
+    let builtin_dir = temp.path().join("builtin");
+    std::fs::create_dir_all(&builtin_dir).unwrap();
+    std::fs::write(builtin_dir.join("demo.js"), "window.demo = true;").unwrap();
+    let manager = UserScriptManager::new(
+        builtin_dir,
+        temp.path().join("user"),
+        temp.path().join("user_scripts.json"),
+    );
+    let evaluated = Arc::new(Mutex::new(Vec::<String>::new()));
+    let runtime = CoreRuntimeService::new(9229, StatusStore::default())
+        .with_user_scripts(manager)
+        .with_user_script_evaluator({
+            let evaluated = evaluated.clone();
+            Arc::new(move |websocket_url, script| {
+                evaluated
+                    .lock()
+                    .unwrap()
+                    .push(format!("{websocket_url}:{script}"));
+                Ok(json!({"status": "ok"}))
+            })
+        })
+        .with_websocket_url("ws://page");
+    let ctx = BridgeContext::core_with_data(Arc::new(runtime), Arc::new(FakeData::default()));
+
+    let status = handle_bridge_request(ctx.clone(), "/backend/status", json!({})).await;
+    let repaired = handle_bridge_request(ctx.clone(), "/backend/repair", json!({})).await;
+    let reloaded = handle_bridge_request(ctx, "/user-scripts/reload", json!({})).await;
+
+    assert_eq!(
+        status,
+        json!({"status": "ok", "message": "后端已连接", "version": codex_elves_core::version::VERSION})
+    );
+    assert_eq!(
+        repaired,
+        json!({"status": "ok", "message": "后端已连接", "version": codex_elves_core::version::VERSION})
+    );
+    assert_eq!(reloaded["scripts"][0]["key"], "builtin:demo.js");
+    let evaluated = evaluated.lock().unwrap();
+    assert_eq!(evaluated.len(), 1);
+    assert!(evaluated[0].starts_with("ws://page:"));
+    assert!(evaluated[0].contains("window.demo = true;"));
+}
+
+#[tokio::test]
+async fn core_runtime_open_devtools_uses_inspector_url_opener() {
+    let opened = Arc::new(Mutex::new(Vec::<String>::new()));
+    let runtime = CoreRuntimeService::new(9229, StatusStore::default())
+        .with_devtools_opener({
+            let opened = opened.clone();
+            Arc::new(move |url| {
+                opened.lock().unwrap().push(url.to_string());
+                Ok(())
+            })
+        })
+        .with_devtools_target_id("page-1");
+    let ctx = BridgeContext::core_with_data(Arc::new(runtime), Arc::new(FakeData::default()));
+
+    let result = handle_bridge_request(ctx, "/devtools/open", json!({})).await;
+
+    assert_eq!(result["status"], "ok");
+    assert_eq!(result["target_id"], "page-1");
+    assert_eq!(
+        opened.lock().unwrap().as_slice(),
+        ["http://127.0.0.1:9229/devtools/inspector.html?ws=127.0.0.1:9229/devtools/page/page-1"]
+    );
+}
+
+#[tokio::test]
+async fn core_runtime_manager_route_attempts_to_open_manager_binary() {
+    let ctx = BridgeContext::core(Arc::new(CoreRuntimeService::new(
+        9229,
+        StatusStore::default(),
+    )));
+
+    let result = handle_bridge_request(ctx, "/manager/open", json!({})).await;
+
+    assert_ne!(result["message"], "管理工具启动未接入当前运行时");
+}
+
+#[tokio::test]
+async fn bridge_backend_status_writes_diagnostic_log() {
+    let temp = tempfile::tempdir().unwrap();
+    let log_path = temp.path().join("codex-elves.log");
+    let diagnostic_log = DiagnosticLogCapture::new(log_path);
+    let ctx = BridgeContext::core(Arc::new(CoreRuntimeService::new(
+        9229,
+        StatusStore::default(),
+    )));
+
+    let result = handle_bridge_request(ctx, "/backend/status", json!({})).await;
+
+    assert_eq!(result["status"], "ok");
+    let contents = diagnostic_log.read();
+    assert!(contents.contains("bridge.request"));
+    assert!(contents.contains("bridge.backend_status_ok"));
+    assert!(contents.contains("/backend/status"));
+}
+
+#[test]
+fn user_script_manager_tolerates_bad_config_fields_and_updates_atomically() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("user_scripts.json");
+    std::fs::write(
+        &config_path,
+        r#"{"enabled":"not bool","scripts":{"user:a.js":false,"user:b.js":"bad"},"custom":true}"#,
+    )
+    .unwrap();
+    let manager = UserScriptManager::new(
+        temp.path().join("builtin"),
+        temp.path().join("user"),
+        config_path.clone(),
+    );
+
+    assert_eq!(manager.load_config().enabled, true);
+    assert_eq!(manager.load_config().scripts.get("user:a.js"), Some(&false));
+    assert!(!manager.load_config().scripts.contains_key("user:b.js"));
+
+    manager.set_script_enabled("user:c.js", false).unwrap();
+    let saved = serde_json::from_str::<Value>(&std::fs::read_to_string(config_path).unwrap())
+        .expect("config should remain valid JSON");
+
+    assert_eq!(saved["enabled"], true);
+    assert_eq!(saved["scripts"]["user:a.js"], false);
+    assert_eq!(saved["scripts"]["user:c.js"], false);
+}
+
+#[test]
+fn script_market_manifest_filters_invalid_entries() {
+    let raw = serde_json::json!({
+        "version": 1,
+        "updated_at": "2026-05-21T00:00:00Z",
+        "scripts": [
+            {
+                "id": "demo",
+                "name": "Demo",
+                "description": "Useful demo",
+                "version": "1.0.0",
+                "author": "BigPizzaV3",
+                "tags": ["ui", 42],
+                "homepage": "https://example.com/demo",
+                "script_url": "https://example.com/demo.js",
+                "sha256": ""
+            },
+            { "id": "", "name": "Bad", "version": "1", "script_url": "https://example.com/bad.js" },
+            { "id": "missing-url", "name": "Bad", "version": "1" }
+        ]
+    });
+
+    let manifest = codex_elves_core::script_market::parse_market_manifest(raw).unwrap();
+
+    assert_eq!(manifest.version, 1);
+    assert_eq!(manifest.updated_at.as_deref(), Some("2026-05-21T00:00:00Z"));
+    assert_eq!(manifest.scripts.len(), 1);
+    assert_eq!(manifest.scripts[0].id, "demo");
+    assert_eq!(manifest.scripts[0].tags, vec!["ui"]);
+}
+
+#[test]
+fn user_script_inventory_includes_market_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let user_dir = temp.path().join("user");
+    std::fs::create_dir_all(&user_dir).unwrap();
+    std::fs::write(user_dir.join("market-demo.js"), "window.demo = true;").unwrap();
+    let manager = UserScriptManager::new(
+        temp.path().join("builtin"),
+        user_dir,
+        temp.path().join("user_scripts.json"),
+    );
+
+    manager
+        .record_market_install(&codex_elves_core::script_market::MarketScript {
+            id: "demo".to_string(),
+            name: "Demo".to_string(),
+            description: "Useful demo".to_string(),
+            version: "1.0.0".to_string(),
+            author: "BigPizzaV3".to_string(),
+            tags: vec!["ui".to_string()],
+            homepage: "https://example.com/demo".to_string(),
+            script_url: "https://example.com/demo.js".to_string(),
+            sha256: String::new(),
+        })
+        .unwrap();
+
+    let inventory = manager.inventory().unwrap();
+
+    assert_eq!(inventory["scripts"][0]["key"], "user:market-demo.js");
+    assert_eq!(inventory["scripts"][0]["market_id"], "demo");
+    assert_eq!(inventory["scripts"][0]["version"], "1.0.0");
+    assert_eq!(inventory["scripts"][0]["installed"], true);
+    assert_eq!(
+        inventory["scripts"][0]["source_url"],
+        "https://example.com/demo.js"
+    );
+    assert_eq!(
+        inventory["scripts"][0]["homepage"],
+        "https://example.com/demo"
+    );
+}
+
+#[test]
+fn built_in_prompt_optimization_suppresses_the_legacy_market_script_without_deleting_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let user_dir = temp.path().join("user");
+    std::fs::create_dir_all(&user_dir).unwrap();
+    let script_path = user_dir.join("market-prompt-optimize.js");
+    std::fs::write(&script_path, "window.legacyPromptOptimizeLoaded = true;").unwrap();
+    let manager = UserScriptManager::new(
+        temp.path().join("builtin"),
+        user_dir,
+        temp.path().join("user_scripts.json"),
+    );
+    manager
+        .record_market_install(&codex_elves_core::script_market::MarketScript {
+            id: "prompt-optimize".to_string(),
+            name: "Prompt optimize".to_string(),
+            description: String::new(),
+            version: "1.0.3".to_string(),
+            author: String::new(),
+            tags: vec!["prompt".to_string()],
+            homepage: "https://example.com/prompt-optimize".to_string(),
+            script_url: "https://example.com/prompt-optimize.js".to_string(),
+            sha256: String::new(),
+        })
+        .unwrap();
+
+    let inventory = manager.inventory().unwrap();
+    let bundle = manager.build_enabled_bundle().unwrap();
+
+    assert_eq!(inventory["scripts"][0]["status"], "built_in");
+    assert_eq!(
+        inventory["scripts"][0]["superseded_by_builtin"],
+        json!(true)
+    );
+    assert!(!bundle.contains("legacyPromptOptimizeLoaded"));
+    assert!(
+        script_path.exists(),
+        "the compatibility guard must not delete user files"
+    );
+}
+
+#[test]
+fn install_market_script_writes_file_and_records_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let manager = UserScriptManager::new(
+        temp.path().join("builtin"),
+        temp.path().join("user"),
+        temp.path().join("user_scripts.json"),
+    );
+    let script = codex_elves_core::script_market::MarketScript {
+        id: "demo".to_string(),
+        name: "Demo".to_string(),
+        description: String::new(),
+        version: "1.0.0".to_string(),
+        author: String::new(),
+        tags: Vec::new(),
+        homepage: "https://example.com/demo".to_string(),
+        script_url: "https://example.com/demo.js".to_string(),
+        sha256: String::new(),
+    };
+
+    codex_elves_core::script_market::install_market_script_content(
+        &manager,
+        &script,
+        b"window.demo = true;",
+    )
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("user").join("market-demo.js")).unwrap(),
+        "window.demo = true;"
+    );
+    let inventory = manager.inventory().unwrap();
+    assert_eq!(inventory["scripts"][0]["market_id"], "demo");
+}
+
+#[test]
+fn install_market_script_ignores_checksum_mismatch_and_replaces_existing_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let user_dir = temp.path().join("user");
+    std::fs::create_dir_all(&user_dir).unwrap();
+    std::fs::write(user_dir.join("market-demo.js"), "old").unwrap();
+    let manager = UserScriptManager::new(
+        temp.path().join("builtin"),
+        user_dir.clone(),
+        temp.path().join("user_scripts.json"),
+    );
+    let script = codex_elves_core::script_market::MarketScript {
+        id: "demo".to_string(),
+        name: "Demo".to_string(),
+        description: String::new(),
+        version: "1.0.0".to_string(),
+        author: String::new(),
+        tags: Vec::new(),
+        homepage: String::new(),
+        script_url: "https://example.com/demo.js".to_string(),
+        sha256: "0000".to_string(),
+    };
+
+    codex_elves_core::script_market::install_market_script_content(&manager, &script, b"new")
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(user_dir.join("market-demo.js")).unwrap(),
+        "new"
+    );
+}
+
+#[tokio::test]
+async fn launch_lifecycle_uses_hook_supplied_bridge_context_for_injection() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex.app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    let hooks = ContextHooks {
+        events: events.clone(),
+    };
+
+    launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(app_dir),
+            debug_port: 9229,
+            helper_port: 45221,
+            status_store: StatusStore::new(temp.path().join("latest-status.json")),
+        },
+        &hooks,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            "bridge-context:9229",
+            "inject-bridge:9229:45221",
+            "watchdog:9229:45221",
+            "status:running",
+        ]
+    );
+}
+
+fn test_context() -> BridgeContext {
+    BridgeContext::new(
+        Arc::new(FakeSettings::default()),
+        Arc::new(FakeRuntime::default()),
+        Arc::new(FakeData::default()),
+    )
+}
+
+#[derive(Default)]
+struct FakeSettings {
+    settings: Mutex<BackendSettings>,
+    codex_app_version: Mutex<String>,
+}
+
+impl FakeSettings {
+    fn with_codex_app_version(version: &str) -> Self {
+        Self {
+            settings: Mutex::new(BackendSettings::default()),
+            codex_app_version: Mutex::new(version.to_string()),
+        }
+    }
+}
+
+#[async_trait]
+impl BridgeSettingsService for FakeSettings {
+    async fn get_settings(&self) -> anyhow::Result<BackendSettings> {
+        Ok(self.settings.lock().unwrap().clone())
+    }
+
+    async fn set_settings(&self, payload: Value) -> anyhow::Result<BackendSettings> {
+        let current = self.settings.lock().unwrap().clone();
+        let mut raw = serde_json::to_value(current).unwrap();
+        let raw = raw.as_object_mut().unwrap();
+        if let Some(value) = payload.get("providerSyncEnabled").and_then(Value::as_bool) {
+            raw.insert("providerSyncEnabled".to_string(), json!(value));
+        }
+        if let Some(value) = payload.get("enhancementsEnabled").and_then(Value::as_bool) {
+            raw.insert("enhancementsEnabled".to_string(), json!(value));
+        }
+        for key in [
+            "codexAppPluginEntryUnlock",
+            "codexAppPluginMarketplaceUnlock",
+            "codexAppSessionDelete",
+            "codexAppMarkdownExport",
+            "codexAppProjectMove",
+            "codexAppConversationView",
+            "codexAppTokenUsage",
+            "codexAppWorkspaceCheckpoint",
+            "codexAppUpstreamWorktreeCreate",
+            "codexAppNativeMenuPlacement",
+            "codexAppNativeFastUnlock",
+        ] {
+            if let Some(value) = payload.get(key).and_then(Value::as_bool) {
+                raw.insert(key.to_string(), json!(value));
+            }
+        }
+        if let Some(value) = payload.get("launchMode").and_then(Value::as_str) {
+            raw.insert("launchMode".to_string(), json!(value));
+        }
+        if let Some(value) = payload.get("relayBaseUrl").and_then(Value::as_str) {
+            raw.insert("relayBaseUrl".to_string(), json!(value));
+        }
+        if let Some(value) = payload.get("relayApiKey").and_then(Value::as_str) {
+            raw.insert("relayApiKey".to_string(), json!(value));
+        }
+        if let Some(value) = payload.get("cliWrapperApiKeyEnv").and_then(Value::as_str) {
+            raw.insert(
+                "cliWrapperApiKeyEnv".to_string(),
+                json!(if value.is_empty() {
+                    "CUSTOM_OPENAI_API_KEY"
+                } else {
+                    value
+                }),
+            );
+        }
+        if let Some(value) = payload
+            .get("codexAppWorkspaceCheckpointStoragePath")
+            .and_then(Value::as_str)
+        {
+            raw.insert(
+                "codexAppWorkspaceCheckpointStoragePath".to_string(),
+                json!(value),
+            );
+        }
+        if let Some(value) = payload
+            .get("codexAppWorkspaceCheckpointRetentionRounds")
+            .and_then(Value::as_u64)
+        {
+            raw.insert(
+                "codexAppWorkspaceCheckpointRetentionRounds".to_string(),
+                json!(value),
+            );
+        }
+        let updated: BackendSettings = serde_json::from_value(Value::Object(raw.clone())).unwrap();
+        *self.settings.lock().unwrap() = updated.clone();
+        Ok(updated)
+    }
+
+    async fn codex_app_version(&self) -> anyhow::Result<String> {
+        Ok(self.codex_app_version.lock().unwrap().clone())
+    }
+}
+
+struct FakeRuntime {
+    enabled: Mutex<bool>,
+    script_enabled: Mutex<bool>,
+}
+
+impl Default for FakeRuntime {
+    fn default() -> Self {
+        Self {
+            enabled: Mutex::new(true),
+            script_enabled: Mutex::new(true),
+        }
+    }
+}
+
+#[async_trait]
+impl BridgeRuntimeService for FakeRuntime {
+    async fn user_script_inventory(&self) -> anyhow::Result<Value> {
+        Ok(self.inventory(false))
+    }
+
+    async fn set_user_scripts_enabled(&self, enabled: bool) -> anyhow::Result<Value> {
+        *self.enabled.lock().unwrap() = enabled;
+        Ok(self.inventory(false))
+    }
+
+    async fn set_user_script_enabled(&self, key: String, enabled: bool) -> anyhow::Result<Value> {
+        assert_eq!(key, "user:a.js");
+        *self.script_enabled.lock().unwrap() = enabled;
+        Ok(self.inventory(false))
+    }
+
+    async fn delete_user_script(&self, key: String) -> anyhow::Result<Value> {
+        assert_eq!(key, "user:a.js");
+        *self.script_enabled.lock().unwrap() = false;
+        Ok(self.inventory(false))
+    }
+
+    async fn reload_user_scripts(&self) -> anyhow::Result<Value> {
+        Ok(self.inventory(true))
+    }
+
+    async fn open_devtools(&self) -> anyhow::Result<Value> {
+        Ok(json!({"status": "ok", "opened": true}))
+    }
+
+    async fn open_manager(&self) -> anyhow::Result<Value> {
+        Ok(json!({"status": "ok", "opened": "manager"}))
+    }
+
+    async fn backend_status(&self) -> anyhow::Result<Value> {
+        Ok(
+            json!({"status": "ok", "message": "后端已连接", "version": codex_elves_core::version::VERSION}),
+        )
+    }
+
+    async fn repair_backend(&self) -> anyhow::Result<Value> {
+        Ok(
+            json!({"status": "ok", "message": "后端已修复", "version": codex_elves_core::version::VERSION}),
+        )
+    }
+
+    async fn install_renderer_features(&self) -> anyhow::Result<Value> {
+        Ok(json!({"status": "ok", "build": codex_elves_core::assets::DIAGNOSTIC_BUILD_ID}))
+    }
+
+    async fn codex_model_catalog(&self) -> anyhow::Result<Value> {
+        Ok(json!({
+            "status": "ok",
+            "model": "qwen3-coder",
+            "default_model": "qwen3-coder",
+            "model_provider": "relay",
+            "provider_name": "Relay",
+            "models": ["qwen3-coder"],
+            "sources": []
+        }))
+    }
+
+    async fn upstream_worktree_status(&self) -> anyhow::Result<Value> {
+        Ok(json!({"status": "ok", "feature": "upstream-worktree"}))
+    }
+
+    async fn upstream_worktree_defaults(&self, payload: Value) -> anyhow::Result<Value> {
+        assert_eq!(payload["repoPath"], json!("/repo"));
+        Ok(json!({
+            "status": "ok",
+            "repoRoot": "/repo",
+            "defaultRemote": "upstream",
+            "defaultBaseBranch": "main",
+        }))
+    }
+
+    async fn upstream_worktree_prepare(&self, payload: Value) -> anyhow::Result<Value> {
+        assert_eq!(payload["repoPath"], json!("/repo"));
+        assert_eq!(payload["remote"], json!("upstream"));
+        assert_eq!(payload["baseBranch"], json!("main"));
+        Ok(json!({
+            "status": "ok",
+            "repoRoot": "/repo",
+            "sourceRef": "upstream/main",
+            "qualifiedSourceRef": "refs/remotes/upstream/main",
+        }))
+    }
+
+    async fn upstream_worktree_create(&self, payload: Value) -> anyhow::Result<Value> {
+        assert_eq!(payload["repoPath"], json!("/repo"));
+        assert_eq!(payload["branchName"], json!("feature/demo"));
+        Ok(json!({
+            "status": "ok",
+            "repoRoot": "/repo",
+            "branchName": "feature/demo",
+            "worktreePath": "/repo-feature-demo",
+        }))
+    }
+}
+
+impl FakeRuntime {
+    fn inventory(&self, reloaded: bool) -> Value {
+        json!({
+            "enabled": *self.enabled.lock().unwrap(),
+            "reloaded": reloaded,
+            "scripts": [
+                {"key": "builtin:demo.js", "name": "demo.js", "enabled": true},
+                {"key": "user:a.js", "name": "a.js", "enabled": *self.script_enabled.lock().unwrap()}
+            ]
+        })
+    }
+}
+
+struct FakeData;
+
+impl Default for FakeData {
+    fn default() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl BridgeDataService for FakeData {
+    async fn delete(&self, session: SessionRef) -> anyhow::Result<DeleteResult> {
+        Ok(DeleteResult {
+            status: DeleteStatus::LocalDeleted,
+            session_id: session.session_id.clone(),
+            message: format!("deleted {}", session.title),
+        })
+    }
+
+    async fn export_markdown(&self, session: SessionRef) -> anyhow::Result<ExportResult> {
+        Ok(ExportResult {
+            status: ExportStatus::Exported,
+            session_id: session.session_id,
+            message: "exported".to_string(),
+            filename: Some("First.md".to_string()),
+            markdown: Some("# First\n".to_string()),
+        })
+    }
+
+    async fn thread_usage_history(&self, session: SessionRef) -> anyhow::Result<Value> {
+        Ok(json!({
+            "status": "ok",
+            "session_id": session.session_id,
+            "history": [
+                {
+                    "source": "rollout-history",
+                    "conversation_id": "local:s1",
+                    "turn_id": "turn-1",
+                    "observed_at": "2026-06-02T05:00:00Z",
+                    "usage": {
+                        "inputTokens": 1200,
+                        "outputTokens": 120,
+                        "totalTokens": 1320,
+                        "cachedTokens": 900,
+                        "cacheReadTokens": 0,
+                        "cacheCreationTokens": 0,
+                        "contextUsed": 1320,
+                        "contextLimit": 258400,
+                        "hasBreakdown": true
+                    }
+                }
+            ]
+        }))
+    }
+
+    async fn thread_usage_summary(&self, session: SessionRef) -> anyhow::Result<Value> {
+        Ok(json!({
+            "status": "ok",
+            "session_id": session.session_id,
+            "summary": {
+                "totalUsage": {
+                    "inputTokens": 1200,
+                    "outputTokens": 120,
+                    "totalTokens": 1320
+                }
+            }
+        }))
+    }
+
+    async fn find_archived_thread_by_title(
+        &self,
+        title: String,
+    ) -> anyhow::Result<Option<SessionRef>> {
+        Ok(Some(SessionRef {
+            session_id: "archived-1".to_string(),
+            title,
+        }))
+    }
+
+    async fn move_thread_workspace(
+        &self,
+        session: SessionRef,
+        target_cwd: String,
+    ) -> anyhow::Result<Value> {
+        Ok(json!({"status": "moved", "session_id": session.session_id, "target_cwd": target_cwd}))
+    }
+
+    async fn thread_sort_key(&self, session: SessionRef) -> anyhow::Result<Value> {
+        Ok(json!({"status": "ok", "session_id": session.session_id, "updated_at": 123}))
+    }
+
+    async fn thread_sort_keys(&self, sessions: Vec<SessionRef>) -> anyhow::Result<Value> {
+        Ok(json!({
+            "status": "ok",
+            "sort_keys": sessions
+                .into_iter()
+                .map(|session| json!({"session_id": session.session_id}))
+                .collect::<Vec<_>>()
+        }))
+    }
+
+    async fn workspace_checkpoint_session_context(
+        &self,
+        session: SessionRef,
+    ) -> anyhow::Result<Value> {
+        Ok(json!({
+            "status": "ok",
+            "session_id": session.session_id,
+            "cwd": "C:/workspace/exact",
+            "host_id": "local"
+        }))
+    }
+}
+
+#[derive(Clone)]
+struct ContextHooks {
+    events: Arc<Mutex<Vec<String>>>,
+}
+
+impl ContextHooks {
+    fn event(&self, event: impl Into<String>) {
+        self.events.lock().unwrap().push(event.into());
+    }
+}
+
+#[async_trait(?Send)]
+impl LaunchHooks for ContextHooks {
+    fn resolve_app_dir(
+        &self,
+        app_dir: Option<&std::path::Path>,
+        _settings: &BackendSettings,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        app_dir
+            .map(std::path::Path::to_path_buf)
+            .ok_or_else(|| anyhow::anyhow!("missing app dir"))
+    }
+
+    fn select_debug_port(&self, requested: u16) -> u16 {
+        requested
+    }
+
+    fn select_helper_port(&self, requested: u16) -> u16 {
+        requested
+    }
+
+    async fn load_settings(&self) -> anyhow::Result<BackendSettings> {
+        Ok(BackendSettings::default())
+    }
+
+    async fn run_provider_sync(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn start_helper(&self, _helper_port: u16) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn launch_codex(
+        &self,
+        _app_dir: &std::path::Path,
+        _debug_port: u16,
+        _extra_args: &[String],
+    ) -> anyhow::Result<CodexLaunch> {
+        Ok(CodexLaunch::Process {
+            command: vec!["codex".to_string()],
+            wait_strategy: ProcessWaitStrategy::TrackedChild,
+            macos_cleanup_policy: None,
+        })
+    }
+
+    async fn bridge_context(
+        &self,
+        debug_port: u16,
+        _app_dir: &std::path::Path,
+    ) -> anyhow::Result<Option<BridgeContext>> {
+        self.event(format!("bridge-context:{debug_port}"));
+        Ok(Some(test_context()))
+    }
+
+    async fn inject(&self, _debug_port: u16, _helper_port: u16) -> anyhow::Result<()> {
+        anyhow::bail!("legacy inject should not run when bridge context is supplied")
+    }
+
+    async fn inject_bridge(
+        &self,
+        debug_port: u16,
+        helper_port: u16,
+        _ctx: BridgeContext,
+    ) -> anyhow::Result<()> {
+        self.event(format!("inject-bridge:{debug_port}:{helper_port}"));
+        Ok(())
+    }
+
+    async fn start_bridge_watchdog(&self, debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
+        self.event(format!("watchdog:{debug_port}:{helper_port}"));
+        Ok(())
+    }
+
+    async fn write_status(&self, status: &str) {
+        self.event(format!("status:{status}"));
+    }
+
+    async fn wait_for_codex_exit(&self, _launch: &CodexLaunch) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn shutdown_helper(&self, _helper_port: u16) {}
+
+    async fn terminate_codex(&self, _launch: &CodexLaunch) {}
+}

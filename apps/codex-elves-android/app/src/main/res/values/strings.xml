@@ -1,0 +1,20 @@
+<resources>
+    <string name="app_name">CodexElves</string>
+    <string name="login_description">输入访问密钥，继续使用你的 Codex 会话。</string>
+    <string name="login_origin_label">服务链接</string>
+    <string name="login_origin_hint">https://域名 或 http://服务器地址:端口</string>
+    <string name="login_key_label">访问密钥</string>
+    <string name="login_key_hint">粘贴或输入访问密钥</string>
+    <string name="login_show_key">显示密钥</string>
+    <string name="login_hide_key">隐藏密钥</string>
+    <string name="login_connect">连接</string>
+    <string name="login_connecting">连接中…</string>
+    <string name="login_help_title">在哪里获取访问密钥？</string>
+    <string name="login_help_expand">在哪里获取访问密钥？展开说明</string>
+    <string name="login_help_collapse">在哪里获取访问密钥？收起说明</string>
+    <string name="login_help_body">服务链接支持 HTTP 或 HTTPS。使用 frp 时，请复制管理器中已应用为主链路的固定公网地址，并保留端口。\n\n访问密钥由本机 CodexElves 管理器的「远程会话」页面设置，请使用设置时保存的密钥。它不是 OpenAI API Key。</string>
+    <string name="login_footer">密钥勿外传</string>
+    <string name="diagnostics_export">导出诊断日志</string>
+    <string name="diagnostics_share_title">分享诊断日志</string>
+    <string name="diagnostics_export_failed">诊断日志导出失败，请稍后重试</string>
+</resources>
