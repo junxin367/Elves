@@ -136,10 +136,10 @@ export function shell() {
   setWorkspaceOpenIn(mountWorkspaceOpenIn({ anchor: $("#open-session-tools"),
     beforeOpen: () => { sessionMenu?.close(); closeComposerMenus(); } }));
   $("#related-session-back").onclick = () => void returnToParentSession().catch(error => notice(error.message, true));
-  // 用户要求恢复原来的彩色 ✨；显式请求 Emoji 呈现，优化完成后仍切换为绿色 sparkles 表示可恢复原文。
+  // 用户要求提示词优化始终使用同一个彩色 ✨，完成后也不切换单色图标；再次点击恢复原文的行为保持不变。
   const optimizeEmoji = element("span", "prompt-optimize-emoji", "\u2728\uFE0F");
   optimizeEmoji.setAttribute("aria-hidden", "true");
-  $("#prompt-optimize").replaceChildren(optimizeEmoji, icon("sparkles"));
+  $("#prompt-optimize").replaceChildren(optimizeEmoji);
   $("#prompt-optimize").onclick = () => void activatePromptOptimization();
   $("#fast-button").onclick = () => void toggleRemoteFast();
   $("#prompt-optimize").oncontextmenu = event => {

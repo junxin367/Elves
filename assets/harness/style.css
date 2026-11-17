@@ -284,14 +284,11 @@ html{scrollbar-color:var(--muted) transparent}
 @media(hover:hover) and (pointer:fine){.composer-toolbar .permission-button:hover:not(:disabled){background:var(--composer-hover,var(--hover))}}
 .context-info{position:relative;display:flex;align-items:center;justify-content:center;flex:0 0 28px;width:28px;height:28px;min-width:0;padding:0;border:0;border-radius:6px;font-size:calc(var(--font-size)*.78);white-space:nowrap}
 .context-info[aria-expanded=true]{color:var(--text)}
-/* 用户要求恢复提示词优化原有彩色 ✨：普通和加载状态使用彩色 Emoji 字体，完成后切换绿色矢量图标。 */
+/* 用户要求提示词优化在普通、加载和完成状态均固定显示彩色 ✨；完成态仅保留淡绿色背景，不替换或隐藏图标。 */
 .prompt-optimize-button{display:grid;place-items:center;flex:0 0 24px;width:24px;height:28px;padding:0;border-radius:6px;color:var(--text)}
 .prompt-optimize-emoji{font-family:"Segoe UI Emoji","Apple Color Emoji","Noto Color Emoji",sans-serif;font-size:16px;line-height:1}
-.prompt-optimize-button>.ui-icon{display:none;width:16px;height:16px}
 .prompt-optimize-button[data-state=loading]{animation:pulse 1s ease-in-out infinite}
-.prompt-optimize-button[data-state=optimized]{background:color-mix(in srgb,var(--green) 14%,transparent);color:var(--green)}
-.prompt-optimize-button[data-state=optimized]>.prompt-optimize-emoji{display:none}
-.prompt-optimize-button[data-state=optimized]>.ui-icon{display:block}
+.prompt-optimize-button[data-state=optimized]{background:color-mix(in srgb,var(--green) 14%,transparent)}
 /* 用户要求 PC 右键弹窗参考 Codex 注入版：600px、最大 760px、双列设置；输入控件沿用会话编辑区派生背景。 */
 .prompt-optimization-settings{width:min(600px,calc(100vw - 40px));max-height:min(760px,calc(100dvh - 40px));padding:0;border:1px solid var(--line);border-radius:18px;background:var(--bg);color:var(--text);box-shadow:0 24px 80px #0005;overflow:hidden}
 .prompt-optimization-settings[open]{display:flex;flex-direction:column}

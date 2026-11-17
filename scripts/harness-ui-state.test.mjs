@@ -15750,14 +15750,24 @@ test("普通输入、换行、粘贴和输入法允许跟随末尾，撤销重�
   }
 });
 
-test("编辑区加号保持正常前景色和交互背景，提示词优化保留彩色与绿色完成图标", async () => {
+test("编辑区加号保持正常前景色和交互背景，提示词优化始终使用同一个彩色图标", async () => {
   const css = await readFile(new URL("../assets/harness/style.css", import.meta.url), "utf8");
   assert.match(css, /\.composer-add-button\{[^}]*color:var\(--text\)/);
   assert.match(css, /\.prompt-optimize-button\{[^}]*color:var\(--text\)/);
   assert.ok(css.includes(".composer-toolbar .composer-add-button:is(:focus-visible,:active,[aria-expanded=true]){background:var(--composer-hover,var(--hover))}"));
   assert.ok(css.includes(".composer-toolbar .composer-add-button:hover:not(:disabled){background:var(--composer-hover,var(--hover))}"));
   assert.match(css, /\.composer-add-button:active:not\(:disabled\)\{opacity:1\}/);
-  assert.ok(app.includes('$("#prompt-optimize").replaceChildren(optimizeEmoji, icon("sparkles"))'));
+  const control = { replaceChildren(...children) { this.children = children; } };
+  const context = rawVm.createContext({
+    $: () => control,
+    element: (tag, className, textContent) => ({ tag, className, textContent, setAttribute() {} }),
+  });
+  rawVm.runInContext(sourceSection("  const optimizeEmoji =", '  $("#prompt-optimize").onclick'), context);
+  assert.equal(control.children.length, 1, "工具栏只创建彩色图标，不保留完成态单色替代图标");
+  assert.equal(control.children[0].className, "prompt-optimize-emoji");
+  assert.equal(control.children[0].textContent, "\u2728\uFE0F");
+  assert.doesNotMatch(css, /\.prompt-optimize-button\[data-state=optimized\][^{]*\{[^}]*display\s*:\s*none/);
+  assert.match(css, /\.prompt-optimize-emoji\{[^}]*font-family:"Segoe UI Emoji","Apple Color Emoji","Noto Color Emoji"/);
 });
 
 function claudeSlashMenuHarness() {
