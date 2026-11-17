@@ -311,15 +311,28 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     const card = section(content, `所选实例的 ${sections[name]}`);
     for (const value of rows) {
       const row = element("div", "appearance-field");
+      const codexMcp = name === "mcp" && record.backend === "codex";
       const inherited = value.enabled == null && (value.canToggle === true || Object.hasOwn(value, "enabled"));
+      // 用户要求 Codex MCP 读取后显示开/关；原生缺省值只用于展示，不能在读取时写成显式配置或当作连接状态。
+      const enabled = codexMcp && inherited ? value.defaultEnabled : value.enabled;
+      const state = typeof enabled === "boolean" ? enabled ? "已开启" : "已关闭" : "使用原生默认";
       const description = [value.description || value.transport,
-        inherited && value.canToggle === true ? "使用原生默认；切换后保存所选状态。" : ""].filter(Boolean).join(" · ");
+        inherited && value.canToggle === true
+          ? `使用原生默认${codexMcp && typeof enabled === "boolean" ? `（${state}）` : ""}；切换后保存所选状态。` : ""]
+        .filter(Boolean).join(" · ");
       row.append(fieldCopy(value.name || value.id || value.path, description));
       if (value.canToggle === true) {
-        const control = switchControl(value.name || value.id, value.enabled);
-        control.onchange = () => void save({ [name === "skills" ? "skill" : "server"]:
-          { id: value.id, enabled: control.checked } });
-        controls.add(control); row.append(control);
+        const control = switchControl(value.name || value.id, enabled);
+        const owner = record, ownerId = selected;
+        control.onchange = () => {
+          if (record === owner && selected === ownerId && control.isConnected)
+            void save({ [name === "skills" ? "skill" : "server"]: { id: value.id, enabled: control.checked } });
+        };
+        controls.add(control);
+        if (codexMcp) {
+          const group = element("span", "instance-mcp-toggle-state");
+          group.append(element("span", "muted", state), control); row.append(group);
+        } else row.append(control);
       } else if (typeof value.enabled === "boolean") {
         row.append(element("span", "muted", value.enabled ? "已开启" : "已关闭"));
       } else if (inherited) {
@@ -502,7 +515,8 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
         || result.inventory.data.some(row => !row || typeof row !== "object"
           || typeof (row.name || row.id || row.path) !== "string"
           || row.canToggle === true && typeof row.id !== "string"
-          || row.enabled != null && typeof row.enabled !== "boolean")
+          || row.enabled != null && typeof row.enabled !== "boolean"
+          || row.defaultEnabled != null && typeof row.defaultEnabled !== "boolean")
         || name === "hooks" && (!Object.hasOwn(result.inventory, "enabled")
           || result.inventory.enabled !== null && typeof result.inventory.enabled !== "boolean"))) {
       throw new Error("实例扩展列表字段不完整，请重新读取。");

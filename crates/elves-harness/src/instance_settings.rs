@@ -608,6 +608,8 @@ fn extension_view(section: &str, backend: &str, document: &Value) -> Result<Valu
                 .map(|(name, value)| {
                     json!({
                         "id":name,"name":name,"enabled":value["enabled"],"canToggle":true,
+                        // 用户要求 MCP 读取后明确显示开关：原生 CLI 未配置 enabled 时默认开启，原值仍保留空值以说明继承来源。
+                        "defaultEnabled":true,
                         "transport":if value["command"].is_string() {"stdio"} else if value["url"].is_string() {"http"} else {"未指定连接方式"}
                     })
                 })

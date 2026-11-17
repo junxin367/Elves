@@ -1814,6 +1814,8 @@ body{font-weight:var(--ui-font-weight,400)}
 .instance-settings-content .appearance-section{margin-bottom:14px}
 .instance-settings-content .appearance-section:not(:first-child){margin-top:26px}
 .instance-settings-content .appearance-notification-switch:indeterminate::after{transform:translateX(6px);opacity:.5}
+/* 用户要求 Codex MCP 明确显示开关状态；文字与开关同组，手机端也保持同排，长服务名沿用左侧说明换行。 */
+.instance-mcp-toggle-state{display:inline-flex;align-items:center;flex-shrink:0;gap:.5em;white-space:nowrap}
 .instance-settings-status:empty{display:none}
 .instance-settings-actions{justify-content:flex-end;margin-top:12px}
 /* 用户要求 Codex、Claude 默认模型在前、思考深度在后并保持两个 Select 同排。
