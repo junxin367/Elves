@@ -1198,6 +1198,13 @@ impl HarnessController {
         }
         match action {
             "localBootstrap" | "desktopBootstrap" => self.desktop_bootstrap(),
+            "addProjectFolder" => {
+                // 仅供带本机私有管理令牌的原生菜单调用；不开放接受任意路径的远程写入口。
+                let path = payload["path"].as_str().context("缺少所选文件夹")?;
+                let project = self.harness.add_local_folder(path).await?;
+                self.publish_event(json!({"method":"remote/sidebarChanged"}));
+                Ok(json!({"ok":true,"project":project}))
+            }
             "saveFrp" | "testPrimaryRoute" | "applyPrimaryRoute" => {
                 self.primary_command(action, payload).await
             }
@@ -1886,10 +1893,31 @@ impl HarnessController {
             object.remove("enabledInstanceIds");
             object.remove("backend");
         }
-        let mut result = self
+        // 实例显示开关不改变既有项目发现；仅在 Codex 未启用且目录确实不可用时保留 Harness 自有项目。
+        let mut result = match self
             .call_codex_backend(action, payload, authorization)
-            .await?;
+            .await
+        {
+            Ok(value) => value,
+            Err(failure)
+                if action == "sidebar"
+                    && enabled_instances
+                        .as_ref()
+                        .is_some_and(|ids| !ids.iter().any(|id| id == "codex:local")) =>
+            {
+                let mut value = self.harness.folder_sidebar().await;
+                value["projectPreferencesWarning"] = json!(format!(
+                    "Codex 项目目录暂不可用：{failure}。已保留 Harness 登记及本机已保存的项目。"
+                ));
+                value
+            }
+            Err(failure) => return Err(failure),
+        };
         instances::annotate_codex(&mut result);
+        if action == "sidebar" {
+            let projects = result["projects"].as_array().cloned().unwrap_or_default();
+            result["projects"] = json!(self.harness.merge_local_projects(projects).await);
+        }
         if action == "sidebar"
             && let Some(ids) = &enabled_instances
         {
@@ -1948,6 +1976,13 @@ impl HarnessController {
         payload: Value,
         authorization: &HarnessAuthorization,
     ) -> anyhow::Result<Value> {
+        if action == "workspaceContext"
+            && payload["threadId"].is_null()
+            && let Some(id) = payload["projectId"].as_str()
+            && let Some(context) = self.harness.local_project_context(id).await
+        {
+            return Ok(context);
+        }
         // 用户要求移除远程桌面注入路由：所有 Codex 读写都由服务管理，失败只保留原错误与回执，不换通道重发。
         #[cfg(test)]
         if let Some(bridge) = self.test_backend.get() {

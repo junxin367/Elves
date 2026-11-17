@@ -15,9 +15,12 @@ export function isElvesClient() {
 }
 
 let disposeNavigation = null;
+let chooseNavigation = null;
+export function showConversationPage() { chooseNavigation?.("conversation"); }
 export function disposeMainNavigation() {
   disposeNavigation?.();
   disposeNavigation = null;
+  chooseNavigation = null;
 }
 
 export function mountMainNavigation({ workspace, openSettings, logout, openPage }) {
@@ -95,6 +98,7 @@ export function mountMainNavigation({ workspace, openSettings, logout, openPage 
       openPopup(settings, { edge: event.key === "ArrowUp" ? "last" : "first" });
     };
   }
+  chooseNavigation = choose;
   settingsArea.append(settings);
   navigation.append(pages, settingsArea);
   workspace.before(shell);

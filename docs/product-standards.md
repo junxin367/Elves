@@ -14,7 +14,7 @@
 
 产品统一使用用户提供的 `03-neon-separated.svg`，仓库唯一源文件为 `assets/harness/icons/elves-logo.svg`。网页、启动页及 README 直接使用 SVG；Windows 应用、托盘和安装程序使用多尺寸 ICO，PWA、Apple touch 及 Android 原生资源使用所需尺寸的 PNG。项目及 Codex、Claude 实例图标保留原值。
 
-资源名称须反映实际用途：`elves-app-icon`、`elves-startup-logo`、`elves-pwa-192`、`elves-pwa-512`、`elves-apple-touch-icon`，以及 Android 的 `elves_login_logo`、`elves_launcher_foreground`、`elves_launcher_monochrome`。使用 `npm --prefix apps/elves-management run assets:brand` 从唯一 SVG 源重建派生资源，不手工修改各端副本。
+资源名称须反映实际用途：`elves-app-icon`、`elves-startup-logo`、`elves-about-logo`、`elves-pwa-192`、`elves-pwa-512`、`elves-apple-touch-icon`，以及 Android 的 `elves_login_logo`、`elves_launcher_foreground`、`elves_launcher_monochrome`。使用 `npm --prefix apps/elves-management run assets:brand` 从唯一 SVG 源重建派生资源，不手工修改各端副本。
 
 Android 前景采用 75% 缩放，使原图约 78% 的图案在 108dp 画布内占约 63dp，保留 66dp 安全区域；背景色保持源 SVG 的 `#F6F4FA`，普通、圆形和单色图标共用这一边界。公开 SVG 与其他网页资源使用同一清单、MIME 和摘要校验。
 
@@ -61,6 +61,16 @@ Elves 启动自动准备本机 Harness 并直接进入工作区，不读取远�
 当前已启用供应商打开“启用本地代理”后，代理随 Elves / Harness 自动启动，运行中开关变化也会生效，不依赖远程网页开关。外观仍按客户端独立保存，其他设置由同一 Harness 的各端共用。
 
 主窗口关闭收进托盘，托盘退出安全回收本客户端拥有的后台。升级请求安全退出并清理旧程序和快捷方式；卸载保留设置、历史、密钥、授权及 WebView 数据。架构细节见 [Elves 与 Harness 架构](harness-architecture.md)。
+
+### Elves 原生文件与帮助菜单
+
+Elves 的“文件”“帮助”位于现有 36px 原生顶栏内，不增加第二条菜单栏。窗口控制、DPI 缩放、拖动和网页配色同步保持原有约定。网页、PWA 与 Android 不提供宿主机菜单。
+
+“文件 → 添加文件夹”打开原生单目录选择器。确认后，Harness 保存所选目录的项目定义并通知各客户端刷新；重复选择同一实际目录复用项目，取消不改写项目。主窗口返回会话页并选择该项目的新会话输入区，保留此前会话草稿，不自动发送消息、启动模型任务或写入 Codex App 状态。只使用 Claude 或未启用实例时也可以登记项目；用户发送 Codex 会话时才核对并登记对应原生项目。
+
+项目跳转由原生保存请求 ID，主工作区完成显示后确认；页面尚未加载或读取失败时保留请求。用户后来主动切换会话时取消旧跳转，更换授权后旧异步结果不更新界面。网页命令只能读取和确认已登记的项目 ID，不能传入文件系统路径或打开系统选择器。
+
+“帮助”依次为“打开项目地址”“更新”“关于 Elves”。项目地址在默认浏览器打开当前 Elves 仓库。更新只查询公开正式发行版，分别显示当前与公开版本；发现新版本后先确认下载，校验仓库、文件大小及 SHA-256，再确认退出并启动安装。发行版缺少可校验的 Windows 安装包时，明确提示并允许打开项目发布页。失败显示实际原因并允许重试，不在启动时自动更新。“关于 Elves”使用独立小窗口展示 SVG logo、实际程序版本、项目主页和 MIT 协议。
 
 ### 远程设置分类与实例配置
 

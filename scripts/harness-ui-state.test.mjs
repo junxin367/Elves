@@ -15226,3 +15226,65 @@ test("Claude 压缩与发送消息一样触发所选模型切换，选择未变�
   assert.equal(context.selectedModel, "claude-haiku-5-5");
   assert.deepEqual(notices.at(-1), ["所选模型未在当前 Claude 的可用模型列表中", true]);
 });
+
+async function nativeProjectMenuFixture() {
+  const source = await loadHarnessAppSource();
+  const id = `elves-project-${"a".repeat(64)}`, calls = [], notices = [];
+  let pending = { projectId: id, requestId: "request-a" };
+  const context = {
+    session: { device: { id: "desktop-a" }, readOnly: false }, selectionVersion: 1,
+    sidebar: { projects: [{ id }] }, document: { documentElement: { dataset: {} } },
+    window: { addEventListener() {} },
+    privateInputScope: value => value?.device?.id || null,
+    __ELVES_CLIENT__: { projectNavigation: async acknowledge => {
+      calls.push(acknowledge ? "acknowledge" : "read");
+      if (acknowledge === pending?.requestId) pending = null;
+      return pending;
+    } },
+    loadSidebar: async () => { calls.push("sidebar"); },
+    showConversationPage: () => calls.push("conversation"),
+    showWelcome: () => { calls.push("retain-draft"); context.selectionVersion++; },
+    startNewChat: async project => { calls.push(project); context.selectionVersion++; },
+    notice: message => notices.push(message),
+  };
+  rawVm.createContext(context);
+  rawVm.runInContext(source.moduleText("features/session/native-projects.js"), context);
+  return { context, calls, notices, id, pending: () => pending };
+}
+
+test("原生添加文件夹先刷新并选择项目，再确认请求；不发送消息", async () => {
+  const h = await nativeProjectMenuFixture();
+  await h.context.openPendingNativeProject();
+  assert.deepEqual(h.calls, ["read", "sidebar", "conversation", "retain-draft", h.id, "acknowledge"]);
+  assert.equal(h.pending(), null);
+  assert.deepEqual(h.notices, []);
+});
+
+test("文件夹读取期间用户切换会话取消旧跳转，授权变化保留待处理请求", async () => {
+  for (const changed of ["selection", "authorization"]) {
+    const h = await nativeProjectMenuFixture();
+    let release;
+    const held = new Promise(resolve => { release = resolve; });
+    h.context.loadSidebar = () => held;
+    const pending = h.context.openPendingNativeProject();
+    await new Promise(resolve => setImmediate(resolve));
+    if (changed === "selection") h.context.selectionVersion++;
+    else h.context.session = { device: { id: "desktop-b" }, readOnly: false };
+    release();
+    await pending;
+    assert.ok(!h.calls.includes("conversation"));
+    assert.equal(h.pending() === null, changed === "selection");
+    assert.deepEqual(h.notices, []);
+  }
+});
+
+test("只读及独立会话窗口不消费主窗口菜单选择", async () => {
+  for (const disabled of ["readonly", "session-window"]) {
+    const h = await nativeProjectMenuFixture();
+    if (disabled === "readonly") h.context.session.readOnly = true;
+    else h.context.document.documentElement.dataset.sessionWindow = "true";
+    await h.context.openPendingNativeProject();
+    assert.deepEqual(h.calls, []);
+    assert.ok(h.pending());
+  }
+});

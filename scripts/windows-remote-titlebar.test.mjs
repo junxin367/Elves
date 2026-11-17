@@ -133,14 +133,14 @@ test("外观连续变化合并为最新颜色并串行同步，模式来自实�
   assert.equal(requests.length, 2, "相同颜色不重复发起本机命令");
 });
 
-test("原生应用顶栏不向任何网页授予窗口控制权限，连接设置仍只允许内置连接页", async () => {
+test("原生顶栏不授予网页窗口控制权限，项目跳转仅接收原生已选项目", async () => {
   const capability = async file => JSON.parse(await readFile(new URL(`src-tauri/capabilities/${file}.json`, base), "utf8"));
   const [appearance, connection, configuration] = await Promise.all([
     capability("content-appearance"), capability("connection-page"),
     readFile(new URL("src-tauri/tauri.conf.json", base), "utf8").then(JSON.parse),
   ]);
   assert.deepEqual(appearance.webviews, ["elves-content", "elves-content-session-*"]);
-  assert.deepEqual(appearance.permissions, ["remote-appearance", "remote-resource-cache", "remote-session-window", "remote-taskbar-badge", "remote-local-inputs"]);
+  assert.deepEqual(appearance.permissions, ["remote-appearance", "remote-resource-cache", "remote-session-window", "remote-taskbar-badge", "remote-local-inputs", "remote-project-navigation"]);
   assert.ok(appearance.remote.urls.every(url => /^https?:/.test(url)));
   assert.equal(connection.local, true);
   assert.equal(connection.remote, undefined);
@@ -150,6 +150,12 @@ test("原生应用顶栏不向任何网页授予窗口控制权限，连接设�
   for (const value of [appearance, connection]) {
     assert.ok(value.permissions.every(permission => !permission.startsWith("core:window:")));
   }
+  const desktop = await readFile(new URL("src-tauri/src/desktop.rs", base), "utf8");
+  const command = desktop.slice(desktop.indexOf("fn client_project_navigation("), desktop.indexOf("struct SessionWindow"));
+  assert.match(command, /webview\.label\(\) != CONTENT_LABEL/);
+  assert.match(command, /webview\.window\(\)\.label\(\) != WINDOW_LABEL/);
+  assert.match(command, /allows_service_url/);
+  assert.doesNotMatch(command, /choose_project_folder|add_local_folder|service_admin_request/);
 });
 
 function simulatedBridge() {

@@ -19,16 +19,19 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use crate::appearance::{AppBarAppearance, ThemeSnapshot, TitlebarTheme};
 
 // 用户要求此处作为放置程序标题及后续程序菜单的原生应用顶栏，固定 36 个逻辑像素。
-// desktop.rs 的网页起点共用此高度，DPI 改变时同步调整，菜单本次不预设内容。
+// desktop.rs 的网页起点共用此高度；文件、帮助菜单放在同一行，不增设第二条菜单栏。
 pub const HEIGHT: f64 = 36.0;
 const BAR_ID: i32 = 0x4345;
 const MINIMIZE: i32 = 0x4346;
 const MAXIMIZE: i32 = 0x4347;
 const CLOSE: i32 = 0x4348;
-const BUTTONS: [i32; 3] = [MINIMIZE, MAXIMIZE, CLOSE];
+const FILE_MENU: i32 = 0x4349;
+const HELP_MENU: i32 = 0x434a;
+const BUTTONS: [i32; 5] = [MINIMIZE, MAXIMIZE, CLOSE, FILE_MENU, HELP_MENU];
 const CLASS: windows_sys::core::PCWSTR = windows_sys::core::w!("ElvesAppBar");
 
 struct Bar {
+    window: tauri::Window,
     parent: HWND,
     title: Vec<u16>,
     appearance: AppBarAppearance,
@@ -36,7 +39,7 @@ struct Bar {
     scale: f64,
     hover: i32,
     active: bool,
-    buttons: [HWND; 3],
+    buttons: [HWND; 5],
 }
 
 impl Drop for Bar {
@@ -135,6 +138,7 @@ pub fn install(window: &tauri::Window, title: &str, close_to_tray: bool) -> taur
             return Err(native_error("无法创建原生应用顶栏"));
         }
         let data = Box::into_raw(Box::new(Bar {
+            window: window.clone(),
             parent,
             title: title.encode_utf16().collect(),
             appearance: AppBarAppearance::new(dark),
@@ -142,7 +146,7 @@ pub fn install(window: &tauri::Window, title: &str, close_to_tray: bool) -> taur
             scale,
             hover: 0,
             active: true,
-            buttons: [null_mut(); 3],
+            buttons: [null_mut(); 5],
         }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, data as isize);
         for (index, name) in [
@@ -153,6 +157,8 @@ pub fn install(window: &tauri::Window, title: &str, close_to_tray: bool) -> taur
             } else {
                 windows_sys::core::w!("关闭")
             },
+            windows_sys::core::w!("文件"),
+            windows_sys::core::w!("帮助"),
         ]
         .into_iter()
         .enumerate()
@@ -226,13 +232,24 @@ pub fn resize(window: &tauri::Window, width: u32, height: u32, scale: f64) -> ta
         let buttons = (*data).buttons;
         let button_width = px(46.0, scale);
         // 沿用原窗口按钮 46px 宽度及底部 1px 分隔线，三枚按钮固定在右侧。
-        for (index, button) in buttons.into_iter().enumerate() {
+        for (index, button) in buttons[..3].iter().copied().enumerate() {
             MoveWindow(
                 button,
                 (width as i32 - button_width * (3 - index as i32)).max(0),
                 0,
                 button_width,
                 (height as i32 - px(1.0, scale)).max(0),
+                0,
+            );
+        }
+        // 用户要求文件、帮助位于原生标题栏，保留右侧三枚窗口按钮及剩余区域拖动。
+        for (index, button) in buttons[3..].iter().copied().enumerate() {
+            MoveWindow(
+                button,
+                px(88.0 + index as f64 * 48.0, scale),
+                px(3.0, scale),
+                px(48.0, scale),
+                (height as i32 - px(7.0, scale)).max(1),
                 0,
             );
         }
@@ -332,7 +349,8 @@ unsafe fn paint(hwnd: HWND) {
                 let mut label = RECT {
                     left: px(10.0 + 16.0 + 7.0, scale),
                     top: 0,
-                    right: (rect.right - px(46.0, scale) * 3 - px(8.0, scale)).max(0),
+                    right: px(80.0, scale)
+                        .min((rect.right - px(46.0, scale) * 3 - px(8.0, scale)).max(0)),
                     bottom: line.top,
                 };
                 let old_font = if !font.is_null() {
@@ -410,6 +428,38 @@ unsafe fn draw_button(hwnd: HWND, item: &DRAWITEMSTRUCT) {
             )
         };
         fill(item.hDC, &item.rcItem, background);
+        if matches!(item.CtlID as i32, FILE_MENU | HELP_MENU) {
+            let previous = if (*data).font.is_null() {
+                null_mut()
+            } else {
+                SelectObject(item.hDC, (*data).font)
+            };
+            SetBkMode(item.hDC, TRANSPARENT as i32);
+            SetTextColor(item.hDC, color(foreground));
+            let text: Vec<u16> = if item.CtlID as i32 == FILE_MENU {
+                "文件"
+            } else {
+                "帮助"
+            }
+            .encode_utf16()
+            .collect();
+            let mut rect = item.rcItem;
+            DrawTextW(
+                item.hDC,
+                text.as_ptr(),
+                text.len() as i32,
+                &mut rect,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+            if !previous.is_null() {
+                SelectObject(item.hDC, previous);
+            }
+            if item.itemState & ODS_FOCUS != 0 {
+                InflateRect(&mut rect, -px(3.0, scale), -px(3.0, scale));
+                DrawFocusRect(item.hDC, &rect);
+            }
+            return;
+        }
         let pen = CreatePen(PS_SOLID, px(1.0, scale), color(foreground));
         if pen.is_null() {
             return;
@@ -522,6 +572,30 @@ unsafe extern "system" fn bar_proc(
             let parent = (*data).parent;
             match message {
                 WM_COMMAND if (wparam >> 16) == BN_CLICKED as usize => {
+                    let id = wparam as u16 as i32;
+                    if matches!(id, FILE_MENU | HELP_MENU) {
+                        let mut rect = RECT::default();
+                        GetWindowRect(GetDlgItem(hwnd, id), &mut rect);
+                        let mut position = windows_sys::Win32::Foundation::POINT {
+                            x: rect.left,
+                            y: rect.bottom,
+                        };
+                        ScreenToClient(parent, &mut position);
+                        // 弹出菜单会进入原生消息循环；窗口关闭后不能再解引用 Bar。
+                        let window = (*data).window.clone();
+                        if let Err(error) = crate::desktop::popup_app_menu(
+                            &window,
+                            id == FILE_MENU,
+                            position.x,
+                            position.y,
+                        ) {
+                            crate::desktop::report_native_error(
+                                &window,
+                                &format!("无法打开菜单：{error}"),
+                            );
+                        }
+                        return 0;
+                    }
                     let command = match wparam as u16 as i32 {
                         MINIMIZE => SC_MINIMIZE,
                         MAXIMIZE if IsZoomed(parent) != 0 => SC_RESTORE,

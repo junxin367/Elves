@@ -457,7 +457,13 @@ impl CodexHarness {
                 .data
                 .deletions
                 .contains_key(payload["threadId"].as_str().unwrap_or(""));
-        if !retained_side && !retained_deletion {
+        let local_project = matches!(action, "workspaceContext" | "pinProject")
+            && if let Some(id) = payload["projectId"].as_str() {
+                self.local_project_context(id).await.is_some()
+            } else {
+                false
+            };
+        if !retained_side && !retained_deletion && !local_project {
             self.start().await.map_err(|failure| {
                 if action == "deleteThread" {
                     deletion::delete_preflight_failure(failure)

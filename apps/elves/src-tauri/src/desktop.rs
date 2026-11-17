@@ -69,6 +69,44 @@ struct ClientState {
     session_windows: Mutex<HashMap<String, SessionWindow>>,
     window_sequence: AtomicU64,
     cache: Arc<ResourceCache>,
+    adding_folder: AtomicBool,
+    checking_update: AtomicBool,
+    project_navigation: Mutex<Option<ProjectNavigation>>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectNavigation {
+    request_id: String,
+    project_id: String,
+}
+
+#[tauri::command]
+fn client_project_navigation(
+    webview: tauri::Webview,
+    state: tauri::State<'_, ClientState>,
+    acknowledge: Option<String>,
+) -> Result<Option<ProjectNavigation>, String> {
+    // 网页只可读取/确认原生菜单已经登记的项目 ID；不能提供路径、打开选择器或触发项目登记。
+    if webview.label() != CONTENT_LABEL
+        || webview.window().label() != WINDOW_LABEL
+        || !allows_service_url(
+            &state,
+            WINDOW_LABEL,
+            &webview.url().map_err(|error| error.to_string())?,
+        )
+    {
+        return Err("只有 Elves 本机主工作区可以接收菜单项目。".into());
+    }
+    let mut pending = state.project_navigation.lock().unwrap();
+    if let Some(request) = acknowledge
+        && pending
+            .as_ref()
+            .is_some_and(|current| current.request_id == request)
+    {
+        *pending = None;
+    }
+    Ok(pending.clone())
 }
 
 struct SessionWindow {
@@ -820,8 +858,325 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
+pub(crate) fn popup_app_menu(
+    window: &tauri::Window,
+    file: bool,
+    x: i32,
+    y: i32,
+) -> tauri::Result<()> {
+    let app = window.app_handle();
+    let state = app.state::<ClientState>();
+    let menu = if file {
+        let ready = !state.starting.load(Ordering::Acquire)
+            && !state.exiting.load(Ordering::Acquire)
+            && !state.adding_folder.load(Ordering::Acquire)
+            && state.home.lock().unwrap().is_some();
+        let add = MenuItem::with_id(app, "file_add_folder", "添加文件夹", ready, None::<&str>)?;
+        Menu::with_items(app, &[&add])?
+    } else {
+        let project = MenuItem::with_id(app, "help_project", "打开项目地址", true, None::<&str>)?;
+        let update = MenuItem::with_id(
+            app,
+            "help_update",
+            if state.checking_update.load(Ordering::Acquire) {
+                "正在更新…"
+            } else {
+                "更新"
+            },
+            !state.checking_update.load(Ordering::Acquire),
+            None::<&str>,
+        )?;
+        let about = MenuItem::with_id(app, "help_about", "关于 Elves", true, None::<&str>)?;
+        Menu::with_items(app, &[&project, &update, &about])?
+    };
+    window.popup_menu_at(&menu, PhysicalPosition::new(x, y))
+}
+
+pub(crate) fn report_native_error(window: &tauri::Window, message: &str) {
+    let title: Vec<u16> = "Elves\0".encode_utf16().collect();
+    let text: Vec<u16> = message.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
+            window
+                .hwnd()
+                .map_or(std::ptr::null_mut(), |hwnd| hwnd.0 as _),
+            text.as_ptr(),
+            title.as_ptr(),
+            windows_sys::Win32::UI::WindowsAndMessaging::MB_OK
+                | windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONERROR,
+        );
+    }
+}
+
+async fn native_message(
+    app: &tauri::AppHandle,
+    text: String,
+    question: bool,
+) -> anyhow::Result<bool> {
+    let target = app.clone();
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    app.run_on_main_thread(move || {
+        let state = target.state::<ClientState>();
+        if state.exiting.load(Ordering::Acquire) {
+            let _ = sender.send(false);
+            return;
+        }
+        let parent = target
+            .get_window(WINDOW_LABEL)
+            .and_then(|window| window.hwnd().ok());
+        let text: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+        use windows_sys::Win32::UI::WindowsAndMessaging::*;
+        let result = unsafe {
+            MessageBoxW(
+                parent.map_or(std::ptr::null_mut(), |hwnd| hwnd.0 as _),
+                text.as_ptr(),
+                windows_sys::core::w!("Elves"),
+                if question {
+                    MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON2
+                } else {
+                    MB_OK | MB_ICONINFORMATION
+                },
+            )
+        };
+        let _ = sender.send(result == IDYES);
+    })?;
+    Ok(receiver.await?)
+}
+
+fn add_folder(app: &tauri::AppHandle) {
+    let state = app.state::<ClientState>();
+    if state.exiting.load(Ordering::Acquire)
+        || state.home.lock().unwrap().is_none()
+        || state.adding_folder.swap(true, Ordering::AcqRel)
+    {
+        return;
+    }
+    show_window(app);
+    let chooser = app.clone();
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    if app
+        .run_on_main_thread(move || {
+            let selected = chooser
+                .get_window(WINDOW_LABEL)
+                .ok_or("主窗口已关闭".to_owned())
+                .and_then(|window| window.hwnd().map_err(|error| error.to_string()))
+                .and_then(|hwnd| crate::local_inputs::choose_project_folder(hwnd.0 as isize));
+            let _ = sender.send(selected);
+        })
+        .is_err()
+    {
+        state.adding_folder.store(false, Ordering::Release);
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let result = async {
+            let Some(folder) = receiver.await?.map_err(anyhow::Error::msg)? else {
+                return Ok::<(), anyhow::Error>(());
+            };
+            let value = elves_harness::service_admin_request(
+                "addProjectFolder",
+                serde_json::json!({"path":folder.to_string_lossy()}),
+            )
+            .await;
+            let id = value["project"]["id"]
+                .as_str()
+                .context(
+                    value["message"]
+                        .as_str()
+                        .unwrap_or("添加文件夹失败，请重试")
+                        .to_owned(),
+                )?
+                .to_owned();
+            *app.state::<ClientState>()
+                .project_navigation
+                .lock()
+                .unwrap() = Some(ProjectNavigation {
+                request_id: uuid::Uuid::new_v4().to_string(),
+                project_id: id,
+            });
+            // 通知只是一种唤醒；待打开项目由原生保存并显式确认，页面加载或刷新不会丢失选择。
+            if let Some(content) = app.get_webview(CONTENT_LABEL) {
+                let _ =
+                    content.eval("window.dispatchEvent(new CustomEvent('elves:project-added'));");
+            }
+            Ok(())
+        }
+        .await;
+        app.state::<ClientState>()
+            .adding_folder
+            .store(false, Ordering::Release);
+        if let Err(error) = result {
+            let _ = native_message(&app, format!("添加文件夹失败：{error:#}"), false).await;
+        }
+    });
+}
+
+fn open_about(app: &tauri::AppHandle) -> tauri::Result<()> {
+    show_window(app);
+    if let Some(window) = app.get_webview_window("elves-about") {
+        window.show()?;
+        return window.set_focus();
+    }
+    let mut address = Url::parse("http://tauri.localhost/about.html").unwrap();
+    address
+        .query_pairs_mut()
+        .append_pair("version", env!("CARGO_PKG_VERSION"));
+    let mut builder =
+        tauri::WebviewWindowBuilder::new(app, "elves-about", WebviewUrl::External(address))
+            .title("关于 Elves")
+            .inner_size(360.0, 360.0)
+            .resizable(false)
+            .minimizable(false)
+            .skip_taskbar(true)
+            .on_navigation(|url| {
+                if matches!(url.host_str(), Some("tauri.localhost")) {
+                    return true;
+                }
+                open_external(url.clone());
+                false
+            });
+    if let Some(parent) = app.get_window(WINDOW_LABEL) {
+        builder = builder.owner_raw(parent.hwnd()?);
+    }
+    builder.build()?;
+    Ok(())
+}
+
+fn check_update(app: &tauri::AppHandle) {
+    let state = app.state::<ClientState>();
+    if state.exiting.load(Ordering::Acquire) || state.checking_update.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    show_window(app);
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let result = async {
+            let Some(release) = crate::updates::check().await? else {
+                native_message(&app, "项目当前尚无公开发行版。".into(), false).await?;
+                return Ok::<(), anyhow::Error>(());
+            };
+            if !release.newer_than(env!("CARGO_PKG_VERSION"))? {
+                native_message(
+                    &app,
+                    format!(
+                        "当前版本：{}\n最新公开版本：{}\n\n无需更新。",
+                        env!("CARGO_PKG_VERSION"),
+                        release.version
+                    ),
+                    false,
+                )
+                .await?;
+                return Ok(());
+            }
+            let Some(installer) = release
+                .installer
+                .filter(|installer| installer.sha256.is_some())
+            else {
+                if native_message(
+                    &app,
+                    format!(
+                        "发现新版本 {}。\n此版本需从项目发布页下载，是否打开？",
+                        release.version
+                    ),
+                    true,
+                )
+                .await?
+                {
+                    open_external(release.page);
+                }
+                return Ok(());
+            };
+            if !native_message(
+                &app,
+                format!("发现新版本 {}。\n是否下载安装包？", release.version),
+                true,
+            )
+            .await?
+            {
+                return Ok(());
+            }
+            let directory = app.state::<ClientState>().directory.join("updates");
+            let path = crate::updates::download(&installer, &directory).await?;
+            if native_message(
+                &app,
+                format!(
+                    "{} 安装包已下载并校验。\n是否退出 Elves 并开始安装？",
+                    release.version
+                ),
+                true,
+            )
+            .await?
+            {
+                let file: Vec<u16> = path
+                    .as_os_str()
+                    .to_string_lossy()
+                    .encode_utf16()
+                    .chain(Some(0))
+                    .collect();
+                let status = unsafe {
+                    windows_sys::Win32::UI::Shell::ShellExecuteW(
+                        std::ptr::null_mut(),
+                        windows_sys::core::w!("open"),
+                        file.as_ptr(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+                    )
+                } as isize;
+                anyhow::ensure!(status > 32, "无法启动安装程序（{status}）");
+                quit_app(&app);
+            }
+            Ok(())
+        }
+        .await;
+        app.state::<ClientState>()
+            .checking_update
+            .store(false, Ordering::Release);
+        if let Err(error) = result {
+            let _ = native_message(&app, format!("更新未完成：{error:#}"), false).await;
+        }
+    });
+}
+
+fn quit_app(app: &tauri::AppHandle) {
+    let state = app.state::<ClientState>();
+    if state.exiting.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if let Some(window) = app.get_window(WINDOW_LABEL) {
+        remember_window(&window, true);
+    }
+    if elves_harness::owns_service() {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            // 用户要求 Elves 使用本机 Harness；仅回收本客户端拥有的后台，保留未确认回执。
+            let result = elves_harness::prepare_service_shutdown("client_exit").await;
+            if let Err(error) = result {
+                let _ = elves_core::diagnostic_log::append_diagnostic_log(
+                    "harness.client_exit_pending",
+                    serde_json::json!({"message":format!("{error:#}")}),
+                );
+            }
+            app.exit(0);
+        });
+    } else {
+        app.exit(0);
+    }
+}
+
 fn handle_menu_event(app: &tauri::AppHandle, event: MenuEvent) {
     match event.id.as_ref() {
+        "file_add_folder" => add_folder(app),
+        "help_project" => open_external(Url::parse(crate::updates::PROJECT_URL).unwrap()),
+        "help_update" => check_update(app),
+        "help_about" => {
+            if let Err(error) = open_about(app)
+                && let Some(window) = app.get_window(WINDOW_LABEL)
+            {
+                report_native_error(&window, &format!("无法打开关于页面：{error}"));
+            }
+        }
         "show" => show_window(app),
         "hide" => {
             if let Some(window) = app.get_window(WINDOW_LABEL) {
@@ -844,31 +1199,7 @@ fn handle_menu_event(app: &tauri::AppHandle, event: MenuEvent) {
                 let _ = webview.reload();
             }
         }
-        "quit" => {
-            let state = app.state::<ClientState>();
-            if state.exiting.swap(true, Ordering::SeqCst) {
-                return;
-            }
-            if let Some(window) = app.get_window(WINDOW_LABEL) {
-                remember_window(&window, true);
-            }
-            if elves_harness::owns_service() {
-                let app = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    // 用户要求 Elves 使用本机 Harness；仅回收本客户端拥有的后台，保留未确认回执。
-                    let result = elves_harness::prepare_service_shutdown("client_exit").await;
-                    if let Err(error) = result {
-                        let _ = elves_core::diagnostic_log::append_diagnostic_log(
-                            "harness.client_exit_pending",
-                            serde_json::json!({"message":format!("{error:#}")}),
-                        );
-                    }
-                    app.exit(0);
-                });
-            } else {
-                app.exit(0);
-            }
-        }
+        "quit" => quit_app(app),
         _ => {}
     }
 }
@@ -1115,7 +1446,8 @@ pub fn run() -> anyhow::Result<()> {
             client_cache_activity,
             client_open_session_window,
             client_choose_inputs,
-            client_paste_inputs
+            client_paste_inputs,
+            client_project_navigation
         ])
         .on_menu_event(handle_menu_event)
         .setup(|app| {
@@ -1157,6 +1489,9 @@ pub fn run() -> anyhow::Result<()> {
                 session_windows: Mutex::new(HashMap::new()),
                 window_sequence: AtomicU64::new(1),
                 cache: cache.clone(),
+                adding_folder: AtomicBool::new(false),
+                checking_update: AtomicBool::new(false),
+                project_navigation: Mutex::new(None),
             });
             // Windows Tauri 本地资源默认 Origin；先完成原生缓存接管，再打开内置启动页并准备本机 Harness。
             let home = Url::parse("http://tauri.localhost/index.html")?;

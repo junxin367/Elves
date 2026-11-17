@@ -235,10 +235,18 @@ impl CodexHarness {
         payload: &Value,
         authorization: &HarnessAuthorization,
     ) -> anyhow::Result<Value> {
-        let project_pin_revision = if action == "pinProject" {
+        let own_project = if let Some(id) = payload["projectId"].as_str() {
+            self.local_project_context(id).await.is_some()
+        } else {
+            false
+        };
+        let project_pin_revision = if action == "pinProject" && !own_project {
             let preferences = self.project_preferences().await?;
-            let projects =
-                preferences.merge(self.list_all("project/list", json!({"limit":100})).await?);
+            let projects = self
+                .merge_local_projects(
+                    preferences.merge(self.list_all("project/list", json!({"limit":100})).await?),
+                )
+                .await;
             let id = required(payload, "projectId")?;
             let project = projects
                 .iter()

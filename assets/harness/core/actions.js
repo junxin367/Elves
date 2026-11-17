@@ -42,4 +42,5 @@ export function scheduleMessages(...args) { return run("scheduleMessages", args)
 export function selectThread(...args) { return run("selectThread", args); } // features/conversation/selection.js
 export function shell(...args) { return run("shell", args); } // features/shell.js
 export function showWelcome(...args) { return run("showWelcome", args); } // features/conversation/selection.js
+export function startNewChat(...args) { return run("startNewChat", args); }
 export function updateComposer(...args) { return run("updateComposer", args); } // features/composer/composer.js

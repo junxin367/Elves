@@ -27,3 +27,8 @@ commands.allow = ["client_open_session_window"]
 identifier = "remote-local-inputs"
 description = "当前前台会话可读取系统选择器选中的文件/文件夹或文件剪贴板，不接受网页提供本机路径。"
 commands.allow = ["client_choose_inputs", "client_paste_inputs"]
+
+[[permission]]
+identifier = "remote-project-navigation"
+description = "仅本机主工作区可读取和确认原生菜单已登记的项目 ID，不能提交文件路径、打开选择器或登记项目。"
+commands.allow = ["client_project_navigation"]

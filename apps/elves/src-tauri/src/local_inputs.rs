@@ -177,6 +177,20 @@ pub(crate) fn read(paths: Vec<PathBuf>) -> Result<Vec<LocalInput>, String> {
 
 #[cfg(windows)]
 pub(crate) fn choose(parent: isize, folders: bool) -> Result<Vec<PathBuf>, String> {
+    choose_with_options(parent, folders, true)
+}
+
+#[cfg(windows)]
+pub(crate) fn choose_project_folder(parent: isize) -> Result<Option<PathBuf>, String> {
+    Ok(choose_with_options(parent, true, false)?.into_iter().next())
+}
+
+#[cfg(windows)]
+fn choose_with_options(
+    parent: isize,
+    folders: bool,
+    multiple: bool,
+) -> Result<Vec<PathBuf>, String> {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
     use windows::Win32::UI::Shell::{
@@ -187,12 +201,22 @@ pub(crate) fn choose(parent: isize, folders: bool) -> Result<Vec<PathBuf>, Strin
         let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)
             .map_err(|error| format!("无法打开文件选择器：{error}"))?;
         let mut options = dialog.GetOptions().map_err(|error| error.to_string())?
-            | FOS_ALLOWMULTISELECT
             | FOS_FORCEFILESYSTEM
             | FOS_PATHMUSTEXIST
             | FOS_FILEMUSTEXIST;
+        if multiple {
+            options |= FOS_ALLOWMULTISELECT;
+        }
         if folders {
             options |= FOS_PICKFOLDERS;
+        }
+        if !multiple {
+            dialog
+                .SetTitle(windows::core::w!("添加文件夹"))
+                .map_err(|error| error.to_string())?;
+            dialog
+                .SetOkButtonLabel(windows::core::w!("添加文件夹"))
+                .map_err(|error| error.to_string())?;
         }
         dialog
             .SetOptions(options)

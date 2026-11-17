@@ -83,6 +83,17 @@ fn executing_history_turn(status: &Value) -> bool {
 }
 
 impl CodexHarness {
+    pub(crate) async fn folder_sidebar(&self) -> Value {
+        let preferences = self.store.lock().await.data.preferences.clone();
+        let (saved, warning) = self.sidebar_project_preferences().await;
+        json!({"ok":true,"complete":true,"projects":saved.merge(vec![]),"recent":[],"pinnedThreads":[],
+        "pinnedThreadsComplete":true,"nextCursor":null,"sideThreadIds":[],
+        "unreadSideThreads":[],"creationAvailable":true,"projectPreferencesWarning":warning,
+        "preferences":if preferences.is_object() { preferences } else {
+            json!({"mode":"project","chats":"updated_at","projects":"updated_at","pinned":"manual"})
+        }})
+    }
+
     pub(super) async fn list_all(
         &self,
         method: &str,
@@ -113,7 +124,7 @@ impl CodexHarness {
             async { Ok::<_, anyhow::Error>(self.sidebar_project_preferences().await) }
         )?;
         // 用户要求 App 添加的项目也进入目录；只合并明确保存的项目，不从会话 cwd 合成。
-        let mut projects = desktop.merge(project_rows);
+        let mut projects = self.merge_local_projects(desktop.merge(project_rows)).await;
         // 侧栏只需要置顶与排序，不能复制整份消息队列、图片和历史回执。
         let (
             mut thread_pins,
@@ -264,6 +275,9 @@ impl CodexHarness {
             );
         }
         let id = required(payload, "projectId")?;
+        if let Some(context) = self.local_project_context(id).await {
+            return Ok(context);
+        }
         // App 已保存但尚未迁入引擎的项目也可读文件；写入前重新读记录，不使用展示缓存。
         let native = self.list_all("project/list", json!({"limit":100})).await?;
         // 原生项目可独立使用；App 文件损坏不能阻断已知原生项目的配置、文件或新建。

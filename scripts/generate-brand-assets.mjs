@@ -82,6 +82,7 @@ for (const [path, size] of [
 }
 await save("apps/elves/src-tauri/icons/elves-app-icon.ico", ico());
 await copyFile(source, resolve(root, "apps/elves/web/elves-startup-logo.svg"));
+await copyFile(source, resolve(root, "apps/elves/web/elves-about-logo.svg"));
 await save("apps/elves-android/app/src/main/res/drawable-nodpi/elves_launcher_foreground.png", png(adaptive(svg), 1024));
 await save("apps/elves-android/app/src/main/res/drawable-nodpi/elves_launcher_monochrome.png", png(adaptive(monochrome()), 1024));
 console.log("已从指定 SVG 生成 Windows、PWA、Apple touch、Android 图标和启动页 SVG。");

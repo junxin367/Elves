@@ -101,6 +101,8 @@ pub(super) struct Data {
     pub project_pins: BTreeSet<String>,
     pub project_pin_overrides: BTreeMap<String, bool>,
     pub project_pin_desktop_revisions: BTreeMap<String, String>,
+    // 用户从 Elves“添加文件夹”登记的项目由 Harness 自己保存，不写入 Codex App 偏好。
+    pub local_projects: BTreeMap<String, Value>,
     pub preferences: Value,
     pub settings: BTreeMap<String, Value>,
     pub answered_questions: BTreeMap<String, Value>,

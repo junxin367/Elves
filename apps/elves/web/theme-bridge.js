@@ -4,7 +4,8 @@
   Object.defineProperty(window, "__ELVES_CLIENT__", {
     value: Object.freeze({
       open: threadId => window.__TAURI__.core.invoke("client_open_session_window", { threadId }),
-      openPreview: preview => window.__TAURI__.core.invoke("client_open_session_window", { preview })
+      openPreview: preview => window.__TAURI__.core.invoke("client_open_session_window", { preview }),
+      projectNavigation: acknowledge => window.__TAURI__.core.invoke("client_project_navigation", { acknowledge })
     })
   });
   let scheduled = false, previous = "", pending = null, running = false, colorContext = null;

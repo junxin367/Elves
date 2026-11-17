@@ -4,6 +4,7 @@ pub mod bundled_tools;
 mod local_inputs;
 pub mod resource_cache;
 pub mod settings;
+pub mod updates;
 
 #[cfg(windows)]
 pub mod app_bar;

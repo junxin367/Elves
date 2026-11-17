@@ -18,6 +18,7 @@ fn main() {
                 "client_open_session_window",
                 "client_choose_inputs",
                 "client_paste_inputs",
+                "client_project_navigation",
             ]));
         tauri_build::try_build(attributes).expect("failed to build Elves");
     }

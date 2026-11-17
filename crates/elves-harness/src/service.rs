@@ -17,8 +17,8 @@ use serde_json::{Value, json};
 
 const ENDPOINT_FILE: &str = "harness-service.json";
 const LOCK_FILE: &str = "harness-service.lock";
-// 协议 10 分离 Harness 本机入口与远程会话授权；后台和代理由唯一 Elves 程序承载。
-const PROTOCOL_VERSION: u32 = 10;
+// 协议 11 增加原生菜单的文件夹登记；本机入口、代理与远程授权继续独立。
+const PROTOCOL_VERSION: u32 = 11;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(windows)]
@@ -146,6 +146,27 @@ async fn retire_obsolete_service(directory: &Path) -> anyhow::Result<()> {
     if endpoint.protocol_version == PROTOCOL_VERSION || !endpoint_is_active(&endpoint).await? {
         return Ok(());
     }
+    if endpoint.protocol_version >= 9 {
+        // 菜单能力升级也先走旧服务已有的安全退出接口，不能为更换私有协议强制中断原生任务。
+        let value = request(
+            &endpoint,
+            "prepareShutdown",
+            &json!({"reason":"client_upgrade"}),
+        )
+        .await?;
+        anyhow::ensure!(
+            matches!(value["status"].as_str(), Some("stopped" | "closing")),
+            "旧版 Harness 未确认安全退出，请先退出 Elves 后重试"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if !endpoint_is_active(&endpoint).await? {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        anyhow::bail!("旧版 Harness 正在安全退出，请稍后重试");
+    }
     #[cfg(windows)]
     {
         // 旧服务没有受控退出接口；先保存受管身份，下次启动补偿，不能把强制终止当作已回收。
@@ -236,6 +257,7 @@ fn supported_action(action: &str) -> bool {
         "status"
             | "localBootstrap"
             | "desktopBootstrap"
+            | "addProjectFolder"
             | "prepareShutdown"
             | "apply"
             | "revoke"
@@ -468,6 +490,68 @@ fn remote_service_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn protocol_upgrade_requests_controlled_shutdown_before_replacing_service() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let directory = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = Endpoint {
+            protocol_version: PROTOCOL_VERSION - 1,
+            process_id: u32::MAX,
+            port: listener.local_addr().unwrap().port(),
+            token: "a".repeat(64),
+        };
+        let closed = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = closed.clone();
+        let shutdown = closed.clone();
+        let counted = calls.clone();
+        let protocol = endpoint.protocol_version;
+        let router = Router::new()
+            .route(
+                "/health",
+                get(move || {
+                    let observed = observed.clone();
+                    async move {
+                        if observed.load(Ordering::Acquire) {
+                            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})))
+                        } else {
+                            (
+                                StatusCode::OK,
+                                Json(json!({"processId":u32::MAX,"protocolVersion":protocol})),
+                            )
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/admin/prepareShutdown",
+                post(move || {
+                    let shutdown = shutdown.clone();
+                    let counted = counted.clone();
+                    async move {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        shutdown.store(true, Ordering::Release);
+                        Json(json!({"status":"stopped"}))
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        std::fs::write(
+            directory.path().join(ENDPOINT_FILE),
+            serde_json::to_vec(&endpoint).unwrap(),
+        )
+        .unwrap();
+        retire_obsolete_service(directory.path()).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(closed.load(Ordering::Acquire));
+        server.abort();
+        let _ = server.await;
+    }
 
     const TEST_DIRECTORY_ENV: &str = "CODEX_ELVES_REMOTE_SERVICE_TEST_DIRECTORY";
 

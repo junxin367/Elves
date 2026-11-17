@@ -256,6 +256,91 @@ fn same_roots(roots: &[String], other: &Value) -> bool {
 }
 
 impl CodexHarness {
+    pub(crate) async fn add_local_folder(&self, path: &str) -> anyhow::Result<Value> {
+        let selected = std::path::PathBuf::from(path);
+        anyhow::ensure!(selected.is_absolute(), "请选择完整的文件夹路径");
+        let cwd = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+            let canonical = std::fs::canonicalize(selected).context("无法读取所选文件夹")?;
+            anyhow::ensure!(canonical.is_dir(), "请选择文件夹");
+            let text = canonical.to_string_lossy().into_owned();
+            Ok(if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+                format!(r"\\{unc}")
+            } else {
+                text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned()
+            })
+        })
+        .await??;
+        let key = if cfg!(windows) {
+            cwd.to_lowercase()
+        } else {
+            cwd.clone()
+        };
+        let id = format!("elves-project-{:x}", Sha256::digest(key.as_bytes()));
+        let name = std::path::Path::new(&cwd)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&cwd)
+            .to_owned();
+        let project = json!({"id":id,"harnessProjectId":id,"serverProjectId":null,
+            "name":name,"cwd":cwd,"roots":[cwd],"threads":[],"backend":"codex",
+            "instanceId":"codex:local","createdAt":crate::now_ms(),"updatedAt":crate::now_ms()});
+        let mut store = self.store.lock().await;
+        if let Some(existing) = store.data.local_projects.get(&id) {
+            return Ok(existing.clone());
+        }
+        store.commit(|data| {
+            data.local_projects.insert(id, project.clone());
+            Ok(())
+        })?;
+        Ok(project)
+    }
+
+    pub(crate) async fn local_project_context(&self, id: &str) -> Option<Value> {
+        let store = self.store.lock().await;
+        let project = store.data.local_projects.get(id)?;
+        Some(
+            json!({"ok":true,"hostId":"local","projectId":id,"harnessProjectId":id,
+            "serverProjectId":null,"cwd":project["cwd"],"roots":project["roots"],"name":project["name"]}),
+        )
+    }
+
+    pub(crate) async fn merge_local_projects(&self, mut projects: Vec<Value>) -> Vec<Value> {
+        let store = self.store.lock().await;
+        for (id, local) in &store.data.local_projects {
+            let roots: Vec<_> = local["roots"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect();
+            let exact = projects.iter().position(|project| project["id"] == *id);
+            let matches: Vec<_> = projects
+                .iter()
+                .enumerate()
+                .filter(|(_, project)| {
+                    project["id"] == *id || same_roots(&roots, &project["roots"])
+                })
+                .map(|(index, _)| index)
+                .collect();
+            if let Some(index) = exact.or_else(|| (matches.len() == 1).then(|| matches[0])) {
+                let project = &mut projects[index];
+                project["id"] = json!(id);
+                project["harnessProjectId"] = json!(id);
+            } else {
+                projects.push(local.clone());
+            }
+        }
+        for project in &mut projects {
+            if let Some(id) = project["harnessProjectId"].as_str() {
+                project["pinned"] = json!(store.data.project_pins.contains(id));
+            }
+        }
+        projects.sort_by_key(|project| project["pinned"] != true);
+        projects
+    }
+
     fn project_home(&self) -> std::path::PathBuf {
         #[cfg(test)]
         {
@@ -305,6 +390,38 @@ impl CodexHarness {
         if let Some(server_id) = context["serverProjectId"].as_str() {
             return Ok((cwd, server_id.to_owned()));
         }
+        if context["harnessProjectId"].is_string() {
+            // 添加文件夹只登记 Harness 项目；用户真正发送时才核对/登记原生项目，不能提前启动会话。
+            let roots: Vec<_> = context["roots"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect();
+            let native = self.list_all("project/list", json!({"limit":100})).await?;
+            let matches: Vec<_> = native
+                .iter()
+                .filter(|project| {
+                    let roots_value = json!(
+                        project["roots"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|root| root["path"].as_str())
+                            .collect::<Vec<_>>()
+                    );
+                    same_roots(&roots, &roots_value)
+                })
+                .collect();
+            anyhow::ensure!(
+                matches.len() <= 1,
+                "原生引擎存在多个相同目录的项目，请先整理项目后重试"
+            );
+            if let Some(project) = matches.first() {
+                return Ok((cwd, required(project, "id")?.to_owned()));
+            }
+        }
         // 只有用户明确发送新会话才把 App 独有项目登记到独立引擎；列表和文件读取绝不写入。
         // project/import 的稳定幂等键避免并发新建生成重复项目，不借用 App 的连接或执行上下文。
         let roots: Vec<_> = context["roots"]
@@ -313,8 +430,13 @@ impl CodexHarness {
             .flatten()
             .map(|path| json!({"path":path}))
             .collect();
+        let prefix = if context["harnessProjectId"].is_string() {
+            "elves:harness-project"
+        } else {
+            "codex-elves:app-project"
+        };
         let imported = self.runtime.request("project/import", json!({
-            "idempotencyKey":format!("codex-elves:app-project:{}",context["projectId"].as_str().unwrap_or(id)),
+            "idempotencyKey":format!("{prefix}:{}",context["projectId"].as_str().unwrap_or(id)),
             "name":context["name"],"roots":roots
         }), Some(authorization)).await?;
         let server_id = imported["project"]["id"]
@@ -381,6 +503,68 @@ fn same_path(left: &str, right: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn menu_folder_projects_persist_deduplicate_and_pin_without_native_engine() {
+        let (directory, authorization) = crate::tests::service_dispatch_fixture().await;
+        let folder = directory.path().join("菜单项目");
+        std::fs::create_dir(&folder).unwrap();
+        let harness = &authorization.controller.harness;
+        let project = harness
+            .add_local_folder(folder.to_str().unwrap())
+            .await
+            .unwrap();
+        let repeated = harness
+            .add_local_folder(folder.join(".").to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(project["id"], repeated["id"]);
+        let id = project["id"].as_str().unwrap();
+        let context = harness.local_project_context(id).await.unwrap();
+        assert_eq!(context["hostId"], "local");
+        assert_eq!(context["cwd"], project["cwd"]);
+        harness
+            .call(
+                "pinProject",
+                json!({"projectId":id,"pinned":true}),
+                Some(&authorization),
+            )
+            .await
+            .unwrap();
+        let projects = harness.merge_local_projects(vec![]).await;
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0]["pinned"], true);
+        assert!(harness.loaded.lock().await.is_empty());
+        assert!(harness.store.lock().await.data.queues.is_empty());
+        let restored = CodexHarness::new(directory.path()).unwrap();
+        assert_eq!(
+            restored.local_project_context(id).await.unwrap()["cwd"],
+            project["cwd"]
+        );
+        assert_eq!(restored.merge_local_projects(vec![]).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn menu_folder_projects_keep_native_aliases_without_inventing_app_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let harness = CodexHarness::new(directory.path()).unwrap();
+        let local = harness
+            .add_local_folder(directory.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let native = json!({"id":"native-project","serverProjectId":"native-project",
+            "name":"已有项目","roots":local["roots"],"threads":[]});
+        let projects = harness.merge_local_projects(vec![native]).await;
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0]["id"], local["id"]);
+        assert!(projects[0]["desktopProjectId"].is_null());
+        assert_eq!(
+            assigned_index(&json!({"projectId":"native-project"}), &projects),
+            Some(0)
+        );
+        assert_eq!(harness.merge_local_projects(projects).await.len(), 1);
+        assert!(harness.add_local_folder("relative-folder").await.is_err());
+    }
 
     fn preferences(state: Value) -> ProjectPreferences {
         let directory = tempfile::tempdir().unwrap();

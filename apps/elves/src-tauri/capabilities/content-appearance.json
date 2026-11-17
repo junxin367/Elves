@@ -4,5 +4,5 @@
   "local": true,
   "remote": {"urls": ["http://*:*/*", "https://*:*/*"]},
   "webviews": ["elves-content", "elves-content-session-*"],
-  "permissions": ["remote-appearance", "remote-resource-cache", "remote-session-window", "remote-taskbar-badge", "remote-local-inputs"]
+  "permissions": ["remote-appearance", "remote-resource-cache", "remote-session-window", "remote-taskbar-badge", "remote-local-inputs", "remote-project-navigation"]
 }

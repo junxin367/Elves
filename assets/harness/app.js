@@ -22,7 +22,7 @@ import { renderMessages, scheduleMessages } from "./features/conversation/histor
 import { reloadThread } from "./features/conversation/history.js";
 import { restoreStoredPending } from "./features/conversation/pending-store.js";
 import { mutate, resolvePending } from "./features/conversation/pending.js";
-import { selectThread, showWelcome } from "./features/conversation/selection.js";
+import { selectThread, showWelcome, startNewChat } from "./features/conversation/selection.js";
 import { installBackNavigationHandlers, installGlobalInputHandlers } from "./features/global-input.js";
 import { restoreGoalComposerRecoveries } from "./features/goal/composer.js";
 import { renderGoalStatus } from "./features/goal/status.js";
@@ -40,6 +40,7 @@ import {
 } from "./features/session/connection-state.js";
 import { installChannelConfigurationObserver } from "./features/session/connection.js";
 import { connect, reconnectChangedAuthorization } from "./features/session/lifecycle.js";
+import { installNativeProjectListener, openPendingNativeProject } from "./features/session/native-projects.js";
 import { handleInitialConnectionError, requireAuthentication, showLogin } from "./features/session/login.js";
 import { installPageLifecycle, retryConnectionRecovery } from "./features/session/page-lifecycle.js";
 import {
@@ -57,7 +58,7 @@ registerActions({
   messageEditor, mutate, receive, reconnectChangedAuthorization, reloadThread, renderApprovals,
   renderGoalStatus, renderItem, renderMessages, renderQueueArea, renderQueuedEditRecoveryControls,
   renderSidebar, requireAuthentication, resolvePending, retryConnectionRecovery, scheduleMessages,
-  selectThread, shell, showWelcome, updateComposer
+  selectThread, shell, showWelcome, startNewChat, updateComposer
 });
 
 installAndroidClickHapticFeedback();
@@ -84,6 +85,7 @@ installNotificationOpenListener();
 installSidePanelMessageListener();
 installSidePanelAppearanceSync();
 installPageLifecycle();
+installNativeProjectListener();
 postPlatformMessage("ready");
 configureAndroidDiagnostics({
   getSession: () => session,
@@ -92,4 +94,4 @@ configureAndroidDiagnostics({
 });
 installChannelConfigurationObserver();
 if (initialAuthenticationRequired) showLogin();
-else connect().catch(handleInitialConnectionError);
+else connect().then(openPendingNativeProject).catch(handleInitialConnectionError);
