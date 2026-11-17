@@ -7,7 +7,7 @@ import { copyText } from "../ui/clipboard.js";
 import { creating, pageLeaving, selectedId, session, thread } from "../core/state.js";
 import { api } from "./api.js";
 import { privateInputScope } from "./session/capabilities.js";
-import { fileOpenInMenu } from "./session/open-in.js";
+import { applicationIcon, fileOpenInMenu } from "./session/open-in.js";
 import { relatedSessionView } from "./session/related-state.js";
 
 function currentFileBrowserThreadId() {
@@ -92,7 +92,8 @@ export function localFileReferenceActions({ openFile } = {}) {
         action: () => preview(path, line) },
       { value: "openBrowser", label: "浏览器打开", icon: "globe", disabled: !owns(owner),
         action: () => { if (owns(owner)) void openLocalFileInBrowser(path); } },
-      { value: "revealFile", label: "在 File Explorer 打开", icon: "folderClosed", disabled: opening.disabled,
+      // 用户要求所有 File Explorer 直达入口与 Open in 共用彩色应用图标，不再使用灰色线框文件夹。
+      { value: "revealFile", label: "在 File Explorer 打开", renderIcon: () => applicationIcon("fileManager"), disabled: opening.disabled,
         action: () => opening.openTarget({ target: "fileManager" }) },
       { ...opening, value: "openIn", label: "打开方式", icon: "window" },
       { value: "copyPath", label: "复制路径", icon: "copy", separatorBefore: true, disabled: !owns(),

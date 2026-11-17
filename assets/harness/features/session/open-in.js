@@ -37,7 +37,7 @@ export function clientOpenInContext() {
       thread.instanceId || "", thread.wslDistribution || "", thread.wslUser || ""]) };
 }
 
-function applicationIcon(target) {
+export function applicationIcon(target) {
   const id = typeof target === "string" ? target : target?.target;
   const node = element("span", `workspace-open-in-app-icon workspace-open-in-${id || "fallback"}`);
   node.setAttribute("aria-hidden", "true");

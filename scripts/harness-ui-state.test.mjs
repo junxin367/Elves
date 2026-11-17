@@ -3762,7 +3762,7 @@ test("Open in 按执行实例显示 WSL，Windows 挂载目录保留 WSL 身份�
     privateInputScope: () => "scope",
   });
   rawVm.runInContext(workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("export function clientOpenInContext("),
-    workspaceOpenInSource.indexOf("function applicationIcon(")).replace(/^export /, ""), context);
+    workspaceOpenInSource.indexOf("export function applicationIcon(")).replace(/^export /, ""), context);
   const first = context.clientOpenInContext();
   assert.equal(first.wslInstance, true);
   context.thread.wslUser = "other";
