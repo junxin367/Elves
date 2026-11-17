@@ -115,7 +115,7 @@ export function persistSmallInputRecoveries() {
   sessionStorage.setItem("codex-elves-failed-inputs", serialized);
 }
 export function ordinaryInputRecord(record) {
-  return record && ["send", "create"].includes(record.action) && !goalComposerAction(record.action, record.payload);
+  return record && ["send", "create", "editMessage"].includes(record.action) && !goalComposerAction(record.action, record.payload);
 }
 export function rememberDraft() {
   // 欢迎页/只读初始页没有激活的草稿，空编辑器不能覆盖已恢复的 $new 草稿。

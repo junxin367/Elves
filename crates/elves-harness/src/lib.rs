@@ -6748,7 +6748,14 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
  case 'thread/compact/start':event('item/started',{threadId:p.threadId,turnId:'compact',item:{id:'compact',type:'contextCompaction'}});
    setTimeout(()=>event('item/completed',{threadId:p.threadId,turnId:'compact',item:{id:'compact',type:'contextCompaction'}}),fastPolicy.compactDelayMs||20);break;
  case 'thread/name/set':t.name=p.name;break;
- case 'thread/revert':t.turns=t.turns.filter(turn=>turn.id!==p.beforeTurnId);result={thread:t};break;
+ case 'thread/revert':{
+   const index=t.turns.findIndex(turn=>turn.id===p.beforeTurnId);
+   if(index<0||t.turns.some(turn=>turn.status==='inProgress')){
+     output({id:q.id,error:{code:-32600,message:'invalid history revert'}});return;
+   }
+   t.turns=t.turns.slice(0,index);result={thread:t};
+   event('thread/reverted',{threadId:p.threadId});break;
+ }
   case 'thread/delete':
     if(t?.name==='reject-delete'){output({id:q.id,error:{code:-32001,message:'fixture deletion rejected'}});return;}
     if(t?.name==='busy-delete'){output({id:q.id,error:{code:-32600,message:`thread ${p.threadId} already has an active writer`}});return;}
@@ -6973,6 +6980,203 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
             .into_iter()
             .filter(|frame| frame["method"] == "thread/items/list")
             .collect()
+    }
+
+    #[tokio::test]
+    async fn harness_history_edit_reverts_paginated_suffix_and_preserves_original_inputs() {
+        let (directory, authorization, id) =
+            harness_history_fixture("completed", false, false).await;
+        let controller = &authorization.controller;
+        let turns: Vec<_> = (0..105).map(|index| json!({
+            "id":format!("round-{index}"),"status":"completed","startedAt":1000+index,
+            "items":[{"id":format!("user-{index}"),"type":"userMessage","content":[
+                {"type":"text","text":format!("问题 {index}"),"text_elements":[{"start":0,"end":1}]},
+                {"type":"image","url":"data:image/png;base64,fixture"},
+                {"type":"skill","name":"review","path":"C:/fixture/SKILL.md"}
+            ]}]
+        })).collect();
+        controller
+            .harness
+            .seed_test_history(json!({"threadId":id,"turns":turns}))
+            .await
+            .unwrap();
+        let detail = controller
+            .call_authorized("thread", json!({"threadId":id}), &authorization)
+            .await
+            .unwrap();
+        assert_eq!(detail["thread"]["capabilities"]["messageEditHistory"], true);
+        assert_eq!(detail["thread"]["messageEditReady"], true);
+        let first_page = controller
+            .call_authorized("history", json!({"threadId":id}), &authorization)
+            .await
+            .unwrap();
+        assert_eq!(
+            first_page["data"][0]["items"][0]["messageMetadata"]["editable"],
+            true
+        );
+        let older = controller
+            .call_authorized(
+                "history",
+                json!({"threadId":id,"cursor":"turns:102"}),
+                &authorization,
+            )
+            .await
+            .unwrap();
+        assert_eq!(older["data"][1]["id"], "round-1");
+        assert_eq!(
+            older["data"][1]["items"][0]["messageMetadata"]["editable"],
+            true
+        );
+        let payload = json!({"threadId":id,"turnId":"round-1","messageId":"user-1",
+            "historyHead":detail["thread"]["editHistoryHead"],"clientUserMessageId":"historical-edit",
+            "prompt":"修改较早的问题","model":"gpt-6.1-sol","reasoningEffort":"low"});
+        let result = controller
+            .call_authorized("editMessage", payload.clone(), &authorization)
+            .await
+            .unwrap();
+        assert_eq!(result["deliveryState"], "accepted");
+        assert_eq!(result["clientUserMessageId"], "historical-edit");
+        let replay = controller
+            .call_authorized("editMessage", payload.clone(), &authorization)
+            .await
+            .unwrap();
+        assert_eq!(replay, result);
+        let history = controller
+            .call_authorized("history", json!({"threadId":id}), &authorization)
+            .await
+            .unwrap();
+        assert_eq!(history["data"].as_array().unwrap().len(), 2);
+        assert_eq!(history["data"][1]["id"], "round-0");
+        assert!(!history["data"].to_string().contains("user-1\""));
+        let requests = harness_engine_requests(directory.path());
+        let edits: Vec<_> = requests
+            .iter()
+            .filter(|frame| frame["method"] == "thread/revert")
+            .collect();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0]["params"]["beforeTurnId"], "round-1");
+        assert!(
+            requests
+                .iter()
+                .any(|frame| frame["method"] == "thread/turns/list"
+                    && frame["params"]["cursor"] == "turns:100")
+        );
+        let start = requests
+            .iter()
+            .rfind(|frame| frame["method"] == "turn/start")
+            .unwrap();
+        assert_eq!(start["params"]["input"][0]["text"], "修改较早的问题");
+        assert_eq!(start["params"]["input"][0]["text_elements"], json!([]));
+        assert_eq!(
+            start["params"]["input"].as_array().unwrap()[1..],
+            turns[1]["items"][0]["content"].as_array().unwrap()[1..]
+        );
+        assert_eq!(start["params"]["effort"], "low");
+        assert!(!requests.iter().any(
+            |frame| frame["method"] == "thread/read" && frame["params"]["includeTurns"] == true
+        ));
+        let mut collision = payload;
+        collision["prompt"] = json!("同 ID 不同内容");
+        assert!(
+            controller
+                .call_authorized("editMessage", collision, &authorization)
+                .await
+                .is_err()
+        );
+        controller.harness.release().await;
+    }
+
+    #[tokio::test]
+    async fn harness_history_edit_rejects_stale_foreign_and_running_targets_before_revert() {
+        let (directory, authorization, id) =
+            harness_history_fixture("completed", false, false).await;
+        let controller = &authorization.controller;
+        let detail = controller
+            .call_authorized("thread", json!({"threadId":id}), &authorization)
+            .await
+            .unwrap();
+        let baseline = json!({"threadId":id,"turnId":"history-turn","messageId":"item-000",
+            "historyHead":detail["thread"]["editHistoryHead"],"clientUserMessageId":"stale-edit","prompt":"新内容"});
+        let mut stale = baseline.clone();
+        stale["historyHead"] = json!("old-history-head");
+        assert!(
+            controller
+                .call_authorized("editMessage", stale, &authorization)
+                .await
+                .is_err()
+        );
+        let mut foreign = baseline.clone();
+        foreign["messageId"] = json!("another-message");
+        assert!(
+            controller
+                .call_authorized("editMessage", foreign, &authorization)
+                .await
+                .is_err()
+        );
+        controller.harness.seed_test_history(json!({"threadId":id,"turns":[{
+            "id":"history-turn","status":"inProgress","items":[{"id":"item-000","type":"userMessage",
+                "content":[{"type":"text","text":"继续"}]}]
+        }]})).await.unwrap();
+        assert!(
+            controller
+                .call_authorized("editMessage", baseline, &authorization)
+                .await
+                .is_err()
+        );
+        assert!(
+            !harness_engine_requests(directory.path())
+                .iter()
+                .any(|frame| frame["method"] == "thread/revert")
+        );
+        controller.harness.release().await;
+    }
+
+    #[tokio::test]
+    async fn harness_history_edit_unknown_send_confirms_only_the_same_new_message_without_replay() {
+        let (directory, authorization, id) =
+            harness_history_fixture("completed", false, false).await;
+        let controller = &authorization.controller;
+        let detail = controller
+            .call_authorized("thread", json!({"threadId":id}), &authorization)
+            .await
+            .unwrap();
+        let payload = json!({"threadId":id,"turnId":"history-turn","messageId":"item-000",
+            "historyHead":detail["thread"]["editHistoryHead"],"clientUserMessageId":"uncertain-edit",
+            "prompt":"uncertain 历史编辑"});
+        assert!(
+            controller
+                .call_authorized("editMessage", payload.clone(), &authorization)
+                .await
+                .is_err()
+        );
+        let replay = controller
+            .call_authorized("editMessage", payload.clone(), &authorization)
+            .await
+            .unwrap();
+        assert_eq!(replay["outcomeUnknown"], true);
+        let state = controller
+            .call_authorized(
+                "sendState",
+                json!({"threadId":id,"clientUserMessageId":"uncertain-edit"}),
+                &authorization,
+            )
+            .await
+            .unwrap();
+        assert_eq!(state["deliveryState"], "accepted");
+        assert_eq!(state["clientUserMessageId"], "uncertain-edit");
+        let replay = controller
+            .call_authorized("editMessage", payload, &authorization)
+            .await
+            .unwrap();
+        assert_eq!(replay, state);
+        assert_eq!(
+            harness_engine_requests(directory.path())
+                .iter()
+                .filter(|frame| frame["method"] == "thread/revert")
+                .count(),
+            1
+        );
+        controller.harness.release().await;
     }
 
     #[tokio::test]

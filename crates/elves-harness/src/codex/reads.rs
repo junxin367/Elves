@@ -337,6 +337,12 @@ impl CodexHarness {
             self.latest_turn(id)
         )?;
         thread["goal"] = goal["goal"].clone();
+        // 用户要求 Codex 任意历史轮次可编辑；逐条标记由 history 提供，不能再只暴露最后一条。
+        thread["capabilities"]["messageEdit"] = json!(true);
+        thread["capabilities"]["messageEditHistory"] = json!(true);
+        thread["editHistoryHead"] = super::message_edit::history_head(latest.as_ref());
+        thread["messageEditReady"] =
+            json!(latest.is_some() && self.message_edit_ready(id, &thread).await);
         self.projection
             .lock()
             .await
@@ -447,9 +453,12 @@ impl CodexHarness {
         if let Some(turn_id) = payload["turnId"].as_str() {
             // 用户要求服务模式可以实际翻页；网页用 itemCursor 表示消息游标，不能误读成轮次 cursor。
             let item_cursor = history_cursor(&payload["itemCursor"], "消息分页游标")?;
-            let page = self
+            let mut page = self
                 .history_turn_items(id, turn_id, &payload["turnStatus"], item_cursor)
                 .await?;
+            if !subagent {
+                super::message_edit::decorate_items(turn_id, &mut page.items);
+            }
             let history = json!({"ok":true,"scope":"items","threadId":id,"turnId":turn_id,"data":page.items,
                 "itemOrder":"asc","itemDirection":"older","itemsPageComplete":true,
                 "itemsComplete":page.next_cursor.is_none(),"itemsNextCursor":page.next_cursor,
@@ -483,9 +492,14 @@ impl CodexHarness {
         let items = futures_util::future::try_join_all(item_reads).await?;
         for (turn, items) in turns.iter_mut().zip(items) {
             let turn_id = required(turn, "id")?.to_owned();
-            pagination.insert(turn_id, items.pagination());
+            pagination.insert(turn_id.clone(), items.pagination());
             items.apply_to(turn);
             *turn = crate::service_history::normalize_history_turn(turn.clone());
+            if !subagent {
+                if let Some(items) = turn["items"].as_array_mut() {
+                    super::message_edit::decorate_items(&turn_id, items);
+                }
+            }
         }
         let history = json!({"ok":true,"scope":"turns","threadId":id,"data":turns,
             "nextCursor":next_cursor,"backwardsCursor":page["backwardsCursor"],

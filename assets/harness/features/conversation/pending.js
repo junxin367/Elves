@@ -47,8 +47,11 @@ export async function mutate(action, payload, { reliable = false, receiptId = nu
     try {
       const record = {
         id, action, payload, deviceId: session.device.id, selectionToken, time: Date.now(),
-        ...(["send", "create", "setGoal"].includes(action) ? {
-          draft: submittedDrafts.get(payload) || snapshotDraft(),
+        ...(["send", "create", "setGoal", "editMessage"].includes(action) ? {
+          // 历史回退事件会重新加载正文；先保存编辑文字，失败或刷新后不能随旧消息节点一起丢失。
+          draft: action === "editMessage"
+            ? { text: payload.prompt, skills: [], attachments: [], goalMode: null }
+            : submittedDrafts.get(payload) || snapshotDraft(),
           ...(goalAction ? { goalReadVersion: goalVersion } : {})
         } : {})
       };
@@ -152,7 +155,7 @@ export async function mutate(action, payload, { reliable = false, receiptId = nu
     });
   }
   if (result.state === "pending") {
-    const confirmed = (action === "send" || action === "editMessage" && claudeThreadId(payload?.threadId)) && ownsPending()
+    const confirmed = (action === "send" || action === "editMessage") && ownsPending()
       ? await confirmPendingSend(pending, result.result).catch(() => null) : null;
     if (confirmed && ownsPending()) result = { state: "completed", result: confirmed };
     else {
@@ -164,11 +167,11 @@ export async function mutate(action, payload, { reliable = false, receiptId = nu
     }
   }
   if (result.state === "unknown") {
-    const confirmed = action === "send" && ownsPending()
+    const confirmed = (action === "send" || action === "editMessage") && ownsPending()
       ? await confirmPendingSend(pending, result.result).catch(() => null) : null;
     if (confirmed && ownsPending()) result = { state: "completed", result: confirmed };
     else {
-      if (ownsPending() && (queueAction || action === "send"
+      if (ownsPending() && (queueAction || action === "send" || action === "editMessage"
           || queuedEditActions.has(action) && session.capabilities?.queueEditRecovery === true))
         void resolvePending();
       throw Object.assign(new Error(result.result?.message || "送达状态未知，请在会话中确认，勿重复发送"), {
@@ -229,7 +232,7 @@ export async function resolvePending() {
       }
       return;
     }
-    if ((current.action === "send" || current.action === "editMessage" && claudeThreadId(current.payload?.threadId))
+    if ((current.action === "send" || current.action === "editMessage")
         && ["pending", "unknown"].includes(receipt.state)) {
       const confirmed = await confirmPendingSend(current, receipt.result);
       if (!stillCurrent()) return;

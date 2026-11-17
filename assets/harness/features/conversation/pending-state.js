@@ -4,7 +4,6 @@ import { notice } from "../../ui/notice.js";
 import { updateComposer } from "../../core/actions.js";
 import { selectedId, session, turns } from "../../core/state.js";
 import { api } from "../api.js";
-import { claudeThreadId } from "../session/capabilities.js";
 
 export let pendingTimer = null;
 export function setPendingTimer(value) { return pendingTimer = value; }
@@ -36,7 +35,8 @@ export function acceptedSendItem(items, clientId) {
 export async function confirmPendingSend(current, result = {}) {
   const threadId = current.payload?.threadId;
   const clientId = result?.clientUserMessageId ?? current.payload?.clientUserMessageId;
-  const historicalEdit = current.action === "editMessage" && claudeThreadId(threadId);
+  // 两种原生实例的历史编辑都必须确认新消息已接收，原消息或排队记录不能充当成功证据。
+  const historicalEdit = current.action === "editMessage";
   if (current.action !== "send" && !historicalEdit || typeof threadId !== "string"
       || typeof clientId !== "string" || !/^[a-zA-Z0-9_-]{1,120}$/.test(clientId)
       || result?.threadId && result.threadId !== threadId

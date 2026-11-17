@@ -163,6 +163,9 @@ export async function recoverFailedInput(record) {
   }
   if (generation !== recoveryGeneration || record.deviceId !== session?.device.id) return;
   failedInputRecoveries.set(record.id, recovery);
+  // 历史编辑失败只恢复修改文字；原生附件由成功重发保留，不能把文字恢复误报为附件也已恢复。
+  if (record.action === "editMessage")
+    notice("历史编辑未完成，修改文字已保留；请核对当前会话历史和原附件后再发送。", true);
   const isCurrent = draftKey() === key && !editingQueuedMessage && !editingMessage;
   if (isCurrent && composerAttachmentsLoading()) return;
   const existing = isCurrent ? snapshotDraft() : storedDraft(key);

@@ -394,7 +394,10 @@ function renderFailedInputRecovery(root) {
     && record.recoveryScope === scope && (record.payload.threadId || newDraftKey(record.payload.projectId, record.payload.backend, record.payload.instanceId)) === key);
   if (!record) return;
   const empty = !editingQueuedMessage && !editingMessage && inputDraftEmpty(snapshotDraft());
-  const box = element("div", "pending-banner", empty
+  const box = element("div", "pending-banner", record.action === "editMessage"
+    ? empty ? "上次历史编辑未完成，修改文字已保留；恢复后请核对当前历史和原附件。"
+      : "上次历史编辑未完成，修改文字已保留；清空当前输入后可恢复，当前草稿不会被覆盖。"
+    : empty
     ? "上次发送失败，原文字、Skill 和图片已保留，可恢复到输入框。"
     : "上次发送失败，原输入已保留；清空当前输入后可恢复，当前内容不会被覆盖。");
   const restore = button("恢复输入", "恢复上次失败的输入，不会自动发送", async () => {

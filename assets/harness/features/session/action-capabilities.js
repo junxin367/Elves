@@ -14,7 +14,8 @@ export function claudeCommandSupported(name) {
     : !creating && thread?.capabilities?.[name === "goal" ? "goalComposer" : name] === true;
 }
 export function threadSentMessageEditAllowed(id = selectedId) {
-  if (claudeThreadId(id)) return thread?.id === id && thread.capabilities?.messageEdit === true
+  if (claudeThreadId(id) || thread?.id === id && thread.capabilities?.messageEditHistory === true)
+    return thread?.id === id && thread.capabilities?.messageEdit === true
     && thread.messageEditReady === true && !threadReadOnly(id);
   if (!id) return false;
   const view = relatedViewForThread(id);

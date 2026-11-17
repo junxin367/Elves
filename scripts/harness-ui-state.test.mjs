@@ -955,8 +955,9 @@ test("仅独立客户端后台保留十五秒角标轮询，停止后清零且�
   assert.equal(intervals.length, 1);
 });
 
-function claudeHistoryEditHarness() {
-  const id = "claude-11111111-2222-4333-8444-555555555555";
+function claudeHistoryEditHarness(backend = "claude") {
+  const id = backend === "claude" ? "claude-11111111-2222-4333-8444-555555555555"
+    : "11111111-2222-4333-8444-555555555555";
   const first = { id: "first-message", type: "userMessage", text: "较早的问题",
     messageMetadata: { turnId: "first-turn", messageId: "first-message", editable: true } };
   const second = { id: "second-message", type: "userMessage",
@@ -966,7 +967,7 @@ function claudeHistoryEditHarness() {
       capabilities: { messageEdit: true, messageEditHistory: true } },
     turns: new Map([["first-turn", { id: "first-turn", items: [first] }],
       ["second-turn", { id: "second-turn", items: [second] }]]),
-    claudeThreadId: value => value === id, threadReadOnly: () => false, relatedViewForThread: () => null,
+    claudeThreadId: value => backend === "claude" && value === id, threadReadOnly: () => false, relatedViewForThread: () => null,
     connected: true, busy: false, stopping: false, pending: null, editingMessage: null, editingQueuedMessage: null,
     compactionLocked: () => false, isActiveThread: () => false, rememberDraft() {},
     messageCopyText: item => item.text, randomId: () => "edit-client", closeComposerMenus() {},
@@ -978,8 +979,9 @@ function claudeHistoryEditHarness() {
   return { context, id, first };
 }
 
-test("Claude 历史编辑保留每条原生消息的编辑能力，并能选择较早问题", () => {
-  const { context, id, first } = claudeHistoryEditHarness();
+for (const backend of ["claude", "codex"]) {
+test(`${backend} 历史编辑保留每条原生消息的编辑能力，并能选择较早问题`, () => {
+  const { context, id, first } = claudeHistoryEditHarness(backend);
   context.syncEditableMessageMetadata();
   assert.equal(first.messageMetadata.editable, true);
   context.beginMessageEdit(id, first);
@@ -994,8 +996,8 @@ test("Claude 历史编辑保留每条原生消息的编辑能力，并能选择�
   assert.equal(context.editingMessage, null);
 });
 
-test("Claude 历史编辑核对原生历史头与具体节点，Codex 保留原有最后一条校验", () => {
-  const { context, first } = claudeHistoryEditHarness();
+test(`${backend} 历史编辑核对原生历史头与具体节点，旧引擎保留最后一条校验`, () => {
+  const { context, first } = claudeHistoryEditHarness(backend);
   const edit = { turnId: "first-turn", messageId: "first-message", historyHead: "native-head" };
   assert.equal(context.messageEditStale(edit), false);
   context.thread.editHistoryHead = "new-native-head";
@@ -1009,12 +1011,12 @@ test("Claude 历史编辑核对原生历史头与具体节点，Codex 保留原�
   assert.equal(context.messageEditStale(context.thread.editableMessage), false);
 });
 
-test("Claude 历史编辑的未知回执只核对同一新消息，排队证据不能确认编辑成功", async () => {
-  const id = "claude-11111111-2222-4333-8444-555555555555", calls = [];
+test(`${backend} 历史编辑的未知回执只核对同一新消息，排队证据不能确认编辑成功`, async () => {
+  const { id } = claudeHistoryEditHarness(backend), calls = [];
   let state = "queued";
   const context = nodeVm.createContext({ nativeConnectionVersion: 1,
     selectedId: id, session: { device: { id: "device" }, capabilities: { queueSendRecovery: true } },
-    turns: new Map(), pendingSendRequest: null, claudeThreadId: value => value === id,
+    turns: new Map(), pendingSendRequest: null,
     acceptedSendItem: () => null,
     api: async (path, payload) => {
       calls.push(path);
@@ -1030,6 +1032,7 @@ test("Claude 历史编辑的未知回执只核对同一新消息，排队证据�
   assert.equal((await context.confirmPendingSend(current)).deliveryState, "accepted");
   assert.equal(calls.length, 2);
 });
+}
 
 test("设置 Select 的调试代理只放行固定设置接口，不扩大到任意路径", () => {
   const context = nodeVm.createContext();
@@ -9145,6 +9148,26 @@ function queuedReceiptHarness({ disk = storage(), refresh = async () => {} } = {
     ? context.steerQueuedMessage("main", "queued-a") : context.removeQueuedMessage("main", "queued-a");
   return { context, requests, notices, refreshes, timers, draft, area, disk, clearedDrafts, receipt, completed, invoke };
 }
+
+test("历史编辑提交前持久保存修改文字，不能把普通输入框草稿误作编辑内容", async () => {
+  const h = queuedReceiptHarness(), writes = [];
+  h.context.setRecoveryScope = value => { h.context.recoveryScope = value; };
+  h.context.recoveryStore.put = async (_scope, entries) => { writes.push(...entries); };
+  const ordinary = h.draft.text;
+  const payload = { threadId: "main", turnId: "old-turn", messageId: "old-message",
+    prompt: "修改后的历史问题", historyHead: "native-head", clientUserMessageId: "edited-client" };
+  const submission = h.context.mutate("editMessage", payload, { reliable: true });
+  await new Promise(resolve => setImmediate(resolve));
+  const record = writes.find(entry => entry.kind === "pending").value;
+  assert.equal(record.draft.text, payload.prompt);
+  assert.equal(record.payload.clientUserMessageId, "edited-client");
+  assert.equal(h.draft.text, ordinary, "编辑不能覆盖原有普通草稿");
+  assert.equal(h.context.ordinaryInputRecord(record), true, "失败后的编辑文字可沿用草稿恢复");
+  h.receipt(0, "completed", { ok: true, threadId: "main", deliveryState: "accepted",
+    clientUserMessageId: "edited-client" });
+  await submission;
+  assert.equal(h.draft.text, ordinary);
+});
 
 test("Claude 引导确认前不展示正文，成功后保留一份消息", async () => {
   const h = queuedReceiptHarness();

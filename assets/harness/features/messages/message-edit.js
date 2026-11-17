@@ -48,7 +48,7 @@ export function cancelMessageEdit({ focus = true } = {}) {
 }
 function messageEditStale(edit) {
   if (thread?.capabilities?.messageEditHistory === true) {
-    // Claude 按每条原生用户消息编辑；保留开始编辑时的历史头，CLI 新增内容后需重新核对编辑目标。
+    // Codex 和 Claude 均保留开始编辑时的原生历史头；其他端新增内容后需重新核对编辑目标。
     const item = turns.get(edit.turnId)?.items?.find(item => item.id === edit.messageId && item.type === "userMessage");
     return !edit.historyHead || edit.historyHead !== thread.editHistoryHead || item?.messageMetadata?.editable !== true;
   }
@@ -89,6 +89,11 @@ export function messageEditor() {
     const status = element("small", "message-editor-status error-text");
     status.setAttribute("role", "status"); status.hidden = true;
     actions.append(status, cancel, send);
+    // 用户要求参考 Codex 编辑历史；提交才回退原轮次及后续历史，取消不能修改历史或工作区文件。
+    if (thread?.capabilities?.messageEditHistory === true && !edit.threadId.startsWith("claude-")) {
+      form.append(element("small", "message-editor-hint",
+        "重新发送将移除该轮及之后的会话历史；已修改的工作区文件不会回退。"));
+    }
     form.append(input, actions);
     form.onsubmit = event => { event.preventDefault(); void submitMessageEdit(); };
     input.oninput = () => { edit.text = input.value; edit.error = ""; updateMessageEditor(); };

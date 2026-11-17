@@ -274,6 +274,15 @@ impl Projection {
         self.retired_plan_turns.insert(key);
     }
 
+    pub fn retire_history_turns(&mut self, id: &str, turns: &[String]) {
+        // 历史编辑移除从原轮次开始的整个后缀；之前的计划和压缩记录必须保留。
+        for turn in turns {
+            self.retire_turn_plan(id, turn);
+        }
+        self.compaction_records
+            .retain(|record| record.thread_id != id || !turns.contains(&record.turn_id));
+    }
+
     fn decorate_turn_plan(&self, id: &str, turn: &mut Value) {
         let Some(turn_id) = turn["id"].as_str() else {
             return;
@@ -494,6 +503,16 @@ impl Projection {
             .unwrap_or("")
             .to_owned();
         if self.is_deleted(&id) && method != "thread/deleted" {
+            return;
+        }
+        // 历史编辑移除的轮次不能被同代次迟到的消息、计划或压缩事件重新放回正文。
+        if let Some(turn_id) = frame["params"]["turnId"]
+            .as_str()
+            .or_else(|| frame["params"]["turn"]["id"].as_str())
+            && self
+                .retired_plan_turns
+                .contains(&(id.clone(), turn_id.to_owned()))
+        {
             return;
         }
         if method == "turn/plan/updated" {
@@ -961,17 +980,33 @@ mod tests {
     #[test]
     fn harness_plan_snapshot_retires_reverted_turn_and_isolates_engine_generations() {
         let mut projection = Projection::default();
-        for turn in ["kept", "edited"] {
+        for turn in ["kept", "edited", "later"] {
             projection.ingest(json!({"method":"turn/plan/updated","params":{
                 "threadId":"main","turnId":turn,"plan":[{"step":turn,"status":"pending"}]}}));
+            projection.remember_compaction(
+                "main",
+                turn,
+                json!({"id":format!("compact-{turn}"),"type":"contextCompaction"}),
+                true,
+            );
         }
-        projection.retire_turn_plan("main", "edited");
+        projection.retire_history_turns("main", &["edited".into(), "later".into()]);
+        assert_eq!(projection.compaction_records.len(), 1);
+        assert_eq!(projection.compaction_records[0].turn_id, "kept");
         projection.ingest(json!({"method":"turn/plan/updated","params":{
             "threadId":"main","turnId":"edited","plan":[{"step":"迟到旧任务","status":"pending"}]}}));
+        projection.ingest(json!({"method":"item/completed","params":{
+            "threadId":"main","turnId":"later","item":{"id":"late-compact","type":"contextCompaction"}}}));
+        assert_eq!(projection.compaction_records.len(), 1);
         let page = json!({"data":[{"id":"kept","items":[]},{"id":"edited","items":[]}]});
         let history = projection.history("main", page.clone(), true);
         assert_eq!(history["data"][0]["plan"][0]["step"], "kept");
         assert!(history["data"][1].get("plan").is_none());
+        assert!(
+            !projection
+                .plans
+                .contains_key(&("main".into(), "later".into()))
+        );
 
         let previous_epoch = projection.epoch.clone();
         projection

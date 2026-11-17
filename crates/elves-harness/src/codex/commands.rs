@@ -509,7 +509,7 @@ impl CodexHarness {
             .await
     }
 
-    async fn start_input(
+    pub(super) async fn start_input(
         &self,
         id: &str,
         payload: &Value,
@@ -789,83 +789,6 @@ impl CodexHarness {
             .entry(id.to_owned())
             .or_insert_with(|| json!({}))["goal"] = response["goal"].clone();
         Ok(json!({"ok":true,"threadId":id,"goal":response["goal"]}))
-    }
-
-    async fn edit_message(
-        &self,
-        id: &str,
-        payload: &Value,
-        authorization: &HarnessAuthorization,
-    ) -> anyhow::Result<Value> {
-        let history = self
-            .runtime
-            .request(
-                "thread/read",
-                json!({"threadId":id,"includeTurns":true}),
-                None,
-            )
-            .await?;
-        let turn = history["thread"]["turns"]
-            .as_array()
-            .and_then(|t| t.last())
-            .ok_or_else(|| error(409, "没有可编辑的消息"))?;
-        if turn["id"] != payload["turnId"]
-            || turn["status"] == "inProgress"
-            || !turn["items"].as_array().is_some_and(|items| {
-                items
-                    .iter()
-                    .any(|i| i["type"] == "userMessage" && i["id"] == payload["messageId"])
-            })
-        {
-            return Err(error(409, "最后一条用户消息已变化"));
-        }
-        let message = turn["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|i| i["id"] == payload["messageId"])
-            .unwrap();
-        let mut input = message["content"]
-            .as_array()
-            .cloned()
-            .ok_or_else(|| error(409, "原消息输入尚未完整加载"))?;
-        let mut replaced = false;
-        for item in &mut input {
-            if item["type"] == "text" && !replaced {
-                item["text"] = payload["prompt"].clone();
-                item["text_elements"] = json!([]);
-                replaced = true;
-            }
-        }
-        if !replaced {
-            input.insert(
-                0,
-                json!({"type":"text","text":payload["prompt"],"text_elements":[]}),
-            );
-        }
-        self.ensure_loaded(id, authorization).await?;
-        self.runtime
-            .request(
-                "thread/revert",
-                json!({"threadId":id,"beforeTurnId":payload["turnId"]}),
-                Some(authorization),
-            )
-            .await?;
-        // 回退后以新的原生历史为准，不能把已删除轮次中的压缩或任务计划重新补回。
-        {
-            let mut projection = self.projection.lock().await;
-            projection.forget_compactions(id);
-            projection.retire_turn_plan(id, payload["turnId"].as_str().unwrap_or(""));
-        }
-        let mut followup = payload.clone();
-        followup["clientUserMessageId"] = json!(uuid::Uuid::new_v4().to_string());
-        // 修改文字仍保留原消息的图片等输入，不能在回退后悄悄丢失附件。
-        let result = self.start_input(id, &followup, input, authorization).await;
-        self.projection
-            .lock()
-            .await
-            .push(json!({"method":"remote/threadReverted","params":{"threadId":id}}));
-        result
     }
 
     pub(super) async fn respond(
