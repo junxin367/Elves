@@ -288,22 +288,23 @@ impl SharedSettings {
         let models = changed(&["model", "reasoningEffort", "effortLevel", "ultraReasoningEnabled",
             "defaultServiceTier", "hiddenModelIds"]);
         let skills = changed(&["skill", "syncClaudeAiSkills", "syncClaudeAiPlugins", "disableBundledSkills"]);
-        self.publish_instance_change(controller, instance, Some((models, skills)));
+        self.publish_instance_change(controller, instance, Some((models, skills, changes.get("instructions").is_some())));
     }
 
     fn publish_instance_change(
         &self,
         controller: &HarnessController,
         instance: &str,
-        catalogs: Option<(bool, bool)>,
+        catalogs: Option<(bool, bool, bool)>,
     ) {
         let revision = self.instance_revision.fetch_add(1, Ordering::AcqRel) + 1;
         let mut params = json!({
             "kind":"instance","instanceId":instance,"epoch":self.epoch,"instanceRevision":revision
         });
-        if let Some((models, skills)) = catalogs {
+        if let Some((models, skills, instructions)) = catalogs {
             params["modelCatalogChanged"] = json!(models);
             params["skillCatalogChanged"] = json!(skills);
+            params["instructionsChanged"] = json!(instructions);
         }
         controller.publish_event(json!({"method":"remote/settingsChanged","params":params}));
     }

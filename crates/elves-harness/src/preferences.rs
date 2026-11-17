@@ -634,18 +634,21 @@ pub(super) async fn instructions(
             })
             .map_err(super::authorization_error)?;
         (text, exists, revision) = read_instruction(&path)?;
-        state.controller.shared_settings.instance_changed(
+        // 指令保存不改变模型或 Skills 目录；用明确影响标记和回执版本避免设置页重复加载。
+        state.controller.shared_settings.instance_settings_changed(
             &state.controller,
             payload["instanceId"].as_str().unwrap_or(""),
+            &json!({"instructions":true}),
         );
     }
     authorization
         .check()
         .await
         .map_err(super::authorization_error)?;
-    Ok(response(
-        json!({"ok":true,"path":display,"content":text,"exists":exists,"revision":revision}),
-    ))
+    let (settings_epoch, instance_revision) = state.controller.shared_settings.instance_version();
+    Ok(response(json!({"ok":true,"instanceId":payload["instanceId"],"path":display,
+        "content":text,"exists":exists,"revision":revision,
+        "settingsEpoch":settings_epoch,"instanceRevision":instance_revision})))
 }
 
 #[cfg(test)]

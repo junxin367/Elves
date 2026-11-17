@@ -44,7 +44,8 @@ export function permissionLabel(backend, mode, creating = false) {
 
 export function mountInstancePermissions({
   page, element, selectControl, setSelectOptions, setSelectValue, api, getInstances,
-  readOnly, authorizationScope, onLoaded = () => {}, onSaved = () => {}
+  readOnly, authorizationScope, onLoaded = () => {}, onSaved = () => {},
+  cache = null, confirmReload = async () => true
 }) {
   const scope = authorizationScope();
   const current = () => page.isConnected && scope === authorizationScope();
@@ -67,19 +68,25 @@ export function mountInstancePermissions({
   const instances = selectControl("permission-instance", "权限设置的会话实例", [], "");
   instanceSlot.append(instances);
   const records = new Map(), reading = new Map(), writing = new Set();
+  const fieldControls = new Set();
   let disposed = false, selected = "";
   const alive = () => !disposed && current();
   const instance = () => getInstances().find(instance => instance.id === selected);
-  const allowed = () => alive() && !readOnly() && records.get(selected)?.readOnly !== true;
+  const ownerKey = id => cache?.identity(id) ?? id;
+  const allowed = () => alive() && !readOnly() && records.get(selected)?.readOnly !== true
+    && !!instance() && !instance().error && !records.get(selected)?.needsRead
+    && (!records.has(selected) || records.get(selected).owner === ownerKey(selected))
+    && !cache?.peek(selected)?.blocked;
   const changes = record => Object.fromEntries(Object.entries(record?.draft || {})
     .filter(([key, value]) => value !== record.original[key]));
   const syncButtons = () => {
     const record = records.get(selected), loading = reading.has(selected), busy = writing.has(selected);
-    save.disabled = !allowed() || loading || busy || !record || !Object.keys(changes(record)).length;
+    save.disabled = !allowed() || busy || !record || !Object.keys(changes(record)).length;
     save.textContent = busy ? "正在保存…" : "保存权限";
     save.setAttribute("aria-busy", String(busy));
     reload.disabled = loading || busy;
     instances.disabled = !getInstances().length;
+    for (const control of fieldControls) control.disabled = !allowed() || busy || control.permissionUnsupported;
   };
   function addField(label, name, options, value, disabled = false) {
     const row = element("label", "appearance-field instance-permission-field");
@@ -89,10 +96,14 @@ export function mountInstancePermissions({
     if (!options.some(option => option.value === value))
       options = [...options, { value, label: "当前自定义配置（保留）", disabled: true }];
     const control = selectControl(`permission-global-${name}`, label, options, value);
+    control.permissionUnsupported = disabled; fieldControls.add(control);
     control.disabled = disabled || !allowed() || writing.has(selected);
+    const owner = records.get(selected), ownerId = selected;
     control.onchange = () => {
       const record = records.get(selected);
-      if (!allowed() || !record || writing.has(selected)) return;
+      // 用户要求迟到选择仍绑定编辑时的实例与记录，不能把旧控件的值写入刚切换的权限配置。
+      if (!allowed() || !record || writing.has(selected) || record !== owner || selected !== ownerId
+          || control.isConnected === false) return;
       record.draft[name] = control.value;
       record.message = "";
       status.textContent = "尚未保存";
@@ -104,9 +115,9 @@ export function mountInstancePermissions({
   function render() {
     if (!alive()) return;
     const record = records.get(selected);
-    fields.replaceChildren();
+    fields.replaceChildren(); fieldControls.clear();
     path.textContent = record?.path || "";
-    status.textContent = reading.has(selected) ? "正在读取实例权限…" : record?.message || "";
+    status.textContent = reading.has(selected) && !record ? "正在读取实例权限…" : record?.message || "";
     if (record) {
       const defaults = { value: "", label: "使用原生默认" };
       if (record.backend === "codex") {
@@ -133,37 +144,64 @@ export function mountInstancePermissions({
     }
     syncButtons();
   }
+  function receive(id, result, discard = false) {
+    const target = getInstances().find(instance => instance.id === id);
+    if (result?.instanceId !== id || result.backend !== target?.backend
+        || typeof result.revision !== "string" || !result.settings || typeof result.settings !== "object"
+        || Array.isArray(result.settings)) throw new Error("实例权限读取结果不匹配，请重新读取。");
+    const previous = records.get(id);
+    if (!discard && previous?.source === result && previous.owner === ownerKey(id)) {
+      previous.needsRead = !!Object.keys(changes(previous)).length && previous.revision !== result.revision;
+      return false;
+    }
+    const original = target.backend === "codex" ? {
+      approvalPolicy: result.settings.customApproval ? "__custom__" : result.settings.approvalPolicy || "",
+      sandboxMode: result.settings.sandboxMode || ""
+    } : { permissionMode: result.settings.permissionMode || "" };
+    const dirty = previous && Object.keys(changes(previous)).length;
+    // 后台核对保留未保存权限和原编辑版本；配置已变化时显式重读后合并，不能悄悄借新版本覆盖。
+    const preserve = !discard && dirty && previous.owner === ownerKey(id);
+    records.set(id, { ...result, ...result.settings, source: result, owner: ownerKey(id),
+      original: preserve ? previous.original : original, draft: preserve ? previous.draft : { ...original },
+      revision: preserve ? previous.revision : result.revision,
+      needsRead: preserve && previous.revision !== result.revision,
+      message: preserve && previous.revision !== result.revision
+        ? "实例权限已变化，未保存的修改已保留；请重新读取后合并。" : discard ? "" : previous?.message || "" });
+    onLoaded(id, result);
+    return true;
+  }
   async function load(id, force = false) {
     if (!id || !alive() || writing.has(id)) return;
-    if (!force && records.has(id)) { render(); return; }
+    const cached = cache?.peek(id);
+    let changed = false;
+    if (cached) changed = receive(id, cached.value, force);
+    if (!force && (cache ? cached?.fresh : records.has(id))) {
+      if (changed) render(); else syncButtons();
+      return;
+    }
     if (reading.has(id)) return reading.get(id);
-    const operation = api("/api/settings/permissions", { instanceId: id }).then(result => {
-      if (!alive()) return;
-      const owner = getInstances().find(instance => instance.id === id);
-      if (result?.instanceId !== id || result.backend !== owner?.backend
-          || typeof result.revision !== "string" || !result.settings || typeof result.settings !== "object")
-        throw new Error("实例权限读取结果不匹配，请重新读取。");
-      const original = owner.backend === "codex" ? {
-        approvalPolicy: result.settings.customApproval ? "__custom__" : result.settings.approvalPolicy || "",
-        sandboxMode: result.settings.sandboxMode || ""
-      } : { permissionMode: result.settings.permissionMode || "" };
-      records.set(id, { ...result, ...result.settings, original, draft: { ...original }, message: "" });
-      onLoaded(id, result);
+    const identity = ownerKey(id);
+    if (records.has(id)) records.get(id).needsRead = force || cached?.blocked === true;
+    const operation = (cache ? cache.read(id, { force, background: records.has(id) })
+      : api("/api/settings/permissions", { instanceId: id })).then(result => {
+      if (!alive() || ownerKey(id) !== identity || reading.get(id) !== operation) return;
+      changed = receive(id, result, force) || changed;
     }).catch(error => {
       if (!alive()) return;
       const record = records.get(id);
-      if (record) record.message = error.message;
+      if (error.name === "AbortError") return;
+      if (record) { record.message = error.message; record.needsRead = true; }
       if (selected === id) status.textContent = error.message;
     }).finally(() => {
+      if (reading.get(id) !== operation) return;
       reading.delete(id);
       if (alive() && selected === id) {
-        // 没有已确认配置时保留读取错误，不能用空默认值开放保存。
-        if (records.has(id)) render();
+        if (changed) render();
         else syncButtons();
       }
     });
     reading.set(id, operation);
-    render();
+    if (!records.has(id) || changed) render(); else syncButtons();
     return operation;
   }
   instances.onchange = () => {
@@ -171,10 +209,15 @@ export function mountInstancePermissions({
     render();
     void load(selected);
   };
-  reload.onclick = () => void load(selected, true);
+  reload.onclick = async () => {
+    if (Object.keys(changes(records.get(selected))).length && !await confirmReload()) return;
+    if (alive()) await load(selected, true);
+  };
   save.onclick = async () => {
     const id = selected, record = records.get(id), settings = changes(record);
     if (!allowed() || !record || !Object.keys(settings).length || writing.has(id)) return;
+    const identity = ownerKey(id);
+    reading.delete(id); cache?.invalidate(id);
     writing.add(id);
     record.message = "";
     render();
@@ -182,36 +225,56 @@ export function mountInstancePermissions({
       const result = await api("/api/settings/permissions", {
         operation: "save", instanceId: id, expectedRevision: record.revision, settings
       });
-      if (!alive()) return;
+      if (scope !== authorizationScope()) return;
+      if (ownerKey(id) !== identity) throw new Error("实例或服务已变化，请重新读取核对权限保存结果。");
       if (result?.instanceId !== id || typeof result.revision !== "string"
           || !result.settings || result.backend !== record.backend)
         throw new Error("保存结果尚未确认，请重新读取实例权限。");
+      for (const [key, value] of Object.entries(settings)) {
+        const actual = result.settings[key] || "";
+        if (actual !== value && !(key === "permissionMode"
+            && ["manual", "default"].includes(actual) && ["manual", "default"].includes(value)))
+          throw new Error("权限保存回执与提交不一致，请重新读取核对。");
+      }
+      const confirmed = cache?.store(id, result) || result;
+      if (!alive()) return;
       const original = record.backend === "codex" ? {
         approvalPolicy: result.settings.customApproval ? "__custom__" : result.settings.approvalPolicy || "",
         sandboxMode: result.settings.sandboxMode || ""
       } : { permissionMode: result.settings.permissionMode || "" };
-      records.set(id, { ...record, ...result, ...result.settings, original, draft: { ...original },
+      records.set(id, { ...record, ...result, ...result.settings, source: confirmed,
+        needsRead: cache?.peek(id)?.blocked === true, original, draft: { ...original },
         message: "已保存至实例全局配置。新会话及后续按实例配置加载的操作使用新设置。" });
       onSaved(id, result);
     } catch (error) {
-      if (alive()) record.message = `${error.message} 未自动重复保存，可重新读取核对。`;
+      if (alive()) { record.needsRead = true; record.message = `${error.message} 未自动重复保存，可重新读取核对。`; }
     } finally {
       writing.delete(id);
-      if (alive() && selected === id) render();
+      if (alive() && selected === id) {
+        render();
+        if (cache?.peek(id)?.blocked) void load(id);
+      }
     }
   };
   return {
     async show(id = null) {
       if (!alive()) return;
+      const previous = selected;
       const choices = getInstances().map(instance => ({ value: instance.id, label: instance.label, icon: instance.backend,
         disabled: !!instance.error }));
-      selected = choices.some(option => option.value === id) ? id
-        : choices.some(option => option.value === selected) ? selected : choices[0]?.value || "";
+      selected = id || selected || choices.find(option => !option.disabled)?.value || "";
+      if (selected && !choices.some(option => option.value === selected))
+        choices.push({ value: selected, label: selected, disabled: true });
       setSelectOptions(instances, choices, selected);
       setSelectValue(instances, selected);
-      render();
+      if (previous !== selected || !records.has(selected)) render(); else syncButtons();
       if (!selected) status.textContent = "尚未检测到可配置的实例";
+      else if (!instance() || instance().error) status.textContent = "所选实例暂不可用，请重新检测或明确选择其他实例。";
       else await load(selected);
+    },
+    refreshInstance(id) {
+      if (!alive() || id && id !== selected || writing.has(selected)) return;
+      if (selected) void load(selected);
     },
     dispose() { disposed = true; }
   };

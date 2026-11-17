@@ -597,10 +597,12 @@ pub(super) async fn settings(
         .check()
         .await
         .map_err(super::authorization_error)?;
+    let (settings_epoch, instance_revision) = state.controller.shared_settings.instance_version();
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
         Json(json!({
             "ok":true, "instanceId":instance, "backend":target.backend,
+            "settingsEpoch":settings_epoch,"instanceRevision":instance_revision,
             "path":target.display, "revision":revision, "settings":settings,
             "supportedModes":supported_modes,
             "readOnly":state.settings.read_only

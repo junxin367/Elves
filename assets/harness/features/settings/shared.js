@@ -210,7 +210,10 @@ export async function refreshSharedSettings(detail = {}) {
 export function receiveSharedSettings(params = {}) {
   const scope = privateInputScope(session);
   void refreshSharedSettings(params.kind === "instance"
-    ? { instanceId: params.instanceId, instanceRevision: params.instanceRevision }
+    ? { instanceId: params.instanceId, instanceRevision: params.instanceRevision, epoch: params.epoch,
+      // 用户要求按实际影响刷新；事件入口必须保留服务端的布尔标记，不能在转发时丢失后退回全量探测。
+      ...Object.fromEntries(["modelCatalogChanged", "skillCatalogChanged", "instructionsChanged"]
+        .filter(key => typeof params[key] === "boolean").map(key => [key, params[key]])) }
     : { preferenceRevision: params.revision })
     .catch(error => { if (scope === privateInputScope(session)) { state.error = error.message; notifySharedSettings(); } });
 }

@@ -6,19 +6,21 @@ import { notice } from "../../ui/notice.js";
 import { confirmAction } from "../../ui/dialog.js";
 import { saveSharedSettings } from "../../core/actions.js";
 import { connected, session } from "../../core/state.js";
-import { api } from "../api.js";
 import { privateInputScope } from "../session/capabilities.js";
-import { loadSessionInstances } from "../session/instance-catalog.js";
 import { availableSessionInstances } from "../session/instances.js";
 import { sharedSettingsState, sharedSettingsWritable, subscribeSharedSettings } from "./shared-state.js";
+import { settingsEnvironments, settingsPageCache } from "./instance-settings-cache.js";
 
 const namingListeners = new Set();
+const namingModelCache = settingsPageCache("naming-models"), namingInfoCache = settingsPageCache("naming-info");
+let latestNamingStatus = null;
 // 用户要求同一功能只有一套口径；可见名称与无障碍名称共用，自动更新标题是自动命名的子设置。
 const namingLabels = {
   enabled: "自动命名", refresh: "自动更新标题", instance: "命名实例", model: "命名模型",
   maxTitleChars: "标题长度上限", refreshEveryTurns: "标题更新间隔", systemPrompt: "命名系统提示词"
 };
 export function receiveConversationNaming(value) {
+  latestNamingStatus = { owner: namingInfoCache.identity(""), value };
   for (const listener of namingListeners) listener(value);
   if (value?.state === "failed") notice(value.message || "自动命名未完成，请检查会话命名设置。", true);
 }
@@ -27,11 +29,13 @@ export function mountConversationNaming(page) {
   page.classList.add("instance-settings-content");
   const scope = privateInputScope(session);
   let disposed = false, loading = false, saving = false, defaults = null, base = null, draft = null;
-  let revision = -1, epoch = "", generation = 0, readController = null, loadedModels = [];
+  let revision = -1, epoch = "", generation = 0, loadedModels = [], catalogOwner = "", showing = null, modelReading = null;
   const alive = () => !disposed && page.isConnected && privateInputScope(session) === scope;
   const supported = () => session?.capabilities?.conversationNaming === true && sharedSettingsState.ready;
   const dirty = () => draft && base && JSON.stringify(draft) !== JSON.stringify(base.conversationNaming);
   const writable = () => alive() && connected && supported() && sharedSettingsWritable(session) && !saving;
+  const catalogReady = () => !!draft && catalogOwner === namingModelCache.identity(draft.instanceId)
+    && !namingModelCache.peek(draft.instanceId)?.blocked && loadedModels.length > 0;
   const card = element("div", "appearance-card");
   const switchControl = label => {
     const input = element("input", "appearance-notification-switch");
@@ -97,11 +101,12 @@ export function mountConversationNaming(page) {
     const canWrite = writable();
     for (const control of [enabled, instances, models, length, refresh, interval, prompt, reset])
       control.disabled = !canWrite || !draft;
-    models.disabled ||= loading;
+    models.disabled ||= !catalogReady();
+    reset.disabled ||= !defaults;
     // 主开关关闭时子设置不生效，禁用控件并保留原选择，避免呈现为两个互相独立的命名开关。
     refresh.disabled ||= !draft?.enabled;
     interval.disabled ||= !draft?.enabled || !draft?.refreshEnabled;
-    save.disabled = !canWrite || loading || !dirty();
+    save.disabled = !canWrite || draft?.enabled && !catalogReady() || !dirty();
     reload.disabled = saving || loading || !alive();
   }
   function restore() {
@@ -124,10 +129,11 @@ export function mountConversationNaming(page) {
   }
   function renderModels() {
     // 模型隐藏偏好只限制选择列表；已有命名配置继续保留，不因隐藏而停用或改投其他模型。
-    const choices = loadedModels.filter(model => model.hiddenByInstance !== true)
+    const available = catalogOwner === namingModelCache.identity(draft?.instanceId) ? loadedModels : [];
+    const choices = available.filter(model => model.hiddenByInstance !== true)
       .map(model => ({ value: model.model, label: model.displayName || model.model }));
     if (draft?.model && !choices.some(option => option.value === draft.model)) {
-      const current = loadedModels.find(model => model.model === draft.model);
+      const current = available.find(model => model.model === draft.model);
       choices.unshift({ value: draft.model, label: current?.hiddenByInstance === true
         ? `${current.displayName || draft.model}（已隐藏，保留当前配置）`
         : `${draft.model}（请核对可用状态）`, disabled: true });
@@ -135,23 +141,40 @@ export function mountConversationNaming(page) {
     if (!draft?.model || !choices.length) choices.unshift({ value: "", label: loading ? "正在读取命名模型…" : "请选择命名模型" });
     setSelectOptions(models, choices, draft?.model || "");
   }
-  async function readNamingModels() {
-    const id = draft?.instanceId, version = ++generation;
-    readController?.abort(); readController = new AbortController();
-    loadedModels = []; loading = true; renderModels(); sync();
-    try {
-      const instance = availableSessionInstances().find(instance => instance.id === id);
-      if (!instance?.ready || instance.error) throw new Error("所选命名实例暂不可用，请重新选择命名实例。");
-      const result = await api("/api/read/models", { backend: instance.backend, instanceId: id, includeAvailable: true },
-        undefined, readController.signal);
-      if (!alive() || generation !== version || draft.instanceId !== id) return;
-      if (!Array.isArray(result.data) || result.data.some(model => typeof model.model !== "string"))
-        throw new Error("命名模型目录返回无效。");
-      loadedModels = result.data; renderModels();
-      if (!loadedModels.length) status.textContent = "所选命名实例未返回可用模型，请检查该实例的原生 CLI。";
-    } catch (error) {
-      if (alive() && generation === version && error.name !== "AbortError") status.textContent = error.message;
-    } finally { if (alive() && generation === version) { loading = false; renderModels(); sync(); } }
+  async function readNamingModels(force = false) {
+    const id = draft?.instanceId, owner = namingModelCache.identity(id);
+    if (modelReading?.owner === owner && !force) return modelReading.promise;
+    const version = ++generation, cached = namingModelCache.peek(id);
+    const changed = catalogOwner !== owner || cached && loadedModels !== cached.value.data;
+    // 用户要求切回命名页先保留已有模型，只有切换实际实例时清除另一实例的目录。
+    if (catalogOwner !== owner) loadedModels = cached?.value.data || [];
+    else if (cached) loadedModels = cached.value.data;
+    catalogOwner = owner;
+    if (changed) renderModels();
+    if (!force && cached?.fresh) { loading = false; sync(); return; }
+    loading = true; sync();
+    const request = { owner, promise: null };
+    modelReading = request;
+    request.promise = (async () => {
+      try {
+        const instance = availableSessionInstances().find(instance => instance.id === id);
+        if (!instance?.ready || instance.error) throw new Error("所选命名实例暂不可用，请重新选择命名实例。");
+        const result = await namingModelCache.read(id, { force, background: loadedModels.length > 0 });
+        if (!alive() || generation !== version || draft.instanceId !== id) return;
+        if (!Array.isArray(result.data) || result.data.some(model => typeof model.model !== "string"))
+          throw new Error("命名模型目录返回无效。");
+        const changed = JSON.stringify(loadedModels) !== JSON.stringify(result.data);
+        loadedModels = result.data;
+        if (changed) renderModels();
+        if (!loadedModels.length) status.textContent = "所选命名实例未返回可用模型，请检查该实例的原生 CLI。";
+      } catch (error) {
+        if (alive() && generation === version && error.name !== "AbortError") status.textContent = error.message;
+      } finally {
+        if (modelReading === request) modelReading = null;
+        if (alive() && generation === version) { loading = false; sync(); }
+      }
+    })();
+    return request.promise;
   }
   function renderRecent(value) {
     recent.textContent = value?.state === "failed" ? value.message
@@ -159,19 +182,31 @@ export function mountConversationNaming(page) {
   }
   async function show(force = false) {
     if (!alive() || saving) return;
+    if (showing && !force) return showing;
     if (force && dirty() && !await confirmAction("重新读取会话命名设置", "当前未保存的修改将被服务端设置替换。", "重新读取")) return;
     if (!alive()) return;
     if (!supported()) { status.textContent = "当前服务尚未支持会话命名，请更新服务后设置。"; sync(); return; }
     status.textContent = "";
-    try {
-      const data = await api("/api/settings/conversation-naming");
-      if (!alive()) return;
-      defaults = data.defaults; renderRecent(data.status);
-      await loadSessionInstances();
-      if (!alive()) return;
-      if (!draft || force || !dirty()) restore();
-      await readNamingModels();
-    } catch (error) { if (alive()) { status.textContent = error.message; sync(); } }
+    // 共享配置已经就绪即可显示表单；状态、默认提示词和目录并行准备，重复进入复用同一份请求。
+    if (!draft || force || !dirty()) restore();
+    const operation = (async () => {
+      try {
+        const preloaded = availableSessionInstances().some(instance => instance.id === draft.instanceId && instance.ready && !instance.error)
+          ? readNamingModels(force) : null;
+        const [data] = await Promise.all([namingInfoCache.read("", { force, background: !!defaults }),
+          settingsEnvironments(force), preloaded]);
+        if (!alive()) return;
+        defaults = data.defaults;
+        const latest = latestNamingStatus?.owner === namingInfoCache.identity("") ? latestNamingStatus.value : null;
+        renderRecent(latest && (!data.status?.updatedAt || latest.updatedAt >= data.status.updatedAt) ? latest : data.status);
+        renderInstances();
+        if (!preloaded) await readNamingModels(force);
+        sync();
+      } catch (error) { if (alive() && error.name !== "AbortError") { status.textContent = error.message; sync(); } }
+      finally { if (showing === operation) showing = null; }
+    })();
+    showing = operation;
+    return operation;
   }
   async function persist() {
     if (!writable() || save.disabled || !draft || !base) return;
@@ -211,11 +246,11 @@ export function mountConversationNaming(page) {
       if (dirty() && changed) status.textContent = "其他客户端已修改会话命名设置，当前未保存内容已保留；保存时将核对冲突。";
       else if (!dirty() && changed) { restore(); if (!page.closest(".appearance-settings-page")?.hidden) void readNamingModels(); }
     }
-    if (change.instance && (!change.instanceId || change.instanceId === draft?.instanceId)
+    if (change.instance && change.modelCatalogChanged !== false && (!change.instanceId || change.instanceId === draft?.instanceId)
         && !page.closest(".appearance-settings-page")?.hidden && !saving) void readNamingModels();
     sync();
   });
   const receive = value => { if (alive()) renderRecent(value); };
   namingListeners.add(receive); sync();
-  return { show, dispose() { disposed = true; generation++; readController?.abort(); unsubscribe(); namingListeners.delete(receive); } };
+  return { show, dispose() { disposed = true; generation++; unsubscribe(); namingListeners.delete(receive); } };
 }

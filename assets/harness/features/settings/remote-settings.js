@@ -12,17 +12,21 @@ import { loadSessionInstances } from "../session/instance-catalog.js";
 const normalizeInstructionText = value => value.replace(/\r\n?/g, "\n");
 const instructionFileText = (value, lineEnding) => lineEnding === "\r\n" ? value.replace(/\n/g, "\r\n") : value;
 const instructionDrafts = new Map();
-export function mountRemoteSettings(dialog) {
+export function mountRemoteSettings(dialog, {
+  cache = null, loadInstances = loadSessionInstances, preferredInstance = () => ""
+} = {}) {
   const find = id => $("#" + id, dialog);
   const instance = find("instruction-instance"), input = find("instruction-content");
   const status = find("instruction-status"), save = find("instruction-save"), reload = find("instruction-reload");
   const detectionButton = find("appearance-detect-environments"), detectionStatus = find("appearance-environments-status");
   let disposed = false, generation = 0, environments = null, instances = [], detection = null, current = null, saving = false;
-  const deviceId = session?.device.id;
-  const alive = () => !disposed && dialog.isConnected && session?.device.id === deviceId;
+  let reading = null, needsRead = false, refreshPending = false;
+  const scope = privateInputScope(session);
+  const alive = () => !disposed && dialog.isConnected && privateInputScope(session) === scope;
   // 用户要求只选择会话实例，编辑其用户级全局指令；实例身份同时隔离各环境的未保存草稿。
   const identity = () => ({ instanceId: instance.value });
-  const keyFor = value => JSON.stringify([privateInputScope(session), value]);
+  const keyFor = value => JSON.stringify([scope, cache?.draftIdentity?.(value.instanceId) || value]);
+  const ownerKey = id => cache?.identity(id) ?? id;
   // 用户要求正常读取后不显示“已读取”；检测、读取及撤销编辑恢复原文时均留空。
   const dirty = () => current && input.value !== current.content;
   // 历史会话保留的已卸载实例不能冒充当前安装；本机 Codex 通过独立远程服务管理全局指令。
@@ -31,8 +35,9 @@ export function mountRemoteSettings(dialog) {
       && (value.id === "codex:local" || !!environment.executables?.[value.backend])));
   const update = () => {
     save.disabled = saving || !!detection || !current || !instanceAvailable(current.instanceId)
-      || current.key !== keyFor(identity()) || !dirty() || session?.readOnly || !connected;
-    reload.disabled = saving || !!detection || !instanceAvailable(instance.value); input.disabled = saving || !current;
+      || current.key !== keyFor(identity()) || current.owner !== ownerKey(instance.value)
+      || needsRead || cache?.peek(instance.value)?.blocked || !dirty() || session?.readOnly || !connected;
+    reload.disabled = saving || !!detection || !!reading || !instanceAvailable(instance.value); input.disabled = saving || !current;
     if (detectionButton) detectionButton.disabled = saving || !!detection;
     instance.disabled = saving || !!detection;
   };
@@ -46,16 +51,18 @@ export function mountRemoteSettings(dialog) {
       options.push({ value: old, label: previous?.label || old, icon: previous?.icon || old.split(":")[0],
         description: "暂不可用", disabled: true });
     }
-    setSelectOptions(instance, options, old || "codex:local");
+    setSelectOptions(instance, options, old || preferredInstance() || "codex:local");
   };
   async function detect(force = false) {
     if (detection) return detection;
+    const version = ++generation;
+    if (force) { needsRead = true; cache?.invalidate(instance.value); }
     if (detectionButton) detectionButton.disabled = true;
     if (detectionStatus) detectionStatus.textContent = "正在检测本机与 WSL 中的会话实例…";
     detection = (async () => {
       try {
-        const result = await loadSessionInstances(force);
-        if (!alive()) return;
+        const result = await loadInstances(force);
+        if (!alive() || generation !== version) return;
         if (!Array.isArray(result.environments) || !Array.isArray(result.instances)) throw new Error("实例检测数据无效。");
         environments = result.environments;
         instances = result.instances;
@@ -76,35 +83,60 @@ export function mountRemoteSettings(dialog) {
       }
     })();
     update();
-    return detection;
+    await detection;
+    if (force && alive() && instanceAvailable(instance.value)) await read({ force: true });
   }
-  async function read({ discard = false } = {}) {
+  function receive(result, value, key, discard = false) {
+    if (typeof result.content !== "string" || typeof result.revision !== "string"
+        || typeof result.path !== "string") throw new Error("指令文件返回格式无效。");
+    const content = normalizeInstructionText(result.content);
+    current = { ...value, content, owner: ownerKey(value.instanceId),
+      lineEnding: result.content.includes("\r\n") ? "\r\n" : "\n", revision: result.revision, key };
+    let draft = !discard && instructionDrafts.get(key);
+    if (draft?.content === content) { instructionDrafts.delete(key); draft = null; }
+    // 后台核对不能覆盖用户在读取期间继续输入的内容；草稿始终保留编辑开始时的文件版本。
+    const next = draft?.content ?? content;
+    if (input.value !== next) input.value = next;
+    needsRead = !!draft && draft.revision !== result.revision;
+    if (needsRead) {
+      current.revision = draft.revision;
+      status.textContent = "有未保存的草稿，原文件也已变化。请复制草稿后重新读取并合并。";
+    } else status.textContent = dirty() ? "未保存的草稿" : result.exists ? "" : "文件尚不存在，保存时创建。";
+    find("instruction-path").textContent = result.path;
+  }
+  async function read({ discard = false, force = false } = {}) {
     if (!alive() || saving) return;
-    const version = ++generation, value = identity(), key = keyFor(value);
-    current = null; input.value = ""; update();
-    find("instruction-path").textContent = "";
-    if (!instanceAvailable(value.instanceId)) {
-      status.textContent = "请选择可用的会话实例。"; return;
+    const value = identity(), key = keyFor(value), owner = ownerKey(value.instanceId);
+    if (reading?.key === key && !force) return reading.promise;
+    const version = ++generation, cached = cache?.peek(value.instanceId);
+    if (cached) receive(cached.value, value, key, discard);
+    else if (current?.key !== key || current.owner !== owner) {
+      current = null; input.value = ""; find("instruction-path").textContent = "";
     }
-    status.textContent = "正在读取原生指令文件…";
-    try {
-      const result = await api("/api/settings/instructions", value);
-      if (!alive() || generation !== version || keyFor(identity()) !== key) return;
-      if (typeof result.content !== "string" || typeof result.revision !== "string")
-        throw new Error("指令文件返回格式无效。");
-      const content = normalizeInstructionText(result.content);
-      current = { ...value, content, lineEnding: result.content.includes("\r\n") ? "\r\n" : "\n", revision: result.revision, key };
-      let draft = !discard && instructionDrafts.get(key);
-      if (draft?.content === content) { instructionDrafts.delete(key); draft = null; }
-      input.value = draft?.content ?? content;
-      if (draft && draft.revision !== result.revision) {
-        current.revision = draft.revision;
-        status.textContent = "有未保存的草稿，原文件也已变化。请复制草稿后重新读取并合并。";
-      } else status.textContent = dirty() ? "未保存的草稿" : result.exists ? "" : "文件尚不存在，保存时创建。";
-      find("instruction-path").textContent = result.path;
-    } catch (error) {
-      if (alive() && generation === version) status.textContent = error.message;
-    } finally { if (alive() && generation === version) update(); }
+    if (!instanceAvailable(value.instanceId)) {
+      needsRead = true; status.textContent = "请选择可用的会话实例。"; update(); return;
+    }
+    if (!force && cached?.fresh) { update(); return; }
+    needsRead ||= force || cached?.blocked === true;
+    if (!current) status.textContent = "正在读取原生指令文件…";
+    const request = { key, promise: null };
+    reading = request; update();
+    request.promise = (cache ? cache.read(value.instanceId, { force, background: !!current })
+      : api("/api/settings/instructions", value)).then(result => {
+      if (!alive() || generation !== version || keyFor(identity()) !== key || owner !== ownerKey(value.instanceId)) return;
+      receive(result, value, key, discard);
+    }).catch(error => {
+      if (alive() && generation === version && error.name !== "AbortError") {
+        needsRead = true; status.textContent = error.message;
+      }
+    }).finally(() => {
+      if (reading === request) reading = null;
+      if (alive() && generation === version) {
+        update();
+        if (refreshPending) { refreshPending = false; void read(); }
+      }
+    });
+    return request.promise;
   }
   input.oninput = () => {
     if (!current) return;
@@ -114,13 +146,18 @@ export function mountRemoteSettings(dialog) {
   };
   instance.onchange = () => void read();
   reload.onclick = async () => {
+    const target = identity().instanceId, owner = ownerKey(target);
     if (dirty() && !await confirmAction("重新读取指令", "当前未保存的草稿将被文件内容替换。", "重新读取")) return;
+    if (!alive() || identity().instanceId !== target || owner !== ownerKey(target)) return;
     if (current) instructionDrafts.delete(current.key);
-    await read({ discard: true });
+    await read({ discard: true, force: true });
   };
   save.onclick = async () => {
-    if (save.disabled || !current || current.key !== keyFor(identity()) || !instanceAvailable(current.instanceId)) return;
-    const value = current, content = input.value;
+    if (!alive() || !connected || session?.readOnly || saving || needsRead || save.disabled || !current
+        || current.key !== keyFor(identity()) || current.owner !== ownerKey(instance.value)
+        || cache?.peek(instance.value)?.blocked || !instanceAvailable(current.instanceId)) return;
+    const value = current, content = input.value, owner = ownerKey(instance.value);
+    generation++; reading = null; cache?.invalidate(value.instanceId);
     saving = true; update(); status.textContent = "正在保存…";
     try {
       const result = await api("/api/settings/instructions", { instanceId: value.instanceId,
@@ -128,26 +165,43 @@ export function mountRemoteSettings(dialog) {
         expectedRevision: value.revision });
       if (typeof result.content !== "string" || typeof result.revision !== "string"
           || normalizeInstructionText(result.content) !== content) throw new Error("保存结果无法确认，请重新读取。");
+      if (scope !== privateInputScope(session)) return;
+      if (owner !== ownerKey(value.instanceId)) throw new Error("实例或服务已变化，请重新读取核对指令保存结果。");
+      cache?.store(value.instanceId, result);
+      if (cache?.peek(value.instanceId)?.fresh) refreshPending = false;
       // 关闭后重开仍可继续编辑；迟到回包只清理自己提交的版本，不能删除新窗口的新草稿。
       const draft = instructionDrafts.get(value.key);
       if (draft?.content === content && draft.revision === value.revision) instructionDrafts.delete(value.key);
       if (!alive()) return;
       current = { ...value, content, revision: result.revision };
+      needsRead = cache?.peek(value.instanceId)?.blocked === true;
       status.textContent = "已保存至原生指令文件。";
-    } catch (error) { if (alive()) status.textContent = error.message; }
-    finally { saving = false; if (alive()) update(); }
+    } catch (error) { if (alive()) { needsRead = true; status.textContent = `${error.message} 未自动重复保存，请重新读取核对。`; } }
+    finally {
+      saving = false;
+      if (alive()) {
+        update();
+        if (refreshPending) { refreshPending = false; void read(); }
+      }
+    }
   };
   if (detectionButton) detectionButton.onclick = () => void detect(true);
   update();
   return {
     refreshInstance(id) {
-      if (!alive() || saving || id && id !== instance.value) return;
-      if (dirty()) { status.textContent = "原生指令已在其他客户端更新，未保存的草稿已保留，请重新读取后合并。"; return; }
+      if (!alive() || id && id !== instance.value) return;
+      if (cache?.peek(instance.value)?.fresh) return;
+      if (saving || reading) { refreshPending = true; return; }
+      if (dirty()) {
+        needsRead = true; update();
+        status.textContent = "原生指令已在其他客户端更新，未保存的草稿已保留，请重新读取后合并。"; return;
+      }
       void read();
     },
     async show(page) {
       if (!environments) await detect();
-      if (page === "instructions" && alive() && !current) await read();
+      if (!environments) return;
+      if (page === "instructions" && alive()) await read();
     },
     dispose() { disposed = true; generation++; }
   };

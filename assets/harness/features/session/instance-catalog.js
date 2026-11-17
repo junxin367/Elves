@@ -3,7 +3,7 @@
 import { $, element } from "../../ui/dom.js";
 import { notice } from "../../ui/notice.js";
 import { loadSidebar, renderSidebar, saveSharedSettings, updateComposer } from "../../core/actions.js";
-import { creating, session } from "../../core/state.js";
+import { creating, nativeConnectionVersion, session } from "../../core/state.js";
 import { api } from "../api.js";
 import { appearance } from "../appearance/theme.js";
 import { assignCreationBackend, creationInstanceId, setCreationInstanceId } from "../composer/creation-state.js";
@@ -41,11 +41,19 @@ export function applySessionPreferences() {
 }
 export async function loadSessionInstances(force = false) {
   const scope = privateInputScope(session);
-  if (sessionInstanceRequest && sessionInstanceRequest.deviceId === session?.device.id && sessionInstanceRequest.scope === scope)
-    return sessionInstanceRequest;
+  const owner = JSON.stringify([scope, sharedSettingsState.epoch, nativeConnectionVersion]);
+  // 设置各页可共用扫描，但服务或原生连接重建后不能接收旧目录；强制检测不能被普通在途读取吞掉。
+  if (sessionInstanceRequest?.catalogOwner === owner) {
+    if (!force || sessionInstanceRequest.force) return sessionInstanceRequest;
+    await sessionInstanceRequest.catch(() => {});
+    if (JSON.stringify([privateInputScope(session), sharedSettingsState.epoch, nativeConnectionVersion]) !== owner)
+      throw new DOMException("实例检测已失效", "AbortError");
+    return loadSessionInstances(true);
+  }
   const deviceId = session?.device.id;
   const request = api("/api/settings/environments", { force }).then(result => {
-    if (session?.device.id === deviceId && privateInputScope(session) === scope) {
+    if (session?.device.id === deviceId
+        && JSON.stringify([privateInputScope(session), sharedSettingsState.epoch, nativeConnectionVersion]) === owner) {
       applySessionCatalog(result);
       reportClaudeRecapDefaults(result, scope);
     }
@@ -53,6 +61,8 @@ export async function loadSessionInstances(force = false) {
   }).finally(() => { if (sessionInstanceRequest === request) setSessionInstanceRequest(null); });
   request.deviceId = deviceId;
   request.scope = scope;
+  request.catalogOwner = owner;
+  request.force = force;
   setSessionInstanceRequest(request);
   return request;
 }

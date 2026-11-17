@@ -71,6 +71,9 @@ export async function loadHarnessAppSource(root = defaultRoot) {
     return module.text;
   }
   function wire(code, context, runInContext) {
+    // 局部函数测试补齐真实入口的目录代次初值；专门测试服务变化时仍使用用例显式提供的状态。
+    if (!Object.hasOwn(context, "nativeConnectionVersion") && /\bnativeConnectionVersion\b/.test(code))
+      context.nativeConnectionVersion = 0;
     if (!Object.hasOwn(context, "syncSharedSettings") && /\bsyncSharedSettings\(/.test(code))
       context.syncSharedSettings = () => {};
     if (!Object.hasOwn(context, "selectedEffort") && /\bselectedEffort\b/.test(code))

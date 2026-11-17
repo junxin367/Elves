@@ -31,10 +31,11 @@ import {
 } from "./theme.js";
 import { rememberInstancePermissionCatalog } from "../composer/options-state.js";
 import { privateInputScope } from "../session/capabilities.js";
-import { loadSessionInstances, renderSessionInstances } from "../session/instance-catalog.js";
-import { availableSessionInstances } from "../session/instances.js";
+import { renderSessionInstances } from "../session/instance-catalog.js";
+import { activeInstanceId, availableSessionInstances } from "../session/instances.js";
 import { mountRemoteSettings } from "../settings/remote-settings.js";
 import { mountConversationNaming } from "../settings/conversation-naming.js";
+import { settingsEnvironments, settingsPageCache } from "../settings/instance-settings-cache.js";
 import {
   instanceSettingPages, mountInstanceSettingsPage, mountShortcuts, settingsNavigation
 } from "../settings/instance-settings.js";
@@ -535,8 +536,8 @@ export function openAppearance() {
   $("#appearance-permissions-entry", dialog).onclick = async () => {
     showAppearancePage($("#appearance-permissions-page", dialog), "权限", $("#appearance-permissions-entry", dialog));
     try {
-      await loadSessionInstances();
-      await instancePermissions.show();
+      await settingsEnvironments();
+      await instancePermissions.show(settingsInstance || activeInstanceId());
     } catch (error) {
       if (dialog.isConnected) notice(error.message, true);
     }
@@ -923,20 +924,40 @@ export function openAppearance() {
   };
   sync.lightReading = syncAutomaticLightSetting.lightReading;
   setSyncAppearanceThemeControls(sync);
-  const remoteSettings = mountRemoteSettings(dialog, sync);
+  let settingsInstance = "";
+  const permissionCache = settingsPageCache("permissions"), instructionCache = settingsPageCache("instructions");
+  const remoteSettings = mountRemoteSettings(dialog, { cache: instructionCache, loadInstances: settingsEnvironments,
+    preferredInstance: () => settingsInstance || activeInstanceId() });
   const instancePermissions = mountInstancePermissions({
     page: $("#instance-permissions", dialog), element, selectControl, setSelectOptions, setSelectValue, api,
     getInstances: availableSessionInstances, readOnly: () => !session || session.readOnly || !connected,
     authorizationScope: () => privateInputScope(session),
+    cache: permissionCache,
+    confirmReload: () => confirmAction("重新读取实例权限", "当前未保存的权限修改将被原生配置替换。", "重新读取"),
     onLoaded: rememberInstancePermissionCatalog,
     onSaved(id, result) { rememberInstancePermissionCatalog(id, result); updateComposer(); }
   });
-  let settingsInstance = "";
   const instancePages = new Map(instanceSettingPages.map(page => [page.id,
     mountInstanceSettingsPage({ page: $(`#appearance-${page.id}-settings`, dialog), section: page.section,
       getSelectedInstance: () => settingsInstance, setSelectedInstance: value => { settingsInstance = value; } })]));
   mountShortcuts($("#appearance-shortcuts-settings", dialog));
   const namingSettings = mountConversationNaming($("#appearance-naming-settings", dialog));
+  // 用户要求可提前准备的设置按操作意图预读：只在导航悬停或聚焦时准备目标，不因打开设置扫描全部 CLI。
+  for (const [id, prepare] of [
+    ["permissions", () => permissionCache.read(settingsInstance || activeInstanceId(), { background: true })],
+    ["instructions", () => instructionCache.read(settingsInstance || activeInstanceId(), { background: true })],
+    ["naming", () => {
+      const id = sharedSettingsState.settings.conversationNaming?.instanceId;
+      return Promise.all([settingsPageCache("naming-info").read("", { background: true }),
+        id ? settingsPageCache("naming-models").read(id, { background: true }) : null]);
+    }]
+  ]) {
+    const entry = $(`#appearance-${id}-entry`, dialog);
+    entry.onpointerenter = entry.onfocus = () => {
+      if (dialog.open && connected && session && privateInputScope(session) === sharedSettingsState.scope)
+        void prepare().catch(() => {});
+    };
+  }
   sync();
   bindAppearanceNumberValue($("#appearance-contrast", dialog), 0, 100,
     () => appearance.colors[appearance.theme].contrast,
@@ -1119,8 +1140,9 @@ export function openAppearance() {
     activeNotificationPage?.syncShared();
     activeNotificationPage?.setBusy(notificationOperations > 0);
     if (change.instance) {
-      if (!$("#appearance-permissions-page", dialog).hidden) void instancePermissions.show();
-      if (!$("#appearance-instructions-page", dialog).hidden) remoteSettings.refreshInstance(change.instanceId);
+      if (!$("#appearance-permissions-page", dialog).hidden) instancePermissions.refreshInstance(change.instanceId);
+      if (change.instructionsChanged !== false && !$("#appearance-instructions-page", dialog).hidden)
+        remoteSettings.refreshInstance(change.instanceId);
     }
   });
   document.body.classList.add("modal-open");
