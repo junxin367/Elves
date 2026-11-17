@@ -1378,6 +1378,35 @@ unsafe fn retain_context_menu_copy(
     }
 }
 
+fn restore_content_focus(window: &tauri::Window) {
+    let Ok(parent) = window.hwnd() else { return };
+    let parent = parent.0 as isize;
+    let Some(content) = window
+        .app_handle()
+        .get_webview(&content_label(window.label()))
+    else {
+        return;
+    };
+    // 用户要求切换程序后恢复编辑与粘贴：add_child 模式不会继承 Wry 普通窗口的 WM_SETFOCUS 转发。
+    // 在实际执行的 UI 回调内确认前台窗口及焦点，只有焦点停在父窗口时才交还 WebView；
+    // 已聚焦的网页控件、原生菜单按钮及其他程序都不能被覆盖，主窗口与独立会话窗口共用此边界。
+    let _ = content.with_webview(move |view| unsafe {
+        use webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+        let parent = parent as windows_sys::Win32::Foundation::HWND;
+        if GetForegroundWindow() != parent || GetFocus() != parent {
+            return;
+        }
+        if let Err(error) = view
+            .controller()
+            .MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC)
+        {
+            eprintln!("恢复会话页面键盘焦点失败：{error}");
+        }
+    });
+}
+
 fn create_client_window(
     app: &tauri::AppHandle,
     label: &str,
@@ -1483,7 +1512,12 @@ fn create_client_window(
                 remember_window(&event_window, false);
             }
         }
-        WindowEvent::Focused(active) => app_bar::set_active(&event_window, *active),
+        WindowEvent::Focused(active) => {
+            app_bar::set_active(&event_window, *active);
+            if *active {
+                restore_content_focus(&event_window);
+            }
+        }
         WindowEvent::CloseRequested { api, .. } if main => {
             let app = event_window.app_handle();
             if !app.state::<ClientState>().exiting.load(Ordering::SeqCst) {

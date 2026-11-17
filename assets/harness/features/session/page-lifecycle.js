@@ -3,7 +3,7 @@
 import { notice } from "../../ui/notice.js";
 import { $ } from "../../ui/dom.js";
 import { selectThread, showWelcome } from "../../core/actions.js";
-import { pageLeaving, selectedId, session, setPageLeaving } from "../../core/state.js";
+import { pageLeaving, selectedId, selectionToken, session, setPageLeaving } from "../../core/state.js";
 import { recoverQuestionReceipts } from "../approval-requests.js";
 import { resetClaudeUsage, syncClaudeUsage } from "../composer/claude-usage.js";
 import { syncComposerMetrics } from "../composer/composer.js";
@@ -16,7 +16,7 @@ import { stopGoalLiveTimer, syncGoalLiveTimer } from "../goal/state.js";
 import { stopActivityTimer, syncActivityTimer } from "../messages/activity-state.js";
 import { drainPendingNotificationOpen } from "../notifications.js";
 import { finishQueueDrag } from "../queue/queue.js";
-import { normalizeRelatedView } from "./capabilities.js";
+import { normalizeRelatedView, privateInputScope } from "./capabilities.js";
 import {
   cancelConnectionProbe, connecting, initialAuthenticationRequired, recordRuntimeDiagnostic,
   setStreamRetry, streamRetry, withRecoveryErrorSilence
@@ -33,19 +33,47 @@ import { rememberReadingPosition } from "./thread-cache.js";
 import { startClientUnreadBadgePolling, stopClientUnreadBadgePolling, syncClientUnreadBadge } from "../sidebar/list.js";
 
 let promptFocusSnapshot = null;
-function rememberPromptFocus() {
+function rememberPromptFocus(target = document.activeElement) {
   const prompt = $("#prompt");
-  if (prompt && document.activeElement === prompt) promptFocusSnapshot = promptSelection(prompt);
+  if (prompt && target === prompt) promptFocusSnapshot = {
+    prompt, selection: promptSelection(prompt), threadId: selectedId, selectionToken, scope: privateInputScope(session)
+  };
 }
 function restorePromptFocus() {
   const snapshot = promptFocusSnapshot;
   if (!snapshot || document.hidden || document.hasFocus?.() === false) return;
-  promptFocusSnapshot = null;
   const prompt = $("#prompt");
-  if (!prompt?.isConnected || prompt.disabled) return;
+  const active = document.activeElement;
+  if (snapshot.prompt !== prompt || snapshot.threadId !== selectedId || snapshot.selectionToken !== selectionToken
+      || snapshot.scope !== privateInputScope(session) || !prompt?.isConnected || prompt.disabled
+      || prompt.closest?.("[inert]") || document.querySelector?.("dialog[open]")
+      || active && active !== prompt && active !== document.body && active !== document.documentElement) {
+    promptFocusSnapshot = null;
+    return;
+  }
   // 用户要求独立客户端切回前台后继续编辑；只恢复后台前确实位于编辑框的焦点和选区。
   prompt.focus({ preventScroll: true });
-  setPromptSelection(prompt, snapshot.start, snapshot.end, snapshot);
+  // WebView 尚未拿到原生键盘焦点时 focus 可能无效；不能先消费快照，后续真实 focus 仍须恢复。
+  if (document.activeElement !== prompt) return;
+  promptFocusSnapshot = null;
+  const selection = snapshot.selection;
+  setPromptSelection(prompt, selection.start, selection.end, selection);
+}
+function installPromptFocusTracking() {
+  // 用户反馈 Alt+Tab、系统复制后无法续写：编辑框 focusout 可能早于 window.blur，须在目标丢失前保存选区。
+  document.addEventListener("focusout", event => {
+    if (event.target !== $("#prompt")) return;
+    if (event.relatedTarget) promptFocusSnapshot = null;
+    else rememberPromptFocus(event.target);
+  }, true);
+  document.addEventListener("focusin", event => {
+    if (event.target !== $("#prompt") && event.target !== document.body && event.target !== document.documentElement)
+      promptFocusSnapshot = null;
+  }, true);
+  // 主动点击页面其他位置属于新的焦点意图，不能让旧的后台快照在稍后重新抢回编辑框。
+  document.addEventListener("pointerdown", event => {
+    if (!$("#prompt")?.contains(event.target)) promptFocusSnapshot = null;
+  }, true);
 }
 function resumePage() {
   const wasLeaving = pageLeaving;
@@ -76,6 +104,7 @@ export function retryConnectionRecovery({ suppressStreamErrors = false, recovery
 }
 // 网络、可见性与页面离开/返回等页面生命周期事件。
 export function installPageLifecycle() {
+  installPromptFocusTracking();
   window.addEventListener("online", () => {
     retryConnectionRecovery({ recoveryProbe: true });
   });

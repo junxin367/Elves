@@ -3513,7 +3513,8 @@ function sessionFilterPopupHarness({ enabled = ["codex:local", "claude:wsl:a", "
   vm.runInContext(sourceSection("function closePopup(", "function fitPopup("), context);
   vm.runInContext(sourceSection("function closePopupSubmenu("), context);
   vm.runInContext(sourceSection('  const typeFilter = $("#sidebar-type-filter");', "  const setSidebarSearchOpen =")
-    + sourceSection('document.addEventListener("pointerdown", event => {', 'document.addEventListener("focusout"'), context);
+    + sourceSection("function installGlobalInputHandlers() {", 'document.addEventListener("focusout"')
+      .replace("function installGlobalInputHandlers() {", ""), context);
   const options = () => context.activePopup?.list.querySelectorAll("button") || [];
   const find = value => options().find(node => node.dataset.value === value);
   return { context, trigger, instances, saved, nodes, element, options, find,
@@ -15373,9 +15374,10 @@ test("Token 减少动态效果时直接更新，等待新轮次数据也不会�
 test("独立客户端切回前台时恢复编辑框焦点和光标，其他控件不抢焦点", () => {
   const selection = { start: 4, end: 4, startTokens: new Set(), endTokens: new Set() }, restores = [];
   const prompt = { isConnected: true, disabled: false, focusCalls: 0,
-    focus(options) { this.focusCalls += 1; this.focusOptions = options; } };
+    focus(options) { this.focusCalls += 1; this.focusOptions = options; document.activeElement = this; } };
   const document = { activeElement: prompt, hidden: false, focused: true, hasFocus() { return this.focused; } };
-  const context = nodeVm.createContext({ nativeConnectionVersion: 1, document,
+  const context = nodeVm.createContext({ nativeConnectionVersion: 1, document, selectedId: "main",
+    selectionToken: "main-selection", session: { device: { id: "device" } }, privateInputScope: () => "device",
     $: selector => selector === "#prompt" ? prompt : null, promptSelection: () => selection,
     setPromptSelection: (...args) => restores.push(args) });
   nodeVm.runInContext(sourceSection("let promptFocusSnapshot", "function resumePage"), context);
@@ -15395,6 +15397,85 @@ test("独立客户端切回前台时恢复编辑框焦点和光标，其他控�
   document.focused = true; context.restorePromptFocus();
   assert.equal(prompt.focusCalls, 2);
   assert.match(app, /window\.addEventListener\("focus", restorePromptFocus\)/);
+});
+
+function composerFocusHarness() {
+  const listeners = new Map(), restores = [], body = {}, root = {};
+  const document = { activeElement: null, body, documentElement: root, hidden: false, focused: true,
+    hasFocus() { return this.focused; },
+    querySelector: () => context.dialog ? {} : null,
+    addEventListener: (type, action) => listeners.set(type, action) };
+  const prompt = { isConnected: true, disabled: false, focusCalls: 0,
+    contains: target => target === prompt,
+    closest: () => context.inert ? {} : null,
+    focus() { this.focusCalls++; if (context.focusEffective) document.activeElement = this; } };
+  document.activeElement = prompt;
+  const context = nodeVm.createContext({ document, selectedId: "main", selectionToken: "main-selection",
+    session: { device: { id: "device", createdAtMs: 1 } }, focusEffective: true, dialog: false, inert: false,
+    $: selector => selector === "#prompt" ? prompt : null,
+    privateInputScope: session => JSON.stringify(session.device),
+    promptSelection: () => ({ start: 4, end: 9 }),
+    setPromptSelection: (...args) => restores.push(args) });
+  nodeVm.runInContext(sourceSection("let promptFocusSnapshot", "function resumePage"), context);
+  context.installPromptFocusTracking();
+  const losePromptFirst = () => {
+    document.activeElement = body;
+    listeners.get("focusout")({ target: prompt, relatedTarget: null });
+    context.rememberPromptFocus();
+  };
+  return { context, document, prompt, listeners, restores, losePromptFirst };
+}
+
+test("编辑框先于窗口失焦时仍保存原选区，切回后可以继续编辑和粘贴", () => {
+  const h = composerFocusHarness();
+  h.losePromptFirst();
+  h.context.restorePromptFocus();
+  assert.equal(h.document.activeElement, h.prompt);
+  assert.equal(h.prompt.focusCalls, 1);
+  assert.equal(h.restores[0][1], 4);
+  assert.equal(h.restores[0][2], 9);
+  h.context.restorePromptFocus();
+  assert.equal(h.prompt.focusCalls, 1, "多个前台事件不能重复改写选区");
+});
+
+test("WebView 尚未拿到焦点或 focus 未生效时保留选区，实际成功后才结束恢复", () => {
+  const h = composerFocusHarness();
+  h.losePromptFirst();
+  h.document.focused = false;
+  h.context.restorePromptFocus();
+  assert.equal(h.prompt.focusCalls, 0);
+  h.document.focused = true;
+  h.context.focusEffective = false;
+  h.context.restorePromptFocus();
+  assert.equal(h.prompt.focusCalls, 1);
+  assert.equal(h.restores.length, 0);
+  h.context.focusEffective = true;
+  h.context.restorePromptFocus();
+  assert.equal(h.prompt.focusCalls, 2);
+  assert.equal(h.restores.length, 1);
+});
+
+test("切换会话、授权、弹窗、禁用及主动改变焦点后，旧编辑框快照不得抢焦点", () => {
+  for (const change of [
+    h => { h.context.selectedId = "other"; },
+    h => { h.context.selectionToken = "new-selection"; },
+    h => { h.context.session.device.createdAtMs++; },
+    h => { h.context.$ = () => ({ ...h.prompt }); },
+    h => { h.context.dialog = true; },
+    h => { h.context.inert = true; },
+    h => { h.prompt.disabled = true; },
+    h => { h.document.activeElement = {}; },
+    h => { h.listeners.get("focusin")({ target: {} }); },
+    h => { h.listeners.get("pointerdown")({ target: {} }); },
+    h => { h.listeners.get("focusout")({ target: h.prompt, relatedTarget: {} }); },
+  ]) {
+    const h = composerFocusHarness();
+    h.losePromptFirst();
+    change(h);
+    h.context.restorePromptFocus();
+    assert.equal(h.prompt.focusCalls, 0);
+    assert.equal(h.restores.length, 0);
+  }
 });
 
 test("编辑器末尾换行滚动到底部，中间编辑保持原滚动位置", () => {
