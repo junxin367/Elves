@@ -360,25 +360,32 @@ export function App() {
     onClickCapture={event => {
       if (event.target instanceof Element && event.target.closest('[role="option"],[role="menuitemradio"],[role="combobox"]')) noteEdit();
     }}>
-    <header className="management-header"><div><h1>{titles[page]}</h1><p>同一 Harness的各客户端共用配置</p></div>
-      <Button onClick={() => void run(refresh)} variant="outline" aria-label="刷新当前页面"><RefreshCw className="h-4 w-4" />刷新</Button>
+    <header className="management-header">
+      <div className="management-page-width">
+        <div><h1>{titles[page]}</h1><p>同一 Harness的各客户端共用配置</p></div>
+        <Button onClick={() => void run(refresh)} variant="outline" aria-label="刷新当前页面"><RefreshCw className="h-4 w-4" />刷新</Button>
+      </div>
     </header>
-    {message ? <div className={`management-notice ${error ? "error" : ""}`} role={error ? "alert" : "status"}>{message}</div> : null}
+    {message ? <div className={`management-notice ${error ? "error" : ""}`} role={error ? "alert" : "status"}>
+      <div className="management-page-width">{message}</div>
+    </div> : null}
     <main className="management-content" key={reloadEpoch}>
-      {!initialized ? <p>{error ? "配置未读取成功，请刷新后重试。" : "正在读取服务器配置…"}</p> : <>
-        {page === "proxy" ? <>
-          <RelayScreen settings={settings} relayFiles={relayFiles} envConflicts={conflicts} ccsProviders={providers}
-            form={form} onFormChange={edit} actions={actions} />
-          <LocalProxyScreen status={proxyStatus} logs={proxyLogs} logsError={proxyError} detail={detail}
-            selectedId={selectedLog} loadingDetailId={loadingLog} form={form} actions={actions} />
-        </> : null}
-        {page === "sessions" ? <SessionsScreen sessions={sessions} actions={actions} /> : null}
-        {page === "remoteAccess" ? <RemoteAccessScreen settings={form.remoteAccess}
-          onChange={remoteAccess => edit({ ...form, remoteAccess })}
-          onSave={next => save({ ...form, remoteAccess: next })}
-          command={(action, payload) => call("remote_access_command", { action, payload })}
-          onNotice={value => report(value, true)} onSuccess={value => report(value)} /> : null}
-      </>}
+      <div className="management-page-width">
+        {!initialized ? <p>{error ? "配置未读取成功，请刷新后重试。" : "正在读取服务器配置…"}</p> : <>
+          {page === "proxy" ? <>
+            <RelayScreen settings={settings} relayFiles={relayFiles} envConflicts={conflicts} ccsProviders={providers}
+              form={form} onFormChange={edit} actions={actions} />
+            <LocalProxyScreen status={proxyStatus} logs={proxyLogs} logsError={proxyError} detail={detail}
+              selectedId={selectedLog} loadingDetailId={loadingLog} form={form} actions={actions} />
+          </> : null}
+          {page === "sessions" ? <SessionsScreen sessions={sessions} actions={actions} /> : null}
+          {page === "remoteAccess" ? <RemoteAccessScreen settings={form.remoteAccess}
+            onChange={remoteAccess => edit({ ...form, remoteAccess })}
+            onSave={next => save({ ...form, remoteAccess: next })}
+            command={(action, payload) => call("remote_access_command", { action, payload })}
+            onNotice={value => report(value, true)} onSuccess={value => report(value)} /> : null}
+        </>}
+      </div>
     </main>
     <TooltipLayer theme={theme} />
   </div>;
