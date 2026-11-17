@@ -366,7 +366,7 @@ fn is_native_remote_compaction_v2_response(
     })
 }
 
-fn should_run_continue_thinking_for_proxy_request(
+fn should_retry_model_capacity_for_proxy_request(
     original_request: Option<&serde_json::Value>,
     forwarded_request: Option<&serde_json::Value>,
 ) -> bool {
@@ -571,7 +571,7 @@ async fn handle_protocol_proxy_connection(
         _ => {}
     }
     // The entire forwarding future has been dropped, including its active
-    // WS/HTTP body and any pending reconnect or continuation request.
+    // WS/HTTP body and any pending reconnect or retry request.
     let original_request_json = serde_json::from_str::<Value>(request_body).ok();
     let original_request_metadata = crate::proxy_log::extract_request_metadata_with_context(
         original_request_json.as_ref(),
@@ -1090,7 +1090,7 @@ async fn handle_protocol_proxy_connection_inner(
             let mut response_capture = Vec::new();
             let mut response_bytes = 0_usize;
             let mut response_truncated = false;
-            let mut continue_thinking_log = LocalContinueThinkingLog::default();
+            let mut stream_log = LocalStreamLog::default();
             let mut layered_compaction_log = LocalLayeredCompactionLog::default();
             if upstream.body_override.is_some() {
                 let raw_body = upstream.into_body_bytes().await?;
@@ -1224,9 +1224,9 @@ async fn handle_protocol_proxy_connection_inner(
                         observer.observe_bytes(&bytes);
                     }
                     first_round_bytes.extend_from_slice(&bytes);
-                    if continue_thinking_log.first_token_ms.is_none() {
+                    if stream_log.first_token_ms.is_none() {
                         let first_token_ms = started_at.elapsed().as_millis() as u64;
-                        continue_thinking_log.first_token_ms = Some(first_token_ms);
+                        stream_log.first_token_ms = Some(first_token_ms);
                         append_local_proxy_first_token_record(
                             &log_id,
                             timestamp_ms,
@@ -1257,33 +1257,23 @@ async fn handle_protocol_proxy_connection_inner(
                     ),
                 );
                 let first_round_sse_text = String::from_utf8_lossy(&first_round_bytes).into_owned();
-                let final_sse_text = if should_run_continue_thinking_for_proxy_request(
+                let final_sse_text = if should_retry_model_capacity_for_proxy_request(
                     request_json.as_ref(),
                     logged_request_json.as_ref(),
                 ) {
                     let request = logged_request_json
                         .as_ref()
-                        .expect("只有可解析的上游请求才会进入自动续思考");
+                        .expect("只有可解析的上游请求才会进入模型繁忙重试");
                     let settings = SettingsStore::default().load().unwrap_or_default();
-                    let result =
-                        crate::protocol_proxy::apply_continue_thinking_to_responses_stream_with_request_context_and_audit(
-                            request,
-                            settings,
-                            request_context,
-                            first_round_sse_text,
-                            &mut request_metadata.audit,
-                        )
-                        .await;
-                    continue_thinking_log = LocalContinueThinkingLog {
-                        triggered: result.triggered,
-                        rounds: result.rounds,
-                        first_token_ms: continue_thinking_log.first_token_ms,
-                        reasoning_tokens: result.reasoning_tokens,
-                        request_body: result.request_body,
-                        before_response_body: result.before_response_body,
-                        after_response_body: result.after_response_body,
-                    };
-                    result.sse_text
+                    // 用户要求删除 GPT 推理续接；这里只对模型繁忙错误重试原请求，不追加思考或工具调用。
+                    crate::protocol_proxy::retry_model_capacity_responses_stream(
+                        request,
+                        &settings,
+                        request_context,
+                        first_round_sse_text,
+                        &mut request_metadata.audit,
+                    )
+                    .await
                 } else {
                     first_round_sse_text
                 };
@@ -1313,7 +1303,7 @@ async fn handle_protocol_proxy_connection_inner(
                 &status,
                 remote_addr_text.clone(),
             );
-            append_local_proxy_record_with_continue_thinking(
+            append_local_proxy_record_with_stream_metadata(
                 log_id.clone(),
                 timestamp_ms,
                 started_at,
@@ -1332,7 +1322,7 @@ async fn handle_protocol_proxy_connection_inner(
                 response_bytes,
                 response_truncated,
                 None,
-                continue_thinking_log,
+                stream_log,
                 layered_compaction_log,
             );
             stream.shutdown().await?;
@@ -1469,7 +1459,7 @@ async fn handle_protocol_proxy_connection_inner(
             "200 OK",
             remote_addr_text.clone(),
         );
-        append_local_proxy_record_with_continue_thinking(
+        append_local_proxy_record_with_stream_metadata(
             log_id.clone(),
             timestamp_ms,
             started_at,
@@ -1488,7 +1478,7 @@ async fn handle_protocol_proxy_connection_inner(
             response_bytes,
             response_truncated,
             stream_error,
-            LocalContinueThinkingLog {
+            LocalStreamLog {
                 first_token_ms,
                 ..Default::default()
             },
@@ -2376,7 +2366,7 @@ async fn handle_deferred_protocol_proxy_stream_connection(
             .audit
             .observe_response(&upstream_model_observer);
         record_observed_upstream_model(&mut request_metadata, upstream_model_observer.model());
-        append_local_proxy_record_with_continue_thinking(
+        append_local_proxy_record_with_stream_metadata(
             log_id.clone(),
             timestamp_ms,
             started_at,
@@ -2395,7 +2385,7 @@ async fn handle_deferred_protocol_proxy_stream_connection(
             response_bytes,
             response_truncated,
             remote_compaction_stream_error,
-            LocalContinueThinkingLog {
+            LocalStreamLog {
                 first_token_ms,
                 ..Default::default()
             },
@@ -2651,7 +2641,7 @@ async fn handle_deferred_protocol_proxy_stream_connection(
         "200 OK",
         remote_addr_text.clone(),
     );
-    append_local_proxy_record_with_continue_thinking(
+    append_local_proxy_record_with_stream_metadata(
         log_id.clone(),
         timestamp_ms,
         started_at,
@@ -2670,7 +2660,7 @@ async fn handle_deferred_protocol_proxy_stream_connection(
         response_bytes,
         response_truncated,
         stream_error,
-        LocalContinueThinkingLog {
+        LocalStreamLog {
             first_token_ms,
             ..Default::default()
         },
@@ -2891,7 +2881,7 @@ async fn handle_chat_completions_proxy_connection(
             &status,
             remote_addr_text.clone(),
         );
-        append_local_proxy_record_with_continue_thinking(
+        append_local_proxy_record_with_stream_metadata(
             log_id.clone(),
             timestamp_ms,
             started_at,
@@ -2910,7 +2900,7 @@ async fn handle_chat_completions_proxy_connection(
             response_bytes,
             response_truncated,
             None,
-            LocalContinueThinkingLog {
+            LocalStreamLog {
                 first_token_ms,
                 ..Default::default()
             },
@@ -2970,14 +2960,8 @@ async fn handle_chat_completions_proxy_connection(
 }
 
 #[derive(Debug, Clone, Default)]
-struct LocalContinueThinkingLog {
-    triggered: bool,
-    rounds: u32,
+struct LocalStreamLog {
     first_token_ms: Option<u64>,
-    reasoning_tokens: Option<u64>,
-    request_body: Option<String>,
-    before_response_body: Option<String>,
-    after_response_body: Option<String>,
 }
 
 #[derive(Default)]
@@ -3035,11 +3019,6 @@ fn append_pending_local_proxy_record(
         reasoning_tokens: None,
         reasoning_effort: request_metadata.reasoning_effort.clone(),
         reasoning_source: request_metadata.reasoning_source.clone(),
-        continue_thinking_triggered: false,
-        continue_thinking_rounds: 0,
-        continue_thinking_request_body: None,
-        continue_thinking_before_response_body: None,
-        continue_thinking_after_response_body: None,
         remote_compaction_triggered: crate::proxy_log::request_uses_remote_compaction_v2(
             request_json,
         ),
@@ -3103,11 +3082,6 @@ fn append_local_proxy_first_token_record(
         reasoning_tokens: None,
         reasoning_effort: request_metadata.reasoning_effort.clone(),
         reasoning_source: request_metadata.reasoning_source.clone(),
-        continue_thinking_triggered: false,
-        continue_thinking_rounds: 0,
-        continue_thinking_request_body: None,
-        continue_thinking_before_response_body: None,
-        continue_thinking_after_response_body: None,
         remote_compaction_triggered: crate::proxy_log::request_body_uses_remote_compaction_v2(
             request_body,
         ),
@@ -3158,7 +3132,7 @@ fn append_local_proxy_record(
     response_truncated: bool,
     error: Option<String>,
 ) {
-    append_local_proxy_record_with_continue_thinking(
+    append_local_proxy_record_with_stream_metadata(
         id,
         timestamp_ms,
         started_at,
@@ -3177,13 +3151,13 @@ fn append_local_proxy_record(
         response_bytes,
         response_truncated,
         error,
-        LocalContinueThinkingLog::default(),
+        LocalStreamLog::default(),
         LocalLayeredCompactionLog::default(),
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn append_local_proxy_record_with_continue_thinking(
+fn append_local_proxy_record_with_stream_metadata(
     id: String,
     timestamp_ms: u64,
     started_at: Instant,
@@ -3202,7 +3176,7 @@ fn append_local_proxy_record_with_continue_thinking(
     response_bytes: usize,
     response_truncated: bool,
     error: Option<String>,
-    continue_thinking: LocalContinueThinkingLog,
+    stream_metadata: LocalStreamLog,
     layered_compaction: LocalLayeredCompactionLog,
 ) {
     let record = crate::proxy_log::ProxyRequestRecord {
@@ -3219,16 +3193,9 @@ fn append_local_proxy_record_with_continue_thinking(
         upstream_response_model: request_metadata.upstream_response_model.clone(),
         independent_compaction_model: request_metadata.independent_compaction_model.clone(),
         independent_compaction_usage: request_metadata.independent_compaction_usage,
-        reasoning_tokens: continue_thinking.reasoning_tokens.or_else(|| {
-            crate::proxy_log::extract_reasoning_tokens_from_response_body(response_body)
-        }),
+        reasoning_tokens: crate::proxy_log::extract_reasoning_tokens_from_response_body(response_body),
         reasoning_effort: request_metadata.reasoning_effort.clone(),
         reasoning_source: request_metadata.reasoning_source.clone(),
-        continue_thinking_triggered: continue_thinking.triggered,
-        continue_thinking_rounds: continue_thinking.rounds,
-        continue_thinking_request_body: continue_thinking.request_body,
-        continue_thinking_before_response_body: continue_thinking.before_response_body,
-        continue_thinking_after_response_body: continue_thinking.after_response_body,
         remote_compaction_triggered: crate::proxy_log::request_body_uses_remote_compaction_v2(
             request_body,
         ),
@@ -3244,7 +3211,7 @@ fn append_local_proxy_record_with_continue_thinking(
         endpoint,
         response_protocol,
         status_code: Some(status_code),
-        first_token_ms: continue_thinking.first_token_ms,
+        first_token_ms: stream_metadata.first_token_ms,
         duration_ms: Some(started_at.elapsed().as_millis() as u64),
         stream,
         request_bytes: request_body.len(),

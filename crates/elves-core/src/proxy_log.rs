@@ -165,16 +165,6 @@ pub struct ProxyRequestRecord {
     pub reasoning_effort: Option<String>,
     pub reasoning_source: Option<String>,
     #[serde(default)]
-    pub continue_thinking_triggered: bool,
-    #[serde(default)]
-    pub continue_thinking_rounds: u32,
-    #[serde(default)]
-    pub continue_thinking_request_body: Option<String>,
-    #[serde(default)]
-    pub continue_thinking_before_response_body: Option<String>,
-    #[serde(default)]
-    pub continue_thinking_after_response_body: Option<String>,
-    #[serde(default)]
     pub remote_compaction_triggered: bool,
     #[serde(default)]
     pub compaction_requested: bool,
@@ -241,10 +231,6 @@ pub struct ProxyRequestSummary {
     pub output_tokens: Option<u64>,
     pub reasoning_effort: Option<String>,
     pub reasoning_source: Option<String>,
-    #[serde(default)]
-    pub continue_thinking_triggered: bool,
-    #[serde(default)]
-    pub continue_thinking_rounds: u32,
     #[serde(default)]
     pub remote_compaction_triggered: bool,
     // None identifies indexes written before request-level compaction tracking.
@@ -341,8 +327,6 @@ impl From<&ProxyRequestRecord> for ProxyRequestSummary {
                 .flatten(),
             reasoning_effort: record.reasoning_effort.clone(),
             reasoning_source: record.reasoning_source.clone(),
-            continue_thinking_triggered: record.continue_thinking_triggered,
-            continue_thinking_rounds: record.continue_thinking_rounds,
             remote_compaction_triggered: record.remote_compaction_triggered,
             compaction_requested: Some(
                 record.compaction_requested
@@ -1643,9 +1627,6 @@ fn serialize_record_for_log(record: &ProxyRequestRecord) -> serde_json::Result<S
     let mut trimmed = record.clone();
     trimmed.request_body.clear();
     trimmed.response_body.clear();
-    trimmed.continue_thinking_request_body = None;
-    trimmed.continue_thinking_before_response_body = None;
-    trimmed.continue_thinking_after_response_body = None;
     trimmed.response_truncated = true;
     trimmed.response_captured_bytes = Some(0);
 
@@ -2681,11 +2662,6 @@ data: [DONE]
             reasoning_tokens: Some(516),
             reasoning_effort: Some("medium".to_string()),
             reasoning_source: Some("reasoning.effort".to_string()),
-            continue_thinking_triggered: false,
-            continue_thinking_rounds: 0,
-            continue_thinking_request_body: None,
-            continue_thinking_before_response_body: None,
-            continue_thinking_after_response_body: None,
             remote_compaction_triggered: false,
             layered_compaction_triggered: false,
             compaction_requested: false,
@@ -3508,11 +3484,6 @@ data: [DONE]
             reasoning_tokens: None,
             reasoning_effort: None,
             reasoning_source: None,
-            continue_thinking_triggered: false,
-            continue_thinking_rounds: 0,
-            continue_thinking_request_body: None,
-            continue_thinking_before_response_body: None,
-            continue_thinking_after_response_body: None,
             remote_compaction_triggered: false,
             layered_compaction_triggered: false,
             compaction_requested: false,

@@ -159,13 +159,8 @@ base_url = "https://old.example/v1"
 }
 
 #[test]
-fn switch_keeps_supported_websocket_when_reasoning_continuation_is_enabled() {
-    assert_switched_websocket_state(true, true);
-}
-
-#[test]
-fn switch_enables_supported_websocket_when_reasoning_continuation_is_disabled() {
-    assert_switched_websocket_state(false, true);
+fn switch_keeps_supported_websocket_enabled() {
+    assert_switched_websocket_state(true);
 }
 
 #[test]
@@ -386,7 +381,6 @@ base_url = "{base_url}"
 }
 
 fn assert_switched_websocket_state(
-    gpt_reasoning_continuation: bool,
     expected_websocket_enabled: bool,
 ) {
     let temp = tempfile::tempdir().unwrap();
@@ -409,7 +403,6 @@ fn assert_switched_websocket_state(
     let next = BackendSettings {
         active_relay_id: "b".to_string(),
         relay_profiles: vec![original.relay_profiles[0].clone(), target],
-        gpt_reasoning_continuation,
         ..BackendSettings::default()
     };
 

@@ -811,14 +811,7 @@ pub struct BackendSettings {
     pub lan_proxy_enabled: bool,
     #[serde(rename = "remoteAccess", default)]
     pub remote_access: RemoteAccessSettings,
-    #[serde(rename = "gptReasoningContinuation", default)]
-    pub gpt_reasoning_continuation: bool,
-    #[serde(
-        rename = "gptReasoningContinuationMaxRounds",
-        default = "default_gpt_reasoning_continuation_max_rounds",
-        deserialize_with = "deserialize_gpt_reasoning_continuation_max_rounds"
-    )]
-    pub gpt_reasoning_continuation_max_rounds: u8,
+    // 用户要求移除 GPT 推理续接；旧版本保存的相关字段按未知字段忽略，不再参与代理行为或保存。
     #[serde(rename = "layeredCompactionEnabled", default)]
     pub layered_compaction_enabled: bool,
     #[serde(rename = "layeredCompactionRetainRecentRoundEnabled", default)]
@@ -892,8 +885,6 @@ impl Default for BackendSettings {
             relay_profiles_enabled: true,
             lan_proxy_enabled: false,
             remote_access: RemoteAccessSettings::default(),
-            gpt_reasoning_continuation: false,
-            gpt_reasoning_continuation_max_rounds: default_gpt_reasoning_continuation_max_rounds(),
             layered_compaction_enabled: false,
             layered_compaction_retain_recent_round_enabled: false,
             layered_compaction_retain_tokens: default_layered_compaction_retain_tokens(),
@@ -1079,14 +1070,6 @@ pub fn default_api_key_env() -> String {
     "CUSTOM_OPENAI_API_KEY".to_string()
 }
 
-fn default_gpt_reasoning_continuation_max_rounds() -> u8 {
-    crate::continue_thinking::MAX_CONTINUE_ROUNDS as u8
-}
-
-fn clamp_gpt_reasoning_continuation_max_rounds(value: u64) -> u8 {
-    value.clamp(1, 9) as u8
-}
-
 fn default_layered_compaction_retain_tokens() -> u32 {
     crate::layered_compaction::DEFAULT_RETAIN_TOKENS
 }
@@ -1130,17 +1113,6 @@ where
     Ok(value
         .filter(|value| !value.is_empty())
         .unwrap_or_else(default_api_key_env))
-}
-
-fn deserialize_gpt_reasoning_continuation_max_rounds<'de, D>(
-    deserializer: D,
-) -> Result<u8, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Ok(Option::<u64>::deserialize(deserializer)?
-        .map(clamp_gpt_reasoning_continuation_max_rounds)
-        .unwrap_or_else(default_gpt_reasoning_continuation_max_rounds))
 }
 
 fn deserialize_layered_compaction_retain_tokens<'de, D>(deserializer: D) -> Result<u32, D::Error>
@@ -1223,6 +1195,9 @@ impl SettingsStore {
 
         let mut raw = self.load_raw_object()?;
         raw.remove("wsFailureFallbackToHttp");
+        // 用户要求移除推理续接：局部保存时清除旧开关和次数，其他未知配置继续保留。
+        raw.remove("gptReasoningContinuation");
+        raw.remove("gptReasoningContinuationMaxRounds");
         merge_known_setting_fields(&mut raw, &payload)?;
         // 用户要求废弃供应商隐藏测试模型；局部保存时也清除旧字段，保留其他未知配置。
         if let Some(profiles) = raw.get_mut("relayProfiles").and_then(Value::as_array_mut) {
@@ -1327,18 +1302,6 @@ fn merge_known_setting_fields(
         }
         serde_json::from_value::<RemoteAccessSettings>(remote.clone())?.validate()?;
         target.insert("remoteAccess".into(), remote);
-    }
-    merge_bool_setting(target, source, "gptReasoningContinuation");
-    if let Some(value) = source
-        .get("gptReasoningContinuationMaxRounds")
-        .and_then(Value::as_u64)
-    {
-        target.insert(
-            "gptReasoningContinuationMaxRounds".to_string(),
-            Value::Number(serde_json::Number::from(
-                clamp_gpt_reasoning_continuation_max_rounds(value),
-            )),
-        );
     }
     merge_bool_setting(target, source, "layeredCompactionEnabled");
     merge_bool_setting(target, source, "layeredCompactionRetainRecentRoundEnabled");
@@ -1594,9 +1557,6 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
         crate::responses_websocket::normalize_responses_websocket_capability(profile);
     }
     settings.codex_home_path = normalize_codex_home_path(&settings.codex_home_path);
-    settings.gpt_reasoning_continuation_max_rounds = clamp_gpt_reasoning_continuation_max_rounds(
-        u64::from(settings.gpt_reasoning_continuation_max_rounds),
-    );
     settings
 }
 
@@ -1713,7 +1673,6 @@ mod tests {
         assert_eq!(settings.relay_test_model, default_relay_test_model());
         assert!(!settings.cli_wrapper_enabled);
         assert_eq!(settings.cli_wrapper_api_key_env, "CUSTOM_OPENAI_API_KEY");
-        assert_eq!(settings.gpt_reasoning_continuation_max_rounds, 3);
         assert!(settings.codex_home_path.is_empty());
         let serialized = serde_json::to_value(&settings).unwrap();
         for removed in [
@@ -1744,7 +1703,6 @@ mod tests {
         assert_eq!(settings.cli_wrapper_api_key, "sk-test");
         assert_eq!(settings.cli_wrapper_api_key_env, "CUSTOM_OPENAI_API_KEY");
         assert_eq!(settings.relay_base_url, default_relay_base_url());
-        assert_eq!(settings.gpt_reasoning_continuation_max_rounds, 3);
         assert_eq!(settings.layered_compaction_retain_tokens, 20_000);
     }
 
@@ -1877,14 +1835,32 @@ mod tests {
     }
 
     #[test]
-    fn settings_clamps_gpt_reasoning_continuation_max_rounds() {
-        let low: BackendSettings =
-            serde_json::from_str(r#"{"gptReasoningContinuationMaxRounds":0}"#).unwrap();
-        assert_eq!(low.gpt_reasoning_continuation_max_rounds, 1);
-
-        let high: BackendSettings =
-            serde_json::from_str(r#"{"gptReasoningContinuationMaxRounds":999}"#).unwrap();
-        assert_eq!(high.gpt_reasoning_continuation_max_rounds, 9);
+    fn removed_reasoning_continuation_settings_are_ignored_and_cleared_on_update() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        fs::write(
+            &store.path,
+            r#"{"gptReasoningContinuation":true,"gptReasoningContinuationMaxRounds":9,"layeredCompactionEnabled":true,"customField":"keep"}"#,
+        )
+        .unwrap();
+        let settings = store.load().unwrap();
+        assert!(settings.layered_compaction_enabled);
+        let serialized = serde_json::to_value(&settings).unwrap();
+        assert!(serialized.get("gptReasoningContinuation").is_none());
+        assert!(serialized.get("gptReasoningContinuationMaxRounds").is_none());
+        store
+            .update(json!({
+                "gptReasoningContinuation": true,
+                "gptReasoningContinuationMaxRounds": 9,
+                "lanProxyEnabled": true
+            }))
+            .unwrap();
+        let persisted: Value = serde_json::from_slice(&fs::read(&store.path).unwrap()).unwrap();
+        assert!(persisted.get("gptReasoningContinuation").is_none());
+        assert!(persisted.get("gptReasoningContinuationMaxRounds").is_none());
+        assert_eq!(persisted["customField"], "keep");
+        assert_eq!(persisted["layeredCompactionEnabled"], true);
+        assert_eq!(persisted["lanProxyEnabled"], true);
     }
 
     #[test]

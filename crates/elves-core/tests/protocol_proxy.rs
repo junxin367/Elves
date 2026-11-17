@@ -5,8 +5,7 @@ use elves_core::layered_compaction::{
 use elves_core::protocol_proxy::{
     AnthropicSseToResponsesConverter, ChatSseToResponsesConverter, UpstreamResponseProtocol,
     anthropic_message_to_response_with_request, anthropic_messages_url,
-    anthropic_sse_to_responses_sse_with_request, apply_continue_thinking_to_responses_stream,
-    apply_continue_thinking_to_responses_stream_with_request_context, chat_completion_to_response,
+    anthropic_sse_to_responses_sse_with_request, chat_completion_to_response,
     chat_completion_to_response_with_request, chat_completions_url, chat_sse_to_responses_sse,
     chat_sse_to_responses_sse_with_request,
     clear_anthropic_reasoning_compatibility_cache_for_tests, handle_responses_proxy_request,
@@ -4594,10 +4593,6 @@ fn parse_response_sse_events(input: &str) -> Vec<ParsedSseEvent> {
         .collect()
 }
 
-fn responses_sse_with_reasoning(response_id: &str, reasoning_tokens: u64) -> String {
-    responses_sse_with_reasoning_and_output(response_id, reasoning_tokens, json!([]))
-}
-
 /// 把一组文本分片包成一个完整的 Anthropic 流式响应（单个 text 块）。
 fn anthropic_sse_from_text_deltas(deltas: &[String]) -> String {
     let mut sse = String::new();
@@ -4708,19 +4703,6 @@ fn assert_all_fragmentations_yield(text: &str, expected: &str) {
         expected,
         "逐字符分片时输出不符：text={text:?}"
     );
-}
-
-fn responses_sse_with_reasoning_and_output(
-    response_id: &str,
-    reasoning_tokens: u64,
-    output: Value,
-) -> String {
-    let output = serde_json::to_string(&output).unwrap();
-    format!(
-        "event: response.completed\n\
-data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"{response_id}\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"gpt-responses\",\"output\":{output},\"usage\":{{\"output_tokens_details\":{{\"reasoning_tokens\":{reasoning_tokens}}}}}}}}}\n\n\
-data: [DONE]\n\n"
-    )
 }
 
 fn remote_compaction_v2_request() -> Value {
@@ -13555,212 +13537,6 @@ async fn aggregate_stream_request_sends_sse_accept_header() {
             .contains("accept: text/event-stream")
     );
     fallback_server.abort();
-}
-
-#[tokio::test]
-async fn continue_thinking_reports_accumulated_reasoning_tokens() {
-    let _lock = settings_path_test_lock().lock().unwrap();
-    let server = spawn_chat_server_with_response(responses_sse_with_reasoning("resp_continue", 38));
-    let settings = BackendSettings {
-        gpt_reasoning_continuation: true,
-        relay_profiles: vec![RelayProfile {
-            id: "responses".to_string(),
-            name: "Responses".to_string(),
-            base_url: server.base_url.clone(),
-            upstream_base_url: server.base_url.clone(),
-            api_key: "sk-test".to_string(),
-            protocol: RelayProtocol::Responses,
-            relay_mode: RelayMode::MixedApi,
-            model_mappings: vec![RelayModelMapping {
-                system_prompt_override: String::new(),
-                request_model: "gpt-responses".to_string(),
-                alias: String::new(),
-                protocol: RelayProtocol::Responses,
-                context_window: "200000".to_string(),
-            }],
-            ..RelayProfile::default()
-        }],
-        active_relay_id: "responses".to_string(),
-        ..BackendSettings::default()
-    };
-
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(
-        "x-codex-beta-features",
-        reqwest::header::HeaderValue::from_static("remote_compaction_v2"),
-    );
-    let request_context = RequestContext::from_headers(headers);
-    let result = apply_continue_thinking_to_responses_stream_with_request_context(
-        &json!({
-            "model": "gpt-responses",
-            "input": "hi",
-            "stream": true,
-            "reasoning": { "effort": "high" }
-        }),
-        settings,
-        &request_context,
-        responses_sse_with_reasoning("resp_first", 516),
-    )
-    .await;
-
-    assert!(result.triggered);
-    assert_eq!(result.rounds, 1);
-    assert_eq!(result.reasoning_tokens, Some(554));
-    assert!(result.sse_text.contains("\"reasoning_tokens\":38"));
-    let request = server.finish();
-    assert_eq!(request.path, "/v1/responses");
-    assert!(request.body.contains("continue_thinking"));
-    assert_eq!(request.x_codex_beta_features, "remote_compaction_v2");
-}
-
-#[tokio::test]
-async fn continue_thinking_skips_response_with_tool_call_output() {
-    let settings = BackendSettings {
-        gpt_reasoning_continuation: true,
-        relay_profiles: vec![RelayProfile {
-            id: "responses".to_string(),
-            name: "Responses".to_string(),
-            base_url: "http://127.0.0.1:9/v1".to_string(),
-            upstream_base_url: "http://127.0.0.1:9/v1".to_string(),
-            api_key: "sk-test".to_string(),
-            protocol: RelayProtocol::Responses,
-            relay_mode: RelayMode::MixedApi,
-            model_mappings: vec![RelayModelMapping {
-                system_prompt_override: String::new(),
-                request_model: "gpt-responses".to_string(),
-                alias: String::new(),
-                protocol: RelayProtocol::Responses,
-                context_window: "200000".to_string(),
-            }],
-            ..RelayProfile::default()
-        }],
-        active_relay_id: "responses".to_string(),
-        ..BackendSettings::default()
-    };
-    let first_round = responses_sse_with_reasoning_and_output(
-        "resp_tool_call",
-        516,
-        json!([
-            {
-                "id": "rs_1",
-                "type": "reasoning",
-                "encrypted_content": "abc123"
-            },
-            {
-                "id": "fc_1",
-                "type": "function_call",
-                "name": "exec_command",
-                "arguments": "{\"cmd\":\"pwd\"}",
-                "call_id": "call_1"
-            }
-        ]),
-    );
-
-    let result = apply_continue_thinking_to_responses_stream(
-        &json!({
-            "model": "gpt-responses",
-            "input": "hi",
-            "stream": true,
-            "reasoning": { "effort": "high" }
-        }),
-        settings,
-        None,
-        first_round,
-    )
-    .await;
-
-    assert!(!result.triggered);
-    assert_eq!(result.rounds, 0);
-    assert_eq!(result.reasoning_tokens, Some(516));
-    assert!(result.sse_text.contains("resp_tool_call"));
-    assert!(result.request_body.is_none());
-    assert!(result.before_response_body.is_none());
-    assert!(result.after_response_body.is_none());
-}
-
-#[tokio::test]
-async fn prompt_only_compaction_does_not_trigger_gpt_reasoning_continuation() {
-    let settings = BackendSettings {
-        layered_compaction_enabled: true,
-        layered_compaction_retain_recent_round_enabled: false,
-        gpt_reasoning_continuation: true,
-        ..BackendSettings::default()
-    };
-    let first_round = responses_sse_with_reasoning("resp_compaction_summary", 516);
-    let result = apply_continue_thinking_to_responses_stream(
-        &json!({
-            "model": "gpt-5.6",
-            "stream": true,
-            "reasoning": { "effort": "high" },
-            "input": [
-                { "type": "message", "role": "user", "content": "recent request" },
-                {
-                    "type": "message",
-                    "role": "user",
-                    "content": "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a summary."
-                }
-            ]
-        }),
-        settings,
-        None,
-        first_round.clone(),
-    )
-    .await;
-
-    assert!(!result.triggered);
-    assert_eq!(result.rounds, 0);
-    assert!(result.request_body.is_none());
-    assert_eq!(result.sse_text, first_round);
-}
-
-#[tokio::test]
-async fn continue_thinking_respects_configured_max_rounds() {
-    let _lock = settings_path_test_lock().lock().unwrap();
-    let server =
-        spawn_chat_server_with_response(responses_sse_with_reasoning("resp_continue_one", 516));
-    let settings = BackendSettings {
-        gpt_reasoning_continuation: true,
-        gpt_reasoning_continuation_max_rounds: 1,
-        relay_profiles: vec![RelayProfile {
-            id: "responses".to_string(),
-            name: "Responses".to_string(),
-            base_url: server.base_url.clone(),
-            upstream_base_url: server.base_url.clone(),
-            api_key: "sk-test".to_string(),
-            protocol: RelayProtocol::Responses,
-            relay_mode: RelayMode::MixedApi,
-            model_mappings: vec![RelayModelMapping {
-                system_prompt_override: String::new(),
-                request_model: "gpt-responses".to_string(),
-                alias: String::new(),
-                protocol: RelayProtocol::Responses,
-                context_window: "200000".to_string(),
-            }],
-            ..RelayProfile::default()
-        }],
-        active_relay_id: "responses".to_string(),
-        ..BackendSettings::default()
-    };
-
-    let result = apply_continue_thinking_to_responses_stream(
-        &json!({
-            "model": "gpt-responses",
-            "input": "hi",
-            "stream": true,
-            "reasoning": { "effort": "high" }
-        }),
-        settings,
-        None,
-        responses_sse_with_reasoning("resp_first", 516),
-    )
-    .await;
-
-    assert!(result.triggered);
-    assert_eq!(result.rounds, 1);
-    assert_eq!(result.reasoning_tokens, Some(1032));
-    assert!(result.sse_text.contains("resp_continue_one"));
-    let request = server.finish();
-    assert!(request.body.contains("call_continue_thinking_1"));
 }
 
 async fn respond_once(listener: tokio::net::TcpListener, response: &'static str) {

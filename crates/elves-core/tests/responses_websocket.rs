@@ -186,25 +186,6 @@ fn native_responses_websocket_supports_mixed_profiles_with_responses_models() {
 }
 
 #[test]
-fn reasoning_continuation_keeps_cached_websocket_support_enabled() {
-    let mut profile = native_responses_profile();
-    normalize_responses_websocket_capability(&mut profile);
-    profile.responses_websocket.state = ResponsesWebsocketCapabilityState::Supported;
-    let enabled = BackendSettings::default();
-    let disabled = BackendSettings {
-        gpt_reasoning_continuation: true,
-        ..BackendSettings::default()
-    };
-
-    assert!(relay_websocket_enabled_for_settings(&enabled, &profile));
-    assert!(relay_websocket_enabled_for_settings(&disabled, &profile));
-    assert_eq!(
-        profile.responses_websocket.state,
-        ResponsesWebsocketCapabilityState::Supported
-    );
-}
-
-#[test]
 fn explicit_websocket_preference_disables_usage_without_clearing_capability() {
     let mut profile = native_responses_profile();
     normalize_responses_websocket_capability(&mut profile);
@@ -801,7 +782,7 @@ async fn local_proxy_applies_system_prompt_overrides_to_each_websocket_request()
     .unwrap();
     let _settings_path = SettingsPathGuard::new(temp.path().join("settings.json"));
     let _proxy_log_path = ProxyLogPathGuard::new(temp.path().join("proxy-requests.jsonl"));
-    save_supported_websocket_settings(upstream_address, false, "gpt-prompt");
+    save_supported_websocket_settings(upstream_address, "gpt-prompt");
     let mut settings = SettingsStore::default().load().unwrap();
     settings.codex_home_path = temp.path().to_string_lossy().to_string();
     let mut mapping = settings.relay_profiles[0].model_mappings[0].clone();
@@ -1091,7 +1072,7 @@ async fn local_proxy_does_not_turn_upstream_pong_into_application_event() {
     let temp = tempfile::tempdir().unwrap();
     let _settings_path = SettingsPathGuard::new(temp.path().join("settings.json"));
     let _proxy_log_path = ProxyLogPathGuard::new(temp.path().join("proxy-requests.jsonl"));
-    save_supported_websocket_settings(upstream_address, false, "gpt-keepalive");
+    save_supported_websocket_settings(upstream_address, "gpt-keepalive");
 
     let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let local_address = local_listener.local_addr().unwrap();
@@ -1166,7 +1147,7 @@ async fn local_proxy_closes_downstream_promptly_when_upstream_ends_without_close
     let temp = tempfile::tempdir().unwrap();
     let _settings_path = SettingsPathGuard::new(temp.path().join("settings.json"));
     let _proxy_log_path = ProxyLogPathGuard::new(temp.path().join("proxy-requests.jsonl"));
-    save_supported_websocket_settings(upstream_address, false, "gpt-upstream-eof");
+    save_supported_websocket_settings(upstream_address, "gpt-upstream-eof");
 
     let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let local_address = local_listener.local_addr().unwrap();
@@ -1237,7 +1218,7 @@ async fn local_proxy_preserves_a_websocket_frame_read_with_the_upgrade_request()
     let temp = tempfile::tempdir().unwrap();
     let _settings_path = SettingsPathGuard::new(temp.path().join("settings.json"));
     let _proxy_log_path = ProxyLogPathGuard::new(temp.path().join("proxy-requests.jsonl"));
-    save_supported_websocket_settings(upstream_address, false, "gpt-trailing-frame");
+    save_supported_websocket_settings(upstream_address, "gpt-trailing-frame");
 
     let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let local_address = local_listener.local_addr().unwrap();
@@ -1323,7 +1304,7 @@ async fn local_proxy_prunes_compacted_image_history_before_websocket_size_check(
     let temp = tempfile::tempdir().unwrap();
     let _settings_path = SettingsPathGuard::new(temp.path().join("settings.json"));
     let _proxy_log_path = ProxyLogPathGuard::new(temp.path().join("proxy-requests.jsonl"));
-    save_supported_websocket_settings(upstream_address, false, "gpt-compacted-images");
+    save_supported_websocket_settings(upstream_address, "gpt-compacted-images");
     let mut settings = SettingsStore::default().load().unwrap();
     settings.relay_profiles[0].system_prompt_override = "compacted custom prompt".to_string();
     SettingsStore::default().save(&settings).unwrap();
@@ -1498,7 +1479,7 @@ async fn local_proxy_restores_resumed_compaction_checkpoint_before_websocket_siz
 
     let _settings_path = SettingsPathGuard::new(temp.path().join("settings.json"));
     let _proxy_log_path = ProxyLogPathGuard::new(temp.path().join("proxy-requests.jsonl"));
-    save_supported_websocket_settings(upstream_address, false, "gpt-resumed-compacted-images");
+    save_supported_websocket_settings(upstream_address, "gpt-resumed-compacted-images");
     let mut settings = SettingsStore::default().load().unwrap();
     settings.codex_home_path = codex_home.to_string_lossy().to_string();
     SettingsStore::default().save(&settings).unwrap();
@@ -1586,7 +1567,7 @@ async fn local_proxy_falls_back_same_turn_when_websocket_request_exceeds_16_mib(
     let temp = tempfile::tempdir().unwrap();
     let _settings_path = SettingsPathGuard::new(temp.path().join("settings.json"));
     let _proxy_log_path = ProxyLogPathGuard::new(temp.path().join("proxy-requests.jsonl"));
-    save_supported_websocket_settings(upstream_address, false, "gpt-large-frame");
+    save_supported_websocket_settings(upstream_address, "gpt-large-frame");
 
     let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let local_address = local_listener.local_addr().unwrap();
@@ -1686,7 +1667,7 @@ async fn unassigned_gpt_model_uses_inferred_responses_websocket_protocol() {
     let temp = tempfile::tempdir().unwrap();
     let _settings_path = SettingsPathGuard::new(temp.path().join("settings.json"));
     let _proxy_log_path = ProxyLogPathGuard::new(temp.path().join("proxy-requests.jsonl"));
-    save_supported_websocket_settings(upstream_address, false, "gpt-assigned");
+    save_supported_websocket_settings(upstream_address, "gpt-assigned");
 
     let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let local_address = local_listener.local_addr().unwrap();
@@ -1733,7 +1714,7 @@ async fn upstream_connection_failure_rejects_upgrade_before_sending_101() {
 
     let temp = tempfile::tempdir().unwrap();
     let _settings_path = SettingsPathGuard::new(temp.path().join("settings.json"));
-    save_supported_websocket_settings(unused_address, false, "gpt-websocket-test");
+    save_supported_websocket_settings(unused_address, "gpt-websocket-test");
 
     let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let local_address = local_listener.local_addr().unwrap();
@@ -1762,7 +1743,7 @@ async fn explicitly_disabled_websocket_rejects_upgrade_before_connecting_upstrea
 
     let temp = tempfile::tempdir().unwrap();
     let _settings_path = SettingsPathGuard::new(temp.path().join("settings.json"));
-    save_supported_websocket_settings(unused_address, false, "gpt-websocket-test");
+    save_supported_websocket_settings(unused_address, "gpt-websocket-test");
     let mut settings = SettingsStore::default().load().unwrap();
     settings.relay_profiles[0].responses_websocket_enabled = Some(false);
     SettingsStore::default().save(&settings).unwrap();
@@ -1794,7 +1775,7 @@ async fn local_proxy_only_downgrades_repeated_interruptions_and_completed_reques
     let _proxy_log_path = ProxyLogPathGuard::new(temp.path().join("proxy-requests.jsonl"));
     let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_address = upstream_listener.local_addr().unwrap();
-    save_supported_websocket_settings(upstream_address, false, "gpt-streak");
+    save_supported_websocket_settings(upstream_address, "gpt-streak");
     let upstream =
         tokio::spawn(async move {
             // 两次断流后完成一次，再连续断流三次；已完成后的 EOF 也不能破坏成功结果。
@@ -1928,7 +1909,7 @@ async fn local_proxy_keeps_websocket_after_client_disconnect_before_first_reques
 
     let temp = tempfile::tempdir().unwrap();
     let _settings_path = SettingsPathGuard::new(temp.path().join("settings.json"));
-    save_supported_websocket_settings(upstream_address, false, "gpt-side-turn");
+    save_supported_websocket_settings(upstream_address, "gpt-side-turn");
 
     let local_listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
     let local_address = local_listener.local_addr().unwrap();
@@ -2068,7 +2049,7 @@ async fn local_proxy_does_not_treat_client_cancellation_as_upstream_failure() {
 
     let temp = tempfile::tempdir().unwrap();
     let _settings_path = SettingsPathGuard::new(temp.path().join("settings.json"));
-    save_supported_websocket_settings(upstream_address, false, "gpt-side-turn-fallback");
+    save_supported_websocket_settings(upstream_address, "gpt-side-turn-fallback");
 
     let local_listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
     let local_address = local_listener.local_addr().unwrap();
@@ -2136,7 +2117,7 @@ async fn resumed_anthropic_compaction_retries_over_http_after_protocol_rejection
     let _proxy_log_path = ProxyLogPathGuard::new(temp.path().join("proxy.jsonl"));
     let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_address = upstream_listener.local_addr().unwrap();
-    save_supported_websocket_settings(upstream_address, false, "gpt-resume-test");
+    save_supported_websocket_settings(upstream_address, "gpt-resume-test");
     let mut settings = SettingsStore::default().load().unwrap();
     settings.layered_compaction_enabled = true;
     settings.relay_profiles[0]
@@ -2353,7 +2334,7 @@ async fn local_proxy_keeps_websocket_for_same_turn_after_application_request() {
 
     let temp = tempfile::tempdir().unwrap();
     let _settings_path = SettingsPathGuard::new(temp.path().join("settings.json"));
-    save_supported_websocket_settings(upstream_address, false, "gpt-side-turn-requested");
+    save_supported_websocket_settings(upstream_address, "gpt-side-turn-requested");
 
     let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let local_address = local_listener.local_addr().unwrap();
@@ -2406,235 +2387,6 @@ async fn local_proxy_keeps_websocket_for_same_turn_after_application_request() {
 
     local_server.await.unwrap();
     upstream.await.unwrap();
-}
-
-#[tokio::test]
-async fn reasoning_continuation_reuses_the_same_websocket_and_only_returns_the_final_round() {
-    let _settings_lock = websocket_settings_test_lock().lock().await;
-    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let upstream_address = upstream_listener.local_addr().unwrap();
-    let upstream = tokio::spawn(async move {
-        let (stream, _) = upstream_listener.accept().await.unwrap();
-        let mut socket = accept_hdr_async(stream, |_request: &Request, response: Response| {
-            Ok(response)
-        })
-        .await
-        .unwrap();
-
-        let first_request = socket.next().await.unwrap().unwrap();
-        let Message::Text(first_request) = first_request else {
-            panic!("expected first response.create");
-        };
-        let first_request: serde_json::Value =
-            serde_json::from_str(first_request.as_str()).unwrap();
-        assert_eq!(first_request["type"], "response.create");
-        assert_eq!(first_request["model"], "gpt-websocket-test");
-        assert_eq!(first_request["previous_response_id"], "resp_parent");
-        assert_eq!(first_request["store"], false);
-        assert_eq!(first_request["instructions"], "custom continuation prompt");
-
-        socket
-            .send(Message::Text(
-                serde_json::json!({
-                    "type": "response.created",
-                    "response": {
-                        "id": "resp_short",
-                        "status": "in_progress"
-                    }
-                })
-                .to_string()
-                .into(),
-            ))
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(80)).await;
-
-        socket
-            .send(Message::Text(
-                serde_json::json!({
-                    "type": "response.completed",
-                    "response": {
-                        "id": "resp_short",
-                        "status": "completed",
-                        "output": [{
-                            "id": "rs_short",
-                            "type": "reasoning",
-                            "encrypted_content": "encrypted-short",
-                            "summary": []
-                        }],
-                        "usage": {
-                            "output_tokens_details": {
-                                "reasoning_tokens": 516
-                            }
-                        }
-                    }
-                })
-                .to_string()
-                .into(),
-            ))
-            .await
-            .unwrap();
-
-        let continue_request = socket.next().await.unwrap().unwrap();
-        let Message::Text(continue_request) = continue_request else {
-            panic!("expected websocket continuation response.create");
-        };
-        let continue_request: serde_json::Value =
-            serde_json::from_str(continue_request.as_str()).unwrap();
-        assert_eq!(continue_request["type"], "response.create");
-        assert_eq!(continue_request["model"], "gpt-websocket-test");
-        assert_eq!(continue_request["previous_response_id"], "resp_short");
-        assert_eq!(
-            continue_request["instructions"],
-            "custom continuation prompt"
-        );
-        assert!(continue_request.get("stream").is_none());
-        assert!(continue_request.get("stream_options").is_none());
-        assert!(continue_request.get("background").is_none());
-        assert!(continue_request.get("conversation").is_none());
-        assert!(continue_request.get("conversation_id").is_none());
-        let continue_input = continue_request["input"].as_array().unwrap();
-        assert_eq!(continue_input.len(), 1);
-        assert_eq!(continue_input[0]["role"], "developer");
-        assert!(!continue_request.to_string().contains("think carefully"));
-        assert!(!continue_request.to_string().contains("encrypted-short"));
-
-        socket
-            .send(Message::Text(
-                serde_json::json!({
-                    "type": "response.completed",
-                    "response": {
-                        "id": "resp_final",
-                        "status": "completed",
-                        "output": [{
-                            "id": "msg_final",
-                            "type": "message",
-                            "role": "assistant",
-                            "status": "completed",
-                            "content": [{
-                                "type": "output_text",
-                                "text": "final answer"
-                            }]
-                        }],
-                        "usage": {
-                            "output_tokens_details": {
-                                "reasoning_tokens": 1552
-                            }
-                        }
-                    }
-                })
-                .to_string()
-                .into(),
-            ))
-            .await
-            .unwrap();
-        let _ = socket.close(None).await;
-    });
-
-    let temp = tempfile::tempdir().unwrap();
-    let _settings_path = SettingsPathGuard::new(temp.path().join("settings.json"));
-    let _proxy_log_path = ProxyLogPathGuard::new(temp.path().join("proxy-requests.jsonl"));
-    save_supported_websocket_settings(upstream_address, true, "gpt-websocket-test");
-    let mut settings = SettingsStore::default().load().unwrap();
-    settings.relay_profiles[0].system_prompt_override = "custom continuation prompt".to_string();
-    SettingsStore::default().save(&settings).unwrap();
-
-    let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let local_address = local_listener.local_addr().unwrap();
-    let local_server = tokio::spawn(async move {
-        let (mut stream, remote_addr) = local_listener.accept().await.unwrap();
-        let request_bytes = read_upgrade_request(&mut stream).await;
-        handle_responses_websocket_connection(stream, request_bytes, Some(remote_addr)).await
-    });
-
-    let (mut client, _) = connect_async(format!("ws://{local_address}/v1/responses"))
-        .await
-        .unwrap();
-    client
-        .send(Message::Text(
-            serde_json::json!({
-                "type": "response.create",
-                "model": "gpt-websocket-test",
-                "instructions": "original continuation prompt",
-                "store": false,
-                "previous_response_id": "resp_parent",
-                "input": [{
-                    "role": "user",
-                    "content": "think carefully"
-                }],
-                "stream": true,
-                "stream_options": {
-                    "include_usage": true
-                },
-                "background": false
-            })
-            .to_string()
-            .into(),
-        ))
-        .await
-        .unwrap();
-
-    let response = loop {
-        let message = client.next().await.unwrap().unwrap();
-        let Message::Text(response) = message else {
-            continue;
-        };
-        break serde_json::from_str::<serde_json::Value>(response.as_str()).unwrap();
-    };
-    assert_eq!(response["type"], "response.completed");
-    assert_eq!(response["response"]["id"], "resp_final");
-    assert!(!response.to_string().contains("resp_short"));
-
-    let _ = client.close(None).await;
-    local_server.await.unwrap().unwrap();
-    upstream.await.unwrap();
-
-    let summaries = elves_core::proxy_log::read_summaries(10).unwrap();
-    let summary = summaries
-        .iter()
-        .find(|entry| entry.model.as_deref() == Some("gpt-websocket-test"))
-        .expect("websocket continuation request should be recorded");
-    assert_eq!(summary.transport, ProxyRequestTransport::Ws);
-    assert_eq!(summary.state, ProxyRequestState::Completed);
-    let first_token_ms = summary
-        .first_token_ms
-        .expect("websocket first response event should record first token latency");
-    let duration_ms = summary
-        .duration_ms
-        .expect("websocket terminal event should record full duration");
-    assert!(
-        duration_ms >= first_token_ms.saturating_add(50),
-        "first token latency {first_token_ms}ms should be lower than duration {duration_ms}ms"
-    );
-    let detail = elves_core::proxy_log::find_record(&summary.id)
-        .unwrap()
-        .expect("websocket continuation request detail should exist");
-    assert!(detail.continue_thinking_triggered);
-    assert_eq!(detail.continue_thinking_rounds, 1);
-    assert_eq!(detail.reasoning_tokens, Some(2068));
-    assert!(
-        detail
-            .continue_thinking_request_body
-            .as_deref()
-            .is_some_and(|body| {
-                body.contains("\"previous_response_id\": \"resp_short\"")
-                    && body.contains("unpublished, incomplete draft")
-            })
-    );
-    assert!(
-        detail
-            .continue_thinking_before_response_body
-            .as_deref()
-            .is_some_and(|body| body.contains("resp_short"))
-    );
-    assert!(
-        detail
-            .continue_thinking_after_response_body
-            .as_deref()
-            .is_some_and(|body| body.contains("resp_final"))
-    );
-    assert!(!detail.response_body.contains("resp_short"));
-    assert!(detail.response_body.contains("resp_final"));
 }
 
 async fn spawn_http_status_server(
@@ -2746,7 +2498,7 @@ async fn helper_allows_client_http_retries_and_ignores_legacy_disabled_setting()
         }
     });
 
-    save_supported_websocket_settings(upstream_address, false, "gpt-fallback-policy");
+    save_supported_websocket_settings(upstream_address, "gpt-fallback-policy");
     let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = local_listener.local_addr().unwrap().port();
     drop(local_listener);
@@ -2856,7 +2608,7 @@ async fn assert_helper_ws_disconnect_cancels(send_created: bool) {
     let _proxy_log_path = ProxyLogPathGuard::new(temp.path().join("proxy-requests.jsonl"));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_address = listener.local_addr().unwrap();
-    save_supported_websocket_settings(upstream_address, false, "gpt-disconnect");
+    save_supported_websocket_settings(upstream_address, "gpt-disconnect");
     let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let provider = tokio::spawn(async move {
@@ -2998,7 +2750,7 @@ async fn websocket_http_policy_preserves_http_models_and_compaction() {
         }
         paths
     });
-    save_supported_websocket_settings(upstream_address, false, "gpt-http-policy");
+    save_supported_websocket_settings(upstream_address, "gpt-http-policy");
     let mut settings = SettingsStore::default().load().unwrap();
     settings.relay_profiles[0].model_mappings.extend([
         RelayModelMapping {
@@ -3131,7 +2883,6 @@ impl Drop for ProxyLogPathGuard {
 
 fn save_supported_websocket_settings(
     upstream_address: std::net::SocketAddr,
-    reasoning_continuation: bool,
     request_model: &str,
 ) {
     let mut profile = RelayProfile {
@@ -3160,7 +2911,6 @@ fn save_supported_websocket_settings(
         .save(&BackendSettings {
             relay_profiles: vec![profile],
             active_relay_id: "relay-websocket-test".to_string(),
-            gpt_reasoning_continuation: reasoning_continuation,
             ..BackendSettings::default()
         })
         .unwrap();

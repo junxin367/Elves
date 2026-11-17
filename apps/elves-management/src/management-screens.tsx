@@ -2,7 +2,7 @@
 import { closestCenter, DndContext, KeyboardSensor, PointerSensor, useSensor, useSensors, type DragEndEvent } from "@dnd-kit/core";
 import { SortableContext, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { ArrowLeft, ArrowDownWideNarrow, ArrowUpNarrowWide, Calendar, Check, CheckCircle2, ChevronDown, Cloud, Copy, Download, Edit3, Eye, EyeOff, GripVertical, MessageCircle, MessageSquareText, Network, Plus, RefreshCw, Save, Search, ShieldCheck, ShieldAlert, Shrink, Sparkles, TestTube, Trash2, X, Zap } from "lucide-react";
+import { ArrowLeft, ArrowDownWideNarrow, ArrowUpNarrowWide, Calendar, Check, CheckCircle2, ChevronDown, Cloud, Copy, Download, Edit3, Eye, EyeOff, GripVertical, MessageCircle, MessageSquareText, Network, Plus, RefreshCw, Save, Search, ShieldCheck, ShieldAlert, Shrink, TestTube, Trash2, X, Zap } from "lucide-react";
 import { ProviderPresetSelector } from "@/components/ProviderPresetSelector";
 import type { PresetPatch } from "@/components/ProviderPresetSelector";
 import type { RelayMode, RelayModelMapping, RelayProtocol } from "@/relay-types";
@@ -38,8 +38,6 @@ export type BackendSettings = {
   relayProfilesEnabled: boolean;
   lanProxyEnabled: boolean;
   remoteAccess: RemoteAccessSettings;
-  gptReasoningContinuation: boolean;
-  gptReasoningContinuationMaxRounds: number;
   layeredCompactionEnabled: boolean;
   layeredCompactionRetainRecentRoundEnabled: boolean;
   layeredCompactionRetainTokens: number;
@@ -364,8 +362,6 @@ export type LocalProxyLogEntry = {
   outputTokens?: number | null;
   reasoningEffort?: string | null;
   reasoningSource?: string | null;
-  continueThinkingTriggered?: boolean | null;
-  continueThinkingRounds?: number | null;
   remoteCompactionTriggered?: boolean | null;
   compactionRequested?: boolean | null;
   layeredCompactionTriggered?: boolean | null;
@@ -391,9 +387,6 @@ export type LocalProxyLogEntry = {
 export type LocalProxyLogDetail = LocalProxyLogEntry & {
   requestBody: string;
   responseBody: string;
-  continueThinkingRequestBody?: string | null;
-  continueThinkingBeforeResponseBody?: string | null;
-  continueThinkingAfterResponseBody?: string | null;
   layeredCompactionBeforeResponseBody?: string | null;
 };
 
@@ -419,8 +412,6 @@ export const defaultSettings: BackendSettings = {
   relayProfilesEnabled: true,
   lanProxyEnabled: false,
   remoteAccess: { ...defaultRemoteAccessSettings },
-  gptReasoningContinuation: false,
-  gptReasoningContinuationMaxRounds: 3,
   layeredCompactionEnabled: false,
   layeredCompactionRetainRecentRoundEnabled: false,
   layeredCompactionRetainTokens: 20000,
@@ -553,7 +544,7 @@ export function LocalProxyScreen({
   const entries = logs?.entries ?? [];
   const [page, setPage] = useState(1);
   const [modelFilter, setModelFilter] = useState("");
-  const [logFilter, setLogFilter] = useState<"high" | "continuation" | "">("");
+  const [logFilter, setLogFilter] = useState<"high" | "">("");
   const modelOptions = useMemo(
     () =>
       Array.from(new Set(entries.map(proxyLogDisplayModel).filter((model): model is string => Boolean(model))))
@@ -574,7 +565,6 @@ export function LocalProxyScreen({
     () =>
       modelFilteredEntries.filter((entry) => {
         if (logFilter === "high" && classifyHighReasoningRequest(entry) !== "high") return false;
-        if (logFilter === "continuation" && !isContinueThinkingEntry(entry)) return false;
         return true;
       }),
     [modelFilteredEntries, logFilter],
@@ -630,43 +620,6 @@ export function LocalProxyScreen({
                 />
                 <span>局域网代理</span>
               </label>
-              <div className="proxy-continue-thinking-control">
-                <label
-                  className="proxy-inline-toggle"
-                  data-tooltip="检测到 GPT 推理被中途截断时，自动让模型继续思考，减少因推理不足导致的错误"
-                >
-                  <input
-                    checked={form.gptReasoningContinuation}
-                    onChange={(event) =>
-                      void actions.saveSettingsValue(
-                        { ...form, gptReasoningContinuation: event.currentTarget.checked },
-                        false,
-                      )
-                    }
-                    type="checkbox"
-                  />
-                  <span>GPT 推理续接</span>
-                </label>
-                <span className="proxy-continue-thinking-limit-label">最大次数:</span>
-                <span className="proxy-continue-thinking-limit-wrap" data-tooltip="GPT 推理续接最大次数，范围 1-9">
-                  <Input
-                    aria-label="GPT 推理续接最大次数"
-                    className="proxy-continue-thinking-limit"
-                    inputMode="numeric"
-                    maxLength={1}
-                    onChange={(event) => {
-                      const digit = event.currentTarget.value.replace(/[^1-9]/g, "").slice(0, 1);
-                      if (!digit) return;
-                      void actions.saveSettingsValue(
-                        { ...form, gptReasoningContinuationMaxRounds: Number(digit) },
-                        true,
-                      );
-                    }}
-                    pattern="[1-9]"
-                    value={String(form.gptReasoningContinuationMaxRounds)}
-                  />
-                </span>
-              </div>
               <Button
                 onClick={() => {
                   void Promise.all([
@@ -773,7 +726,7 @@ export function LocalProxyScreen({
                 onChange={(next) => setModelFilter(next)}
               />
               <div
-                aria-label="请求高推理和 GPT 续接比例"
+                aria-label="请求高推理比例"
                 className="proxy-iq-ratio"
               >
                 <button
@@ -783,14 +736,6 @@ export function LocalProxyScreen({
                   type="button"
                 >
                   高 <strong>{requestRatio.highPercent}%</strong>
-                </button>
-                <button
-                  aria-pressed={logFilter === "continuation"}
-                  className={`proxy-iq-ratio-item continuation ${logFilter === "continuation" ? "active" : ""}`}
-                  onClick={() => setLogFilter((current) => (current === "continuation" ? "" : "continuation"))}
-                  type="button"
-                >
-                  续接 <strong>{requestRatio.continuationPercent}%</strong>
                 </button>
               </div>
             </div>
@@ -863,20 +808,6 @@ export function LocalProxyScreen({
                             {formatReasoningTokens(entry.reasoningTokens)}
                           </span>
                         </span>
-                        {entry.continueThinkingTriggered ? (
-                          <span
-                            aria-label={formatContinueThinkingTitle(entry)}
-                            className="proxy-continue-thinking-badge"
-                            data-tooltip={formatContinueThinkingTitle(entry)}
-                          >
-                            <Sparkles aria-hidden="true" className="proxy-continue-thinking-icon" />
-                            {typeof entry.continueThinkingRounds === "number" && entry.continueThinkingRounds > 0 ? (
-                              <span className="proxy-continue-thinking-count">
-                                {entry.continueThinkingRounds}
-                              </span>
-                            ) : null}
-                          </span>
-                        ) : null}
                       </small>
                     </span>
                     <span className="proxy-log-status" title={entry.error || entry.errorCode || undefined}>
@@ -986,27 +917,13 @@ export function LocalProxyLogDetailDialog({
   onCopyRequest: (text?: string) => Promise<void>;
   onCopyResponse: (text?: string) => Promise<void>;
 }) {
-  const [requestView, setRequestView] = useState<"full" | "continue">("full");
-  const [responseView, setResponseView] = useState<"full" | "before" | "after" | "precompaction">("full");
+  const [responseView, setResponseView] = useState<"full" | "precompaction">("full");
   const [responseFormat, setResponseFormat] = useState<"summary" | "raw">("summary");
   useEffect(() => { setResponseFormat("summary"); }, [entry.id, responseView]);
-  const continueRequestBody = entry.continueThinkingRequestBody?.trim() || "";
-  const continueBeforeBody = entry.continueThinkingBeforeResponseBody?.trim() || "";
-  const continueAfterBody = entry.continueThinkingAfterResponseBody?.trim() || "";
-  const hasContinueThinkingRequest = entry.continueThinkingTriggered && continueRequestBody;
-  const hasContinueThinkingViews = entry.continueThinkingTriggered && (continueBeforeBody || continueAfterBody);
   const layeredCompactionBeforeBody = entry.layeredCompactionBeforeResponseBody?.trim() || "";
   const hasLayeredCompactionView = entry.layeredCompactionTriggered && layeredCompactionBeforeBody;
-  const requestViewBody = requestView === "continue" ? continueRequestBody : entry.requestBody;
-  const responseViewBody =
-    responseView === "before"
-      ? continueBeforeBody
-      : responseView === "after"
-        ? continueAfterBody
-        : responseView === "precompaction"
-          ? layeredCompactionBeforeBody
-          : entry.responseBody;
-  const formattedRequestViewBody = formatProxyBody(requestViewBody);
+  const responseViewBody = responseView === "precompaction" ? layeredCompactionBeforeBody : entry.responseBody;
+  const formattedRequestViewBody = formatProxyBody(entry.requestBody);
   const responseBodyView = useMemo(() => readProxyResponseBody(responseViewBody), [responseViewBody]);
   // 统计始终读取原始事件的格式化结果，切换汇总和原始视图不能改变 token 数。
   const formattedResponseViewBody = responseBodyView.formatted;
@@ -1048,7 +965,6 @@ export function LocalProxyLogDetailDialog({
   }, [onClose]);
 
   useEffect(() => {
-    setRequestView("full");
     setResponseView("full");
   }, [entry.id]);
 
@@ -1170,7 +1086,7 @@ export function LocalProxyLogDetailDialog({
           <strong title="当前返回的 Token 用量；缓存计入输入，推理计入输出">Token</strong>
           {responseView !== "full" ? (
             <span className="proxy-detail-usage-scope">
-              {responseView === "before" ? "续接前" : responseView === "after" ? "续接后" : "压缩前"}
+              压缩前
             </span>
           ) : null}
           <dl className="proxy-detail-usage-list">
@@ -1197,32 +1113,6 @@ export function LocalProxyLogDetailDialog({
             <div className="proxy-detail-pane">
               <div className="proxy-detail-pane-head">
                 <span>完整请求</span>
-                {hasContinueThinkingRequest ? (
-                  <span className="proxy-detail-response-tabs" aria-label="续接请求视图">
-                    <Button
-                      aria-pressed={requestView === "full"}
-                      className={`proxy-detail-copy-button proxy-detail-view-button ${requestView === "full" ? "active" : ""}`}
-                      onClick={() => setRequestView("full")}
-                      size="sm"
-                      title="查看续接前请求"
-                      type="button"
-                      variant="secondary"
-                    >
-                      续接前
-                    </Button>
-                    <Button
-                      aria-pressed={requestView === "continue"}
-                      className={`proxy-detail-copy-button proxy-detail-view-button ${requestView === "continue" ? "active" : ""}`}
-                      onClick={() => setRequestView("continue")}
-                      size="sm"
-                      title="查看续接后请求"
-                      type="button"
-                      variant="secondary"
-                    >
-                      续接后
-                    </Button>
-                  </span>
-                ) : null}
                 <Button
                   aria-label="复制请求"
                   className="proxy-detail-copy-button"
@@ -1259,34 +1149,6 @@ export function LocalProxyLogDetailDialog({
                       variant="secondary"
                     >
                       原始事件
-                    </Button>
-                  </span>
-                ) : null}
-                {hasContinueThinkingViews ? (
-                  <span className="proxy-detail-response-tabs" aria-label="续接返回视图">
-                    <Button
-                      aria-pressed={responseView === "before"}
-                      className={`proxy-detail-copy-button proxy-detail-view-button ${responseView === "before" ? "active" : ""}`}
-                      disabled={!continueBeforeBody}
-                      onClick={() => setResponseView("before")}
-                      size="sm"
-                      title={continueBeforeBody ? "查看续接前汇总返回" : "当前日志未保存续接前汇总返回"}
-                      type="button"
-                      variant="secondary"
-                    >
-                      续接前
-                    </Button>
-                    <Button
-                      aria-pressed={responseView === "after"}
-                      className={`proxy-detail-copy-button proxy-detail-view-button ${responseView === "after" ? "active" : ""}`}
-                      disabled={!continueAfterBody}
-                      onClick={() => setResponseView("after")}
-                      size="sm"
-                      title={continueAfterBody ? "查看续接后汇总返回" : "当前日志未保存续接后汇总返回"}
-                      type="button"
-                      variant="secondary"
-                    >
-                      续接后
                     </Button>
                   </span>
                 ) : null}
@@ -2695,9 +2557,7 @@ export function RelayProfileEditor({
       ? `${responsesWebsocketBaseMessage} ${
           !profile.responsesWebsocketEnabled
             ? "当前已关闭，Responses 模型会使用 HTTP/SSE。"
-            : form.gptReasoningContinuation
-              ? "Responses 模型会使用 WebSocket；触发 GPT 推理续接时会复用同一连接。"
-              : "Responses 模型会使用 WebSocket。"
+            : "Responses 模型会使用 WebSocket。"
         }`
       : responsesWebsocketBaseMessage;
   const responsesWebsocketCheckedAt =
@@ -2788,11 +2648,11 @@ export function RelayProfileEditor({
           <span>{relayProfileEditorStatus(profile, form, isNew)}</span>
         </div>
         <div className="relay-editor-actions">
-          {/* 代理随 Elves 启动，提示只说明启动行为及续接用途。 */}
+          {/* 用户要求删除 GPT 推理续接；本地代理开关只控制代理随 Elves 启动。 */}
           {showApiFields ? (
             <label
               className="inline-check local-proxy-toggle"
-              data-tooltip="随 Elves 启动，可配合「GPT 推理续接」补全被截断的思考。"
+              data-tooltip="启用后，本地协议代理随 Elves 启动。"
             >
               <input
                 checked={profile.localProxyEnabled}
@@ -5416,31 +5276,18 @@ export function localProxyStateLabel(status: LocalProxyStatusResult | null) {
 export function calculateRequestRatio(entries: LocalProxyLogEntry[]) {
   let high = 0;
   let highTotal = 0;
-  let continuation = 0;
-  let continuationTotal = 0;
 
   entries.forEach((entry) => {
     highTotal += 1;
     if (classifyHighReasoningRequest(entry) === "high") {
       high += 1;
     }
-    if (isGptModel(proxyLogDisplayModel(entry))) {
-      continuationTotal += 1;
-      if (isContinueThinkingEntry(entry)) {
-        continuation += 1;
-      }
-    }
   });
 
   return {
     high,
-    continuation,
     highTotal,
-    continuationTotal,
     highPercent: highTotal ? Math.round((high / highTotal) * 100) : 0,
-    continuationPercent: continuationTotal
-      ? Math.round((continuation / continuationTotal) * 100)
-      : 0,
   };
 }
 
@@ -5528,14 +5375,6 @@ export function classifyHighReasoningRequest(entry: Pick<LocalProxyLogEntry, "re
   return null;
 }
 
-export function isContinueThinkingEntry(entry: LocalProxyLogEntry) {
-  return isGptModel(proxyLogDisplayModel(entry)) && entry.continueThinkingTriggered === true;
-}
-
-export function isGptModel(model?: string | null) {
-  return Boolean(model?.toLowerCase().includes("gpt"));
-}
-
 export function isClaudeModel(model?: string | null) {
   const slug = model?.trim().toLowerCase().split("/").filter(Boolean).pop() || "";
   return slug === "claude" || slug.startsWith("claude-") || slug.startsWith("anthropic.claude");
@@ -5543,12 +5382,6 @@ export function isClaudeModel(model?: string | null) {
 
 export function formatReasoningTokens(value?: number | null) {
   return typeof value === "number" ? value.toLocaleString() : "-";
-}
-
-export function formatContinueThinkingTitle(entry: Pick<LocalProxyLogEntry, "continueThinkingRounds">) {
-  return typeof entry.continueThinkingRounds === "number" && entry.continueThinkingRounds > 0
-    ? `已触发 GPT 推理续接 ${entry.continueThinkingRounds} 轮`
-    : "已触发 GPT 推理续接";
 }
 
 export function formatLayeredCompactionTitle(
@@ -5756,7 +5589,6 @@ export function normalizeSettings(settings: BackendSettings): BackendSettings {
     lanProxyEnabled: settings.lanProxyEnabled === true,
     remoteAccess: { ...defaultRemoteAccessSettings, ...settings.remoteAccess },
 
-    gptReasoningContinuationMaxRounds: clampNumber(settings.gptReasoningContinuationMaxRounds || 3, 1, 9),
     layeredCompactionRetainTokens: clampNumber(
       settings.layeredCompactionRetainTokens || 20000,
       20000,

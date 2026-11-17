@@ -2091,7 +2091,7 @@ fn validate_remote_compaction_v2_bridge_candidate(
                 )
             }
         };
-        crate::continue_thinking::extract_terminal_response_object(&rewritten)
+        crate::protocol_proxy::extract_terminal_response_object(&rewritten)
             .context("V2 候选流缺少终止响应")?
     } else {
         let upstream_json: Value =
@@ -4660,77 +4660,55 @@ fn conversation_id_from_responses_request(body: &Value) -> Option<String> {
     None
 }
 
-#[derive(Debug, Clone)]
-pub struct ContinueThinkingResult {
-    pub sse_text: String,
-    pub triggered: bool,
-    pub rounds: u32,
-    pub reasoning_tokens: Option<u64>,
-    pub request_body: Option<String>,
-    pub before_response_body: Option<String>,
-    pub after_response_body: Option<String>,
-}
-
-impl ContinueThinkingResult {
-    fn unchanged(sse_text: String) -> Self {
-        Self {
-            sse_text,
-            triggered: false,
-            rounds: 0,
-            reasoning_tokens: None,
-            request_body: None,
-            before_response_body: None,
-            after_response_body: None,
+// 用户要求移除按推理用量自动续接；SSE 终态解析继续供压缩和模型繁忙重试共用。
+/// 从一段完整的 Responses SSE 文本中提取终止事件（response.completed /
+/// response.incomplete / response.failed）里的 `response` 对象。取最后一个
+/// 匹配的事件（正常情况下每轮响应只有一个终止事件）。
+pub fn extract_terminal_response_object(sse_text: &str) -> Option<Value> {
+    let mut result = None;
+    for block in sse_text.split("\n\n") {
+        for line in block.lines() {
+            let line = line.trim();
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            let Ok(event) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+            let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
+            if matches!(
+                event_type,
+                "response.completed" | "response.incomplete" | "response.failed"
+            ) {
+                if let Some(response) = event.get("response") {
+                    result = Some(response.clone());
+                }
+            }
         }
     }
+    result
+}
 
-    fn from_state(
-        sse_text: String,
-        triggered: bool,
-        rounds: u32,
-        reasoning_tokens: Option<u64>,
-        request_body: Option<String>,
-        before_response_body: Option<String>,
-    ) -> Self {
-        let after_response_body = if triggered {
-            terminal_response_body_from_sse(&sse_text)
-        } else {
-            None
-        };
-        Self {
-            sse_text,
-            triggered,
-            rounds,
-            reasoning_tokens,
-            request_body,
-            before_response_body,
-            after_response_body,
-        }
+#[cfg(test)]
+mod response_sse_tests {
+    use super::extract_terminal_response_object;
+
+    #[test]
+    fn extracts_terminal_response_and_preserves_native_reasoning_usage() {
+        let sse = "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"output_tokens_details\":{\"reasoning_tokens\":516}}}}\n\n";
+        let response = extract_terminal_response_object(sse).unwrap();
+        assert_eq!(response["status"], "completed");
+        assert_eq!(response["usage"]["output_tokens_details"]["reasoning_tokens"], 516);
     }
-}
 
-fn terminal_response_body_from_sse(sse_text: &str) -> Option<String> {
-    let response_object = crate::continue_thinking::extract_terminal_response_object(sse_text)?;
-    serde_json::to_string_pretty(&response_object).ok()
-}
-
-fn terminal_response_body(response_object: &Value) -> Option<String> {
-    serde_json::to_string_pretty(response_object).ok()
-}
-
-fn continue_request_body(requests: &[Value]) -> Option<String> {
-    match requests {
-        [] => None,
-        [single] => single
-            .get("request")
-            .and_then(|request| serde_json::to_string_pretty(request).ok()),
-        _ => serde_json::to_string_pretty(&json!({ "rounds": requests })).ok(),
-    }
-}
-
-fn add_reasoning_tokens(total: &mut Option<u64>, reasoning_tokens: Option<u64>) {
-    if let Some(reasoning_tokens) = reasoning_tokens {
-        *total = Some(total.unwrap_or(0).saturating_add(reasoning_tokens));
+    #[test]
+    fn non_terminal_stream_has_no_terminal_response() {
+        let sse = "event: response.created\ndata: {\"type\":\"response.created\"}\n\n";
+        assert!(extract_terminal_response_object(sse).is_none());
     }
 }
 
@@ -4787,7 +4765,7 @@ fn value_has_retryable_model_capacity_error(value: &Value) -> bool {
 }
 
 pub(crate) fn responses_stream_has_retryable_model_capacity_error(sse_text: &str) -> bool {
-    let Some(response) = crate::continue_thinking::extract_terminal_response_object(sse_text)
+    let Some(response) = crate::protocol_proxy::extract_terminal_response_object(sse_text)
     else {
         return false;
     };
@@ -5021,7 +4999,7 @@ fn observe_model_capacity_attempt(
     audit.error_code = attempt.error_code.clone();
 }
 
-async fn retry_model_capacity_responses_stream(
+pub(crate) async fn retry_model_capacity_responses_stream(
     original_request: &Value,
     settings: &crate::settings::BackendSettings,
     request_context: &RequestContext,
@@ -5173,275 +5151,6 @@ async fn retry_model_capacity_responses_stream(
     }
 
     current_sse_text
-}
-
-/// GPT + Responses 直连协议下的"续思考"驱动。
-///
-/// 入参为第一轮已完成的上游 SSE 文本（UTF-8）。若 reasoning_tokens 命中 518
-/// 网格且倍数低于阈值，则把上一轮的 reasoning item（带 encrypted_content）
-/// 和一个伪造的 continue_thinking 工具调用/返回回传上游，让模型从截断处
-/// 继续思考，直到不再命中网格或达到最大续写轮数。返回最后一轮的完整 SSE
-/// 文本和续写触发元数据；其中 reasoning_tokens 是各轮累计值，供请求日志展示。
-///
-/// 任何异常（无法解析终止事件、续写请求失败等）都直接返回当前已有的文本，
-/// 不阻断主流程。
-pub async fn apply_continue_thinking_to_responses_stream(
-    original_request: &Value,
-    settings: crate::settings::BackendSettings,
-    original_user_agent: Option<&str>,
-    first_round_sse_text: String,
-) -> ContinueThinkingResult {
-    let request_context = RequestContext::from_user_agent(original_user_agent);
-    apply_continue_thinking_to_responses_stream_with_request_context(
-        original_request,
-        settings,
-        &request_context,
-        first_round_sse_text,
-    )
-    .await
-}
-
-pub async fn apply_continue_thinking_to_responses_stream_with_request_context(
-    original_request: &Value,
-    settings: crate::settings::BackendSettings,
-    request_context: &RequestContext,
-    first_round_sse_text: String,
-) -> ContinueThinkingResult {
-    let mut audit = crate::proxy_log::ProxyRequestAudit::default();
-    apply_continue_thinking_to_responses_stream_with_request_context_and_audit(
-        original_request,
-        settings,
-        request_context,
-        first_round_sse_text,
-        &mut audit,
-    )
-    .await
-}
-
-pub(crate) async fn apply_continue_thinking_to_responses_stream_with_request_context_and_audit(
-    original_request: &Value,
-    settings: crate::settings::BackendSettings,
-    request_context: &RequestContext,
-    first_round_sse_text: String,
-    audit: &mut crate::proxy_log::ProxyRequestAudit,
-) -> ContinueThinkingResult {
-    let first_round_sse_text = retry_model_capacity_responses_stream(
-        original_request,
-        &settings,
-        request_context,
-        first_round_sse_text,
-        audit,
-    )
-    .await;
-    let model = original_request
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if !settings.gpt_reasoning_continuation
-        || !crate::continue_thinking::is_supported_model(model)
-        || crate::layered_compaction::is_any_compaction_request(original_request)
-    {
-        return ContinueThinkingResult::unchanged(first_round_sse_text);
-    }
-
-    let mut current_sse_text = first_round_sse_text;
-    let max_continue_rounds = u32::from(settings.gpt_reasoning_continuation_max_rounds);
-    let mut round: u32 = 0;
-    let mut triggered = false;
-    let mut completed_rounds = 0;
-    let mut accumulated_reasoning_tokens = None;
-    let mut continue_requests = Vec::new();
-    let mut before_response_body = None;
-    let stream_idle_timeout = stream_idle_timeout_for_request(Some(original_request));
-    loop {
-        let Some(response_object) =
-            crate::continue_thinking::extract_terminal_response_object(&current_sse_text)
-        else {
-            return ContinueThinkingResult::from_state(
-                current_sse_text,
-                triggered,
-                completed_rounds,
-                accumulated_reasoning_tokens,
-                continue_request_body(&continue_requests),
-                before_response_body,
-            );
-        };
-        let reasoning_tokens = crate::continue_thinking::extract_reasoning_tokens(&response_object);
-        add_reasoning_tokens(&mut accumulated_reasoning_tokens, reasoning_tokens);
-        if !crate::continue_thinking::response_allows_continuation(&response_object)
-            || !crate::continue_thinking::should_continue_thinking(reasoning_tokens)
-        {
-            return ContinueThinkingResult::from_state(
-                current_sse_text,
-                triggered,
-                completed_rounds,
-                accumulated_reasoning_tokens,
-                continue_request_body(&continue_requests),
-                before_response_body,
-            );
-        }
-        let tool_call_types = crate::continue_thinking::response_tool_call_types(&response_object);
-        if !tool_call_types.is_empty() {
-            let _ = crate::diagnostic_log::append_diagnostic_log(
-                "continue_thinking.skipped_tool_call",
-                json!({
-                    "model": model,
-                    "reasoningTokens": reasoning_tokens,
-                    "gridMultiple": reasoning_tokens.and_then(crate::continue_thinking::grid_multiple),
-                    "toolCallTypes": tool_call_types
-                }),
-            );
-            return ContinueThinkingResult::from_state(
-                current_sse_text,
-                triggered,
-                completed_rounds,
-                accumulated_reasoning_tokens,
-                continue_request_body(&continue_requests),
-                before_response_body,
-            );
-        }
-        if round >= max_continue_rounds {
-            return ContinueThinkingResult::from_state(
-                current_sse_text,
-                triggered,
-                completed_rounds,
-                accumulated_reasoning_tokens,
-                continue_request_body(&continue_requests),
-                before_response_body,
-            );
-        }
-        round += 1;
-        triggered = true;
-        if before_response_body.is_none() {
-            before_response_body = terminal_response_body(&response_object);
-        }
-
-        let previous_output_items =
-            crate::continue_thinking::extract_output_items(&response_object);
-        let continue_request = crate::continue_thinking::build_continue_request(
-            original_request,
-            &previous_output_items,
-            round,
-        );
-        continue_requests.push(json!({
-            "round": round,
-            "request": continue_request.clone()
-        }));
-        let Ok(continue_body) = serde_json::to_string(&continue_request) else {
-            return ContinueThinkingResult::from_state(
-                current_sse_text,
-                triggered,
-                completed_rounds,
-                accumulated_reasoning_tokens,
-                continue_request_body(&continue_requests),
-                before_response_body,
-            );
-        };
-
-        let _ = crate::diagnostic_log::append_diagnostic_log(
-            "continue_thinking.round_start",
-            json!({
-                "model": model,
-                "round": round,
-                "reasoningTokens": reasoning_tokens,
-                "gridMultiple": reasoning_tokens.and_then(crate::continue_thinking::grid_multiple)
-            }),
-        );
-
-        // 续接轮次与首轮遵循同一规则：响应头可能就是首个业务进展，
-        // 因此继续按请求推理等级使用业务空闲预算。
-        let upstream = match open_responses_proxy_request_with_settings_request_context_and_timeout(
-            &continue_body,
-            settings.clone(),
-            request_context,
-            Some(stream_idle_timeout),
-        )
-        .await
-        {
-            Ok(upstream) => upstream,
-            Err(error) => {
-                let _ = crate::diagnostic_log::append_diagnostic_log(
-                    "continue_thinking.round_request_failed",
-                    json!({ "round": round, "error": error.to_string() }),
-                );
-                return ContinueThinkingResult::from_state(
-                    current_sse_text,
-                    triggered,
-                    completed_rounds,
-                    accumulated_reasoning_tokens,
-                    continue_request_body(&continue_requests),
-                    before_response_body,
-                );
-            }
-        };
-        if !upstream.is_success() {
-            return ContinueThinkingResult::from_state(
-                current_sse_text,
-                triggered,
-                completed_rounds,
-                accumulated_reasoning_tokens,
-                continue_request_body(&continue_requests),
-                before_response_body,
-            );
-        }
-        let response_protocol = upstream.response_protocol;
-        let bytes = match upstream
-            .into_body_bytes_with_idle_timeout(stream_idle_timeout)
-            .await
-        {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                let _ = crate::diagnostic_log::append_diagnostic_log(
-                    "continue_thinking.round_stream_failed",
-                    json!({ "round": round, "error": error.to_string() }),
-                );
-                return ContinueThinkingResult::from_state(
-                    current_sse_text,
-                    triggered,
-                    completed_rounds,
-                    accumulated_reasoning_tokens,
-                    continue_request_body(&continue_requests),
-                    before_response_body,
-                );
-            }
-        };
-        let round_sse_text = buffered_upstream_response_as_responses_sse(
-            &bytes,
-            response_protocol,
-            &continue_request,
-        )
-        .ok();
-        let valid_terminal = round_sse_text
-            .as_deref()
-            .and_then(crate::continue_thinking::extract_terminal_response_object)
-            .is_some_and(|response| {
-                matches!(
-                    response.get("status").and_then(Value::as_str),
-                    Some("completed" | "incomplete")
-                ) && response.get("error").is_none_or(Value::is_null)
-            });
-        if !valid_terminal {
-            let _ = crate::diagnostic_log::append_diagnostic_log(
-                "continue_thinking.round_invalid_terminal",
-                json!({"round":round,"preservedPreviousResponse":true}),
-            );
-            return ContinueThinkingResult::from_state(
-                current_sse_text,
-                triggered,
-                completed_rounds,
-                accumulated_reasoning_tokens,
-                continue_request_body(&continue_requests),
-                before_response_body,
-            );
-        }
-        let round_sse_text = round_sse_text.expect("validated terminal response");
-        let _ = crate::diagnostic_log::append_diagnostic_log(
-            "continue_thinking.round_completed",
-            json!({ "round": round, "bytes": round_sse_text.len() }),
-        );
-        completed_rounds = round;
-        current_sse_text = round_sse_text;
-    }
 }
 
 fn effective_user_agent(configured_user_agent: &str, original_user_agent: Option<&str>) -> String {

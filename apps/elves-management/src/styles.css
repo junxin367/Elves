@@ -3434,30 +3434,6 @@ body {
   cursor: pointer;
 }
 
-.proxy-continue-thinking-control {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.proxy-continue-thinking-limit-label {
-  color: hsl(var(--muted-foreground));
-  font-size: 12px;
-  white-space: nowrap;
-}
-
-.proxy-continue-thinking-limit-wrap {
-  display: inline-flex;
-  width: 42px;
-}
-
-.proxy-continue-thinking-limit {
-  width: 42px;
-  height: 30px;
-  padding: 0 8px;
-  text-align: center;
-}
-
 .switch-row {
   display: grid;
   grid-template-columns: 18px minmax(0, 1fr);
@@ -5043,45 +5019,6 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.proxy-log-reasoning-tokens > .proxy-continue-thinking-badge {
-  overflow: visible;
-}
-
-.proxy-continue-thinking-badge {
-  align-items: center;
-  display: inline-flex;
-  flex: 0 0 auto;
-  height: 16px;
-  justify-content: flex-start;
-  position: relative;
-  width: 20px;
-}
-
-.proxy-continue-thinking-icon {
-  color: rgb(113 199 73);
-  flex: 0 0 auto;
-  height: 14px;
-  width: 14px;
-}
-
-.proxy-continue-thinking-count {
-  align-items: center;
-  background: transparent;
-  color: hsl(var(--brand-accent));
-  display: inline-flex;
-  font-family: Inter, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
-  font-size: 9px;
-  font-weight: 800;
-  height: auto;
-  justify-content: center;
-  line-height: 1;
-  min-width: 0;
-  padding: 0;
-  position: absolute;
-  right: 0;
-  top: -4px;
 }
 
 .proxy-reasoning-token.normal {

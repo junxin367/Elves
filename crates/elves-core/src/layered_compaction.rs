@@ -2693,7 +2693,7 @@ pub fn apply_layered_compaction_to_responses_sse(
         return LayeredCompactionResult::unchanged(sse_text);
     }
     let Some(response_object) =
-        crate::continue_thinking::extract_terminal_response_object(&sse_text)
+        crate::protocol_proxy::extract_terminal_response_object(&sse_text)
     else {
         return LayeredCompactionResult::unchanged(sse_text);
     };
@@ -3843,7 +3843,7 @@ mod tests {
         assert_eq!(done_items.len(), 1);
         assert!(done_items[0].contains("\"type\":\"compaction\""));
         assert!(!rewritten.contains("\"type\":\"message\",\"status\":\"completed\""));
-        let terminal = crate::continue_thinking::extract_terminal_response_object(&rewritten)
+        let terminal = crate::protocol_proxy::extract_terminal_response_object(&rewritten)
             .expect("rewritten SSE has terminal response");
         assert_eq!(
             terminal
@@ -4340,7 +4340,7 @@ mod tests {
         );
         assert!(result.triggered);
         assert_eq!(result.retained_items, 4);
-        let response = crate::continue_thinking::extract_terminal_response_object(&result.sse_text)
+        let response = crate::protocol_proxy::extract_terminal_response_object(&result.sse_text)
             .expect("structured legacy response");
         let encoded = extract_message_text(&response).expect("structured payload text");
         let payload =
@@ -4382,7 +4382,7 @@ mod tests {
             DEFAULT_RETAIN_TOKENS,
             summary_sse("较早历史摘要"),
         );
-        let response = crate::continue_thinking::extract_terminal_response_object(&result.sse_text)
+        let response = crate::protocol_proxy::extract_terminal_response_object(&result.sse_text)
             .expect("structured response");
         let encoded = extract_message_text(&response).expect("structured payload text");
         let payload =
@@ -4767,7 +4767,7 @@ mod tests {
                 .sse_text
                 .contains("local_compaction_retained_tail_too_large")
         );
-        let response = crate::continue_thinking::extract_terminal_response_object(&result.sse_text)
+        let response = crate::protocol_proxy::extract_terminal_response_object(&result.sse_text)
             .expect("trimmed compaction response");
         let encoded = extract_message_text(&response).expect("structured payload text");
         let payload =
@@ -4846,7 +4846,7 @@ mod tests {
         );
         assert!(result.triggered);
         assert!(!result.sse_text.contains("response.failed"));
-        let response = crate::continue_thinking::extract_terminal_response_object(&result.sse_text)
+        let response = crate::protocol_proxy::extract_terminal_response_object(&result.sse_text)
             .expect("trimmed compaction response");
         let encoded = extract_message_text(&response).expect("structured payload text");
         let payload =
@@ -4909,7 +4909,7 @@ mod tests {
         );
         assert!(result.triggered);
         assert!(!result.sse_text.contains("response.failed"));
-        let response = crate::continue_thinking::extract_terminal_response_object(&result.sse_text)
+        let response = crate::protocol_proxy::extract_terminal_response_object(&result.sse_text)
             .expect("trimmed compaction response");
         let encoded = extract_message_text(&response).expect("structured payload text");
         let payload =
@@ -4951,7 +4951,7 @@ mod tests {
             summary_sse("SUMMARY"),
         );
         assert!(result.triggered);
-        let response = crate::continue_thinking::extract_terminal_response_object(&result.sse_text)
+        let response = crate::protocol_proxy::extract_terminal_response_object(&result.sse_text)
             .expect("trimmed compaction response");
         let encoded = extract_message_text(&response).expect("structured payload text");
         let payload =
@@ -5005,7 +5005,7 @@ mod tests {
             summary_sse("SUMMARY"),
         );
         assert!(result.triggered);
-        let response = crate::continue_thinking::extract_terminal_response_object(&result.sse_text)
+        let response = crate::protocol_proxy::extract_terminal_response_object(&result.sse_text)
             .expect("trimmed compaction response");
         let encoded = extract_message_text(&response).expect("structured payload text");
         let payload =
@@ -5080,7 +5080,7 @@ mod tests {
             summary_sse("SUMMARY"),
         );
         assert!(result.triggered);
-        let response = crate::continue_thinking::extract_terminal_response_object(&result.sse_text)
+        let response = crate::protocol_proxy::extract_terminal_response_object(&result.sse_text)
             .expect("trimmed compaction response");
         let encoded = extract_message_text(&response).expect("structured payload text");
         let payload =
@@ -5163,7 +5163,7 @@ mod tests {
             summary_sse("SUMMARY"),
         );
         assert!(result.triggered);
-        let response = crate::continue_thinking::extract_terminal_response_object(&result.sse_text)
+        let response = crate::protocol_proxy::extract_terminal_response_object(&result.sse_text)
             .expect("trimmed compaction response");
         let encoded = extract_message_text(&response).expect("structured payload text");
         let payload =
@@ -5216,7 +5216,7 @@ mod tests {
             summary_sse("SUMMARY"),
         );
         assert!(result.triggered);
-        let response = crate::continue_thinking::extract_terminal_response_object(&result.sse_text)
+        let response = crate::protocol_proxy::extract_terminal_response_object(&result.sse_text)
             .expect("trimmed compaction response");
         let encoded = extract_message_text(&response).expect("structured payload text");
         let payload =
@@ -5265,7 +5265,7 @@ mod tests {
             summary_sse("SUMMARY"),
         );
         assert!(result.triggered);
-        let response = crate::continue_thinking::extract_terminal_response_object(&result.sse_text)
+        let response = crate::protocol_proxy::extract_terminal_response_object(&result.sse_text)
             .expect("trimmed compaction response");
         let encoded = extract_message_text(&response).expect("structured payload text");
         let payload =
@@ -5415,7 +5415,7 @@ mod tests {
             summary_sse("SUMMARY"),
         );
         assert!(result.triggered);
-        let response = crate::continue_thinking::extract_terminal_response_object(&result.sse_text)
+        let response = crate::protocol_proxy::extract_terminal_response_object(&result.sse_text)
             .expect("trimmed compaction response");
         let encoded = extract_message_text(&response).expect("structured payload text");
         let payload =
@@ -5517,7 +5517,7 @@ mod tests {
                 .sse_text
                 .contains("local_compaction_retained_tail_too_large")
         );
-        let response = crate::continue_thinking::extract_terminal_response_object(&result.sse_text)
+        let response = crate::protocol_proxy::extract_terminal_response_object(&result.sse_text)
             .expect("soft-limit compaction response");
         let encoded = extract_message_text(&response).expect("structured payload text");
         let payload =

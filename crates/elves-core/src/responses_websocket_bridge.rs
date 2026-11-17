@@ -454,7 +454,7 @@ async fn bridge_responses_websockets(
     request_logger: WebSocketRequestLogger,
     request_context: crate::request_headers::RequestContext,
 ) -> anyhow::Result<()> {
-    let continuation = WebSocketContinuationCoordinator::default();
+    let response_coordinator = WebSocketResponseCoordinator::default();
     enum BridgeEvent {
         Downstream(Option<Result<Message, WebSocketError>>),
         Upstream(Option<Result<Message, WebSocketError>>),
@@ -743,7 +743,7 @@ async fn bridge_responses_websockets(
                                 .as_ref()
                                 .and_then(|plan| plan.independent_compaction_usage),
                         );
-                        if let Err(error) = continuation
+                        if let Err(error) = response_coordinator
                             .register_request_with_settings_and_plan(
                                 request_payload,
                                 log_id,
@@ -812,16 +812,16 @@ async fn bridge_responses_websockets(
                         {
                             Message::Close(None)
                         }
-                        Some(Err(_)) | None if continuation.has_validated_compaction() => {
+                        Some(Err(_)) | None if response_coordinator.has_validated_compaction() => {
                             Message::Close(None)
                         }
                         Some(Err(error)) => {
                             let error_message = format!("upstream WebSocket read failed: {error}");
-                            if let Some(WebSocketContinuationAction::Flush { messages, metadata }) =
-                                continuation
+                            if let Some(WebSocketResponseAction::Flush { messages, metadata }) =
+                                response_coordinator
                                     .fail_active_compaction("websocket_read_failed", &error_message)?
                             {
-                                request_logger.record_continue_metadata(&metadata);
+                                request_logger.record_response_metadata(&metadata);
                                 for message in messages {
                                     let message_is_close = matches!(message, Message::Close(_));
                                     if forward_downstream_response(
@@ -896,13 +896,13 @@ async fn bridge_responses_websockets(
                             anyhow::bail!("读取上游 Responses WebSocket 消息失败：{error_message}");
                         }
                         None => {
-                            if let Some(WebSocketContinuationAction::Flush { messages, metadata }) =
-                                continuation.fail_active_compaction(
+                            if let Some(WebSocketResponseAction::Flush { messages, metadata }) =
+                                response_coordinator.fail_active_compaction(
                                     "websocket_ended",
                                     "upstream WebSocket ended before a terminal response.",
                                 )?
                             {
-                                request_logger.record_continue_metadata(&metadata);
+                                request_logger.record_response_metadata(&metadata);
                                 for message in messages {
                                     let message_is_close = matches!(message, Message::Close(_));
                                     if forward_downstream_response(
@@ -950,8 +950,8 @@ async fn bridge_responses_websockets(
                         request_logger.record_transport_failure("上游在请求完成前关闭 WS");
                     }
                     request_logger.record_first_response_event(&message);
-                    match continuation.handle_upstream_message(message)? {
-                        WebSocketContinuationAction::Forward(message) => {
+                    match response_coordinator.handle_upstream_message(message)? {
+                        WebSocketResponseAction::Forward(message) => {
                             if forward_downstream_response(
                                 &mut downstream,
                                 message,
@@ -964,9 +964,9 @@ async fn bridge_responses_websockets(
                                 break;
                             }
                         }
-                        WebSocketContinuationAction::Buffered => {}
-                        WebSocketContinuationAction::Continue { request, metadata } => {
-                            request_logger.record_continue_metadata(&metadata);
+                        WebSocketResponseAction::Buffered => {}
+                        WebSocketResponseAction::Continue { request, metadata } => {
+                            request_logger.record_response_metadata(&metadata);
                             if let Some(delay) = metadata.retry_delay {
                                 tokio::time::sleep(delay).await;
                             }
@@ -981,17 +981,17 @@ async fn bridge_responses_websockets(
                                 forward_websocket_message(
                                 &mut upstream,
                                 request,
-                                "转发 Responses WebSocket 续接请求超时",
-                                "转发 Responses WebSocket 续接请求失败",
+                                "转发 Responses WebSocket 重试请求超时",
+                                "转发 Responses WebSocket 重试请求失败",
                                 ).await
                             }.await;
                             let sent_close = match retry_result {
                                 Ok(closed) => closed,
                                 Err(error) => {
-                                    if let Some(WebSocketContinuationAction::Flush { messages, metadata }) =
-                                        continuation.fail_active_compaction("retry_transport_failed", &error.to_string())?
+                                    if let Some(WebSocketResponseAction::Flush { messages, metadata }) =
+                                        response_coordinator.fail_active_compaction("retry_transport_failed", &error.to_string())?
                                     {
-                                        request_logger.record_continue_metadata(&metadata);
+                                        request_logger.record_response_metadata(&metadata);
                                         for message in messages {
                                             forward_downstream_response(&mut downstream, message,
                                                 &request_logger, metadata.log_id.as_deref()).await?;
@@ -1010,8 +1010,8 @@ async fn bridge_responses_websockets(
                                 continue 'bridge;
                             }
                         }
-                        WebSocketContinuationAction::Flush { messages, metadata } => {
-                            request_logger.record_continue_metadata(&metadata);
+                        WebSocketResponseAction::Flush { messages, metadata } => {
+                            request_logger.record_response_metadata(&metadata);
                             let closes_connection = messages
                                 .iter()
                                 .any(|message| matches!(message, Message::Close(_)));
@@ -1375,30 +1375,23 @@ async fn recover_upstream_connection(
 }
 
 #[derive(Clone, Default)]
-struct WebSocketContinuationCoordinator {
-    state: Arc<Mutex<WebSocketContinuationState>>,
+struct WebSocketResponseCoordinator {
+    state: Arc<Mutex<WebSocketResponseState>>,
 }
 
 #[derive(Default)]
-struct WebSocketContinuationState {
-    active: Option<ActiveWebSocketContinuation>,
+struct WebSocketResponseState {
+    active: Option<ActiveWebSocketResponse>,
     discarded_response_ids: VecDeque<String>,
 }
 
-struct ActiveWebSocketContinuation {
+struct ActiveWebSocketResponse {
     audit: crate::proxy_log::ProxyRequestAudit,
     mode: ActiveWebSocketMode,
     original_request: Value,
     log_id: Option<String>,
-    max_rounds: u32,
     round: u32,
-    completed_rounds: u32,
-    accumulated_reasoning_tokens: Option<u64>,
     buffered_messages: Vec<Message>,
-    fallback_messages: Vec<Message>,
-    fallback_response_body: Option<String>,
-    continue_requests: Vec<Value>,
-    before_response_body: Option<String>,
     compaction_plan: Option<WebSocketCompactionPlan>,
     capacity_retry_attempts: u8,
 }
@@ -1430,20 +1423,16 @@ enum ActiveWebSocketMode {
         layered_enabled: bool,
         retain_tokens: u32,
     },
-    ContinueThinking,
+    ModelCapacityRetry,
 }
 
 #[derive(Clone, Default)]
-struct WebSocketContinueMetadata {
+struct WebSocketResponseMetadata {
     upstream_attempts: Vec<crate::proxy_log::ProxyRequestAttempt>,
     upstream_attempt_pending: bool,
     log_id: Option<String>,
-    triggered: bool,
-    rounds: u32,
-    reasoning_tokens: Option<u64>,
     request_body: Option<String>,
-    before_response_body: Option<String>,
-    after_response_body: Option<String>,
+
     layered_compaction_triggered: bool,
     layered_compaction_retain_tokens: Option<u32>,
     layered_compaction_retained_items: Option<u32>,
@@ -1453,20 +1442,20 @@ struct WebSocketContinueMetadata {
     reconnect_upstream: bool,
 }
 
-enum WebSocketContinuationAction {
+enum WebSocketResponseAction {
     Forward(Message),
     Buffered,
     Continue {
         request: Message,
-        metadata: WebSocketContinueMetadata,
+        metadata: WebSocketResponseMetadata,
     },
     Flush {
         messages: Vec<Message>,
-        metadata: WebSocketContinueMetadata,
+        metadata: WebSocketResponseMetadata,
     },
 }
 
-impl WebSocketContinuationCoordinator {
+impl WebSocketResponseCoordinator {
     fn has_validated_compaction(&self) -> bool {
         self.state.lock().ok().is_some_and(|state| {
             state.active.as_ref().is_some_and(|active| {
@@ -1506,9 +1495,16 @@ impl WebSocketContinuationCoordinator {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| anyhow::anyhow!("Responses WebSocket 续接状态锁已损坏"))?;
-        if state.active.is_some() {
-            anyhow::bail!("自动推理续接期间不支持并发 response.create");
+            .map_err(|_| anyhow::anyhow!("Responses WebSocket 响应状态锁已损坏"))?;
+        if let Some(active) = state.active.as_mut() {
+            if matches!(active.mode, ActiveWebSocketMode::ModelCapacityRetry)
+                && !crate::layered_compaction::is_any_compaction_request(payload)
+            {
+                // 普通请求可沿用原生排队；出现并发后放弃当前请求的重试预算，避免重试插到后续请求之后。
+                active.capacity_retry_attempts = MODEL_CAPACITY_RETRY_DELAYS.len() as u8;
+                return Ok(());
+            }
+            anyhow::bail!("Responses WebSocket 响应预检期间不支持并发 response.create");
         }
         if !settings.layered_compaction_enabled
             && crate::layered_compaction::is_any_compaction_request(payload)
@@ -1545,7 +1541,7 @@ impl WebSocketContinuationCoordinator {
                     http_fallback_required: false,
                 }
             });
-            state.active = Some(ActiveWebSocketContinuation {
+            state.active = Some(ActiveWebSocketResponse {
                 audit: Default::default(),
                 mode: ActiveWebSocketMode::ValidatedCompaction {
                     kind,
@@ -1554,44 +1550,28 @@ impl WebSocketContinuationCoordinator {
                 },
                 original_request: payload.clone(),
                 log_id,
-                max_rounds: 0,
                 round: 0,
-                completed_rounds: 0,
-                accumulated_reasoning_tokens: None,
                 buffered_messages: Vec::new(),
-                fallback_messages: Vec::new(),
-                fallback_response_body: None,
-                continue_requests: Vec::new(),
-                before_response_body: None,
                 compaction_plan: Some(compaction_plan),
                 capacity_retry_attempts: 0,
             });
             return Ok(());
         }
-        // 原生压缩请求不需要本地状态，也不能误进自动推理续接。
+        // 原生压缩请求不进入普通请求的模型繁忙重试。
         if crate::layered_compaction::is_any_compaction_request(payload) {
             return Ok(());
         }
-        if !settings.gpt_reasoning_continuation
-            || !crate::continue_thinking::is_supported_model(model)
-        {
+        // 用户要求删除按低推理 Token 追加的续接；普通 GPT 请求仅保留模型繁忙重试。
+        if !model.trim().to_ascii_lowercase().starts_with("gpt") {
             return Ok(());
         }
-
-        state.active = Some(ActiveWebSocketContinuation {
+        state.active = Some(ActiveWebSocketResponse {
             audit: Default::default(),
-            mode: ActiveWebSocketMode::ContinueThinking,
+            mode: ActiveWebSocketMode::ModelCapacityRetry,
             original_request: payload.clone(),
             log_id,
-            max_rounds: u32::from(settings.gpt_reasoning_continuation_max_rounds),
             round: 0,
-            completed_rounds: 0,
-            accumulated_reasoning_tokens: None,
             buffered_messages: Vec::new(),
-            fallback_messages: Vec::new(),
-            fallback_response_body: None,
-            continue_requests: Vec::new(),
-            before_response_body: None,
             compaction_plan: None,
             capacity_retry_attempts: 0,
         });
@@ -1601,11 +1581,11 @@ impl WebSocketContinuationCoordinator {
     fn handle_upstream_message(
         &self,
         message: Message,
-    ) -> anyhow::Result<WebSocketContinuationAction> {
+    ) -> anyhow::Result<WebSocketResponseAction> {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| anyhow::anyhow!("Responses WebSocket 续接状态锁已损坏"))?;
+            .map_err(|_| anyhow::anyhow!("Responses WebSocket 响应状态锁已损坏"))?;
         if let Message::Text(text) = &message {
             if let Ok(payload) = serde_json::from_str::<Value>(text.as_str()) {
                 if websocket_response_id(&payload).is_some_and(|response_id| {
@@ -1614,16 +1594,16 @@ impl WebSocketContinuationCoordinator {
                         .iter()
                         .any(|discarded| discarded == &response_id)
                 }) {
-                    return Ok(WebSocketContinuationAction::Buffered);
+                    return Ok(WebSocketResponseAction::Buffered);
                 }
             }
         }
         let Some(active) = state.active.as_mut() else {
-            return Ok(WebSocketContinuationAction::Forward(message));
+            return Ok(WebSocketResponseAction::Forward(message));
         };
 
         if matches!(message, Message::Ping(_) | Message::Pong(_)) {
-            return Ok(WebSocketContinuationAction::Forward(message));
+            return Ok(WebSocketResponseAction::Forward(message));
         }
         let mode = active.mode;
         if let ActiveWebSocketMode::ValidatedCompaction {
@@ -1641,20 +1621,18 @@ impl WebSocketContinuationCoordinator {
             );
         }
         if matches!(message, Message::Close(_)) {
-            let mut active = state.active.take().expect("active continuation must exist");
-            let mut messages = if active.round > 0 && !active.fallback_messages.is_empty() {
-                std::mem::take(&mut active.fallback_messages)
-            } else {
-                std::mem::take(&mut active.buffered_messages)
+            let mut active = state.active.take().expect("active response must exist");
+            let metadata = WebSocketResponseMetadata {
+                log_id: active.log_id.clone(),
+                ..Default::default()
             };
+            let mut messages = std::mem::take(&mut active.buffered_messages);
             messages.push(message);
-            let metadata =
-                websocket_continue_metadata(&active, active.fallback_response_body.clone());
-            return Ok(WebSocketContinuationAction::Flush { messages, metadata });
+            return Ok(WebSocketResponseAction::Flush { messages, metadata });
         }
 
         let Message::Text(text) = &message else {
-            return Ok(WebSocketContinuationAction::Forward(message));
+            return Ok(WebSocketResponseAction::Forward(message));
         };
         let payload = serde_json::from_str::<Value>(text.as_str()).ok();
         let event_type = payload
@@ -1664,7 +1642,20 @@ impl WebSocketContinuationCoordinator {
             .unwrap_or_default();
         active.buffered_messages.push(message);
         if !is_terminal_websocket_response_event(event_type) {
-            return Ok(WebSocketContinuationAction::Buffered);
+            if matches!(event_type, "response.created" | "response.in_progress") {
+                return Ok(WebSocketResponseAction::Buffered);
+            }
+            // 正文、思考或工具参数一旦开始，立即释放首帧并恢复原生流式转发；不得为低 Token 判定等待终态。
+            let active = state.active.take().expect("active response must exist");
+            // 日志器已经登记本次进行中的尝试；首帧不以旧失败快照覆盖它，终态继续由原生流更新。
+            let metadata = WebSocketResponseMetadata {
+                log_id: active.log_id.clone(),
+                ..Default::default()
+            };
+            return Ok(WebSocketResponseAction::Flush {
+                messages: active.buffered_messages,
+                metadata,
+            });
         }
         let mut observer = crate::proxy_log::UpstreamResponseModelObserver::default();
         if let Some(payload) = &payload {
@@ -1691,10 +1682,6 @@ impl WebSocketContinuationCoordinator {
             .transport = Some(crate::proxy_log::ProxyRequestTransport::Ws);
         active.audit.observe_response(&observer);
 
-        let response_object = payload
-            .as_ref()
-            .and_then(|payload| payload.get("response"))
-            .cloned();
         if is_retryable_websocket_model_capacity_error(payload.as_ref())
             && active
                 .original_request
@@ -1723,9 +1710,9 @@ impl WebSocketContinuationCoordinator {
                     "delayMs": MODEL_CAPACITY_RETRY_DELAYS[retry_index].as_millis()
                 }),
             );
-            return Ok(WebSocketContinuationAction::Continue {
+            return Ok(WebSocketResponseAction::Continue {
                 request: Message::Text(request_text.into()),
-                metadata: WebSocketContinueMetadata {
+                metadata: WebSocketResponseMetadata {
                     log_id: active.log_id.clone(),
                     upstream_attempts: active.audit.upstream_attempts.clone(),
                     upstream_attempt_pending: true,
@@ -1734,104 +1721,11 @@ impl WebSocketContinuationCoordinator {
                 },
             });
         }
-        let reasoning_tokens = response_object
-            .as_ref()
-            .and_then(crate::continue_thinking::extract_reasoning_tokens);
-        add_websocket_reasoning_tokens(&mut active.accumulated_reasoning_tokens, reasoning_tokens);
-        active.completed_rounds = active.round;
-        if active.round > 0 {
-            let _ = crate::diagnostic_log::append_diagnostic_log(
-                "continue_thinking.round_completed",
-                serde_json::json!({
-                    "transport": "ws",
-                    "round": active.round,
-                    "responseId": response_object
-                        .as_ref()
-                        .and_then(|response| response.get("id"))
-                        .and_then(Value::as_str)
-                }),
-            );
-        }
-
-        let should_continue = matches!(event_type, "response.completed" | "response.incomplete")
-            && response_object
-                .as_ref()
-                .is_some_and(crate::continue_thinking::should_continue_response)
-            && active.round < active.max_rounds;
-        if should_continue {
-            let next_round = active.round + 1;
-            let response_object = response_object
-                .as_ref()
-                .expect("continuation requires a terminal response object");
-            let Some(continue_request) = crate::continue_thinking::build_websocket_continue_request(
-                &active.original_request,
-                response_object,
-                next_round,
-            ) else {
-                let _ = crate::diagnostic_log::append_diagnostic_log(
-                    "continue_thinking.round_skipped",
-                    serde_json::json!({
-                        "transport": "ws",
-                        "reason": "missing_latest_response_id",
-                        "round": next_round
-                    }),
-                );
-                let active = state.active.take().expect("active continuation must exist");
-                return Ok(WebSocketContinuationAction::Flush {
-                    messages: active.buffered_messages.clone(),
-                    metadata: websocket_continue_metadata(&active, None),
-                });
-            };
-            active.round = next_round;
-            if active.before_response_body.is_none() {
-                active.before_response_body = response_object
-                    .as_object()
-                    .and_then(|_| serde_json::to_string_pretty(response_object).ok());
-            }
-            active.continue_requests.push(serde_json::json!({
-                "round": active.round,
-                "mode": continue_request.mode.as_str(),
-                "request": continue_request.request.clone()
-            }));
-            let request_text = serde_json::to_string(&continue_request.request)
-                .context("序列化 Responses WebSocket 续接请求失败")?;
-            active.fallback_messages = std::mem::take(&mut active.buffered_messages);
-            active.fallback_response_body = serde_json::to_string_pretty(response_object).ok();
-            let mut metadata = websocket_continue_metadata(active, None);
-            metadata.upstream_attempt_pending = true;
-            let _ = crate::diagnostic_log::append_diagnostic_log(
-                "continue_thinking.round_start",
-                serde_json::json!({
-                    "transport": "ws",
-                    "model": active
-                        .original_request
-                        .get("model")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default(),
-                    "mode": continue_request.mode.as_str(),
-                    "round": active.round,
-                    "reasoningTokens": reasoning_tokens,
-                    "gridMultiple": reasoning_tokens
-                        .and_then(crate::continue_thinking::grid_multiple)
-                }),
-            );
-            return Ok(WebSocketContinuationAction::Continue {
-                request: Message::Text(request_text.into()),
-                metadata,
-            });
-        }
-
-        let active = state.active.take().expect("active continuation must exist");
-        let after_response_body = if active.round > 0 {
-            response_object
-                .as_ref()
-                .and_then(|response| serde_json::to_string_pretty(response).ok())
-        } else {
-            None
-        };
-        Ok(WebSocketContinuationAction::Flush {
-            messages: active.buffered_messages.clone(),
-            metadata: websocket_continue_metadata(&active, after_response_body),
+        let active = state.active.take().expect("active response must exist");
+        let metadata = websocket_response_metadata(&active);
+        Ok(WebSocketResponseAction::Flush {
+            messages: active.buffered_messages,
+            metadata,
         })
     }
 
@@ -1839,11 +1733,11 @@ impl WebSocketContinuationCoordinator {
         &self,
         failure_suffix: &str,
         detail: &str,
-    ) -> anyhow::Result<Option<WebSocketContinuationAction>> {
+    ) -> anyhow::Result<Option<WebSocketResponseAction>> {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| anyhow::anyhow!("Responses WebSocket 续接状态锁已损坏"))?;
+            .map_err(|_| anyhow::anyhow!("Responses WebSocket 响应状态锁已损坏"))?;
         let mode = state.active.as_ref().map(|active| active.mode);
         let (code_prefix, label) = match mode {
             Some(ActiveWebSocketMode::ValidatedCompaction { kind, .. }) => {
@@ -1911,9 +1805,9 @@ impl WebSocketContinuationCoordinator {
         );
         let mut messages = responses_sse_to_websocket_messages(&failure_sse);
         messages.push(Message::Close(None));
-        Ok(Some(WebSocketContinuationAction::Flush {
+        Ok(Some(WebSocketResponseAction::Flush {
             messages,
-            metadata: WebSocketContinueMetadata {
+            metadata: WebSocketResponseMetadata {
                 log_id: active.log_id,
                 upstream_attempts: active.audit.upstream_attempts,
                 ..Default::default()
@@ -1923,12 +1817,12 @@ impl WebSocketContinuationCoordinator {
 }
 
 fn handle_validated_compaction_websocket_message(
-    state: &mut WebSocketContinuationState,
+    state: &mut WebSocketResponseState,
     message: Message,
     kind: crate::layered_compaction::CompactionKind,
     layered_enabled: bool,
     retain_tokens: u32,
-) -> anyhow::Result<WebSocketContinuationAction> {
+) -> anyhow::Result<WebSocketResponseAction> {
     use crate::layered_compaction::*;
     let payload = match &message {
         Message::Text(text) => serde_json::from_str::<Value>(text.as_str()).ok(),
@@ -1961,7 +1855,7 @@ fn handle_validated_compaction_websocket_message(
     }
     active.buffered_messages.push(message);
     if !terminal && !malformed {
-        return Ok(WebSocketContinuationAction::Buffered);
+        return Ok(WebSocketResponseAction::Buffered);
     }
     let source_sse = websocket_messages_to_responses_sse(&active.buffered_messages);
     let (response, verdict) = if malformed {
@@ -2062,7 +1956,7 @@ fn handle_validated_compaction_websocket_message(
         let request = Message::Text(serde_json::to_string(&retry)?.into());
         active.round = 1;
         active.buffered_messages.clear();
-        let metadata = WebSocketContinueMetadata {
+        let metadata = WebSocketResponseMetadata {
             log_id: active.log_id.clone(),
             upstream_attempts: active.audit.upstream_attempts.clone(),
             upstream_attempt_pending: true,
@@ -2073,7 +1967,7 @@ fn handle_validated_compaction_websocket_message(
         if let Some(id) = payload.as_ref().and_then(websocket_response_id) {
             remember_discarded_websocket_response_id(state, id);
         }
-        return Ok(WebSocketContinuationAction::Continue { request, metadata });
+        return Ok(WebSocketResponseAction::Continue { request, metadata });
     }
     let active = state.active.take().expect("active compaction");
     let (result, stats) = match verdict {
@@ -2115,9 +2009,9 @@ fn handle_validated_compaction_websocket_message(
     if closed {
         messages.push(Message::Close(None));
     }
-    Ok(WebSocketContinuationAction::Flush {
+    Ok(WebSocketResponseAction::Flush {
         messages,
-        metadata: WebSocketContinueMetadata {
+        metadata: WebSocketResponseMetadata {
             log_id: active.log_id,
             upstream_attempts: active.audit.upstream_attempts,
             layered_compaction_triggered: stats.triggered,
@@ -2131,7 +2025,7 @@ fn handle_validated_compaction_websocket_message(
 }
 
 fn remember_discarded_websocket_response_id(
-    state: &mut WebSocketContinuationState,
+    state: &mut WebSocketResponseState,
     response_id: String,
 ) {
     const MAX_DISCARDED_RESPONSE_IDS: usize = 64;
@@ -2191,12 +2085,6 @@ fn responses_sse_to_websocket_messages(sse_text: &str) -> Vec<Message> {
         .collect()
 }
 
-fn add_websocket_reasoning_tokens(total: &mut Option<u64>, reasoning_tokens: Option<u64>) {
-    if let Some(reasoning_tokens) = reasoning_tokens {
-        *total = Some(total.unwrap_or(0).saturating_add(reasoning_tokens));
-    }
-}
-
 fn is_retryable_websocket_model_capacity_error(payload: Option<&Value>) -> bool {
     let Some(payload) = payload else {
         return false;
@@ -2230,30 +2118,11 @@ fn is_retryable_websocket_model_capacity_error(payload: Option<&Value>) -> bool 
         .contains("selected model is at capacity")
 }
 
-fn websocket_continue_metadata(
-    active: &ActiveWebSocketContinuation,
-    after_response_body: Option<String>,
-) -> WebSocketContinueMetadata {
-    WebSocketContinueMetadata {
+fn websocket_response_metadata(active: &ActiveWebSocketResponse) -> WebSocketResponseMetadata {
+    WebSocketResponseMetadata {
         log_id: active.log_id.clone(),
         upstream_attempts: active.audit.upstream_attempts.clone(),
-        triggered: active.round > 0,
-        rounds: active.completed_rounds,
-        reasoning_tokens: active.accumulated_reasoning_tokens,
-        request_body: websocket_continue_request_body(&active.continue_requests),
-        before_response_body: active.before_response_body.clone(),
-        after_response_body,
         ..Default::default()
-    }
-}
-
-fn websocket_continue_request_body(requests: &[Value]) -> Option<String> {
-    match requests {
-        [] => None,
-        [single] => single
-            .get("request")
-            .and_then(|request| serde_json::to_string_pretty(request).ok()),
-        _ => serde_json::to_string_pretty(&serde_json::json!({ "rounds": requests })).ok(),
     }
 }
 
@@ -2460,11 +2329,6 @@ impl WebSocketRequestLogger {
             reasoning_tokens: None,
             reasoning_effort: metadata.reasoning_effort,
             reasoning_source: metadata.reasoning_source,
-            continue_thinking_triggered: false,
-            continue_thinking_rounds: 0,
-            continue_thinking_request_body: None,
-            continue_thinking_before_response_body: None,
-            continue_thinking_after_response_body: None,
             remote_compaction_triggered: crate::proxy_log::request_uses_remote_compaction_v2(Some(
                 payload,
             )),
@@ -2610,7 +2474,7 @@ impl WebSocketRequestLogger {
             return Some("completed_response_requires_context_recovery");
         }
         for tracked in state.requests.values() {
-            // 包括已交付给 Codex 的事件，以及压缩/续接正在缓冲的事件。
+            // 包括已交付给 Codex 的事件，以及压缩/重试正在缓冲的事件。
             // 这些请求都不能从初始 response.create 无条件重放。
             if tracked.record.first_token_ms.is_some() {
                 return Some("application_response_already_received");
@@ -3086,7 +2950,7 @@ impl WebSocketRequestLogger {
         }
     }
 
-    fn record_continue_metadata(&self, metadata: &WebSocketContinueMetadata) {
+    fn record_response_metadata(&self, metadata: &WebSocketResponseMetadata) {
         let Some(log_id) = metadata.log_id.as_deref() else {
             return;
         };
@@ -3096,13 +2960,6 @@ impl WebSocketRequestLogger {
         let Some(tracked) = state.requests.get_mut(log_id) else {
             return;
         };
-        tracked.record.reasoning_tokens = metadata.reasoning_tokens;
-        tracked.record.continue_thinking_triggered = metadata.triggered;
-        tracked.record.continue_thinking_rounds = metadata.rounds;
-        tracked.record.continue_thinking_request_body = metadata.request_body.clone();
-        tracked.record.continue_thinking_before_response_body =
-            metadata.before_response_body.clone();
-        tracked.record.continue_thinking_after_response_body = metadata.after_response_body.clone();
         if !metadata.upstream_attempts.is_empty() {
             tracked.record.audit.upstream_attempts = metadata.upstream_attempts.clone();
         }
@@ -3359,7 +3216,7 @@ fn resolve_websocket_log_id(
         if let Some(log_id) = state.response_ids.get(response_id) {
             return Some(log_id.clone());
         }
-        // 上游一次只处理一个 response。续接轮次可能产生新的 response_id，
+        // 上游一次只处理一个 response。重试可能产生新的 response_id，
         // 但仍必须绑定当前队首，不能误分配给后续排队请求。
         if let Some(log_id) = state
             .active_order
@@ -4495,9 +4352,9 @@ fn websocket_header(request: &Request, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveWebSocketContinuation, ActiveWebSocketMode, WebSocketConnectionContext,
-        WebSocketContinuationAction, WebSocketContinuationCoordinator, WebSocketContinuationState,
-        WebSocketContinueMetadata, WebSocketRequestLogger, WebSocketTransportLiveness,
+        ActiveWebSocketResponse, ActiveWebSocketMode, WebSocketConnectionContext,
+        WebSocketResponseAction, WebSocketResponseCoordinator, WebSocketResponseState,
+        WebSocketResponseMetadata, WebSocketRequestLogger, WebSocketTransportLiveness,
         activate_next_queued_websocket_request, arm_compaction_responses_websocket_http_fallback,
         arm_early_disconnect_responses_websocket_http_fallback,
         arm_oversized_responses_websocket_http_fallback,
@@ -4970,7 +4827,7 @@ mod tests {
             &relay,
             &crate::request_headers::RequestContext::default(),
         );
-        let coordinator = WebSocketContinuationCoordinator::default();
+        let coordinator = WebSocketResponseCoordinator::default();
         coordinator
             .register_request_with_settings_and_plan(&payload, None, options, &settings, plan)
             .unwrap();
@@ -4993,11 +4850,11 @@ mod tests {
                 .into(),
             ))
             .unwrap();
-        let WebSocketContinuationAction::Flush { messages, .. } = action else {
+        let WebSocketResponseAction::Flush { messages, .. } = action else {
             panic!("valid compaction should flush");
         };
         let sse = super::websocket_messages_to_responses_sse(&messages);
-        let terminal = crate::continue_thinking::extract_terminal_response_object(&sse).unwrap();
+        let terminal = crate::protocol_proxy::extract_terminal_response_object(&sse).unwrap();
         assert_eq!(terminal["model"], "gpt-original");
         assert!(sse.contains("kept"));
     }
@@ -5019,7 +4876,7 @@ mod tests {
             &relay,
             &crate::request_headers::RequestContext::default(),
         );
-        let coordinator = WebSocketContinuationCoordinator::default();
+        let coordinator = WebSocketResponseCoordinator::default();
         coordinator
             .register_request_with_settings_and_plan(&payload, None, options, &settings, plan)
             .unwrap();
@@ -5027,7 +4884,7 @@ mod tests {
         let action = coordinator
             .handle_upstream_message(Message::Close(None))
             .unwrap();
-        let WebSocketContinuationAction::Continue {
+        let WebSocketResponseAction::Continue {
             request: Message::Text(request),
             metadata,
         } = action
@@ -5057,7 +4914,7 @@ mod tests {
                 .into(),
             ))
             .unwrap();
-        assert!(matches!(action, WebSocketContinuationAction::Flush { .. }));
+        assert!(matches!(action, WebSocketResponseAction::Flush { .. }));
         assert!(coordinator.state.lock().unwrap().active.is_none());
     }
 
@@ -5116,7 +4973,7 @@ mod tests {
                             payload, &settings,
                         );
                     assert_eq!(first["model"], original["model"]);
-                    let coordinator = WebSocketContinuationCoordinator::default();
+                    let coordinator = WebSocketResponseCoordinator::default();
                     coordinator
                         .register_request_with_settings(&original, None, options, &settings)
                         .unwrap();
@@ -5137,7 +4994,7 @@ mod tests {
                             true,
                         ))
                         .unwrap();
-                    let WebSocketContinuationAction::Continue {
+                    let WebSocketResponseAction::Continue {
                         request: Message::Text(retry),
                         metadata,
                     } = action
@@ -5173,7 +5030,7 @@ mod tests {
                                 false,
                             ))
                             .unwrap(),
-                        WebSocketContinuationAction::Buffered
+                        WebSocketResponseAction::Buffered
                     ));
                     let action = coordinator
                         .handle_upstream_message(response(
@@ -5186,7 +5043,7 @@ mod tests {
                             false,
                         ))
                         .unwrap();
-                    let WebSocketContinuationAction::Flush { messages, metadata } = action else {
+                    let WebSocketResponseAction::Flush { messages, metadata } = action else {
                         panic!("第二次尝试必须终止");
                     };
                     assert_eq!(metadata.upstream_attempts.len(), 2);
@@ -5201,7 +5058,7 @@ mod tests {
                     );
                     let sse = super::websocket_messages_to_responses_sse(&messages);
                     let terminal =
-                        crate::continue_thinking::extract_terminal_response_object(&sse).unwrap();
+                        crate::protocol_proxy::extract_terminal_response_object(&sse).unwrap();
                     assert_eq!(
                         terminal["status"],
                         if valid_retry { "completed" } else { "failed" }
@@ -5222,7 +5079,6 @@ mod tests {
             layered_compaction_enabled: false,
             layered_compaction_retain_recent_round_enabled: true,
             layered_compaction_prompt_override: "MUST NOT APPLY".to_string(),
-            gpt_reasoning_continuation: true,
             ..Default::default()
         };
         for model in ["gpt-test", "claude-test", "deepseek-test"] {
@@ -5247,7 +5103,7 @@ mod tests {
                 assert_eq!(original, payload);
                 assert_eq!(forwarded, payload);
                 assert!(options.is_none());
-                let coordinator = WebSocketContinuationCoordinator::default();
+                let coordinator = WebSocketResponseCoordinator::default();
                 coordinator
                     .register_request_with_settings(
                         &original,
@@ -5269,7 +5125,7 @@ mod tests {
                         ]
                     }
                 }).to_string().into());
-                let WebSocketContinuationAction::Forward(forwarded) = coordinator
+                let WebSocketResponseAction::Forward(forwarded) = coordinator
                     .handle_upstream_message(response.clone())
                     .unwrap()
                 else {
@@ -5302,7 +5158,7 @@ mod tests {
             });
             let (original, _, options) =
                 prepare_downstream_response_create_payload_with_settings(payload, &settings);
-            let coordinator = WebSocketContinuationCoordinator::default();
+            let coordinator = WebSocketResponseCoordinator::default();
             coordinator
                 .register_request_with_settings(&original, None, options, &settings)
                 .unwrap();
@@ -5310,21 +5166,21 @@ mod tests {
                 coordinator
                     .handle_upstream_message(Message::Ping(vec![1].into()))
                     .unwrap(),
-                WebSocketContinuationAction::Forward(Message::Ping(_))
+                WebSocketResponseAction::Forward(Message::Ping(_))
             ));
-            let WebSocketContinuationAction::Continue { metadata, .. } =
+            let WebSocketResponseAction::Continue { metadata, .. } =
                 coordinator.handle_upstream_message(first_failure).unwrap()
             else {
                 panic!("首次流中断或非法帧必须重试");
             };
             assert!(metadata.reconnect_upstream);
-            let WebSocketContinuationAction::Flush { messages, .. } = coordinator
+            let WebSocketResponseAction::Flush { messages, .. } = coordinator
                 .handle_upstream_message(Message::Close(None))
                 .unwrap()
             else {
                 panic!("第二次中断必须返回失败");
             };
-            let terminal = crate::continue_thinking::extract_terminal_response_object(
+            let terminal = crate::protocol_proxy::extract_terminal_response_object(
                 &super::websocket_messages_to_responses_sse(&messages),
             )
             .unwrap();
@@ -5784,7 +5640,7 @@ mod tests {
             );
         }
 
-        logger.record_continue_metadata(&WebSocketContinueMetadata {
+        logger.record_response_metadata(&WebSocketResponseMetadata {
             log_id: Some(id.clone()),
             request_body: Some(
                 json!({"type":"response.create","model":"claude-opus-5-5","input":[]}).to_string(),
@@ -6455,7 +6311,6 @@ mod tests {
         let settings = BackendSettings {
             layered_compaction_enabled: true,
             layered_compaction_prompt_override: "CUSTOM PROMPT".to_string(),
-            gpt_reasoning_continuation: true,
             ..Default::default()
         };
         let payload = json!({
@@ -6475,7 +6330,7 @@ mod tests {
         );
         assert!(!options.unwrap().enabled);
 
-        let coordinator = WebSocketContinuationCoordinator::default();
+        let coordinator = WebSocketResponseCoordinator::default();
         coordinator
             .register_request_with_settings(&request_payload, None, options, &settings)
             .expect("关闭补回仍需校验摘要");
@@ -6488,7 +6343,7 @@ mod tests {
         let action = coordinator
             .handle_upstream_message(response.clone())
             .unwrap();
-        let WebSocketContinuationAction::Flush { messages, .. } = action else {
+        let WebSocketResponseAction::Flush { messages, .. } = action else {
             panic!("校验通过后应封装摘要");
         };
         let sse = super::websocket_messages_to_responses_sse(&messages);
@@ -6525,7 +6380,7 @@ mod tests {
 
     #[test]
     fn websocket_non_gpt_remote_compaction_uses_request_config_snapshot() {
-        let coordinator = WebSocketContinuationCoordinator::default();
+        let coordinator = WebSocketResponseCoordinator::default();
         coordinator
             .register_request_with_settings(
                 &json!({
@@ -6581,7 +6436,7 @@ mod tests {
             forwarded["input"][2]["content"][0]["text"],
             crate::layered_compaction::compaction_instruction("CUSTOM V2 PROMPT")
         );
-        let coordinator = WebSocketContinuationCoordinator::default();
+        let coordinator = WebSocketResponseCoordinator::default();
         coordinator
             .register_request_with_settings(&request_payload, None, options, &settings)
             .unwrap();
@@ -6604,7 +6459,7 @@ mod tests {
                 .into(),
             ))
             .unwrap();
-        let WebSocketContinuationAction::Flush { messages, metadata } = action else {
+        let WebSocketResponseAction::Flush { messages, metadata } = action else {
             panic!("本地桥接 V2 应产生 compaction 响应");
         };
         let done = messages
@@ -6628,9 +6483,9 @@ mod tests {
 
     #[test]
     fn websocket_non_gpt_summary_response_becomes_compaction_events() {
-        let coordinator = WebSocketContinuationCoordinator {
-            state: Arc::new(Mutex::new(WebSocketContinuationState {
-                active: Some(ActiveWebSocketContinuation {
+        let coordinator = WebSocketResponseCoordinator {
+            state: Arc::new(Mutex::new(WebSocketResponseState {
+                active: Some(ActiveWebSocketResponse {
                     audit: Default::default(),
                     mode: ActiveWebSocketMode::ValidatedCompaction {
                         kind: crate::layered_compaction::CompactionKind::RemoteV2,
@@ -6655,15 +6510,9 @@ mod tests {
                         ]
                     }),
                     log_id: Some("log-compaction".to_string()),
-                    max_rounds: 0,
+
                     round: 0,
-                    completed_rounds: 0,
-                    accumulated_reasoning_tokens: None,
                     buffered_messages: Vec::new(),
-                    fallback_messages: Vec::new(),
-                    fallback_response_body: None,
-                    continue_requests: Vec::new(),
-                    before_response_body: None,
                     compaction_plan: None,
                     capacity_retry_attempts: 0,
                 }),
@@ -6694,7 +6543,7 @@ mod tests {
                 .into(),
             ))
             .unwrap();
-        let WebSocketContinuationAction::Flush { messages, .. } = action else {
+        let WebSocketResponseAction::Flush { messages, .. } = action else {
             panic!("remote compaction terminal response should flush rewritten messages");
         };
         let payloads = messages
@@ -6742,10 +6591,10 @@ mod tests {
         );
     }
 
-    fn websocket_legacy_compaction_coordinator() -> WebSocketContinuationCoordinator {
-        WebSocketContinuationCoordinator {
-            state: Arc::new(Mutex::new(WebSocketContinuationState {
-                active: Some(ActiveWebSocketContinuation {
+    fn websocket_legacy_compaction_coordinator() -> WebSocketResponseCoordinator {
+        WebSocketResponseCoordinator {
+            state: Arc::new(Mutex::new(WebSocketResponseState {
+                active: Some(ActiveWebSocketResponse {
                     audit: Default::default(),
                     mode: ActiveWebSocketMode::ValidatedCompaction {
                         kind: crate::layered_compaction::CompactionKind::Legacy,
@@ -6783,15 +6632,9 @@ mod tests {
                         ]
                     }),
                     log_id: Some("log-legacy-compaction".to_string()),
-                    max_rounds: 0,
+
                     round: 0,
-                    completed_rounds: 0,
-                    accumulated_reasoning_tokens: None,
                     buffered_messages: Vec::new(),
-                    fallback_messages: Vec::new(),
-                    fallback_response_body: None,
-                    continue_requests: Vec::new(),
-                    before_response_body: None,
                     compaction_plan: None,
                     capacity_retry_attempts: 0,
                 }),
@@ -6802,7 +6645,7 @@ mod tests {
 
     #[test]
     fn websocket_legacy_compaction_registers_layered_mode() {
-        let coordinator = WebSocketContinuationCoordinator::default();
+        let coordinator = WebSocketResponseCoordinator::default();
         coordinator
             .register_request_with_settings(
                 &json!({
@@ -6867,7 +6710,7 @@ mod tests {
                 .into(),
             ))
             .unwrap();
-        let WebSocketContinuationAction::Flush { messages, metadata } = action else {
+        let WebSocketResponseAction::Flush { messages, metadata } = action else {
             panic!("legacy compaction terminal response should flush rewritten messages");
         };
         let payloads = messages
@@ -6935,10 +6778,10 @@ mod tests {
         );
     }
 
-    fn websocket_remote_compaction_coordinator() -> WebSocketContinuationCoordinator {
-        WebSocketContinuationCoordinator {
-            state: Arc::new(Mutex::new(WebSocketContinuationState {
-                active: Some(ActiveWebSocketContinuation {
+    fn websocket_remote_compaction_coordinator() -> WebSocketResponseCoordinator {
+        WebSocketResponseCoordinator {
+            state: Arc::new(Mutex::new(WebSocketResponseState {
+                active: Some(ActiveWebSocketResponse {
                     audit: Default::default(),
                     mode: ActiveWebSocketMode::ValidatedCompaction {
                         kind: crate::layered_compaction::CompactionKind::RemoteV2,
@@ -6951,15 +6794,9 @@ mod tests {
                         "input": [{ "type": "compaction_trigger" }]
                     }),
                     log_id: Some("log-compaction-failure".to_string()),
-                    max_rounds: 0,
+
                     round: 0,
-                    completed_rounds: 0,
-                    accumulated_reasoning_tokens: None,
                     buffered_messages: Vec::new(),
-                    fallback_messages: Vec::new(),
-                    fallback_response_body: None,
-                    continue_requests: Vec::new(),
-                    before_response_body: None,
                     compaction_plan: None,
                     capacity_retry_attempts: 0,
                 }),
@@ -6975,7 +6812,7 @@ mod tests {
             .fail_active_compaction("websocket_read_failed", "upstream read failed")
             .unwrap()
             .expect("active V2 bridge should be failed closed");
-        let WebSocketContinuationAction::Flush { messages, .. } = action else {
+        let WebSocketResponseAction::Flush { messages, .. } = action else {
             panic!("transport failure should flush a V2 failure");
         };
         let payload_text = messages
@@ -6998,7 +6835,7 @@ mod tests {
             .fail_active_compaction("websocket_ended", "upstream ended without a close frame")
             .unwrap()
             .expect("active V2 bridge should be failed closed on EOF");
-        let WebSocketContinuationAction::Flush { messages, .. } = action else {
+        let WebSocketResponseAction::Flush { messages, .. } = action else {
             panic!("EOF should flush a V2 failure");
         };
         let payload_text = messages
@@ -7015,76 +6852,123 @@ mod tests {
     }
 
     #[test]
-    fn continuation_close_falls_back_to_last_completed_round() {
-        let first_terminal = Message::Text(
+    fn low_reasoning_response_is_forwarded_without_extra_model_requests() {
+        let coordinator = WebSocketResponseCoordinator::default();
+        let request = json!({"type":"response.create","model":"gpt-test","input":"hello"});
+        coordinator
+            .register_request_with_settings(&request, None, None, &BackendSettings::default())
+            .unwrap();
+        let terminal = Message::Text(
             json!({
-                "type": "response.completed",
-                "response": {
-                    "id": "resp_short",
-                    "output": [{
-                        "type": "reasoning",
-                        "encrypted_content": "encrypted-short"
-                    }],
-                    "usage": {
-                        "output_tokens_details": {
-                            "reasoning_tokens": 516
-                        }
-                    }
-                }
+                "type":"response.completed",
+                "response":{"id":"resp_native","status":"completed","output":[],
+                    "usage":{"output_tokens_details":{"reasoning_tokens":516}}}
             })
             .to_string()
             .into(),
         );
-        let coordinator = WebSocketContinuationCoordinator {
-            state: Arc::new(Mutex::new(WebSocketContinuationState {
-                active: Some(ActiveWebSocketContinuation {
-                    audit: Default::default(),
-                    mode: ActiveWebSocketMode::ContinueThinking,
-                    original_request: json!({
-                        "type": "response.create",
-                        "model": "gpt-test",
-                        "input": []
-                    }),
-                    log_id: Some("log-1".to_string()),
-                    max_rounds: 3,
-                    round: 0,
-                    completed_rounds: 0,
-                    accumulated_reasoning_tokens: None,
-                    buffered_messages: Vec::new(),
-                    fallback_messages: Vec::new(),
-                    fallback_response_body: None,
-                    continue_requests: Vec::new(),
-                    before_response_body: None,
-                    compaction_plan: None,
-                    capacity_retry_attempts: 0,
-                }),
-                ..Default::default()
-            })),
+        let WebSocketResponseAction::Flush { messages, .. } = coordinator
+            .handle_upstream_message(terminal.clone())
+            .unwrap()
+        else {
+            panic!("native terminal response must be returned without another request");
         };
+        assert_eq!(messages, vec![terminal]);
+        assert!(coordinator.state.lock().unwrap().active.is_none());
+    }
 
-        let action = coordinator
-            .handle_upstream_message(first_terminal.clone())
+    #[test]
+    fn ordinary_response_streams_before_terminal_and_preserves_capacity_retry() {
+        let request = json!({"type":"response.create","model":"gpt-test","input":"hello","tools":[]});
+        let coordinator = WebSocketResponseCoordinator::default();
+        coordinator
+            .register_request_with_settings(&request, None, None, &BackendSettings::default())
             .unwrap();
-        assert!(matches!(
-            action,
-            WebSocketContinuationAction::Continue { .. }
-        ));
-
-        let action = coordinator
-            .handle_upstream_message(Message::Close(None))
-            .unwrap();
-        let WebSocketContinuationAction::Flush { messages, metadata } = action else {
-            panic!("expected fallback flush");
-        };
-        assert_eq!(messages.first(), Some(&first_terminal));
-        assert!(matches!(messages.last(), Some(Message::Close(_))));
-        assert_eq!(metadata.reasoning_tokens, Some(516));
-        assert_eq!(metadata.rounds, 0);
-        assert!(
-            metadata
-                .after_response_body
-                .as_deref()
-                .is_some_and(|body| body.contains("resp_short"))
+        let created = Message::Text(
+            json!({"type":"response.created","response":{"id":"resp_stream"}})
+                .to_string()
+                .into(),
         );
+        assert!(matches!(
+            coordinator
+                .handle_upstream_message(created.clone())
+                .unwrap(),
+            WebSocketResponseAction::Buffered
+        ));
+        let delta = Message::Text(
+            json!({"type":"response.output_text.delta","delta":"hello"})
+                .to_string()
+                .into(),
+        );
+        let WebSocketResponseAction::Flush { messages, .. } =
+            coordinator.handle_upstream_message(delta.clone()).unwrap()
+        else {
+            panic!("first content must be forwarded before the terminal event");
+        };
+        assert_eq!(messages, vec![created, delta]);
+        assert!(coordinator.state.lock().unwrap().active.is_none());
+
+        let coordinator = WebSocketResponseCoordinator::default();
+        coordinator
+            .register_request_with_settings(&request, None, None, &BackendSettings::default())
+            .unwrap();
+        let failed = Message::Text(json!({"type":"response.failed","response":{"status":"failed", "error":{"code":"model_at_capacity"}}}).to_string().into());
+        let WebSocketResponseAction::Continue {
+            request: Message::Text(retry),
+            ..
+        } = coordinator.handle_upstream_message(failed).unwrap()
+        else {
+            panic!("capacity errors should still retry the unchanged request");
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(retry.as_str()).unwrap(),
+            request
+        );
+        let retried_delta = Message::Text(
+            json!({"type":"response.output_text.delta","delta":"retry succeeded"})
+                .to_string()
+                .into(),
+        );
+        let WebSocketResponseAction::Flush { metadata, .. } =
+            coordinator.handle_upstream_message(retried_delta).unwrap()
+        else {
+            panic!("retry content must resume native streaming");
+        };
+        assert!(
+            metadata.upstream_attempts.is_empty(),
+            "first content must preserve the logger's pending retry attempt"
+        );
+    }
+
+    #[test]
+    fn queued_ordinary_requests_keep_native_order_without_capacity_replay() {
+        let coordinator = WebSocketResponseCoordinator::default();
+        let request = json!({"type":"response.create","model":"gpt-test","input":"first"});
+        coordinator
+            .register_request_with_settings(&request, None, None, &BackendSettings::default())
+            .unwrap();
+        let created = Message::Text(
+            json!({"type":"response.created","response":{"id":"resp_first"}})
+                .to_string()
+                .into(),
+        );
+        assert!(matches!(
+            coordinator
+                .handle_upstream_message(created.clone())
+                .unwrap(),
+            WebSocketResponseAction::Buffered
+        ));
+        let next_request = json!({"type":"response.create","model":"gpt-test","input":"second"});
+        coordinator
+            .register_request_with_settings(&next_request, None, None, &BackendSettings::default())
+            .unwrap();
+        let failed = Message::Text(json!({"type":"response.failed","response":{"status":"failed","error":{"code":"model_at_capacity"}}}).to_string().into());
+        let WebSocketResponseAction::Flush { messages, .. } =
+            coordinator.handle_upstream_message(failed.clone()).unwrap()
+        else {
+            panic!("queued native requests must not be reordered by a retry");
+        };
+        assert_eq!(messages, vec![created, failed]);
+        assert!(coordinator.state.lock().unwrap().active.is_none());
     }
 }

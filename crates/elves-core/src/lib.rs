@@ -6,7 +6,6 @@ pub mod cli_wrapper;
 pub mod codex_home;
 pub mod codex_sqlite;
 mod compaction_cache;
-pub mod continue_thinking;
 pub mod diagnostic_log;
 pub mod env_conflicts;
 pub mod http_client;
