@@ -824,7 +824,7 @@ impl CodexHarness {
             .runtime
             .read(
                 "config/read",
-                json!({"cwd":main["cwd"],"includeLayers":false}),
+                json!({"cwd":main["cwd"],"includeLayers":true}),
             )
             .await?;
         if !config["config"].is_object() {
@@ -851,6 +851,7 @@ impl CodexHarness {
             .unwrap_or(Value::Null);
         let mut params = json!({"threadId":parent,"ephemeral":true,"excludeTurns":true,"threadSource":"user",
             "developerInstructions":instructions,"config":{"thread_unload_delay_secs":0}});
+        super::super::instance_settings::apply_codex_compaction_default(&config, &mut params);
         // 用户要求继承点击创建时的主会话选择，包括尚未发送的模型/深度；旧客户端再读原生及已保存设置。
         let model = payload["model"]
             .as_str()

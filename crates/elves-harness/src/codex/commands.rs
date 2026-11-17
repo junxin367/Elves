@@ -655,6 +655,7 @@ impl CodexHarness {
             }
             params["config"]["model_reasoning_effort"] = json!(effort);
         }
+        super::super::instance_settings::apply_codex_compaction_default(&config, &mut params);
         let response = self
             .runtime
             .request("thread/start", params, Some(authorization))

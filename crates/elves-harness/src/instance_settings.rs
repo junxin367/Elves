@@ -269,6 +269,53 @@ fn optional_bool(value: &Value) -> Result<Value, ApiError> {
     }
 }
 
+fn validate_compaction_prompt(value: &Value) -> Result<(), ApiError> {
+    if value.is_null()
+        || value.as_str().is_some_and(|text| {
+            !text.trim().is_empty()
+                && text.chars().count() <= 20_000
+                && !text.chars().any(|character| {
+                    character.is_control() && !matches!(character, '\n' | '\r' | '\t')
+                })
+        })
+    {
+        Ok(())
+    } else {
+        Err(ApiError::new(400, "压缩提示词需为 1～20000 个字符，或恢复默认"))
+    }
+}
+
+pub(super) fn claude_compaction_prompt(
+    directory: &Path,
+    instance: &str,
+) -> Result<String, ApiError> {
+    let (preference, _) = preferences(directory)?;
+    let value = &preference["instances"][instance]["compactionPrompt"];
+    validate_compaction_prompt(value)?;
+    Ok(value.as_str().unwrap_or("").to_owned())
+}
+
+pub(super) fn apply_codex_compaction_default(config: &Value, params: &mut Value) {
+    // 用户指定 Codex 默认压缩提示词沿用旧管理器；显式原生提示词或文件配置继续优先，不能改写代理全局设置。
+    // 文件路径可能只出现在原生配置层，不能因顶层序列化没有该字段就覆盖用户的提示词文件。
+    let native_override = |value: &Value| !value["compact_prompt"].is_null()
+        || value["experimental_compact_prompt_file"].as_str().is_some_and(|path| !path.is_empty());
+    let effective = config.get("config").unwrap_or(config);
+    if native_override(effective)
+        || config["layers"].as_array().into_iter().flatten()
+            .any(|layer| native_override(&layer["config"]))
+    {
+        return;
+    }
+    if !params["config"].is_object() {
+        params["config"] = json!({});
+    }
+    if params["config"]["compact_prompt"].is_null() {
+        params["config"]["compact_prompt"] =
+            json!(elves_core::layered_compaction::DEFAULT_COMPACTION_PROMPT);
+    }
+}
+
 fn general_view(backend: &str, document: &Value) -> Result<Value, ApiError> {
     if backend == "codex" {
         let legacy_agents = optional_bool(&document["features"]["multi_agent"])?;
@@ -308,7 +355,12 @@ fn set_toml(
             if let Some(original) = table.get(key).and_then(toml_edit::Item::as_value) {
                 *value.decor_mut() = original.decor().clone();
             }
-            table.insert(key, toml_edit::Item::Value(value));
+            // 已有键直接替换值，保留键本身的前缀注释；insert 会重建键并丢失模型前的注释。
+            if let Some(original) = table.get_mut(key) {
+                *original = toml_edit::Item::Value(value);
+            } else {
+                table.insert(key, toml_edit::Item::Value(value));
+            }
         } else {
             table.remove(key);
         }
@@ -352,7 +404,7 @@ fn updated_native(
         let mut document = text
             .parse::<toml_edit::DocumentMut>()
             .map_err(|_| ApiError::new(422, "Codex 配置格式无效，未覆盖原文件"))?;
-        if section == "models"
+        if matches!(section, "general" | "models")
             && changes.contains_key("model")
             && !changes.contains_key("reasoningEffort")
         {
@@ -368,14 +420,14 @@ fn updated_native(
                 ("general", "memories") => &["features", "memories"],
                 ("general", "multiAgent") => &["features", "multi_agent_v2", "enabled"],
                 ("general", "goals") => &["features", "goals"],
-                ("models", "model") => &["model"],
-                ("models", "reasoningEffort") => &["model_reasoning_effort"],
+                ("general" | "models", "model") => &["model"],
+                ("general" | "models", "reasoningEffort") => &["model_reasoning_effort"],
                 ("hooks", "enabled") => &["features", "hooks"],
                 _ => return Err(ApiError::new(400, "不支持的 Codex 实例设置")),
             };
             let replacement = if value.is_null() {
                 None
-            } else if section == "general" || section == "hooks" {
+            } else if matches!(key.as_str(), "todo" | "memories" | "multiAgent" | "goals" | "enabled") {
                 Some(toml_edit::Value::from(
                     value
                         .as_bool()
@@ -419,7 +471,7 @@ fn updated_native(
                         continue;
                     }
                     // CLI 仅确认 model 是可持久化的原生设置；effortLevel 未获确认，不能写入后显示假成功。
-                    ("models", "model")
+                    ("general" | "models", "model")
                         if value.is_null()
                             || value.as_str().is_some_and(|value| {
                                 !value.is_empty()
@@ -807,8 +859,21 @@ pub(super) async fn settings(
             Err(_) => capability_error = "所选 Codex 原生引擎未成功返回特性目录，实验能力暂不可修改，原生诊断项保持只读，请重新读取。".into(),
         }
     }
-    let mut catalog = if section == "models" {
-        Some(model_catalog(&state, instance, &authorization).await?)
+    // 模型默认值并入会话实例，读取和保存共用当前实例及同一原生配置版本；models 仅保留兼容入口。
+    let model_settings = matches!(section, "general" | "models") && !adapter_read_only;
+    let mut catalog = if model_settings {
+        match model_catalog(&state, instance, &authorization).await {
+            Ok(value) => Some(value),
+            Err(failure) if section == "general" => {
+                // 合并后模型目录读取失败不能阻断已支持的其他设置；写模型前仍须确认同一实例的目录。
+                if !capability_error.is_empty() {
+                    capability_error.push(' ');
+                }
+                capability_error.push_str(&format!("无法读取当前实例模型目录：{}", failure.message));
+                None
+            }
+            Err(failure) => return Err(failure),
+        }
     } else {
         None
     };
@@ -825,6 +890,11 @@ pub(super) async fn settings(
             .as_object()
             .filter(|changes| !changes.is_empty())
             .ok_or_else(|| ApiError::new(400, "请选择需要保存的设置"))?;
+        if changes.keys().any(|key| matches!(key.as_str(), "model" | "reasoningEffort" | "effortLevel"))
+            && catalog.is_none()
+        {
+            return Err(ApiError::new(409, "未取得当前实例模型目录，请重新读取后再保存模型设置"));
+        }
         options::validate_changes(
             &target.backend,
             section,
@@ -836,7 +906,7 @@ pub(super) async fn settings(
             },
         )?;
         if changes.contains_key("ultraReasoningEnabled") {
-            if section != "models" || target.backend != "codex" || changes.len() != 1 {
+            if !matches!(section, "general" | "models") || target.backend != "codex" || changes.len() != 1 {
                 return Err(ApiError::new(400, "Ultra 开关需要单独保存"));
             }
             let value = &changes["ultraReasoningEnabled"];
@@ -852,6 +922,16 @@ pub(super) async fn settings(
                 &authorization,
             )
             .await?;
+        } else if changes.contains_key("compactionPrompt") && target.backend == "claude" {
+            if section != "general" || changes.len() != 1 {
+                return Err(ApiError::new(400, "压缩提示词需要单独保存"));
+            }
+            validate_compaction_prompt(&changes["compactionPrompt"])?;
+            // Claude 只给所选实例的原生 /compact 传附加说明，不伪造 CLI 配置键或改变正常对话的系统提示词。
+            save_preference(
+                directory, instance, "compactionPrompt", &changes["compactionPrompt"],
+                payload["expectedPreferenceRevision"].as_str().unwrap_or(""), &authorization,
+            ).await?;
         } else if changes.contains_key("autoCompactWindow") {
             if section != "general"
                 || target.backend != "claude"
@@ -898,9 +978,7 @@ pub(super) async fn settings(
                 return Err(ApiError::new(409, "当前 Claude CLI 尚未确认支持输入建议"));
             }
             if let Some(catalog) = &catalog
-                && !changes
-                    .keys()
-                    .all(|key| options::contains(&target.backend, section, key))
+                && changes.keys().any(|key| matches!(key.as_str(), "model" | "reasoningEffort" | "effortLevel"))
             {
                 validate_models(
                     &target.backend,
@@ -914,6 +992,7 @@ pub(super) async fn settings(
         }
         if changes.contains_key("ultraReasoningEnabled")
             || changes.contains_key("autoCompactWindow")
+            || changes.contains_key("compactionPrompt") && target.backend == "claude"
         {
             state
                 .controller
@@ -922,7 +1001,9 @@ pub(super) async fn settings(
         }
         updated = true;
     }
-    if updated && section == "models" {
+    if updated && model_settings && catalog.is_some()
+        && ["model", "reasoningEffort", "ultraReasoningEnabled"].iter().any(|key| payload["settings"].get(*key).is_some())
+    {
         catalog = Some(model_catalog(&state, instance, &authorization).await?);
     }
     let (text, revision) = permissions::read_file(&target.path)?;
@@ -939,12 +1020,22 @@ pub(super) async fn settings(
         }),
         _ => json!({}),
     };
+    if section == "general" && model_settings {
+        let defaults = json!({
+            "model":document["model"],
+            "reasoningEffort":if target.backend == "codex" {
+                document["model_reasoning_effort"].clone()
+            } else {Value::Null},
+            "ultraReasoningEnabled":ultra_enabled(directory, instance)?
+        });
+        values.as_object_mut().unwrap().extend(defaults.as_object().unwrap().clone());
+    }
     if target.backend == "claude" && section == "general" {
         let window = &preference["instances"][instance]["autoCompactWindow"];
         validate_compact(window)?;
         values["autoCompactWindow"] = window.clone();
     }
-    let extra_settings = options::append_view(
+    let mut extra_settings = options::append_view(
         &target.backend,
         section,
         &document,
@@ -955,6 +1046,27 @@ pub(super) async fn settings(
             &capabilities["extraSettings"]
         },
     );
+    if section == "general" {
+        // 先按实例暴露真实能力边界：当前两个原生引擎均未确认独立压缩模型接口，不能借用旧代理模型配置。
+        values["compactionModel"] = json!("session");
+        extra_settings.push(json!({
+            "id":"compactionModel","kind":"enum","label":"压缩模型","group":"缓存与压缩",
+            "description":"","value":"session","readOnly":true,
+            "readOnlyReason":"当前尚未确认该实例的独立压缩模型接口，暂跟随会话模型；未借用代理的全局设置。",
+            "options":[{"value":"session","label":"跟随会话模型"}]
+        }));
+        if target.backend == "claude" {
+            let prompt = &preference["instances"][instance]["compactionPrompt"];
+            validate_compaction_prompt(prompt)?;
+            values["compactionPrompt"] = prompt.clone();
+            extra_settings.push(json!({
+                "id":"compactionPrompt","kind":"text","label":"压缩提示词","group":"缓存与压缩",
+                "description":"作为所选实例原生 /compact 的附加说明，仅用于手动压缩；自动压缩继续使用原生规则。",
+                "value":prompt,"readOnly":false,"readOnlyReason":null,"options":[],
+                "min":null,"max":20000,"defaultValue":null
+            }));
+        }
+    }
     authorization
         .check()
         .await
@@ -1033,6 +1145,72 @@ pub(super) async fn settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merged_instance_settings_preserve_model_and_compaction_native_contracts() {
+        let before = "# 保留配置\nmodel = \"old\"\nmodel_reasoning_effort = \"high\"\n[features]\ngoals = true\n";
+        let updated = updated_native("codex", "general", before, &json!({"model":"new"})).unwrap();
+        let updated = updated_native("codex", "general", &updated,
+            &json!({"autoCompactTokenLimit":600000,"reasoningSummary":"detailed","defaultServiceTier":"priority"})).unwrap();
+        let saved = native_document("codex", &updated).unwrap();
+        assert_eq!(saved["model"], "new");
+        assert!(saved["model_reasoning_effort"].is_null());
+        assert_eq!(saved["model_auto_compact_token_limit"], 600000);
+        assert_eq!(saved["model_reasoning_summary"], "detailed");
+        assert_eq!(saved["service_tier"], "priority");
+        assert_eq!(saved["features"]["goals"], true);
+        assert!(updated.contains("# 保留配置"));
+        assert_eq!(native_document("claude",
+            &updated_native("claude", "general", "{}", &json!({"model":"selected-model"})).unwrap()).unwrap()["model"], "selected-model");
+        assert!(updated_native("codex", "general", before, &json!({"compactionModel":"invented"})).is_err());
+    }
+
+    #[test]
+    fn codex_compaction_prompt_reuses_manager_default_and_respects_native_overrides() {
+        let default = elves_core::layered_compaction::DEFAULT_COMPACTION_PROMPT;
+        let mut params = json!({"config":{"model_reasoning_effort":"high"}});
+        apply_codex_compaction_default(&json!({}), &mut params);
+        assert_eq!(params["config"]["compact_prompt"], default);
+        assert_eq!(params["config"]["model_reasoning_effort"], "high");
+        for config in [json!({"compact_prompt":"custom"}),
+            json!({"experimental_compact_prompt_file":"/fixture/custom.md"}),
+            json!({"config":{},"layers":[{"config":{"experimental_compact_prompt_file":"/fixture/project.md"}}]}),
+            json!({"config":{"compact_prompt":"effective"},"layers":[]})] {
+            let mut params = json!({"config":{"model_reasoning_effort":"high"}});
+            apply_codex_compaction_default(&config, &mut params);
+            assert!(params["config"]["compact_prompt"].is_null());
+        }
+        let before = "\u{feff}# 保留\r\nmodel = \"fixture\" # 模型注释\r\n";
+        let saved = updated_native("codex", "general", before,
+            &json!({"compactionPrompt":"第一行\n第二行"})).unwrap();
+        assert_eq!(native_document("codex", &saved).unwrap()["compact_prompt"], "第一行\n第二行");
+        let cleared = updated_native("codex", "general", &saved,
+            &json!({"compactionPrompt":null})).unwrap();
+        assert!(native_document("codex", &cleared).unwrap()["compact_prompt"].is_null());
+        assert!(cleared.contains("# 模型注释"));
+        let mut values = json!({});
+        let rows = options::append_view("codex", "general", &json!({}), &mut values, &features());
+        let prompt = rows.iter().find(|row| row["id"] == "compactionPrompt").unwrap();
+        assert_eq!(prompt["defaultValue"], default);
+        assert_eq!(prompt["readOnly"], false);
+    }
+
+    #[test]
+    fn claude_compaction_prompt_is_scoped_to_the_exact_instance() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join(PREFERENCES_FILE),
+            serde_json::to_string(&json!({"instances":{
+                "claude:wsl:one":{"compactionPrompt":"实例一说明"},
+                "claude:wsl:two":{"compactionPrompt":"实例二说明"}
+            }})).unwrap()).unwrap();
+        assert_eq!(claude_compaction_prompt(directory.path(), "claude:wsl:one").unwrap(), "实例一说明");
+        assert_eq!(claude_compaction_prompt(directory.path(), "claude:wsl:two").unwrap(), "实例二说明");
+        assert_eq!(claude_compaction_prompt(directory.path(), "claude:wsl:missing").unwrap(), "");
+        assert!(validate_compaction_prompt(&json!(" \n\t")).is_err());
+        assert!(validate_compaction_prompt(&json!("invalid\u{0000}")).is_err());
+        assert!(validate_compaction_prompt(&json!("x".repeat(20001))).is_err());
+        assert!(validate_compaction_prompt(&Value::Null).is_ok());
+    }
 
     fn features() -> Value {
         json!({
@@ -1165,7 +1343,7 @@ mod tests {
                 "",
                 &json!({"reasoningSummary":"detailed"})
             )
-            .is_err()
+            .is_ok()
         );
         assert!(
             updated_native(

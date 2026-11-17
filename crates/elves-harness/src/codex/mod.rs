@@ -355,11 +355,19 @@ impl CodexHarness {
             return Ok(());
         }
         // 仅写操作才 resume；读取不抢占桌面会话，底层 writer lock 决定最终归属。
+        let identity = self.runtime.read(
+            "thread/read", json!({"threadId":id,"includeTurns":false}),
+        ).await?;
+        let config = self.runtime.request(
+            "config/read", json!({"cwd":identity["thread"]["cwd"],"includeLayers":true}), None,
+        ).await?;
+        let mut params = json!({"threadId":id,"excludeTurns":true});
+        super::instance_settings::apply_codex_compaction_default(&config, &mut params);
         let response = self
             .runtime
             .request(
                 "thread/resume",
-                json!({"threadId":id,"excludeTurns":true}),
+                params,
                 Some(guard),
             )
             .await?;

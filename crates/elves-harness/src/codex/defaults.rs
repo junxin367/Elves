@@ -135,7 +135,7 @@ impl CodexHarness {
         let (config, mut models, requirements) = tokio::try_join!(
             self.runtime.request(
                 "config/read",
-                json!({"cwd":cwd,"includeLayers":false}),
+                json!({"cwd":cwd,"includeLayers":true}),
                 None
             ),
             self.list_all("model/list", json!({"limit":100,"includeHidden":false})),

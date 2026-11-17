@@ -172,8 +172,14 @@ impl Claude {
         if let Some(mode) = payload["permissionMode"].as_str() {
             c.permission_mode = Some(mode.to_owned());
         }
+        // 用户要求压缩提示词按实例发起；只传给同一 WSL 原生 /compact，不改代理或正常会话系统提示词。
+        let compaction_prompt = if action == "compact" {
+            crate::instance_settings::claude_compaction_prompt(&self.directory, &c.config.instance_id())?
+        } else {
+            String::new()
+        };
         let (name, argument) = match action {
-            "compact" => ("compact", ""),
+            "compact" => ("compact", compaction_prompt.as_str()),
             "setGoal" => ("goal", goal_argument(payload)?),
             "updateGoal" => {
                 let goal = &c.native_control["goal"];

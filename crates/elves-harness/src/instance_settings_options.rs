@@ -40,7 +40,12 @@ fn definitions() -> &'static [Definition] {
 fn definition(backend: &str, section: &str, key: &str) -> Option<&'static Definition> {
     definitions()
         .iter()
-        .find(|item| item.backend == backend && item.section == section && item.id == key)
+        .find(|item| item.backend == backend && matches_section(item, section) && item.id == key)
+}
+
+fn matches_section(item: &Definition, section: &str) -> bool {
+    // 用户要求“模型与思考”并入会话实例；保留 models 接口兼容已有客户端，general 返回同一批原生字段。
+    item.section == section || section == "general" && item.section == "models"
 }
 
 fn raw_value(document: &Value, item: &Definition) -> Value {
@@ -76,6 +81,13 @@ fn valid_value(item: &Definition, value: &Value) -> bool {
                     })
             }),
             "enum" => item.options.iter().any(|option| option["value"] == *value),
+            "text" => value.as_str().is_some_and(|text| {
+                !text.trim().is_empty()
+                    && text.chars().count() <= item.max.unwrap_or(20_000) as usize
+                    && !text.chars().any(|character| {
+                        character.is_control() && !matches!(character, '\n' | '\r' | '\t')
+                    })
+            }),
             _ => false,
         }
 }
@@ -106,10 +118,6 @@ fn unavailable(item: &Definition, features: &Value) -> Option<String> {
         Some("deprecated") => Some("所选实例的原生引擎已弃用此功能，未修改原配置。".into()),
         _ => Some("无法确认所选实例是否支持此原生特性，请重新读取；未借用其他实例的能力。".into()),
     }
-}
-
-pub(super) fn contains(backend: &str, section: &str, key: &str) -> bool {
-    definition(backend, section, key).is_some()
 }
 
 pub(super) fn validate_changes(
@@ -200,7 +208,7 @@ pub(super) fn append_view(
     let mut rows = Vec::new();
     for item in definitions()
         .iter()
-        .filter(|item| item.backend == backend && item.section == section)
+        .filter(|item| item.backend == backend && matches_section(item, section))
     {
         let raw = raw_value(document, item);
         if item.configured_only && raw.is_null() {
@@ -214,13 +222,20 @@ pub(super) fn append_view(
         };
         let value = if valid { raw } else { Value::Null };
         values[&item.id] = value.clone();
+        let default_value = if item.backend == "codex" && item.id == "compactionPrompt" {
+            // 用户指定 Codex 默认压缩提示词复用旧管理器的唯一源文件，不能在前端另存一份或改写原文。
+            json!(elves_core::layered_compaction::DEFAULT_COMPACTION_PROMPT)
+        } else {
+            Value::Null
+        };
         rows.push(json!({
             "id":item.id,"kind":item.kind,"label":item.label,"description":item.description,
             "group":item.group,"options":item.options,"min":item.min,"max":item.max,
-            "readOnly":reason.is_some(),"readOnlyReason":reason,"value":value,"valueInvalid":!valid
+            "readOnly":reason.is_some(),"readOnlyReason":reason,"value":value,"valueInvalid":!valid,
+            "defaultValue":default_value
         }));
     }
-    if backend == "claude" && section == "models" {
+    if backend == "claude" && matches!(section, "general" | "models") {
         // 当前 CLI 未确认 modelSettings.<model>.effortLevel 的持久化合同；只展示安全的模型 ID 和已知深度。
         for (model, settings) in document["modelSettings"]
             .as_object()

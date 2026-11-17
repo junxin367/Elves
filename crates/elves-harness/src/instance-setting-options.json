@@ -38,22 +38,28 @@
   {
     "backend": "codex", "section": "models", "id": "autoCompactTokenLimit",
     "path": ["model_auto_compact_token_limit"], "kind": "integer", "min": 1, "max": 9007199254740991,
-    "group": "压缩与输出", "label": "自动压缩阈值",
+    "group": "缓存与压缩", "label": "自动压缩阈值",
     "description": "达到此 Token 数时由原生引擎触发历史压缩；留空使用模型默认值，不改写模型上下文容量。"
   },
   {
     "backend": "codex", "section": "models", "id": "reasoningSummary",
     "path": ["model_reasoning_summary"], "kind": "enum",
     "options": [{"value": "auto", "label": "自动"}, {"value": "concise", "label": "简洁"}, {"value": "detailed", "label": "详细"}, {"value": "none", "label": "不生成"}],
-    "group": "压缩与输出", "label": "思考摘要",
+    "group": "模型与思考", "label": "思考摘要",
     "description": "设置模型返回的思考摘要详细程度；实际支持情况由所选模型和上游决定。"
   },
   {
     "backend": "codex", "section": "models", "id": "defaultServiceTier",
     "path": ["service_tier"], "kind": "enum",
     "options": [{"value": "default", "label": "标准"}, {"value": "priority", "label": "优先（Fast）"}, {"value": "flex", "label": "Flex"}],
-    "group": "压缩与输出", "label": "默认服务档位",
+    "group": "模型与思考", "label": "默认服务档位",
     "description": "保存实例的原生默认请求档位，可用性由模型和上游决定；已有会话输入区的 Fast 选择仍按该会话实际配置生效。"
+  },
+  {
+    "backend": "codex", "section": "general", "id": "compactionPrompt",
+    "path": ["compact_prompt"], "kind": "text", "max": 20000,
+    "group": "缓存与压缩", "label": "压缩提示词",
+    "description": "用于所选 Codex 实例的历史压缩；默认沿用旧管理器提示词，新会话或重新加载后生效。"
   },
   {
     "backend": "codex", "section": "general", "id": "legacyJsRepl",

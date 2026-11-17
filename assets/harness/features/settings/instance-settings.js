@@ -25,8 +25,8 @@ export const settingsNavigation = [
     { id: "shortcuts", label: "快捷键", icon: "keyboard" }
   ] },
   { id: "agents", label: "智能体", items: [
+    // 用户要求模型、思考及压缩配置统一从“会话实例”进入，共用同一个实例选择和保存版本。
     { id: "types", label: "会话实例", icon: "allSessions" },
-    { id: "models", label: "模型与思考", icon: "model" },
     // 用户要求该设置入口统一称“会话命名”，与页面标题、提示及产品规范保持一致。
     { id: "naming", label: "会话命名", icon: "edit" },
     { id: "permissions", label: "权限", icon: "shield" },
@@ -43,8 +43,7 @@ export const settingsNavigation = [
   ] }
 ];
 export const instanceSettingPages = [
-  { id: "types", label: "会话实例", section: "general", description: "按实例管理常规能力和原生配置。" },
-  { id: "models", label: "模型与思考", section: "models", description: "设置所选实例的默认模型与默认思考深度。" },
+  { id: "types", label: "会话实例", section: "general", description: "按实例管理默认模型、思考、缓存压缩和原生能力。" },
   { id: "skills", label: "Skills", section: "skills", description: "查看和管理所选实例的 Skills。" },
   { id: "mcp", label: "MCP", section: "mcp", description: "查看和管理所选实例的 MCP 服务。" },
   { id: "hooks", label: "钩子", section: "hooks", description: "查看和管理所选实例的原生钩子。" }
@@ -124,6 +123,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
   actions.append(reload);
   page.append(head, detect, content, status, actions);
   const controls = new Set();
+  const textDrafts = new Map();
   function sync() {
     instances.disabled = !alive() || detecting || saving || !availableSessionInstances().length;
     detect.disabled = !alive() || detecting || saving || !session || !connected;
@@ -159,7 +159,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     control.onchange = () => {
       if (record !== owner || selected !== ownerId || !control.isConnected) return;
       const settings = { [key]: transform(control.value) };
-      if (name === "models" && key === "model" && record.backend === "codex") {
+      if (key === "model" && record.backend === "codex") {
         // 切换 Codex 实例默认模型时恢复模型默认思考深度，避免把旧模型的专属等级带给新模型。
         settings.reasoningEffort = null;
       }
@@ -281,7 +281,8 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
         const label = option.options?.find(choice => choice.value === value)?.label;
         const configured = label || (option.id.startsWith("nativeModelEffort:") ? effortLabels[value] : "") || String(value);
         // 诊断项只说明文件中的值；不能把已移除或未确认的原生能力显示成“已开启”。
-        const text = option.valueInvalid ? "配置值无效" : value == null ? "使用原生默认" : `配置值：${configured}`;
+        const text = option.id === "compactionModel" ? configured
+          : option.valueInvalid ? "配置值无效" : value == null ? "使用原生默认" : `配置值：${configured}`;
         row.append(fieldCopy(option.label, option.readOnlyReason || option.description),
           element("span", "muted", text));
         card.append(row); continue;
@@ -291,6 +292,37 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
       } else if (option.kind === "enum") {
         addSelect(card, option.id, option.label, option.description,
           [inherit, ...option.options], value || "", value => value || null);
+      } else if (option.kind === "text") {
+        const box = element("div", "appearance-instructions-card");
+        const input = element("textarea", "instruction-content");
+        const owner = record, ownerId = selected, draftKey = JSON.stringify([ownerId, option.id]);
+        const draft = textDrafts.get(draftKey), fallback = option.defaultValue || "";
+        input.setAttribute("aria-label", option.label); input.maxLength = option.max;
+        input.placeholder = fallback ? "使用默认压缩提示词" : "使用原生默认";
+        input.value = draft?.value ?? value ?? fallback;
+        // 提示词草稿按实例保留；保存沿用开始编辑时的原生/偏好版本，迟到输入不能借用其他实例或新配置版本。
+        input.oninput = () => {
+          if (record === owner && selected === ownerId && input.isConnected)
+            textDrafts.set(draftKey, { value: input.value, revision: owner.revision,
+              preferenceRevision: owner.preferenceRevision });
+        };
+        const savePrompt = button("保存提示词", `保存${option.label}`, () => {
+          if (record !== owner || selected !== ownerId || !input.isConnected) return;
+          const current = textDrafts.get(draftKey) || { ...owner, value: input.value };
+          if (!current.value.trim() || current.value.length > option.max) {
+            message = `${option.label}需填写 1～${option.max} 个字符，或恢复默认。`; sync(); return;
+          }
+          void save({ [option.id]: current.value }, current);
+        }, "text-button");
+        const resetPrompt = button("恢复默认", `恢复默认${option.label}`, () => {
+          if (record === owner && selected === ownerId && input.isConnected)
+            void save({ [option.id]: null });
+        }, "text-button");
+        const actions = element("div", "appearance-action-buttons");
+        actions.append(resetPrompt, savePrompt);
+        box.append(fieldCopy(option.label, option.description), input, actions);
+        for (const control of [input, savePrompt, resetPrompt]) controls.add(control);
+        card.append(box);
       } else if (option.kind === "integer") {
         const row = element("label", "appearance-field");
         const input = element("input");
@@ -323,7 +355,11 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
   function render() {
     content.replaceChildren(); controls.clear();
     if (record) {
-      if (name === "general") renderGeneral();
+      if (name === "general") {
+        // 合并页面只读取当前实例的一份设置；旧服务未返回模型目录时仍可显示已有常规配置。
+        if (Array.isArray(record.models)) renderModels();
+        renderGeneral();
+      }
       else if (name === "models") renderModels();
       else renderInventory();
       renderExtraSettings();
@@ -357,6 +393,10 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
                   || values[option.id] < option.min || values[option.id] > option.max)
               : option.kind === "enum"
                 ? values[option.id] !== null && !option.options.some(choice => choice.value === values[option.id])
+                : option.kind === "text"
+                  ? !Number.isSafeInteger(option.max) || option.max < 1 || option.max > 20000
+                    || values[option.id] !== null && typeof values[option.id] !== "string"
+                    || option.defaultValue != null && typeof option.defaultValue !== "string"
                 : true))))
       throw new Error("实例额外设置字段无法确认，请重新读取。");
     if (name === "general") {
@@ -369,7 +409,8 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
             && !(Number.isInteger(values.autoCompactWindow) && values.autoCompactWindow >= 100000
               && values.autoCompactWindow <= 1000000)))
         throw new Error("实例常规设置字段不完整，请重新读取。");
-    } else if (name === "models") {
+    }
+    if (name === "models" || name === "general" && result.models != null) {
       if (!Array.isArray(result.models) || result.models.some(model => !model || typeof model.model !== "string"
             || model.displayName != null && typeof model.displayName !== "string"
             || model.supportedReasoningEfforts != null && (!Array.isArray(model.supportedReasoningEfforts)
@@ -379,13 +420,13 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
           || result.effectiveModel != null && typeof result.effectiveModel !== "string"
           || result.backend === "codex" && typeof values.ultraReasoningEnabled !== "boolean")
         throw new Error("实例模型设置字段不完整，请重新读取。");
-    } else if (!result.inventory || !Array.isArray(result.inventory.data)
+    } else if (name !== "general" && (!result.inventory || !Array.isArray(result.inventory.data)
         || result.inventory.data.some(row => !row || typeof row !== "object"
           || typeof (row.name || row.id || row.path) !== "string"
           || row.canToggle === true && typeof row.id !== "string"
           || row.enabled != null && typeof row.enabled !== "boolean")
         || name === "hooks" && (!Object.hasOwn(result.inventory, "enabled")
-          || result.inventory.enabled !== null && typeof result.inventory.enabled !== "boolean")) {
+          || result.inventory.enabled !== null && typeof result.inventory.enabled !== "boolean"))) {
       throw new Error("实例扩展列表字段不完整，请重新读取。");
     }
     return result;
@@ -415,14 +456,14 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
       }
     }
   }
-  async function save(settings) {
+  async function save(settings, expected = record) {
     if (!writable()) { render(); return; }
     const id = selected, before = record;
     saving = true; message = ""; render();
     try {
       const result = await api("/api/settings/instance", { instanceId: id, section: name,
-        operation: "save", settings, expectedRevision: before.revision,
-        expectedPreferenceRevision: before.preferenceRevision });
+        operation: "save", settings, expectedRevision: expected.revision,
+        expectedPreferenceRevision: expected.preferenceRevision });
       if (scope !== privateInputScope(session) || selected !== id) return;
       record = checkedResult(result, id);
       for (const [key, value] of Object.entries(settings)) {
@@ -431,8 +472,11 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
             : record.settings[key === "effortLevel" ? "reasoningEffort" : key];
         if (actual !== (["skill", "server"].includes(key) ? value.enabled : value))
           throw new Error("保存结果与所选设置不一致，请重新读取核对。");
+        const draftKey = JSON.stringify([id, key]), draft = textDrafts.get(draftKey);
+        if (value === null || draft?.value === value) textDrafts.delete(draftKey);
       }
-      if (name === "models") {
+      if (name === "models" || name === "general"
+          && ["model", "reasoningEffort", "ultraReasoningEnabled", "defaultServiceTier"].some(key => Object.hasOwn(settings, key))) {
         // 已确认的配置变更即使设置窗口已关闭也须失效缓存；其他实例的旧磁盘目录同样不能在下次启动恢复。
         const removed = readCache.remove(scope, "models", id === "codex:local" ? "global" : id).catch(() => {});
         if (id === activeInstanceId()) {
