@@ -233,6 +233,7 @@ pub struct ResourceCache {
     update_lock: Arc<tokio::sync::Mutex<()>>,
     network: reqwest::Client,
     loopback: reqwest::Client,
+    desktop_cookie: Arc<RwLock<Option<(url::Origin, String)>>>,
 }
 
 fn client(no_proxy: bool) -> anyhow::Result<reqwest::Client> {
@@ -287,14 +288,17 @@ async fn request(
     client: &reqwest::Client,
     url: Url,
     limit: usize,
+    cookie: Option<String>,
 ) -> anyhow::Result<(Vec<u8>, String)> {
-    let mut response = client
+    let mut request = client
         .get(url)
         .header("skip_zrok_interstitial", "1")
         .header("ngrok-skip-browser-warning", "true")
-        .header("Accept-Encoding", "gzip")
-        .send()
-        .await?;
+        .header("Accept-Encoding", "gzip");
+    if let Some(cookie) = cookie {
+        request = request.header(reqwest::header::COOKIE, cookie);
+    }
+    let mut response = request.send().await?;
     ensure!(response.status().is_success(), "无法取得网页资源");
     let encoded_limit = limit.saturating_add(64 * 1024);
     ensure!(
@@ -336,8 +340,13 @@ pub async fn fetch_manifest(
     client: &reqwest::Client,
     origin: &Url,
 ) -> anyhow::Result<(Manifest, String)> {
-    let (bytes, headers) =
-        request(client, origin.join("app-resources.json")?, MAX_MANIFEST).await?;
+    let (bytes, headers) = request(
+        client,
+        origin.join("app-resources.json")?,
+        MAX_MANIFEST,
+        None,
+    )
+    .await?;
     Ok((Manifest::parse(&bytes)?, headers))
 }
 
@@ -416,6 +425,7 @@ impl ResourceCache {
             update_lock: Arc::new(tokio::sync::Mutex::new(())),
             network: client(false)?,
             loopback: client(true)?,
+            desktop_cookie: Arc::new(RwLock::new(None)),
         }))
     }
     pub fn fork_view(&self, url: &Url) -> Arc<Self> {
@@ -438,7 +448,30 @@ impl ResourceCache {
             update_lock: self.update_lock.clone(),
             network: self.network.clone(),
             loopback: self.loopback.clone(),
+            desktop_cookie: self.desktop_cookie.clone(),
         })
+    }
+    pub(crate) fn set_desktop_identity(&self, url: &Url, cookie: &str) -> anyhow::Result<()> {
+        ensure!(
+            url.scheme() == "http" && url.host_str() == Some("127.0.0.1") && valid_hash(cookie),
+            "本机资源授权无效"
+        );
+        *self.desktop_cookie.write().unwrap() =
+            Some((url.origin(), format!("elves_desktop={cookie}")));
+        Ok(())
+    }
+    fn cookie_for(&self, url: &Url) -> Option<String> {
+        // 管理页转为本机专用后，缓存下载仅为原生已确认的同一回环 Origin 的管理资源附带授权。
+        // 不向公开资源、API、其他端口或远程地址发送 Cookie；凭据仅驻留内存，不写缓存文件。
+        if !url.path().starts_with("/management/") {
+            return None;
+        }
+        self.desktop_cookie
+            .read()
+            .unwrap()
+            .as_ref()
+            .filter(|(origin, _)| *origin == url.origin())
+            .map(|(_, cookie)| cookie.clone())
     }
     pub fn enable(&self) {
         self.enabled.store(true, Ordering::SeqCst);
@@ -641,19 +674,20 @@ impl ResourceCache {
         let mut files = BTreeMap::new();
         for entry in &manifest.files {
             self.idle(epoch).await?;
-            let bytes = if let Some(bytes) =
-                old.matches(entry).or_else(|| self.builtin.matches(entry))
-            {
-                bytes
-            } else {
-                let (bytes, _) =
-                    request(self.http(url), url.join(&entry.path)?, entry.size as usize).await?;
-                ensure!(
-                    bytes.len() as u64 == entry.size && hex(&bytes) == entry.sha256,
-                    "网页资源摘要不匹配"
-                );
-                Arc::from(bytes)
-            };
+            let bytes =
+                if let Some(bytes) = old.matches(entry).or_else(|| self.builtin.matches(entry)) {
+                    bytes
+                } else {
+                    let target = url.join(&entry.path)?;
+                    let cookie = self.cookie_for(&target);
+                    let (bytes, _) =
+                        request(self.http(url), target, entry.size as usize, cookie).await?;
+                    ensure!(
+                        bytes.len() as u64 == entry.size && hex(&bytes) == entry.sha256,
+                        "网页资源摘要不匹配"
+                    );
+                    Arc::from(bytes)
+                };
             files.insert(entry.path.clone(), bytes);
         }
         self.idle(epoch).await?;
@@ -854,23 +888,73 @@ mod tests {
         }
     }
 
+    #[test]
+    fn desktop_cache_credentials_are_bound_to_the_local_origin_and_management_resources() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = ResourceCache::new(directory.path().into()).unwrap();
+        let home = Url::parse("http://127.0.0.1:45223/").unwrap();
+        cache.set_desktop_identity(&home, &"a".repeat(64)).unwrap();
+        let target = home.join("management/index.html").unwrap();
+        assert_eq!(
+            cache.cookie_for(&target),
+            Some(format!("elves_desktop={}", "a".repeat(64)))
+        );
+        for url in [
+            "http://127.0.0.1:45223/api/session",
+            "http://127.0.0.1:45223/app.js",
+            "http://127.0.0.1:45222/management/index.html",
+            "https://remote.example/management/index.html",
+        ] {
+            assert!(cache.cookie_for(&Url::parse(url).unwrap()).is_none());
+        }
+        let child = cache.fork_view(&home);
+        cache.set_desktop_identity(&home, &"b".repeat(64)).unwrap();
+        assert_eq!(
+            child.cookie_for(&target),
+            Some(format!("elves_desktop={}", "b".repeat(64)))
+        );
+        assert!(
+            cache
+                .set_desktop_identity(
+                    &Url::parse("https://remote.example/").unwrap(),
+                    &"c".repeat(64)
+                )
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn gzip_update_is_atomic_and_an_existing_connection_reopens_offline() {
         use std::net::TcpListener;
         let directory = tempfile::tempdir().unwrap();
         let cache = ResourceCache::new(directory.path().into()).unwrap();
         cache.enable();
-        let updated = sample(bundled::BUNDLED_REVISION + 1, "complete-new-page");
+        let mut updated = sample(bundled::BUNDLED_REVISION + 1, "complete-new-page");
+        let management: Arc<[u8]> = Arc::from(&b"private-management-page"[..]);
+        let mut updated_manifest = updated.manifest.as_ref().clone();
+        updated_manifest.files.push(Resource {
+            path: "/management/index.html".into(),
+            content_type: "text/html; charset=utf-8".into(),
+            size: management.len() as u64,
+            sha256: hex(&management),
+        });
+        updated_manifest.version = manifest_version(&updated_manifest.files);
+        updated.manifest = Arc::new(updated_manifest);
+        updated
+            .files
+            .insert("/management/index.html".into(), management.clone());
         let manifest = serde_json::to_vec(updated.manifest.as_ref()).unwrap();
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(&manifest).unwrap();
         let encoded = encoder.finish().unwrap();
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        cache.set_desktop_identity(&url, &"a".repeat(64)).unwrap();
         let server = std::thread::spawn(move || {
             for (route, bytes, extra) in [
                 ("/app-resources.json", encoded, "Content-Encoding: gzip\r\n"),
                 ("/", b"complete-new-page".to_vec(), ""),
+                ("/management/index.html", management.to_vec(), ""),
             ] {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream
@@ -885,9 +969,11 @@ mod tests {
                 }
                 let headers = String::from_utf8(received).unwrap().to_ascii_lowercase();
                 assert!(headers.starts_with(&format!("get {route} ")));
-                assert!(
-                    !headers.contains("\r\ncookie:") && !headers.contains("\r\nauthorization:")
+                assert_eq!(
+                    headers.contains(&format!("\r\ncookie: elves_desktop={}", "a".repeat(64))),
+                    route.starts_with("/management/")
                 );
+                assert!(!headers.contains("\r\nauthorization:"));
                 write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n",

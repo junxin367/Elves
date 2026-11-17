@@ -78,6 +78,10 @@ fn dispatch(
     authorization: HarnessAuthorization,
 ) -> ManagementFuture {
     Box::pin(async move {
+        // 管理分发再次核对真实本机身份，阻止其他调用路径用远程授权读取配置、凭据、日志或批量会话。
+        if authorization.device.key_id != crate::desktop::DEVICE_KEY_ID {
+            return Err(crate::ApiError::new(403, "管理功能仅可在 Elves 独立客户端使用").into());
+        }
         let writes_settings = matches!(
             command.as_str(),
             "save_settings"
@@ -171,4 +175,25 @@ fn dispatch(
         }
         Ok(result)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn remote_identity_is_rejected_before_any_management_configuration_read() {
+        let (_directory, authorization) = crate::tests::service_dispatch_fixture().await;
+        for command in [
+            "load_settings",
+            "save_settings",
+            "list_local_sessions",
+            "remote_access_command",
+        ] {
+            let error = dispatch(command.into(), json!({}), authorization.clone())
+                .await
+                .unwrap_err();
+            assert_eq!(error.downcast_ref::<crate::ApiError>().unwrap().code, 403);
+        }
+    }
 }

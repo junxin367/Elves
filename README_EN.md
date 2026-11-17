@@ -9,6 +9,8 @@ Elves is a Windows desktop client. Opening it starts local Harness and enters th
 
 Browsers, PWAs, and Android connect through Harness's optional remote-session capability. Turning it off leaves desktop use and the local proxy available. Elves does not require Codex App and provides no page injection, desktop execution bridge, or separate manager application.
 
+Proxy settings, session management, and remote-access administration are available only in the Elves desktop client. Browsers, PWAs, and Android require an access key for conversations and ordinary settings; management pages and their APIs are blocked.
+
 [Releases](https://github.com/junxin367/Elves/releases) · [Documentation](docs/README.md) · [Issues](https://github.com/junxin367/Elves/issues)
 
 ## Features

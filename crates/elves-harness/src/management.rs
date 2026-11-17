@@ -90,9 +90,12 @@ pub(super) async fn command(
     headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
+    // 用户要求网页、PWA、Android 不开放任何管理能力；远程密码和设备授权不能提升为本机管理权限。
+    if !state.desktop {
+        return Err(ApiError::new(403, "管理功能仅可在 Elves 独立客户端使用"));
+    }
     let device = authorized(&state, &headers).await?;
-    // 代理配置和日志可能包含凭据；只读设备不能借管理页面取得供应商或访问密钥。
-    // 本机管理授权来自内置连接页的一次性证明。仅回环地址可解除只读；普通网页及公网 Cookie 不享有例外。
+    // 本机身份来自原生启动的一次性证明；同时核对实际监听、回环对端、Host 和设备身份。
     let native_owner = state.desktop
         && !trust.external_public
         && peer.ip().is_loopback()
@@ -101,14 +104,10 @@ pub(super) async fn command(
             .and_then(|value| value.to_str().ok())
             == Some(format!("127.0.0.1:{}", state.settings.port).as_str())
         && device.key_id == desktop::DEVICE_KEY_ID;
-    let authorization = state.controller.authorization(
-        device,
-        if native_owner {
-            None
-        } else {
-            Some("management")
-        },
-    );
+    if !native_owner {
+        return Err(ApiError::new(403, "管理功能仅可在 Elves 独立客户端使用"));
+    }
+    let authorization = state.controller.authorization(device, None);
     authorization.check().await.map_err(authorization_error)?;
     let handler = HANDLER
         .get()

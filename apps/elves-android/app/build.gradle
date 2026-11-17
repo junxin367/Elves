@@ -117,7 +117,8 @@ def bundledWebResources = {
         def source = remoteAssets.toPath().relativize(file.toPath()).toString().replace(File.separatorChar, '/' as char)
         def dot = source.lastIndexOf('.')
         def contentType = dot > source.lastIndexOf('/') ? harnessResourceContentTypes[source.substring(dot + 1)] : null
-        if (contentType == null || separatelyServedResources.contains(source)) return
+        // 用户要求 Android 不提供管理页面；与服务端远程资源清单及缓存拦截规则保持一致。
+        if (contentType == null || separatelyServedResources.contains(source) || source.startsWith("management/")) return
         resources << [source: source, path: source == "index.html" ? "/" : "/" + source, contentType: contentType]
     }
     resources.sort { a, b -> a.path <=> b.path }

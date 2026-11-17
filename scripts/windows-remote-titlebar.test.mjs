@@ -140,7 +140,7 @@ test("原生顶栏不授予网页窗口控制权限，项目跳转仅接收原�
     readFile(new URL("src-tauri/tauri.conf.json", base), "utf8").then(JSON.parse),
   ]);
   assert.deepEqual(appearance.webviews, ["elves-content", "elves-content-session-*"]);
-  assert.deepEqual(appearance.permissions, ["remote-appearance", "remote-resource-cache", "remote-session-window", "remote-taskbar-badge", "remote-local-inputs", "remote-project-navigation"]);
+  assert.deepEqual(appearance.permissions, ["remote-appearance", "remote-resource-cache", "remote-session-window", "remote-taskbar-badge", "remote-local-inputs", "remote-project-navigation", "remote-desktop-authentication"]);
   assert.ok(appearance.remote.urls.every(url => /^https?:/.test(url)));
   assert.equal(connection.local, true);
   assert.equal(connection.remote, undefined);

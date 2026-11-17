@@ -4,6 +4,11 @@ description = "Elves 内置启动页可读取状态并重试本机 Harness。"
 commands.allow = ["client_startup_state", "client_retry_startup"]
 
 [[permission]]
+identifier = "remote-desktop-authentication"
+description = "仅原生绑定的本机会话页可恢复自身授权，不可指定服务地址、读取凭据或变更远程权限。"
+commands.allow = ["client_recover_authentication"]
+
+[[permission]]
 identifier = "remote-appearance"
 description = "当前服务仅可同步经过校验的原生应用顶栏 RGB 配色，不可操作窗口或修改连接设置。"
 commands.allow = ["client_titlebar_theme"]

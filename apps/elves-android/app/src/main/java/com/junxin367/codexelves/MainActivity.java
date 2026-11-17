@@ -928,6 +928,13 @@ public final class MainActivity extends Activity {
         }
         Uri uri = request.getUrl();
         boolean sameOrigin = ServiceOrigin.matches(origin, uri);
+        String resourcePath = uri.getPath();
+        // Android 只访问远程会话；在旧缓存读取和网络请求之前封禁管理页面及管理接口。
+        if (sameOrigin && resourcePath != null && (resourcePath.equals("/management")
+            || resourcePath.startsWith("/management/") || resourcePath.equals("/api/management")
+            || resourcePath.startsWith("/api/management/"))) {
+            return errorResponse(403, "管理功能仅可在 Elves 独立客户端使用");
+        }
         if (!sameOrigin && !ServiceOrigin.allowsChannelRequest(
             uri.toString(), request.getMethod(), request.getRequestHeaders()
         )) {

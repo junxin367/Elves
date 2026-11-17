@@ -429,4 +429,244 @@ mod tests {
             assert_eq!(authorized(&state, &headers).await.err().unwrap().code, 403);
         }
     }
+
+    #[tokio::test]
+    async fn management_is_native_only_on_http_even_with_remote_credentials_or_forged_client_headers()
+     {
+        let (_directory, remote_authorization) = crate::tests::service_dispatch_fixture().await;
+        let controller = remote_authorization.controller;
+        let local = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_port = local.local_addr().unwrap().port();
+        let remote_port = remote.local_addr().unwrap().port();
+        controller.desktop_running.store(true, Ordering::Release);
+        controller.desktop_port.store(local_port, Ordering::Release);
+        let local_router = scoped_router(
+            controller.clone(),
+            RemoteAccessSettings {
+                port: local_port,
+                ..Default::default()
+            },
+            true,
+        );
+        let remote_router = scoped_router(
+            controller.clone(),
+            RemoteAccessSettings {
+                enabled: true,
+                port: remote_port,
+                ..Default::default()
+            },
+            false,
+        );
+        let local_server = tokio::spawn(async move {
+            axum::serve(
+                local,
+                local_router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let remote_server = tokio::spawn(async move {
+            axum::serve(
+                remote,
+                remote_router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let local_url = format!("http://127.0.0.1:{local_port}");
+        let remote_url = format!("http://127.0.0.1:{remote_port}");
+        assert_eq!(
+            client
+                .get(format!("{local_url}/api/session"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+        assert_eq!(
+            client
+                .get(format!("{remote_url}/api/session"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+        assert_eq!(
+            client
+                .post(format!("{local_url}/api/connect"))
+                .header("Origin", &local_url)
+                .json(&json!({"key":"remote-password-cannot-authorize-desktop"}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+        let proof = management::issue_local_proof(&controller.state_dir);
+        let connected = client
+            .post(format!("{local_url}/api/connect"))
+            .header("Origin", &local_url)
+            .json(&json!({"localProof":proof["proof"]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(connected.status(), 200);
+        let local_cookie = connected.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let remote_cookie = format!("{COOKIE_NAME}=isolated-service-dispatch-token");
+        let local_session: Value = client
+            .get(format!("{local_url}/api/session"))
+            .header("Cookie", &local_cookie)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(local_session["transport"], "desktop");
+        let remote_session: Value = client
+            .get(format!("{remote_url}/api/session"))
+            .header("Cookie", &remote_cookie)
+            .header("User-Agent", "Elves")
+            .header("X-Elves-Client", "desktop")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(remote_session["transport"], "remote");
+        assert_eq!(remote_session["capabilities"]["management"], false);
+        assert_eq!(
+            client
+                .get(format!("{local_url}/api/session"))
+                .header("Cookie", &remote_cookie)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+        assert_eq!(
+            client
+                .get(format!("{remote_url}/api/session"))
+                .header("Cookie", &local_cookie)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+        assert_eq!(
+            client
+                .get(format!("{local_url}/management/index.html"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+        assert_eq!(
+            client
+                .get(format!("{local_url}/management/index.html"))
+                .header("Cookie", &local_cookie)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        for path in web_assets()
+            .keys()
+            .copied()
+            .filter(|path| management_page_path(path))
+            .chain([
+                "/management",
+                "/management/",
+                "/api/management",
+                "/api/management/load_settings",
+            ])
+        {
+            for cookie in [None, Some(&remote_cookie), Some(&local_cookie)] {
+                let mut request = client
+                    .get(format!("{remote_url}{path}"))
+                    .header("User-Agent", "Elves")
+                    .header("X-Elves-Client", "desktop")
+                    .header("If-None-Match", "*");
+                if let Some(cookie) = cookie {
+                    request = request.header("Cookie", cookie);
+                }
+                assert_eq!(request.send().await.unwrap().status(), 403, "{path}");
+            }
+        }
+        for command in [
+            "load_settings",
+            "save_settings",
+            "read_relay_files",
+            "list_local_sessions",
+            "read_local_proxy_logs",
+            "read_local_proxy_log_detail",
+            "remote_access_command",
+        ] {
+            // 无效 JSON 也先被权限边界拒绝，不能靠绕开页面或正文解析探测管理功能。
+            assert_eq!(
+                client
+                    .post(format!("{remote_url}/api/management/{command}"))
+                    .header("Origin", &remote_url)
+                    .header("Cookie", &remote_cookie)
+                    .header("Content-Type", "application/json")
+                    .body("invalid-json")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                403,
+                "{command}"
+            );
+        }
+        let local_manifest: Value = client
+            .get(format!("{local_url}/app-resources.json"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let remote_manifest: Value = client
+            .get(format!("{remote_url}/app-resources.json"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            local_manifest["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|file| file["path"].as_str().is_some_and(management_page_path))
+        );
+        assert!(
+            !remote_manifest["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|file| file["path"].as_str().is_some_and(management_page_path))
+        );
+        assert_ne!(local_manifest["version"], remote_manifest["version"]);
+        local_server.abort();
+        remote_server.abort();
+        let _ = local_server.await;
+        let _ = remote_server.await;
+    }
 }

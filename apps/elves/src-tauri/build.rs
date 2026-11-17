@@ -10,6 +10,7 @@ fn main() {
             .app_manifest(tauri_build::AppManifest::new().commands(&[
                 "client_startup_state",
                 "client_retry_startup",
+                "client_recover_authentication",
                 "client_titlebar_theme",
                 "client_unread_badge",
                 "client_cache_status",

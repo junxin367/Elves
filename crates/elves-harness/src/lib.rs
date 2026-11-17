@@ -2424,9 +2424,11 @@ struct AppResourceFile {
 
 fn build_app_resources_manifest(
     assets: &HashMap<&'static str, StaticWebAsset>,
+    desktop: bool,
 ) -> AppResourcesManifest {
     let mut files: Vec<_> = assets
         .iter()
+        .filter(|(path, _)| desktop || !management_page_path(path))
         .map(|(path, asset)| AppResourceFile {
             path: (*path).to_string(),
             content_type: asset.content_type.to_string(),
@@ -2466,20 +2468,35 @@ fn update_manifest_version_field(hasher: &mut Sha256, value: &[u8]) {
     hasher.update(value);
 }
 
-fn app_resources_json() -> &'static [u8] {
-    static JSON: OnceLock<Box<[u8]>> = OnceLock::new();
-    JSON.get_or_init(|| {
-        serde_json::to_vec(&build_app_resources_manifest(web_assets()))
+fn app_resources_json(desktop: bool) -> &'static [u8] {
+    static DESKTOP: OnceLock<Box<[u8]>> = OnceLock::new();
+    static REMOTE: OnceLock<Box<[u8]>> = OnceLock::new();
+    let json = if desktop { &DESKTOP } else { &REMOTE };
+    json.get_or_init(|| {
+        serde_json::to_vec(&build_app_resources_manifest(web_assets(), desktop))
             .expect("app resource manifest should serialize")
             .into_boxed_slice()
     })
 }
 
-fn app_resources_asset() -> &'static StaticWebAsset {
-    static ASSET: OnceLock<StaticWebAsset> = OnceLock::new();
-    ASSET.get_or_init(|| {
-        StaticWebAsset::new("application/json; charset=utf-8", app_resources_json())
+fn app_resources_asset(desktop: bool) -> &'static StaticWebAsset {
+    static DESKTOP: OnceLock<StaticWebAsset> = OnceLock::new();
+    static REMOTE: OnceLock<StaticWebAsset> = OnceLock::new();
+    let asset = if desktop { &DESKTOP } else { &REMOTE };
+    asset.get_or_init(|| {
+        StaticWebAsset::new(
+            "application/json; charset=utf-8",
+            app_resources_json(desktop),
+        )
     })
+}
+
+fn management_page_path(path: &str) -> bool {
+    path == "/management" || path.starts_with("/management/")
+}
+
+fn management_request_path(path: &str) -> bool {
+    management_page_path(path) || path == "/api/management" || path.starts_with("/api/management/")
 }
 
 fn strong_etag(bytes: &[u8]) -> HeaderValue {
@@ -2568,12 +2585,12 @@ fn apply_static_asset_headers(response: &mut Response, asset: &StaticWebAsset, g
     }
 }
 
-async fn static_web_asset(uri: Uri, headers: HeaderMap) -> Response {
+async fn static_web_asset(State(state): State<WebState>, uri: Uri, headers: HeaderMap) -> Response {
     // 摘要和压缩按资源首次访问生成，不让 Mermaid 等非首屏资源阻塞入口。
     // 首次计算或同资源并发等待均在阻塞线程池中完成，避免占住事件/API 工作线程。
     tokio::task::spawn_blocking(move || {
         let asset = if uri.path() == "/app-resources.json" {
-            app_resources_asset()
+            app_resources_asset(state.desktop)
         } else if let Some(asset) = web_assets().get(if uri.path() == "/side-thread" {
             "/"
         } else {
@@ -2952,6 +2969,15 @@ async fn access_boundary_response(
     mut request: Request,
     next: Next,
 ) -> Response {
+    // 用户要求全部管理页面与接口只在本机客户端开放；在解析请求体、路由及缓存复验之前拒绝远程访问。
+    if !state.desktop && management_request_path(request.uri().path()) {
+        let mut response =
+            ApiError::new(403, "管理功能仅可在 Elves 独立客户端使用").into_response();
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return response;
+    }
     let static_web_asset = is_static_web_asset_path(request.uri().path());
     let side_thread_panel = request.uri().path() == "/side-thread";
     let host = request
@@ -3128,8 +3154,9 @@ async fn access_boundary_response(
         external_public,
         external_https,
     });
-    let private_api = (path == "/api" || path.starts_with("/api/"))
-        && !matches!(path.as_str(), "/api/connect" | "/api/login-status");
+    let private_api = management_page_path(&path)
+        || (path == "/api" || path.starts_with("/api/"))
+            && !matches!(path.as_str(), "/api/connect" | "/api/login-status");
     let private_image = path.starts_with("/api/images/")
         || path.starts_with("/api/videos/") && path.ends_with("/poster");
     // Reject unauthorized uploads before JSON/body extraction and before routing.
@@ -3545,7 +3572,8 @@ async fn session(
         "sessionMetrics":true,"workspaceOpenIn":cfg!(windows),
         "claudeSessions":true,"claudeProjectTrust":true,"claudeSubscriptionUsage":true}});
     response["transport"] = json!(if state.desktop { "desktop" } else { "remote" });
-    response["capabilities"]["management"] = json!(management::available());
+    // 管理权限由服务端真实入口决定，普通网页或 Android 不能通过伪造客户端标记取得能力。
+    response["capabilities"]["management"] = json!(state.desktop && management::available());
     Ok(Json(response))
 }
 
@@ -15425,9 +15453,9 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
             ),
         ]);
 
-        let first = build_app_resources_manifest(&first_assets);
-        let reordered = build_app_resources_manifest(&reordered_assets);
-        let changed = build_app_resources_manifest(&changed_assets);
+        let first = build_app_resources_manifest(&first_assets, false);
+        let reordered = build_app_resources_manifest(&reordered_assets, false);
+        let changed = build_app_resources_manifest(&changed_assets, false);
 
         assert_eq!(first.version, reordered.version);
         assert_ne!(first.version, changed.version);

@@ -2,6 +2,7 @@
 import { button, element } from "../ui/dom.js";
 import { icon } from "../ui/icons.js";
 import { closePopup, openPopup, togglePopup } from "../ui/popup.js";
+import { session } from "../core/state.js";
 
 export const mainNavigationItems = Object.freeze([
   { id: "conversation", label: "会话", icon: "chat" },
@@ -12,6 +13,11 @@ export const mainNavigationItems = Object.freeze([
 
 export function isElvesClient() {
   return typeof globalThis.__ELVES_CLIENT__?.open === "function";
+}
+
+export function canManageHarness() {
+  // 网页、PWA、Android 只显示会话；管理页要求原生容器和服务端确认的本机传输及管理能力同时成立。
+  return isElvesClient() && session?.transport === "desktop" && session?.capabilities?.management === true;
 }
 
 let disposeNavigation = null;
@@ -34,9 +40,11 @@ export function mountMainNavigation({ workspace, openSettings, logout, openPage 
   management.id = "management-workspace";
   management.hidden = true;
   let current = "conversation", savedPosition = null;
+  const items = mainNavigationItems.filter(item => item.id === "conversation" || canManageHarness());
   const controls = new Map();
   const choose = id => {
-    if (current === id) return;
+    if (current === id || !items.some(item => item.id === id)
+        || id !== "conversation" && !canManageHarness()) return;
     closePopup();
     if (current === "conversation") {
       const messages = workspace.querySelector("#messages");
@@ -60,11 +68,11 @@ export function mountMainNavigation({ workspace, openSettings, logout, openPage 
           savedPosition.node.scrollTop = savedPosition.top;
       });
     } else {
-      management.setAttribute("aria-label", mainNavigationItems.find(page => page.id === current).label);
+      management.setAttribute("aria-label", items.find(page => page.id === current).label);
       openPage(current, management);
     }
   };
-  for (const item of mainNavigationItems) {
+  for (const item of items) {
     const control = button("", item.label, () => choose(item.id), "main-navigation-button");
     control.dataset.page = item.id;
     control.setAttribute("aria-controls", item.id === "conversation" ? "session-sidebar" : management.id);

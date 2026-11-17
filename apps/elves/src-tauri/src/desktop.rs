@@ -72,6 +72,13 @@ struct ClientState {
     adding_folder: AtomicBool,
     checking_update: AtomicBool,
     project_navigation: Mutex<Option<ProjectNavigation>>,
+    // 本机凭据仅留在原生内存，串行恢复并复用仍有效的令牌，避免多个窗口互相撤销授权。
+    desktop_identity: tokio::sync::Mutex<Option<DesktopIdentity>>,
+}
+
+struct DesktopIdentity {
+    url: Url,
+    cookie: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -194,6 +201,33 @@ async fn client_retry_startup(
     trusted_startup_page(&webview)?;
     open_workspace(app).await
 }
+
+#[tauri::command]
+async fn client_recover_authentication(
+    webview: tauri::Webview,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let state = app.state::<ClientState>();
+    let source = webview.url().map_err(|error| error.to_string())?;
+    let window = webview.window();
+    // 用户要求独立客户端免密：只有原生已绑定的本机会话页能恢复自己的 Cookie，不能指定地址或取得凭据。
+    if state.exiting.load(Ordering::Acquire)
+        || webview.label() != content_label(window.label())
+        || !allows_service_url(&state, window.label(), &source)
+        || !matches!(source.path(), "/" | "/side-thread")
+    {
+        return Err("只有 Elves 本机会话工作区可以恢复本机授权。".into());
+    }
+    let url = authorize_workspace(&app).await?;
+    if source.origin() != url.origin() {
+        if let Some(content) = app.get_webview(CONTENT_LABEL) {
+            content.navigate(url).map_err(|error| error.to_string())?;
+        }
+        return Err("本机服务地址已更新，请在 Elves 主窗口继续。".into());
+    }
+    Ok(())
+}
+
 async fn open_workspace(app: tauri::AppHandle) -> Result<(), String> {
     let state = app.state::<ClientState>();
     if state.starting.swap(true, Ordering::AcqRel) {
@@ -201,88 +235,16 @@ async fn open_workspace(app: tauri::AppHandle) -> Result<(), String> {
     }
     *state.startup_error.lock().unwrap() = None;
     let result: Result<(), String> = async {
-        // 用户要求直接进入 Elves：只启动本机 Harness，不读取远程地址、不打开远程开关、不要求访问密钥。
-        elves_harness::ensure_service_running()
-            .await
-            .map_err(|error| format!("{error:#}"))?;
-        let value =
-            elves_harness::service_admin_request("desktopBootstrap", serde_json::json!({})).await;
-        let url = Url::parse(value["url"].as_str().ok_or_else(|| {
-            value["message"]
-                .as_str()
-                .unwrap_or("Harness 本机入口尚未就绪")
-                .to_owned()
-        })?)
-        .map_err(|error| error.to_string())?;
-        if url.scheme() != "http" || url.host_str() != Some("127.0.0.1") || url.path() != "/" {
-            return Err("Harness 返回了无效的本机入口。".into());
-        }
-        let proof = value["proof"].as_str().ok_or("Harness 启动证明缺失")?;
-        let response = reqwest::Client::builder()
-            .no_proxy()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .map_err(|error| error.to_string())?
-            .post(url.join("api/connect").map_err(|error| error.to_string())?)
-            .header("Origin", url.origin().ascii_serialization())
-            .json(&serde_json::json!({"localProof":proof}))
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        if !response.status().is_success() {
-            return Err(format!(
-                "Harness 本机授权失败（HTTP {}）",
-                response.status()
-            ));
-        }
-        let cookie = response
-            .headers()
-            .get("set-cookie")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(';').next())
-            .and_then(|value| value.strip_prefix("elves_desktop="))
-            .filter(|value| !value.is_empty() && value.len() <= 256)
-            .ok_or("Harness 本机授权回执缺失")?
-            .to_owned();
+        let url = authorize_workspace(&app).await?;
         state
             .cache
             .prepare(&url, false)
             .await
             .map_err(|error| error.to_string())?;
-        *state.home.lock().unwrap() = Some(url.clone());
         let view = app
             .get_webview(CONTENT_LABEL)
             .ok_or("Elves 工作区窗口尚未就绪")?;
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        view.with_webview(move |view| {
-            use webview2_com::Microsoft::Web::WebView2::Win32::{
-                COREWEBVIEW2_COOKIE_SAME_SITE_KIND_STRICT, ICoreWebView2_2,
-            };
-            use windows::core::{HSTRING, Interface};
-            let outcome = (|| -> windows::core::Result<()> {
-                unsafe {
-                    let core = view.controller().CoreWebView2()?;
-                    let manager = core.cast::<ICoreWebView2_2>()?.CookieManager()?;
-                    let credential = manager.CreateCookie(
-                        &HSTRING::from("elves_desktop"),
-                        &HSTRING::from(cookie),
-                        &HSTRING::from("127.0.0.1"),
-                        &HSTRING::from("/"),
-                    )?;
-                    credential.SetIsHttpOnly(true)?;
-                    credential.SetSameSite(COREWEBVIEW2_COOKIE_SAME_SITE_KIND_STRICT)?;
-                    manager.AddOrUpdateCookie(&credential)?;
-                    // Cookie 写入完成后才加载首页，避免出现远程连接或登录页；凭据不进入 URL 或页面脚本。
-                    core.Navigate(&HSTRING::from(url.as_str()))?;
-                    Ok(())
-                }
-            })();
-            let _ = sender.send(outcome.map_err(|error| error.to_string()));
-        })
-        .map_err(|error| error.to_string())?;
-        receiver
-            .await
-            .map_err(|_| "Elves 工作区初始化未完成".to_owned())??;
+        view.navigate(url).map_err(|error| error.to_string())?;
         Ok(())
     }
     .await;
@@ -292,6 +254,125 @@ async fn open_workspace(app: tauri::AppHandle) -> Result<(), String> {
         show_startup_page(&app);
     }
     result
+}
+
+async fn authorize_workspace(app: &tauri::AppHandle) -> Result<Url, String> {
+    let state = app.state::<ClientState>();
+    let mut identity = state.desktop_identity.lock().await;
+    if state.exiting.load(Ordering::Acquire) {
+        return Err("Elves 正在退出。".into());
+    }
+    // 用户要求直接进入 Elves：只启动本机 Harness，不读取远程地址、不打开远程开关、不要求访问密钥。
+    elves_harness::ensure_service_running()
+        .await
+        .map_err(|error| format!("{error:#}"))?;
+    let value =
+        elves_harness::service_admin_request("desktopBootstrap", serde_json::json!({})).await;
+    let url = Url::parse(value["url"].as_str().ok_or_else(|| {
+        value["message"]
+            .as_str()
+            .unwrap_or("Harness 本机入口尚未就绪")
+            .to_owned()
+    })?)
+    .map_err(|error| error.to_string())?;
+    if url.scheme() != "http" || url.host_str() != Some("127.0.0.1") || url.path() != "/" {
+        return Err("Harness 返回了无效的本机入口。".into());
+    }
+    let proof = value["proof"].as_str().ok_or("Harness 启动证明缺失")?;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let mut cookie = None;
+    if let Some(current) = identity
+        .as_ref()
+        .filter(|current| current.url.origin() == url.origin())
+    {
+        let response = client
+            .get(url.join("api/session").map_err(|error| error.to_string())?)
+            .header(
+                reqwest::header::COOKIE,
+                format!("elves_desktop={}", current.cookie),
+            )
+            .send()
+            .await;
+        if response.is_ok_and(|response| response.status().is_success()) {
+            cookie = Some(current.cookie.clone());
+        }
+    }
+    let cookie = match cookie {
+        Some(cookie) => cookie,
+        None => {
+            let response = client
+                .post(url.join("api/connect").map_err(|error| error.to_string())?)
+                .header("Origin", url.origin().ascii_serialization())
+                .json(&serde_json::json!({"localProof":proof}))
+                .send()
+                .await
+                .map_err(|error| error.to_string())?;
+            if !response.status().is_success() {
+                return Err(format!(
+                    "Harness 本机授权失败（HTTP {}）",
+                    response.status()
+                ));
+            }
+            response
+                .headers()
+                .get("set-cookie")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(';').next())
+                .and_then(|value| value.strip_prefix("elves_desktop="))
+                .filter(|value| !value.is_empty() && value.len() <= 256)
+                .ok_or("Harness 本机授权回执缺失")?
+                .to_owned()
+        }
+    };
+    let view = app
+        .get_webview(CONTENT_LABEL)
+        .ok_or("Elves 工作区窗口尚未就绪")?;
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let stored_cookie = cookie.clone();
+    view.with_webview(move |view| {
+        use webview2_com::Microsoft::Web::WebView2::Win32::{
+            COREWEBVIEW2_COOKIE_SAME_SITE_KIND_STRICT, ICoreWebView2_2,
+        };
+        use windows::core::{HSTRING, Interface};
+        let outcome = (|| -> windows::core::Result<()> {
+            unsafe {
+                let core = view.controller().CoreWebView2()?;
+                let manager = core.cast::<ICoreWebView2_2>()?.CookieManager()?;
+                let credential = manager.CreateCookie(
+                    &HSTRING::from("elves_desktop"),
+                    &HSTRING::from(cookie),
+                    &HSTRING::from("127.0.0.1"),
+                    &HSTRING::from("/"),
+                )?;
+                credential.SetIsHttpOnly(true)?;
+                // 该凭据只用于经原生确认的 HTTP 回环入口；显式设置属性，不依赖 WebView 的 Cookie 默认值。
+                credential.SetIsSecure(false)?;
+                credential.SetSameSite(COREWEBVIEW2_COOKIE_SAME_SITE_KIND_STRICT)?;
+                manager.AddOrUpdateCookie(&credential)?;
+                Ok(())
+            }
+        })();
+        let _ = sender.send(outcome.map_err(|error| error.to_string()));
+    })
+    .map_err(|error| error.to_string())?;
+    receiver
+        .await
+        .map_err(|_| "Elves 工作区初始化未完成".to_owned())??;
+    state
+        .cache
+        .set_desktop_identity(&url, &stored_cookie)
+        .map_err(|error| error.to_string())?;
+    *state.home.lock().unwrap() = Some(url.clone());
+    *identity = Some(DesktopIdentity {
+        url: url.clone(),
+        cookie: stored_cookie,
+    });
+    Ok(url)
 }
 
 fn trusted_service_page(webview: &tauri::Webview, state: &ClientState) -> Result<Url, String> {
@@ -1439,6 +1520,7 @@ pub fn run() -> anyhow::Result<()> {
         .invoke_handler(tauri::generate_handler![
             client_startup_state,
             client_retry_startup,
+            client_recover_authentication,
             client_titlebar_theme,
             client_unread_badge,
             client_cache_status,
@@ -1492,6 +1574,7 @@ pub fn run() -> anyhow::Result<()> {
                 adding_folder: AtomicBool::new(false),
                 checking_update: AtomicBool::new(false),
                 project_navigation: Mutex::new(None),
+                desktop_identity: tokio::sync::Mutex::new(None),
             });
             // Windows Tauri 本地资源默认 Origin；先完成原生缓存接管，再打开内置启动页并准备本机 Harness。
             let home = Url::parse("http://tauri.localhost/index.html")?;

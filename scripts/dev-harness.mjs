@@ -47,6 +47,8 @@ export function createRemoteEventStream() {
 // 网页资源按 scripts/harness-resources.mjs 的统一规则在启动时从目录生成，新增或拆分模块无需在此登记；
 // 文件内容每次请求时读取，只有新增或删除资源文件后需要重启调试服务器。
 const files = new Map((await listHarnessUiResources(assets))
+  // 此入口是网页远程预览；与服务端远程清单一致，不提供仅供独立客户端使用的管理页面。
+  .filter(({ route }) => !route.startsWith("/management/"))
   .map(({ route, file, contentType }) => [route, [file, contentType]]));
 const recoveryFiles = new Map([
   ["/cache-recovery.html", ["cache-recovery.html", "text/html; charset=utf-8"]],

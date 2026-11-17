@@ -6,13 +6,17 @@ import { $ } from "../../ui/dom.js";
 import { loadSidebar, reloadThread, selectThread } from "../../core/actions.js";
 import { connected, creating, nativeConnectionVersion, pageLeaving, selectedId, session } from "../../core/state.js";
 import { privateInputScope } from "./capabilities.js";
+import { isElvesClient } from "../main-navigation.js";
 
 export let initialAuthenticationRequired = false;
 // 从会话存储恢复“需要重新登录”标记。
 export function restoreAuthenticationRequirement() {
+  // 用户要求本机客户端不出现远程密码页；历史 401 标记不能覆盖原生已经建立的本机授权。
+  if (isElvesClient()) { setAuthenticationRequired(false); return; }
   try { initialAuthenticationRequired = sessionStorage.getItem("codex-elves-auth-required") === "1"; } catch {}
 }
 export function setAuthenticationRequired(required) {
+  required = required && !isElvesClient();
   initialAuthenticationRequired = required;
   try {
     if (required) sessionStorage.setItem("codex-elves-auth-required", "1");

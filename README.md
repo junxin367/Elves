@@ -9,6 +9,8 @@ Elves 是 Windows 桌面客户端，打开后自动启动本机 Harness 并进�
 
 网页、PWA 和 Android 通过 Harness 的“远程会话”能力接入同一工作区。远程会话可以关闭，不影响 Elves 本机使用或本地代理。项目不再依赖 Codex App，也不提供页面注入、桌面桥接或独立管理器。
 
+代理设置、会话管理和远程访问配置仅在 Elves 独立客户端开放。网页、PWA、Android 使用访问密钥登录后提供会话与普通设置，不能访问管理页面或相应管理接口。
+
 [版本发布](https://github.com/junxin367/Elves/releases) · [使用与开发文档](docs/README.md) · [问题反馈](https://github.com/junxin367/Elves/issues)
 
 ## 可以做什么

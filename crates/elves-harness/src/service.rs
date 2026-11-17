@@ -17,8 +17,8 @@ use serde_json::{Value, json};
 
 const ENDPOINT_FILE: &str = "harness-service.json";
 const LOCK_FILE: &str = "harness-service.lock";
-// 协议 11 增加原生菜单的文件夹登记；本机入口、代理与远程授权继续独立。
-const PROTOCOL_VERSION: u32 = 11;
+// 协议 12 将管理能力限定到本机身份；新客户端必须更换旧后台，不能沿用仍向远程开放管理的服务。
+const PROTOCOL_VERSION: u32 = 12;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(windows)]

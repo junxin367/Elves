@@ -13,7 +13,7 @@ import { captureTransferInputs, hasTransferFiles, readTransferInputs } from "../
 import { marked, Renderer } from "../assets/harness/vendor/marked.esm.js";
 import { defaultSharedSettings } from "../assets/harness/features/settings/shared-state.js";
 
-async function navigationFixture(native = false) {
+async function navigationFixture(native = false, transport = native ? "desktop" : "remote") {
   const source = await loadHarnessAppSource();
   const node = (tag, className = "") => ({
     tag, className, children: [], attributes: {}, dataset: {}, hidden: false, isConnected: true,
@@ -36,6 +36,7 @@ async function navigationFixture(native = false) {
   openPage.setVisible = value => visibility.push(value);
   openPage.dispose = () => callbacks.disposed++;
   const context = {
+    session: { transport, capabilities: { management: true } },
     workspace, openPage, element: node, icon: name => ({ name }),
     button: (text, label, action, className) => Object.assign(node("button", className), { label, action }),
     closePopup() {}, togglePopup: control => { context.popup = control; }, openPopup() {},
@@ -52,7 +53,7 @@ async function navigationFixture(native = false) {
 }
 
 test("统一主导航固定排序，切换后保留当前会话草稿、节点与阅读位置", async () => {
-  const fixture = await navigationFixture();
+  const fixture = await navigationFixture(true);
   assert.deepEqual(Array.from(fixture.buttons, button => button.label), ["会话", "代理设置", "会话管理", "远程会话"]);
   fixture.buttons[1].action();
   assert.equal(fixture.workspace.hidden, true);
@@ -73,6 +74,16 @@ test("统一主导航固定排序，切换后保留当前会话草稿、节点�
   assert.equal(fixture.callbacks.disposed, 1);
 });
 
+test("网页和 Android 不提供管理入口，伪造客户端标记也不能打开远程管理页", async () => {
+  for (const native of [false, true]) {
+    const fixture = await navigationFixture(native, "remote");
+    assert.deepEqual(Array.from(fixture.buttons, button => button.label), ["会话"]);
+    for (const page of ["proxy", "sessions", "remoteAccess"]) fixture.context.navigation.choose(page);
+    assert.deepEqual(fixture.opened, []);
+    assert.equal(fixture.workspace.hidden, false);
+  }
+});
+
 test("导航底部设置按客户端区分：Windows 直接打开，网页仅有设置和退出", async () => {
   const web = await navigationFixture();
   web.settings.action();
@@ -86,6 +97,84 @@ test("导航底部设置按客户端区分：Windows 直接打开，网页仅有
   assert.equal(native.callbacks.settings, 1);
   assert.equal(native.settings.menuOptions, undefined);
   assert.equal(native.context.popup, undefined);
+});
+
+test("独立客户端忽略历史远程登录标记，网页和 Android 保留密码登录要求", async () => {
+  const source = await loadHarnessAppSource();
+  for (const native of [false, true]) {
+    const values = new Map([["codex-elves-auth-required", "1"]]);
+    const context = rawVm.createContext({
+      isElvesClient: () => native,
+      sessionStorage: { getItem: key => values.get(key), setItem: (key, value) => values.set(key, value), removeItem: key => values.delete(key) },
+    });
+    rawVm.runInContext(source.section("let initialAuthenticationRequired", 'let loginClientId = ""'), context);
+    rawVm.runInContext("restoreAuthenticationRequirement()", context);
+    assert.equal(rawVm.runInContext("initialAuthenticationRequired", context), !native);
+    rawVm.runInContext("setAuthenticationRequired(true)", context);
+    assert.equal(values.has("codex-elves-auth-required"), !native);
+  }
+});
+
+async function nativeAuthenticationFixture(failure = null) {
+  const source = await loadHarnessAppSource();
+  let complete, recoveries = 0, connections = 0, remembered = 0;
+  const nativeResult = new Promise((resolve, reject) => { complete = () => failure ? reject(failure) : resolve(); });
+  const tags = [], messages = [];
+  const context = rawVm.createContext({
+    __ELVES_CLIENT__: { recoverAuthentication() { recoveries++; return nativeResult; } },
+    isElvesClient: () => true, connecting: null,
+    element(tag, className, text) { tags.push(tag); if (text) messages.push(text); return { append() {}, setAttribute() {} }; },
+    button() { return {}; }, productLogo() { return {}; },
+    app: { replaceChildren() {} }, announceAppReady() {}, disposeMainNavigation() {},
+    loginPageCleanup: null, closePopup() {}, disconnect() {}, cancelConnectionProbe() {},
+    rememberPageInputs() { remembered++; },
+    setAuthenticationRequired(value) { assert.equal(value, false); },
+    async connect() { connections++; }, async openPendingNativeProject() {},
+    clearPrivateInputs() { assert.fail("本机恢复不能清理草稿"); },
+    showLogin() { assert.fail("本机恢复不能显示远程密码页"); },
+  });
+  rawVm.runInContext(source.section("let nativeAuthenticationRecovery = null;", "function showConnectionRecovery("), context);
+  return { context, complete, tags, messages, counts: () => ({ recoveries, connections, remembered }) };
+}
+
+test("本机授权恢复合并重复 401 并保留草稿，不显示密码或重发写操作", async () => {
+  const fixture = await nativeAuthenticationFixture();
+  rawVm.runInContext("requireAuthentication(); requireAuthentication();", fixture.context);
+  assert.deepEqual(fixture.counts(), { recoveries: 1, connections: 0, remembered: 1 });
+  fixture.complete();
+  await rawVm.runInContext("nativeAuthenticationRecovery", fixture.context);
+  assert.deepEqual(fixture.counts(), { recoveries: 1, connections: 1, remembered: 1 });
+  assert.equal(fixture.tags.includes("input"), false);
+});
+
+test("本机恢复失败显示真实错误和重试，不自动循环或退回远程密码登录", async () => {
+  const fixture = await nativeAuthenticationFixture(new Error("Harness 本机端口不可用"));
+  rawVm.runInContext("requireAuthentication()", fixture.context);
+  fixture.complete();
+  await rawVm.runInContext("nativeAuthenticationRecovery", fixture.context);
+  assert.deepEqual(fixture.counts(), { recoveries: 1, connections: 0, remembered: 1 });
+  assert.ok(fixture.messages.includes("Harness 本机端口不可用"));
+  assert.equal(fixture.tags.includes("input"), false);
+});
+
+test("PWA 不从旧缓存恢复管理页面或管理脚本", async () => {
+  const source = await readFile(new URL("../assets/harness/sw.js", import.meta.url), "utf8");
+  const handlers = new Map();
+  const context = rawVm.createContext({
+    self: { location: { origin: "https://elves.example" }, addEventListener: (type, handler) => handlers.set(type, handler) },
+    URL, Response, Promise,
+    cachedResource() { assert.fail("被禁止的管理页不能访问旧缓存"); },
+    noteForegroundDemand() { assert.fail("被禁止的管理页不能触发资源下载"); },
+  });
+  rawVm.runInContext(source.slice(source.indexOf('self.addEventListener("fetch",')), context);
+  for (const path of ["/management", "/management/index.html", "/management/assets/old.js"]) {
+    let pending;
+    handlers.get("fetch")({ request: { url: `https://elves.example${path}`, method: "GET" },
+      respondWith(response) { pending = response; }, waitUntil() {} });
+    const response = await pending;
+    assert.equal(response.status, 403);
+    assert.equal(response.headers.get("cache-control"), "no-store");
+  }
 });
 
 async function instanceOptionUiFixture(settings, extraSettings, backend = "codex", capabilityError = "") {

@@ -13,7 +13,7 @@ import {
 import { randomId } from "../../core/util.js";
 import { api } from "../api.js";
 import { openAppearance } from "../appearance/dialog.js";
-import { disposeMainNavigation } from "../main-navigation.js";
+import { disposeMainNavigation, isElvesClient } from "../main-navigation.js";
 import { setApprovalSignature } from "../approval-state.js";
 import { resetNewChatBranch, setCreationProject } from "../composer/creation-state.js";
 import { clearPrivateInputs } from "../composer/draft-restore.js";
@@ -39,10 +39,11 @@ import { setEditingMessage } from "../messages/message-edit.js";
 import { setPendingNotificationOpen } from "../notifications.js";
 import { setEditingQueuedMessage } from "../queue/state.js";
 import {
-  connectionErrorMessage, initialAuthenticationRequired, loginPageCleanup, remoteLoginClientId,
+  cancelConnectionProbe, connecting, connectionErrorMessage, initialAuthenticationRequired, loginPageCleanup, remoteLoginClientId,
   setAuthenticationRequired, setLoginPageCleanup
 } from "./connection-state.js";
-import { connect, disconnect } from "./lifecycle.js";
+import { connect, disconnect, rememberPageInputs } from "./lifecycle.js";
+import { openPendingNativeProject } from "./native-projects.js";
 import { resetRelatedSessions } from "./related.js";
 import {
   announceAppReady, composerScroll, sessionTools, setCloseMobileSidebar, setComposerScroll,
@@ -55,6 +56,7 @@ import {
 } from "../sidebar/list-state.js";
 
 export function showLogin() {
+  if (isElvesClient()) { void recoverNativeAuthentication(); return; }
   disposeMainNavigation();
   loginPageCleanup?.();
   resetNewChatBranch();
@@ -309,7 +311,47 @@ export function showLogin() {
   if (matchMedia("(min-width: 761px) and (hover: hover) and (pointer: fine)").matches) key.focus({ preventScroll: true });
   announceAppReady();
 }
+let nativeAuthenticationRecovery = null;
+function showNativeConnectionRecovery(error = null, working = false) {
+  disposeMainNavigation();
+  loginPageCleanup?.();
+  closePopup();
+  const page = element("div", "pair-page"), panel = element("main", "pair-panel");
+  const brand = element("div", "pair-brand");
+  brand.append(productLogo(), element("h1", "", "Elves"));
+  const message = element("p", `pair-status ${error ? "error-text" : "muted"}`,
+    error?.message || "正在恢复本机会话…");
+  message.setAttribute("role", error ? "alert" : "status");
+  const retry = button("重试本机连接", "重试本机连接", () => void recoverNativeAuthentication(), "primary pair-submit");
+  retry.hidden = working;
+  panel.append(brand, message, retry, element("p", "muted", "Elves 独立客户端无需输入访问密钥。"));
+  page.append(panel);
+  app.replaceChildren(page);
+  announceAppReady();
+}
+function recoverNativeAuthentication() {
+  if (nativeAuthenticationRecovery) return nativeAuthenticationRecovery;
+  // 本机 401 只恢复本机 Cookie；保留草稿及未知回执，不清理私有输入、不进入远程登录，也不重发操作。
+  rememberPageInputs();
+  const previousConnection = connecting;
+  disconnect();
+  setAuthenticationRequired(false);
+  showNativeConnectionRecovery(null, true);
+  nativeAuthenticationRecovery = (async () => {
+    const bridge = globalThis.__ELVES_CLIENT__;
+    if (typeof bridge?.recoverAuthentication !== "function")
+      throw new Error("当前客户端尚不支持本机授权恢复，请重新启动或更新 Elves。");
+    await bridge.recoverAuthentication();
+    await previousConnection?.catch(() => {});
+    cancelConnectionProbe();
+    await connect();
+    await openPendingNativeProject();
+  })().catch(error => showNativeConnectionRecovery(error))
+    .finally(() => { nativeAuthenticationRecovery = null; });
+  return nativeAuthenticationRecovery;
+}
 export function requireAuthentication() {
+  if (isElvesClient()) { void recoverNativeAuthentication(); return; }
   clearRemoteChannels();
   disconnect();
   setPendingNotificationOpen(null);
@@ -320,6 +362,7 @@ export function requireAuthentication() {
   showLogin();
 }
 export function showConnectionRecovery(error) {
+  if (isElvesClient()) { showNativeConnectionRecovery(error); return; }
   showLogin();
   loginPageCleanup?.();
   const page = element("div", "pair-page");

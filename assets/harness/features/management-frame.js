@@ -3,6 +3,7 @@ import { element } from "../ui/dom.js";
 import { requireAuthentication } from "../core/actions.js";
 import { session } from "../core/state.js";
 import { deleteSidebarThread } from "./sidebar/thread-deletion.js";
+import { canManageHarness } from "./main-navigation.js";
 
 export function createManagementPages() {
   const deviceId = session?.device.id;
@@ -22,7 +23,7 @@ export function createManagementPages() {
   };
   const receive = async event => {
     if (event.origin !== location.origin || event.source !== frame?.contentWindow
-      || !frame?.isConnected || session?.device.id !== deviceId) return;
+      || !frame?.isConnected || session?.device.id !== deviceId || !canManageHarness()) return;
     const value = event.data;
     if (value?.type === "management-ready") {
       loading?.remove(); loading = null;
@@ -50,9 +51,9 @@ export function createManagementPages() {
   themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["class", "style", "data-theme"] });
   const open = (page, host) => {
     current = page;
-    if (session?.capabilities?.management !== true) {
+    if (!canManageHarness()) {
       host.replaceChildren(element("p", "management-unavailable",
-        "当前远程服务尚未提供统一管理功能，请更新运行后台后重新连接。"));
+        "管理功能仅可在 Elves 独立客户端使用。"));
       return;
     }
     if (!frame) {

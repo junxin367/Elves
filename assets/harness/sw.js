@@ -118,6 +118,7 @@ async function manifestVersion(files) {
 function validateResourcePath(path) {
   if (path === "/") return true;
   if (!resourcePathPattern.test(path) || path.includes("\\") || path === "/api" || path.startsWith("/api/")
+      || path === "/management" || path.startsWith("/management/")
       || path === manifestPath || recoveryPaths.has(path))
     return false;
   const url = new URL(path, self.location.origin);
@@ -716,6 +717,13 @@ self.addEventListener("fetch", event => {
   const { request } = event;
   const url = new URL(request.url);
   if (url.origin !== self.location.origin) return;
+  // PWA 不开放管理页；即使旧版本缓存包含这些页面，也不能从缓存恢复管理入口。
+  if (url.pathname === "/management" || url.pathname.startsWith("/management/")) {
+    event.respondWith(Promise.resolve(new Response("管理功能仅可在 Elves 独立客户端使用", {
+      status: 403, headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" }
+    })));
+    return;
+  }
   if (url.pathname === "/api" || url.pathname.startsWith("/api/")) {
     // API 本身不能区分周期轮询和主动恢复。这里只延后新任务，
     // 正在下载的任务是否抢占由页面携带的 busy/preempt 生命周期决定。
