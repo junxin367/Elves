@@ -853,6 +853,55 @@ async fn save_native(
     permissions::save_settings_file(target, &output, &native_changes, revision, authorization).await
 }
 
+async fn settings_capabilities(
+    state: &WebState,
+    target: &ConfigFile,
+    instance: &str,
+    section: &str,
+) -> (Value, Value, String) {
+    let mut capabilities = json!({});
+    let mut native_features = json!({});
+    let mut capability_error = String::new();
+    if matches!(section, "general" | "models")
+        && let Some(config) = &target.claude_config
+    {
+        // CLI 能力读取失败时仍保留已接入的回顾配置；未确认的新选项禁用，并把失败原因返回页面。
+        let help = match claude_help(config).await {
+            Ok(help) => help,
+            Err(error) => {
+                capability_error = error.message;
+                String::new()
+            }
+        };
+        capabilities = json!({
+            "promptSuggestions":help.contains("--prompt-suggestions"),
+            "autoCompactWindow":help.contains("--autocompact"),
+            "defaultReasoningEffort":help.contains("--effort <")
+        });
+        if section == "general" && help.contains("--settings") && help.contains("doctor") {
+            match claude_option_capabilities(config).await {
+                Ok(value) => capabilities["extraSettings"] = value,
+                Err(error) => {
+                    if !capability_error.is_empty() {
+                        capability_error.push(' ');
+                    }
+                    capability_error.push_str(&error.message);
+                }
+            }
+        }
+    }
+    if target.backend == "codex"
+        && instance == "codex:local"
+        && ["general", "models"].contains(&section)
+    {
+        match state.controller.harness.settings_features().await {
+            Ok(value) => native_features = value,
+            Err(_) => capability_error = "所选 Codex 原生引擎未成功返回特性目录，实验能力暂不可修改，原生诊断项保持只读，请重新读取。".into(),
+        }
+    }
+    (capabilities, native_features, capability_error)
+}
+
 pub(super) async fn settings(
     State(state): State<WebState>,
     headers: HeaderMap,
@@ -896,51 +945,22 @@ pub(super) async fn settings(
             "该 Codex 实例的独立执行适配器尚未接入，未改投本机实例",
         ));
     }
-    let mut capabilities = json!({});
-    let mut native_features = json!({});
-    let mut capability_error = String::new();
-    if matches!(section, "general" | "models")
-        && let Some(config) = &target.claude_config
-    {
-        // CLI 能力读取失败时仍保留已接入的回顾配置；未确认的新选项禁用，并把失败原因返回页面。
-        let help = match claude_help(config).await {
-            Ok(help) => help,
-            Err(error) => {
-                capability_error = error.message;
-                String::new()
-            }
-        };
-        capabilities = json!({
-            "promptSuggestions":help.contains("--prompt-suggestions"),
-            "autoCompactWindow":help.contains("--autocompact"),
-            "defaultReasoningEffort":help.contains("--effort <")
-        });
-        if section == "general" && help.contains("--settings") && help.contains("doctor") {
-            match claude_option_capabilities(config).await {
-                Ok(value) => capabilities["extraSettings"] = value,
-                Err(error) => {
-                    if !capability_error.is_empty() {
-                        capability_error.push(' ');
-                    }
-                    capability_error.push_str(&error.message);
-                }
-            }
-        }
-    }
-    if target.backend == "codex"
-        && instance == "codex:local"
-        && ["general", "models"].contains(&section)
-    {
-        match state.controller.harness.settings_features().await {
-            Ok(value) => native_features = value,
-            Err(_) => capability_error = "所选 Codex 原生引擎未成功返回特性目录，实验能力暂不可修改，原生诊断项保持只读，请重新读取。".into(),
-        }
-    }
     // 模型默认值并入会话实例，读取和保存共用当前实例及同一原生配置版本；models 仅保留兼容入口。
     let model_settings = matches!(section, "general" | "models") && !adapter_read_only;
-    let mut catalog = if model_settings {
-        match model_catalog(&state, instance, &authorization,
-            !(write && payload["settings"].get("hiddenModelIds").is_some())).await {
+    // 用户要求设置操作减少等待：能力与目录独立并行准备，普通读取/非模型保存复用原生目录缓存。
+    // 只有用户明确重新读取时强制查目录；模型默认值写入后仍在下方重新取得已生效目录。
+    let ((capabilities, native_features, mut capability_error), catalog_result) = tokio::join!(
+        settings_capabilities(&state, &target, instance, section),
+        async {
+            if model_settings {
+                Some(model_catalog(&state, instance, &authorization, payload["forceReload"] == true).await)
+            } else {
+                None
+            }
+        }
+    );
+    let mut catalog = match catalog_result {
+        Some(result) => match result {
             Ok(value) => Some(value),
             Err(failure) if section == "general" => {
                 // 合并后模型目录读取失败不能阻断已支持的其他设置；写模型前仍须确认同一实例的目录。
@@ -951,9 +971,8 @@ pub(super) async fn settings(
                 None
             }
             Err(failure) => return Err(failure),
-        }
-    } else {
-        None
+        },
+        None => None,
     };
     let _serial = permissions::CONFIG_WRITE
         .get_or_init(|| Mutex::new(()))
@@ -1084,7 +1103,7 @@ pub(super) async fn settings(
             state
                 .controller
                 .shared_settings
-                .instance_changed(&state.controller, instance);
+                .instance_settings_changed(&state.controller, instance, &payload["settings"]);
         } else {
             if changes.contains_key("promptSuggestionEnabled")
                 && capabilities["promptSuggestions"] != true
@@ -1114,7 +1133,7 @@ pub(super) async fn settings(
             state
                 .controller
                 .shared_settings
-                .instance_changed(&state.controller, instance);
+                .instance_settings_changed(&state.controller, instance, &payload["settings"]);
         }
         updated = true;
     }
@@ -1197,8 +1216,10 @@ pub(super) async fn settings(
         .check()
         .await
         .map_err(super::authorization_error)?;
+    let (settings_epoch, instance_revision) = state.controller.shared_settings.instance_version();
     let mut response = json!({
         "ok":true,"instanceId":instance,"backend":target.backend,
+        "settingsEpoch":settings_epoch,"instanceRevision":instance_revision,
         "path":target.display,"revision":revision,"preferenceRevision":preference_revision,
         "settings":values,"capabilities":capabilities,"capabilityError":capability_error,
         "extraSettings":extra_settings,

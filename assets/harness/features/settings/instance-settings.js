@@ -7,11 +7,14 @@ import { readCache } from "../../core/stores.js";
 import { loadModels, refreshSkillCatalog, updateComposer } from "../../core/actions.js";
 import { api } from "../api.js";
 import { privateInputScope } from "../session/capabilities.js";
-import { activeInstanceId, availableSessionInstances, sessionInstanceEnabled } from "../session/instances.js";
+import { activeInstanceId, availableSessionInstances, sessionInstanceEnabled, sessionInstances } from "../session/instances.js";
 import { loadSessionInstances, setInstanceDisplay } from "../session/instance-catalog.js";
 import { invalidateModelSettings, selectedEffort, setSelectedEffort } from "../composer/options-state.js";
 import { effortLabels } from "../composer/prompt-editor.js";
 import { sharedSettingsWritable, subscribeSharedSettings } from "./shared-state.js";
+import {
+  cachedInstanceSettings, instanceSettingsIdentity, invalidateInstanceSettings, readInstanceSettings, storeInstanceSettings
+} from "./instance-settings-cache.js";
 import { notice } from "../../ui/notice.js";
 
 const sections = {
@@ -91,15 +94,17 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
   setSelectedInstance = () => {} }) {
   const scope = privateInputScope(session);
   let disposed = false, selected = "", record = null, detecting = false, loading = false, saving = false, needsRead = false;
-  let pendingModelFocus = null;
-  let generation = 0, readController = null, message = "", externalRefresh = false;
+  let pendingModelFocus = null, recordIdentity = "";
+  let generation = 0, message = "", externalRefresh = false;
   const alive = () => !disposed && page.isConnected && scope === privateInputScope(session);
+  // 过期缓存后台核对时可继续编辑；已知跨端变化或服务、CLI 身份变化后，旧记录只供查看。
   const writable = () => alive() && connected && session && !session.readOnly && !record?.readOnly
-    && !detecting && !loading && !saving && !needsRead && !!record
+    && !detecting && !saving && !needsRead && !!record
+    && recordIdentity === instanceSettingsIdentity(selected, name) && !cachedInstanceSettings(selected, name)?.blocked
     && !!currentInstance() && !currentInstance().error && record.backend === currentInstance().backend;
   const currentInstance = () => availableSessionInstances().find(instance => instance.id === selected);
   function retireRead() {
-    generation++; readController?.abort(); readController = null; loading = false;
+    generation++; loading = false;
     return generation;
   }
   const head = element("div", "appearance-card instance-settings-target");
@@ -119,7 +124,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
   const content = element("div", "instance-settings-content");
   const status = element("p", "appearance-hint instance-settings-status");
   status.setAttribute("role", "status"); status.setAttribute("aria-live", "polite");
-  const reload = button("重新读取", "重新读取当前实例设置", () => void read(), "text-button");
+  const reload = button("重新读取", "重新读取当前实例设置", () => void refresh(true), "text-button");
   const actions = element("div", "appearance-action-buttons instance-settings-actions");
   actions.append(reload);
   page.append(head, detect, content, status, actions);
@@ -134,8 +139,10 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     // 显示开关来自服务端共享偏好，不等待原生配置读取；实例检测或保存期间仍锁定目标。
     display.disabled = !alive() || detecting || saving || !currentInstance()
       || !connected || !sharedSettingsWritable(session);
-    status.textContent = detecting ? "正在检测会话实例…" : loading ? "正在读取实例设置…" : saving ? "正在保存…" : message;
-    for (const control of controls) control.disabled = !writable() || control.settingsUnsupported === true;
+    // 用户要求已有配置在后台核对时继续显示，不再反复进入整页读取状态；首次无缓存时才显示读取提示。
+    status.textContent = detecting ? "正在检测会话实例…" : loading && !record ? "正在读取实例设置…" : saving ? "正在保存…" : message;
+    const canWrite = writable();
+    for (const control of controls) control.disabled = !canWrite || control.settingsUnsupported === true;
   }
   function addSwitch(card, key, label, description, value, unsupported = false) {
     const row = element("label", "appearance-field");
@@ -503,39 +510,67 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     return result;
   }
   async function read() {
+    return refresh();
+  }
+  async function refresh(force = false) {
     if (!alive() || saving || detecting) return;
-    const id = selected, version = retireRead();
-    record = null; needsRead = false;
+    const id = selected, version = retireRead(), previous = record;
+    needsRead = false;
     if (!id || !currentInstance() || currentInstance().error) {
+      record = null;
       message = "所选实例暂不可用，请重新检测或明确选择其他实例。"; render(); return;
     }
     if (!session || !connected) {
+      record = null;
       message = "连接远程服务后可读取实例设置。"; render(); return;
     }
-    readController = new AbortController();
-    loading = true; record = null; message = ""; needsRead = false; render();
+    const cached = cachedInstanceSettings(id, name);
+    try { record = cached ? checkedResult(cached.value, id) : null; }
+    catch { invalidateInstanceSettings(id); record = null; }
+    recordIdentity = instanceSettingsIdentity(id, name);
+    needsRead = force || cached?.blocked === true;
+    if (!force && cached?.fresh && record) {
+      if (record !== previous) render(); else sync();
+      return;
+    }
+    // 缓存显示与请求生命周期分开；切页或关窗只撤销页面接收，其他入口可继续复用同一在途读取。
+    loading = true; message = "";
+    if (record !== previous) render(); else sync();
+    let changed = false;
     try {
-      const result = await api("/api/settings/instance", { instanceId: id, section: name }, undefined, readController.signal);
+      const result = await readInstanceSettings(id, name, { force, background: !!record
+        || page.closest?.(".appearance-settings-page")?.hidden === true });
       if (!alive() || selected !== id || generation !== version) return;
+      changed = record !== result;
       record = checkedResult(result, id);
+      recordIdentity = instanceSettingsIdentity(id, name);
+      needsRead = false;
     } catch (error) {
-      if (alive() && selected === id && generation === version) message = error.message;
+      if (alive() && selected === id && generation === version && error.name !== "AbortError") {
+        needsRead = true;
+        message = record ? `后台核对失败，保留上次设置；重新读取后可继续修改。${error.message}` : error.message;
+      }
     } finally {
       if (alive() && selected === id && generation === version) {
-        loading = false; render();
+        loading = false;
+        if (changed) render(); else sync();
         if (externalRefresh) { externalRefresh = false; void read(); }
       }
     }
   }
   async function save(settings, expected = record) {
     if (!writable()) { render(); return; }
-    const id = selected, before = record;
+    const id = selected, before = record, identity = instanceSettingsIdentity(selected, name);
+    // 保存先撤销同一实例旧读取；旧快照不能在成功回执之后回填，也不能带着旧版本继续写入其他分类。
+    retireRead(); invalidateInstanceSettings(id);
     saving = true; message = ""; render();
     try {
       const result = await api("/api/settings/instance", { instanceId: id, section: name,
         operation: "save", settings, expectedRevision: expected.revision,
         expectedPreferenceRevision: expected.preferenceRevision });
       if (scope !== privateInputScope(session) || selected !== id) return;
+      if (identity !== instanceSettingsIdentity(id, name))
+        throw new Error("实例或服务已变化，请重新读取核对保存结果。");
       record = checkedResult(result, id);
       for (const [key, value] of Object.entries(settings)) {
         const actual = key === "enabled" ? record.inventory?.enabled
@@ -546,6 +581,10 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
           throw new Error("保存结果与所选设置不一致，请重新读取核对。");
         const draftKey = JSON.stringify([id, key]), draft = textDrafts.get(draftKey);
         if (value === null || draft?.value === value) textDrafts.delete(draftKey);
+      }
+      record = storeInstanceSettings(id, name, record);
+      if (cachedInstanceSettings(id, name)?.blocked) {
+        needsRead = true; externalRefresh = true;
       }
       if (name === "models" || name === "general"
           && ["model", "reasoningEffort", "ultraReasoningEnabled", "defaultServiceTier", "hiddenModelIds"]
@@ -585,12 +624,16 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     if (!alive() || saving) return;
     // 重新检测开始即撤销旧读取和写入口；迟到的旧回包不能盖掉“实例不可用”，也不能恢复旧控件。
     const version = retireRead();
-    detecting = true; message = ""; sync();
+    // 已检测的目录可直接准备目标；重新检测才等待环境扫描，避免每次切回设置都重复启动检测。
+    detecting = force || !sessionInstances.length; message = ""; sync();
     if (!session || !connected) {
       detecting = false; record = null; message = "连接远程服务后可读取实例设置。"; render(); return;
     }
     try {
-      await loadSessionInstances(force);
+      if (detecting) {
+        if (force) invalidateInstanceSettings(selected || getSelectedInstance() || activeInstanceId());
+        await loadSessionInstances(force);
+      }
       if (!alive() || generation !== version) return;
       const choices = availableSessionInstances().map(instance =>
         ({ value: instance.id, label: instance.label, icon: instance.backend, disabled: !!instance.error }));
@@ -610,7 +653,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
       selected = preferred || choices.find(option => !option.disabled)?.value || "";
       setSelectedInstance(selected);
       setSelectOptions(instances, choices, selected);
-      if (selected) await read();
+      if (selected) await refresh(force);
       else { record = null; message = "尚未检测到可配置的会话实例。"; render(); }
     } catch (error) {
       if (alive() && generation === version) { record = null; message = error.message; render(); }

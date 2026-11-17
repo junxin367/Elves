@@ -83,18 +83,24 @@ function applySnapshot(snapshot, scope, detail = {}, expectedEpoch = state.epoch
   }
   if (nativeChanged) {
     const id = changedInstance;
+    // 用户要求普通设置操作不重复启动目录探测；只在连续事件明确声明未影响目录时跳过，漏事件仍完整刷新。
+    const modelsChanged = !id || detail.modelCatalogChanged !== false;
+    const skillsChanged = !id || detail.skillCatalogChanged !== false;
     const instances = id ? [id] : availableSessionInstances().map(instance => instance.id);
     for (const target of instances) {
       instancePermissionCatalogs.delete(target);
-      void readCache.remove(scope, "models", target === "codex:local" ? "global" : target).catch(() => {});
+      if (modelsChanged)
+        void readCache.remove(scope, "models", target === "codex:local" ? "global" : target).catch(() => {});
     }
     if (!id || id === activeInstanceId()) {
-      invalidateModelSettings();
-      if ($("#composer")) {
-        updateComposer();
-        void loadModels(true).catch(() => {});
-        void refreshSkillCatalog().catch(() => {});
+      if (modelsChanged) {
+        invalidateModelSettings();
+        if ($("#composer")) {
+          updateComposer();
+          void loadModels(true).catch(() => {});
+        }
       }
+      if (skillsChanged && $("#composer")) void refreshSkillCatalog().catch(() => {});
     }
   }
   if (changed && $("#composer") && oldChoice !== JSON.stringify(state.settings.newChat[activeInstanceId()])) {

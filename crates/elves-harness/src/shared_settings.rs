@@ -267,11 +267,45 @@ impl SharedSettings {
         self.view(&self.read()?.0)
     }
 
+    pub fn instance_version(&self) -> (&str, u64) {
+        // 用户要求保存后不重复加载；回执携带同一服务的原生设置版本，用于识别随后到达的同版本通知。
+        (&self.epoch, self.instance_revision.load(Ordering::Acquire))
+    }
+
     pub fn instance_changed(&self, controller: &HarnessController, instance: &str) {
+        self.publish_instance_change(controller, instance, None);
+    }
+
+    pub fn instance_settings_changed(
+        &self,
+        controller: &HarnessController,
+        instance: &str,
+        changes: &Value,
+    ) {
+        // 用户要求常规设置不重复探测模型与 Skills；只传目录影响标记，不在事件中传播原生配置值。
+        // 新增会影响目录的设置时须同步此列表；其他原生更新入口继续用 instance_changed 完整撤销缓存。
+        let changed = |keys: &[&str]| keys.iter().any(|key| changes.get(*key).is_some());
+        let models = changed(&["model", "reasoningEffort", "effortLevel", "ultraReasoningEnabled",
+            "defaultServiceTier", "hiddenModelIds"]);
+        let skills = changed(&["skill", "syncClaudeAiSkills", "syncClaudeAiPlugins", "disableBundledSkills"]);
+        self.publish_instance_change(controller, instance, Some((models, skills)));
+    }
+
+    fn publish_instance_change(
+        &self,
+        controller: &HarnessController,
+        instance: &str,
+        catalogs: Option<(bool, bool)>,
+    ) {
         let revision = self.instance_revision.fetch_add(1, Ordering::AcqRel) + 1;
-        controller.publish_event(json!({"method":"remote/settingsChanged","params":{
+        let mut params = json!({
             "kind":"instance","instanceId":instance,"epoch":self.epoch,"instanceRevision":revision
-        }}));
+        });
+        if let Some((models, skills)) = catalogs {
+            params["modelCatalogChanged"] = json!(models);
+            params["skillCatalogChanged"] = json!(skills);
+        }
+        controller.publish_event(json!({"method":"remote/settingsChanged","params":params}));
     }
 
     async fn update(

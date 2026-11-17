@@ -1125,6 +1125,8 @@ export function openAppearance() {
   });
   document.body.classList.add("modal-open");
   dialog.showModal();
+  // 用户要求可行时提前准备实例设置；只预读本次当前实例，点击实例页时复用缓存或同一请求，不扫描其他 CLI。
+  if (session && connected) void instancePages.get("types").show();
   syncSettingsOffset();
   if (matchMedia("(min-width: 761px)").matches) dialog.classList.add("appearance-screen-visible");
   else requestAnimationFrame(() => {

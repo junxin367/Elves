@@ -331,7 +331,7 @@ pub(super) async fn save_settings_file(
         authorization
             .controller
             .shared_settings
-            .instance_changed(&authorization.controller, &target.instance_id);
+            .instance_settings_changed(&authorization.controller, &target.instance_id, changes);
         return Ok(());
     };
     // 用户要求保存原生配置时保留 Linux 权限；不能用 Windows Permissions 经 UNC 重建文件。
@@ -411,7 +411,7 @@ pub(super) async fn save_settings_file(
     authorization
         .controller
         .shared_settings
-        .instance_changed(&authorization.controller, &target.instance_id);
+        .instance_settings_changed(&authorization.controller, &target.instance_id, changes);
     Ok(())
 }
 
