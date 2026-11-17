@@ -3,6 +3,7 @@ import { button, element } from "../ui/dom.js";
 import { icon } from "../ui/icons.js";
 import { closePopup, openPopup, togglePopup } from "../ui/popup.js";
 import { session } from "../core/state.js";
+import { isAndroidContainer } from "../platform.js";
 
 export const mainNavigationItems = Object.freeze([
   { id: "conversation", label: "会话", icon: "chat" },
@@ -36,6 +37,10 @@ export function mountMainNavigation({ workspace, openSettings, logout, openPage 
   navigation.setAttribute("aria-label", "主导航");
   const pages = element("div", "main-navigation-pages");
   const settingsArea = element("div", "main-navigation-settings");
+  const sidebar = workspace.querySelector("#session-sidebar");
+  const footer = element("div", "sidebar-footer mobile-sidebar-footer");
+  const footerActions = element("div", "footer-actions");
+  let mobileNavigation = false;
   const management = element("main", "management-workspace");
   management.id = "management-workspace";
   management.hidden = true;
@@ -85,8 +90,8 @@ export function mountMainNavigation({ workspace, openSettings, logout, openPage 
     pages.append(control);
   }
   const settings = button("", "设置", () => {
-    // Windows 独立客户端直接进入设置；网页、PWA 与 Android 只提供设置和原有退出操作。
-    if (isElvesClient()) openSettings();
+    // 用户要求手机恢复旧版底部两个独立按钮；PC 网页保留菜单，Windows 仍直接打开设置。
+    if (isElvesClient() || mobileNavigation) openSettings();
     else togglePopup(settings);
   }, "main-navigation-button");
   settings.id = "appearance-button";
@@ -101,16 +106,49 @@ export function mountMainNavigation({ workspace, openSettings, logout, openPage 
       { label: "退出", icon: "logout", action: logout }
     ];
     settings.onkeydown = event => {
-      if (!["ArrowDown", "ArrowUp"].includes(event.key)) return;
+      if (mobileNavigation || !["ArrowDown", "ArrowUp"].includes(event.key)) return;
       event.preventDefault();
       openPopup(settings, { edge: event.key === "ArrowUp" ? "last" : "first" });
     };
   }
+  const logoutButton = button("", "退出", logout, "footer-button");
+  logoutButton.id = "logout";
+  logoutButton.append(icon("logout"), element("span", "", "退出"));
+  footerActions.append(logoutButton);
+  footer.append(footerActions);
+  footer.hidden = true;
+  if (!isElvesClient()) sidebar?.append(footer);
+  // 用户要求手机网页与 Android 无主导航：760px 沿用会话抽屉断点；粗指针无悬停及 Android 容器兼顾横屏。
+  // 只移动同一个设置按钮，保留 appearance-button 的退出锁定与设置入口，不创建重复 ID。
+  const mobileMedia = matchMedia("(max-width: 760px), (hover: none) and (pointer: coarse)");
+  const syncMobileNavigation = () => {
+    const mobile = !isElvesClient() && !!sidebar && (mobileMedia.matches || isAndroidContainer());
+    if (mobile !== mobileNavigation) closePopup();
+    mobileNavigation = mobile;
+    shell.dataset.mobileNavigation = String(mobile);
+    footer.hidden = !mobile;
+    settings.className = mobile ? "footer-button" : "main-navigation-button";
+    settings.replaceChildren(icon("settings"), ...(mobile ? [element("span", "", "设置")] : []));
+    if (mobile || isElvesClient()) {
+      settings.removeAttribute("aria-haspopup");
+      settings.removeAttribute("aria-expanded");
+    } else {
+      settings.setAttribute("aria-haspopup", "menu");
+      settings.setAttribute("aria-expanded", "false");
+    }
+    if (mobile) footerActions.prepend(settings);
+    else settingsArea.append(settings);
+  };
+  mobileMedia.addEventListener("change", syncMobileNavigation);
+  syncMobileNavigation();
   chooseNavigation = choose;
-  settingsArea.append(settings);
   navigation.append(pages, settingsArea);
   workspace.before(shell);
   shell.append(navigation, workspace, management);
-  disposeNavigation = () => openPage.dispose?.();
+  disposeNavigation = () => {
+    mobileMedia.removeEventListener("change", syncMobileNavigation);
+    footer.remove();
+    openPage.dispose?.();
+  };
   return { choose, shell, management };
 }

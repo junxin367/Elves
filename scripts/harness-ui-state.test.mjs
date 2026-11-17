@@ -13,7 +13,8 @@ import { captureTransferInputs, hasTransferFiles, readTransferInputs } from "../
 import { marked, Renderer } from "../assets/harness/vendor/marked.esm.js";
 import { defaultSharedSettings } from "../assets/harness/features/settings/shared-state.js";
 
-async function navigationFixture(native = false, transport = native ? "desktop" : "remote") {
+async function navigationFixture(native = false, transport = native ? "desktop" : "remote",
+  { mobile = false, android = false } = {}) {
   const source = await loadHarnessAppSource();
   const node = (tag, className = "") => ({
     tag, className, children: [], attributes: {}, dataset: {}, hidden: false, isConnected: true,
@@ -24,12 +25,33 @@ async function navigationFixture(native = false, transport = native ? "desktop" 
     },
     setAttribute(name, value) { this.attributes[name] = value; },
     removeAttribute(name) { delete this.attributes[name]; },
-    append(...children) { this.children.push(...children); },
+    append(...children) {
+      for (const child of children) {
+        child.remove?.();
+        child.parentNode = this;
+        this.children.push(child);
+      }
+    },
+    prepend(child) { child.remove?.(); child.parentNode = this; this.children.unshift(child); },
+    replaceChildren(...children) { for (const child of [...this.children]) child.remove?.(); this.append(...children); },
+    remove() {
+      if (this.parentNode) this.parentNode.children = this.parentNode.children.filter(child => child !== this);
+      this.parentNode = null;
+    },
     before(value) { this.insertedBefore = value; },
   });
   const messages = { scrollTop: 320, isConnected: true };
   const workspace = node("div", "workspace");
-  workspace.querySelector = selector => selector === "#messages" ? messages : null;
+  const sidebar = node("aside", "sidebar"), sidebarContent = node("div", "sidebar-content");
+  sidebar.append(sidebarContent);
+  workspace.querySelector = selector => selector === "#messages" ? messages
+    : selector === "#session-sidebar" ? sidebar : null;
+  const listeners = new Set(), media = {
+    matches: mobile,
+    addEventListener(type, callback) { assert.equal(type, "change"); listeners.add(callback); },
+    removeEventListener(type, callback) { assert.equal(type, "change"); listeners.delete(callback); },
+    change(value) { this.matches = value; for (const callback of listeners) callback(); },
+  };
   workspace.draft = "保留当前输入";
   const opened = [], visibility = [], animation = [], callbacks = { settings: 0, logout: 0, disposed: 0 };
   const openPage = page => opened.push(page);
@@ -42,14 +64,18 @@ async function navigationFixture(native = false, transport = native ? "desktop" 
     closePopup() {}, togglePopup: control => { context.popup = control; }, openPopup() {},
     requestAnimationFrame: callback => animation.push(callback),
     openSettings: () => callbacks.settings++, logout: () => callbacks.logout++,
+    matchMedia: () => media, isAndroidContainer: () => android,
     ...(native ? { __ELVES_CLIENT__: { open() {} } } : {}),
   };
   rawVm.createContext(context);
   rawVm.runInContext(source.moduleText("features/main-navigation.js")
     + "\nglobalThis.navigation = mountMainNavigation({ workspace, openPage, openSettings, logout });", context);
   const [navigation] = context.navigation.shell.children;
-  return { context, workspace, messages, callbacks, opened, visibility, animation,
-    buttons: navigation.children[0].children, settings: navigation.children[1].children[0] };
+  const footer = sidebar.children.find(child => child.className.includes("mobile-sidebar-footer"));
+  return { context, workspace, messages, callbacks, opened, visibility, animation, sidebar, sidebarContent, footer, media, listeners,
+    navigation, settingsArea: navigation.children[1], buttons: navigation.children[0].children,
+    settings: navigation.children[1].children[0] || footer.children[0].children[0],
+    logout: footer?.children[0].children.find(child => child.id === "logout") };
 }
 
 test("统一主导航固定排序，切换后保留当前会话草稿、节点与阅读位置", async () => {
@@ -97,6 +123,57 @@ test("导航底部设置按客户端区分：Windows 直接打开，网页仅有
   assert.equal(native.callbacks.settings, 1);
   assert.equal(native.settings.menuOptions, undefined);
   assert.equal(native.context.popup, undefined);
+});
+
+test("手机网页与 Android 恢复列表底部独立设置和退出按钮，设置不再弹菜单", async () => {
+  for (const options of [{ mobile: true }, { mobile: true, android: true }, { android: true }]) {
+    const fixture = await navigationFixture(false, "remote", options);
+    assert.equal(fixture.context.navigation.shell.dataset.mobileNavigation, "true");
+    assert.equal(fixture.footer.hidden, false);
+    assert.equal(fixture.sidebar.children.at(-1), fixture.footer);
+    assert.equal(fixture.sidebarContent.children.length, 0, "底部按钮不属于列表滚动内容");
+    assert.equal(fixture.settingsArea.children.length, 0);
+    assert.deepEqual(fixture.footer.children[0].children.map(child => child.id), ["appearance-button", "logout"]);
+    assert.equal(fixture.settings.className, "footer-button");
+    assert.equal(fixture.settings.attributes["aria-haspopup"], undefined);
+    fixture.settings.action();
+    assert.equal(fixture.callbacks.settings, 1);
+    assert.equal(fixture.context.popup, undefined);
+    fixture.logout.action();
+    assert.equal(fixture.callbacks.logout, 1, "退出沿用传入的原有确认回调");
+  }
+});
+
+test("手机与 PC 网页切换复用设置按钮并清理监听，不改变会话、草稿和阅读位置", async () => {
+  const fixture = await navigationFixture(false, "remote", { mobile: true });
+  const settings = fixture.settings;
+  fixture.media.change(false);
+  assert.equal(fixture.context.navigation.shell.dataset.mobileNavigation, "false");
+  assert.equal(fixture.footer.hidden, true);
+  assert.equal(fixture.settingsArea.children[0], settings);
+  assert.equal(settings.className, "main-navigation-button");
+  settings.action();
+  assert.equal(fixture.context.popup, settings);
+  fixture.media.change(true);
+  assert.equal(fixture.footer.children[0].children[0], settings);
+  assert.equal(fixture.settingsArea.children.length, 0);
+  assert.equal(fixture.workspace.draft, "保留当前输入");
+  assert.equal(fixture.messages.scrollTop, 320);
+  assert.deepEqual(fixture.opened, []);
+  rawVm.runInContext("disposeMainNavigation(); disposeMainNavigation();", fixture.context);
+  assert.equal(fixture.listeners.size, 0);
+  assert.equal(fixture.sidebar.children.includes(fixture.footer), false);
+  assert.equal(fixture.callbacks.disposed, 1);
+});
+
+test("Windows 窄窗口仍保留 PC 主导航与直接设置入口，不出现退出按钮", async () => {
+  const fixture = await navigationFixture(true, "desktop", { mobile: true });
+  assert.equal(fixture.context.navigation.shell.dataset.mobileNavigation, "false");
+  assert.equal(fixture.footer, undefined);
+  assert.equal(fixture.buttons.length, 4);
+  fixture.settings.action();
+  assert.equal(fixture.callbacks.settings, 1);
+  assert.equal(fixture.context.popup, undefined);
 });
 
 test("独立客户端忽略历史远程登录标记，网页和 Android 保留密码登录要求", async () => {

@@ -46,7 +46,7 @@ html.theme-transition{transition:--bg 300ms linear,--composer-bg 300ms linear,--
 :root{--control-icon-size:32px;--control-inline-size:28px;--control-toolbar-size:32px;--control-menu-height:36px;--prompt-editor-max-height:180px;--popup-max-height:80dvh}
 /* 用户要求输入框发送/停止共用按钮固定为 28px；桌面、手机共用此值，独立于工具栏的 32px/36px 尺寸。 */
 :root{--composer-send-size:28px}
-/* 用户要求统一主导航为 52px：36px 按钮加左右各 8px；四个入口固定排序，设置始终贴底。 */
+/* 用户要求 PC 主导航为 52px：36px 按钮加左右各 8px；手机网页与 Android 由 data-mobile-navigation 取消整列占位。 */
 .remote-shell{display:grid;grid-template-columns:52px minmax(0,1fr);height:100dvh;min-width:0;overflow:hidden}
 .remote-shell>.workspace{height:100%;min-width:0}
 .main-navigation{display:flex;flex-direction:column;align-items:center;justify-content:space-between;min-height:0;padding:12px 8px max(12px,env(safe-area-inset-bottom));background:var(--side);box-shadow:inset -1px 0 var(--line);z-index:21}
@@ -60,7 +60,11 @@ html.theme-transition{transition:--bg 300ms linear,--composer-bg 300ms linear,--
 .management-unavailable{padding:24px;color:var(--muted);line-height:1.7}
 .remote-shell:has(>.workspace.related-session-view){grid-template-columns:minmax(0,1fr)}
 .remote-shell:has(>.workspace.related-session-view)>.main-navigation{display:none}
-@media(max-width:760px){.remote-shell>.workspace>.sidebar{left:52px;width:min(80vw,calc(100vw - 52px))}.remote-shell>.workspace>.sidebar-backdrop{left:52px}.main-navigation{padding-top:max(12px,env(safe-area-inset-top))}}
+@media(max-width:760px){.remote-shell:not([data-mobile-navigation=true])>.workspace>.sidebar{left:52px;width:min(80vw,calc(100vw - 52px))}.remote-shell:not([data-mobile-navigation=true])>.workspace>.sidebar-backdrop{left:52px}.main-navigation{padding-top:max(12px,env(safe-area-inset-top))}}
+/* 用户要求手机不出现主导航：会话区用满宽度，抽屉和遮罩从屏幕左缘开始；窄 PC 客户端仍保留原生主导航。 */
+.remote-shell[data-mobile-navigation=true]{grid-template-columns:minmax(0,1fr)}
+.remote-shell[data-mobile-navigation=true]>.main-navigation{display:none}
+.remote-shell[data-mobile-navigation=true]>.workspace>.sidebar,.remote-shell[data-mobile-navigation=true]>.workspace>.sidebar-backdrop{left:0}
 .workspace.related-session-view{--sidebar-layout-width:0px;grid-template-columns:minmax(0,1fr)}
 .workspace.related-session-view>.sidebar,.workspace.related-session-view>.sidebar-backdrop{display:none!important}
 .workspace.related-session-view>.conversation{grid-column:1;min-width:0;width:100%;background:var(--bg);position:relative;z-index:calc(var(--layer-menu,200) + 1);animation:related-session-enter .17s ease-out}
@@ -503,6 +507,10 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .footer-actions{display:flex;align-items:center;justify-content:space-between;gap:8px}
 .footer-button{display:flex;align-items:center;gap:8px;min-height:36px;border:0;text-align:left;padding:8px}
 .footer-button:hover{color:var(--text)}
+/* 用户要求设置、退出固定在手机会话列表底部；滚动只发生在 sidebar-content，底部不收缩并保留系统安全区。 */
+.mobile-sidebar-footer{flex-shrink:0;margin-top:auto;padding-bottom:max(6px,env(safe-area-inset-bottom))}
+.mobile-sidebar-footer .footer-actions{width:100%}
+.mobile-sidebar-footer .footer-button{min-height:var(--control-menu-height)}
 #appearance-button{font-weight:500}
 .ui-popup{position:fixed;inset:auto;margin:0;display:flex;flex-direction:column;max-width:calc(100vw - 16px);max-height:var(--popup-max-height);min-width:0;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:var(--radius-popup);padding:4px;box-shadow:0 8px 28px #0002;z-index:var(--layer-menu);overflow:hidden;animation:popup-appear var(--duration-popup) ease-out}
 .ui-popup[popover]:not(:popover-open){display:none}
