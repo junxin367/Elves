@@ -1118,7 +1118,7 @@ impl Claude {
                 .map(|c| c.id.clone()),
         );
         for id in opened {
-            let _ = self.sync_discovered(&id).await;
+            let _ = self.sync_discovered(&id, None).await;
         }
         Ok(())
     }
@@ -1265,7 +1265,11 @@ impl Claude {
         Ok(())
     }
 
-    async fn sync_discovered(self: &Arc<Self>, id: &str) -> anyhow::Result<()> {
+    async fn sync_discovered(
+        self: &Arc<Self>,
+        id: &str,
+        authorization: Option<&HarnessAuthorization>,
+    ) -> anyhow::Result<()> {
         let lock = self.lock(id).await;
         let _guard = lock.lock().await;
         let c = self.conversation(id).await?;
@@ -1302,7 +1306,8 @@ impl Claude {
         let frame = match result {
             Ok(frame) => frame,
             Err(failure) => {
-                self.clear_missing_history_unread(&c, &failure).await?;
+                self.clear_missing_history_unread(&c, &failure, authorization)
+                    .await?;
                 return Err(failure);
             }
         };
@@ -1321,6 +1326,7 @@ impl Claude {
         &self,
         observed: &Conversation,
         failure: &anyhow::Error,
+        authorization: Option<&HarnessAuthorization>,
     ) -> anyhow::Result<()> {
         // 用户要求此类无有效原生历史的会话也消除未读；只匹配指定 WSL 读取器的明确结果，超时、断网等错误仍保留未读。
         if !observed.unread
@@ -1331,8 +1337,18 @@ impl Claude {
         {
             return Ok(());
         }
-        // 只读接入仍不修改已读状态，不能借历史失败绕过原有 markRead 的权限边界。
-        if let Some(controller) = self.controller.get().and_then(Weak::upgrade)
+        // 本机读取按本机身份确认已读，不受远程只读开关影响；只读或已撤销的远程身份仍不能修改未读。
+        if let Some(authorization) = authorization {
+            if authorization
+                .controller
+                .authorization(authorization.device.clone(), Some("markRead"))
+                .check()
+                .await
+                .is_err()
+            {
+                return Ok(());
+            }
+        } else if let Some(controller) = self.controller.get().and_then(Weak::upgrade)
             && controller.access_policy.read().unwrap().read_only
         {
             return Ok(());
@@ -1444,11 +1460,20 @@ impl Claude {
             "messages":messages}))
     }
 
+    #[cfg(test)]
     pub async fn detail(self: &Arc<Self>, id: &str) -> anyhow::Result<Value> {
+        self.detail_authorized(id, None).await
+    }
+
+    pub async fn detail_authorized(
+        self: &Arc<Self>,
+        id: &str,
+        authorization: Option<&HarnessAuthorization>,
+    ) -> anyhow::Result<Value> {
         if Self::is_subagent_id(id) {
             return self.subagent_detail(id).await;
         }
-        self.sync_discovered(id).await?;
+        self.sync_discovered(id, authorization).await?;
         let c = self.conversation(id).await?;
         let mut thread = c.view();
         for (key, value) in c.queue_snapshot(&self.epoch).as_object().unwrap() {
@@ -1529,14 +1554,23 @@ impl Claude {
         Ok(c.metrics())
     }
 
+    #[cfg(test)]
     pub async fn history(self: &Arc<Self>, payload: &Value) -> anyhow::Result<Value> {
+        self.history_authorized(payload, None).await
+    }
+
+    pub async fn history_authorized(
+        self: &Arc<Self>,
+        payload: &Value,
+        authorization: Option<&HarnessAuthorization>,
+    ) -> anyhow::Result<Value> {
         let id = payload["threadId"]
             .as_str()
             .context("缺少 Claude 会话 ID")?;
         if Self::is_subagent_id(id) {
             return self.subagent_history(payload).await;
         }
-        self.sync_discovered(id).await?;
+        self.sync_discovered(id, authorization).await?;
         let c = self.conversation(id).await?;
         let end = match &payload["cursor"] {
             Value::Null => c.turns.len(),
@@ -5145,6 +5179,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_native_history_uses_desktop_permission_and_keeps_remote_read_only() {
+        const MISSING: &str = "Claude 控制请求失败：指定 WSL 内没有该原生会话的有效历史";
+        for desktop in [false, true] {
+            for action in ["thread", "history"] {
+                let (_directory, service, mut c) = fixture();
+                let (_auth_directory, mut authorization) =
+                    crate::tests::service_dispatch_fixture().await;
+                if desktop {
+                    authorization = crate::tests::desktop_authorization(authorization).await;
+                } else {
+                    authorization
+                        .controller
+                        .publish_access_policy(&crate::RemoteAccessSettings {
+                            enabled: true,
+                            read_only: true,
+                            ..Default::default()
+                        });
+                }
+                c.shared = true;
+                c.discovered = true;
+                c.unread = true;
+                service
+                    .change(|saved| {
+                        saved.conversations.insert(c.id.clone(), c.clone());
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+                discovery_fixture_response(&service, json!([]), Err((503, MISSING.into()))).await;
+                let failure = if action == "thread" {
+                    service.detail_authorized(&c.id, Some(&authorization)).await
+                } else {
+                    service
+                        .history_authorized(&json!({"threadId":c.id}), Some(&authorization))
+                        .await
+                }
+                .unwrap_err();
+                assert_eq!(failure.downcast_ref::<ApiError>().unwrap().message, MISSING);
+                assert_eq!(
+                    service.conversation(&c.id).await.unwrap().unread,
+                    !desktop,
+                    "{action}: 远程只读不能阻止本机清理未读，也不能被远程读取绕过"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn missing_native_history_does_not_acknowledge_newer_replies_or_other_instances() {
         let (_directory, service, mut observed) = fixture();
         observed.unread = true;
@@ -5174,6 +5256,7 @@ mod tests {
                         503,
                         "Claude 控制请求失败：指定 WSL 内没有该原生会话的有效历史",
                     ),
+                    None,
                 )
                 .await
                 .unwrap();

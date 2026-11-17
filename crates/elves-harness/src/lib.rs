@@ -189,6 +189,33 @@ struct AuthState {
     receipts: HashMap<String, Receipt>,
 }
 
+impl AuthState {
+    fn resolve_device<'a>(
+        &'a self,
+        desktop: Option<&'a Device>,
+        id: &str,
+        key_id: Option<&str>,
+    ) -> Option<&'a Device> {
+        let matches = |device: &&Device| {
+            device.id == id && key_id.is_none_or(|key_id| device.key_id == key_id)
+        };
+        // Elves 本机身份独立保存；队列、命名与回执恢复不能要求它存在于远程设备清单。
+        desktop
+            .filter(|device| device.key_id == desktop::DEVICE_KEY_ID)
+            .filter(matches)
+            .or_else(|| {
+                self.devices.iter().find(|device| {
+                    matches(device)
+                        && device.expires_at_ms > now_ms()
+                        && self
+                            .access_key
+                            .as_ref()
+                            .is_some_and(|key| device.key_id == key.id)
+                })
+            })
+    }
+}
+
 #[derive(Clone, Copy)]
 struct AccessPolicy {
     enabled: bool,
@@ -808,6 +835,24 @@ impl HarnessController {
             write_action: write_action.map(str::to_owned),
             request_id: None,
         }
+    }
+
+    async fn resolve_device(&self, id: &str, key_id: Option<&str>) -> Option<Device> {
+        let desktop = self.desktop_device.lock().await;
+        // 恢复本机队列与命名时不等待远程密钥文件或设备授权锁。
+        if let Some(device) = desktop.as_ref().filter(|device| {
+            device.key_id == desktop::DEVICE_KEY_ID
+                && device.id == id
+                && key_id.is_none_or(|key_id| device.key_id == key_id)
+        }) {
+            return Some(device.clone());
+        }
+        drop(desktop);
+        self.auth
+            .lock()
+            .await
+            .resolve_device(None, id, key_id)
+            .cloned()
     }
 
     async fn access_key_snapshot(
@@ -1706,8 +1751,12 @@ impl HarnessController {
             .recorded(async {
                 execution::transport("claude-wsl-stdio", action, action == "send");
                 match action {
-                    "thread" => self.claude.detail(id).await,
-                    "history" => self.claude.history(&payload).await,
+                    "thread" => self.claude.detail_authorized(id, Some(authorization)).await,
+                    "history" => {
+                        self.claude
+                            .history_authorized(&payload, Some(authorization))
+                            .await
+                    }
                     "workspaceContext" => self.claude.workspace(id).await,
                     "models" => {
                         self.claude
@@ -1967,20 +2016,25 @@ impl HarnessController {
         // 未完成删除清理仍依赖原成功回执；换设备或原授权过期不能先淘汰唯一的持久确认。
         let protected_deletions = self.harness.protected_delete_receipts().await;
         {
+            let desktop = self.desktop_device.lock().await;
             let mut auth = self.auth.lock().await;
             if !auth
-                .devices
-                .iter()
-                .any(|current| current.id == device.id && current.expires_at_ms > now_ms())
+                .resolve_device(desktop.as_ref(), &device.id, Some(&device.key_id))
+                .is_some_and(|current| constant_time_eq(&current.token_hash, &device.token_hash))
             {
                 return Err(ApiError::new(401, "设备授权已撤销或过期"));
             }
-            let active_devices = auth
+            let mut active_devices = auth
                 .devices
                 .iter()
                 .filter(|device| device.expires_at_ms > now_ms())
                 .map(|device| device.id.clone())
                 .collect::<std::collections::HashSet<_>>();
+            // 本机回执按持久身份保留；远程关闭、换密钥或设备清理不能导致重复执行桌面操作。
+            if let Some(desktop) = desktop.as_ref() {
+                active_devices.insert(desktop.id.clone());
+            }
+            drop(desktop);
             auth.receipts.retain(|key, receipt| {
                 receipt.state == "pending"
                     || active_devices.contains(&receipt.device_id)
@@ -6412,6 +6466,26 @@ mod tests {
         harness_fixture_with_store(None).await
     }
 
+    pub(super) async fn desktop_authorization(
+        mut authorization: HarnessAuthorization,
+    ) -> HarnessAuthorization {
+        authorization.device.key_id = desktop::DEVICE_KEY_ID.into();
+        authorization.device.expires_at_ms = u64::MAX;
+        let controller = &authorization.controller;
+        *controller.desktop_device.lock().await = Some(authorization.device.clone());
+        controller.desktop_running.store(true, Ordering::Release);
+        controller.running.store(false, Ordering::SeqCst);
+        controller.publish_access_policy(&RemoteAccessSettings {
+            enabled: false,
+            read_only: true,
+            allow_approvals: false,
+            ..Default::default()
+        });
+        controller.auth.lock().await.devices.clear();
+        authorization.check().await.unwrap();
+        authorization
+    }
+
     async fn harness_fixture_with_store(
         saved: Option<Value>,
     ) -> (tempfile::TempDir, HarnessAuthorization) {
@@ -8611,6 +8685,45 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
                 .iter()
                 .any(|f| f.get("method").is_none() && f["result"]["decision"] == "accept")
         );
+    }
+
+    #[tokio::test]
+    async fn harness_desktop_queue_dispatches_with_remote_access_disabled() {
+        let (directory, authorization) = harness_fixture().await;
+        let authorization = desktop_authorization(authorization).await;
+        let controller = &authorization.controller;
+        let created = controller
+            .call_authorized(
+                "create",
+                json!({"projectId":"project-a","prompt":"wait desktop first"}),
+                &authorization,
+            )
+            .await
+            .unwrap();
+        let id = created["threadId"].as_str().unwrap();
+        let queued = controller
+            .call_authorized(
+                "send",
+                json!({"threadId":id,"prompt":"desktop followup","clientUserMessageId":"desktop-queued"}),
+                &authorization,
+            )
+            .await
+            .unwrap();
+        assert_eq!(queued["deliveryState"], "queued");
+        controller
+            .harness
+            .seed_test_history(json!({"threadId":id,"finish":true}))
+            .await
+            .unwrap();
+        harness_wait_side_starts(directory.path(), id, 2).await;
+        assert!(
+            harness_engine_requests(directory.path())
+                .iter()
+                .any(|frame| frame["method"] == "turn/start"
+                    && frame["params"]["clientUserMessageId"] == "desktop-queued")
+        );
+        assert!(controller.auth.lock().await.devices.is_empty());
+        controller.harness.release().await;
     }
 
     #[tokio::test]

@@ -351,13 +351,8 @@ impl ConversationNaming {
             record.clone()
         };
         let device = controller
-            .auth
-            .lock()
+            .resolve_device(&record.owner, None)
             .await
-            .devices
-            .iter()
-            .find(|device| device.id == record.owner)
-            .cloned()
             .context("命名所属设备授权已失效")?;
         let authorization = controller.authorization(device, Some("rename"));
         authorization.check().await?;
@@ -717,13 +712,17 @@ mod tests {
 
     async fn naming_fixture(
         blocked: bool,
+        desktop: bool,
     ) -> (
         tempfile::TempDir,
         super::super::HarnessAuthorization,
         String,
         TestGeneration,
     ) {
-        let (directory, authorization) = super::super::tests::harness_fixture().await;
+        let (directory, mut authorization) = super::super::tests::harness_fixture().await;
+        if desktop {
+            authorization = super::super::tests::desktop_authorization(authorization).await;
+        }
         std::fs::write(directory.path().join("naming-fixture"), b"").unwrap();
         let settings = Settings {
             enabled: true,
@@ -798,7 +797,7 @@ mod tests {
 
     #[tokio::test]
     async fn conversation_naming_first_message_before_completion_then_every_five_turns() {
-        let (_directory, authorization, id, generation) = naming_fixture(false).await;
+        let (_directory, authorization, id, generation) = naming_fixture(false, false).await;
         let controller = &authorization.controller;
         let service = &controller.conversation_naming;
         wait_idle(service).await;
@@ -827,8 +826,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conversation_naming_uses_desktop_owner_without_remote_devices() {
+        let (_directory, authorization, id, _) = naming_fixture(false, true).await;
+        wait_idle(&authorization.controller.conversation_naming).await;
+        assert_eq!(native_title(&authorization, &id).await, "首条自动标题");
+        assert!(
+            authorization
+                .controller
+                .auth
+                .lock()
+                .await
+                .devices
+                .is_empty()
+        );
+        release_engine(&authorization).await;
+    }
+
+    #[tokio::test]
     async fn conversation_naming_late_result_keeps_manual_title_and_stops_updates() {
-        let (_directory, authorization, id, generation) = naming_fixture(true).await;
+        let (_directory, authorization, id, generation) = naming_fixture(true, false).await;
         let controller = &authorization.controller;
         controller
             .call_authorized(
@@ -868,7 +884,7 @@ mod tests {
 
     #[tokio::test]
     async fn conversation_naming_disabled_during_generation_discards_late_result() {
-        let (directory, authorization, id, generation) = naming_fixture(true).await;
+        let (directory, authorization, id, generation) = naming_fixture(true, false).await;
         let controller = &authorization.controller;
         {
             let _configuration = controller.conversation_naming.configuration.write().await;

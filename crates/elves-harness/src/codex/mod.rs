@@ -640,13 +640,8 @@ impl CodexHarness {
             .and_then(Weak::upgrade)
             .context("远程会话服务已停止")?;
         let device = controller
-            .auth
-            .lock()
+            .resolve_device(&message.device_id, Some(&message.key_id))
             .await
-            .devices
-            .iter()
-            .find(|d| d.id == message.device_id && d.key_id == message.key_id)
-            .cloned()
             .context("队列消息的设备授权已撤销")?;
         let mut authorization = controller.authorization(device, Some("send"));
         authorization.request_id = message.request_id.clone();

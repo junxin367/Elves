@@ -779,13 +779,8 @@ impl Claude {
                 continue;
             };
             let device = controller
-                .auth
-                .lock()
-                .await
-                .devices
-                .iter()
-                .find(|d| d.id == message.device_id && d.key_id == message.key_id)
-                .cloned();
+                .resolve_device(&message.device_id, Some(&message.key_id))
+                .await;
             let Some(device) = device else { continue };
             let auth = controller.authorization(device, Some("send"));
             // 自动续发也逐次核对原设备授权；退出、只读或撤销后不能继续派发。
@@ -1936,6 +1931,48 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn desktop_queue_auto_sends_without_remote_access_and_stops_with_desktop() {
+        let (_directory, _auth_directory, service, c, auth, calls, _) = fixture().await;
+        let auth = crate::tests::desktop_authorization(auth).await;
+        for id in ["B", "C"] {
+            service
+                .command("send", &payload(&c, id), &auth)
+                .await
+                .unwrap();
+        }
+        let idle = |saved: &mut Saved| {
+            let current = saved.conversations.get_mut(&c.id).unwrap();
+            current.native_status = json!({"tempo":"idle"});
+            current.queued_messages.clear();
+            current.turns.last_mut().unwrap()["status"] = json!("completed");
+            Ok(())
+        };
+        service.change(idle).await.unwrap();
+        service.drain_remote_queues().await;
+        assert_eq!(calls.lock().await.len(), 1);
+        assert_eq!(calls.lock().await[0]["client_id"], "B");
+        service.change(idle).await.unwrap();
+        service
+            .change(|saved| {
+                let current = saved.conversations.get_mut(&c.id).unwrap();
+                current
+                    .turns
+                    .push(json!({"id":"B","status":"completed","_nativeDone":true,"items":[]}));
+                current
+                    .remote_queue
+                    .observe_turns(&current.turns, &current.native_status);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        auth.controller
+            .desktop_running
+            .store(false, Ordering::Release);
+        service.drain_remote_queues().await;
+        assert_eq!(calls.lock().await.len(), 1, "本机入口停止后不能继续派发");
     }
 
     #[tokio::test]

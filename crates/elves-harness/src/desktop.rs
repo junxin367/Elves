@@ -141,6 +141,20 @@ pub(super) async fn connect(state: WebState) -> Result<Response, ApiError> {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct DesktopActionsBackend {
+        sends: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl TestRemoteBackend for DesktopActionsBackend {
+        async fn call(&self, action: &str, payload: Value) -> anyhow::Result<Value> {
+            anyhow::ensure!(action == "send", "unexpected test action: {action}");
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"ok":true,"threadId":payload["threadId"],"deliveryState":"accepted"}))
+        }
+    }
+
     fn fixture() -> (tempfile::TempDir, WebState) {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../temp");
         std::fs::create_dir_all(&root).unwrap();
@@ -195,13 +209,125 @@ mod tests {
         assert!(state.controller.auth.lock().await.devices.is_empty());
         state
             .controller
-            .authorization(device, Some("send"))
+            .authorization(device.clone(), Some("send"))
             .check()
             .await
             .unwrap();
+        let remote_lock = state.controller.auth.lock().await;
+        let recovered = tokio::time::timeout(
+            Duration::from_secs(1),
+            state
+                .controller
+                .resolve_device(&device.id, Some(DEVICE_KEY_ID)),
+        )
+        .await
+        .expect("本机身份恢复不能等待远程授权锁");
+        assert_eq!(recovered.unwrap().id, device.id);
+        drop(remote_lock);
         let mut remote = state.clone();
         remote.desktop = false;
         assert_eq!(authorized(&remote, &headers).await.err().unwrap().code, 503);
+    }
+
+    #[tokio::test]
+    async fn desktop_actions_accept_local_identity_and_keep_idempotent_receipts() {
+        let (_directory, state) = fixture();
+        let backend = Arc::new(DesktopActionsBackend::default());
+        assert!(state.controller.test_backend.set(backend.clone()).is_ok());
+        let mut headers = login(&state).await;
+        let payload = json!({
+            "threadId":"e56d7c7d-645e-43d5-ae5b-e097fe1f9bdc",
+            "prompt":"desktop action regression"
+        });
+        for request in ["desktop-send-a", "desktop-send-b", "desktop-send-a"] {
+            headers.insert("idempotency-key", HeaderValue::from_str(request).unwrap());
+            let Json(receipt) = action(
+                State(state.clone()),
+                Path("send".into()),
+                headers.clone(),
+                Json(payload.clone()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(receipt["state"], "completed");
+        }
+        assert_eq!(backend.sends.load(Ordering::SeqCst), 2);
+        assert!(state.controller.auth.lock().await.devices.is_empty());
+        let Json(saved) = receipt(
+            State(state.clone()),
+            Path("desktop-send-a".into()),
+            headers.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved["state"], "completed");
+        let device = authorized(&state, &headers).await.unwrap();
+        assert_eq!(
+            state
+                .controller
+                .execute(
+                    device,
+                    "desktop-send-a".into(),
+                    "send".into(),
+                    json!({"threadId":payload["threadId"],"prompt":"different"}),
+                )
+                .await
+                .unwrap_err()
+                .code,
+            409
+        );
+    }
+
+    #[tokio::test]
+    async fn desktop_receipts_survive_reconnect_and_restart_without_remote_credentials() {
+        let (directory, state) = fixture();
+        let backend = Arc::new(DesktopActionsBackend::default());
+        assert!(state.controller.test_backend.set(backend.clone()).is_ok());
+        let headers = login(&state).await;
+        let device = authorized(&state, &headers).await.unwrap();
+        let payload = json!({"threadId":"desktop-thread","prompt":"persisted request"});
+        state
+            .controller
+            .execute(
+                device.clone(),
+                "desktop-restart".into(),
+                "send".into(),
+                payload.clone(),
+            )
+            .await
+            .unwrap();
+        let controller = HarnessController::new(directory.path().to_owned()).unwrap();
+        controller.desktop_running.store(true, Ordering::Release);
+        assert!(controller.test_backend.set(backend.clone()).is_ok());
+        let restarted = WebState {
+            controller,
+            ..state
+        };
+        let next_headers = login(&restarted).await;
+        let next_device = authorized(&restarted, &next_headers).await.unwrap();
+        assert_eq!(next_device.id, device.id);
+        assert!(
+            restarted
+                .controller
+                .authorization(device, Some("send"))
+                .check()
+                .await
+                .is_err(),
+            "重连更新 Cookie 后不能沿用旧令牌"
+        );
+        let repeated = restarted
+            .controller
+            .execute(
+                next_device,
+                "desktop-restart".into(),
+                "send".into(),
+                payload,
+            )
+            .await
+            .unwrap();
+        assert_eq!(repeated["state"], "completed");
+        assert_eq!(backend.sends.load(Ordering::SeqCst), 1);
+        assert!(restarted.controller.auth.lock().await.access_key.is_none());
     }
 
     #[tokio::test]

@@ -971,6 +971,9 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
                     | "configRequirements/read"
             )
         )));
+        // 先让隔离引擎完成后台分页；未完成的原生 RPC 不能被当成空闲并强制回收。
+        std::fs::write(directory.path().join("continue"), "").unwrap();
+        wait_until(async || service.catalog.state.lock().await.complete).await;
         service.stop_preparation().await;
         assert!(!service.catalog.state.lock().await.loaded);
         assert!(
