@@ -64,6 +64,14 @@ fn hidden_model_ids(value: &Value) -> Result<Vec<String>, ApiError> {
     }).collect()
 }
 
+fn claude_default_effort(value: &Value) -> Result<Option<&str>, ApiError> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    value.as_str().filter(|effort| ["low", "medium", "high", "xhigh", "max"].contains(effort))
+        .map(Some).ok_or_else(|| ApiError::new(400, "Claude 默认思考深度必须是当前模型支持的原生等级，或使用模型默认"))
+}
+
 pub(super) fn decorate_claude_model_visibility(
     directory: &Path,
     instance: &str,
@@ -77,6 +85,17 @@ pub(super) fn decorate_claude_model_visibility(
             row["hiddenByInstance"] = json!(row["model"].as_str()
                 .is_some_and(|id| hidden.iter().any(|hidden| hidden == id)));
         }
+    }
+    // 用户要求在会话实例设置 Claude 默认深度；只叠加完整目录的默认值，历史会话快照仍保留自身等级。
+    if catalog["catalogComplete"] != false {
+        let effort = claude_default_effort(&preference["instances"][instance]["defaultReasoningEffort"])?;
+        let supported = effort.is_some_and(|effort| catalog["data"].as_array().is_some_and(|rows| rows.iter().any(|row| {
+            row["supportedReasoningEfforts"].as_array().is_some_and(|efforts| {
+                efforts.iter().any(|value| value["reasoningEffort"] == effort)
+            })
+        })));
+        // 保存回执可能带有保存前的展示默认值；恢复“使用模型默认”时同样必须清除该旧值。
+        catalog["defaultReasoningEffort"] = json!(if supported { effort.unwrap() } else { "" });
     }
     Ok(catalog)
 }
@@ -744,8 +763,8 @@ fn validate_models(
 ) -> Result<(), ApiError> {
     if backend == "claude" && changes.get("effortLevel").is_some() {
         return Err(ApiError::new(
-            409,
-            "尚未确认当前 Claude CLI 的默认思考深度配置，请在会话输入区选择。",
+            400,
+            "Claude 默认思考深度请使用会话实例的 reasoningEffort 设置，不写入原生 effortLevel 字段。",
         ));
     }
     let model = changes
@@ -753,12 +772,7 @@ fn validate_models(
         .unwrap_or(&document["model"])
         .as_str()
         .or_else(|| catalog["defaultModel"].as_str());
-    let effort_key = if backend == "codex" {
-        "reasoningEffort"
-    } else {
-        "effortLevel"
-    };
-    let effort = changes.get(effort_key).and_then(Value::as_str);
+    let effort = changes.get("reasoningEffort").and_then(Value::as_str);
     if changes["model"].is_null() && changes.get("model").is_some() && effort.is_some() {
         return Err(ApiError::new(
             400,
@@ -770,6 +784,9 @@ fn validate_models(
             .as_array()?
             .iter()
             .find(|row| row["model"] == model)
+            .or_else(|| (backend == "claude").then(|| {
+                catalog["data"].as_array()?.iter().find(|row| row["resolvedModel"] == model)
+            }).flatten())
     });
     // 移除失效的模型覆盖不依赖旧模型仍在目录中；只有明确选择新模型时才要求目录命中。
     if changes.get("model").is_some_and(|value| !value.is_null()) && selected.is_none() {
@@ -872,7 +889,7 @@ pub(super) async fn settings(
     let mut capabilities = json!({});
     let mut native_features = json!({});
     let mut capability_error = String::new();
-    if section == "general"
+    if matches!(section, "general" | "models")
         && let Some(config) = &target.claude_config
     {
         // CLI 能力读取失败时仍保留已接入的回顾配置；未确认的新选项禁用，并把失败原因返回页面。
@@ -885,9 +902,10 @@ pub(super) async fn settings(
         };
         capabilities = json!({
             "promptSuggestions":help.contains("--prompt-suggestions"),
-            "autoCompactWindow":help.contains("--autocompact")
+            "autoCompactWindow":help.contains("--autocompact"),
+            "defaultReasoningEffort":help.contains("--effort <")
         });
-        if help.contains("--settings") && help.contains("doctor") {
+        if section == "general" && help.contains("--settings") && help.contains("doctor") {
             match claude_option_capabilities(config).await {
                 Ok(value) => capabilities["extraSettings"] = value,
                 Err(error) => {
@@ -966,6 +984,18 @@ pub(super) async fn settings(
             let previous = hidden_model_ids(&preference["instances"][instance]["hiddenModelIds"])?;
             validate_hidden_model_selection(&ids, &previous, catalog.as_ref())?;
             save_preference(directory, instance, "hiddenModelIds", &json!(ids),
+                payload["expectedPreferenceRevision"].as_str().unwrap_or(""), &authorization).await?;
+        } else if target.backend == "claude" && changes.contains_key("reasoningEffort") {
+            if !matches!(section, "general" | "models") || changes.len() != 1 {
+                return Err(ApiError::new(400, "Claude 默认思考深度需要单独保存"));
+            }
+            let value = &changes["reasoningEffort"];
+            if claude_default_effort(value)?.is_some() && capabilities["defaultReasoningEffort"] != true {
+                return Err(ApiError::new(409, "所选实例的 Claude CLI 未提供 --effort，无法设置默认思考深度"));
+            }
+            validate_models("claude", &document, &payload["settings"], catalog.as_ref().unwrap(), false)?;
+            // 默认深度属于 Harness 实例偏好，后续新会话经原生控制接口交给 CLI 的 --effort；不伪造 settings.json 键。
+            save_preference(directory, instance, "defaultReasoningEffort", value,
                 payload["expectedPreferenceRevision"].as_str().unwrap_or(""), &authorization).await?;
         } else if changes.contains_key("ultraReasoningEnabled") {
             if !matches!(section, "general" | "models") || target.backend != "codex" || changes.len() != 1 {
@@ -1056,6 +1086,7 @@ pub(super) async fn settings(
             || changes.contains_key("autoCompactWindow")
             || changes.contains_key("compactionPrompt") && target.backend == "claude"
             || changes.contains_key("hiddenModelIds")
+            || target.backend == "claude" && changes.contains_key("reasoningEffort")
         {
             state
                 .controller
@@ -1101,6 +1132,8 @@ pub(super) async fn settings(
     if target.backend == "claude" && matches!(section, "general" | "models") {
         values["hiddenModelIds"] = json!(hidden_model_ids(
             &preference["instances"][instance]["hiddenModelIds"])?);
+        values["reasoningEffort"] = json!(claude_default_effort(
+            &preference["instances"][instance]["defaultReasoningEffort"])?);
     }
     let mut extra_settings = options::append_view(
         &target.backend,
@@ -1273,6 +1306,33 @@ mod tests {
         assert!(validate_hidden_model_selection(&["retired".into()], &["retired".into()], None).is_ok());
         assert!(validate_hidden_model_selection(&[], &["retired".into()], None).is_ok());
         assert!(updated_native("claude", "general", "{}", &json!({"hiddenModelIds":["present"]})).is_err());
+    }
+
+    #[test]
+    fn claude_instance_default_effort_is_scoped_supported_and_resettable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(PREFERENCES_FILE);
+        std::fs::write(&path, r#"{"instances":{"claude:wsl:one":{"defaultReasoningEffort":"max"}}}"#).unwrap();
+        let catalog = json!({"catalogComplete":true,"defaultModel":"model-a","defaultReasoningEffort":"",
+            "data":[{"model":"model-a","supportedReasoningEfforts":[{"reasoningEffort":"max"}]}]});
+        let shown = decorate_claude_model_visibility(directory.path(), "claude:wsl:one", catalog.clone()).unwrap();
+        assert_eq!(shown["defaultReasoningEffort"], "max");
+        let other = decorate_claude_model_visibility(directory.path(), "claude:wsl:two", catalog.clone()).unwrap();
+        assert_eq!(other["defaultReasoningEffort"], "");
+        let mut unsupported = catalog.clone();
+        unsupported["data"][0]["supportedReasoningEfforts"] = json!([]);
+        assert_eq!(decorate_claude_model_visibility(directory.path(), "claude:wsl:one", unsupported).unwrap()["defaultReasoningEffort"], "");
+        let mut history = catalog.clone();
+        history["catalogComplete"] = json!(false);
+        history["defaultReasoningEffort"] = json!("low");
+        assert_eq!(decorate_claude_model_visibility(directory.path(), "claude:wsl:one", history).unwrap()["defaultReasoningEffort"], "low");
+        std::fs::write(&path, r#"{"instances":{"claude:wsl:one":{}}}"#).unwrap();
+        assert_eq!(decorate_claude_model_visibility(directory.path(), "claude:wsl:one", shown).unwrap()["defaultReasoningEffort"], "");
+        assert!(claude_default_effort(&json!("ultra")).is_err());
+        assert!(claude_default_effort(&json!(true)).is_err());
+        assert!(validate_models("claude", &json!({"model":"model-a"}), &json!({"reasoningEffort":"max"}), &catalog, false).is_ok());
+        assert!(validate_models("claude", &json!({"model":"model-a"}), &json!({"reasoningEffort":"high"}), &catalog, false).is_err());
+        assert!(updated_native("claude", "general", "{}", &json!({"reasoningEffort":"max"})).is_err());
     }
 
     #[test]

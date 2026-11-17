@@ -42,8 +42,12 @@ export function currentEffort() {
     if (modelIdentityMatches(model, remembered.model) && (catalog?.supportedReasoningEfforts || [])
         .some(effort => effort.reasoningEffort === remembered.reasoningEffort)) return remembered.reasoningEffort;
     if (isClaude()) {
+      // 用户要求 Claude 的实例默认深度用于后续新会话；已记住的有效选择优先，默认值也必须受所选模型支持。
+      if (modelDefaults.reasoningEffort && (catalog?.supportedReasoningEfforts || [])
+          .some(effort => effort.reasoningEffort === modelDefaults.reasoningEffort))
+        return modelDefaults.reasoningEffort;
       if (remembered.reasoningEffort && modelIdentityMatches(model, remembered.model))
-        return defaultModelEffort(catalog, modelIdentityMatches(model, modelDefaults.model) ? modelDefaults.reasoningEffort : "");
+        return defaultModelEffort(catalog);
     } else {
       const defaults = codexCreationDefaults();
       if (defaults && modelIdentityMatches(model, defaults.model)) return defaults.reasoningEffort || defaultModelEffort(catalog);

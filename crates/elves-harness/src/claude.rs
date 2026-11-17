@@ -2189,7 +2189,10 @@ impl Claude {
             spent_requests: BTreeMap::new(),
         };
         let process = self.spawn(&c).await?;
-        apply_model(&process, &mut c, payload, authorization).await?;
+        // 用户要求实例默认思考深度用于后续新会话；仅首条消息补齐缺省值，显式等级和显式恢复默认保持优先。
+        let catalog = self.model_visibility(&c.config.instance_id(), normalize_models(&process.initialization))?;
+        let initial_payload = new_session_model_defaults(payload, &catalog);
+        apply_model(&process, &mut c, &initial_payload, authorization).await?;
         authorization.check().await?;
         self.change(|saved| {
             saved.conversations.insert(c.id.clone(), c.clone());
@@ -4385,6 +4388,26 @@ fn project_shared_history(frame: &Value, generation: &str) -> Vec<Value> {
     turns
 }
 
+fn new_session_model_defaults(payload: &Value, catalog: &Value) -> Value {
+    let mut initial = payload.clone();
+    if payload.get("reasoningEffort").is_some() {
+        return initial;
+    }
+    let default = catalog["defaultModel"].as_str().unwrap_or("");
+    let requested = payload["model"].as_str().filter(|model| !model.is_empty()).unwrap_or(default);
+    let row = catalog["data"].as_array().and_then(|rows| rows.iter().find(|row| {
+        row["model"] == requested || row["resolvedModel"].is_string() && row["resolvedModel"] == requested
+    }));
+    if let Some(effort) = catalog["defaultReasoningEffort"].as_str().filter(|effort| !effort.is_empty())
+        && row.is_some_and(|row| row["supportedReasoningEfforts"].as_array().is_some_and(|efforts| {
+            efforts.iter().any(|value| value["reasoningEffort"] == effort)
+        }))
+    {
+        initial["reasoningEffort"] = json!(effort);
+    }
+    initial
+}
+
 fn model_selection<'a>(
     c: &'a Conversation,
     payload: &'a Value,
@@ -5765,6 +5788,26 @@ mod tests {
             {"value":"model-a","resolvedModel":"model-a","supportedEffortLevels":["low"]}]}));
         assert_eq!(single["data"].as_array().unwrap().len(), 1);
         assert_eq!(single["defaultModel"], "model-a");
+    }
+
+    #[test]
+    fn claude_new_session_defaults_respect_explicit_effort_model_and_capabilities() {
+        let catalog = json!({"defaultModel":"sol","defaultReasoningEffort":"max","data":[
+            {"model":"sol","resolvedModel":"gpt-6.1-sol","supportedReasoningEfforts":[{"reasoningEffort":"high"},{"reasoningEffort":"max"}]},
+            {"model":"other","supportedReasoningEfforts":[{"reasoningEffort":"high"}]}]});
+        assert_eq!(new_session_model_defaults(&json!({"prompt":"test"}), &catalog)["reasoningEffort"], "max");
+        assert_eq!(new_session_model_defaults(&json!({"model":"gpt-6.1-sol"}), &catalog)["reasoningEffort"], "max");
+        assert_eq!(new_session_model_defaults(&json!({"reasoningEffort":"high"}), &catalog)["reasoningEffort"], "high");
+        assert_eq!(new_session_model_defaults(&json!({"reasoningEffort":""}), &catalog)["reasoningEffort"], "");
+        assert!(new_session_model_defaults(&json!({"model":"other"}), &catalog)["reasoningEffort"].is_null());
+        let mut unsupported = catalog.clone();
+        unsupported["defaultReasoningEffort"] = json!("ultra");
+        assert!(new_session_model_defaults(&json!({}), &unsupported)["reasoningEffort"].is_null());
+        let (_directory, _service, mut c) = fixture();
+        c.model.clear();
+        c.effort.clear();
+        let initial = new_session_model_defaults(&json!({}), &catalog);
+        assert_eq!(model_selection(&c, &initial, &catalog).unwrap(), ("sol", "max"));
     }
 
     #[test]

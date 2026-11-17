@@ -219,13 +219,17 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     const model = modelId ? models.find(model => model.model === modelId) : models.find(model => model.isDefault);
     const efforts = (model?.supportedReasoningEfforts || [])
       .filter(effort => effort.reasoningEffort !== "ultra" || values.ultraReasoningEnabled === true);
-    if (record.backend === "codex") addSelect(card, "reasoningEffort",
-        "默认思考深度", "可选深度由当前模型能力决定。",
+    // 用户要求 Claude 也在会话实例设置默认思考深度；按原生模型能力列出等级，保存为同一实例的 Harness 默认值。
+    const claudeEffortUnsupported = record.backend === "claude" && record.capabilities?.defaultReasoningEffort !== true;
+    addSelect(card, "reasoningEffort",
+        "默认思考深度", record.backend === "claude"
+          ? "用于此实例后续新会话；输入区已记住的有效选择优先，已有会话保持原深度。"
+          : "可选深度由当前模型能力决定。",
         [{ value: "", label: "使用模型默认" }, ...efforts.map(effort =>
           ({ value: effort.reasoningEffort, label: effortLabels[effort.reasoningEffort] || effort.reasoningEffort }))],
-        values.reasoningEffort || "", apiValue, !model);
-    else content.append(element("p", "appearance-hint",
-      "尚未确认当前 Claude CLI 的默认思考深度配置，请在会话输入区选择。"));
+        values.reasoningEffort || "", apiValue, !model || claudeEffortUnsupported);
+    if (claudeEffortUnsupported) content.append(element("p", "appearance-hint",
+      "所选实例的 Claude CLI 尚未确认提供 --effort，默认思考深度暂不可修改。"));
     if (!model) content.append(element("p", "appearance-hint",
       "当前模型未出现在实例目录中，请选择可用模型或选择“使用原生默认”。"));
     // 实例默认值与输入区记住的选择是不同来源；明确既有优先级，不能把此处描述为覆盖全部新会话选择。
