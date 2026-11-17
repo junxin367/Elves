@@ -93,9 +93,8 @@ Elves 与 Harness 共用工作区网页，位于 `assets/harness/`。会话工�
 | 实现 | 用途 |
 | --- | --- |
 | `scripts/harness-resources.mjs` | 调试入口、资源检查、Windows 构建输入核对 |
-| `crates/elves-harness/build.rs` | 服务端内嵌资源、静态路由和资源清单 |
+| `crates/elves-assets/build.rs` | Harness 与 Windows 客户端共用的内嵌资源、静态路由和资源清单 |
 | `apps/elves-android/app/build.gradle` 的 `bundledWebResources` | APK 内置网页包 |
-| `apps/elves/src-tauri/build.rs` | Windows 独立客户端内置网页包 |
 | `scripts/update-remote-service.ps1` 的 `Get-RemoteUpdateSource` | 正式服务更新的目标清单与内嵌资源核对 |
 
 服务端对清单内全部资源统一返回 `Cache-Control: no-cache` 并以 ETag 复验。此前 `session-tools.js`、`session-files.js`、`workspace-preview.js`、`session-menu.js`、`file-preview.html` 未列入静态资源判定，返回 `no-store`；现与其他版本壳资源一致。`/side-thread` 与缓存恢复页仍为 `no-store`。

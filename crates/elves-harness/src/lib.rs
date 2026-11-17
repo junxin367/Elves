@@ -101,11 +101,8 @@ pub use service::{
 };
 use zrok_tunnel::ZrokTunnelService;
 
-// 网页资源由 build.rs 按统一目录规则生成（见 scripts/harness-resources.mjs）；
-// 缓存恢复页不属于任一版本壳，单独内嵌并以 no-store 提供。
-include!(concat!(env!("OUT_DIR"), "/harness_ui_assets.rs"));
-const WEB_CACHE_RECOVERY_HTML: &str = include_str!("../../../assets/harness/cache-recovery.html");
-const WEB_CACHE_RECOVERY_JS: &str = include_str!("../../../assets/harness/cache-recovery.js");
+// 用户要求加快编译：网页字节统一由 elves-assets 内嵌，Harness 与客户端不再重复生成资源表。
+// 缓存恢复页仍独立提供为 no-store；远程管理权限继续由本服务校验。
 const COOKIE_NAME: &str = "codex_elves_device";
 const HARNESS_READ_GUIDANCE: &str = "Harness 执行引擎暂时不可用，请稍后重试。";
 const MAX_DEVICES: usize = 32;
@@ -2396,7 +2393,7 @@ impl StaticWebAsset {
 
 fn web_assets() -> &'static HashMap<&'static str, StaticWebAsset> {
     WEB_ASSETS.get_or_init(|| {
-        HARNESS_UI_ASSETS
+        elves_assets::web_assets()
             .iter()
             .map(|&(path, content_type, bytes)| (path, StaticWebAsset::new(content_type, bytes)))
             .collect()
@@ -2457,10 +2454,7 @@ fn build_app_resources_manifest(
 
 fn web_resource_revision() -> u64 {
     // 网页资源有改动时递增编号；Android 会拒绝不高于缓存的版本，APK 与服务共用此文件。
-    include_str!("../../../assets/harness/resource-revision.txt")
-        .trim()
-        .parse()
-        .expect("web resource revision should be a positive integer")
+    elves_assets::resource_revision()
 }
 
 fn update_manifest_version_field(hasher: &mut Sha256, value: &[u8]) {
@@ -2613,13 +2607,13 @@ async fn cache_recovery_asset(uri: Uri, headers: HeaderMap) -> Response {
         "/cache-recovery.html" => HTML.get_or_init(|| {
             StaticWebAsset::new(
                 "text/html; charset=utf-8",
-                WEB_CACHE_RECOVERY_HTML.as_bytes(),
+                elves_assets::cache_recovery_html(),
             )
         }),
         "/cache-recovery.js" => SCRIPT.get_or_init(|| {
             StaticWebAsset::new(
                 "application/javascript; charset=utf-8",
-                WEB_CACHE_RECOVERY_JS.as_bytes(),
+                elves_assets::cache_recovery_js(),
             )
         }),
         _ => return StatusCode::NOT_FOUND.into_response(),
@@ -2676,7 +2670,7 @@ fn scoped_router(
         desktop,
     };
     // 版本壳资源按生成表逐项注册（含 "/"），新增网页模块无需在此登记。
-    let static_routes = HARNESS_UI_ASSETS
+    let static_routes = elves_assets::web_assets()
         .iter()
         .fold(Router::new(), |router, &(path, _, _)| {
             router.route(path, get(static_web_asset))

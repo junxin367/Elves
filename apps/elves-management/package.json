@@ -6,7 +6,8 @@
   "scripts": {
     "assets:brand": "node ../../scripts/generate-brand-assets.mjs",
     "dev": "vite --host 127.0.0.1 --port 1420",
-    "build": "npm run check:harness && npm run vite:build && cargo build --profile release-fast -p elves --bin elves",
+    "build": "npm run check:harness && npm run build:frontend && cargo build --locked --profile release-fast -p elves --bin elves",
+    "build:frontend": "node scripts/build-frontend.mjs",
     "check": "npm run check:harness && tsc --noEmit -p tsconfig.json",
     "check:harness": "node ../../scripts/check-harness-assets.mjs",
     "vite:dev": "vite --host 127.0.0.1 --port 1420",

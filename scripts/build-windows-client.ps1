@@ -24,10 +24,19 @@ if ($BinaryDirectory -and !$SkipBuild) {
 # 用户要求只提供一个 Elves Windows 程序；此入口只构建客户端，不启动管理器、不构建 Android。
 if (!$SkipBuild) {
     $cargo = Get-Command "cargo.exe" -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    $npm = Get-Command "npm.cmd" -CommandType Application -ErrorAction Stop | Select-Object -First 1
     Push-Location $RepoRoot
     try {
+        # 用户要求缩短日常编译并保持资源正确：检查始终执行，前端仅在输入或产物摘要变化时重建。
+        # 统一在 Rust 前准备管理资源，避免单独编译客户端时内嵌到旧页面。
+        & $npm.Path --prefix apps/elves-management run check:harness
+        if ($LASTEXITCODE -ne 0) { throw "Harness resource check failed: $LASTEXITCODE" }
+        & $npm.Path --prefix apps/elves-management run build:frontend
+        if ($LASTEXITCODE -ne 0) { throw "Management frontend build failed: $LASTEXITCODE" }
+        $compileClock = [Diagnostics.Stopwatch]::StartNew()
         & $cargo.Path build --locked --profile $Profile -p elves --bin elves
         if ($LASTEXITCODE -ne 0) { throw "Elves client build failed: $LASTEXITCODE" }
+        Write-Output "[TIME] Cargo ($Profile): $([math]::Round($compileClock.Elapsed.TotalSeconds, 2)) s"
     }
     finally { Pop-Location }
 }

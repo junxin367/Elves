@@ -7,17 +7,6 @@ import { listHarnessUiResources, harnessResourceContentTypes, separatelyServedRe
 const root = resolve(import.meta.dirname, "..");
 const assetRoot = resolve(root, "assets/harness");
 
-function checkSyntax(path, source) {
-  const result = spawnSync(process.execPath, ["--check", "--input-type=module"], {
-    input: source
-  });
-  if (result.status === 0) return null;
-  const details = Buffer.concat([result.stdout || Buffer.alloc(0), result.stderr || Buffer.alloc(0)])
-    .toString("utf8")
-    .trim();
-  return `${relative(root, path)}: ES module 语法检查失败\n${details}`;
-}
-
 function localImports(source, { dynamic = true } = {}) {
   const imports = new Set();
   const patterns = [
@@ -59,9 +48,6 @@ for (const file of jsFiles.sort()) {
   const path = resolve(assetRoot, file);
   const source = await readFile(path);
   sources.set(file, source.toString("utf8"));
-  const syntaxError = checkSyntax(path, source);
-  if (syntaxError) errors.push(syntaxError);
-
   for (const specifier of localImports(source.toString("utf8"))) {
     const target = resolve(dirname(path), specifier);
     if (!target.startsWith(`${assetRoot}${sep}`)) {
@@ -114,35 +100,46 @@ for (const file of jsFiles.sort()) {
   for (const file of [...graph.keys()].sort()) if (!order.has(file)) visit(file);
 }
 
+// 用户要求缩短编译：在同一个 Node 子进程内完成全部模块的语法解析和链接，避免逐文件启动进程。
 // 具名导入须在目标模块中存在：用 V8 只链接、不执行全部模块，缺失或冲突的导出会在链接阶段报错。
 // 浏览器遇到这类错误会整页无法加载，而截取源码的 vm 测试无法发现，因此作为静态门禁。
 const linkCheck = spawnSync(process.execPath, ["--experimental-vm-modules", "--no-warnings", "--input-type=module", "-e", `
-  import { readFileSync } from "node:fs";
-  import { pathToFileURL } from "node:url";
   import vm from "node:vm";
-  const files = JSON.parse(process.argv[1]);
-  const context = vm.createContext({});
-  const modules = new Map(files.map(file => {
-    const identifier = pathToFileURL(file).href;
-    return [identifier, new vm.SourceTextModule(readFileSync(file, "utf8"), { identifier, context })];
+  const sources = JSON.parse(await new Promise(resolve => {
+    let data = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", chunk => data += chunk);
+    process.stdin.on("end", () => resolve(data));
   }));
+  const context = vm.createContext({});
+  const modules = new Map(), failures = [];
+  for (const [identifier, source] of sources) {
+    try { modules.set(identifier, new vm.SourceTextModule(source, { identifier, context })); }
+    catch (error) { failures.push(identifier + "：ES module 语法检查失败：" + error.message); }
+  }
   const linker = specifier => (_, referencing) => {
     const found = modules.get(new URL(specifier, referencing.identifier).href);
     if (!found) throw new Error("未找到模块：" + specifier);
     return found;
   };
-  const failures = [];
   for (const [identifier, module] of modules) {
     if (module.status !== "unlinked") continue;
     try { await module.link((specifier, referencing) => linker(specifier)(null, referencing)); }
     catch (error) { failures.push(identifier + "：" + error.message); }
   }
   if (failures.length) { console.log(failures.join("\\n")); process.exitCode = 1; }
-`, JSON.stringify(jsFiles.map(file => resolve(assetRoot, file)))], { encoding: "utf8" });
+`], {
+  // 源码通过 stdin 传递，使用父进程已读取的同一份内容，避免重复 IO 及 Windows 命令行长度限制。
+  input: JSON.stringify([...sources].map(([file, source]) => [pathToFileURL(resolve(assetRoot, file)).href, source])),
+  encoding: "utf8",
+  maxBuffer: 8 * 1024 * 1024,
+});
+if (linkCheck.error) throw linkCheck.error;
 if (linkCheck.status !== 0) {
   // 同一处错误会在所有依赖它的模块上重复出现：按错误去重，并按导入语句定位实际写错的模块。
   const escapeRegExp = value => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const lines = `${linkCheck.stdout || ""}${linkCheck.stderr || ""}`.trim().split("\n").filter(Boolean);
+  if (!lines.length) errors.push(`ES module 检查进程异常退出：${linkCheck.status ?? linkCheck.signal ?? "未知原因"}`);
   for (const message of new Set(lines.map(line => line.slice(line.indexOf("：") + 1)))) {
     const missing = message.match(/The requested module '([^']+)' does not provide an export named '([^']+)'/);
     const importers = missing ? [...sources].filter(([, text]) => new RegExp(
@@ -172,9 +169,8 @@ for (const file of preloads) {
 
 // 各端按同一目录规则生成网页资源清单；规则变化时须同步修改下列实现。
 const ruleImplementations = [
-  "crates/elves-harness/build.rs",
+  "crates/elves-assets/build.rs",
   "apps/elves-android/app/build.gradle",
-  "apps/elves/src-tauri/build.rs",
 ];
 for (const implementation of ruleImplementations) {
   let text;

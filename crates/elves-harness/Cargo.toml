@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+elves-assets = { path = "../elves-assets" }
 elves-core = { path = "../elves-core" }
 elves-data = { path = "../elves-data" }
 aes-gcm.workspace = true

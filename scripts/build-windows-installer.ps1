@@ -1,6 +1,8 @@
 param(
     [string]$Version = "",
-    [string]$MakensisPath = ""
+    [string]$MakensisPath = "",
+    [ValidateSet("release", "release-fast")]
+    [string]$Profile = "release"
 )
 
 Set-StrictMode -Version Latest
@@ -103,7 +105,6 @@ function Start-CargoCacheCleanup {
 
 $RepoRoot = Resolve-RepoRoot
 $ResolvedVersion = Resolve-WorkspaceVersion -RepoRoot $RepoRoot
-$ManagementDir = Join-Path $RepoRoot "apps\elves-management"
 $DistAppDir = Join-Path $RepoRoot "dist\windows\app"
 $InstallerScriptDir = Join-Path $RepoRoot "scripts\installer\windows"
 $InstallerScript = Join-Path $InstallerScriptDir "Elves.nsi"
@@ -114,17 +115,17 @@ if ($env:CARGO_TARGET_DIR) {
     }
     else {
         $CargoTargetDir = [System.IO.Path]::GetFullPath(
-            (Join-Path $ManagementDir $env:CARGO_TARGET_DIR)
+            (Join-Path $RepoRoot $env:CARGO_TARGET_DIR)
         )
     }
 }
 else {
     $CargoTargetDir = Join-Path $RepoRoot "target"
 }
-$ReleaseDir = Join-Path $CargoTargetDir "release-fast"
+if ($env:CARGO_BUILD_TARGET) { $CargoTargetDir = Join-Path $CargoTargetDir $env:CARGO_BUILD_TARGET }
+$ReleaseDir = Join-Path $CargoTargetDir $Profile
 $ReleaseMirrorDir = Join-Path $CargoTargetDir "release"
 
-$NpmPath = Resolve-ToolPath -Name "npm.cmd" -ExplicitPath "" -FallbackPaths @()
 $NodePath = Resolve-ToolPath -Name "node.exe" -ExplicitPath "" -FallbackPaths @()
 $NsisPath = Resolve-ToolPath `
     -Name "makensis" `
@@ -138,7 +139,6 @@ $NsisPath = Resolve-ToolPath `
 
 Write-Output "[INFO] Repo: $RepoRoot"
 Write-Output "[INFO] Version: $ResolvedVersion"
-Write-Output "[INFO] npm: $NpmPath"
 Write-Output "[INFO] makensis: $NsisPath"
 Write-Output "[INFO] Cargo target: $CargoTargetDir"
 
@@ -147,7 +147,9 @@ $ToolRuntimeVerifier = Join-Path $RepoRoot "scripts\verify-tool-runtime.mjs"
 # 用户要求已修复功能不能因构建基线回退；编译前核对服务协议及压缩恢复，复制前后再核对完整资源。
 Invoke-Checked -FilePath $NodePath -Arguments @($BuildInputVerifier, $RepoRoot, "--source-only") -WorkingDirectory $RepoRoot
 Invoke-Checked -FilePath $NodePath -Arguments @($ToolRuntimeVerifier, $RepoRoot, "--source-only") -WorkingDirectory $RepoRoot
-Invoke-Checked -FilePath $NpmPath -Arguments @("run", "build") -WorkingDirectory $ManagementDir
+# 用户要求日常编译提速：安装包默认仍用 release 完整优化；显式 -Profile release-fast 仅用于本机调试包。
+# 客户端入口负责共享管理前端的摘要复用与单次 Cargo 构建，并同时生成经过 PE 校验的便携程序。
+& (Join-Path $RepoRoot "scripts\build-windows-client.ps1") -Version $ResolvedVersion -Profile $Profile
 Invoke-Checked -FilePath $NodePath -Arguments @($BuildInputVerifier, $RepoRoot, $ReleaseDir) -WorkingDirectory $RepoRoot
 
 New-Item -ItemType Directory -Path $DistAppDir -Force | Out-Null
@@ -174,8 +176,10 @@ foreach ($artifact in @($ClientExe)) {
     }
     # target/release 中的 exe 与 deps 产物是硬链接，需先删除再复制，避免改写 cargo 缓存
     $mirrorPath = Join-Path $ReleaseMirrorDir (Split-Path -Leaf $artifact)
-    Remove-Item -LiteralPath $mirrorPath -Force -ErrorAction SilentlyContinue
-    Copy-Item -LiteralPath $artifact -Destination $mirrorPath -Force
+    if ([IO.Path]::GetFullPath($mirrorPath) -ne [IO.Path]::GetFullPath($artifact)) {
+        Remove-Item -LiteralPath $mirrorPath -Force -ErrorAction SilentlyContinue
+        Copy-Item -LiteralPath $artifact -Destination $mirrorPath -Force
+    }
     Copy-Item -LiteralPath $artifact -Destination $DistAppDir -Force
 }
 
@@ -183,10 +187,6 @@ foreach ($artifact in @($ClientExe)) {
 Invoke-Checked -FilePath $NodePath -Arguments @($ToolRuntimeVerifier, $RepoRoot, "--embedded", $ClientExe) -WorkingDirectory $RepoRoot
 Invoke-Checked -FilePath $NodePath -Arguments @($ToolRuntimeVerifier, $RepoRoot, "--embedded", (Join-Path $DistAppDir "elves.exe")) -WorkingDirectory $RepoRoot
 Invoke-Checked -FilePath $NodePath -Arguments @($BuildInputVerifier, $RepoRoot, $DistAppDir) -WorkingDirectory $RepoRoot
-
-# 校验独立客户端为 x64 GUI 程序，并保留单独交付的便携 EXE；安装包同时嵌入上述同一份客户端。
-& (Join-Path $RepoRoot "scripts\build-windows-client.ps1") `
-    -Version $ResolvedVersion -Profile "release-fast" -SkipBuild -BinaryDirectory $ReleaseDir
 
 Invoke-Checked `
     -FilePath $NsisPath `

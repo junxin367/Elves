@@ -1,6 +1,8 @@
 param(
     [string]$Version = "",
     [string]$MakensisPath = "",
+    [ValidateSet("release", "release-fast")]
+    [string]$Profile = "release",
     [string]$AndroidJavaHome = "",
     [string]$AndroidSdkHome = "",
     [string]$AndroidGradlePath = ""
@@ -12,7 +14,7 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSCommandPath
 $BuildScript = Join-Path $RepoRoot "scripts\build-windows-installer.ps1"
 
-& $BuildScript -Version $Version -MakensisPath $MakensisPath
+& $BuildScript -Version $Version -MakensisPath $MakensisPath -Profile $Profile
 $windowsExitCode = $LASTEXITCODE
 if ($windowsExitCode -ne 0) {
     exit $windowsExitCode

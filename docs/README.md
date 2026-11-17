@@ -20,6 +20,7 @@
 - [产品规范](product-standards.md)：已确认的功能、交互和跨端约束。
 - [Elves 与 Harness 架构](harness-architecture.md)：代码边界、启动、本地代理和本机/远程隔离。
 - [工作区网页架构](harness-web-architecture.md)：模块分层、共享管理前端及网页资源构建。
+- [构建性能](build-performance.md)：日常与正式编译配置、前端内容缓存及实测方法。
 - [Harness Codex 执行](remote-service-mode.md)：独立 app-server、权限、回执及原生执行边界。
 - [功能需求条目](harness-product-features.md)：按用户任务组织的功能与交互条目。
 - [协议代理压缩](context-compaction.md)、[web_search](protocol-proxy-web-search.md)：协议代理的对应行为与兼容规则。

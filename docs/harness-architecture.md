@@ -7,6 +7,7 @@ Elves 是用户安装的桌面产品。Harness 是独立执行和管理产品，
 | 目录 | 责任 |
 | --- | --- |
 | `apps/elves/` | 唯一 Windows 程序、原生窗口、启动和本机文件能力 |
+| `crates/elves-assets/` | 客户端与 Harness 共用的内嵌网页资源，不包含执行或授权逻辑 |
 | `crates/elves-harness/` | Harness 服务、Codex app-server、Claude CLI、管理命令及远程授权 |
 | `crates/elves-core/` | 设置、模型能力、协议代理及原生供应商配置 |
 | `crates/elves-data/` | 会话目录、SQLite、Markdown 和供应商数据同步 |
@@ -14,7 +15,7 @@ Elves 是用户安装的桌面产品。Harness 是独立执行和管理产品，
 | `assets/harness/` | Elves 与 Harness 网页共用的工作区资源 |
 | `apps/elves-android/` | Android 远程接入容器，保留正式签名和 applicationId |
 
-依赖方向为客户端调用 Harness，Harness 使用 core 与 data，data 使用 core。core 不依赖 Harness 或桌面窗口。管理接口使用固定白名单；所有执行仍经过目标原生实例，禁止桥接 Codex App。
+依赖方向为客户端调用 Harness，Harness 使用 core 与 data，data 使用 core；客户端与 Harness 共用 assets。core 不依赖 Harness 或桌面窗口。管理接口使用固定白名单；所有执行仍经过目标原生实例，禁止桥接 Codex App。
 
 ## 启动与代理
 

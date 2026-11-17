@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 base64.workspace = true
+elves-assets = { path = "../../../crates/elves-assets" }
 elves-core = { path = "../../../crates/elves-core" }
 elves-harness = { path = "../../../crates/elves-harness" }
 directories.workspace = true

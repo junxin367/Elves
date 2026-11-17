@@ -1,8 +1,7 @@
 // Harness 工作区资源清单的唯一规则：assets/harness 目录下的每个公开网页文件都是版本壳资源，
 // 新增或拆分模块只需放进该目录，无需逐处登记。以下实现按同一规则从目录生成清单，修改规则时须同步核对：
-// - crates/elves-harness/build.rs（服务端内嵌资源与静态路由）
+// - crates/elves-assets/build.rs（Harness 与 Windows 客户端共用的内嵌资源表）
 // - apps/elves-android/app/build.gradle（APK 内置网页包）
-// - apps/elves/src-tauri/build.rs（Windows 独立客户端内置网页包）
 // - scripts/dev-harness.mjs（本机调试服务器）
 // 规则：按扩展名确定 MIME，index.html 提供为 "/"；缓存恢复页及脚本独立提供、不进入版本清单；
 // 其余扩展名（版本号、许可证文本等）不作为网页资源。

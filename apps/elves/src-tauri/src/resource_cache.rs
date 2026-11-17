@@ -12,10 +12,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 
-mod bundled {
-    include!(concat!(env!("OUT_DIR"), "/bundled_resources.rs"));
-}
-
 // 用户要求与 Android 一样校验并缓存公开网页资源；单文件 12MiB、整包 32MiB、最多 512 项，与 Android 清单限制同步。
 const MAX_FILE: usize = 12 * 1024 * 1024;
 const MAX_TOTAL: u64 = 32 * 1024 * 1024;
@@ -158,9 +154,10 @@ impl Snapshot {
     }
     fn bundled() -> Self {
         let mut files = BTreeMap::new();
-        let entries: Vec<_> = bundled::bundled_files()
-            .into_iter()
-            .map(|(path, mime, bytes)| {
+        // 与 Harness 共用同一内嵌资源表，避免网页改动在两个大型 crate 中重复编译。
+        let entries: Vec<_> = elves_assets::web_assets()
+            .iter()
+            .map(|&(path, mime, bytes)| {
                 files.insert(path.to_owned(), Arc::from(bytes));
                 Resource {
                     path: path.into(),
@@ -173,7 +170,7 @@ impl Snapshot {
         let manifest = Manifest {
             schema_version: 1,
             min_shell_version: 1,
-            revision: bundled::BUNDLED_REVISION,
+            revision: elves_assets::resource_revision(),
             version: manifest_version(&entries),
             files: entries,
         };
@@ -929,7 +926,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let cache = ResourceCache::new(directory.path().into()).unwrap();
         cache.enable();
-        let mut updated = sample(bundled::BUNDLED_REVISION + 1, "complete-new-page");
+        let mut updated = sample(elves_assets::resource_revision() + 1, "complete-new-page");
         let management: Arc<[u8]> = Arc::from(&b"private-management-page"[..]);
         let mut updated_manifest = updated.manifest.as_ref().clone();
         updated_manifest.files.push(Resource {

@@ -76,16 +76,19 @@ npm --prefix apps/elves-management run check
 cargo fmt --all -- --check
 cargo check --workspace --locked
 
-# 构建管理页面、Elves 客户端、Windows 安装包和便携版
+# 日常编译：检查网页资源、按内容复用管理前端，再增量构建客户端和便携版
+.\scripts\build-windows-client.ps1
+
+# 需要完整优化的客户端时
+.\scripts\build-windows-client.ps1 -Profile release
+
+# 仅在需要安装包时构建；默认使用 release 完整优化
 .\scripts\build-windows-installer.ps1
 ```
 
-产物位于 `dist/windows/`。该入口不附带 Android 构建。只构建客户端时，先生成共享管理页面：
+产物位于 `dist/windows/`，以上入口均不附带 Android 构建。日常 `release-fast` 只对项目自身 crate 使用较轻的优化；正式 `release` 保持完整优化。网页资源只在 `elves-assets` 中嵌入一次，供客户端和 Harness 共用。
 
-```powershell
-npm --prefix apps/elves-management run vite:build
-.\scripts\build-windows-client.ps1
-```
+仅构建共享管理页面时，使用 `npm --prefix apps/elves-management run build:frontend`；它同时核对源码、配置、依赖及生成文件的内容摘要，任一变化都会重建。使用 `run build:frontend -- --force` 或原有 `run vite:build` 可强制重建。构建配置与实测方法见[构建性能说明](docs/build-performance.md)。
 
 | 目录 | 责任 |
 | --- | --- |
