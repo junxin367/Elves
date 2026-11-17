@@ -1,19 +1,55 @@
 use std::ffi::OsStr;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
+use std::path::Path;
 use std::process::Command;
 
 use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Threading::GetProcessId;
+use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
     SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
-    ShellExecuteExW,
+    SHOpenFolderAndSelectItems, SHParseDisplayName, ShellExecuteExW,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::PCWSTR;
 
 fn wide(value: &OsStr) -> Vec<u16> {
     value.encode_wide().chain([0]).collect()
+}
+
+struct ShellFileItem(*mut ITEMIDLIST);
+
+impl ShellFileItem {
+    fn parse(path: &Path) -> io::Result<Self> {
+        // 文件协议的相对路径使用 /；交给 Windows Shell 前转换为 \，仍使用已经校验过的根目录和原文件。
+        let path = wide(OsStr::new(&super::display_path(path).replace('/', r"\")));
+        let mut item = std::ptr::null_mut();
+        unsafe { SHParseDisplayName(PCWSTR(path.as_ptr()), None, &mut item, 0, None) }
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        if item.is_null() {
+            return Err(io::Error::other("无法取得所选文件的原生位置"));
+        }
+        Ok(Self(item))
+    }
+}
+
+impl Drop for ShellFileItem {
+    fn drop(&mut self) {
+        unsafe { CoTaskMemFree(Some(self.0.cast())) };
+    }
+}
+
+pub(super) fn reveal_file(path: &Path) -> io::Result<()> {
+    let _apartment = crate::windows_integration::ComApartment::init()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let item = ShellFileItem::parse(path)?;
+    // 用户要求打开所点文件所在目录并选中文件；直接使用已校验文件的完整 Shell 身份，
+    // cidl=0 表示定位该文件，避免 /select 被通用参数转义后误解析并退回“文档”等默认目录。
+    // 解析或定位失败必须报错，不另开工作区根目录或自动重试。
+    unsafe { SHOpenFolderAndSelectItems(item.0, None, 0) }
+        .map_err(|error| io::Error::other(error.to_string()))
 }
 
 // ShellExecute 只接受参数字符串；按 Windows argv 规则转义每个独立参数，路径中的引号和尾部反斜杠不能变成额外命令。
@@ -126,5 +162,39 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn shell_file_items_preserve_exact_paths_with_spaces_unicode_and_commas() {
+        use windows::Win32::UI::Shell::{SHGetNameFromIDList, SIGDN_FILESYSPATH};
+
+        let _apartment = crate::windows_integration::ComApartment::init().unwrap();
+        let temp_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../temp");
+        std::fs::create_dir_all(&temp_root).unwrap();
+        let temp_root = std::fs::canonicalize(temp_root).unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("explorer-selection-")
+            .tempdir_in(temp_root)
+            .unwrap();
+        for relative in ["plain.txt", "子目录 with spaces/文档,a;b #1.md"] {
+            let file = directory.path().join(relative);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, b"shell file identity").unwrap();
+            for path in [
+                file.clone(),
+                std::path::PathBuf::from(super::super::display_path(&file).replace('\\', "/")),
+            ] {
+                let item = ShellFileItem::parse(&path)
+                    .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+                let name = unsafe { SHGetNameFromIDList(item.0, SIGDN_FILESYSPATH) }.unwrap();
+                let actual = unsafe { name.to_string() };
+                unsafe { CoTaskMemFree(Some(name.0.cast())) };
+                assert_eq!(
+                    std::fs::canonicalize(actual.unwrap()).unwrap(),
+                    std::fs::canonicalize(&file).unwrap()
+                );
+            }
+        }
+        assert!(ShellFileItem::parse(&directory.path().join("missing.md")).is_err());
     }
 }

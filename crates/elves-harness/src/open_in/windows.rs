@@ -461,10 +461,6 @@ fn command(
             // GitHub Desktop 原生 CLI 使用 --cli-open；--path 只会启动程序而不会切到指定仓库。
             command.arg("--cli-open").arg(display_path(root));
         }
-        "fileManager" if file.is_some() => {
-            // 用户要求在 File Explorer 定位所点文件；固定 /select 参数与路径作为一个参数，不经 shell 拼接执行。
-            command.arg(format!("/select,{path}"));
-        }
         "gitBash" => {
             command.arg(format!("--cd={directory_path}"));
         }
@@ -530,11 +526,17 @@ pub(super) fn launch(application: &Application, root: &Path) -> Result<LaunchOut
         .as_ref()
         .map(|file| super::super::workspace::open_in_file_path(&file.root, &file.relative))
         .transpose()?;
-    let mut command = command(application, root, terminal.as_deref(), file.as_deref());
     let snapshot = foreground::Snapshot::capture();
     // 用户要求应用/文件夹打开后可见：通过 Windows Shell 正常显示启动，再恢复并激活对应目标窗口；不模拟键盘或修改系统焦点策略。
-    let process_id = start::launch(&mut command)
-        .map_err(|error| ApiError::new(422, &format!("无法启动 {}：{error}", application.label)))?;
+    let process_id = match (application.target, file.as_deref()) {
+        // 正文直达入口与“打开方式”的 Explorer 均定位已校验原文件，不能把 /select 当作普通 argv。
+        ("fileManager", Some(file)) => start::reveal_file(file).map(|()| None),
+        _ => {
+            let mut command = command(application, root, terminal.as_deref(), file.as_deref());
+            start::launch(&mut command)
+        }
+    }
+    .map_err(|error| ApiError::new(422, &format!("无法启动 {}：{error}", application.label)))?;
     let focus = foreground::activate(
         &snapshot,
         application,
@@ -626,7 +628,7 @@ mod tests {
     }
 
     #[test]
-    fn file_editors_receive_exact_file_and_explorer_selects_it_without_a_shell() {
+    fn file_editors_receive_exact_file_and_terminals_use_parent_directory() {
         let root = Path::new(r"E:\repo");
         let file = Path::new(r"E:\repo\子目录 with spaces\a;b.ts");
         for target in ["vscode", "visualStudio", "intellij", "sublimeText", "rider"] {
@@ -639,13 +641,6 @@ mod tests {
             assert_eq!(args(&editor), [file.to_str().unwrap()], "{target}");
             assert_eq!(editor.get_current_dir(), file.parent());
         }
-        let explorer = command(
-            &application("fileManager", r"C:\Windows\explorer.exe"),
-            root,
-            None,
-            Some(file),
-        );
-        assert_eq!(args(&explorer), [format!("/select,{}", file.display())]);
         let bash = command(
             &application("gitBash", r"C:\Apps\git-bash.exe"),
             root,
