@@ -31,7 +31,7 @@ export function togglePopup(trigger) {
   if (activePopup?.trigger === trigger) closePopup(true);
   else openPopup(trigger);
 }
-export function openPopup(trigger, { query = "", edge = null, focus = true, position = null } = {}) {
+export function openPopup(trigger, { query = "", edge = null, focus = true, focusSearch = true, position = null } = {}) {
   if (trigger.disabled || !trigger.isConnected) return;
   closePopup(); closeAppMenus();
   const node = element("div", `ui-popup${trigger.popupClassName ? ` ${trigger.popupClassName}` : ""}`);
@@ -88,7 +88,12 @@ export function openPopup(trigger, { query = "", edge = null, focus = true, posi
   const target = edge === "last" ? enabled.at(-1) : edge === "first" ? enabled[0]
     : selected && !selected.disabled ? selected : enabled[0];
   activePopup.index = Math.max(0, buttons.indexOf(target));
-  if (focus) target?.focus();
+  if (focus) {
+    if (input && focusSearch && trigger.selectFocusSearch?.()) {
+      input.focus({ preventScroll: true });
+      input.setSelectionRange(input.value.length, input.value.length);
+    } else target?.focus();
+  }
   fitPopup();
   node.onkeydown = event => {
     if (event.isComposing || !activePopup) return;

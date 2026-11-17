@@ -6,7 +6,7 @@ import {
 } from "../attachments.js";
 import { prepareRemoteTunnelAccess, remoteChannelRoutes, requestRemote } from "../channels.js";
 import { permissionOptions } from "../permissions.js";
-import { openAndroidBrowser, postPlatformMessage } from "../platform.js";
+import { isAndroidContainer, openAndroidBrowser, postPlatformMessage } from "../platform.js";
 import { createWorkspaceBranch } from "../session-files.js";
 import { mountSessionMenu } from "../session-menu.js";
 import { mountSessionTools } from "../session-tools.js";
@@ -23,7 +23,7 @@ import {
 } from "../core/actions.js";
 import { app, connected, creating, nativeConnectionVersion, selectedId, session, sidebar } from "../core/state.js";
 import { api } from "./api.js";
-import { disposeMainNavigation, mountMainNavigation } from "./main-navigation.js";
+import { disposeMainNavigation, isElvesClient, mountMainNavigation } from "./main-navigation.js";
 import { createManagementPages } from "./management-frame.js";
 import { openAppearance } from "./appearance/dialog.js";
 import { setApprovalSignature } from "./approval-state.js";
@@ -234,6 +234,9 @@ export function shell() {
   const projectSelect = selectControl("project-select", "新会话项目", [], "", "new-chat-project-select", selected =>
     [...(selected?.value ? [icon("folder")] : []), element("span", "select-label", selected?.label || "不在项目中工作")]);
   projectSelect.selectSearchable = true;
+  // 用户要求 PC 点击“选择项目”后可直接输入；Android 和触屏移动网页保留原焦点行为，窄 PC 窗口仍支持搜索聚焦。
+  projectSelect.selectFocusSearch = () => !isAndroidContainer()
+    && (isElvesClient() || matchMedia("(hover: hover) and (pointer: fine)").matches);
   projectSelect.popupClassName = "project-picker-popup";
   projectSelect.popupDirection = "up";
   projectSelect.popupWidth = 400;

@@ -39,7 +39,8 @@ export function createSelectComponent({ element, icon, button, togglePopup, open
       if (node.disabled || event.isComposing) return;
       if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
         event.preventDefault();
-        openPopup(node, { edge: event.key === "Home" ? "first" : event.key === "End" ? "last" : null });
+        // 方向键、Home 和 End 打开继续聚焦选项；点击项目选择器时按其配置聚焦搜索框。
+        openPopup(node, { edge: event.key === "Home" ? "first" : event.key === "End" ? "last" : null, focusSearch: false });
       }
     };
     return node;
