@@ -591,8 +591,11 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
       const target = choices.find(option => option.value === preferred);
       detecting = false;
       if (preferred && (!target || target.disabled)) {
-        if (!target) choices.push({ value: preferred,
-          label: instances.selectOptions.find(option => option.value === preferred)?.label || preferred, disabled: true });
+        if (!target) {
+          const previous = instances.selectOptions.find(option => option.value === preferred);
+          choices.push({ value: preferred, label: previous?.label || preferred,
+            icon: previous?.icon || preferred.split(":")[0], disabled: true });
+        }
         selected = preferred; setSelectOptions(instances, choices, selected);
         record = null; message = "所选实例暂不可用，请重新检测或明确选择其他实例。"; render(); return;
       }

@@ -203,7 +203,7 @@ export function mountInstancePermissions({
   return {
     async show(id = null) {
       if (!alive()) return;
-      const choices = getInstances().map(instance => ({ value: instance.id, label: instance.label,
+      const choices = getInstances().map(instance => ({ value: instance.id, label: instance.label, icon: instance.backend,
         disabled: !!instance.error }));
       selected = choices.some(option => option.value === id) ? id
         : choices.some(option => option.value === selected) ? selected : choices[0]?.value || "";

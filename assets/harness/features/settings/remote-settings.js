@@ -38,11 +38,13 @@ export function mountRemoteSettings(dialog) {
   };
   const renderInstances = () => {
     const old = instance.value;
-    const options = instances.map(value => ({ value: value.id, label: value.label, disabled: !instanceAvailable(value.id) }));
+    const options = instances.map(value => ({ value: value.id, label: value.label, icon: value.backend,
+      disabled: !instanceAvailable(value.id) }));
     if (old && !instances.some(value => value.id === old)) {
       // 实例暂不可用时保留原目标，不能把旧指令和草稿悄悄配给另一个本机/WSL 文件。
-      const label = instance.selectOptions.find(option => option.value === old)?.label || old;
-      options.push({ value: old, label, description: "暂不可用", disabled: true });
+      const previous = instance.selectOptions.find(option => option.value === old);
+      options.push({ value: old, label: previous?.label || old, icon: previous?.icon || old.split(":")[0],
+        description: "暂不可用", disabled: true });
     }
     setSelectOptions(instance, options, old || "codex:local");
   };
@@ -202,12 +204,13 @@ export function mountClaudeRecapSettings({
       const detection = await loadInstances();
       if (!alive() || generation !== version) return;
       const choices = getInstances().filter(instance => instance.backend === "claude")
-        .map(instance => ({ value: instance.id, label: instance.label, disabled: !!instance.error || instance.ready === false }));
+        .map(instance => ({ value: instance.id, label: instance.label, icon: instance.backend,
+          disabled: !!instance.error || instance.ready === false }));
       // 用户要求按实际 Claude 实例控制；保留用户选中的实例，不把失败或迟到结果套用到另一个 WSL 用户。
       if (preferred && (preferred === selected || preferred.startsWith("claude:"))
           && !choices.some(option => option.value === preferred)) {
         choices.push({ value: preferred, label: instances.selectOptions?.find(option => option.value === preferred)?.label || preferred,
-          disabled: true });
+          icon: "claude", disabled: true });
       }
       selected = choices.some(option => option.value === preferred) ? preferred
         : choices.find(option => !option.disabled)?.value || choices[0]?.value || "";

@@ -85,6 +85,8 @@ export function icon(name) {
   };
   const node = element("span", "ui-icon");
   node.setAttribute("aria-hidden", "true");
+  // 用户要求所有实例 Select 保留品牌配色；触发器和下拉选项共用此标记，仅给品牌图标着色。
+  if (["codex", "claude"].includes(name)) node.dataset.backend = name;
   const recent = name === "recent";
   // 沿用官方结形裁剪框和原始路径，只去掉画布留白，避免 16px 图标内的品牌标识被额外缩小。
   const viewBox = name === "codex" ? "118.557 120.758 484.139 479.818" : ["claudeManual", "claudeEdits", "claudePlan", "claudeAuto", "claudeBypass"].includes(name) ? "0 0 20 20" : recent ? "0 0 16 16" : "0 0 24 24";

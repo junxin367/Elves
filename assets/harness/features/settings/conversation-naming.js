@@ -115,8 +115,11 @@ export function mountConversationNaming(page) {
   function renderInstances() {
     const choices = availableSessionInstances().map(instance => ({ value: instance.id,
       label: instance.label, icon: instance.backend, disabled: !instance.ready || !!instance.error }));
-    if (draft?.instanceId && !choices.some(option => option.value === draft.instanceId))
-      choices.push({ value: draft.instanceId, label: draft.instanceId, disabled: true });
+    if (draft?.instanceId && !choices.some(option => option.value === draft.instanceId)) {
+      const previous = instances.selectOptions.find(option => option.value === draft.instanceId);
+      choices.push({ value: draft.instanceId, label: previous?.label || draft.instanceId,
+        icon: previous?.icon || draft.instanceId.split(":")[0], disabled: true });
+    }
     setSelectOptions(instances, choices, draft?.instanceId || "");
   }
   function renderModels() {
