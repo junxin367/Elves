@@ -8,8 +8,13 @@ const appearancePresets = {
   light: { background: "#ffffff", foreground: "#1f1f1f", accent: "#171717", contrast: 45 },
   dark: { background: "#171717", foreground: "#ededed", accent: "#ededed", contrast: 60 }
 };
-// 用户要求主题与明暗模式独立；两套主题分别保存浅色/深色调色，切换主题不覆盖另一套自定义颜色。
+// 用户要求主题与明暗模式独立；各套主题分别保存浅色/深色调色，切换主题不覆盖其他主题的自定义颜色。
 export const appearanceThemes = {
+  // 用户指定截图配色命名为 Elver 并作为默认：两种模式均用绿色强调色；深色对比度 60%，浅色沿用 45%。
+  elver: { label: "Elver", colors: {
+    light: { background: "#ffffff", foreground: "#3b3b3b", accent: "#16a34a", contrast: 45 },
+    dark: { background: "#1e1e1e", foreground: "#cccccc", accent: "#16a34a", contrast: 60 }
+  } },
   chatgpt: { label: "ChatGPT", colors: appearancePresets },
   "vscode-plus": { label: "VS Code Plus", colors: {
     light: { background: "#ffffff", foreground: "#3b3b3b", accent: "#0078d4", contrast: 45 },
@@ -39,7 +44,8 @@ export function defaultAppearance(theme = matchMedia("(prefers-color-scheme: dar
     // 用户要求字体默认参考 Codex：系统界面字体/系统等宽字体，均为 14px；保留已保存字号和独立文件阅读字号。
     fontSize: 14, codeFontSize: 14, uiFont: "", codeFont: "", uiFontWeight: 400, codeFontWeight: 400,
     conversationWidth: conversationWidthDefault, sessionTypes: { codex: true, claude: false }, sessionInstances: null, sessionFilter: "all",
-    themePreset: "chatgpt", palettes, colors: palettes.chatgpt,
+    // 首次使用及“恢复默认外观”均选择 Elver；读取时继续保留已保存的主题和自定义配色。
+    themePreset: "elver", palettes, colors: palettes.elver,
     fileReadingFontSize: fileReadingFontDefault, projectThreadLimit: 5, backgroundOpacity: 35, backgroundFit: "cover" };
 }
 export function readAppearance() {
@@ -50,6 +56,9 @@ export function readAppearance() {
     if (["light", "dark"].includes(saved.theme)) value.theme = saved.theme;
     if (["auto", "manual"].includes(saved.themeMode)) value.themeMode = saved.themeMode;
     if (Object.hasOwn(appearanceThemes, saved.themePreset)) value.themePreset = saved.themePreset;
+    // 主题预设出现前的 colors 属于 ChatGPT；升级默认主题不能把旧配色迁入 Elver。
+    else if (!saved.themePreset && saved.colors && typeof saved.colors === "object" && !Array.isArray(saved.colors))
+      value.themePreset = "chatgpt";
     // 用户要求除外观外跨端共用；旧字段仅由迁移流程读取，不能在连接新服务前恢复成设备独有配置。
     for (const key of ["uiFont", "codeFont"]) if (validFontFamily(saved[key])) value[key] = saved[key].trim();
     for (const key of ["uiFontWeight", "codeFontWeight"])
@@ -310,7 +319,7 @@ export function mixColor(left, right, weight) {
 }
 function appearanceContrast(theme, value) {
   // 对齐 Codex 原生对比度曲线：45/60 是浅/深色默认值，60 是变化灵敏度的分母；
-  // 高于默认值后加倍增强，保持默认表面颜色不变；与两套 appearanceThemes 默认值同步核对。
+  // 高于默认值后加倍增强，保持默认表面颜色不变；与各套 appearanceThemes 默认值同步核对。
   const baseline = theme === "dark" ? 60 : 45;
   const setting = Number.isInteger(value) ? Math.min(100, Math.max(0, value)) : baseline;
   const scaled = setting / 100 + (setting - baseline) / 60 * .7;
