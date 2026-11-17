@@ -1195,7 +1195,7 @@ checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 
 [[package]]
 name = "elves"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1221,7 +1221,7 @@ dependencies = [
 
 [[package]]
 name = "elves-core"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1261,7 +1261,7 @@ dependencies = [
 
 [[package]]
 name = "elves-data"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1278,7 +1278,7 @@ dependencies = [
 
 [[package]]
 name = "elves-harness"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
