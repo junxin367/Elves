@@ -8,6 +8,8 @@ dist/
 target/
 node_modules/
 temp/
+# 用户要求管理页仅跟踪源码：HTML 与带哈希的 JS/CSS 均由前端构建生成，客户端构建前须先准备。
+/assets/harness/management/
 jdk-17.0.20.1+1/
 apps/elves-management/src-tauri/gen/
 apps/elves/src-tauri/gen/

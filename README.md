@@ -73,6 +73,7 @@ Elves 是 Windows 桌面客户端，打开后自动启动本机 Harness 并进�
 ```powershell
 npm --prefix apps/elves-management ci
 npm --prefix apps/elves-management run check
+npm --prefix apps/elves-management run build:frontend
 cargo fmt --all -- --check
 cargo check --workspace --locked
 
@@ -90,13 +91,15 @@ cargo check --workspace --locked
 
 仅构建共享管理页面时，使用 `npm --prefix apps/elves-management run build:frontend`；它同时核对源码、配置、依赖及生成文件的内容摘要，任一变化都会重建。使用 `run build:frontend -- --force` 或原有 `run vite:build` 可强制重建。构建配置与实测方法见[构建性能说明](docs/build-performance.md)。
 
+管理页生成目录 `assets/harness/management/` 不纳入 Git，包括入口 HTML 和带哈希的 JS/CSS。全新检出、清理产物或切换管理页源码后，应先生成前端再运行 Cargo；缺少入口或入口引用的资源时，Rust 构建会明确失败。普通工作区网页源码、品牌图标、第三方运行库及内置插件包继续纳入 Git。
+
 | 目录 | 责任 |
 | --- | --- |
 | `apps/elves/` | 唯一 Windows 程序、原生窗口及本机客户端能力 |
 | `crates/elves-harness/` | Harness 执行、会话、管理及可选远程接入 |
 | `crates/elves-core/`、`crates/elves-data/` | 原生配置、协议代理与会话数据访问 |
 | `assets/harness/` | 桌面与远程入口共用的工作区网页 |
-| `apps/elves-management/` | 共享管理前端，产物提交到 `assets/harness/management/` |
+| `apps/elves-management/` | 共享管理前端源码，构建到 `assets/harness/management/`，产物不入 Git |
 | `apps/elves-android/` | Android 远程接入容器，版本与签名独立维护 |
 
 ## 文档

@@ -19,6 +19,8 @@
 
 缓存位于该前端的 `node_modules/.cache/elves/`。缓存不存在或损坏、产物缺失或被修改时重新构建；构建失败不记录成功缓存。构建期间输入发生变化也不记录本次结果。新增业务目录同样参与摘要，只有 `node_modules` 和 Git 元数据被排除。
 
+管理页源码、配置与依赖锁定文件纳入 Git；`assets/harness/management/` 是被忽略的生成目录，HTML 和哈希资源均不提交。Windows 构建入口和 CI 在 Cargo 前准备前端。直接使用 Cargo 的开发者须先运行上述前端构建；`elves-assets` 会检查管理页入口及其脚本、样式引用，缺失时给出生成命令并终止，避免把不完整资源嵌入程序。
+
 强制重建：
 
 ```powershell

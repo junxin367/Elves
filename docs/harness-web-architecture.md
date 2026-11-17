@@ -60,7 +60,7 @@ Elves 与 Harness 共用工作区网页，位于 `assets/harness/`。会话工�
 
 `features/main-navigation.js` 创建固定 52px 主导航，切换时隐藏而不销毁会话 DOM；`features/management-frame.js` 保留单个管理 iframe，负责页面切换、主题同步、配置更新事件和会话删除回传。因旧容器会为缓存文档返回禁止嵌入响应头，父页读取固定同源 `/management/index.html` 后写入 `srcdoc`；脚本与样式均使用 `/management/` 绝对资源路径，API 沿用当前服务 Cookie。消息须同时检查 Origin、frame 窗口及当前设备，授权变化卸载整个管理页。
 
-管理前端源码位于 `apps/elves-management/src/ManagementApp.tsx`，已有页面组件在 `management-screens.tsx` 中复用；Rust 管理命令位于 `crates/elves-harness/src/management/`，不再生成管理器二进制。前端修改后先运行 `npm --prefix apps/elves-management run check` 和 `run vite:build`，提交源码和生成的 `assets/harness/management/`，再构建内嵌网页的客户端。
+管理前端源码位于 `apps/elves-management/src/ManagementApp.tsx`，已有页面组件在 `management-screens.tsx` 中复用；Rust 管理命令位于 `crates/elves-harness/src/management/`，不再生成管理器二进制。前端修改后先运行 `npm --prefix apps/elves-management run check` 和 `run build:frontend`，再构建内嵌网页的客户端。Git 只保存源码、配置与依赖锁定文件；生成的 `assets/harness/management/` 整体忽略，不提交入口 HTML 或哈希资源。直接运行 Cargo 时若生成资源缺失，构建明确失败并提示先准备前端。
 
 管理 API 固定为 `POST /api/management/{command}`。命令必须登记在白名单，服务执行前复核设备授权；只读远程设备不能通过管理页读取凭据。真实回环中的本机管理授权来自私有管理端点签发的一次性证明，可管理服务以解除只读。配置 revision 覆盖设置及当前 Codex Home 的配置/认证文件，过期版本保存返回 409；事件通知与 15 秒轮询补齐更新，有草稿时提示合并。
 
