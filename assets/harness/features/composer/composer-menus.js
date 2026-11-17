@@ -68,7 +68,9 @@ export function renderModelMenu() {
   };
   const group = element("div", "model-options"); group.setAttribute("role", "group"); group.setAttribute("aria-label", "模型");
   const modelId = currentModelId(), matchedModel = currentModel(), selectedReasoning = currentEffort();
-  const visibleModels = models.filter(model => `${model.displayName || ""} ${model.model}`.toLowerCase().includes(modelQuery.trim().toLowerCase()));
+  // 用户要求 Claude 可按实例隐藏模型；完整目录保留用于当前模型和能力判断，仅过滤可重新选择的条目。
+  const visibleModels = models.filter(model => model.hiddenByInstance !== true
+    && `${model.displayName || ""} ${model.model}`.toLowerCase().includes(modelQuery.trim().toLowerCase()));
   for (const model of visibleModels) group.append(choice(model.displayName || model.model, matchedModel === model, () => {
     if (currentModel() !== model) {
       // 用户要求切换模型不丢弃思考深度，Claude 和 Codex 的已有及新建会话共用此规则。
@@ -80,11 +82,17 @@ export function renderModelMenu() {
     if (creating) rememberNewChatModel(model.model);
     applyModelMenuChoice();
   }, null, `model:${model.model}`));
-  if (modelId && !matchedModel && modelId.toLowerCase().includes(modelQuery.trim().toLowerCase())) {
-    const current = choice(modelId, true, () => {}, "当前会话模型，原生模型列表暂未提供", `model:${modelId}`);
+  if (modelId && (!matchedModel || matchedModel.hiddenByInstance === true)
+      && `${matchedModel?.displayName || ""} ${modelId}`.toLowerCase().includes(modelQuery.trim().toLowerCase())) {
+    const current = choice(matchedModel?.displayName || modelId, true, () => {},
+      matchedModel?.hiddenByInstance === true ? "当前所选模型，已在实例设置中隐藏" : "当前会话模型，原生模型列表暂未提供",
+      `model:${modelId}`);
     current.disabled = true; group.prepend(current);
   }
-  if (!group.children.length) group.append(element("p", "popover-empty muted", models.length ? "没有匹配的模型，请修改搜索条件" : "暂无可选模型，请稍后重试"));
+  if (!group.children.length) group.append(element("p", "popover-empty muted",
+    models.length && models.every(model => model.hiddenByInstance === true)
+      ? "当前实例的模型均已隐藏，可在会话实例设置中恢复显示"
+      : models.length ? "没有匹配的模型，请修改搜索条件" : "暂无可选模型，请稍后重试"));
   menu.append(group);
   const efforts = element("div", "effort-options"); efforts.setAttribute("role", "group"); efforts.setAttribute("aria-label", "思考深度");
   const supportedEfforts = (currentModel()?.supportedReasoningEfforts || []).filter(effort => effort.reasoningEffort !== "minimal");

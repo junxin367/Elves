@@ -1863,7 +1863,7 @@ impl Claude {
             && let Some((at, data)) = self.metadata.lock().await.get(&key)
             && at.elapsed() < MODEL_CATALOG_TTL
         {
-            return Ok(data.clone());
+            return self.model_visibility(&key, data.clone());
         }
         let process = self.catalog_process(config, cwd).await?;
         let data = normalize_models(&process.initialization);
@@ -1874,8 +1874,15 @@ impl Claude {
         self.metadata
             .lock()
             .await
-            .insert(key, (Instant::now(), data.clone()));
-        Ok(data)
+            .insert(key.clone(), (Instant::now(), data.clone()));
+        self.model_visibility(&key, data)
+    }
+
+    fn model_visibility(&self, instance: &str, catalog: Value) -> anyhow::Result<Value> {
+        // 模型能力仍来自同一 WSL CLI；展示偏好按请求时的实例重新叠加，不污染五分钟原生目录缓存。
+        Ok(crate::instance_settings::decorate_claude_model_visibility(
+            &self.directory, instance, catalog,
+        )?)
     }
 
     async fn catalog_process(
@@ -1928,7 +1935,8 @@ impl Claude {
         force: bool,
     ) -> anyhow::Result<Value> {
         if Self::is_subagent_id(id) {
-            return self.subagent_models(id).await;
+            let catalog = self.subagent_models(id).await?;
+            return self.model_visibility(&self.instance_id(id).await?, catalog);
         }
         let c = self.conversation(id).await?;
         let key = c.config.instance_id();
@@ -1936,7 +1944,7 @@ impl Claude {
             && (!include_available || !force && at.elapsed() < MODEL_CATALOG_TTL)
         {
             // 浏览历史只复用实例目录，不启动 CLI；显式打开选择器时按相同有效期核对完整选项。
-            return Ok(data.clone());
+            return self.model_visibility(&key, data.clone());
         }
         let process = self
             .processes
@@ -1951,8 +1959,8 @@ impl Claude {
                 self.metadata
                     .lock()
                     .await
-                    .insert(key, (Instant::now(), data.clone()));
-                return Ok(data);
+                    .insert(key.clone(), (Instant::now(), data.clone()));
+                return self.model_visibility(&key, data);
             }
         }
         if c.discovered && !include_available {
@@ -1968,7 +1976,7 @@ impl Claude {
                 })
                 .into_iter()
                 .collect();
-            return Ok(
+            return self.model_visibility(&key,
                 json!({"ok":true,"backend":"claude","data":rows,"catalogComplete":false,
                 "defaultModel":c.model,"defaultReasoningEffort":c.effort}),
             );

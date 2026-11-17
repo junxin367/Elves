@@ -120,9 +120,15 @@ export function mountConversationNaming(page) {
     setSelectOptions(instances, choices, draft?.instanceId || "");
   }
   function renderModels() {
-    const choices = loadedModels.map(model => ({ value: model.model, label: model.displayName || model.model }));
-    if (draft?.model && !choices.some(option => option.value === draft.model))
-      choices.unshift({ value: draft.model, label: `${draft.model}（请核对可用状态）`, disabled: true });
+    // 模型隐藏偏好只限制选择列表；已有命名配置继续保留，不因隐藏而停用或改投其他模型。
+    const choices = loadedModels.filter(model => model.hiddenByInstance !== true)
+      .map(model => ({ value: model.model, label: model.displayName || model.model }));
+    if (draft?.model && !choices.some(option => option.value === draft.model)) {
+      const current = loadedModels.find(model => model.model === draft.model);
+      choices.unshift({ value: draft.model, label: current?.hiddenByInstance === true
+        ? `${current.displayName || draft.model}（已隐藏，保留当前配置）`
+        : `${draft.model}（请核对可用状态）`, disabled: true });
+    }
     if (!draft?.model || !choices.length) choices.unshift({ value: "", label: loading ? "正在读取命名模型…" : "请选择命名模型" });
     setSelectOptions(models, choices, draft?.model || "");
   }

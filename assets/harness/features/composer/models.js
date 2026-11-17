@@ -44,11 +44,11 @@ export async function loadModels(force = false, { includeAvailable = false } = {
     await modelsPromise.catch(() => {});
     return current() ? loadModels(force, { includeAvailable: true }) : [];
   }
-  const previousModels = models;
   const request = (async () => {
     const result = await api("/api/read/models", { ...context, forceReload: force, includeAvailable });
     if (!current()) return [];
     if (!Array.isArray(result.data) || !result.data.every(model => model && typeof model.model === "string"
+        && (model.hiddenByInstance == null || typeof model.hiddenByInstance === "boolean")
         && (model.supportedReasoningEfforts == null || Array.isArray(model.supportedReasoningEfforts))))
       throw new Error("模型列表返回格式无效");
     // 历史当前模型属于会话展示，不是可用模型目录；不能缓存它或覆盖实例的全局默认值。
@@ -88,7 +88,8 @@ export async function loadModels(force = false, { includeAvailable = false } = {
   finally {
     if (modelsPromise === request) {
       setModelsPromise(null); updateComposer();
-      if (models !== previousModels && $("#model-settings") && !$("#model-settings").hidden) renderModelMenu();
+      // 展示偏好刷新后，即使完整目录暂未返回，也不能让已打开的菜单残留旧的可选模型。
+      if (current() && $("#model-settings") && !$("#model-settings").hidden) renderModelMenu();
       scheduleCatalogRefresh();
     }
   }

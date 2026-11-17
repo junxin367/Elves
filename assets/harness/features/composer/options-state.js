@@ -48,7 +48,8 @@ export function setModelsPromise(value) { return modelsPromise = value; }
 export function setModelsLoadedAt(value) { return modelsLoadedAt = value; }
 // 服务模式改按实际 GPT 模型开放 Fast；旧缓存中的能力否定和缺失档位需重新读取。
 // 用户要求默认隐藏 Ultra；旧目录缓存不能在设置页尚未读取时继续开放该等级。
-export const modelCatalogCacheVersion = 5;
+// Claude 隐藏模型标记随完整目录缓存；旧目录重新读取，避免恢复缓存时短暂显示已隐藏的模型。
+export const modelCatalogCacheVersion = 6;
 export let modelSettingsVersion = 0;
 export function invalidateModelSettings() {
   modelSettingsVersion++;

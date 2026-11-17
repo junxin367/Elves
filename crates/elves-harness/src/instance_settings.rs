@@ -2,7 +2,7 @@
 use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
-use std::{collections::BTreeMap, sync::OnceLock};
+use std::{collections::{BTreeMap, BTreeSet}, sync::OnceLock};
 
 use axum::Json;
 use axum::extract::State;
@@ -44,6 +44,54 @@ fn preferences(directory: &Path) -> Result<(Value, String), ApiError> {
         return Err(ApiError::new(422, "实例偏好文件格式无效，未覆盖原文件"));
     }
     Ok((value, revision))
+}
+
+fn hidden_model_ids(value: &Value) -> Result<Vec<String>, ApiError> {
+    if value.is_null() {
+        return Ok(vec![]);
+    }
+    // 单实例最多 512 个隐藏 ID；每项沿用原生模型字段的 200 字节上限，避免把配置全文误存为名单。
+    let invalid = || ApiError::new(400, "模型隐藏名单需为不重复的模型 ID 列表，最多 512 项");
+    let rows = value.as_array().filter(|rows| rows.len() <= 512).ok_or_else(invalid)?;
+    let mut seen = BTreeSet::new();
+    rows.iter().map(|row| {
+        let id = row.as_str().filter(|id| !id.is_empty() && id.len() <= 200
+            && !id.chars().any(char::is_control)).ok_or_else(invalid)?;
+        if !seen.insert(id) {
+            return Err(invalid());
+        }
+        Ok(id.to_owned())
+    }).collect()
+}
+
+pub(super) fn decorate_claude_model_visibility(
+    directory: &Path,
+    instance: &str,
+    mut catalog: Value,
+) -> Result<Value, ApiError> {
+    let (preference, _) = preferences(directory)?;
+    let hidden = hidden_model_ids(&preference["instances"][instance]["hiddenModelIds"])?;
+    // 用户要求 Claude 默认显示全部模型、允许按实例隐藏；保留原生完整目录及能力，隐藏不能改变已有会话的执行模型。
+    if let Some(rows) = catalog["data"].as_array_mut() {
+        for row in rows {
+            row["hiddenByInstance"] = json!(row["model"].as_str()
+                .is_some_and(|id| hidden.iter().any(|hidden| hidden == id)));
+        }
+    }
+    Ok(catalog)
+}
+
+fn validate_hidden_model_selection(
+    ids: &[String],
+    previous: &[String],
+    catalog: Option<&Value>,
+) -> Result<(), ApiError> {
+    if ids.iter().any(|id| !previous.contains(id) && !catalog.is_some_and(|catalog| {
+        catalog["data"].as_array().is_some_and(|rows| rows.iter().any(|row| row["model"] == id.as_str()))
+    })) {
+        return Err(ApiError::new(409, "待隐藏模型已不在当前实例目录中，请重新读取；恢复显示不受影响"));
+    }
+    Ok(())
 }
 
 pub(super) fn ultra_enabled(directory: &Path, instance: &str) -> Result<bool, ApiError> {
@@ -673,12 +721,13 @@ async fn model_catalog(
     state: &WebState,
     instance: &str,
     authorization: &HarnessAuthorization,
+    force_reload: bool,
 ) -> Result<Value, ApiError> {
     let value = state
         .controller
         .call_authorized(
             "models",
-            json!({"instanceId":instance,"includeAvailable":true,"forceReload":true}),
+            json!({"instanceId":instance,"includeAvailable":true,"forceReload":force_reload}),
             authorization,
         )
         .await
@@ -862,7 +911,8 @@ pub(super) async fn settings(
     // 模型默认值并入会话实例，读取和保存共用当前实例及同一原生配置版本；models 仅保留兼容入口。
     let model_settings = matches!(section, "general" | "models") && !adapter_read_only;
     let mut catalog = if model_settings {
-        match model_catalog(&state, instance, &authorization).await {
+        match model_catalog(&state, instance, &authorization,
+            !(write && payload["settings"].get("hiddenModelIds").is_some())).await {
             Ok(value) => Some(value),
             Err(failure) if section == "general" => {
                 // 合并后模型目录读取失败不能阻断已支持的其他设置；写模型前仍须确认同一实例的目录。
@@ -905,7 +955,19 @@ pub(super) async fn settings(
                 &capabilities["extraSettings"]
             },
         )?;
-        if changes.contains_key("ultraReasoningEnabled") {
+        if changes.contains_key("hiddenModelIds") {
+            if target.backend != "claude" || !matches!(section, "general" | "models") || changes.len() != 1
+                || !changes["hiddenModelIds"].is_array()
+            {
+                return Err(ApiError::new(400, "模型显示设置仅支持单独修改当前 Claude 实例的隐藏名单"));
+            }
+            let ids = hidden_model_ids(&changes["hiddenModelIds"])?;
+            let (preference, _) = preferences(directory)?;
+            let previous = hidden_model_ids(&preference["instances"][instance]["hiddenModelIds"])?;
+            validate_hidden_model_selection(&ids, &previous, catalog.as_ref())?;
+            save_preference(directory, instance, "hiddenModelIds", &json!(ids),
+                payload["expectedPreferenceRevision"].as_str().unwrap_or(""), &authorization).await?;
+        } else if changes.contains_key("ultraReasoningEnabled") {
             if !matches!(section, "general" | "models") || target.backend != "codex" || changes.len() != 1 {
                 return Err(ApiError::new(400, "Ultra 开关需要单独保存"));
             }
@@ -993,6 +1055,7 @@ pub(super) async fn settings(
         if changes.contains_key("ultraReasoningEnabled")
             || changes.contains_key("autoCompactWindow")
             || changes.contains_key("compactionPrompt") && target.backend == "claude"
+            || changes.contains_key("hiddenModelIds")
         {
             state
                 .controller
@@ -1004,7 +1067,7 @@ pub(super) async fn settings(
     if updated && model_settings && catalog.is_some()
         && ["model", "reasoningEffort", "ultraReasoningEnabled"].iter().any(|key| payload["settings"].get(*key).is_some())
     {
-        catalog = Some(model_catalog(&state, instance, &authorization).await?);
+        catalog = Some(model_catalog(&state, instance, &authorization, true).await?);
     }
     let (text, revision) = permissions::read_file(&target.path)?;
     let document = native_document(&target.backend, &text)?;
@@ -1034,6 +1097,10 @@ pub(super) async fn settings(
         let window = &preference["instances"][instance]["autoCompactWindow"];
         validate_compact(window)?;
         values["autoCompactWindow"] = window.clone();
+    }
+    if target.backend == "claude" && matches!(section, "general" | "models") {
+        values["hiddenModelIds"] = json!(hidden_model_ids(
+            &preference["instances"][instance]["hiddenModelIds"])?);
     }
     let mut extra_settings = options::append_view(
         &target.backend,
@@ -1082,7 +1149,11 @@ pub(super) async fn settings(
         } else {""},
         "updated":updated
     });
-    if let Some(catalog) = catalog {
+    if let Some(mut catalog) = catalog {
+        if target.backend == "claude" {
+            // 隐藏名单可能在本次保存中改变；返回前按已确认的新偏好标记，完整模型与能力不变。
+            catalog = decorate_claude_model_visibility(directory, instance, catalog)?;
+        }
         response["models"] = catalog["data"].clone();
         response["effectiveModel"] = catalog["defaultModel"].clone();
     }
@@ -1145,6 +1216,64 @@ pub(super) async fn settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_model_visibility_defaults_to_all_and_preserves_native_catalog() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = json!({"data":[
+            {"model":"first","supportedReasoningEfforts":[{"reasoningEffort":"high"}]},
+            {"model":"second","supportedReasoningEfforts":[]}],
+            "defaultModel":"first","defaultReasoningEffort":"high"});
+        let shown = decorate_claude_model_visibility(directory.path(), "claude:wsl:one", catalog.clone()).unwrap();
+        assert_eq!(shown["data"].as_array().unwrap().len(), 2);
+        assert_eq!(shown["data"][0]["hiddenByInstance"], false);
+        assert_eq!(shown["data"][1]["hiddenByInstance"], false);
+        std::fs::write(directory.path().join(PREFERENCES_FILE),
+            serde_json::to_string(&json!({"instances":{
+                "claude:wsl:one":{"hiddenModelIds":["first"]},
+                "claude:wsl:two":{"hiddenModelIds":["second"]}
+            }})).unwrap()).unwrap();
+        let one = decorate_claude_model_visibility(directory.path(), "claude:wsl:one", catalog.clone()).unwrap();
+        let two = decorate_claude_model_visibility(directory.path(), "claude:wsl:two", catalog.clone()).unwrap();
+        assert_eq!(one["data"][0]["hiddenByInstance"], true);
+        assert_eq!(one["data"][1]["hiddenByInstance"], false);
+        assert_eq!(two["data"][0]["hiddenByInstance"], false);
+        assert_eq!(two["data"][1]["hiddenByInstance"], true);
+        assert_eq!(one["defaultModel"], "first");
+        assert_eq!(one["data"][0]["supportedReasoningEfforts"], catalog["data"][0]["supportedReasoningEfforts"]);
+        assert!(catalog["data"][0]["hiddenByInstance"].is_null(), "原始目录缓存不能被展示偏好污染");
+    }
+
+    #[test]
+    fn claude_model_visibility_new_models_show_and_reset_reuses_native_catalog() {
+        let directory = tempfile::tempdir().unwrap();
+        let preference = directory.path().join(PREFERENCES_FILE);
+        std::fs::write(&preference, r#"{"instances":{"claude:wsl:one":{"hiddenModelIds":["old"]}}}"#).unwrap();
+        let catalog = json!({"data":[{"model":"old"},{"model":"new"}],"catalogComplete":true});
+        let shown = decorate_claude_model_visibility(directory.path(), "claude:wsl:one", catalog.clone()).unwrap();
+        assert_eq!(shown["data"][0]["hiddenByInstance"], true);
+        assert_eq!(shown["data"][1]["hiddenByInstance"], false);
+        std::fs::write(&preference, r#"{"instances":{"claude:wsl:one":{"hiddenModelIds":[]}}}"#).unwrap();
+        let restored = decorate_claude_model_visibility(directory.path(), "claude:wsl:one", catalog).unwrap();
+        assert!(restored["data"].as_array().unwrap().iter().all(|row| row["hiddenByInstance"] == false));
+        assert_eq!(restored["catalogComplete"], true);
+    }
+
+    #[test]
+    fn claude_model_visibility_validates_ids_without_writing_native_settings() {
+        assert_eq!(hidden_model_ids(&Value::Null).unwrap(), Vec::<String>::new());
+        assert!(hidden_model_ids(&json!(["model", "model"])).is_err());
+        assert!(hidden_model_ids(&json!([""])).is_err());
+        assert!(hidden_model_ids(&json!(["bad\nid"])).is_err());
+        assert!(hidden_model_ids(&json!(["x".repeat(201)])).is_err());
+        assert!(hidden_model_ids(&json!((0..513).map(|id| format!("model-{id}")).collect::<Vec<_>>())).is_err());
+        let catalog = json!({"data":[{"model":"present"}]});
+        assert!(validate_hidden_model_selection(&["present".into()], &[], Some(&catalog)).is_ok());
+        assert!(validate_hidden_model_selection(&["unknown".into()], &[], Some(&catalog)).is_err());
+        assert!(validate_hidden_model_selection(&["retired".into()], &["retired".into()], None).is_ok());
+        assert!(validate_hidden_model_selection(&[], &["retired".into()], None).is_ok());
+        assert!(updated_native("claude", "general", "{}", &json!({"hiddenModelIds":["present"]})).is_err());
+    }
 
     #[test]
     fn merged_instance_settings_preserve_model_and_compaction_native_contracts() {

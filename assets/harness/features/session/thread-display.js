@@ -128,6 +128,7 @@ export async function restoreReadViews(value) {
   // 用户要求模型能力共用目录；缺失 Fast 元数据或未过滤 Ultra 的旧缓存必须重新读取。
   if (saved.modelCatalog?.version === modelCatalogCacheVersion && Array.isArray(saved.modelCatalog.models)
       && saved.modelCatalog.models.every(model => model && typeof model.model === "string"
+        && (model.hiddenByInstance == null || typeof model.hiddenByInstance === "boolean")
         && (model.supportedReasoningEfforts == null || Array.isArray(model.supportedReasoningEfforts)))
       && catalogUsable(saved.modelCatalog)) {
     setModels(saved.modelCatalog.models);

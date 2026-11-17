@@ -91,6 +91,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
   setSelectedInstance = () => {} }) {
   const scope = privateInputScope(session);
   let disposed = false, selected = "", record = null, detecting = false, loading = false, saving = false, needsRead = false;
+  let pendingModelFocus = null;
   let generation = 0, readController = null, message = "", externalRefresh = false;
   const alive = () => !disposed && page.isConnected && scope === privateInputScope(session);
   const writable = () => alive() && connected && session && !session.readOnly && !record?.readOnly
@@ -207,9 +208,11 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     const values = record.settings;
     const card = section(content, "实例默认值");
     const models = record.models || [];
+    const hidden = record.backend === "claude" ? values.hiddenModelIds || [] : [];
     addSelect(card, "model", "默认模型", record.backend === "codex" ? "切换默认模型后，默认思考深度恢复为“使用模型默认”。" : "",
       [inherit,
-        ...models.map(model => ({ value: model.model, label: model.displayName || model.model }))],
+        ...models.filter(model => !hidden.includes(model.model))
+          .map(model => ({ value: model.model, label: model.displayName || model.model }))],
       values.model || "", value => value === "" ? null : value);
     const modelId = values.model || record.effectiveModel;
     // 已配置的模型退出目录时不能借用另一个模型的能力；仍允许用户重选模型或移除失效覆盖。
@@ -232,6 +235,38 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
       const reasoning = section(content, "思考深度");
       addSwitch(reasoning, "ultraReasoningEnabled", "开放 Ultra 思考深度",
         "默认关闭；开启后，仅在支持的 Codex 模型中显示 Ultra。", values.ultraReasoningEnabled);
+    }
+  }
+  function renderModelVisibility() {
+    if (record.backend !== "claude" || !Array.isArray(record.settings.hiddenModelIds)) return;
+    const owner = record, ownerId = selected, hidden = record.settings.hiddenModelIds, models = record.models || [];
+    const card = section(content, "显示模型", "claude");
+    const reset = button("全部显示", "显示当前实例的全部模型", () => {
+      if (record === owner && selected === ownerId && reset.isConnected && hidden.length)
+        void save({ hiddenModelIds: [] });
+    }, "text-button");
+    reset.settingsUnsupported = !hidden.length; controls.add(reset);
+    const summary = element("div", "appearance-field");
+    summary.append(fieldCopy("模型列表",
+      "默认显示全部；关闭某项后，仅从此实例的模型选择列表隐藏。新增模型自动显示，已有会话保留当前模型。"), reset);
+    card.append(summary);
+    if (!models.length) card.append(element("p", "appearance-hint",
+      "尚未取得当前实例的完整模型目录；可以先恢复全部显示，再重新读取。"));
+    // 完整原生目录仍保留在设置页，隐藏名单只按当前实例保存，不能变成全局模型白名单或修改 Claude 配置。
+    for (const model of models) {
+      const label = model.displayName || model.model;
+      const row = element("label", "appearance-field");
+      const control = switchControl(`显示模型 ${label}`, !hidden.includes(model.model));
+      control.dataset.modelVisibilityId = model.model;
+      control.onchange = () => {
+        if (record !== owner || selected !== ownerId || !control.isConnected) return;
+        const next = new Set(hidden);
+        control.checked ? next.delete(model.model) : next.add(model.model);
+        pendingModelFocus = { instanceId: ownerId, model: model.model };
+        void save({ hiddenModelIds: [...next] });
+      };
+      row.append(fieldCopy(label, label === model.model ? "" : model.model), control);
+      controls.add(control); card.append(row);
     }
   }
   function renderInventory() {
@@ -358,6 +393,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
       if (name === "general") {
         // 合并页面只读取当前实例的一份设置；旧服务未返回模型目录时仍可显示已有常规配置。
         if (Array.isArray(record.models)) renderModels();
+        renderModelVisibility();
         renderGeneral();
       }
       else if (name === "models") renderModels();
@@ -366,6 +402,11 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
       if (record.readOnly || session?.readOnly) message ||= record.readOnlyReason || "当前为只读访问";
     }
     sync();
+    if (pendingModelFocus && !saving && !loading && selected === pendingModelFocus.instanceId) {
+      const control = [...controls].find(control => control.dataset?.modelVisibilityId === pendingModelFocus.model);
+      if (control && !control.disabled) control.focus({ preventScroll: true });
+      pendingModelFocus = null;
+    }
   }
   function checkedResult(result, id) {
     if (!result || result.ok === false || result.instanceId !== id || result.backend !== currentInstance()?.backend
@@ -374,6 +415,12 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
         || !result.settings || Array.isArray(result.settings) || typeof result.settings !== "object")
       throw new Error("实例设置返回结果无法确认，请重新读取。");
     const values = result.settings;
+    if (result.backend === "claude" && values.hiddenModelIds != null
+        && (!Array.isArray(values.hiddenModelIds) || values.hiddenModelIds.length > 512
+          || new Set(values.hiddenModelIds).size !== values.hiddenModelIds.length
+          || values.hiddenModelIds.some(id => typeof id !== "string" || !id.length || id.length > 200
+            || /[\u0000-\u001f\u007f]/u.test(id))))
+      throw new Error("实例模型显示设置返回格式无效，请重新读取。");
     if (result.extraSettings != null && (!Array.isArray(result.extraSettings)
         || result.extraSettings.length > 100 || result.extraSettings.some(option =>
           !option || typeof option.id !== "string" || typeof option.label !== "string"
@@ -412,6 +459,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     }
     if (name === "models" || name === "general" && result.models != null) {
       if (!Array.isArray(result.models) || result.models.some(model => !model || typeof model.model !== "string"
+            || model.hiddenByInstance != null && typeof model.hiddenByInstance !== "boolean"
             || model.displayName != null && typeof model.displayName !== "string"
             || model.supportedReasoningEfforts != null && (!Array.isArray(model.supportedReasoningEfforts)
               || model.supportedReasoningEfforts.some(effort => !effort || typeof effort.reasoningEffort !== "string")))
@@ -470,13 +518,15 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
         const actual = key === "enabled" ? record.inventory?.enabled
           : ["skill", "server"].includes(key) ? record.inventory?.data?.find(row => row.id === value.id)?.enabled
             : record.settings[key === "effortLevel" ? "reasoningEffort" : key];
-        if (actual !== (["skill", "server"].includes(key) ? value.enabled : value))
+        if (key === "hiddenModelIds" ? JSON.stringify(actual) !== JSON.stringify(value)
+          : actual !== (["skill", "server"].includes(key) ? value.enabled : value))
           throw new Error("保存结果与所选设置不一致，请重新读取核对。");
         const draftKey = JSON.stringify([id, key]), draft = textDrafts.get(draftKey);
         if (value === null || draft?.value === value) textDrafts.delete(draftKey);
       }
       if (name === "models" || name === "general"
-          && ["model", "reasoningEffort", "ultraReasoningEnabled", "defaultServiceTier"].some(key => Object.hasOwn(settings, key))) {
+          && ["model", "reasoningEffort", "ultraReasoningEnabled", "defaultServiceTier", "hiddenModelIds"]
+            .some(key => Object.hasOwn(settings, key))) {
         // 已确认的配置变更即使设置窗口已关闭也须失效缓存；其他实例的旧磁盘目录同样不能在下次启动恢复。
         const removed = readCache.remove(scope, "models", id === "codex:local" ? "global" : id).catch(() => {});
         if (id === activeInstanceId()) {
@@ -485,14 +535,17 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
             setSelectedEffort("");
           invalidateModelSettings(); updateComposer();
           void removed.then(() => {
-            if (scope === privateInputScope(session) && id === activeInstanceId()) return loadModels(true);
+            if (scope === privateInputScope(session) && id === activeInstanceId())
+              return loadModels(!Object.hasOwn(settings, "hiddenModelIds"));
           }).catch(() => {});
         }
       } else if (name === "skills") {
         // 用户修改原生 Skill 后及时撤销旧补全缓存；只为当前实例主动重读，不借用其他会话的环境探测。
         void refreshSkillCatalog({ reload: id === activeInstanceId() }).catch(() => {});
       }
-      if (alive()) message = "已保存，新会话或重新加载后生效。";
+      if (alive()) message = Object.hasOwn(settings, "hiddenModelIds")
+        ? "模型显示设置已保存，已有会话继续使用当前模型。"
+        : "已保存，新会话或重新加载后生效。";
     } catch (error) {
       if (alive() && selected === id) {
         record = before; needsRead = true;
