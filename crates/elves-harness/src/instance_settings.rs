@@ -126,6 +126,16 @@ pub(super) fn ultra_enabled(directory: &Path, instance: &str) -> Result<bool, Ap
     }
 }
 
+pub(super) fn persistent_sides_enabled(directory: &Path, instance: &str) -> Result<bool, ApiError> {
+    let (value, _) = preferences(directory)?;
+    // 用户要求持久侧边默认关闭；这是按实例共享的 Harness 偏好，只影响之后新建的侧边。
+    match &value["instances"][instance]["persistentSideThreads"] {
+        Value::Null => Ok(false),
+        Value::Bool(enabled) => Ok(*enabled),
+        _ => Err(ApiError::new(422, "持久侧边配置无效，请重新读取实例设置")),
+    }
+}
+
 pub(super) fn filter_model_rows(models: &mut [Value], enabled: bool) {
     if enabled {
         return;
@@ -997,6 +1007,18 @@ pub(super) async fn settings(
             // 默认深度属于 Harness 实例偏好，后续新会话经原生控制接口交给 CLI 的 --effort；不伪造 settings.json 键。
             save_preference(directory, instance, "defaultReasoningEffort", value,
                 payload["expectedPreferenceRevision"].as_str().unwrap_or(""), &authorization).await?;
+        } else if changes.contains_key("persistentSideThreads") {
+            if section != "general" || target.backend != "codex" || changes.len() != 1
+                || !changes["persistentSideThreads"].is_boolean()
+            {
+                return Err(ApiError::new(400, "持久侧边开关需要单独保存布尔值"));
+            }
+            if changes["persistentSideThreads"] == true {
+                state.controller.harness.require_persistent_sides().await
+                    .map_err(super::authorization_error)?;
+            }
+            save_preference(directory, instance, "persistentSideThreads", &changes["persistentSideThreads"],
+                payload["expectedPreferenceRevision"].as_str().unwrap_or(""), &authorization).await?;
         } else if changes.contains_key("ultraReasoningEnabled") {
             if !matches!(section, "general" | "models") || target.backend != "codex" || changes.len() != 1 {
                 return Err(ApiError::new(400, "Ultra 开关需要单独保存"));
@@ -1083,6 +1105,7 @@ pub(super) async fn settings(
             save_native(&target, &text, &revision, &payload, &authorization).await?;
         }
         if changes.contains_key("ultraReasoningEnabled")
+            || changes.contains_key("persistentSideThreads")
             || changes.contains_key("autoCompactWindow")
             || changes.contains_key("compactionPrompt") && target.backend == "claude"
             || changes.contains_key("hiddenModelIds")
@@ -1114,6 +1137,9 @@ pub(super) async fn settings(
         }),
         _ => json!({}),
     };
+    if target.backend == "codex" && section == "general" {
+        values["persistentSideThreads"] = json!(persistent_sides_enabled(directory, instance)?);
+    }
     if section == "general" && model_settings {
         let defaults = json!({
             "model":document["model"],
@@ -1249,6 +1275,19 @@ pub(super) async fn settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_persistent_sides_default_off_and_preferences_are_instance_scoped() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(!persistent_sides_enabled(directory.path(), "codex:local").unwrap());
+        std::fs::write(directory.path().join(PREFERENCES_FILE),
+            r#"{"instances":{"codex:local":{"persistentSideThreads":true},"codex:other":{"persistentSideThreads":false}}}"#).unwrap();
+        assert!(persistent_sides_enabled(directory.path(), "codex:local").unwrap());
+        assert!(!persistent_sides_enabled(directory.path(), "codex:other").unwrap());
+        std::fs::write(directory.path().join(PREFERENCES_FILE),
+            r#"{"instances":{"codex:local":{"persistentSideThreads":"true"}}}"#).unwrap();
+        assert!(persistent_sides_enabled(directory.path(), "codex:local").is_err());
+    }
 
     #[test]
     fn claude_model_visibility_defaults_to_all_and_preserves_native_catalog() {

@@ -113,6 +113,8 @@ pub(super) struct Data {
     pub settings: BTreeMap<String, Value>,
     // 持久分支保留可点击的来源和家族标题；临时侧边不写入此表。
     pub fork_sources: BTreeMap<String, Value>,
+    // 持久侧边只保存创建时权限与协作模式；正文、父子关系与历史由原生 attached thread 持有。
+    pub persistent_sides: BTreeMap<String, super::persistent_sides::PersistentSide>,
     pub answered_questions: BTreeMap<String, Value>,
     pub thread_devices: BTreeMap<String, String>,
     pub queue_gates: BTreeMap<String, QueueGate>,

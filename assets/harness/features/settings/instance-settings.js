@@ -185,6 +185,11 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
       ]) addSwitch(card, key, label, description, values[key]);
       content.append(element("p", "appearance-hint",
         "仅修改所选实例的原生配置，新会话或重新加载后生效。"));
+      // 用户要求按 Codex 实例提供默认关闭的持久侧边开关；旧服务缺字段时禁用，不能假装已支持。
+      const sides = section(content, "侧边会话");
+      addSwitch(sides, "persistentSideThreads", "持久侧边会话",
+        "默认关闭。开启后新建的侧边会保留历史，可在关闭标签或服务重启后重新打开；已有侧边不转换。",
+        values.persistentSideThreads === true, typeof values.persistentSideThreads !== "boolean");
     } else {
       addSwitch(card, "awaySummaryEnabled", "离开期间回顾",
         "离开后返回时自动回顾会话进展；关闭后保留已有回顾。", values.awaySummaryEnabled);
@@ -466,6 +471,9 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
         : ["awaySummaryEnabled", "promptSuggestionEnabled"];
       if (keys.some(key => !Object.hasOwn(values, key) || values[key] !== null && typeof values[key] !== "boolean"))
         throw new Error("实例常规设置字段不完整，请重新读取。");
+      if (result.backend === "codex" && Object.hasOwn(values, "persistentSideThreads")
+          && typeof values.persistentSideThreads !== "boolean")
+        throw new Error("持久侧边开关字段无效，请重新读取。");
       if (result.backend === "claude" && (!Object.hasOwn(values, "autoCompactWindow")
           || values.autoCompactWindow !== null && values.autoCompactWindow !== "auto"
             && !(Number.isInteger(values.autoCompactWindow) && values.autoCompactWindow >= 100000

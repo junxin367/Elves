@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 use super::super::HarnessAuthorization;
 use super::store::{Edit, Queued};
 use super::{CodexHarness, error, required, sent_key};
-use crate::codex_service::normalize_thread_response;
+use crate::codex_service::{attached_parent_id, normalize_session_response, normalize_thread_response};
 
 impl CodexHarness {
     pub(super) async fn command(
@@ -26,11 +26,7 @@ impl CodexHarness {
         if action == "createSideThread" {
             return self.create_side(&payload, authorization).await;
         }
-        if action == "closeSideThread"
-            || self
-                .known_side(payload["threadId"].as_str().unwrap_or(""))
-                .await
-        {
+        if self.known_side(payload["threadId"].as_str().unwrap_or("")).await {
             return self.side_command(action, &payload, authorization).await;
         }
         if action == "pinThread"
@@ -67,7 +63,28 @@ impl CodexHarness {
                 None,
             )
             .await?;
-        normalize_thread_response(&identity)?;
+        normalize_session_response(&identity)?;
+        if let Some(parent) = attached_parent_id(&identity["thread"]) {
+            if action == "closeSideThread" {
+                if payload["parentThreadId"] != parent {
+                    return Err(error(409, "持久侧边的父会话关系已变化"));
+                }
+                // 用户要求关闭持久侧边标签保留历史；不停止任务、不清队列，也不把原生线程标成已删除。
+                return Ok(json!({"ok":true,"threadId":id,"parentThreadId":parent,
+                    "closed":true,"ephemeral":false,"historyRetained":true}));
+            }
+            if !matches!(action, "send" | "stop" | "compact" | "rename" | "markRead" | "setGoal"
+                | "updateGoal" | "approve" | "answer" | "removeQueued" | "reorderQueued"
+                | "beginQueuedEdit" | "editQueued" | "cancelQueuedEdit" | "dismissQueuedEdit" | "steerQueued")
+            {
+                return Err(error(409, "持久侧边不支持此操作，请返回主会话"));
+            }
+            if action != "markRead" {
+                self.persistent_snapshot(&identity["thread"]).await?;
+            }
+        } else if action == "closeSideThread" {
+            return Err(error(409, "此会话不是侧边会话"));
+        }
         if action == "answer" && payload["method"] == "remote/requestUserInputAsync" {
             return self.answer_async(&id, &payload, authorization).await;
         }
@@ -424,7 +441,7 @@ impl CodexHarness {
                     None,
                 )
                 .await?;
-            normalize_thread_response(&fresh)?;
+            normalize_session_response(&fresh)?;
             // 准备之后再检查；只有此时明确开始执行，才把本次意图转换为真正的队列消息。
             if self.send_is_running(id, &fresh["thread"]).await? {
                 deferred_anchor = Some(self.queue_anchor(id).await.unwrap_or((None, false)));
@@ -528,7 +545,9 @@ impl CodexHarness {
             .unwrap_or("")
             .to_owned();
         // 会话菜单只覆盖后续新轮次；steer 不更改正在执行的轮次权限。
-        super::super::permissions::apply_codex(payload, &mut params, &cwd, false)?;
+        if !self.store.lock().await.data.persistent_sides.contains_key(id) {
+            super::super::permissions::apply_codex(payload, &mut params, &cwd, false)?;
+        }
         for (source, target) in [
             ("model", "model"),
             ("reasoningEffort", "effort"),
@@ -538,6 +557,7 @@ impl CodexHarness {
                 params[target] = payload[source].clone();
             }
         }
+        self.apply_persistent_turn(id, &mut params).await?;
         // Fast 按保存成功后的偏好在新轮次派发时读取，排队消息不冻结入队时的旧档位。
         self.apply_fast_to_turn(id, &mut params).await?;
         let applied_tier = params["serviceTier"].clone();
@@ -558,6 +578,7 @@ impl CodexHarness {
             remembered["serviceTier"] = applied_tier;
         }
         self.remember_settings(id, &remembered).await?;
+        self.name_persistent_side(id, payload, authorization).await;
         Ok(
             json!({"ok":true,"confirmed":true,"threadId":id,"turnId":turn_id,
             "clientUserMessageId":payload["clientUserMessageId"],"deliveryState":"accepted",

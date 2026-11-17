@@ -1,6 +1,6 @@
 //! Codex 仅是执行引擎；连接、请求关联和事件接收由 Harness 统一管理。
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -62,6 +62,7 @@ pub(super) struct Runtime {
 pub(super) struct Connection {
     pub generation: String,
     pub generation_index: u64,
+    pub user_agent: OnceLock<String>,
     alive: Arc<AtomicBool>,
     stdin: mpsc::Sender<WriteFrame>,
     write_gate: Mutex<()>,
@@ -201,6 +202,7 @@ impl Runtime {
         let connection = Arc::new(Connection {
             generation,
             generation_index,
+            user_agent: OnceLock::new(),
             alive,
             stdin: service.stdin,
             write_gate: Mutex::new(()),
@@ -220,9 +222,15 @@ impl Runtime {
             )
             .await
             .context("远程会话引擎初始化失败");
-        if let Err(error) = initialized {
-            *self.retry_after.lock().await = Some(Instant::now() + Duration::from_secs(30));
-            return Err(error);
+        let initialized = match initialized {
+            Ok(value) => value,
+            Err(error) => {
+                *self.retry_after.lock().await = Some(Instant::now() + Duration::from_secs(30));
+                return Err(error);
+            }
+        };
+        if let Some(agent) = initialized["userAgent"].as_str() {
+            let _ = connection.user_agent.set(agent.to_owned());
         }
         connection
             .write(json!({"method":"initialized","params":{}}), None)

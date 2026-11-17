@@ -67,6 +67,10 @@ export function sideThreadsEnabled() {
 export function serviceSideThread() {
   return thread?.id === selectedId && thread?.serviceSide === true;
 }
+export function temporarySideThread() {
+  // 用户要求持久侧边支持原生目标；只有原生明确非临时的侧边解除临时限制，旧服务保持原行为。
+  return serviceSideThread() && thread.ephemeral !== false;
+}
 export function threadForkAllowed(id = selectedId) {
   // 用户要求不支持的侧边直接移除分支入口；能力必须来自当前持久 Codex 主会话。
   return !!id && !creating && thread?.id === id && !isClaude() && !threadReadOnly(id)
@@ -88,7 +92,9 @@ export function threadActionReadOnly(action, id = selectedId) {
     && thread.viewKind === "side" && thread.sideThreadExpired === true);
 }
 export function threadReadOnlyMessage() {
-  return session?.readOnly ? "当前设备为只读模式" : "当前会话仅支持只读查看";
+  return session?.readOnly ? "当前设备为只读模式"
+    : thread?.id === selectedId && typeof thread.readOnlyReason === "string" && thread.readOnlyReason.trim()
+    ? thread.readOnlyReason : "当前会话仅支持只读查看";
 }
 export function isActiveThread() {
   const status = thread?.status?.status || thread?.status;

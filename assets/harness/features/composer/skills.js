@@ -47,7 +47,7 @@ import { goalCommandMatches, selectedGoal } from "../goal/state.js";
 import { editingMessage } from "../messages/message-edit.js";
 import { editingQueuedMessage } from "../queue/state.js";
 import { claudeCommandSupported } from "../session/action-capabilities.js";
-import { backendCapability, isClaude, privateInputScope, serviceSideThread, threadForkAllowed, threadReadOnly } from "../session/capabilities.js";
+import { backendCapability, isClaude, privateInputScope, temporarySideThread, threadForkAllowed, threadReadOnly } from "../session/capabilities.js";
 import { activeInstanceId } from "../session/instances.js";
 import { cacheDisplayData, currentThreadDisplay, optionalCachedRead, readScope } from "../session/thread-cache.js";
 
@@ -75,7 +75,7 @@ export function slashMenuEntries(query = slashQuery()) {
   // 用户要求分支紧接“压缩”，临时侧边及其他不支持的实例直接移除，不显示禁用占位。
   if (threadForkAllowed() && ["fork", "分支", "在新聊天中分支"].some(value => value.includes(query.query)))
     entries.push({ type: "fork", enabled: forkCommandAvailable(query) });
-  if (!serviceSideThread() && goalCommandMatches(query.query) && (!isClaude() || claudeCommandSupported("goal")))
+  if (!temporarySideThread() && goalCommandMatches(query.query) && (!isClaude() || claudeCommandSupported("goal")))
     entries.push({ type: "goal", enabled: !goalComposerReason() });
   // 用户要求在 / 菜单提供提示词优化；独立优化服务不依赖 Claude 原生压缩或目标能力。
   if (promptOptimizationCommandMatches(query.query)) {

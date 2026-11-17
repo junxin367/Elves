@@ -1376,7 +1376,7 @@ impl HarnessController {
                 self.harness.check_deletion_barrier(id).await?;
             }
             // 用户要求侧边继承主会话权限且没有独立切换入口；接口同样禁止保存侧边权限覆盖。
-            if self.harness.known_side(id).await {
+            if self.harness.any_side(id).await {
                 return Err(ApiError::new(409, "侧边会话沿用创建时继承的主会话权限").into());
             }
             // 只确认原会话身份，不恢复执行；实例来自服务端会话，不能由客户端改投环境。
@@ -1671,13 +1671,15 @@ impl HarnessController {
             } else {
                 let settings_path = self.state_dir.join("settings.json");
                 let first_token = self.harness.session_first_token(&id).await;
+                let attached = self.harness.any_side(&id).await;
                 let id = id.to_owned();
                 tokio::task::spawn_blocking(move || {
                     let Ok(settings) = SettingsStore::new(settings_path).load() else {
                         return Value::Null;
                     };
                     let home = crate::codex_home::codex_home_dir_for_settings(&settings);
-                    session_metrics::codex(&home, &id, first_token)
+                    if attached { session_metrics::codex_thread(&home, &id, first_token, true) }
+                    else { session_metrics::codex(&home, &id, first_token) }
                 })
                 .await
                 .unwrap_or(Value::Null)
@@ -6587,8 +6589,13 @@ mod tests {
         let script = directory.path().join("engine.cjs");
         std::fs::write(&script,r#"
 const fs=require('node:fs'),readline=require('node:readline'),crypto=require('node:crypto');
-const threads=new Map(),goals=new Map(),modelContexts=new Map(),boundaryReads=new Map();let approval=null,related={rows:[],loaded:[]};
-const output=v=>process.stdout.write(JSON.stringify(v)+'\n');
+const persisted=fs.existsSync(__dirname+'/persistent-engine.json')?JSON.parse(fs.readFileSync(__dirname+'/persistent-engine.json','utf8')):{};
+const threads=new Map(persisted.threads||[]),goals=new Map(persisted.goals||[]),modelContexts=new Map(persisted.contexts||[]),boundaryReads=new Map();let approval=null,related={rows:[],loaded:[]};
+const output=v=>{
+  if(fs.existsSync(__dirname+'/persistent-fixture'))fs.writeFileSync(__dirname+'/persistent-engine.json',JSON.stringify({
+    threads:[...threads].filter(([,t])=>!t.ephemeral),goals:[...goals],contexts:[...modelContexts].filter(([id])=>!threads.get(id)?.ephemeral)}));
+  process.stdout.write(JSON.stringify(v)+'\n');
+};
 const event=(method,params)=>output({method,params});
 const logTurn=(t,type,turn)=>{if(t?.path)fs.appendFileSync(t.path,JSON.stringify({
   timestamp:new Date().toISOString(),type:'event_msg',payload:{type,turn_id:turn.id}})+'\n');};
@@ -6631,14 +6638,18 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
  const pinnedSection='01984de2-8f74-7c91-a3b2-5c5e937cf318';
  const t=threads.get(p.threadId)||nativePins?.rows?.find(row=>row.id===p.threadId)||related.rows.find(row=>row.id===p.threadId);let result={};
  switch(q.method){
- case 'initialize':result={userAgent:'isolated-fixture'};break;
+ case 'initialize':result={userAgent:sidePolicy.userAgent||'codex_cli_rs/0.169.0-alpha.11.1 (Windows)'};break;
  case 'project/list':result={data:[{id:'project-a',name:'隔离项目',roots:[{path:__dirname}],position:0,metadata:{}}],nextCursor:null};break;
  case 'threadSection/list':
    if(!nativePins){output({id:q.id,error:{code:-32601,message:'unsupported sections'}});return;}
    if(nativePins.sectionError){output({id:q.id,error:{code:nativePins.sectionError,message:'section lookup failed'}});return;}
    result={data:nativePins.missingSection?[]:[{id:pinnedSection,name:'已改名的置顶分区'}],nextCursor:null};break;
  case 'thread/list':
-   if(p.ancestorThreadId){
+   if(p.attachedToThreadId){
+     const rows=[...threads.values(),...related.rows];
+     result={data:rows.filter(row=>!row.ephemeral&&!!row.archived===!!p.archived
+       &&(row.attachedToThreadId===p.attachedToThreadId||sidePolicy.attachedUnrelated)),nextCursor:null};
+   }else if(p.ancestorThreadId){
      if(related.listFailure){output({id:q.id,error:{code:-32000,message:'related lookup failed'}});return;}
      const all=new Map([...threads.values(),...related.rows].map(row=>[row.id,row]));
      const belongs=row=>{const seen=new Set([row.id]);for(let parent=row.parentThreadId;parent&&!seen.has(parent);parent=all.get(parent)?.parentThreadId){if(parent===p.ancestorThreadId)return true;seen.add(parent);}return false;};
@@ -6650,7 +6661,8 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
        .map(row=>({...row,section:{id:nativePins.wrongSection?'custom':pinnedSection,name:'Pinned'}}));
      const start=Number(p.cursor||0),end=start+(nativePins.pageSize||100);
      result={data:data.slice(start,end),nextCursor:nativePins.cursorLoop?'1':end<data.length?String(end):null};
-   }else result={data:[...threads.values(),...(nativePins?.recentIds||[]).map(id=>nativePins.rows.find(row=>row.id===id))],nextCursor:null};
+   }else result={data:[...threads.values(),...(nativePins?.recentIds||[]).map(id=>nativePins.rows.find(row=>row.id===id))]
+     .filter(row=>!row.attachedToThreadId),nextCursor:null};
    break;
  case 'thread/loaded/list':result={data:related.loaded,nextCursor:null};break;
  case 'test/seedSubagents':
@@ -6668,7 +6680,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
    event('thread/section/changed',{threadId:p.threadId,sectionId:p.sectionId});break;
  case 'thread/start':{
    const id=crypto.randomUUID();const thread={id,cwd:p.cwd,name:fs.existsSync(__dirname+'/naming-fixture')?null:'隔离会话',ephemeral:false,threadSource:'user',source:'appServer',
-     projectId:p.projectId,status:{type:'idle'},turns:[],createdAt:1,updatedAt:1,path:__dirname+'/'+id+'.jsonl'};
+     projectId:p.projectId,attachedToThreadId:null,status:{type:'idle'},turns:[],createdAt:1,updatedAt:1,path:__dirname+'/'+id+'.jsonl'};
    modelContexts.set(id,{items:[],developerInstructions:p.developerInstructions||'',model:p.model||'gpt-6.1-sol',
      reasoningEffort:p.config?.model_reasoning_effort||'high',permissions:permissionSnapshot(p)});
    threads.set(id,thread);result={thread,model:'gpt-6.1-sol',reasoningEffort:'high',cwd:p.cwd};
@@ -6681,10 +6693,10 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
      output({id:q.id,error:{code:-32600,message:'invalid fork turn'}});return;
    }
    const id=crypto.randomUUID(),ephemeral=p.ephemeral===true;
-   const turns=ephemeral?[]:structuredClone(t.turns.slice(0,cutoff+1));
+   const turns=ephemeral||p.attachToSource?[]:structuredClone(t.turns.slice(0,cutoff+1));
    if(!p.lastTurnId&&turns.at(-1)?.status==='inProgress')turns.at(-1).status='interrupted';
    const thread={...t,id,ephemeral,path:ephemeral?null:__dirname+'/'+id+'.jsonl',forkedFromId:p.threadId,
-     parentThreadId:null,turns,status:{type:'idle'}};
+     parentThreadId:null,attachedToThreadId:p.attachToSource?p.threadId:null,turns,status:{type:'idle'}};
    // fork 的界面轮次可以为空，但模型历史必须保留父上下文，避免测试漏掉主任务被继续执行的问题。
    const inherited=modelContexts.get(p.threadId)||{items:[],developerInstructions:''};
    const permissions={...permissionSnapshot(p,inherited.permissions),...sidePolicy.forkPermissions};
@@ -6703,7 +6715,8 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
  case 'thread/unsubscribe':
    if(t?.ephemeral&&sidePolicy.unsubscribeError){output({id:q.id,error:{code:sidePolicy.unsubscribeError,message:'side unsubscribe fixture failure'}});return;}
    if(!t){result={status:'notLoaded'};break;}
-   threads.delete(p.threadId);modelContexts.delete(p.threadId);event('thread/closed',{threadId:p.threadId});result={status:'unsubscribed'};break;
+   if(t.ephemeral){threads.delete(p.threadId);modelContexts.delete(p.threadId);}else t.status={type:'notLoaded'};
+   event('thread/closed',{threadId:p.threadId});result={status:'unsubscribed'};break;
  case 'thread/read': if(!t){output({id:q.id,error:{code:-32600,message:'unknown thread'}});return;}
    if(fastPolicy.finishCompactionRead){
      const count=(boundaryReads.get(p.threadId)||0)+1;boundaryReads.set(p.threadId,count);
@@ -11169,6 +11182,159 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     }
 
     #[tokio::test]
+    async fn harness_service_side_persistent_setting_restart_queue_and_deletion() {
+        let (directory, authorization) = harness_fixture().await;
+        std::fs::write(directory.path().join("persistent-fixture"), "").unwrap();
+        let controller = &authorization.controller;
+        let main = controller.call_authorized("create",
+            json!({"projectId":"project-a","prompt":"父会话参考历史","permissionMode":"read-only"}), &authorization).await.unwrap();
+        let parent = main["threadId"].as_str().unwrap();
+        let temporary = controller.call_authorized("createSideThread",
+            json!({"threadId":parent}), &authorization).await.unwrap();
+        assert_eq!(temporary["thread"]["ephemeral"], true, "缺少偏好时必须默认临时侧边");
+        controller.call_authorized("closeSideThread",
+            json!({"threadId":temporary["threadId"],"parentThreadId":parent}), &authorization).await.unwrap();
+        let preference_path = directory.path().join("remote-instance-preferences.json");
+        std::fs::write(&preference_path, r#"{"instances":{"codex:local":{"persistentSideThreads":true}}}"#).unwrap();
+        let side = controller.call_authorized("createSideThread",
+            json!({"threadId":parent,"permissionMode":"read-only"}), &authorization).await.unwrap();
+        let id = side["threadId"].as_str().unwrap();
+        assert_eq!(side["thread"]["ephemeral"], false);
+        assert_eq!(side["thread"]["parentThreadId"], parent);
+        assert_eq!(side["thread"]["capabilities"]["sessionPermissions"], false);
+        assert_eq!(controller.call_authorized("history", json!({"threadId":id}), &authorization).await.unwrap()["data"], json!([]));
+        let sent = controller.call_authorized("send",
+            json!({"threadId":id,"prompt":"wait 持久侧边正文","clientUserMessageId":"persistent-first",
+                "permissionMode":"full-access","collaborationMode":{"mode":"plan"}}), &authorization).await.unwrap();
+        assert_eq!(sent["deliveryState"], "accepted");
+        let queued = controller.call_authorized("send",
+            json!({"threadId":id,"prompt":"保留的持久队列","clientUserMessageId":"persistent-queued"}), &authorization).await.unwrap();
+        assert_eq!(queued["deliveryState"], "queued");
+        let closed = controller.call_authorized("closeSideThread",
+            json!({"threadId":id,"parentThreadId":parent}), &authorization).await.unwrap();
+        assert_eq!(closed["historyRetained"], true);
+        assert_eq!(controller.call_authorized("relatedThreads", json!({"threadId":parent}), &authorization).await.unwrap()["sideThreads"][0]["id"], id);
+        let blocked = controller.call_authorized("deleteThread", json!({"threadId":parent}), &authorization).await.unwrap_err();
+        assert!(blocked.to_string().contains("侧边会话执行中"), "{blocked}");
+        controller.call_authorized("stop", json!({"threadId":id}), &authorization).await.unwrap();
+        std::fs::write(&preference_path, r#"{"instances":{"codex:local":{"persistentSideThreads":false}}}"#).unwrap();
+        controller.harness.enabled.store(false, Ordering::Release);
+        controller.harness.release().await;
+
+        let recovered = HarnessController::new(directory.path().to_owned()).unwrap();
+        recovered.publish_access_policy(&RemoteAccessSettings { enabled:true, ..Default::default() });
+        recovered.running.store(true, Ordering::SeqCst);
+        recovered.auth.lock().await.devices.push(authorization.device.clone());
+        let recovered_auth = recovered.authorization(authorization.device.clone(), Some("recovered"));
+        let mut command = tokio::process::Command::new("node");
+        command.arg(directory.path().join("engine.cjs")).stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).kill_on_drop(true);
+        #[cfg(windows)]
+        command.creation_flags(crate::windows_create_hidden_process());
+        recovered.harness.install_test_process(crate::codex_service::RunningService::for_test(command.spawn().unwrap()).unwrap()).await;
+        let related = recovered.call_authorized("relatedThreads", json!({"threadId":parent}), &recovered_auth).await.unwrap();
+        assert_eq!(related["sideThreads"][0]["id"], id, "关闭开关和重启不能隐藏已有持久侧边");
+        let history = recovered.call_authorized("history", json!({"threadId":id}), &recovered_auth).await.unwrap();
+        assert!(history.to_string().contains("持久侧边正文"));
+        assert!(!history.to_string().contains("父会话参考历史"));
+        assert!(recovered.call_authorized("queue", json!({"threadId":id}), &recovered_auth).await.unwrap().to_string().contains("保留的持久队列"));
+        let detail = recovered.call_authorized("thread", json!({"threadId":id}), &recovered_auth).await.unwrap();
+        assert_eq!(detail["thread"]["capabilities"]["forkThread"], false);
+        for action in ["forkThread", "createSideThread", "pinThread", "editMessage"] {
+            assert!(recovered.call_authorized(action, json!({"threadId":id,"pinned":true}), &recovered_auth).await.is_err(), "{action}");
+        }
+        recovered.call_authorized("send", json!({"threadId":id,"prompt":"重启后继续",
+            "clientUserMessageId":"persistent-recovered","model":"gpt-6.1-sol","permissionMode":"full-access"}), &recovered_auth).await.unwrap();
+        let requests: Vec<Value> = std::fs::read_to_string(directory.path().join("requests.jsonl")).unwrap()
+            .lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        let forks: Vec<_> = requests.iter().filter(|request| request["method"] == "thread/fork").collect();
+        assert_eq!(forks[1]["params"]["attachToSource"], true);
+        assert!(forks[1]["params"]["config"].get("features.goals").is_none());
+        let resumed = requests.iter().find(|request| request["method"] == "thread/resume" && request["params"]["threadId"] == id).unwrap();
+        assert_eq!(resumed["params"]["sandbox"], "read-only");
+        let last = requests.iter().rev().find(|request| request["method"] == "turn/start" && request["params"]["threadId"] == id).unwrap();
+        assert_eq!(last["params"]["sandboxPolicy"]["type"], "readOnly");
+        assert_eq!(last["params"]["collaborationMode"]["mode"], "default");
+        assert_eq!(last["params"]["collaborationMode"]["settings"]["model"], "gpt-6.1-sol");
+        let sidebar = recovered.call_authorized("sidebar", json!({}), &recovered_auth).await.unwrap();
+        assert!(!sidebar["recent"].as_array().unwrap().iter().any(|row| row["id"] == id));
+        recovered.harness.seed_test_history(json!({"threadId":id,"finish":true})).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let goal = recovered.call_authorized("setGoal", json!({"threadId":id,"prompt":"持久侧边独立目标"}),
+            &recovered_auth).await.unwrap();
+        assert_eq!(goal["goal"]["objective"], "持久侧边独立目标");
+        recovered.call_authorized("updateGoal", json!({"threadId":id,"operation":"pause",
+            "objective":goal["goal"]["objective"],"expectedCreatedAt":goal["goal"]["createdAt"],
+            "expectedObjective":goal["goal"]["objective"],"expectedStatus":goal["goal"]["status"]}),
+            &recovered_auth).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        recovered.harness.seed_test_subagents(json!({"rows":[
+            {"id":"archived-side","attachedToThreadId":parent,"ephemeral":false,"archived":true,
+                "cwd":directory.path(),"status":{"type":"idle"},"turns":[]},
+            {"id":"nested-side","attachedToThreadId":"archived-side","ephemeral":false,
+                "cwd":directory.path(),"status":{"type":"idle"},"turns":[]}
+        ]})).await.unwrap();
+        recovered.call_authorized("deleteThread", json!({"threadId":parent}), &recovered_auth).await.unwrap();
+        let saved: Value = serde_json::from_slice(&std::fs::read(directory.path().join("remote-harness-state.json")).unwrap()).unwrap();
+        assert!(saved["persistentSides"].get(id).is_none());
+        assert!(saved["queues"].get(id).is_none());
+        let requests: Vec<Value> = std::fs::read_to_string(directory.path().join("requests.jsonl")).unwrap()
+            .lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        let deletions: Vec<_> = requests.iter().filter(|request| request["method"] == "thread/delete")
+            .map(|request| request["params"]["threadId"].clone()).collect();
+        assert_eq!(deletions, vec![json!("nested-side"),json!("archived-side"),json!(id),json!(parent)]);
+        recovered.harness.enabled.store(false, Ordering::Release);
+        recovered.harness.release().await;
+    }
+
+    #[tokio::test]
+    async fn harness_service_side_persistent_missing_native_child_keeps_unknown_delete_barrier() {
+        let saved = json!({"persistentSides":{"lost-side":{"parent":"delete-parent",
+            "permissions":{},"collaborationMode":null,"permissionMode":null,"initialized":true}},
+            "deletions":{"lost-side":{"state":"unknown","deviceId":"device","requestId":"original-delete"}}});
+        let (directory, authorization) = harness_fixture_with_store(Some(saved)).await;
+        let controller = &authorization.controller;
+        controller.harness.seed_test_subagents(json!({"rows":[{
+            "id":"delete-parent","cwd":directory.path(),"ephemeral":false,"threadSource":"user",
+            "attachedToThreadId":null,"status":{"type":"idle"},"turns":[]
+        }]})).await.unwrap();
+        let failure = controller.call_authorized("deleteThread", json!({"threadId":"delete-parent"}),
+            &authorization).await.unwrap_err();
+        assert!(failure.to_string().contains("尚未确认的删除"), "{failure}");
+        assert!(!std::fs::read_to_string(directory.path().join("requests.jsonl")).unwrap().contains("\"thread/delete\""));
+        controller.harness.enabled.store(false, Ordering::Release);
+        controller.harness.release().await;
+    }
+
+    #[tokio::test]
+    async fn harness_service_side_persistent_rejects_old_engine_and_uninitialized_history() {
+        for policy in [json!({"userAgent":"codex_cli_rs/0.165.0-alpha.9"}), json!({"boundaryError":-32000})] {
+            let (directory, authorization) = harness_fixture().await;
+            let controller = &authorization.controller;
+            std::fs::write(directory.path().join("side-policy.json"), policy.to_string()).unwrap();
+            let parent = controller.call_authorized("create", json!({"projectId":"project-a","prompt":"父任务"}),
+                &authorization).await.unwrap()["threadId"].as_str().unwrap().to_owned();
+            std::fs::write(directory.path().join("remote-instance-preferences.json"),
+                r#"{"instances":{"codex:local":{"persistentSideThreads":true}}}"#).unwrap();
+            let failure = controller.call_authorized("createSideThread", json!({"threadId":parent}), &authorization).await.unwrap_err();
+            if policy.get("userAgent").is_some() {
+                assert!(failure.to_string().contains("升级"), "{failure}");
+                assert!(!std::fs::read_to_string(directory.path().join("requests.jsonl")).unwrap().contains("\"thread/fork\""));
+            } else {
+                assert!(failure.downcast_ref::<ApiError>().unwrap().outcome_unknown);
+                let related = controller.call_authorized("relatedThreads", json!({"threadId":parent}), &authorization).await.unwrap();
+                let id = related["sideThreads"][0]["id"].as_str().unwrap();
+                let detail = controller.call_authorized("thread", json!({"threadId":id}), &authorization).await.unwrap();
+                assert_eq!(detail["thread"]["readOnly"], true);
+                assert!(controller.call_authorized("send", json!({"threadId":id,"prompt":"不能发送","clientUserMessageId":"uninitialized"}),
+                    &authorization).await.is_err());
+            }
+            controller.harness.enabled.store(false, Ordering::Release);
+            controller.harness.release().await;
+        }
+    }
+
+    #[tokio::test]
     async fn harness_service_side_create_send_queue_stop_close_stays_in_memory() {
         let (directory, authorization) = harness_fixture().await;
         let controller = &authorization.controller;
@@ -12503,11 +12669,77 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
                 .await
                 .is_ok()
         );
+        delay.store(0, Ordering::SeqCst);
+        std::fs::write(directory.path().join("remote-instance-preferences.json"),
+            r#"{"instances":{"codex:local":{"persistentSideThreads":true}}}"#).unwrap();
+        if controller.harness.require_persistent_sides().await.is_err() {
+            let failure = controller.call_authorized("createSideThread",
+                json!({"threadId":parent}), &authorization).await.unwrap_err();
+            assert!(failure.to_string().contains("升级"), "{failure}");
+            controller.harness.enabled.store(false, Ordering::Release);
+            controller.harness.release().await;
+            server.abort();
+            let _ = server.await;
+            eprintln!("原生侧边验收：旧引擎临时侧边通过，持久侧边在创建前提示升级");
+            return;
+        }
+        let persistent = controller.call_authorized("createSideThread",
+            json!({"threadId":parent}), &authorization).await.unwrap();
+        let persistent_id = persistent["threadId"].as_str().unwrap();
+        assert_eq!(persistent["thread"]["ephemeral"], false);
+        controller.call_authorized("send", json!({"threadId":persistent_id,"prompt":"PERSISTENT_NATIVE_INPUT",
+            "clientUserMessageId":"persistent-native-first"}), &authorization).await.unwrap();
+        let persistent_history = completed(&authorization, persistent_id).await;
+        assert!(persistent_history.to_string().contains("PERSISTENT_NATIVE_INPUT"));
+        assert!(!persistent_history.to_string().contains("PARENT_NATIVE_CONTEXT"));
+        let unsent = controller.call_authorized("createSideThread",
+            json!({"threadId":parent}), &authorization).await.unwrap();
+        let unsent_id = unsent["threadId"].as_str().unwrap();
+        let closed = controller.call_authorized("closeSideThread",
+            json!({"threadId":persistent_id,"parentThreadId":parent}), &authorization).await.unwrap();
+        assert_eq!(closed["historyRetained"], true);
         controller.harness.enabled.store(false, Ordering::Release);
         controller.harness.release().await;
+        eprintln!("原生侧边验收：重启独立服务，恢复已发送和未发送的持久侧边");
+        let recovered = HarnessController::new(directory.path().to_owned()).unwrap();
+        recovered.publish_access_policy(&RemoteAccessSettings { enabled:true, ..Default::default() });
+        recovered.running.store(true, Ordering::SeqCst);
+        recovered.auth.lock().await.devices.push(authorization.device.clone());
+        let recovered_auth = recovered.authorization(authorization.device.clone(), Some("persistent-restart"));
+        recovered.harness.install_test_process(
+            crate::codex_service::RunningService::for_test(command.spawn().unwrap()).unwrap()).await;
+        let related = recovered.call_authorized("relatedThreads", json!({"threadId":parent}), &recovered_auth).await.unwrap();
+        assert!(related["sideThreads"].as_array().unwrap().iter().any(|row| row["id"] == persistent_id));
+        assert!(related["sideThreads"].as_array().unwrap().iter().any(|row| row["id"] == unsent_id));
+        let history = recovered.call_authorized("history", json!({"threadId":persistent_id}), &recovered_auth).await.unwrap();
+        assert!(history.to_string().contains("PERSISTENT_NATIVE_INPUT"));
+        assert!(!history.to_string().contains("PARENT_NATIVE_CONTEXT"));
+        assert_eq!(recovered.call_authorized("history", json!({"threadId":unsent_id}), &recovered_auth).await.unwrap()["data"], json!([]));
+        recovered.call_authorized("send", json!({"threadId":unsent_id,"prompt":"UNSENT_AFTER_RESTART",
+            "clientUserMessageId":"unsent-after-restart"}), &recovered_auth).await.unwrap();
+        completed(&recovered_auth, unsent_id).await;
+        {
+            let captured = requests.lock().await;
+            for marker in ["PERSISTENT_NATIVE_INPUT", "UNSENT_AFTER_RESTART"] {
+                let request = captured.iter().find(|request| request["input"].to_string().contains(marker)).unwrap();
+                let input = request["input"].to_string();
+                assert!(input.contains("PARENT_NATIVE_CONTEXT"), "持久侧边丢失父参考上下文");
+                assert!(input.contains("Side conversation boundary."), "重启后丢失侧边任务边界");
+                assert!(latest_mode(request).contains("# Plan Mode"));
+                for name in ["get_goal","create_goal","update_goal"] {
+                    assert!(effective_tools(request).contains(name), "持久侧边未注册 {name}");
+                }
+            }
+        }
+        let metrics = recovered.call_authorized("sessionMetrics", json!({"threadId":persistent_id}), &recovered_auth).await.unwrap();
+        assert_eq!(metrics["metrics"]["source"], "codex-side");
+        assert_eq!(metrics["metrics"]["totalTokens"], 20, "持久侧边统计不能累加父会话用量");
+        recovered.call_authorized("deleteThread", json!({"threadId":parent}), &recovered_auth).await.unwrap();
+        recovered.harness.enabled.store(false, Ordering::Release);
+        recovered.harness.release().await;
         server.abort();
         let _ = server.await;
-        eprintln!("原生侧边验收：原生引擎和模拟上游已停止");
+        eprintln!("原生侧边验收：临时及持久侧边、重启恢复和删除均已通过");
     }
 
     async fn native_pin_fixture(options: Value) -> (tempfile::TempDir, HarnessAuthorization) {

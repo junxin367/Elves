@@ -27,7 +27,7 @@ Treat inherited parent-thread history before the side-conversation boundary as r
 - Request escalated permissions or broader sandbox access only when necessary for an operation the user explicitly requests after the boundary, including a read-only operation, and when the thread's approval policy permits it.
 - Send messages to another thread only with explicit user authorization after the boundary."#;
 
-fn side_boundary_items(parent: &str) -> Value {
+pub(super) fn side_boundary_items(parent: &str) -> Value {
     let reference = json!({"threadId":parent});
     let text = format!(
         "Side conversation boundary.\n\n\
@@ -40,7 +40,7 @@ fn side_boundary_items(parent: &str) -> Value {
     json!([{"type":"message","role":"user","content":[{"type":"input_text","text":text}]}])
 }
 
-fn side_permissions(response: &Value) -> anyhow::Result<Value> {
+pub(super) fn side_permissions(response: &Value) -> anyhow::Result<Value> {
     let approval = &response["approvalPolicy"];
     let reviewer = &response["approvalsReviewer"];
     let sandbox = &response["sandbox"];
@@ -63,7 +63,7 @@ fn side_permissions(response: &Value) -> anyhow::Result<Value> {
     Ok(permissions)
 }
 
-fn apply_side_fork_permissions(params: &mut Value, permissions: &Value) -> anyhow::Result<()> {
+pub(super) fn apply_side_fork_permissions(params: &mut Value, permissions: &Value) -> anyhow::Result<()> {
     if !(permissions["approvalPolicy"].is_string() || permissions["approvalPolicy"].is_object())
         || !permissions["approvalsReviewer"].is_string()
     {
@@ -864,8 +864,21 @@ impl CodexHarness {
                 "subagentsError":failure.to_string()})
             }
         };
+        let persistent_rows = self.attached_sides(parent, false).await?;
+        let mut persistent_views = Vec::new();
+        for raw in &persistent_rows {
+            persistent_views.push(self.persistent_summary(raw).await?);
+        }
+        let persistent_enabled = self.persistent_sides_enabled().await?;
         let projection = self.projection.lock().await;
         let mut rows = Vec::new();
+        for detail in &persistent_views {
+            rows.push(json!({"id":detail["id"],"title":detail["title"],"createdAtMs":detail["createdAt"],
+                "ephemeral":false,"parentThreadId":parent,
+                "running":detail["priority"]["active"] == true && detail["priority"]["attentionState"] != "waiting",
+                "hasUnreadTurn":detail["priority"]["attentionState"] == "waiting"
+                    || detail["hasUnreadTurn"] == true && detail["priority"]["active"] != true}));
+        }
         for (id, side) in &projection.sides.threads {
             if side.parent != parent || side.closed {
                 continue;
@@ -878,7 +891,7 @@ impl CodexHarness {
         rows.sort_by_key(|row| row["createdAtMs"].as_u64().unwrap_or(0));
         related["sideThreads"] = json!(rows);
         related["canCreateSideThread"] = json!(
-            projection
+            persistent_enabled || projection
                 .sides
                 .threads
                 .values()
@@ -886,6 +899,11 @@ impl CodexHarness {
                 .count()
                 < MAX_OPEN_SIDES
         );
+        drop(projection);
+        let mut projection = self.projection.lock().await;
+        for raw in persistent_rows {
+            projection.persistent_sides.insert(raw["id"].as_str().unwrap().to_owned(), parent.to_owned());
+        }
         Ok(related)
     }
 
@@ -907,7 +925,14 @@ impl CodexHarness {
             )
             .await?;
         let main = crate::codex_service::normalize_thread_response(&identity)?;
-        if self
+        let persistent = self.persistent_sides_enabled().await?;
+        if persistent {
+            self.require_persistent_sides().await?;
+            if identity["thread"].get("attachedToThreadId").is_none() {
+                return Err(error(409, "当前原生引擎未返回侧边关联字段，持久侧边未创建；请升级独立 Codex CLI"));
+            }
+        }
+        if !persistent && self
             .projection
             .lock()
             .await
@@ -956,6 +981,12 @@ impl CodexHarness {
         // 用户要求临时侧边不向模型提供目标工具；仅覆盖本次 fork，不修改主会话或实例的 goals 配置。
         let mut params = json!({"threadId":parent,"ephemeral":true,"excludeTurns":true,"threadSource":"user",
             "developerInstructions":instructions,"config":{"thread_unload_delay_secs":0,"features.goals":false}});
+        if persistent {
+            // 用户要求开启后创建原生持久侧边；保留原生 goals 配置，不继承临时分支的目标工具禁用覆盖。
+            params["ephemeral"] = json!(false);
+            params["attachToSource"] = json!(true);
+            params["config"] = json!({});
+        }
         super::super::instance_settings::apply_codex_compaction_default(&config, &mut params);
         // 用户要求继承点击创建时的主会话选择，包括尚未发送的模型/深度；旧客户端再读原生及已保存设置。
         let model = payload["model"]
@@ -1001,8 +1032,12 @@ impl CodexHarness {
             .request_in_generation(&connection.generation, "thread/fork", params, authorization)
             .await?;
         let raw = &fork["thread"];
-        let valid = raw["ephemeral"] == true
-            && raw["path"].is_null()
+        let valid = raw["ephemeral"] == !persistent
+            && if persistent {
+                raw["path"].is_string() && raw["attachedToThreadId"] == parent
+            } else {
+                raw["path"].is_null() && raw["attachedToThreadId"].is_null()
+            }
             && raw["forkedFromId"] == parent
             && raw["cwd"] == main["cwd"]
             && raw["id"]
@@ -1018,6 +1053,12 @@ impl CodexHarness {
             .into());
         }
         let id = raw["id"].as_str().unwrap().to_owned();
+        if persistent {
+            return self.finish_persistent_side(parent, &fork, collaboration_mode,
+                payload["permissionMode"].clone(), &connection.generation, authorization).await
+                .map_err(|failure| ApiError { code:503, outcome_unknown:true,
+                    message:format!("持久侧边已创建，但初始化尚未全部确认；请查询原回执，不要重复创建：{failure}") }.into());
+        }
         // 必须先确认边界已写入模型上下文，再登记可发送的侧边会话；失败不允许降级为普通 fork。
         let initialized = async {
             let permissions = side_permissions(&fork)?;

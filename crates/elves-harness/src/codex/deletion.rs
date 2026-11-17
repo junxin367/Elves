@@ -21,6 +21,67 @@ fn side_executing(projection: &super::projection::Projection, parent: &str, id: 
 }
 
 impl CodexHarness {
+    async fn persistent_descendants(&self, parent: &str) -> anyhow::Result<Vec<String>> {
+        let mut pending = vec![parent.to_owned()];
+        let mut seen = std::collections::HashSet::from([parent.to_owned()]);
+        let mut children = Vec::new();
+        while let Some(source) = pending.pop() {
+            {
+                let store = self.store.lock().await;
+                // 后代删除超时后可能已退出原生列表；列表缺失不能解除原删除回执的未知结果保护。
+                if store.data.persistent_sides.iter().any(|(id, side)| side.parent == source
+                    && store.data.deletions.get(id).is_some_and(|deletion| deletion.state != "deleted"))
+                {
+                    return Err(error(409, "持久侧边有尚未确认的删除，主会话未删除；请先核对原侧边删除回执"));
+                }
+            }
+            // 用户要求主会话删除覆盖全部持久侧边，包含重启后未加载及已归档的后代；只读列举不会恢复执行。
+            for archived in [false, true] {
+                for row in self.attached_sides(&source, archived).await? {
+                    let id = row["id"].as_str().unwrap().to_owned();
+                    if !seen.insert(id.clone()) {
+                        return Err(error(503, "持久侧边关联重复或形成循环，本次未删除"));
+                    }
+                    if seen.len() > 4096 {
+                        return Err(error(503, "持久侧边数量超出单次删除范围，本次未删除"));
+                    }
+                    pending.push(id.clone());
+                    children.push(id);
+                }
+            }
+        }
+        children.reverse();
+        Ok(children)
+    }
+
+    async fn preflight_persistent_child(&self, id: &str) -> anyhow::Result<()> {
+        self.check_deletion_barrier(id).await?;
+        let identity = self.runtime.request("thread/read",
+            json!({"threadId":id,"includeTurns":false}), None).await?;
+        crate::codex_service::normalize_session_response(&identity)?;
+        let status = &identity["thread"]["status"];
+        let projection = self.projection.lock().await;
+        if matches!(status.as_str().or_else(|| status["type"].as_str()),
+            Some("active" | "inProgress" | "running" | "waiting" | "unknown"))
+            || projection.active.contains_key(id)
+        {
+            return Err(error(409, "侧边会话执行中，无法删除"));
+        }
+        if projection.compactions.contains_key(id) || !projection.requests_for(id).is_empty() {
+            return Err(error(409, "侧边会话仍有压缩或待处理交互，无法删除"));
+        }
+        drop(projection);
+        let store = self.store.lock().await;
+        if store.data.queues.get(id).is_some_and(|queue| queue.iter().any(|message|
+            matches!(message.state.as_str(), "sending" | "unknown" | "direct-sending" | "direct-unknown")))
+            || store.data.edits.values().any(|edit| edit.thread_id == id
+                && !matches!(edit.state.as_str(), "committed" | "canceled"))
+        {
+            return Err(error(409, "侧边会话仍有待核对的发送或编辑，无法删除"));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn protected_delete_receipts(&self) -> std::collections::HashSet<String> {
         self.store
             .lock()
@@ -136,7 +197,7 @@ impl CodexHarness {
             )
             .await
             .map_err(delete_preflight_failure)?;
-        crate::codex_service::normalize_thread_response(&identity)
+        crate::codex_service::normalize_session_response(&identity)
             .map_err(delete_preflight_failure)?;
         let status = &identity["thread"]["status"];
         if matches!(
@@ -169,6 +230,20 @@ impl CodexHarness {
                 return Err(error(409, "侧边会话执行中，无法删除"));
             }
         }
+        let descendants = self.persistent_descendants(id).await.map_err(delete_preflight_failure)?;
+        for child in &descendants {
+            self.preflight_persistent_child(child).await?;
+        }
+        // 持有全部后代写锁直至父删除完成；锁内再预检，不能让后代在预检后开始新任务。
+        let mut ordered = descendants.clone();
+        ordered.sort();
+        let mut child_locks = Vec::new();
+        for child in &ordered {
+            child_locks.push(self.thread_lock(child).await.lock_owned().await);
+        }
+        for child in &descendants {
+            self.preflight_persistent_child(child).await?;
+        }
         {
             let store = self.store.lock().await;
             if let Some(deletion) = store.data.deletions.get(id) {
@@ -196,6 +271,11 @@ impl CodexHarness {
                 ));
             }
             drop(store);
+            for child in &descendants {
+                // 原生 attached 后代必须子级优先删除；每个子删除仍独立保存未知结果保护，失败不派发父删除。
+                Box::pin(self.delete_thread(child, authorization)).await.map_err(|failure|
+                    error(503, &format!("删除持久侧边失败，主会话未删除：{failure}")))?;
+            }
             // 仅关闭已经确认空闲的侧边，避免主会话删除后留下孤立正文；执行中侧边已在预检和锁内复查拦截。
             self.close_sides_for_deletion(id, authorization).await?;
             let mut store = self.store.lock().await;
@@ -363,6 +443,7 @@ impl Data {
         self.thread_pins.remove(id);
         self.settings.remove(id);
         self.fork_sources.remove(id);
+        self.persistent_sides.remove(id);
         self.thread_devices.remove(id);
         self.queue_gates.remove(id);
         let prefix = format!("{id}:");

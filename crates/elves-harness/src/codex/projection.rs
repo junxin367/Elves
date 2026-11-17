@@ -29,6 +29,7 @@ pub(super) struct Projection {
     pub threads: HashMap<String, Value>,
     pub subagents: super::subagents::SubagentState,
     pub sides: super::sides::SideState,
+    pub persistent_sides: HashMap<String, String>,
     pub requests: HashMap<String, Value>,
     pub active: HashMap<String, String>,
     pub queue_turn_outcomes: HashMap<String, Value>,
@@ -59,6 +60,7 @@ impl Default for Projection {
             threads: HashMap::new(),
             subagents: super::subagents::SubagentState::default(),
             sides: super::sides::SideState::default(),
+            persistent_sides: HashMap::new(),
             requests: HashMap::new(),
             active: HashMap::new(),
             queue_turn_outcomes: HashMap::new(),
@@ -84,6 +86,9 @@ impl Projection {
     pub fn forget_deleted_thread(&mut self, id: &str) {
         // 删除事实跨引擎重连保留；迟到的原生快照、状态和审批不能复活此 ID。
         self.deleted_threads.insert(id.to_owned());
+        if let Some(parent) = self.persistent_sides.remove(id) {
+            self.push(json!({"method":"remote/relatedThreadsChanged","params":{"threadId":parent,"closedThreadIds":[id]}}));
+        }
         self.clear_side_runtime(id);
         self.queue_turn_outcomes.remove(id);
         self.first_token_observations.remove(id);
@@ -219,7 +224,7 @@ impl Projection {
             .threads
             .get(thread_id)
             .and_then(|snapshot| snapshot["hasUnreadTurn"].as_bool())
-            .filter(|_| thread["serviceSide"] != true)
+            .filter(|_| thread["serviceSide"] != true || thread["ephemeral"] == false)
         {
             thread["hasUnreadTurn"] = json!(unread);
         }
@@ -541,6 +546,12 @@ impl Projection {
             frame["params"]["remotePlanRevision"] = json!(revision);
         }
         let side = self.sides.threads.contains_key(&id);
+        if let Some(parent) = crate::codex_service::attached_parent_id(&frame["params"]["thread"]) {
+            self.persistent_sides.insert(id.clone(), parent.to_owned());
+        }
+        if let Some(parent) = self.persistent_sides.get(&id).cloned() {
+            self.push(json!({"method":"remote/relatedThreadsChanged","params":{"threadId":parent}}));
+        }
         if let Some((_, closed)) = self.sides.observe(&frame) {
             if closed {
                 self.close_side(&id);
@@ -621,7 +632,7 @@ impl Projection {
                     return;
                 }
                 if let Ok(mut thread) =
-                    crate::codex_service::normalize_thread(&frame["params"]["thread"])
+                    crate::codex_service::normalize_session_response(&json!({"thread":frame["params"]["thread"]}))
                 {
                     if let Some(previous) = self.threads.get(&id) {
                         for key in ["model", "reasoningEffort", "serviceTier"] {

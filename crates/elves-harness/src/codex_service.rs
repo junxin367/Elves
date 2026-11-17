@@ -372,6 +372,7 @@ pub(crate) fn normalize_thread(thread: &Value) -> anyhow::Result<Value> {
         .and_then(Value::as_object)
         .is_some_and(|source| source.contains_key("subAgent") || source.contains_key("subagent"));
     if ephemeral
+        || thread.get("attachedToThreadId").is_some_and(|parent| !parent.is_null())
         || parent_thread_id.is_some()
         || source_is_subagent
         || thread_source.is_some_and(|source| source.eq_ignore_ascii_case("subagent"))
@@ -380,6 +381,32 @@ pub(crate) fn normalize_thread(thread: &Value) -> anyhow::Result<Value> {
         bail!("Codex CLI service 只提供主会话元数据");
     }
     normalize_thread_metadata(thread)
+}
+
+pub(crate) fn attached_parent_id(thread: &Value) -> Option<&str> {
+    thread["attachedToThreadId"].as_str()
+        .filter(|parent| !parent.is_empty() && thread["id"] != *parent)
+}
+
+pub(crate) fn normalize_session_response(response: &Value) -> anyhow::Result<Value> {
+    if attached_parent_id(&response["thread"]).is_none() {
+        return normalize_thread_response(response);
+    }
+    let raw = &response["thread"];
+    anyhow::ensure!(raw["ephemeral"] == false && subagent_parent_id(raw).is_none(),
+        "原生持久侧边身份无效");
+    let mut value = normalize_thread_metadata(raw)?;
+    value["viewKind"] = json!("side");
+    value["serviceSide"] = json!(true);
+    value["parentThreadId"] = raw["attachedToThreadId"].clone();
+    value["attachedToThreadId"] = raw["attachedToThreadId"].clone();
+    if let Some(read_state) = response.get("readState") {
+        value["readState"] = read_state.clone();
+        if let Some(first) = read_state.get("firstUnread") {
+            value["hasUnreadTurn"] = json!(!first.is_null());
+        }
+    }
+    Ok(value)
 }
 
 pub(crate) fn subagent_parent_id(thread: &Value) -> Option<&str> {
@@ -686,6 +713,20 @@ mod tests {
             }))
             .is_err()
         );
+        let attached = json!({"id":"persistent-side","cwd":"C:/workspace","ephemeral":false,
+            "attachedToThreadId":"main","parentThreadId":null});
+        assert!(normalize_thread(&attached).is_err(), "持久侧边不得进入普通主会话目录");
+        let normalized = normalize_session_response(&json!({"thread":attached,
+            "readState":{"firstUnread":{"turnId":"side-turn"},"revision":"r1"}})).unwrap();
+        assert_eq!(normalized["viewKind"], "side");
+        assert_eq!(normalized["ephemeral"], false);
+        assert_eq!(normalized["parentThreadId"], "main");
+        assert_eq!(normalized["hasUnreadTurn"], true);
+        for invalid in [json!(""), json!("persistent-side"), json!(42)] {
+            let mut malformed = attached.clone();
+            malformed["attachedToThreadId"] = invalid;
+            assert!(normalize_session_response(&json!({"thread":malformed})).is_err());
+        }
     }
 
     #[test]

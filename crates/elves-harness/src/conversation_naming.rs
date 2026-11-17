@@ -265,7 +265,7 @@ impl ConversationNaming {
                     return anyhow::Ok(());
                 }
                 if super::claude::Claude::is_subagent_id(&id)
-                    || controller.harness.known_side(&id).await
+                    || controller.harness.any_side(&id).await
                 {
                     return Ok(());
                 }

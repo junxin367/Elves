@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 
 use super::projects::assigned_index;
 use super::{CodexHarness, error, required, sent_key};
-use crate::codex_service::{normalize_thread, normalize_thread_response};
+use crate::codex_service::{attached_parent_id, normalize_session_response, normalize_thread};
 
 // 40 只限制一次引擎读取的条数；执行中的轮次必须读取全部分页，不能因此隐藏“继续”等开头输入。
 const HISTORY_ITEM_PAGE_LIMIT: usize = 40;
@@ -178,10 +178,27 @@ impl CodexHarness {
             rows.extend(pins);
         }
         let mut recent = Vec::new();
+        let persistent = self.persistent_sidebar_rows().await?;
         let projection = self.projection.lock().await;
         let mut side_ids = Vec::new();
         let mut unread_sides = Vec::new();
         let mut side_attention = std::collections::HashMap::<String, Value>::new();
+        for summary in persistent {
+            let id = summary["id"].as_str().unwrap_or("");
+            let parent = summary["parentThreadId"].as_str().unwrap_or("");
+            side_ids.push(id.to_owned());
+            let active = summary["priority"]["active"] == true;
+            let waiting = summary["priority"]["attentionState"] == "waiting";
+            let unread = summary["hasUnreadTurn"] == true && !active && !waiting;
+            if unread {
+                unread_sides.push(json!({"id":id,"parentThreadId":parent}));
+            }
+            let flags = side_attention.entry(parent.to_owned())
+                .or_insert_with(|| json!({"active":false,"waiting":false,"unread":false}));
+            flags["active"] = json!(flags["active"] == true || active);
+            flags["waiting"] = json!(flags["waiting"] == true || waiting);
+            flags["unread"] = json!(flags["unread"] == true || unread);
+        }
         for (id, side) in &projection.sides.threads {
             if side.closed {
                 continue;
@@ -322,7 +339,7 @@ impl CodexHarness {
         if crate::codex_service::subagent_parent_id(&response["thread"]).is_some() {
             return self.subagent_detail(id, &response["thread"]).await;
         }
-        let mut thread = normalize_thread_response(&response)?;
+        let mut thread = normalize_session_response(&response)?;
         if let Some(settings) = self.store.lock().await.data.settings.get(id) {
             for key in ["model", "reasoningEffort", "serviceTier"] {
                 if thread[key].is_null() {
@@ -411,6 +428,7 @@ impl CodexHarness {
             thread[key] = queue[key].clone();
         }
         thread["fastMode"] = json!(self.fast_preference(id).await);
+        self.decorate_persistent_side(&response["thread"], &mut thread).await;
         Ok(json!({"ok":true,"thread":thread,"nativeBridge":"harness"}))
     }
 
@@ -445,13 +463,14 @@ impl CodexHarness {
         };
         anyhow::ensure!(identity["thread"]["id"] == id, "会话历史身份不匹配");
         let subagent = crate::codex_service::subagent_parent_id(&identity["thread"]).is_some();
+        let side = attached_parent_id(&identity["thread"]).is_some();
         if subagent {
             crate::codex_service::normalize_subagent_thread(&identity["thread"])?;
             if identity["thread"]["ephemeral"] == true {
                 return self.ephemeral_subagent_history(id, payload).await;
             }
         } else {
-            normalize_thread_response(&identity)?;
+            normalize_session_response(&identity)?;
         }
         let cursor = history_cursor(&payload["cursor"], "会话分页游标")?;
         if let Some(turn_id) = payload["turnId"].as_str() {
@@ -460,7 +479,7 @@ impl CodexHarness {
             let mut page = self
                 .history_turn_items(id, turn_id, &payload["turnStatus"], item_cursor)
                 .await?;
-            if !subagent {
+            if !subagent && !side {
                 super::message_edit::decorate_items(turn_id, &mut page.items);
             }
             let history = json!({"ok":true,"scope":"items","threadId":id,"turnId":turn_id,"data":page.items,
@@ -499,7 +518,7 @@ impl CodexHarness {
             pagination.insert(turn_id.clone(), items.pagination());
             items.apply_to(turn);
             *turn = crate::service_history::normalize_history_turn(turn.clone());
-            if !subagent {
+            if !subagent && !side {
                 if let Some(items) = turn["items"].as_array_mut() {
                     super::message_edit::decorate_items(&turn_id, items);
                 }

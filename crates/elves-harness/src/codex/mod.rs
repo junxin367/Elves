@@ -10,6 +10,7 @@ mod forks;
 mod message_edit;
 mod naming;
 mod pins;
+mod persistent_sides;
 mod projection;
 mod projects;
 mod queue_gate;
@@ -119,6 +120,9 @@ impl CodexHarness {
         let audit = Arc::new(execution::Audit::default());
         let store = Store::open(directory)?;
         let mut initial_projection = Projection::default();
+        for (id, side) in &store.data.persistent_sides {
+            initial_projection.persistent_sides.insert(id.clone(), side.parent.clone());
+        }
         for (id, deletion) in &store.data.deletions {
             if deletion.state == "deleted" {
                 initial_projection.forget_deleted_thread(id);
@@ -381,6 +385,17 @@ impl CodexHarness {
         ).await?;
         let mut params = json!({"threadId":id,"excludeTurns":true});
         super::instance_settings::apply_codex_compaction_default(&config, &mut params);
+        if crate::codex_service::attached_parent_id(&identity["thread"]).is_some() {
+            let side = self.persistent_snapshot(&identity["thread"]).await?;
+            // 用户要求重启后沿用创建权限；resume 本身同样不能借用后来变化的全局权限。
+            sides::apply_side_fork_permissions(&mut params, &side.permissions)?;
+            if let Some(saved) = self.store.lock().await.data.settings.get(id) {
+                if saved["model"].is_string() { params["model"] = saved["model"].clone(); }
+                if saved["reasoningEffort"].is_string() {
+                    params["config"]["model_reasoning_effort"] = saved["reasoningEffort"].clone();
+                }
+            }
+        }
         let response = self
             .runtime
             .request(
@@ -389,7 +404,8 @@ impl CodexHarness {
                 Some(guard),
             )
             .await?;
-        let mut thread = crate::codex_service::normalize_thread_response(&response)?;
+        let mut thread = crate::codex_service::normalize_session_response(&response)?;
+        self.decorate_persistent_side(&response["thread"], &mut thread).await;
         for key in ["model", "reasoningEffort", "serviceTier"] {
             if let Some(value) = response.get(key) {
                 thread[key] = value.clone();
@@ -718,7 +734,10 @@ impl CodexHarness {
                 None,
             )
             .await?;
-        crate::codex_service::normalize_thread_response(&identity)?;
+        crate::codex_service::normalize_session_response(&identity)?;
+        if crate::codex_service::attached_parent_id(&identity["thread"]).is_some() {
+            self.persistent_snapshot(&identity["thread"]).await?;
+        }
         if self.send_is_running(id, &identity["thread"]).await? {
             let (turn, compacting) = self.queue_anchor(id).await?;
             self.remember_queue_wait(id, turn, compacting).await?;

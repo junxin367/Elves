@@ -255,7 +255,10 @@ export function isMissingThreadError(error, id) {
   const missing = [...message.matchAll(/(thread not loaded:|unknown thread:|no rollout found for thread id )\s*["']?([A-Za-z0-9_-]+)/gi)];
   if (missing.length && !missing.some(match => match[2] === id)) return false;
   if (error?.readThreadId !== id && !missing.some(match => match[2] === id)) return false;
-  const side = normalizeRelatedView(relatedSessionView, id)?.kind === "side";
+  const view = normalizeRelatedView(relatedSessionView, id), side = view?.kind === "side";
+  // 用户要求持久侧边重启后可恢复；暂未加载或读取失败不能套用临时侧边的不可恢复过期态。
+  if (side && (view.ephemeral === false || thread?.id === id && thread.ephemeral === false))
+    return code === 410;
   // 原生 -32600 目前经服务层映射为 HTTP 503；仅准确侧边 ID 的缺失原因可作为过期证据。
   if (code === 503) return side && missing.some(match => match[2] === id);
   if (code === 410) return true;
@@ -267,11 +270,13 @@ export function isMissingThreadError(error, id) {
 export function sideThreadExpired(id = selectedId) {
   const view = normalizeRelatedView(relatedSessionView, id)
     || normalizeRelatedView(relatedThreadViews.get(id), id);
-  return view?.kind === "side" && (view.expired === true || thread?.id === id && thread.sideThreadExpired === true);
+  return view?.kind === "side" && view.ephemeral !== false && !(thread?.id === id && thread.ephemeral === false)
+    && (view.expired === true || thread?.id === id && thread.sideThreadExpired === true);
 }
 async function retireExpiredSideThread(id) {
   const current = normalizeRelatedView(relatedSessionView, id);
-  if (id !== selectedId || current?.kind !== "side") return false;
+  if (id !== selectedId || current?.kind !== "side" || current.ephemeral === false
+      || thread?.id === id && thread.ephemeral === false) return false;
   const expired = { ...current, expired: true };
   setRelatedSessionView(expired);
   relatedThreadViews.set(id, expired);
@@ -300,7 +305,13 @@ async function retireExpiredSideThread(id) {
 }
 export async function clearMissingThreadSelection(id) {
   if (id !== selectedId || !session) return false;
-  if (normalizeRelatedView(relatedSessionView, id)?.kind === "side")
+  const current = normalizeRelatedView(relatedSessionView, id);
+  if (current?.kind === "side" && (current.ephemeral === false || thread?.id === id && thread.ephemeral === false)) {
+    await returnToParentSession();
+    notice("此持久侧边已不可读取，已返回主会话", true);
+    return true;
+  }
+  if (current?.kind === "side")
     return retireExpiredSideThread(id);
   if (normalizeRelatedView(relatedSessionView, id)?.kind === "subagent") {
     // 只读子智能体已释放时回到原主会话，不能为查看历史重新运行或遗留可编辑输入框。
@@ -359,7 +370,7 @@ export function adoptRelatedMenu(result) {
     rememberRelatedView(item.id, "subagent", item.parentThreadId ?? null, item.name,
       { openedFromThreadId: parentThreadId, ephemeral: item.ephemeral });
   for (const item of result.sideThreads) rememberRelatedView(item.id, "side", null, item.title,
-    { openedFromThreadId: parentThreadId });
+    { openedFromThreadId: parentThreadId, ephemeral: item.ephemeral });
   filterSideThreadSidebar(sidebar);
   renderSidebar();
 }
@@ -563,8 +574,9 @@ async function finishRelatedOperation(record, result, { allowSelection = false }
   relatedThreadOperations.delete(relatedOperationKey(record)); persistRelatedOperations();
   if (record.action === "createSideThread") {
     sessionMenu?.updateSideThread(record.parentThreadId, { id: result.threadId,
-      title: result.thread?.title || "新建侧边会话", hasUnreadTurn: false });
-    rememberRelatedView(result.threadId, "side", record.parentThreadId);
+      title: result.thread?.title || "新建侧边会话", ephemeral: result.thread?.ephemeral, hasUnreadTurn: false });
+    rememberRelatedView(result.threadId, "side", record.parentThreadId, "",
+      { ephemeral: result.thread?.ephemeral });
     filterSideThreadSidebar(sidebar);
     renderSidebar();
     if (allowSelection && record.autoOpen !== false && !relatedSessionView && selectedId === record.parentThreadId
@@ -574,7 +586,8 @@ async function finishRelatedOperation(record, result, { allowSelection = false }
         const state = { ...history.state }; delete state[sideCreationHistoryKey];
         history.replaceState(state, "", location.href);
       }
-      await openRelatedThread({ id: result.threadId, title: result.thread?.title || "新建侧边会话" }, "side",
+      await openRelatedThread({ id: result.threadId, title: result.thread?.title || "新建侧边会话",
+        ephemeral: result.thread?.ephemeral }, "side",
         record.parentThreadId, { initialThread: record.state === "submitting"
             && result.synchronization?.status !== "failed" ? result.thread : null,
           replaceHistory: prepared, preparedView: prepared,
@@ -586,6 +599,9 @@ async function finishRelatedOperation(record, result, { allowSelection = false }
     }
     if (record.scope === privateInputScope(session) && typeof result.warning === "string" && result.warning.trim())
       notice(`侧边会话已创建。${result.warning.trim()}`, true);
+  } else if (result.ephemeral === false && result.historyRetained === true) {
+    // 用户要求关闭持久侧边只卸载标签，关联列表和历史仍可重开；临时侧边继续终态释放。
+    sessionTools?.closeThread?.(result.threadId, "side");
   } else {
     sessionMenu?.updateSideThread(record.parentThreadId, { id: result.threadId }, { remove: true });
     await retireNativeSideThreads([result.threadId], { notify: false });
@@ -629,7 +645,10 @@ export async function runRelatedOperation(action, item = null) {
   if (action === "closeSideThread") {
     const view = normalizeRelatedView(relatedThreadViews.get(item?.id), item?.id);
     if ((view?.openedFromThreadId || view?.parentThreadId) !== parentThreadId || view.kind !== "side") return;
-    if (!await confirmAction("关闭侧边会话", "关闭后，此临时侧边会话及其内容将无法恢复。确定关闭吗？", "关闭会话", true)
+    const persistent = item?.ephemeral === false || view.ephemeral === false;
+    if (!await confirmAction("关闭侧边会话", persistent
+      ? "关闭标签后保留持久侧边历史，可从会话菜单重新打开；正在执行的任务继续运行。"
+      : "关闭后，此临时侧边会话及其内容将无法恢复。确定关闭吗？", "关闭会话", !persistent)
         || selectedId !== parentThreadId || scope !== privateInputScope(session) || relatedSessionView) return;
   }
   const record = { id: randomId(), action, scope, parentThreadId,

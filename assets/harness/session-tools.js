@@ -488,6 +488,10 @@ export function mountSessionTools(options) {
   updateContext();
   return {
     open, openFile, openSideThread, openSubagent, openSideCreation, updateContext,
+    closeThread(threadId, kind = "side") {
+      if (!disposed && currentContext?.key === identity())
+        closeTab(tabKey({ kind, threadId }));
+    },
     close: () => desktop() ? hidePanel() : mobile?.close(),
     dispose() {
       if (disposed) return;

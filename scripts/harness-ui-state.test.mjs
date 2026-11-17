@@ -287,6 +287,32 @@ async function instanceOptionUiFixture(settings, extraSettings, backend = "codex
   return { context, selections, saved, module };
 }
 
+test("Codex 实例页单独显示持久侧边开关，旧服务缺字段时禁用", async () => {
+  const module = await readFile(new URL("../assets/harness/features/settings/instance-settings.js", import.meta.url), "utf8");
+  const start = module.indexOf("  function renderGeneral()");
+  const end = module.indexOf("  function renderModels()", start);
+  for (const value of [undefined, false, true]) {
+    const switches = [], cards = [];
+    const context = {
+      record: { backend: "codex", settings: { persistentSideThreads: value } },
+      content: { append() {} }, element: () => ({}),
+      section(_content, label) { cards.push(label); return { label }; },
+      addSwitch(card, key, label, description, checked, unsupported = false) {
+        switches.push({ card, key, label, description, checked, unsupported });
+      },
+    };
+    rawVm.createContext(context); rawVm.runInContext(module.slice(start, end), context);
+    context.renderGeneral();
+    const side = switches.find(control => control.key === "persistentSideThreads");
+    assert.equal(side.card.label, "侧边会话");
+    assert.equal(side.checked, value === true);
+    assert.equal(side.unsupported, value === undefined);
+    assert.match(side.description, /默认关闭/);
+    assert.match(side.description, /已有侧边不转换/);
+    assert.equal(switches.filter(control => control.card.label === "Codex 常规设置").length, 4);
+  }
+});
+
 test("实例额外设置使用原生默认选项，只读诊断不创建可写控件", async () => {
   const options = [
     { id: "generateMemories", kind: "boolean", group: "记忆", label: "生成记忆", description: "测试", readOnly: false },
@@ -1731,11 +1757,12 @@ test("消息编辑和队列草稿都可直接切换 Fast，实际提交和回执
 test("模型按钮允许编辑消息及队列草稿时选择，仅在编辑提交或回执待确认时锁定", () => {
   const control = {};
   const context = nodeVm.createContext({ nativeConnectionVersion: 1, $: () => control, sessionTypeEnabled: true,
-    threadReadOnly: () => false, deleting: false, serviceSideThread: () => false, active: true,
+    threadReadOnly: () => false, deleting: false, serviceSideThread: () => false, temporarySideThread: () => false, active: true,
     editingMessage: null, editingQueuedMessage: null, busy: false, stopping: false, pending: null, connected: true });
   const gate = sourceSection('  $("#model-button").disabled =', '  $("#sidebar-view-toggle").disabled =');
   for (const kind of ["none", "message", "queue", "side", "side-queue"]) {
     context.serviceSideThread = () => kind.startsWith("side");
+    context.temporarySideThread = context.serviceSideThread;
     context.editingMessage = kind === "message" ? {} : null;
     context.editingQueuedMessage = ["queue", "side-queue"].includes(kind) ? { state: "editing" } : null;
     nodeVm.runInContext(gate, context);
@@ -7303,7 +7330,7 @@ function queuedEditFeedbackHarness() {
     compactionSendReason: "", compaction: { state: "idle" }, deleting: false, prompt: h.prompt.value,
     pageLeaving: false, stream: null, composerDiagnosticState: "", creating: false,
     privateInputScope: () => "device-a", recordRuntimeDiagnostic() {},
-    isClaude: () => false, serviceSideThread: () => true,
+    isClaude: () => false, serviceSideThread: () => true, temporarySideThread: () => true,
     mutate: async (action, payload) => {
       h.submissions.push({ action, payload });
       context.pending = { id: "edit-receipt", action, payload, deviceId: "device-a", time: Date.now() };
@@ -8619,7 +8646,7 @@ function independentPromptOptimizationHarness(backend = "claude") {
     currentThreadDisplay: () => ({ tokenUsage: null }), contextUsage: () => null,
     compactUsageDescription: () => "", compactCommandAvailable: () => false, compactContext() {},
     claudeCommandSupported: () => false,
-    serviceSideThread: () => false,
+    serviceSideThread: () => false, temporarySideThread: () => false,
     goalComposerReason: () => "当前原生会话不提供目标", selectGoalCommand() {},
     deleting: false, composerCanAddImages: () => true, chooseComposerImages() {},
     activePopup: null, renderPopup() {}, closePopup() {}, closeComposerMenus() {},
@@ -9828,6 +9855,23 @@ test("侧边过期后仍读取服务保留的最新历史和较早消息", async
   await context.readHistoryPage(true, context.selectionVersion);
   assert.equal(calls.length, 2, "过期后仍可向前翻页");
   assert.equal(calls.every(call => call.path === "/api/read/history"), true);
+});
+
+test("持久侧边暂未加载时保留历史与草稿，不进入临时侧边过期态", async () => {
+  for (const endpoint of ["thread", "history"]) {
+    const h = sideExpiryHarness(() => jsonResponse({
+      ok: false, message: `thread not loaded: ${expiredSideProbe.threadId}`
+    }, 503));
+    h.context.relatedSessionView.ephemeral = false;
+    h.context.thread.ephemeral = false;
+    if (endpoint === "thread") await assert.rejects(h.context.reloadThread(), error => error.code === 503);
+    else await h.context.readHistoryPage(false, h.context.selectionVersion);
+    assert.equal(h.context.sideThreadExpired(h.id), false);
+    assert.equal(await h.context.retireExpiredSideThread(h.id), false);
+    assert.equal(h.nodes.get("#composer").hidden, false);
+    assert.equal(h.nodes.get("#side-thread-expired").hidden, true);
+    h.assertRetained();
+  }
 });
 
 test("过期侧边阅读后提交已读，清除父会话蓝点并保留其它侧边未读", async () => {
@@ -15813,7 +15857,7 @@ function claudeSlashMenuHarness() {
     cacheDisplayData: (...values) => writes.push(values), setTimeout: () => 1, clearTimeout() {},
     editingMessage: null, editingQueuedMessage: null, threadReadOnly: () => false,
     compactCommandAvailable: () => true, goalComposerReason: () => "",
-    threadForkAllowed: () => false, forkAvailable: () => false, serviceSideThread: () => false,
+    threadForkAllowed: () => false, forkAvailable: () => false, serviceSideThread: () => false, temporarySideThread: () => false,
     compactCommandMatches: query => ["compact", "压缩"].some(value => value.includes(query)),
     goalCommandMatches: query => ["goal", "目标"].some(value => value.includes(query)),
     skillIdentity: skill => `${skill.name}\0${skill.path}`, skillVisibleName: skill => skill.name,
@@ -16308,12 +16352,16 @@ test("斜杠分支紧随压缩，支持中文和 fork 筛选，侧边同时移�
   h.prompt.value = "保留文字 /fork"; h.prompt.selectionStart = h.prompt.selectionEnd = h.prompt.value.length;
   assert.equal(c.slashMenuEntries()[0].enabled, false);
   c.selectForkCommand(); assert.equal(h.prompt.value, "保留文字 /fork");
-  c.threadForkAllowed = () => false; c.serviceSideThread = () => true;
+  c.threadForkAllowed = () => false; c.serviceSideThread = () => true; c.temporarySideThread = () => true;
   h.prompt.value = "/"; h.prompt.selectionStart = h.prompt.selectionEnd = 1;
   assert.deepEqual(Array.from(c.slashMenuEntries(), entry => entry.type), ["compact", "promptOptimize"]);
   const tools = independentPromptOptimizationHarness("codex");
-  tools.context.serviceSideThread = () => true; tools.context.updateComposer();
+  tools.context.serviceSideThread = () => true; tools.context.temporarySideThread = () => true; tools.context.updateComposer();
   assert.equal(tools.add.menuOptions.some(option => option.value === "goal"), false);
+  c.temporarySideThread = () => false;
+  assert.deepEqual(Array.from(c.slashMenuEntries(), entry => entry.type), ["compact", "goal", "promptOptimize"]);
+  tools.context.temporarySideThread = () => false; tools.context.updateComposer();
+  assert.equal(tools.add.menuOptions.some(option => option.value === "goal"), true);
 });
 
 function installForkReceiptHarness(h) {

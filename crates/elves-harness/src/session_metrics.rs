@@ -442,6 +442,8 @@ struct CodexMetrics {
     ended: Option<u64>,
     observed: Option<u64>,
     total: Option<u64>,
+    own_total: Option<u64>,
+    own_complete: bool,
     previous_total: Option<u64>,
     input: u64,
     output: u64,
@@ -530,6 +532,10 @@ impl CodexMetrics {
                     return;
                 }
                 let last = &info["last_token_usage"];
+                // 用户要求持久侧边统计不含父会话累计值；只累加此侧边原生 rollout 的实际模型调用。
+                if !self.turn_id.is_empty() && let Some(tokens) = count(&last["total_tokens"]) {
+                    self.own_total = Some(self.own_total.unwrap_or(0).saturating_add(tokens));
+                }
                 if let Some(at) = at {
                     self.cache_observed_at = Some(at);
                     self.cache_expiry = infer_cache_expiry(
@@ -599,6 +605,17 @@ impl CodexMetrics {
         );
         metrics
     }
+
+    fn value_for_thread(&self, first_token: Option<(String, u64)>, attached: bool) -> Value {
+        let mut value = self.value_with_first_token(first_token);
+        if attached {
+            value["source"] = json!("codex-side");
+            value["totalTokens"] = if self.own_complete {
+                json!(self.own_total.filter(|total| *total <= SAFE_INTEGER))
+            } else { Value::Null };
+        }
+        value
+    }
 }
 
 #[derive(Clone)]
@@ -611,11 +628,15 @@ struct Cached {
 }
 
 pub(super) fn codex(home: &Path, id: &str, first_token: Option<(String, u64)>) -> Value {
+    codex_thread(home, id, first_token, false)
+}
+
+pub(super) fn codex_thread(home: &Path, id: &str, first_token: Option<(String, u64)>, attached: bool) -> Value {
     let Some(path) = super::context_usage::rollout_path(home, id) else {
         return Value::Null;
     };
     with_cache_expiry(
-        read_codex_with_first_token(&path, first_token).unwrap_or(Value::Null),
+        read_codex_kind(&path, first_token, attached).unwrap_or(Value::Null),
         id,
     )
 }
@@ -625,10 +646,15 @@ fn read_codex(path: &Path) -> std::io::Result<Value> {
     read_codex_with_first_token(path, None)
 }
 
+#[cfg(test)]
 fn read_codex_with_first_token(
     path: &Path,
     first_token: Option<(String, u64)>,
 ) -> std::io::Result<Value> {
+    read_codex_kind(path, first_token, false)
+}
+
+fn read_codex_kind(path: &Path, first_token: Option<(String, u64)>, attached: bool) -> std::io::Result<Value> {
     static CACHE: OnceLock<Mutex<HashMap<PathBuf, Cached>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut file = File::open(path)?;
@@ -643,10 +669,11 @@ fn read_codex_with_first_token(
         && entry.len == len
         && entry.modified == modified
     {
-        return Ok(entry.parser.value_with_first_token(first_token));
+        return Ok(entry.parser.value_for_thread(first_token, attached));
     }
     let mut parser = CodexMetrics::default();
     let mut offset = len.saturating_sub(MAX_READ_BYTES);
+    parser.own_complete = offset == 0;
     if let Some(entry) = cached
         && len > entry.len
         && len.saturating_sub(entry.offset) <= MAX_READ_BYTES
@@ -689,7 +716,7 @@ fn read_codex_with_first_token(
     }
     let parsed = offset + end as u64;
     let tail = bytes[end.saturating_sub(128)..end].to_vec();
-    let result = parser.value_with_first_token(first_token);
+    let result = parser.value_for_thread(first_token, attached);
     let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
     if cache.len() >= CACHE_CAPACITY && !cache.contains_key(path) {
         cache.clear();
@@ -973,6 +1000,25 @@ mod tests {
         assert_eq!(value["inputTokens"], 150);
         assert_eq!(value["outputTokens"], 40);
         assert_eq!(value["turnTokens"], 190);
+    }
+
+    #[test]
+    fn session_metrics_codex_attached_total_excludes_parent_and_hides_partial_history() {
+        let mut parser = CodexMetrics { own_complete:true, ..Default::default() };
+        for row in [
+            event("task_started", "2026-11-18T00:00:00Z", json!({"turn_id":"side"})),
+            usage(10200, 200), usage(10200, 200), usage(10500, 300),
+        ] {
+            parser.consume(&serde_json::to_vec(&row).unwrap());
+        }
+        assert_eq!(parser.value()["totalTokens"], 10500);
+        let side = parser.value_for_thread(None, true);
+        assert_eq!(side["source"], "codex-side");
+        assert_eq!(side["totalTokens"], 500);
+        assert_eq!(side["turnTokens"], 500);
+        parser.own_complete = false;
+        assert!(parser.value_for_thread(None, true)["totalTokens"].is_null());
+        assert_eq!(parser.value_for_thread(None, true)["turnTokens"], 500);
     }
 
     #[test]

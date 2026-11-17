@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 use super::store::Queued;
 use super::{CodexHarness, error};
 use crate::HarnessAuthorization;
-use crate::codex_service::normalize_thread_response;
+use crate::codex_service::normalize_session_response;
 
 impl CodexHarness {
     pub(super) async fn compact(
@@ -24,7 +24,7 @@ impl CodexHarness {
                 None,
             )
             .await?;
-        normalize_thread_response(&identity)?;
+        normalize_session_response(&identity)?;
         if !self.send_is_running(id, &identity["thread"]).await? {
             return self.start_compaction(id, authorization).await;
         }
@@ -39,7 +39,7 @@ impl CodexHarness {
                     None,
                 )
                 .await?;
-            normalize_thread_response(&latest)?;
+            normalize_session_response(&latest)?;
             if !self.send_is_running(id, &latest["thread"]).await? {
                 return self.start_compaction(id, authorization).await;
             }

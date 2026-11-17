@@ -86,7 +86,7 @@ import { editingQueuedMessage, queueVersion, queuedEditActions } from "../queue/
 import { claudeCommandSupported } from "../session/action-capabilities.js";
 import {
   activeBackend, backendCapability, claudeNativeQueue, isActiveThread, isClaude, privateInputScope,
-  queueCapability, serviceSideThread, threadReadOnly, threadReadOnlyMessage
+  queueCapability, serviceSideThread, temporarySideThread, threadReadOnly, threadReadOnlyMessage
 } from "../session/capabilities.js";
 import { recordRuntimeDiagnostic, stream } from "../session/connection-state.js";
 import {
@@ -239,7 +239,7 @@ export function updateComposer({ followEnd = false } = {}) {
       description: compactUsageDescription(usage),
       disabled: !compactCommandAvailable(), action: compactContext }
   // 用户要求临时侧边直接移除“目标”按钮，/ 菜单需同步隐藏，不能仅保留禁用项。
-  ].filter(option => (option.value !== "goal" || !serviceSideThread())
+  ].filter(option => (option.value !== "goal" || !temporarySideThread())
     && (!isClaude() || !["compact", "goal"].includes(option.value) || claudeCommandSupported(option.value)));
   add.disabled = add.menuOptions.every(option => option.disabled);
   if (activePopup?.trigger === add) renderPopup();
