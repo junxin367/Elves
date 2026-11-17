@@ -55,10 +55,10 @@ function messageEditStale(edit) {
   return Object.hasOwn(thread || {}, "editableMessage")
     && (thread.editableMessage?.turnId !== edit.turnId || thread.editableMessage?.messageId !== edit.messageId);
 }
-export function updateMessageEditor() {
+export function updateMessageEditor({ followEnd = false } = {}) {
   const edit = editingMessage;
   if (!edit?.form) return;
-  resizeEditorInput(edit.input);
+  resizeEditorInput(edit.input, { followEnd });
   const locked = busy || !!pending;
   const stale = messageEditStale(edit);
   const unavailable = !connected || threadReadOnly(edit.threadId) || !threadSentMessageEditAllowed(edit.threadId)
@@ -96,7 +96,11 @@ export function messageEditor() {
     }
     form.append(input, actions);
     form.onsubmit = event => { event.preventDefault(); void submitMessageEdit(); };
-    input.oninput = () => { edit.text = input.value; edit.error = ""; updateMessageEditor(); };
+    // 历史消息编辑与主输入框共用滚动约束：实际输入才跟随末尾，状态刷新及撤销不改变阅读位置。
+    input.oninput = event => {
+      edit.text = input.value; edit.error = "";
+      updateMessageEditor({ followEnd: !["historyUndo", "historyRedo"].includes(event.inputType) });
+    };
     input.onkeydown = event => {
       if (event.isComposing) return;
       if (event.key === "Escape" && !busy && !pending) { event.preventDefault(); cancelMessageEdit(); }

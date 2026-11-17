@@ -143,7 +143,7 @@ export function syncPendingFeedbackTimer() {
     updateComposer();
   }, Math.min(...remaining)));
 }
-export function updateComposer() {
+export function updateComposer({ followEnd = false } = {}) {
   workspaceOpenIn?.updateContext();
   sessionTools?.updateContext();
   syncRelatedSessionLayout();
@@ -171,7 +171,7 @@ export function updateComposer() {
     }
   }
   syncBackendModels();
-  resizeComposerInput();
+  resizeComposerInput({ followEnd });
   renderGoalStatus();
   renderQueueArea();
   updateScrollControl();

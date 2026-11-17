@@ -15649,20 +15649,49 @@ test("切换会话、授权、弹窗、禁用及主动改变焦点后，旧编�
   }
 });
 
-test("编辑器末尾换行滚动到底部，中间编辑保持原滚动位置", () => {
+test("编辑器被动刷新保留手动滚动位置，仅实际末尾输入时跟随底部", () => {
   const input = { isConnected: true, style: {}, value: "line\n", selectionStart: 5, selectionEnd: 5,
     scrollHeight: 240, scrollTop: 0 };
+  let height = "";
+  Object.defineProperty(input.style, "height", {
+    get: () => height,
+    set(value) { height = value; if (value === "auto") input.scrollTop = 0; }
+  });
   const context = nodeVm.createContext({ nativeConnectionVersion: 1, document: { activeElement: input },
     getComputedStyle: () => ({ minHeight: "80", maxHeight: "180" }) });
   nodeVm.runInContext(sourceSection("function resizeEditorInput(", "function resizeComposerInput("), context);
   context.resizeEditorInput(input);
   assert.equal(input.style.height, "180px");
   assert.equal(input.style.overflowY, "auto");
+  assert.equal(input.scrollTop, 0, "光标仍在末尾，手动滚到顶部后普通刷新不能拉回底部");
+  input.scrollTop = 72; context.resizeEditorInput(input);
+  assert.equal(input.scrollTop, 72, "重算高度可能临时重置滚动位置，普通刷新须恢复原位置");
+  context.resizeEditorInput(input, { followEnd: true });
   assert.equal(input.scrollTop, 240, "末尾回车后跟随到最新内容底部");
-  input.selectionStart = input.selectionEnd = 1; input.scrollTop = 72; context.resizeEditorInput(input);
+  input.selectionStart = input.selectionEnd = 1; input.scrollTop = 72;
+  context.resizeEditorInput(input, { followEnd: true });
   assert.equal(input.scrollTop, 72, "编辑中间内容不能强制跳到底部");
+  input.selectionEnd = 5; context.resizeEditorInput(input, { followEnd: true });
+  assert.equal(input.scrollTop, 72, "存在选区时不强制跳到底部");
+  input.selectionStart = 5; context.document.activeElement = null;
+  context.resizeEditorInput(input, { followEnd: true });
+  assert.equal(input.scrollTop, 72, "非当前编辑框不能因迟到输入回调跳到底部");
   input.selectionStart = input.selectionEnd = 5; input.scrollHeight = 80; context.resizeEditorInput(input);
   assert.equal(input.scrollTop, 0, "内容无需滚动时沿用原顶部位置");
+});
+
+test("普通输入、换行、粘贴和输入法允许跟随末尾，撤销重做保留恢复的阅读位置", () => {
+  const { context } = queuedEditPersistenceHarness(), updates = [];
+  context.updateComposer = options => updates.push(options);
+  for (const event of [
+    { inputType: "insertText" }, { inputType: "insertParagraph" }, { key: "Enter" }, { type: "paste" },
+    { inputType: "insertCompositionText", isComposing: true }, { type: "compositionend" },
+    { inputType: "historyUndo" }, { inputType: "historyRedo" }
+  ]) {
+    context.handlePromptInput(event, { preserveCanonical: true });
+    assert.equal(updates.at(-1)?.followEnd, !["historyUndo", "historyRedo"].includes(event.inputType),
+      `跟随请求须区分实际编辑与恢复历史：${JSON.stringify(event)}`);
+  }
 });
 
 test("编辑区加号保持正常前景色和交互背景，提示词优化保留彩色与绿色完成图标", async () => {

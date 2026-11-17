@@ -307,9 +307,10 @@ export function composerPrompt(text = $("#prompt")?.value || "", skills = select
   }
   return (result + body.slice(cursor)).trim();
 }
-export function resizeEditorInput(input) {
+export function resizeEditorInput(input, { followEnd = false } = {}) {
   if (!input?.isConnected) return;
-  const followEnd = document.activeElement === input && input.selectionStart === input.selectionEnd
+  const scrollTop = input.scrollTop;
+  const followCaret = followEnd && document.activeElement === input && input.selectionStart === input.selectionEnd
     && input.selectionEnd === String(input.value ?? "").length;
   input.style.height = "auto";
   const style = getComputedStyle(input);
@@ -318,9 +319,10 @@ export function resizeEditorInput(input) {
   input.style.height = `${Math.min(maxHeight, contentHeight)}px`;
   input.style.overflowY = contentHeight > maxHeight ? "auto" : "hidden";
   if (contentHeight <= maxHeight) input.scrollTop = 0;
-  // 用户要求回车换行后光标保持可见；仅无选区且光标位于末尾时跟随底部，中间编辑不跳滚动位置。
-  else if (followEnd) input.scrollTop = input.scrollHeight;
+  // 用户要求手动滚动不被末尾光标拉回；仅实际输入请求跟随末尾，普通刷新、撤销和草稿恢复保留阅读位置。
+  // height=auto 的测量可能重置滚动位置，主输入框与历史消息编辑框都须在重算后恢复。
+  else input.scrollTop = followCaret ? input.scrollHeight : scrollTop;
 }
-export function resizeComposerInput() {
-  resizeEditorInput($("#prompt"));
+export function resizeComposerInput(options) {
+  resizeEditorInput($("#prompt"), options);
 }

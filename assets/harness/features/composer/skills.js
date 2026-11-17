@@ -378,6 +378,8 @@ export function selectPromptOptimizationCommand() {
   void activatePromptOptimization();
 }
 export function handlePromptInput(event, { preserveCanonical = false } = {}) {
+  // 用户要求末尾输入仍保持光标可见；撤销/重做沿用已恢复的滚动位置，不能当作新输入跟随。
+  const followEnd = !["historyUndo", "historyRedo"].includes(event?.inputType);
   if (!preserveCanonical) forgetPromptCanonicalText();
   if (!preserveCanonical) {
     const prompt = $("#prompt");
@@ -387,12 +389,12 @@ export function handlePromptInput(event, { preserveCanonical = false } = {}) {
       setPromptSelection(prompt, selection.start, selection.end, selection);
     }
   }
-  if (event?.isComposing) { rememberQueuedMessageEdit(); updateComposer(); closeSkillMenu(); return; }
+  if (event?.isComposing) { rememberQueuedMessageEdit(); updateComposer({ followEnd }); closeSkillMenu(); return; }
   if (preserveCanonical) restorePromptCanonicalContent();
   syncSelectedSkillsFromPrompt();
   syncPromptTrailingBreak($("#prompt"));
   rememberDraft();
-  updateComposer();
+  updateComposer({ followEnd });
   setSkillIndex(0); void updateSkillMenu();
   $("#prompt")?.editHistory?.commit();
 }
