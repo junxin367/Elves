@@ -12,6 +12,9 @@ use super::super::{HarnessAuthorization, now_ms};
 pub(super) struct Queued {
     pub id: String,
     pub payload: Value,
+    // 手动压缩与普通消息共用顺序，但不能作为用户正文发送或取回编辑。
+    #[serde(default)]
+    pub compact: bool,
     pub created_at: u64,
     pub device_id: String,
     pub key_id: String,
@@ -32,6 +35,7 @@ impl Queued {
         Self {
             id,
             payload,
+            compact: false,
             created_at: now_ms(),
             device_id: authorization.device.id.clone(),
             key_id: authorization.device.key_id.clone(),
@@ -48,7 +52,9 @@ impl Queued {
             .map(|image| json!({"src":image["dataUrl"],"name":image["name"]}))
             .collect();
         json!({"id":self.id,"clientUserMessageId":self.payload["clientUserMessageId"],
-            "text":self.payload["prompt"],"prompt":self.payload["prompt"],"createdAt":self.created_at,
+            "action":if self.compact {"compact"} else {"send"},
+            "text":if self.compact {json!("压缩上下文")} else {self.payload["prompt"].clone()},
+            "prompt":self.payload["prompt"],"createdAt":self.created_at,
             "canSendNow":matches!(self.state.as_str(),"queued"|"paused"),"pausedReason":match self.state.as_str() {
                 "unknown" => json!("消息送达状态待核对"), "paused" => json!("消息已暂停"), _ => Value::Null },
             "remoteDeliveryState":if self.state=="unknown" {"outcome-unknown"} else {"queued"},
@@ -265,6 +271,7 @@ mod tests {
                     data.queues.insert(
                         "thread-a".into(),
                         vec![Queued {
+                            compact: false,
                             id: "message-a".into(),
                             payload: json!({"prompt":"test","clientUserMessageId":"client-a"}),
                             created_at: 1,

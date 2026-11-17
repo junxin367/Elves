@@ -99,7 +99,7 @@ impl Claude {
     pub(super) async fn dispatch_native_command(
         &self,
         c: &Conversation,
-        process: &Arc<Process>,
+        process: &Process,
         name: &str,
         argument: &str,
         expected_goal: Option<&Value>,
@@ -119,6 +119,17 @@ impl Claude {
                 Some(authorization),
             )
             .await?;
+        if name == "compact"
+            && result["nativeCommand"]["id"]
+                .as_str()
+                .is_none_or(str::is_empty)
+        {
+            return Err(dispatched_unknown(ApiError::new(
+                503,
+                "压缩命令身份尚未确认，请核对原回执",
+            ))
+            .into());
+        }
         // 只确认命令已交给原生；网页等 goal_status / compact_boundary 才显示实际结果。
         let current = self.conversation(&c.id).await?;
         Ok(
@@ -130,7 +141,7 @@ impl Claude {
 
     /// 等本次压缩前触发的设置切换（模型或思考深度）有结果；未生效则返回错误，调用方不再发送 /compact。
     async fn wait_for_setting_switch(
-        self: &Arc<Self>,
+        &self,
         id: &str,
         name: &str,
         before: &str,
@@ -172,12 +183,46 @@ impl Claude {
         payload: &Value,
         authorization: &HarnessAuthorization,
     ) -> anyhow::Result<Value> {
+        let process = self
+            .processes
+            .lock()
+            .await
+            .get(&c.id)
+            .filter(|p| p.channel.live.load(Ordering::Acquire))
+            .cloned();
+        let process = match process {
+            Some(process) => process,
+            None => {
+                let process = self.spawn(c).await?;
+                self.processes
+                    .lock()
+                    .await
+                    .insert(c.id.clone(), process.clone());
+                process
+            }
+        };
+        self.execute_native_command(c, &process, action, payload, authorization, true)
+            .await
+    }
+
+    pub(super) async fn execute_native_command(
+        &self,
+        c: &mut Conversation,
+        process: &Process,
+        action: &str,
+        payload: &Value,
+        authorization: &HarnessAuthorization,
+        allow_queue: bool,
+    ) -> anyhow::Result<Value> {
         if let Some(mode) = payload["permissionMode"].as_str() {
             c.permission_mode = Some(mode.to_owned());
         }
         // 用户要求压缩提示词按实例发起；只传给同一 WSL 原生 /compact，不改代理或正常会话系统提示词。
         let compaction_prompt = if action == "compact" {
-            crate::instance_settings::claude_compaction_prompt(&self.directory, &c.config.instance_id())?
+            crate::instance_settings::claude_compaction_prompt(
+                &self.directory,
+                &c.config.instance_id(),
+            )?
         } else {
             String::new()
         };
@@ -201,24 +246,39 @@ impl Claude {
             }
             _ => return Err(error(400, "不支持的 Claude 原生命令")),
         };
-        let process = self
-            .processes
-            .lock()
-            .await
-            .get(&c.id)
-            .filter(|p| p.channel.live.load(Ordering::Acquire))
-            .cloned();
-        let process = match process {
-            Some(process) => process,
-            None => {
-                let process = self.spawn(c).await?;
-                self.processes
-                    .lock()
-                    .await
-                    .insert(c.id.clone(), process.clone());
-                process
+        if action == "compact" {
+            if !c.shared
+                || !process.initialization["commands"]
+                    .as_array()
+                    .is_some_and(|commands| {
+                        commands.iter().any(|command| command["name"] == "compact")
+                    })
+            {
+                return Err(error(409, "当前 Claude CLI 未提供此原生命令"));
             }
-        };
+            // 用户要求执行中的手动压缩可见排队；先刷新同一原生连接，不能把旧执行状态或本地占位当作准入依据。
+            process
+                .control(json!({"subtype":"shared_sync"}), Some(authorization))
+                .await?;
+            *c = self.conversation(&c.id).await?;
+            if c.active() {
+                return if allow_queue {
+                    self.enqueue_compaction(c, payload, authorization).await
+                } else {
+                    Ok(json!({"deferred":true}))
+                };
+            }
+            if matches!(
+                c.native_control["compaction"]["state"].as_str(),
+                Some("pending" | "running" | "unknown")
+            ) {
+                return if allow_queue {
+                    Err(error(409, "已有压缩正在执行或结果待确认，请先核对原操作"))
+                } else {
+                    Ok(json!({"deferred":true}))
+                };
+            }
+        }
         // 用户要求压缩与发送消息、/goal 一样触发所选模型切换：网页菜单里的模型只是本地选择，
         // 不在此先应用，/compact 会沿用 CLI 当前模型而界面仍显示新选择。
         // 只有请求明确带了模型或思考深度才应用，普通压缩不依赖模型目录；应用失败（模型不在列表、
@@ -237,9 +297,9 @@ impl Claude {
         };
         if action == "setGoal" || compact_requests_model_choice(action, payload) {
             if action == "setGoal" {
-                apply_permissions(&process, c, payload, authorization).await?;
+                apply_permissions(process, c, payload, authorization).await?;
             }
-            apply_model(&process, c, payload, authorization).await?;
+            apply_model(process, c, payload, authorization).await?;
             self.change(|saved| {
                 let current = saved
                     .conversations
@@ -258,8 +318,22 @@ impl Claude {
         for (name, before) in switch_names.iter().zip(&switch_before) {
             self.wait_for_setting_switch(&c.id, name, before).await?;
         }
+        if action == "compact" && !switch_names.is_empty() {
+            // 切换模型可能等待原生确认；准备完成后再次核对，期间开始的任务必须让压缩回到队列。
+            process
+                .control(json!({"subtype":"shared_sync"}), Some(authorization))
+                .await?;
+            *c = self.conversation(&c.id).await?;
+            if c.active() {
+                return if allow_queue {
+                    self.enqueue_compaction(c, payload, authorization).await
+                } else {
+                    Ok(json!({"deferred":true}))
+                };
+            }
+        }
         let expected_goal = (action == "updateGoal").then_some(&c.native_control["goal"]);
-        self.dispatch_native_command(c, &process, name, argument, expected_goal, authorization)
+        self.dispatch_native_command(c, process, name, argument, expected_goal, authorization)
             .await
     }
 }
@@ -327,8 +401,16 @@ mod tests {
     #[test]
     fn compaction_item_preserves_only_explicit_native_model() {
         let event = json!({"id":"compact","status":"completed","compactionModel":"actual-compression-model"});
-        assert_eq!(compaction_item(&event).unwrap()["compactionModel"], "actual-compression-model");
-        for model in [Value::Null, json!(""), json!("invalid\nmodel"), json!("x".repeat(201))] {
+        assert_eq!(
+            compaction_item(&event).unwrap()["compactionModel"],
+            "actual-compression-model"
+        );
+        for model in [
+            Value::Null,
+            json!(""),
+            json!("invalid\nmodel"),
+            json!("x".repeat(201)),
+        ] {
             let mut invalid = event.clone();
             invalid["compactionModel"] = model;
             assert!(compaction_item(&invalid).unwrap()["compactionModel"].is_null());

@@ -147,6 +147,24 @@ mod tests {
     }
 
     #[test]
+    fn harness_service_side_standalone_compaction_keeps_history_and_queue_available() {
+        let mut side = side();
+        for method in ["item/started", "item/completed"] {
+            side.observe(
+                &json!({"method":method,"params":{"turnId":"standalone-compact",
+                "item":{"id":"compact","type":"contextCompaction","status":"completed"}}}),
+            );
+            assert!(!side.incomplete, "独立压缩事件不能把完整侧边历史标为缺失");
+            assert!(side.history(&json!({"threadId":"side"})).is_ok());
+        }
+        side.observe(
+            &json!({"method":"item/started","params":{"turnId":"unknown-turn",
+            "item":{"id":"ordinary","type":"agentMessage","text":"缺少原轮次"}}}),
+        );
+        assert!(side.incomplete, "普通消息缺少原轮次时继续保留完整性保护");
+    }
+
+    #[test]
     fn harness_service_side_compaction_queue_waits_for_success_and_preserves_edit_drafts() {
         for status in ["completed", "failed", "interrupted"] {
             let mut side = side();
@@ -157,6 +175,7 @@ mod tests {
                 ["queued", "editing"]
                     .into_iter()
                     .map(|state| Queued {
+                        compact: false,
                         id: state.into(),
                         payload: json!({"prompt":"保留的队列内容"}),
                         created_at: 1,
@@ -557,7 +576,12 @@ impl SideThread {
             }
             "item/started" | "item/completed" => {
                 if let Some(id) = params["turnId"].as_str() {
-                    self.upsert_item(id, params["item"].clone());
+                    // 手动压缩可能只有独立原生轮次 ID；由投影保存其压缩事件，不能误判侧边历史缺失并阻断后续队列。
+                    if params["item"]["type"] != "contextCompaction"
+                        || self.turns.iter().any(|turn| turn["id"] == id)
+                    {
+                        self.upsert_item(id, params["item"].clone());
+                    }
                     if params["item"]["type"] == "contextCompaction" {
                         let thread = self.metadata["id"].as_str().unwrap_or("");
                         // 用户要求压缩期间可维护侧边队列；只在原生确认正常完成后放行，失败仍暂停待发消息。
@@ -780,7 +804,7 @@ impl CodexHarness {
         self.projection.lock().await.sides.threads.contains_key(id)
     }
 
-    async fn side_generation(&self, id: &str) -> anyhow::Result<String> {
+    pub(super) async fn side_generation(&self, id: &str) -> anyhow::Result<String> {
         let connection = self.runtime.connection().await?;
         let projection = self.projection.lock().await;
         let side = projection
@@ -811,7 +835,11 @@ impl CodexHarness {
         if side.closed {
             return Err(error(410, "侧边会话已关闭，内容已释放"));
         }
-        side.history(payload)
+        Ok(projection.history(
+            id,
+            side.history(payload)?,
+            payload["cursor"].is_null() && payload["turnId"].is_null(),
+        ))
     }
 
     pub(super) async fn related_sides(&self, payload: &Value) -> anyhow::Result<Value> {
@@ -1231,17 +1259,7 @@ impl CodexHarness {
                 }
                 self.respond(id, action, payload, authorization).await
             }
-            "compact" => {
-                self.runtime
-                    .request_in_generation(
-                        &generation,
-                        "thread/compact/start",
-                        json!({"threadId":id}),
-                        authorization,
-                    )
-                    .await?;
-                Ok(json!({"ok":true,"threadId":id}))
-            }
+            "compact" => self.compact(id, authorization).await,
             _ => Err(error(409, "此操作不适用于临时侧边会话")),
         }
     }
@@ -1523,6 +1541,9 @@ impl CodexHarness {
         let permit = authorization.prepare_dispatch().await?;
         let mut projection = self.projection.lock().await;
         let active = projection.active.get(id).cloned();
+        if manual && message.compact && active.is_some() {
+            return Err(error(409, "手动压缩需等待当前任务结束，不能引导执行"));
+        }
         if projection.compactions.contains_key(id) {
             return if manual {
                 Err(error(409, "侧边会话压缩期间不能引导队列消息"))
@@ -1569,9 +1590,12 @@ impl CodexHarness {
         })?;
         projection.side_changed(id);
         drop(projection);
-        let result = self
-            .deliver_side(id, &message.payload, authorization, active)
-            .await;
+        let result = if message.compact {
+            self.start_compaction(id, authorization).await
+        } else {
+            self.deliver_side(id, &message.payload, authorization, active)
+                .await
+        };
         let mut projection = self.projection.lock().await;
         if let Some(side) = projection
             .sides

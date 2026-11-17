@@ -266,6 +266,8 @@ export function confirmQueuedSteerDisplay(id, messageId, result) {
   let record = sentMessageDisplayFor({ id: messageId }, id);
   if (!record && thread?.id === id) {
     const message = thread.queuedMessages?.find(message => message.id === messageId);
+    // 刷新后查询原回执也不能把压缩操作恢复成一条用户消息。
+    if (message?.action === "compact") return;
     if (message) {
       record = rememberSendDisplay({
         threadId: id, clientUserMessageId: queueMessageIdentity(message) || messageId,
@@ -292,6 +294,7 @@ function renderQueuedMessages(messages, previous = null) {
   queue.setAttribute("role", "list");
   for (const message of messages) {
     const row = element("div", "queued-message");
+    const compact = message.action === "compact";
     const messageId = message?.id;
     const accepted = message?.remoteDeliveryState === "accepted";
     row.dataset.messageId = messageId || "";
@@ -344,15 +347,17 @@ function renderQueuedMessages(messages, previous = null) {
       || !!message.submission?.status && message.submission.status !== "queued";
     const steering = queuedActionBusy.has(key) && pending?.action === "steerQueued"
       && pending.payload?.threadId === threadId && pending.payload?.messageId === messageId;
-    const steer = button("", accepted ? "消息已发送，队列记录待同步"
+    const steer = button("", compact ? active ? "等待当前任务结束后压缩" : "执行排队压缩" : accepted ? "消息已发送，队列记录待同步"
       : steering ? "正在引导此队列消息" : awaitingReceipt ? "队列消息结果待确认" : retryable ? "重试此队列消息" : "引导此队列消息",
       () => void steerQueuedMessage(threadId, messageId), "queued-steer-button");
-    steer.append(steering ? element("span", "spinner") : icon(retryable ? "retry" : "steer"),
-      element("span", "", accepted ? "已发送" : steering ? "引导中" : awaitingReceipt ? "待确认" : retryable ? "重试" : "引导"));
+    steer.append(steering ? element("span", "spinner") : icon(retryable ? "retry" : compact ? "compactContext" : "steer"),
+      element("span", "", accepted ? "已发送" : steering ? compact ? "执行中" : "引导中" : awaitingReceipt ? "待确认" : retryable ? "重试" : compact ? active ? "等待执行" : "执行" : "引导"));
     // 异常恢复沿用原有手动重试入口；显示服务端暂停原因，不能因重新打开页面自动恢复或重发。
     if (retryable) steer.title = message.pausedReason;
     // 用户要求压缩期间仅限制引导；编辑、删除及排序继续按各自的队列状态判断。
-    steer.disabled = accepted || awaitingReceipt || unavailable || compactionLocked(threadId) || message.canSendNow === false;
+    // 排队压缩不能引导或打断正在执行的轮次；空闲后的手动重试仍使用同一个队列项。
+    steer.disabled = accepted || awaitingReceipt || unavailable || compactionLocked(threadId) || message.canSendNow === false
+      || compact && active;
     const menu = button("", "排队消息操作", () => togglePopup(menu), "queued-menu-button");
     menu.id = `queued-menu-${messageId}`;
     menu.append(icon("more"));
@@ -361,13 +366,13 @@ function renderQueuedMessages(messages, previous = null) {
     menu.disabled = unavailable || thread?.backend === "claude" && accepted;
     menu.popupClassName = "queued-message-popup";
     menu.menuOptions = [
-      {
+      ...(!compact ? [{
         label: "编辑消息",
         icon: "edit",
         disabled: accepted || !!editingQueuedMessage || !!editingMessage || busy || !!pending
           || typeof message?.clientUserMessageId !== "string" || !Number.isFinite(message?.createdAt),
         action: () => beginQueuedMessageEdit(threadId, message)
-      },
+      }] : []),
       {
         label: accepted ? "移除已发送记录" : "删除排队消息",
         value: "remove",
@@ -479,6 +484,8 @@ async function steerQueuedMessage(threadId, messageId) {
   if (queuedActionBusy.has(key)) return;
   const queuedMessage = thread?.id === threadId
     ? thread.queuedMessages?.find(message => message?.id === messageId) : null;
+  const compact = queuedMessage?.action === "compact";
+  if (compact && isActiveThread()) return;
   const preview = {
     threadId,
     messageId,
@@ -487,7 +494,7 @@ async function steerQueuedMessage(threadId, messageId) {
       ?? null,
     text: queueMessageText(queuedMessage)
   };
-  const sendDisplay = rememberSendDisplay({
+  const sendDisplay = compact ? null : rememberSendDisplay({
     threadId, clientUserMessageId: preview.clientId || messageId, prompt: preview.text,
     images: queuedMessage?.context?.imageAttachments || queuedMessage?.images || [],
     skills: queuedMessage?.context?.skills || queuedMessage?.skills || []
@@ -495,7 +502,7 @@ async function steerQueuedMessage(threadId, messageId) {
   if (sendDisplay) sendDisplay.messageId = messageId;
   queuedActionBusy.add(key);
   // 引导中不插入正文；成功后使用同一份确认展示缓存，不能因历史尚未同步而移除。
-  setPendingSteer(preview);
+  if (!compact) setPendingSteer(preview);
   recordDiagnostic("remote.steer", { phase: "request" });
   renderMessages();
   if (selectedId === threadId) renderQueueArea();

@@ -3066,6 +3066,7 @@ impl Claude {
                     c.live_preview = None;
                 }
                 c.remote_queue.observe_turns(&c.turns, &c.native_status);
+                c.remote_queue.observe_compaction(&c.native_control);
                 let mut view = c.view();
                 let changed = history_changed
                     || previous_view != view

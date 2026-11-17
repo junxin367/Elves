@@ -105,25 +105,7 @@ impl CodexHarness {
                 self.queue_changed(&id).await;
                 Ok(json!({"ok":true,"threadId":id}))
             }
-            "compact" => {
-                let revision = self.projection.lock().await.compaction_revision(&id);
-                self.ensure_loaded(&id, authorization).await?;
-                self.runtime
-                    .request(
-                        "thread/compact/start",
-                        json!({"threadId":id}),
-                        Some(authorization),
-                    )
-                    .await?;
-                let mut projection = self.projection.lock().await;
-                // 开始/完成事件可能早于 RPC 回执，不能再覆盖为 pending。
-                if projection.compaction_revision(&id) == revision {
-                    projection.compactions.insert(id.clone(),
-                        json!({"state":"pending","turnId":null,"itemId":"pending-manual-context-compaction"}));
-                }
-                let compaction = projection.compaction(&id);
-                Ok(json!({"ok":true,"threadId":id,"compaction":compaction}))
-            }
+            "compact" => self.compact(&id, authorization).await,
             "rename" => {
                 // 自动命名仅在原生名称仍与生成前一致时写回；该比较位于会话写锁内，防止覆盖另一端的手动改名。
                 if let Some(expected) = payload["expectedName"].as_str()
@@ -190,6 +172,14 @@ impl CodexHarness {
                     .ok_or_else(|| error(409, "队列消息已变化"))?;
                 if !["queued", "paused"].contains(&message.state.as_str()) {
                     return Err(error(409, "此队列消息当前不能引导"));
+                }
+                if message.compact {
+                    if self.send_is_running(&id, &identity["thread"]).await? {
+                        return Err(error(409, "手动压缩需等待当前任务结束，不能引导执行"));
+                    }
+                    self.dispatch_queued_inner(&id, &message, authorization, true)
+                        .await?;
+                    return Ok(self.queue(&id).await);
                 }
                 let input = inputs(&message.payload)?;
                 self.store.lock().await.commit(|data| {
@@ -1028,6 +1018,9 @@ impl CodexHarness {
             if action == "removeQueued" {
                 queue.remove(index);
                 return Ok(());
+            }
+            if queue[index].compact {
+                return Err(error(409, "排队压缩不能编辑，只能删除或调整顺序"));
             }
             if payload["originalText"] != queue[index].payload["prompt"]
                 || payload["clientUserMessageId"] != queue[index].payload["clientUserMessageId"]

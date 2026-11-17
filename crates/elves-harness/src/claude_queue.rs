@@ -12,6 +12,8 @@ pub(super) struct RemoteQueue {
     paused: bool,
     awaiting_turn: Option<String>,
     awaiting_started: bool,
+    // 压缩已交给 CLI 后等待同一命令的终态；短暂 idle 不能让后续消息越过压缩。
+    awaiting_compaction: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -19,6 +21,8 @@ pub(super) struct RemoteQueue {
 struct Message {
     id: String,
     payload: Value,
+    #[serde(default)]
+    compact: bool,
     created_at: u64,
     device_id: String,
     key_id: String,
@@ -96,7 +100,9 @@ impl Message {
             .map(|i| json!({"src":i["dataUrl"],"name":i["name"]}))
             .collect();
         json!({"id":self.id,"clientUserMessageId":self.payload["clientUserMessageId"],
-            "text":self.payload["prompt"],"createdAt":self.created_at,"remoteQueueSource":"remote",
+            "action":if self.compact {"compact"} else {"send"},
+            "text":if self.compact {json!("压缩上下文")} else {self.payload["prompt"].clone()},
+            "createdAt":self.created_at,"remoteQueueSource":"remote",
             "canSendNow":matches!(self.state.as_str(),"queued"|"paused"),
             "pausedReason":if self.reason.is_empty() {
                 if paused {json!("队列已暂停")} else {Value::Null}
@@ -111,6 +117,29 @@ impl Message {
 }
 
 impl RemoteQueue {
+    pub(super) fn observe_compaction(&mut self, control: &Value) {
+        let Some(id) = self.awaiting_compaction.as_deref() else {
+            return;
+        };
+        let event = control["compactionEvents"]
+            .as_array()
+            .and_then(|events| events.iter().find(|event| event["id"] == id));
+        let command = control["commands"]
+            .as_array()
+            .and_then(|commands| commands.iter().find(|command| command["id"] == id));
+        let state = event
+            .and_then(|event| event["status"].as_str())
+            .or_else(|| command.and_then(|command| command["state"].as_str()));
+        match state {
+            Some("completed") => self.awaiting_compaction = None,
+            Some("failed" | "interrupted" | "cancelled" | "canceled") => {
+                self.awaiting_compaction = None;
+                self.pause();
+            }
+            _ => {}
+        }
+    }
+
     pub(super) fn pause(&mut self) {
         self.paused = true;
         self.revision += 1;
@@ -238,7 +267,7 @@ impl RemoteQueue {
             matches!(message.state.as_str(), "queued" | "paused"),
             "此消息正在编辑或发送"
         );
-        message.steer = true;
+        message.steer = !message.compact;
         self.revision += 1;
         Ok(())
     }
@@ -295,9 +324,14 @@ impl Conversation {
         self.shared
             && !self.deleted
             && !self.active()
+            && !matches!(
+                self.native_control["compaction"]["state"].as_str(),
+                Some("pending" | "running" | "unknown")
+            )
             && self.queued_messages.is_empty()
             && !self.remote_queue.paused
             && self.remote_queue.awaiting_turn.is_none()
+            && self.remote_queue.awaiting_compaction.is_none()
             && self
                 .remote_queue
                 .messages
@@ -316,6 +350,51 @@ impl Conversation {
 }
 
 impl Claude {
+    pub(super) async fn enqueue_compaction(
+        &self,
+        c: &Conversation,
+        payload: &Value,
+        authorization: &HarnessAuthorization,
+    ) -> anyhow::Result<Value> {
+        authorization.check().await?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut payload = payload.clone();
+        payload["clientUserMessageId"] = json!(id);
+        self.change(|saved| {
+            let current = saved
+                .conversations
+                .get_mut(&c.id)
+                .context("Claude 会话不存在")?;
+            if current.remote_queue.messages.len() >= 100 {
+                return Err(error(429, "此会话的待执行操作已达上限"));
+            }
+            current.remote_queue.messages.push(Message {
+                id: id.clone(),
+                payload,
+                compact: true,
+                created_at: now_ms(),
+                device_id: authorization.device.id.clone(),
+                key_id: authorization.device.key_id.clone(),
+                state: "queued".into(),
+                direct: false,
+                steer: false,
+                reason: String::new(),
+                native_intent: None,
+                native_edit: None,
+            });
+            // 新压缩不解除旧队列的暂停；停止、失败和未知回执继续按原规则处理。
+            current.remote_queue.revision += 1;
+            Ok(())
+        })
+        .await?;
+        self.remote_queue_changed(&c.id).await;
+        let mut response = self.conversation(&c.id).await?.queue_snapshot(&self.epoch);
+        response["messageId"] = json!(id);
+        response["confirmed"] = json!(true);
+        response["deliveryState"] = json!("queued");
+        Ok(response)
+    }
+
     pub(crate) async fn queue_send_state(&self, payload: &Value) -> anyhow::Result<Value> {
         let id = required(payload, "threadId")?;
         let client = required(payload, "clientUserMessageId")?;
@@ -473,6 +552,7 @@ impl Claude {
                     return Err(error(409, "请先核对尚未确认的消息"));
                 }
                 c.remote_queue.messages.push(Message {
+                    compact: false,
                     id: client_id.clone(),
                     payload: payload.clone(),
                     created_at: now_ms(),
@@ -542,6 +622,9 @@ impl Claude {
                     .iter_mut()
                     .find(|m| m.id == message_id)
                     .ok_or_else(|| error(409, "队列消息已变化"))?;
+                if message.compact && c.native_status["tempo"] == "active" && steer {
+                    return Err(error(409, "手动压缩需等待当前任务结束，不能引导执行"));
+                }
                 anyhow::ensure!(
                     matches!(message.state.as_str(), "queued" | "paused"),
                     "此消息正在编辑或发送"
@@ -550,7 +633,7 @@ impl Claude {
                 message.reason.clear();
                 let result = message.clone();
                 c.remote_queue.paused = false;
-                c.remote_queue.awaiting_turn = Some(message_id.into());
+                c.remote_queue.awaiting_turn = (!message.compact).then(|| message_id.into());
                 c.remote_queue.awaiting_started = false;
                 c.remote_queue.revision += 1;
                 Ok(result)
@@ -585,6 +668,18 @@ impl Claude {
         let mut edit_settings = None;
         let result = async {
             let mut c = self.conversation(id).await?;
+            if message.compact {
+                return self
+                    .execute_native_command(
+                        &mut c,
+                        process,
+                        "compact",
+                        &message.payload,
+                        authorization,
+                        false,
+                    )
+                    .await;
+            }
             // 用户要求权限不能阻断消息：普通投递交由连接端确认或登记待生效，原生审批和草稿继续保留；
             // 显式 next 引导仍不改写当前轮次权限。
             if !steer {
@@ -664,6 +759,13 @@ impl Claude {
                     m.direct = false;
                 }
             } else if result.is_ok() {
+                if message.compact {
+                    c.remote_queue.awaiting_compaction =
+                        result.as_ref().ok().and_then(|response| {
+                            response["nativeCommand"]["id"].as_str().map(str::to_owned)
+                        });
+                    c.remote_queue.observe_compaction(&c.native_control);
+                }
                 if let Some((model, effort)) = &edit_settings {
                     c.model = model.clone();
                     c.effort = effort.clone();
@@ -782,7 +884,10 @@ impl Claude {
                 .resolve_device(&message.device_id, Some(&message.key_id))
                 .await;
             let Some(device) = device else { continue };
-            let auth = controller.authorization(device, Some("send"));
+            let auth = controller.authorization(
+                device,
+                Some(if message.compact { "compact" } else { "send" }),
+            );
             // 自动续发也逐次核对原设备授权；退出、只读或撤销后不能继续派发。
             if auth.check().await.is_err() {
                 continue;
@@ -967,6 +1072,10 @@ impl RemoteQueue {
             return Ok(response);
         }
         anyhow::ensure!(
+            !self.messages[index].compact,
+            "排队压缩不能编辑，只能删除或调整顺序"
+        );
+        anyhow::ensure!(
             payload["originalText"] == self.messages[index].payload["prompt"]
                 && payload["clientUserMessageId"]
                     == self.messages[index].payload["clientUserMessageId"]
@@ -1059,7 +1168,8 @@ mod tests {
             writer,
             channel: channel.clone(),
             shared: true,
-            initialization: json!({"models":[{"value":"test-model","supportedEffortLevels":["low","max"]}]}),
+            initialization: json!({"models":[{"value":"test-model","supportedEffortLevels":["low","max"]}],
+                "commands":[{"name":"compact"}]}),
         });
         service.processes.lock().await.insert(c.id.clone(), process);
         service
@@ -1140,7 +1250,24 @@ mod tests {
                         .await
                         .unwrap();
                 }
+                if request["subtype"] == "shared_native_command"
+                    && matches!(reply, Reply::Accepted)
+                    && let Some(service) = weak.upgrade()
+                {
+                    service
+                        .change(|saved| {
+                            let c = saved.conversations.get_mut(&id).unwrap();
+                            c.native_control = json!({"compaction":{"state":"pending"},
+                            "commands":[{"id":request["id"],"name":"compact","state":"pending"}]});
+                            Ok(())
+                        })
+                        .await
+                        .unwrap();
+                }
                 let response = match reply {
+                    Reply::Accepted if request["subtype"] == "shared_native_command" => Ok(
+                        json!({"accepted":true,"nativeCommand":{"id":request["id"],"state":"pending"}}),
+                    ),
                     Reply::Accepted => Ok(json!({"accepted":true})),
                     Reply::Deferred => Ok(json!({"deferred":true,"accepted":false})),
                     Reply::Rejected => Err(ApiError::new(409, "尚未投递").into()),
@@ -1171,6 +1298,204 @@ mod tests {
 
     fn payload(c: &Conversation, id: &str) -> Value {
         json!({"threadId":c.id,"clientUserMessageId":id,"prompt":format!("正文-{id}")})
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_queues_with_messages_and_waits_for_its_own_terminal_status() {
+        for outcome in ["completed", "failed", "interrupted", "unknown"] {
+            let (_directory, _auth_directory, service, c, auth, calls, _) = fixture().await;
+            let compact = service
+                .command("compact", &json!({"threadId":c.id}), &auth)
+                .await
+                .unwrap();
+            assert_eq!(compact["deliveryState"], "queued");
+            let queued = compact["queuedMessages"][0].clone();
+            assert_eq!(queued["action"], "compact");
+            assert_eq!(queued["text"], "压缩上下文");
+            service
+                .command("send", &payload(&c, "after-compact"), &auth)
+                .await
+                .unwrap();
+            assert!(
+                calls.lock().await.is_empty(),
+                "执行中不能派发压缩或后续消息"
+            );
+            assert!(
+                service
+                    .command(
+                        "steerQueued",
+                        &json!({"threadId":c.id,"messageId":queued["id"]}),
+                        &auth
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(
+                service
+                    .command(
+                        "beginQueuedEdit",
+                        &json!({"threadId":c.id,"messageId":queued["id"],"editId":"compact-edit"}),
+                        &auth
+                    )
+                    .await
+                    .is_err()
+            );
+            service
+                .change(|saved| {
+                    let current = saved.conversations.get_mut(&c.id).unwrap();
+                    current.native_status = json!({"tempo":"idle"});
+                    current.turns[0]["status"] = json!("completed");
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            service.drain_remote_queues().await;
+            service.drain_remote_queues().await;
+            let command = calls.lock().await[0].clone();
+            assert_eq!(command["subtype"], "shared_native_command");
+            assert_eq!(command["name"], "compact");
+            assert_eq!(
+                calls.lock().await.len(),
+                1,
+                "压缩仅受理或短暂空闲时不能续发"
+            );
+            service
+                .change(|saved| {
+                    let current = saved.conversations.get_mut(&c.id).unwrap();
+                    current.native_control = json!({"compaction":{"state":"idle"},
+                    "commands":[{"id":command["id"],"state":"completed"}],
+                    "compactionEvents":[{"id":command["id"],"status":outcome}]});
+                    current
+                        .remote_queue
+                        .observe_compaction(&current.native_control);
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            service.drain_remote_queues().await;
+            assert_eq!(
+                calls.lock().await.len(),
+                if outcome == "completed" { 2 } else { 1 }
+            );
+            if outcome == "completed" {
+                assert_eq!(calls.lock().await[1]["client_id"], "after-compact");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_waits_behind_a_turn_blocked_on_native_approval() {
+        let (_directory, _auth_directory, service, c, auth, calls, _) = fixture().await;
+        service
+            .change(|saved| {
+                let current = saved.conversations.get_mut(&c.id).unwrap();
+                current.native_status = json!({"tempo":"blocked","needs":"permission prompt"});
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let queued = service
+            .command("compact", &json!({"threadId":c.id}), &auth)
+            .await
+            .unwrap();
+        assert_eq!(queued["deliveryState"], "queued");
+        service.drain_remote_queues().await;
+        assert!(
+            calls.lock().await.is_empty(),
+            "等待当前轮次审批时不能直接派发压缩"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_rechecks_running_state_after_applying_model_choice() {
+        let (_directory, _auth_directory, service, c, auth, calls, replies) = fixture().await;
+        replies.lock().await.extend([
+            Reply::SyncIdle,
+            Reply::Accepted,
+            Reply::Accepted,
+            Reply::SyncActive,
+        ]);
+        let queued = tokio::time::timeout(
+            Duration::from_secs(5),
+            service.command(
+                "compact",
+                &json!({"threadId":c.id,"reasoningEffort":"max"}),
+                &auth,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(queued["deliveryState"], "queued");
+        assert_eq!(queued["queuedMessages"][0]["action"], "compact");
+        assert_eq!(calls.lock().await.len(), 2);
+        assert_eq!(calls.lock().await[0]["subtype"], "set_model");
+        assert_eq!(calls.lock().await[1]["subtype"], "apply_flag_settings");
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_keeps_idle_direct_and_safe_retry() {
+        for reply in [Reply::Accepted, Reply::Rejected, Reply::Unknown] {
+            let (directory, _auth_directory, service, c, auth, calls, replies) = fixture().await;
+            let queued = service
+                .command("compact", &json!({"threadId":c.id}), &auth)
+                .await
+                .unwrap();
+            service
+                .command("stop", &json!({"threadId":c.id}), &auth)
+                .await
+                .unwrap();
+            service
+                .change(|saved| {
+                    let current = saved.conversations.get_mut(&c.id).unwrap();
+                    current.native_status = json!({"tempo":"idle"});
+                    current.turns[0]["status"] = json!("completed");
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            service.drain_remote_queues().await;
+            assert_eq!(calls.lock().await.len(), 1, "停止后队列保持暂停");
+            replies.lock().await.push_back(reply);
+            let result = service
+                .command(
+                    "steerQueued",
+                    &json!({"threadId":c.id,"messageId":queued["messageId"]}),
+                    &auth,
+                )
+                .await;
+            let queue = service.queue(&c.id).await.unwrap();
+            if matches!(reply, Reply::Accepted) {
+                assert!(result.is_ok());
+                assert!(queue["queuedMessages"].as_array().unwrap().is_empty());
+            } else {
+                assert!(result.is_err());
+                assert_eq!(
+                    queue["queuedMessages"][0]["submission"]["status"],
+                    if matches!(reply, Reply::Unknown) {
+                        "outcome-unknown"
+                    } else {
+                        "queued"
+                    }
+                );
+                let restored = Claude::new(directory.path()).unwrap();
+                assert_eq!(
+                    restored.queue(&c.id).await.unwrap()["queuedMessages"][0]["action"],
+                    "compact"
+                );
+            }
+            service.drain_remote_queues().await;
+            assert_eq!(calls.lock().await.len(), 2, "未知或失败压缩不能自动重放");
+        }
+        let (_directory, _auth_directory, service, c, auth, calls, replies) = fixture().await;
+        replies.lock().await.push_back(Reply::SyncIdle);
+        let direct = service
+            .command("compact", &json!({"threadId":c.id}), &auth)
+            .await
+            .unwrap();
+        assert!(direct["nativeCommand"].is_object());
+        assert_ne!(direct["deliveryState"], "queued");
+        assert_eq!(calls.lock().await.len(), 1);
     }
 
     #[tokio::test]
@@ -1238,6 +1563,7 @@ mod tests {
                 "dataUrl":format!("data:image/png;base64,{}",base64::engine::general_purpose::STANDARD.encode(png.get_ref()))})
         }).collect();
         let original = Message {
+            compact: false,
             id: "images".into(),
             payload: json!({"prompt":"原图","clientUserMessageId":"images",
             "images":[images[0],images[1]]}),
@@ -1293,6 +1619,7 @@ mod tests {
         let payload = json!({"clientUserMessageId":"image-message","prompt":"原内容","images":[image.clone(),image.clone(),image.clone()]});
         super::super::super::validate_input_images(&payload).unwrap();
         let original = Message {
+            compact: false,
             id: "image-message".into(),
             payload: payload.clone(),
             created_at: 1,
@@ -2242,6 +2569,7 @@ mod tests {
     #[test]
     fn unconfirmed_intent_is_not_native_acceptance_and_dispatching_restarts_as_unknown() {
         let message = Message {
+            compact: false,
             id: "C".into(),
             payload: json!({"clientUserMessageId":"C","prompt":"C"}),
             created_at: 1,

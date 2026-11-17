@@ -9723,6 +9723,230 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     }
 
     #[tokio::test]
+    async fn harness_manual_compaction_queues_in_order_for_main_and_side_sessions() {
+        for side in [false, true] {
+            let (directory, authorization, id) = if side {
+                harness_active_side_fixture().await
+            } else {
+                let (directory, authorization) = harness_fixture().await;
+                let created = authorization
+                    .controller
+                    .call_authorized(
+                        "create",
+                        json!({"projectId":"project-a","prompt":"wait manual compact"}),
+                        &authorization,
+                    )
+                    .await
+                    .unwrap();
+                (
+                    directory,
+                    authorization,
+                    created["threadId"].as_str().unwrap().to_owned(),
+                )
+            };
+            let controller = &authorization.controller;
+            std::fs::write(
+                directory.path().join("fast-policy.json"),
+                br#"{"compactDelayMs":1500}"#,
+            )
+            .unwrap();
+            controller
+                .call_authorized(
+                    "send",
+                    json!({"threadId":id,"prompt":"wait before manual compact",
+                "clientUserMessageId":"before-manual-compact"}),
+                    &authorization,
+                )
+                .await
+                .unwrap();
+            let queued = controller
+                .call_authorized("compact", json!({"threadId":id}), &authorization)
+                .await
+                .unwrap();
+            assert_eq!(queued["deliveryState"], "queued");
+            assert_eq!(queued["queuedMessages"][1]["action"], "compact");
+            let compact = queued["queuedMessages"][1].clone();
+            assert!(
+                controller
+                    .call_authorized(
+                        "steerQueued",
+                        json!({"threadId":id,"messageId":compact["id"]}),
+                        &authorization
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(controller.call_authorized("beginQueuedEdit", json!({"threadId":id,
+                "messageId":compact["id"],"editId":"compact-edit","originalText":compact["text"],
+                "clientUserMessageId":compact["clientUserMessageId"],"createdAt":compact["createdAt"]}),
+                &authorization).await.is_err());
+            controller
+                .call_authorized(
+                    "send",
+                    json!({"threadId":id,"prompt":"wait after manual compact",
+                "clientUserMessageId":"after-manual-compact"}),
+                    &authorization,
+                )
+                .await
+                .unwrap();
+            assert!(
+                !harness_engine_requests(directory.path())
+                    .iter()
+                    .any(|frame| frame["method"] == "thread/compact/start")
+            );
+            controller
+                .harness
+                .seed_test_history(json!({"threadId":id,"finish":true}))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    if harness_engine_requests(directory.path())
+                        .iter()
+                        .any(|frame| {
+                            frame["method"] == "turn/start"
+                                && frame["params"]["clientUserMessageId"] == "before-manual-compact"
+                        })
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                !harness_engine_requests(directory.path())
+                    .iter()
+                    .any(|frame| frame["method"] == "thread/compact/start"),
+                "压缩不能越过前面的排队消息"
+            );
+            controller
+                .harness
+                .seed_test_history(json!({"threadId":id,"finish":true}))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let queue = controller
+                        .call_authorized("queue", json!({"threadId":id}), &authorization)
+                        .await
+                        .unwrap();
+                    if queue["queuedMessages"].as_array().unwrap().is_empty() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let requests = harness_engine_requests(directory.path());
+            let compact_calls: Vec<_> = requests
+                .iter()
+                .enumerate()
+                .filter(|(_, frame)| frame["method"] == "thread/compact/start")
+                .collect();
+            assert_eq!(compact_calls.len(), 1);
+            let after = requests
+                .iter()
+                .position(|frame| {
+                    frame["method"] == "turn/start"
+                        && frame["params"]["clientUserMessageId"] == "after-manual-compact"
+                })
+                .unwrap();
+            assert!(compact_calls[0].0 < after, "后续消息不能越过压缩");
+            let view = controller
+                .call_authorized("thread", json!({"threadId":id}), &authorization)
+                .await
+                .unwrap();
+            assert_eq!(view["thread"]["compaction"]["state"], "idle");
+            let history = controller
+                .call_authorized("history", json!({"threadId":id}), &authorization)
+                .await
+                .unwrap();
+            assert!(
+                history["transcriptEvents"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event["item"]["type"] == "contextCompaction"),
+                "压缩执行后的真实事件在重读主会话和侧边历史时均保留"
+            );
+            controller.harness.release().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn harness_manual_compaction_keeps_stop_pause_and_allows_idle_retry_of_the_same_item() {
+        for side in [false, true] {
+            let (directory, authorization, id) = if side {
+                harness_active_side_fixture().await
+            } else {
+                let (directory, authorization) = harness_fixture().await;
+                let created = authorization
+                    .controller
+                    .call_authorized(
+                        "create",
+                        json!({"projectId":"project-a","prompt":"wait stopped compact"}),
+                        &authorization,
+                    )
+                    .await
+                    .unwrap();
+                (
+                    directory,
+                    authorization,
+                    created["threadId"].as_str().unwrap().to_owned(),
+                )
+            };
+            let controller = &authorization.controller;
+            let compact = controller
+                .call_authorized("compact", json!({"threadId":id}), &authorization)
+                .await
+                .unwrap();
+            controller
+                .call_authorized("stop", json!({"threadId":id}), &authorization)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(850)).await;
+            let queue = controller
+                .call_authorized("queue", json!({"threadId":id}), &authorization)
+                .await
+                .unwrap();
+            assert!(queue["queuedMessages"][0]["pausedReason"].is_string());
+            assert!(
+                !harness_engine_requests(directory.path())
+                    .iter()
+                    .any(|frame| frame["method"] == "thread/compact/start")
+            );
+            controller
+                .call_authorized(
+                    "steerQueued",
+                    json!({"threadId":id,"messageId":compact["messageId"]}),
+                    &authorization,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                harness_engine_requests(directory.path())
+                    .iter()
+                    .filter(|frame| frame["method"] == "thread/compact/start")
+                    .count(),
+                1
+            );
+            assert!(
+                controller
+                    .call_authorized("queue", json!({"threadId":id}), &authorization)
+                    .await
+                    .unwrap()["queuedMessages"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            controller.harness.release().await;
+        }
+    }
+
+    #[tokio::test]
     async fn harness_queue_normal_compaction_completion_still_dispatches_in_order() {
         let (directory, authorization) = harness_fixture().await;
         let controller = &authorization.controller;

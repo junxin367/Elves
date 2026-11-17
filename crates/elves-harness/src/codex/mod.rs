@@ -2,6 +2,7 @@
 //! 用户要求 Codex 仅保留服务模式；不连接 Codex App，也不包含桌面 IPC、页面脚本或注入回退。
 mod catalog;
 mod commands;
+mod compaction;
 mod defaults;
 mod deletion;
 mod fast;
@@ -659,7 +660,10 @@ impl CodexHarness {
             .resolve_device(&message.device_id, Some(&message.key_id))
             .await
             .context("队列消息的设备授权已撤销")?;
-        let mut authorization = controller.authorization(device, Some("send"));
+        let mut authorization = controller.authorization(
+            device,
+            Some(if message.compact { "compact" } else { "send" }),
+        );
         authorization.request_id = message.request_id.clone();
         execution::Scope::new(
             self.audit.clone(),
@@ -668,7 +672,7 @@ impl CodexHarness {
             Some(&authorization),
         )
         .recorded(async {
-            self.dispatch_queued_inner(id, message, &authorization)
+            self.dispatch_queued_inner(id, message, &authorization, false)
                 .await?;
             Ok(json!({"ok":true}))
         })
@@ -681,12 +685,13 @@ impl CodexHarness {
         id: &str,
         message: &Queued,
         authorization: &HarnessAuthorization,
+        manual: bool,
     ) -> anyhow::Result<()> {
         authorization.check().await?;
         self.check_deletion_barrier(id).await?;
         if self.known_side(id).await {
             return self
-                .dispatch_side_queued(id, message, authorization, false)
+                .dispatch_side_queued(id, message, authorization, manual)
                 .await;
         }
         // 自动续发必须核对真实执行状态；重连后内存中没有 active 不代表上一轮正常完成。
@@ -704,9 +709,10 @@ impl CodexHarness {
             self.remember_queue_wait(id, turn, compacting).await?;
             return Ok(());
         }
-        if !self
-            .queue_completion_confirmed(id, &identity, message.created_at)
-            .await?
+        if !manual
+            && !self
+                .queue_completion_confirmed(id, &identity, message.created_at)
+                .await?
         {
             return Ok(());
         }
@@ -718,23 +724,30 @@ impl CodexHarness {
         }
         self.store.lock().await.commit(|data| {
             anyhow::ensure!(
-                data.queue_gates
-                    .get(id)
-                    .is_some_and(|gate| gate.phase == "ready"),
+                manual
+                    || data
+                        .queue_gates
+                        .get(id)
+                        .is_some_and(|gate| gate.phase == "ready"),
                 "上一轮完成状态已变化，队列继续等待"
             );
             let queued = data
                 .queues
                 .get_mut(id)
                 .and_then(|q| {
-                    q.iter_mut()
-                        .find(|q| q.id == message.id && q.state == "queued")
+                    q.iter_mut().find(|q| {
+                        q.id == message.id && (q.state == "queued" || manual && q.state == "paused")
+                    })
                 })
                 .context("队列消息已变化")?;
             queued.state = "sending".into();
             Ok(())
         })?;
-        let result = self.start_turn(id, &message.payload, authorization).await;
+        let result = if message.compact {
+            self.start_compaction(id, authorization).await
+        } else {
+            self.start_turn(id, &message.payload, authorization).await
+        };
         self.store.lock().await.commit(|data| {
             match &result {
                 Ok(response) => {

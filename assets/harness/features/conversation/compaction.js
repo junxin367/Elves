@@ -228,6 +228,14 @@ async function applyCompactionReceipt(id, receiptId, receipt) {
     updateComposer();
     return;
   }
+  if (receipt.result?.deliveryState === "queued") {
+    // 用户要求执行中手动压缩与消息共用队列；入队只确认等待，不能提前锁定压缩或向正文插入压缩事件。
+    if (current.state !== "running" && !current.nativeConfirmed)
+      setCompactionState(id, { state: "idle", turnId: current.baselineTurnId, itemId: current.baselineItemId });
+    updateComposer();
+    if (selectedId === id) await reloadThread();
+    return;
+  }
   const acknowledged = setCompactionState(id, { ...current, acknowledged: true });
   if (receipt.result?.compaction) reconcileCompaction(id, receipt.result.compaction);
   // 用户要求远程压缩完成时不再弹出提示；仍核对回执、解除压缩状态并刷新会话。

@@ -6575,6 +6575,24 @@ function queueDeliveryHarness(messages) {
   return { context, notices };
 }
 
+test("排队压缩按操作展示，可删除和重排，执行中不能引导或编辑", () => {
+  const messages = [
+    { id: "compact", action: "compact", text: "压缩上下文", submission: { status: "queued" } },
+    { id: "ordinary", text: "普通消息", submission: { status: "queued" } },
+  ];
+  const { context } = queueDeliveryHarness(messages);
+  context.thread.status = "active";
+  const row = context.renderQueuedMessages(messages).children[0];
+  assert.equal(row.children.find(node => node.className === "queued-steer-button").disabled, true);
+  const menu = row.children.find(node => node.className === "queued-menu-button");
+  assert.equal(menu.menuOptions.length, 1);
+  assert.equal(menu.menuOptions[0].value, "remove");
+  assert.equal(context.queueReorderAvailable(), true);
+  context.thread.status = "idle";
+  assert.equal(context.renderQueuedMessages(messages).children[0].children
+    .find(node => node.className === "queued-steer-button").disabled, false);
+});
+
 test("已接受的本地队列残留不算待执行，不提供引导、编辑或重排，保留明确移除入口", () => {
   const messages = [
     { id: "consumed", clientUserMessageId: "client-a", createdAt: 1, text: "已接受的原消息",
@@ -9150,6 +9168,25 @@ function queuedReceiptHarness({ disk = storage(), refresh = async () => {} } = {
     ? context.steerQueuedMessage("main", "queued-a") : context.removeQueuedMessage("main", "queued-a");
   return { context, requests, notices, refreshes, timers, draft, area, disk, clearedDrafts, receipt, completed, invoke };
 }
+
+test("排队压缩仅在空闲时重试，成功回执也不伪造用户正文或引导占位", async () => {
+  const h = queuedReceiptHarness();
+  h.context.thread.queuedMessages[0].action = "compact";
+  await h.invoke("steerQueued");
+  assert.equal(h.requests.length, 0);
+  h.context.isActiveThread = () => false;
+  h.context.confirmQueuedSteerDisplay("main", "queued-a", { confirmed: true, deliveryState: "accepted" });
+  assert.equal(h.context.withSentMessageDisplays().flatMap(turn => turn.items).length, 0);
+  const operation = h.invoke("steerQueued");
+  assert.equal(h.context.pendingSteer, null);
+  assert.equal(h.context.withSentMessageDisplays().flatMap(turn => turn.items).length, 0);
+  h.receipt(0, "completed", { ok: true, threadId: "main",
+    queueEpoch: "current", queueRevision: 2, queuedMessages: [] });
+  await operation;
+  assert.equal(h.context.withSentMessageDisplays().flatMap(turn => turn.items).length, 0);
+  assert.equal(h.context.thread.queuedMessages.length, 0);
+  assert.equal(h.draft.text, "操作期间保留的普通草稿");
+});
 
 test("历史编辑提交前持久保存修改文字，不能把普通输入框草稿误作编辑内容", async () => {
   const h = queuedReceiptHarness(), writes = [];
@@ -13139,6 +13176,22 @@ test("压缩完成的回执和实时事件静默解除锁定，失败仍给出�
     item: { type: "contextCompaction", id: "compact", completed: true, status: "failed" },
   });
   assert.deepEqual(h.notices, [{ message: "上下文压缩失败，请查看原生会话。", error: true }]);
+});
+
+test("手动压缩入队回执解除请求占位，迟到回执不覆盖已确认的真实压缩", async () => {
+  for (const running of [false, true]) {
+    const h = delayFeedbackHarness();
+    let reloads = 0;
+    h.context.reloadThread = async () => ++reloads;
+    h.context.compactions.set("main", { state: running ? "running" : "pending",
+      nativeConfirmed: running, receiptId: "compact-receipt", time: h.now() });
+    await h.context.applyCompactionReceipt("main", "compact-receipt", {
+      state: "completed", result: { deliveryState: "queued", queuedMessages: [{ id: "compact", action: "compact" }] },
+    });
+    assert.equal(h.context.compactionLocked("main"), running);
+    assert.equal(reloads, 1);
+    assert.deepEqual(h.notices, []);
+  }
 });
 
 test("问答先显示提交按钮状态，五秒后才增加中性说明且保留原回答回执", async () => {

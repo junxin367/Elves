@@ -711,6 +711,7 @@ mod tests {
     fn queue_recovery_keeps_order_and_unknown_receipts_and_preserves_confirmed_completion() {
         let directory = tempfile::tempdir().unwrap();
         let message = |id: &str, state: &str| Queued {
+            compact: false,
             id: id.into(),
             payload: json!({"prompt":id,"clientUserMessageId":id}),
             created_at: 1,
@@ -779,6 +780,7 @@ mod tests {
         data.queues.insert(
             "thread".into(),
             vec![Queued {
+                compact: false,
                 id: "queued".into(),
                 payload: json!({}),
                 created_at: 1,
