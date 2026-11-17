@@ -1735,6 +1735,8 @@ class NativeSession:
         # 并确保同一条消息只在确认新进程接管同一会话后重试一次。
         self.version_recovery = None
         self.lock_folder = Path(f"/tmp/codex-elves-claude-{os.getuid()}")
+        self.edit_lock_owner = None
+        self.recovery_folder = Path.home() / ".local/state/elves/claude-environment-recovery"
 
     def control_projection(self):
         current = self.compaction_events.get(self.compaction_event_id)
@@ -2237,6 +2239,8 @@ class NativeSession:
                 or live.get("state") in ("done", "stopped", "failed", "ended")
                 and live.get("sessionStatus") not in ("busy", "idle", "waiting")):
             live = self.restore_job()
+        elif live and not (name == "goal" and argument == "clear") and self.time_zone_restore_plan() is not None:
+            live = self.restore_job()
         command = {"id": request["id"], "name": name, "argument": argument,
                    "state": "pending", "issuedAt": int(time.time() * 1000),
                    "baseline": self.goal_revision if name == "goal" else self.compaction.get("itemId"),
@@ -2548,9 +2552,11 @@ class NativeSession:
                     raise
                 time.sleep(0.2)
 
-    def check_history_resume(self):
+    def check_history_resume(self, *, registration_released=False):
         # 用户要求不创建副本：原生 2.1.322 在被占用/短 ID 冲突/状态不可核对时会自动分叉，首次发送前只读预检并明确拒绝这些情况。
-        if str(uuid.UUID(self.native_id)) != self.native_id or (self.root / "jobs" / self.native_id[:8]).exists():
+        job_directory = self.root / "jobs" / self.native_id[:8]
+        if (str(uuid.UUID(self.native_id)) != self.native_id
+                or (job_directory / "state.json" if registration_released else job_directory).exists()):
             raise NativeError("ESESSIONCONFLICT", "原生会话身份或后台登记有冲突，未创建副本或提交消息")
         try:
             for path in (self.root / "sessions").glob("*.json"):
@@ -2584,13 +2590,14 @@ class NativeSession:
         except (OSError, ValueError, KeyError, TypeError) as failure:
             raise NativeError("ERESUMECHECK", "无法只读确认原生会话未被占用，未恢复、创建副本或提交消息") from failure
 
-    def start(self, text=None):
+    def start(self, text=None, *, launch_flags=None, registration_released=False, launch_cwd=None):
         if self.native_id:
-            self.check_history_resume()
+            self.check_history_resume(registration_released=registration_released)
         # 用户要求实际后台执行继承当前 WSL 时区；--bg 可复用旧 daemon/预热 worker，
         # 必须经 CLI 原生的会话设置传递 TZ，不能只依赖外层 Python 的环境或强制重启其他会话。
         settings = {"worktree": {"bgIsolation": "none"}, "env": {"TZ": native_time_zone()}}
-        arguments = [self.cli, "--bg", "--settings", json.dumps(settings, separators=(",", ":"))]
+        arguments = [self.cli, "--bg", *(launch_flags if launch_flags is not None else
+                     ["--settings", json.dumps(settings, separators=(",", ":"))])]
         # 用户要求窗口只用于本实例后续新建的远程会话；恢复已有原生会话不替换其启动参数。
         if not self.native_id and self.auto_compact_window is not None:
             arguments += ["--autocompact", self.auto_compact_window]
@@ -2615,7 +2622,7 @@ class NativeSession:
         if text is not None:
             arguments += ["--", text]
         result = subprocess.run(arguments, stdin=subprocess.DEVNULL,
-                                capture_output=True, timeout=60)
+                                capture_output=True, timeout=60, cwd=launch_cwd)
         output = (result.stdout + result.stderr).decode("utf-8", "replace")
         match = re.search(r"backgrounded\s*[·:]\s*([0-9a-f]{8})", output)
         if result.returncode or not match:
@@ -2629,18 +2636,202 @@ class NativeSession:
             raise RuntimeError("原版 Claude 未返回同一 UUID，未替换原会话、历史或停止其他任务")
         self.bind(job)
 
+    def time_zone_recovery_directory(self):
+        return self.recovery_folder / hashlib.sha256(str(self.root).encode()).hexdigest()[:16]
+
+    def time_zone_restore_plan(self):
+        # 用户要求旧会话恢复也继承当前 WSL 登录时区。respawn 忽略 --settings，
+        # 带新设置直接 --bg --resume 会分叉；必须先核对无 worktree 的同一原生身份。
+        if not re.fullmatch(r"[0-9a-f]{8}", self.short):
+            return None
+        try:
+            if str(uuid.UUID(self.native_id)) != self.native_id:
+                return None
+        except ValueError:
+            return None
+        recovery = self.time_zone_recovery_directory()
+        journal = recovery / f"timezone-{self.native_id}.json"
+        saved = native_json(journal) if journal.exists() else None
+        if saved is not None and (saved.get("nativeId") != self.native_id or saved.get("jobId") != self.short
+                or saved.get("root") != str(self.root) or saved.get("cli") != self.cli):
+            raise NativeError("ETIMEZONE", "Claude 时区恢复记录无法核对，未停止会话或发送消息")
+        record = native_json(self.root / "jobs" / self.short / "state.json")
+        if not record and saved is None:
+            return None
+        if record and (record.get("resumeSessionId") or record.get("sessionId")) != self.native_id:
+            raise NativeError("ETIMEZONE", "Claude 后台任务身份已变化，未停止会话或发送消息")
+        flags = record.get("respawnFlags", []) if record else saved.get("flags")
+        if not isinstance(flags, list) or any(not isinstance(flag, str) or "\0" in flag for flag in flags):
+            raise NativeError("ETIMEZONE", "Claude 原启动参数无法核对，未停止会话或发送消息")
+        flags, settings, setting_index = list(flags), {}, None
+        for index, flag in enumerate(flags):
+            raw = flags[index + 1] if flag == "--settings" and index + 1 < len(flags) else (
+                flag[len("--settings="):] if flag.startswith("--settings=") else None)
+            if raw is not None:
+                try:
+                    # 自动迁移仅接纳 Harness 生成的内联设置；不复制外部配置文件或认证环境。
+                    settings = json.loads(raw)
+                    if (not isinstance(settings, dict) or not isinstance(settings.get("env", {}), dict)
+                            or not isinstance(settings.get("worktree", {}), dict)
+                            or set(settings) - {"worktree", "env", "disableAllHooks"}
+                            or set(settings.get("env", {})) - {"TZ"}
+                            or settings.get("worktree", {}) not in ({}, {"bgIsolation": "none"})
+                            or ("disableAllHooks" in settings and type(settings["disableAllHooks"]) is not bool)):
+                        raise ValueError()
+                except (ValueError, TypeError):
+                    raise NativeError("ETIMEZONE", "旧 Claude 会话包含无法安全迁移的设置，未停止会话或发送消息") from None
+                setting_index = index
+        target = native_time_zone()
+        if record and settings.get("env", {}).get("TZ") == target:
+            if saved is not None:
+                if (recovery / f"files-{self.native_id}").exists():
+                    raise NativeError("ETIMEZONE", "Claude 仍有待恢复的运行文件，已保留恢复记录，尚未发送消息")
+                journal.unlink(missing_ok=True)
+            return None
+        cwd = record.get("cwd") if record else saved.get("cwd")
+        if (self.short != self.native_id[:8] or not isinstance(cwd, str) or not cwd.startswith("/")
+                or not Path(cwd).is_dir() or record.get("worktreePath") or record.get("worktreeBranch")
+                or record.get("originCwd") or record.get("worktreeHookBased") or record.get("routine")
+                or record.get("interactiveLineage") or record.get("template") == "exec"
+                or record.get("sessionPermissionRules") or record.get("memoryToggledOff")
+                or record.get("autoMemoryOffThisSession")
+                or (record.get("bgIsolation") != "none" and settings.get("worktree", {}).get("bgIsolation") != "none")):
+            raise NativeError("ETIMEZONE", "旧 Claude 会话的目录或后台身份不支持安全更新时区，未停止会话或发送消息")
+        if "worktree" not in settings and record.get("bgIsolation") == "none":
+            settings["worktree"] = {"bgIsolation": "none"}
+        if (set(settings) - {"worktree", "env", "disableAllHooks"}
+                or set(settings.get("env", {})) - {"TZ"}
+                or settings.get("worktree", {}) != {"bgIsolation": "none"}):
+            raise NativeError("ETIMEZONE", "旧 Claude 会话含自定义启动设置，当前无法安全保留并更新时区，未停止会话或发送消息")
+        value_flags = {"--settings", "--model", "--effort", "--name", "-n", "--permission-mode",
+                       "--autocompact", "--allowedTools", "--allowed-tools"}
+        switches = {"--allow-dangerously-skip-permissions", "--dangerously-skip-permissions",
+                    "--strict-mcp-config"}
+        index = 0
+        while index < len(flags):
+            flag = flags[index].split("=", 1)[0]
+            if flag in value_flags:
+                index += 1 if "=" in flags[index] else 2
+                if index > len(flags):
+                    raise NativeError("ETIMEZONE", "Claude 原启动参数不完整，未停止会话或发送消息")
+            elif flags[index] in switches:
+                index += 1
+            else:
+                raise NativeError("ETIMEZONE", "旧 Claude 会话含无法安全迁移的启动参数，未停止会话或发送消息")
+        settings["env"] = {"TZ": target}
+        encoded = json.dumps(settings, ensure_ascii=False, separators=(",", ":"))
+        if setting_index is None:
+            flags += ["--settings", encoded]
+        elif flags[setting_index] == "--settings":
+            flags[setting_index + 1] = encoded
+        else:
+            flags[setting_index] = f"--settings={encoded}"
+        if record.get("nameSource") in ("user", "collision") and isinstance(record.get("name"), str):
+            flags += [f"--name={record['name']}"]
+        return {"nativeId": self.native_id, "jobId": self.short, "root": str(self.root),
+                "cli": self.cli, "cwd": cwd, "flags": flags, "timeZone": target}
+
+    def restore_time_zone(self, expected_cli_version=None):
+        with self.edit_lock():
+            plan = self.time_zone_restore_plan()
+            if plan is None:
+                return None
+            stored = native_json(self.root / "jobs" / self.short / "state.json")
+            in_flight = stored.get("inFlight") or {}
+            if (not isinstance(in_flight, dict) or stored.get("queuedPrompt")
+                    or in_flight.get("tasks") or in_flight.get("queued")
+                    or in_flight.get("kinds") or in_flight.get("drainableMonitors")):
+                raise NativeError("ETIMEZONE", "旧 Claude 会话仍有原生排队输入或后台任务，未更新时区或发送消息")
+            recovery = self.time_zone_recovery_directory()
+            recovery.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if recovery.is_symlink() or recovery.stat().st_uid != os.getuid():
+                raise NativeError("ETIMEZONE", "Claude 时区恢复目录归属异常，未停止会话或发送消息")
+            source_directory = self.root / "jobs" / self.short
+            if not source_directory.exists():
+                source_directory = source_directory.parent
+            if source_directory.stat().st_dev != recovery.stat().st_dev:
+                raise NativeError("ETIMEZONE", "Claude 配置与恢复目录不在同一文件系统，当前无法安全迁移，未停止会话或发送消息")
+            journal = recovery / f"timezone-{self.native_id}.json"
+            preserved = recovery / f"files-{self.native_id}"
+            # 用户要求恢复失败后仍可继续原会话；移除登记前原子保存非认证启动参数。
+            # 清单只在目标 WSL 用户私有目录保存，成功核对同一 UUID 和时区后删除。
+            temporary = journal.with_suffix(f".{uuid.uuid4().hex}.tmp")
+            try:
+                descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                    json.dump(plan, stream, ensure_ascii=False, separators=(",", ":"))
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, journal)
+            finally:
+                temporary.unlink(missing_ok=True)
+            outcome = self.shutdown()
+            if outcome.get("stopped") is not True:
+                if not preserved.exists():
+                    journal.unlink(missing_ok=True)
+                reasons = {"active": "会话仍在执行或等待交互", "native_draft": "原生终端仍有未发送草稿",
+                           "background_work": "会话仍有后台任务", "screen_unknown": "无法确认终端输入和后台任务",
+                           "state_changed": "会话状态已变化"}
+                raise NativeError("ETIMEZONE", f"旧 Claude 会话暂不能更新时区：{reasons.get(outcome.get('reason'), '无法核对安全空闲状态')}；未发送消息")
+            # 停止后再次核对，外部终端若重新打开会话，保留它并拒绝移除登记。
+            if self.job_alive() or self.session_holders():
+                raise NativeError("ETIMEZONE", "Claude 会话已被重新打开，未移除后台登记或发送消息")
+            record_path = self.root / "jobs" / self.short / "state.json"
+            if record_path.exists():
+                # 用户要求保留旧会话数据：rm 只负责释放登记，原任务的 tmp、时间线等运行文件
+                # 先移到同一 WSL 用户的持久私有目录，再于新进程启动前按原路径放回，不覆盖同名文件。
+                preserved.mkdir(mode=0o700, exist_ok=True)
+                if preserved.is_symlink() or preserved.stat().st_uid != os.getuid():
+                    raise NativeError("ETIMEZONE", "Claude 运行文件恢复目录无法核对，未移除后台登记")
+                for entry in record_path.parent.iterdir():
+                    if entry.name == "state.json":
+                        continue
+                    destination = preserved / entry.name
+                    if destination.exists() or destination.is_symlink():
+                        raise NativeError("ETIMEZONE", "Claude 运行文件存在恢复冲突，已保留原文件，未移除后台登记")
+                    entry.rename(destination)
+                result = subprocess.run([self.cli, "rm", self.short], stdin=subprocess.DEVNULL,
+                                        capture_output=True, timeout=30)
+                if result.returncode or record_path.exists():
+                    raise NativeError("ETIMEZONE", "Claude 未释放旧后台登记，历史已保留，尚未恢复时区或发送消息")
+            if preserved.exists():
+                record_path.parent.mkdir(parents=True, exist_ok=True)
+                for entry in preserved.iterdir():
+                    destination = record_path.parent / entry.name
+                    if destination.exists() or destination.is_symlink():
+                        raise NativeError("ETIMEZONE", "Claude 运行文件存在恢复冲突，已保留两份文件，尚未启动或发送消息")
+                    entry.rename(destination)
+                preserved.rmdir()
+            # 恢复使用原任务登记的目录，不借用连接端或其他会话当前所在的项目。
+            self.start(launch_flags=plan["flags"], registration_released=True, launch_cwd=plan["cwd"])
+            job = self.wait_restored_job(plan["jobId"], plan["nativeId"], expected_cli_version)
+            verified = self.time_zone_restore_plan()
+            if verified is not None:
+                raise NativeError("ETIMEZONE", "Claude 尚未确认原会话已使用目标 WSL 时区，未发送消息")
+            journal.unlink(missing_ok=True)
+            return job
+
     def restore_job(self, expected_cli_version=None):
+        if self.time_zone_restore_plan() is not None:
+            recovered = self.restore_time_zone(expected_cli_version)
+            if recovered is not None:
+                return recovered
         # 用户要求恢复同一原生会话：已有后台 ID 用原版 respawn 重新连接；
         # --bg --resume 遇到残留的运行标记会自动创建副本，不能用它代替原会话。
         expected_short = self.short
+        expected_native = self.native_id
         result = subprocess.run([self.cli, "respawn", expected_short],
                                 stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
         if result.returncode:
             raise RuntimeError("原版 Claude 后台恢复失败，未创建副本或提交消息，请核对原版 CLI")
+        return self.wait_restored_job(expected_short, expected_native, expected_cli_version)
+
+    def wait_restored_job(self, expected_short, expected_native, expected_cli_version=None):
         deadline = time.monotonic() + 20
         while True:
             job = self.lookup()
             if (job and job.get("short") == expected_short and not job.get("outcome")
+                    and (job.get("resumeSessionId") or job.get("sessionId")) == expected_native
                     and (not expected_cli_version or job.get("cliVersion") == expected_cli_version)):
                 self.bind(job)
                 # respawn 复用原生任务保存的启动参数；网页最近选择的模型/等级仍需由原生命令应用。
@@ -2700,6 +2891,12 @@ class NativeSession:
             live = recovered
             self.read_messages()
             status = NativeDiscovery.status(live or {}, self.messages)
+        if live and not live.get("outcome") and self.time_zone_restore_plan() is not None:
+            # 旧会话在首次继续发送时迁移；正在执行时先保留队列，不能为修正时区中断原轮次。
+            if status.get("tempo") == "active":
+                return {"deferred": True, "accepted": False}
+            live = self.restore_job()
+            self.read_messages()
         # 远程队列由本程序管理：普通消息直接送入原生普通回复入口，只有点击“引导”的消息
         # 才使用 nextTurn=True；已有审批继续由 CLI 处理，不借此替用户批准、拒绝或取消工具。
         text = self.prepare_text(content, client_id)
@@ -2754,6 +2951,10 @@ class NativeSession:
     def edit_lock(self):
         # 用户要求只禁止同时编辑历史：同一 WSL 用户下连接同一原生会话的多个连接端（如正式服务与验收服务）
         # 串行执行编辑，第二个编辑直接拒绝；不阻止原版终端，终端打开回退面板时由 waiting 状态拒绝。
+        owner = threading.get_ident()
+        if self.edit_lock_owner == owner:
+            yield
+            return
         folder = self.lock_folder
         folder.mkdir(mode=0o700, exist_ok=True)
         if folder.is_symlink() or folder.stat().st_uid != os.getuid():
@@ -2764,9 +2965,13 @@ class NativeSession:
             try:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                raise NativeError("EBUSY", "该会话正在由另一个网页编辑历史，请稍后重试") from None
+                raise NativeError("EBUSY", "该会话正在由另一个网页编辑历史或恢复环境，请稍后重试") from None
+            # 历史编辑内的恢复共用同一把锁，允许同一线程嵌套，禁止其他连接端同时迁移。
+            self.edit_lock_owner = owner
             yield
         finally:
+            if self.edit_lock_owner == owner:
+                self.edit_lock_owner = None
             os.close(handle)
 
     def session_holders(self):

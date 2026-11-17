@@ -733,7 +733,8 @@ class SharedQueueHistoryTests(unittest.TestCase):
         for directory in ("jobs/1234abcd", "daemon", "sessions"):
             (native.root / directory).mkdir(parents=True, exist_ok=True)
         stored = {"sessionId": native.native_id, "state": "done", "tempo": "idle",
-                  "lastTerminalAt": 2000, "updatedAt": 2000}
+                  "lastTerminalAt": 2000, "updatedAt": 2000,
+                  "respawnFlags": ["--settings", json.dumps({"env": {"TZ": namespace["native_time_zone"]()}})]}
         (native.root / "jobs/1234abcd/state.json").write_text(json.dumps(stored))
         (native.root / "daemon/roster.json").write_text(json.dumps(
             {"workers": {native.short: {"sessionId": native.native_id, "replPid": pid}}}))
@@ -3552,6 +3553,198 @@ class SharedPermissionTests(unittest.TestCase):
             self.assertEqual("--permission-mode" in arguments, mode != "configured")
             if mode == "default":
                 self.assertEqual(arguments[arguments.index("--permission-mode") + 1], "manual")
+
+
+class SharedTimeZoneRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.environment = patch.dict(os.environ, {"TZ": "America/Los_Angeles"})
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+        self.native = NativeSession("native-cli", "1234abcd-0000-4000-8000-000000000000", "1234abcd")
+        self.native.root = Path(folder.name) / "native"
+        self.native.lock_folder = Path(folder.name) / "locks"
+        self.native.recovery_folder = Path(folder.name) / "recovery"
+        self.path = self.native.root / "jobs/1234abcd/state.json"
+        self.path.parent.mkdir(parents=True)
+        self.flags = ["--settings", '{"worktree":{"bgIsolation":"none"}}',
+                      "--model", "gpt-6.1-sol", "--effort", "max", "--autocompact", "200000",
+                      "--permission-mode", "bypassPermissions", "--allow-dangerously-skip-permissions"]
+        self.record = {"sessionId": self.native.native_id, "cwd": folder.name, "template": "bg",
+                       "name": "保留的名称", "nameSource": "user", "respawnFlags": self.flags,
+                       "providerEnv": {"PRIVATE_TOKEN": "must-not-be-copied"}}
+        self.path.write_text(json.dumps(self.record))
+        self.job = {"short": self.native.short, "sessionId": self.native.native_id, "tempo": "idle"}
+        self.native.shutdown = MagicMock(return_value={"stopped": True})
+        self.native.job_alive = MagicMock(return_value=False)
+        self.native.session_holders = MagicMock(return_value=[])
+        self.native.wait_restored_job = MagicMock(return_value=self.job)
+        self.native.start = MagicMock(side_effect=self.started)
+        self.journal = self.native.time_zone_recovery_directory() / f"timezone-{self.native.native_id}.json"
+
+    def started(self, *, launch_flags, registration_released, launch_cwd):
+        self.assertTrue(registration_released)
+        self.assertEqual(launch_cwd, self.record["cwd"])
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps({**self.record, "respawnFlags": launch_flags}))
+
+    def removed(self, arguments, **kwargs):
+        self.assertEqual(arguments, ["native-cli", "rm", "1234abcd"])
+        self.assertEqual(self.journal.stat().st_mode & 0o777, 0o600)
+        self.assertNotIn("must-not-be-copied", self.journal.read_text())
+        self.path.unlink()
+        return SimpleNamespace(returncode=0)
+
+    def test_old_job_recovers_same_identity_and_preserves_launch_options(self):
+        with patch.object(namespace["subprocess"], "run", side_effect=self.removed):
+            result = self.native.restore_job()
+        self.assertEqual(result["sessionId"], self.native.native_id)
+        flags = self.native.start.call_args.kwargs["launch_flags"]
+        settings = json.loads(flags[flags.index("--settings") + 1])
+        self.assertEqual(settings["env"], {"TZ": "America/Los_Angeles"})
+        self.assertEqual(flags[2:len(self.flags)], self.flags[2:])
+        self.assertEqual(flags[-1], "--name=保留的名称")
+        self.native.wait_restored_job.assert_called_once_with("1234abcd", self.native.native_id, None)
+        self.assertFalse(self.journal.exists())
+
+    def test_safe_refusals_preserve_job_and_never_remove_registration(self):
+        for reason in ("active", "native_draft", "background_work", "screen_unknown", "state_changed"):
+            with self.subTest(reason=reason):
+                self.native.shutdown.return_value = {"stopped": False, "reason": reason}
+                with patch.object(namespace["subprocess"], "run") as run:
+                    with self.assertRaises(namespace["NativeError"]):
+                        self.native.restore_job()
+                run.assert_not_called()
+                self.assertTrue(self.path.exists())
+                self.assertFalse(self.journal.exists())
+                self.native.start.assert_not_called()
+
+    def test_failed_start_retries_from_private_journal_without_new_identity(self):
+        artifact = self.path.parent / "tmp/result.txt"
+        artifact.parent.mkdir()
+        artifact.write_text("启动失败也保留运行文件")
+        self.native.start.side_effect = RuntimeError("fixture launch failed")
+        with patch.object(namespace["subprocess"], "run", side_effect=self.removed):
+            with self.assertRaisesRegex(RuntimeError, "fixture launch failed"):
+                self.native.restore_job()
+        self.assertFalse(self.path.exists())
+        self.assertTrue(self.journal.exists())
+        self.native.start.side_effect = self.started
+        with patch.object(namespace["subprocess"], "run") as run:
+            result = self.native.restore_job()
+        run.assert_not_called()
+        self.assertEqual(result["sessionId"], self.native.native_id)
+        self.assertFalse(self.journal.exists())
+        self.assertEqual(artifact.read_text(), "启动失败也保留运行文件")
+
+    def test_worktree_auth_settings_and_changed_identity_are_not_migrated(self):
+        cases = [{"worktreePath": "/fixture/worktree"},
+                 {"sessionId": "other-session"},
+                 {"sessionPermissionRules": {"allow": ["Bash"]}},
+                 {"respawnFlags": ["--settings", '{"worktree":{"bgIsolation":"none"},"env":{"TOKEN":"private"}}']},
+                 {"respawnFlags": ["--settings", '{"env":{"TOKEN":"private"}}',
+                                   "--settings", '{"worktree":{"bgIsolation":"none"}}']},
+                 {"respawnFlags": ["--settings", "/fixture/private-settings.json"]}]
+        for fields in cases:
+            with self.subTest(fields=fields):
+                self.path.write_text(json.dumps({**self.record, **fields}))
+                with patch.object(namespace["subprocess"], "run") as run:
+                    with self.assertRaises(namespace["NativeError"]):
+                        self.native.restore_job()
+                run.assert_not_called()
+                self.native.shutdown.assert_not_called()
+
+    def test_queued_native_input_and_reopened_session_block_registration_removal(self):
+        self.path.write_text(json.dumps({**self.record, "queuedPrompt": "尚未处理的输入"}))
+        with patch.object(namespace["subprocess"], "run") as run:
+            with self.assertRaises(namespace["NativeError"]):
+                self.native.restore_job()
+        run.assert_not_called()
+        self.native.shutdown.assert_not_called()
+        self.path.write_text(json.dumps(self.record))
+        self.native.job_alive.return_value = True
+        with patch.object(namespace["subprocess"], "run") as run:
+            with self.assertRaises(namespace["NativeError"]):
+                self.native.restore_job()
+        run.assert_not_called()
+        self.assertTrue(self.path.exists())
+
+    def test_matching_timezone_uses_native_respawn_without_reregistration(self):
+        self.path.write_text(json.dumps({**self.record, "respawnFlags": [
+            "--settings", '{"env":{"TZ":"America/Los_Angeles"}}']}))
+        with patch.object(namespace["subprocess"], "run", return_value=SimpleNamespace(returncode=0)) as run:
+            self.native.restore_job()
+        self.assertEqual(run.call_args.args[0], ["native-cli", "respawn", "1234abcd"])
+        self.native.shutdown.assert_not_called()
+        self.native.start.assert_not_called()
+
+    def test_same_session_history_edit_can_nest_environment_recovery_lock(self):
+        with self.native.edit_lock():
+            with self.native.edit_lock():
+                self.assertEqual(self.native.edit_lock_owner, namespace["threading"].get_ident())
+        self.assertIsNone(self.native.edit_lock_owner)
+
+    def test_original_runtime_files_are_restored_before_new_cli_starts(self):
+        runtime = self.path.parent / "tmp"
+        runtime.mkdir()
+        artifact = runtime / "result.txt"
+        artifact.write_text("保留已有运行文件")
+        original_start = self.started
+
+        def started(**kwargs):
+            self.assertEqual(artifact.read_text(), "保留已有运行文件")
+            return original_start(**kwargs)
+
+        self.native.start.side_effect = started
+        with patch.object(namespace["subprocess"], "run", side_effect=self.removed):
+            self.native.restore_job()
+        self.assertEqual(artifact.read_text(), "保留已有运行文件")
+        self.assertFalse(any(self.native.time_zone_recovery_directory().glob("files-*")))
+
+    def test_idle_send_repairs_before_delivering_only_the_new_message(self):
+        native = self.native
+        native.lookup = lambda: self.job
+        native.bind = lambda job: None
+        native.read_messages = lambda: None
+        native.poll = lambda **kwargs: None
+        native.restore_job = MagicMock(return_value=self.job)
+        native.reply = MagicMock()
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = native.send({"client_id": "new-message", "content": [{"type": "text", "text": "新消息"}]})
+        self.assertTrue(result["accepted"])
+        native.restore_job.assert_called_once_with()
+        native.reply.assert_called_once_with("新消息", next_turn=False)
+
+    def test_active_send_waits_without_restarting_or_accepting_the_message(self):
+        native = self.native
+        live = {**self.job, "tempo": "active", "state": "working", "sessionStatus": "busy"}
+        native.lookup = lambda: live
+        native.bind = lambda job: None
+        native.read_messages = lambda: None
+        native.restore_job = MagicMock()
+        native.reply = MagicMock()
+        result = native.send({"client_id": "later", "steer": True,
+                              "content": [{"type": "text", "text": "稍后处理"}]})
+        self.assertTrue(result["deferred"])
+        self.assertFalse(result["accepted"])
+        native.restore_job.assert_not_called()
+        native.reply.assert_not_called()
+        native.shutdown.assert_not_called()
+
+    def test_failed_native_remove_can_retry_without_losing_runtime_files(self):
+        artifact = self.path.parent / "tmp/result.txt"
+        artifact.parent.mkdir()
+        artifact.write_text("移除失败也保留运行文件")
+        with patch.object(namespace["subprocess"], "run", return_value=SimpleNamespace(returncode=1)):
+            with self.assertRaises(namespace["NativeError"]):
+                self.native.restore_job()
+        self.assertTrue(self.journal.exists())
+        self.assertTrue(self.path.exists())
+        with patch.object(namespace["subprocess"], "run", side_effect=self.removed):
+            self.native.restore_job()
+        self.assertEqual(artifact.read_text(), "移除失败也保留运行文件")
+        self.assertFalse(self.journal.exists())
 
 
 if __name__ == "__main__":
