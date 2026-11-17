@@ -3249,19 +3249,21 @@ test("文件阅读字号默认12，旧配置和新设置都限制在6至14且独
   assert.equal(context.defaultAppearance().fileReadingFontSize, 12);
 });
 
-test("新会话设置默认仅 Codex、正文950和系统14px字体，兼容旧颜色及隔离两套主题", () => {
+test("新会话设置默认仅 Codex、正文950和界面14代码阅读12px字体，兼容旧颜色及隔离主题", () => {
   const disk = storage();
   const context = vm.createContext({ nativeConnectionVersion: 1, localStorage: disk, matchMedia: () => ({ matches: false }) });
   vm.runInContext((sourceSection("const appearancePresets =", "let ambientLightStatus =") + sourceSection("function conversationBackend(", "function privateInputScope(") + sourceSection("function sessionFilterValue(")), context);
   const defaults = context.readAppearance();
   assert.deepEqual(JSON.parse(JSON.stringify(defaults.sessionTypes)), { codex: true, claude: false });
   assert.equal(defaults.conversationWidth, 950);
-  assert.equal(defaults.fontSize, 14); assert.equal(defaults.codeFontSize, 14);
+  assert.equal(defaults.fontSize, 14); assert.equal(defaults.codeFontSize, 12);
+  assert.equal(defaults.fileReadingFontSize, 12);
   assert.equal(defaults.uiFont, ""); assert.equal(defaults.codeFont, "");
-  disk.setItem("codex-elves-web-appearance", JSON.stringify({ fontSize: 17, conversationWidth: 100000,
+  disk.setItem("codex-elves-web-appearance", JSON.stringify({ fontSize: 17, codeFontSize: 18, fileReadingFontSize: 13, conversationWidth: 100000,
     uiFont: "Consolas;url(invalid)", colors: { dark: { background: "#232323" } } }));
   const migrated = context.readAppearance();
   assert.equal(migrated.fontSize, 17); assert.equal(migrated.conversationWidth, 950);
+  assert.equal(migrated.codeFontSize, 18); assert.equal(migrated.fileReadingFontSize, 13);
   assert.equal(migrated.uiFont, "");
   assert.equal(migrated.colors.dark.background, "#232323");
   assert.equal(migrated.palettes["vscode-plus"].dark.background, "#1f1f1f");

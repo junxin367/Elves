@@ -1652,7 +1652,7 @@ html[data-session-window=true] .workspace>.sidebar,html[data-session-window=true
 .side-thread-expired-banner span{font-size:.78571rem;color:var(--muted)}
 @media(max-width:760px){.composer-anchor>.side-thread-expired-banner{min-height:calc(104px + var(--control-toolbar-size))}}
 
-/* 用户要求字体区分程序与代码：系统字体默认 14px；文件预览仍保留独立阅读字号。 */
+/* 用户要求默认界面 14px、代码与文件阅读 12px；代码回退值与 defaultAppearance 同步，文件预览继续使用独立阅读字号。 */
 :root{font-family:var(--ui-font-family,-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif)}
 body{font-weight:var(--ui-font-weight,400)}
 .markdown code,.local-file-reference,.color-hex,.command-group-title.markdown-inline code,
@@ -1662,7 +1662,7 @@ body{font-weight:var(--ui-font-weight,400)}
   font-family:var(--code-font-family,ui-monospace,Consolas,monospace);
   font-weight:var(--code-font-weight,400)
 }
-.markdown code,.code-block pre,.tool-output,.approval-command-code,.appearance-code-preview{font-size:var(--code-font-size,14px)}
+.markdown code,.code-block pre,.tool-output,.approval-command-code,.appearance-code-preview{font-size:var(--code-font-size,12px)}
 .appearance-code-preview{margin:12px 0 20px;padding:12px;overflow:auto;background:var(--code);border-radius:8px;line-height:1.7}
 .appearance-font-preview{padding:12px;background:var(--side);border-radius:8px}
 /* 用户要求先按右侧实际可用宽度保留正文上限，空间不足才收窄；有足够留白才以整个窗口居中。
@@ -1710,7 +1710,7 @@ body{font-weight:var(--ui-font-weight,400)}
 .instruction-selectors>label{display:flex;flex:1 1 180px;flex-direction:column;gap:6px;min-width:0;font-size:.85714rem}
 .instruction-selectors .select-trigger{width:100%;max-width:100%;padding:8px}
 .instruction-path{user-select:text}
-.instruction-content{display:block;width:100%;height:45dvh;min-height:180px;resize:vertical;font-size:var(--code-font-size,14px);line-height:1.7;tab-size:2}
+.instruction-content{display:block;width:100%;height:45dvh;min-height:180px;resize:vertical;font-size:var(--code-font-size,12px);line-height:1.7;tab-size:2}
 /* 正常读取后隐藏空状态，避免为已移除的提示保留一行。 */
 #instruction-status:empty{display:none}
 /* 手机和 PC 的固定菜单均不拦截页面点击，菜单自身仍可交互；手机普通页面点击隐藏由菜单模块处理，侧边会话除外。 */
