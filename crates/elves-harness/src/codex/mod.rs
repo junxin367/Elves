@@ -777,6 +777,10 @@ impl CodexHarness {
                         }
                         .into();
                     }
+                    if message.compact {
+                        // 压缩失败或结果未知时暂停整个后续队列；删除失败项也不能让后面的消息自行续发。
+                        data.pause_queue(id, "压缩未确认完成，后续操作已暂停；请核对后手动重试");
+                    }
                 }
             }
             Ok(())

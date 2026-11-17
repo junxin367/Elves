@@ -6580,7 +6580,7 @@ mod tests {
         let script = directory.path().join("engine.cjs");
         std::fs::write(&script,r#"
 const fs=require('node:fs'),readline=require('node:readline'),crypto=require('node:crypto');
-const threads=new Map(),goals=new Map(),modelContexts=new Map();let approval=null,related={rows:[],loaded:[]};
+const threads=new Map(),goals=new Map(),modelContexts=new Map(),boundaryReads=new Map();let approval=null,related={rows:[],loaded:[]};
 const output=v=>process.stdout.write(JSON.stringify(v)+'\n');
 const event=(method,params)=>output({method,params});
 const logTurn=(t,type,turn)=>{if(t?.path)fs.appendFileSync(t.path,JSON.stringify({
@@ -6698,6 +6698,11 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
    if(!t){result={status:'notLoaded'};break;}
    threads.delete(p.threadId);modelContexts.delete(p.threadId);event('thread/closed',{threadId:p.threadId});result={status:'unsubscribed'};break;
  case 'thread/read': if(!t){output({id:q.id,error:{code:-32600,message:'unknown thread'}});return;}
+   if(fastPolicy.finishCompactionRead){
+     const count=(boundaryReads.get(p.threadId)||0)+1;boundaryReads.set(p.threadId,count);
+     if(count===2){const snapshot=structuredClone(t);finish(p.threadId);
+       setTimeout(()=>output({id:q.id,result:{thread:snapshot,readState:{firstUnread:null,revision:'r1'}}}),200);return;}
+   }
    if(nativePins?.confirmFailure&&nativePins.moved){output({id:q.id,error:{code:-32000,message:'confirmation failed'}});return;}
    if(t.ephemeral&&p.includeTurns&&related.snapshotError){output({id:q.id,error:related.snapshotError});return;}
    const sectionId=nativePins?.ids.includes(p.threadId)?pinnedSection:nativePins?.sections?.[p.threadId];
@@ -6753,8 +6758,27 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
  }
  case 'turn/steer':result={turnId:t.turns.at(-1).id};break;
  case 'turn/interrupt':finish(p.threadId,'interrupted');break;
- case 'thread/compact/start':event('item/started',{threadId:p.threadId,turnId:'compact',item:{id:'compact',type:'contextCompaction'}});
+ case 'thread/compact/start':{
+   if(fastPolicy.compactReject){output({id:q.id,error:{code:-32600,message:'compaction rejected before execution'}});return;}
+   if(fastPolicy.nativeCompactionTurns){
+     const compact=()=>{
+       const turn={id:crypto.randomUUID(),status:'inProgress',items:[]},item={id:crypto.randomUUID(),type:'contextCompaction'};
+       t.turns.push(turn);t.status={type:'active'};logTurn(t,'task_started',turn);
+       event('turn/started',{threadId:p.threadId,turn});
+       event('item/started',{threadId:p.threadId,turnId:turn.id,item});
+       setTimeout(()=>{
+         if(turn.status!=='inProgress')return;
+         const status=fastPolicy.compactOutcome||'completed';
+         if(status==='completed')event('item/completed',{threadId:p.threadId,turnId:turn.id,item});
+         finish(p.threadId,status);
+       },fastPolicy.compactDelayMs||20);
+     };
+     if(fastPolicy.compactReplyFirst){output({id:q.id,result:{}});setImmediate(compact);return;}
+     compact();break;
+   }
+   event('item/started',{threadId:p.threadId,turnId:'compact',item:{id:'compact',type:'contextCompaction'}});
    setTimeout(()=>event('item/completed',{threadId:p.threadId,turnId:'compact',item:{id:'compact',type:'contextCompaction'}}),fastPolicy.compactDelayMs||20);break;
+ }
  case 'thread/name/set':
    if(t.forkedFromId&&t.name==='reject-fork-name'){output({id:q.id,error:{code:-32000,message:'name fixture failure'}});return;}
    t.name=p.name;break;
@@ -9719,6 +9743,326 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
                 .collect::<Vec<_>>();
             assert_eq!(starts.len(), if outcome == "completed" { 2 } else { 1 });
             controller.harness.release().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn harness_compaction_boundary_rejected_head_keeps_followers_paused() {
+        for side in [false, true] {
+            let (directory, authorization, id) = if side {
+                harness_active_side_fixture().await
+            } else {
+                let (directory, authorization) = harness_fixture().await;
+                let created = authorization
+                    .controller
+                    .call_authorized(
+                        "create",
+                        json!({"projectId":"project-a","prompt":"wait reject compact"}),
+                        &authorization,
+                    )
+                    .await
+                    .unwrap();
+                (
+                    directory,
+                    authorization,
+                    created["threadId"].as_str().unwrap().to_owned(),
+                )
+            };
+            let controller = &authorization.controller;
+            controller.harness.enabled.store(false, Ordering::Release);
+            let compact = controller
+                .call_authorized("compact", json!({"threadId":id}), &authorization)
+                .await
+                .unwrap();
+            controller
+                .call_authorized(
+                    "send",
+                    json!({"threadId":id,"prompt":"wait follower",
+                "clientUserMessageId":"reject-follower"}),
+                    &authorization,
+                )
+                .await
+                .unwrap();
+            std::fs::write(
+                directory.path().join("fast-policy.json"),
+                br#"{"compactReject":true}"#,
+            )
+            .unwrap();
+            controller
+                .harness
+                .seed_test_history(json!({"threadId":id,"finish":true}))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                controller
+                    .call_authorized(
+                        "steerQueued",
+                        json!({"threadId":id,"messageId":compact["messageId"]}),
+                        &authorization
+                    )
+                    .await
+                    .is_err()
+            );
+            controller
+                .call_authorized(
+                    "removeQueued",
+                    json!({"threadId":id,"messageId":compact["messageId"]}),
+                    &authorization,
+                )
+                .await
+                .unwrap();
+            controller.harness.enabled.store(true, Ordering::Release);
+            tokio::time::sleep(Duration::from_millis(850)).await;
+            let queue = controller
+                .call_authorized("queue", json!({"threadId":id}), &authorization)
+                .await
+                .unwrap();
+            assert_eq!(
+                queue["queuedMessages"].as_array().unwrap().len(),
+                1,
+                "side={side}: 删除失败压缩不能自动续发后续消息"
+            );
+            assert!(queue["queuedMessages"][0]["pausedReason"].is_string());
+            controller.harness.release().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn harness_compaction_boundary_completion_during_admission_does_not_strand_the_request() {
+        let (directory, authorization) = harness_fixture().await;
+        let controller = &authorization.controller;
+        let created = controller
+            .call_authorized(
+                "create",
+                json!({"projectId":"project-a","prompt":"wait admission boundary"}),
+                &authorization,
+            )
+            .await
+            .unwrap();
+        let id = created["threadId"].as_str().unwrap();
+        std::fs::write(
+            directory.path().join("fast-policy.json"),
+            br#"{"finishCompactionRead":true}"#,
+        )
+        .unwrap();
+        controller
+            .call_authorized("compact", json!({"threadId":id}), &authorization)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if harness_engine_requests(directory.path())
+                    .iter()
+                    .any(|frame| frame["method"] == "thread/compact/start")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("任务在准入期间正常结束后，压缩仍必须执行");
+        assert_eq!(
+            harness_engine_requests(directory.path())
+                .iter()
+                .filter(|frame| frame["method"] == "thread/compact/start")
+                .count(),
+            1
+        );
+        controller.harness.release().await;
+    }
+
+    #[tokio::test]
+    async fn harness_compaction_boundary_native_turn_lifecycle_preserves_two_compactions_and_fifo()
+    {
+        for side in [false, true] {
+            for reply_first in [false, true] {
+                let (directory, authorization, id) = if side {
+                    harness_active_side_fixture().await
+                } else {
+                    let (directory, authorization) = harness_fixture().await;
+                    let created = authorization
+                        .controller
+                        .call_authorized(
+                            "create",
+                            json!({"projectId":"project-a","prompt":"wait native compactions"}),
+                            &authorization,
+                        )
+                        .await
+                        .unwrap();
+                    (
+                        directory,
+                        authorization,
+                        created["threadId"].as_str().unwrap().to_owned(),
+                    )
+                };
+                let controller = &authorization.controller;
+                std::fs::write(directory.path().join("fast-policy.json"), serde_json::to_vec(&json!({
+                    "nativeCompactionTurns":true,"compactReplyFirst":reply_first,"compactDelayMs":200
+                })).unwrap()).unwrap();
+                for _ in 0..2 {
+                    controller
+                        .call_authorized("compact", json!({"threadId":id}), &authorization)
+                        .await
+                        .unwrap();
+                }
+                controller
+                    .call_authorized(
+                        "send",
+                        json!({"threadId":id,"prompt":"wait native follower",
+                    "clientUserMessageId":"native-follower"}),
+                        &authorization,
+                    )
+                    .await
+                    .unwrap();
+                controller
+                    .harness
+                    .seed_test_history(json!({"threadId":id,"finish":true}))
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(20), async {
+                    loop {
+                        let queue = controller
+                            .call_authorized("queue", json!({"threadId":id}), &authorization)
+                            .await
+                            .unwrap();
+                        assert!(
+                            queue["queuedMessages"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .all(|message| message["pausedReason"].is_null()),
+                            "side={side}, first={reply_first}: {queue}"
+                        );
+                        if queue["queuedMessages"].as_array().unwrap().is_empty() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                let requests = harness_engine_requests(directory.path());
+                let compacts: Vec<_> = requests
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, frame)| frame["method"] == "thread/compact/start")
+                    .collect();
+                assert_eq!(compacts.len(), 2);
+                assert!(
+                    requests
+                        .iter()
+                        .position(|frame| frame["method"] == "turn/start"
+                            && frame["params"]["clientUserMessageId"] == "native-follower")
+                        .unwrap()
+                        > compacts[1].0
+                );
+                controller.harness.release().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn harness_compaction_boundary_native_failure_and_stop_keep_followers_paused() {
+        for side in [false, true] {
+            for stop in [false, true] {
+                let (directory, authorization, id) = if side {
+                    harness_active_side_fixture().await
+                } else {
+                    let (directory, authorization) = harness_fixture().await;
+                    let created=authorization.controller.call_authorized("create",
+                        json!({"projectId":"project-a","prompt":"wait native terminal boundary"}), &authorization).await.unwrap();
+                    (
+                        directory,
+                        authorization,
+                        created["threadId"].as_str().unwrap().to_owned(),
+                    )
+                };
+                let controller = &authorization.controller;
+                std::fs::write(
+                    directory.path().join("fast-policy.json"),
+                    serde_json::to_vec(&json!({
+                        "nativeCompactionTurns":true,"compactReplyFirst":true,
+                        "compactDelayMs":if stop {5000} else {200},
+                        "compactOutcome":if stop {"completed"} else {"failed"}
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                controller
+                    .call_authorized("compact", json!({"threadId":id}), &authorization)
+                    .await
+                    .unwrap();
+                controller
+                    .call_authorized(
+                        "send",
+                        json!({"threadId":id,"prompt":"wait terminal follower",
+                    "clientUserMessageId":"terminal-follower"}),
+                        &authorization,
+                    )
+                    .await
+                    .unwrap();
+                controller
+                    .harness
+                    .seed_test_history(json!({"threadId":id,"finish":true}))
+                    .await
+                    .unwrap();
+                if stop {
+                    let compact = tokio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            let view = controller
+                                .call_authorized("thread", json!({"threadId":id}), &authorization)
+                                .await
+                                .unwrap();
+                            if view["thread"]["compaction"]["state"] == "running" {
+                                break view["thread"]["compaction"].clone();
+                            }
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    controller
+                        .call_authorized("stop", json!({"threadId":id}), &authorization)
+                        .await
+                        .unwrap();
+                    assert!(
+                        harness_engine_requests(directory.path())
+                            .iter()
+                            .any(|request| request["method"] == "turn/interrupt"
+                                && request["params"]["turnId"] == compact["turnId"])
+                    );
+                }
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let queue = controller
+                            .call_authorized("queue", json!({"threadId":id}), &authorization)
+                            .await
+                            .unwrap();
+                        if queue["queuedMessages"].as_array().unwrap().len() == 1
+                            && queue["queuedMessages"][0]["pausedReason"].is_string()
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(
+                    !harness_engine_requests(directory.path())
+                        .iter()
+                        .any(|request| request["method"] == "turn/start"
+                            && request["params"]["clientUserMessageId"] == "terminal-follower")
+                );
+                let view = controller
+                    .call_authorized("thread", json!({"threadId":id}), &authorization)
+                    .await
+                    .unwrap();
+                assert_eq!(view["thread"]["compaction"]["state"], "idle");
+                controller.harness.release().await;
+            }
         }
     }
 

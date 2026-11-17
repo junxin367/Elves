@@ -16002,6 +16002,117 @@ test("Claude 压缩命令受理后的正常等待保持静默，空闲超过宽�
   assert.match(composer, /action: "nativeCompactionStart"/);
 });
 
+function compactionBoundaryHarness({ storageFails = false, reloadFails = false } = {}) {
+  const calls = [], notices = [];
+  const context = nodeVm.createContext({
+    selectedId: "boundary-thread", thread: { id: "boundary-thread", compaction: { state: "idle" } },
+    session: { device: { id: "boundary-device", createdAtMs: 1 }, capabilities: { compactionQueueSend: true } },
+    compactions: new Map(), compactionVersion: 0, stopping: false, busy: false, pending: null,
+    connected: true, isClaude: () => false, claudeNativeQueue: () => false, threadReadOnly: () => false,
+    selectedModel: "", selectedEffort: "", modelChoiceVersion: 0,
+    setSelectedModel: value => context.selectedModel = value,
+    setSelectedEffort: value => context.selectedEffort = value,
+    privateInputScope: value => JSON.stringify([value?.device.id, value?.device.createdAtMs]),
+    currentThreadDisplay: () => ({ model: "current-model" }),
+    modelIdentityMatches: (left, right) => left === right,
+    randomId: () => "boundary-receipt", updateComposer() {},
+    sessionStorage: {
+      setItem() { if (storageFails) throw new Error("storage unavailable"); },
+      removeItem() { if (storageFails) throw new Error("storage unavailable"); },
+    },
+    notice: (text, error) => notices.push({ text, error }),
+    reloadThread: async () => { if (reloadFails) throw new Error("读取暂时失败"); },
+    api: async (path, body) => {
+      calls.push({ path, body });
+      return { state: "completed", result: { compaction: { state: "pending" } } };
+    },
+  });
+  nodeVm.runInContext([
+    sourceSection("function normalizeCompaction(", "function compactionAdvanced("),
+    sourceSection("function compactionAdvanced(", "// 用户要求 Claude 压缩没有异常时不显示提示"),
+    sourceSection("async function applyCompactionReceipt(", "async function resolveCompactionReceipt("),
+    sourceSection("function compactionModelChoice(", "function compactionEventMatches("),
+    sourceSection("function compactionEventMatches("),
+  ].join("\n"), context);
+  return { context, calls, notices };
+}
+
+test("压缩边界：回执持久化失败不能留下未提交的压缩锁", async () => {
+  const h = compactionBoundaryHarness({ storageFails: true });
+  await h.context.compactContext();
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.context.compactionLocked(), false);
+  assert.equal(h.context.compactions.size, 0);
+  assert.equal(h.context.thread.compaction.state, "idle");
+  assert.equal(h.notices.length, 1);
+});
+
+test("压缩边界：已确认请求后的读取失败不能退回送达未知", async () => {
+  const h = compactionBoundaryHarness({ reloadFails: true });
+  await h.context.compactContext();
+  const current = h.context.currentCompaction();
+  assert.equal(current.acknowledged, true);
+  assert.equal(current.state, "pending");
+  assert.ok(h.notices.some(notice => /读取|刷新/.test(notice.text)));
+  assert.ok(h.notices.every(notice => !/未收到压缩回执/.test(notice.text)));
+});
+
+test("压缩边界：授权变化后的迟到回执不能清除新授权的模型选择", async () => {
+  const h = compactionBoundaryHarness();
+  h.context.isClaude = () => true;
+  h.context.selectedModel = "selected-model";
+  h.context.api = async () => {
+    h.context.session = { device: { id: "another-device", createdAtMs: 2 } };
+    h.context.compactions.clear();
+    return { state: "completed", result: { deliveryState: "queued", queuedMessages: [] } };
+  };
+  await h.context.compactContext();
+  assert.equal(h.context.selectedModel, "selected-model");
+  assert.equal(h.context.compactions.size, 0);
+  assert.deepEqual(h.notices, []);
+});
+
+test("压缩边界：上一轮迟到的完成事件不能解除新请求的回执锁", () => {
+  for (const [turnId, itemId] of [["old-turn", "old-compact"], ["older-turn", "older-compact"]]) {
+    for (const placeholder of [null, "pending-manual-context-compaction"]) {
+      const h = compactionBoundaryHarness();
+      h.context.compactions.set("boundary-thread", { state: "pending", receiptId: "new-receipt",
+        baselineTurnId: "old-turn", baselineItemId: "old-compact", turnId: null, itemId: placeholder });
+      h.context.receiveCompactionLifecycle({ method: "item/completed" }, {
+        threadId: "boundary-thread", turnId,
+        item: { id: itemId, type: "contextCompaction", source: "manual", completed: true },
+      });
+      assert.equal(h.context.currentCompaction().state, "pending");
+      assert.equal(h.context.currentCompaction().receiptId, "new-receipt");
+    }
+  }
+});
+
+test("压缩边界：服务端明确拒绝的回执保留原模型选择", async () => {
+  const h = compactionBoundaryHarness();
+  h.context.isClaude = () => true;
+  h.context.selectedModel = "rejected-model";
+  h.context.api = async () => ({ state: "failed", result: { notSent: true, message: "模型切换未通过" } });
+  await h.context.compactContext();
+  assert.equal(h.context.selectedModel, "rejected-model");
+  assert.equal(h.context.compactionLocked(), false);
+  assert.equal(h.notices[0].text, "模型切换未通过");
+});
+
+test("压缩边界：代理故障和明确未知不能解除回执锁，明确未提交可以解除", async () => {
+  for (const [failure, expected] of [
+    [{ code: 502 }, "unknown"],
+    [{ code: 409, outcomeUnknown: true }, "unknown"],
+    [{ code: 503, notSubmitted: true }, "idle"],
+  ]) {
+    const h = compactionBoundaryHarness();
+    h.context.api = async () => { throw Object.assign(new Error("请求异常"), failure); };
+    await h.context.compactContext();
+    assert.equal(h.context.currentCompaction().state, expected);
+    assert.equal(h.context.compactionLocked(), expected === "unknown");
+  }
+});
+
 test("Claude 压缩与发送消息一样触发所选模型切换，选择未变化时不带多余设置", async () => {
   const calls = [], notices = [];
   const context = nodeVm.createContext({
@@ -16012,9 +16123,10 @@ test("Claude 压缩与发送消息一样触发所选模型切换，选择未变�
     stopping: false, busy: false, pending: null, connected: true, thread: { id: "claude-thread", compaction: {} },
     threadReadOnly: () => false, compactionLocked: () => false, normalizeCompaction: value => value || {},
     randomId: () => "receipt-1", session: { device: { id: "device-1" } }, compactions: new Map(),
+    privateInputScope: value => JSON.stringify([value?.device.id, value?.device.createdAtMs]),
     setCompactionState() {}, updateComposer() {}, notice: (message, error) => notices.push([message, error]),
     applyCompactionReceipt: async () => {},
-    api: async (path, body) => { calls.push([path, body]); return { ok: true }; }
+    api: async (path, body) => { calls.push([path, body]); return { state: "completed", result: { ok: true } }; }
   });
   nodeVm.runInContext(sourceSection("function compactionModelChoice(", "function compactionEventMatches("), context);
   const run = async (state = {}) => {

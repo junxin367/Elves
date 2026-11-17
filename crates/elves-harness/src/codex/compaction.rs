@@ -29,6 +29,25 @@ impl CodexHarness {
             return self.start_compaction(id, authorization).await;
         }
         let anchor = self.queue_anchor(id).await?;
+        if anchor.0.is_none() && !anchor.1 {
+            // 原轮次可能在读取与准入之间正常结束；重读后走直接压缩，不能留下没有依赖轮次的等待项。
+            let latest = self
+                .runtime
+                .request(
+                    "thread/read",
+                    json!({"threadId":id,"includeTurns":false}),
+                    None,
+                )
+                .await?;
+            normalize_thread_response(&latest)?;
+            if !self.send_is_running(id, &latest["thread"]).await? {
+                return self.start_compaction(id, authorization).await;
+            }
+            return Err(error(
+                409,
+                "当前执行轮次尚未确认，压缩未提交；请重新读取后再试",
+            ));
+        }
         let mut message = Queued::new(json!({"threadId":id}), authorization);
         message.compact = true;
         let mut store = self.store.lock().await;

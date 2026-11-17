@@ -41,6 +41,9 @@ struct Message {
     // 历史编辑仅复用直接发送的在途回执；定位由后端核对生成，不接收网页指定的原生路径。
     #[serde(default)]
     native_edit: Option<Value>,
+    // 每次实际派发使用单独的原生命令身份，先持久保存；旧尝试的迟到结果不能确认手动重试。
+    #[serde(default)]
+    native_command_id: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -118,6 +121,46 @@ impl Message {
 
 impl RemoteQueue {
     pub(super) fn observe_compaction(&mut self, control: &Value) {
+        let confirmed: Vec<_> = self
+            .messages
+            .iter()
+            .filter(|message| {
+                message.compact && matches!(message.state.as_str(), "sending" | "unknown")
+            })
+            .filter_map(|message| {
+                let id = message.native_command_id.as_deref()?;
+                let event = control["compactionEvents"]
+                    .as_array()
+                    .and_then(|events| events.iter().find(|event| event["id"] == id));
+                let command = control["commands"].as_array().and_then(|commands| {
+                    commands
+                        .iter()
+                        .find(|command| command["id"] == id && command["name"] == "compact")
+                });
+                // pending 只是发送前意图；只有相同尝试的原生执行或完成证据可以解除未知状态。
+                (event.is_some_and(|event| {
+                    matches!(
+                        event["status"].as_str(),
+                        Some("inProgress" | "completed" | "failed" | "interrupted")
+                    )
+                }) || command.is_some_and(|command| {
+                    matches!(command["state"].as_str(), Some("running" | "completed"))
+                }))
+                .then(|| {
+                    (
+                        message.id.clone(),
+                        id.to_owned(),
+                        fingerprint(&message.payload),
+                    )
+                })
+            })
+            .collect();
+        for (message_id, command_id, hash) in confirmed {
+            self.messages.retain(|message| message.id != message_id);
+            self.accepted.insert(message_id, hash);
+            self.awaiting_compaction = Some(command_id);
+            self.revision += 1;
+        }
         let Some(id) = self.awaiting_compaction.as_deref() else {
             return;
         };
@@ -381,6 +424,7 @@ impl Claude {
                 reason: String::new(),
                 native_intent: None,
                 native_edit: None,
+                native_command_id: None,
             });
             // 新压缩不解除旧队列的暂停；停止、失败和未知回执继续按原规则处理。
             current.remote_queue.revision += 1;
@@ -564,6 +608,7 @@ impl Claude {
                     reason: String::new(),
                     native_intent: None,
                     native_edit: native_edit.clone(),
+                    native_command_id: None,
                 });
                 if c.remote_queue.paused && !c.active() && c.queued_messages.is_empty() {
                     c.remote_queue.awaiting_turn = None;
@@ -631,6 +676,12 @@ impl Claude {
                 );
                 message.state = "sending".into();
                 message.reason.clear();
+                // 显式重试接管该条操作的后续派发授权；原生暂缓后不能继续绑定已撤销的旧设备而永久滞留。
+                message.device_id = authorization.device.id.clone();
+                message.key_id = authorization.device.key_id.clone();
+                if message.compact {
+                    message.native_command_id = Some(uuid::Uuid::new_v4().to_string());
+                }
                 let result = message.clone();
                 c.remote_queue.paused = false;
                 c.remote_queue.awaiting_turn = (!message.compact).then(|| message_id.into());
@@ -666,7 +717,7 @@ impl Claude {
             self.remote_queue_changed(id).await;
         }
         let mut edit_settings = None;
-        let result = async {
+        let mut result = async {
             let mut c = self.conversation(id).await?;
             if message.compact {
                 return self
@@ -676,7 +727,7 @@ impl Claude {
                         "compact",
                         &message.payload,
                         authorization,
-                        false,
+                        message.native_command_id.as_deref(),
                     )
                     .await;
             }
@@ -747,6 +798,20 @@ impl Claude {
                 .conversations
                 .get_mut(id)
                 .context("Claude 会话不存在")?;
+            if message.compact {
+                c.remote_queue.observe_compaction(&c.native_control);
+                if c.remote_queue.accepted.get(&message.id) == Some(&fingerprint(&message.payload))
+                    && !c
+                        .remote_queue
+                        .messages
+                        .iter()
+                        .any(|queued| queued.id == message.id)
+                {
+                    // 原生证据可以先于控制回包到达，不能将已执行的同次压缩重新保存为未知、再让用户重试。
+                    result = Ok(json!({"nativeCommand":{"id":message.native_command_id},
+                        "compaction":c.native_control["compaction"]}));
+                }
+            }
             if deferred {
                 c.remote_queue.awaiting_turn = None;
                 if let Some(m) = c
@@ -795,6 +860,9 @@ impl Claude {
                 if not_sent {
                     c.remote_queue.awaiting_turn = None;
                 }
+            }
+            if message.compact && result.is_err() {
+                c.remote_queue.pause();
             }
             c.remote_queue.revision += 1;
             c.remote_queue.compact();
@@ -1125,6 +1193,8 @@ mod tests {
         Rejected,
         ControlRejected,
         Unknown,
+        CompletedUnknown,
+        WrongCommand,
         SyncIdle,
         SyncActive,
         SyncRejected,
@@ -1264,6 +1334,21 @@ mod tests {
                         .await
                         .unwrap();
                 }
+                if request["subtype"] == "shared_native_command"
+                    && matches!(reply, Reply::CompletedUnknown)
+                    && let Some(service) = weak.upgrade()
+                {
+                    service
+                        .change(|saved| {
+                            let current = saved.conversations.get_mut(&id).unwrap();
+                            current.native_control = json!({"compaction":{"state":"idle"},
+                            "commands":[{"id":request["id"],"name":"compact","state":"completed"}],
+                            "compactionEvents":[{"id":request["id"],"status":"completed"}]});
+                            Ok(())
+                        })
+                        .await
+                        .unwrap();
+                }
                 let response = match reply {
                     Reply::Accepted if request["subtype"] == "shared_native_command" => Ok(
                         json!({"accepted":true,"nativeCommand":{"id":request["id"],"state":"pending"}}),
@@ -1276,7 +1361,11 @@ mod tests {
                         "Claude 控制请求失败：原生会话仍在其他 CLI 中打开",
                     )
                     .into()),
-                    Reply::Unknown => Err(ApiError::new(503, "回执未知").after_admission().into()),
+                    Reply::Unknown | Reply::CompletedUnknown => {
+                        Err(ApiError::new(503, "回执未知").after_admission().into())
+                    }
+                    Reply::WrongCommand => Ok(json!({"accepted":true,
+                        "nativeCommand":{"id":"another-command","name":"compact","state":"pending"}})),
                     Reply::PermissionPending => Ok(json!({"permissionPending":true,
                         "nativeSettings":{"permissionMode":"acceptEdits","changes":{
                             "permissionMode":{"id":"pending-permission","requested":"configured",
@@ -1298,6 +1387,291 @@ mod tests {
 
     fn payload(c: &Conversation, id: &str) -> Value {
         json!({"threadId":c.id,"clientUserMessageId":id,"prompt":format!("正文-{id}")})
+    }
+
+    #[tokio::test]
+    async fn compaction_boundary_deferred_retry_uses_the_current_device_authorization() {
+        let (_directory, _auth_directory, service, c, auth, calls, replies) = fixture().await;
+        let compact = service
+            .command("compact", &json!({"threadId":c.id}), &auth)
+            .await
+            .unwrap();
+        let mut device = auth.device.clone();
+        device.id = "new-compaction-device".into();
+        auth.controller
+            .auth
+            .lock()
+            .await
+            .devices
+            .push(device.clone());
+        let current_auth = auth
+            .controller
+            .authorization(device.clone(), Some("steerQueued"));
+        service
+            .change(|saved| {
+                let current = saved.conversations.get_mut(&c.id).unwrap();
+                current.native_status = json!({"tempo":"idle"});
+                current.turns[0]["status"] = json!("completed");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        replies.lock().await.push_back(Reply::SyncActive);
+        let deferred = service
+            .command(
+                "steerQueued",
+                &json!({"threadId":c.id,"messageId":compact["messageId"]}),
+                &current_auth,
+            )
+            .await
+            .unwrap();
+        assert_eq!(deferred["deliveryState"], "queued");
+        let rebound = service
+            .conversation(&c.id)
+            .await
+            .unwrap()
+            .remote_queue
+            .messages[0]
+            .clone();
+        assert_eq!(rebound.device_id, device.id);
+        auth.controller
+            .auth
+            .lock()
+            .await
+            .devices
+            .retain(|device| device.id != auth.device.id);
+        service
+            .change(|saved| {
+                let current = saved.conversations.get_mut(&c.id).unwrap();
+                current.native_status = json!({"tempo":"idle"});
+                current.turns[0]["status"] = json!("completed");
+                // 反事实核对：恢复旧版本遗留的设备绑定时，原有撤销保护会阻止续发。
+                current.remote_queue.messages[0].device_id = auth.device.id.clone();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        service.drain_remote_queues().await;
+        assert!(calls.lock().await.is_empty());
+        service
+            .change(|saved| {
+                saved
+                    .conversations
+                    .get_mut(&c.id)
+                    .unwrap()
+                    .remote_queue
+                    .messages[0]
+                    .device_id = rebound.device_id;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        service.drain_remote_queues().await;
+        assert_eq!(
+            calls.lock().await.len(),
+            1,
+            "恢复同次显式重试的有效设备后，压缩应只续发一次"
+        );
+        assert_eq!(calls.lock().await[0]["subtype"], "shared_native_command");
+    }
+
+    #[tokio::test]
+    async fn compaction_boundary_retry_rejects_old_attempt_completion() {
+        let (_directory, _auth_directory, service, c, auth, calls, replies) = fixture().await;
+        let compact = service
+            .command("compact", &json!({"threadId":c.id}), &auth)
+            .await
+            .unwrap();
+        service
+            .change(|saved| {
+                let current = saved.conversations.get_mut(&c.id).unwrap();
+                current.native_status = json!({"tempo":"idle"});
+                current.turns[0]["status"] = json!("completed");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        for reply in [Reply::Rejected, Reply::Unknown] {
+            replies.lock().await.push_back(reply);
+            assert!(
+                service
+                    .command(
+                        "steerQueued",
+                        &json!({"threadId":c.id,"messageId":compact["messageId"]}),
+                        &auth
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        let attempts = calls.lock().await.clone();
+        assert_ne!(
+            attempts[0]["id"], attempts[1]["id"],
+            "明确重试必须取得新的原生命令身份"
+        );
+        service
+            .change(|saved| {
+                let current = saved.conversations.get_mut(&c.id).unwrap();
+                current
+                    .remote_queue
+                    .observe_compaction(&json!({"compactionEvents":[{
+                "id":attempts[0]["id"],"status":"completed"}]}));
+                assert_eq!(current.remote_queue.messages.len(), 1);
+                current
+                    .remote_queue
+                    .observe_compaction(&json!({"compactionEvents":[{
+                "id":attempts[1]["id"],"status":"completed"}]}));
+                assert!(current.remote_queue.messages.is_empty());
+                assert!(current.remote_queue.paused, "核对未知回执不能解除原有暂停");
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn compaction_boundary_native_completion_precedes_unknown_reply_and_wrong_reply_is_rejected()
+     {
+        for reply in [Reply::CompletedUnknown, Reply::WrongCommand] {
+            let (_directory, _auth_directory, service, c, auth, calls, replies) = fixture().await;
+            let compact = service
+                .command("compact", &json!({"threadId":c.id}), &auth)
+                .await
+                .unwrap();
+            service
+                .change(|saved| {
+                    let current = saved.conversations.get_mut(&c.id).unwrap();
+                    current.native_status = json!({"tempo":"idle"});
+                    current.turns[0]["status"] = json!("completed");
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            replies.lock().await.push_back(reply);
+            let result = service
+                .command(
+                    "steerQueued",
+                    &json!({"threadId":c.id,"messageId":compact["messageId"]}),
+                    &auth,
+                )
+                .await;
+            let queue = service.queue(&c.id).await.unwrap();
+            if matches!(reply, Reply::CompletedUnknown) {
+                assert_eq!(result.unwrap()["deliveryState"], "accepted");
+                assert!(queue["queuedMessages"].as_array().unwrap().is_empty());
+            } else {
+                assert!(result.is_err());
+                assert_eq!(
+                    queue["queuedMessages"][0]["submission"]["status"],
+                    "outcome-unknown"
+                );
+            }
+            assert_eq!(calls.lock().await.len(), 1, "回包异常不能重发压缩");
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_boundary_rejected_head_keeps_followers_paused_after_removal() {
+        let (_directory, _auth_directory, service, c, auth, calls, replies) = fixture().await;
+        let compact = service
+            .command("compact", &json!({"threadId":c.id}), &auth)
+            .await
+            .unwrap();
+        service
+            .command("send", &payload(&c, "follower"), &auth)
+            .await
+            .unwrap();
+        service
+            .change(|saved| {
+                let current = saved.conversations.get_mut(&c.id).unwrap();
+                current.native_status = json!({"tempo":"idle"});
+                current.turns[0]["status"] = json!("completed");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        replies.lock().await.push_back(Reply::Rejected);
+        assert!(
+            service
+                .command(
+                    "steerQueued",
+                    &json!({"threadId":c.id,"messageId":compact["messageId"]}),
+                    &auth
+                )
+                .await
+                .is_err()
+        );
+        service
+            .command(
+                "removeQueued",
+                &json!({"threadId":c.id,"messageId":compact["messageId"]}),
+                &auth,
+            )
+            .await
+            .unwrap();
+        service.drain_remote_queues().await;
+        assert_eq!(
+            calls.lock().await.len(),
+            1,
+            "删除失败压缩后不能自动发送后续消息"
+        );
+        assert_eq!(service.queue(&c.id).await.unwrap()["queuePaused"], true);
+    }
+
+    #[tokio::test]
+    async fn compaction_boundary_unknown_result_accepts_only_the_same_native_attempt() {
+        let (_directory, _auth_directory, service, c, auth, calls, replies) = fixture().await;
+        let compact = service
+            .command("compact", &json!({"threadId":c.id}), &auth)
+            .await
+            .unwrap();
+        service
+            .change(|saved| {
+                let current = saved.conversations.get_mut(&c.id).unwrap();
+                current.native_status = json!({"tempo":"idle"});
+                current.turns[0]["status"] = json!("completed");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        replies.lock().await.push_back(Reply::Unknown);
+        assert!(
+            service
+                .command(
+                    "steerQueued",
+                    &json!({"threadId":c.id,"messageId":compact["messageId"]}),
+                    &auth
+                )
+                .await
+                .is_err()
+        );
+        let command = calls.lock().await[0].clone();
+        service
+            .change(|saved| {
+                let current = saved.conversations.get_mut(&c.id).unwrap();
+                for control in [
+                    json!({"commands":[{"id":command["id"],"name":"compact","state":"pending"}]}),
+                    json!({"compactionEvents":[{"id":"other-attempt","status":"completed"}]}),
+                ] {
+                    current.remote_queue.observe_compaction(&control);
+                    assert_eq!(
+                        current.remote_queue.messages.len(),
+                        1,
+                        "意图或其它压缩不能确认原请求"
+                    );
+                }
+                current.remote_queue.observe_compaction(&json!({
+                    "compactionEvents":[{"id":command["id"],"status":"completed"}]
+                }));
+                assert!(
+                    current.remote_queue.messages.is_empty(),
+                    "相同原生命令的完成证据必须解除未知队列项"
+                );
+                assert!(current.remote_queue.awaiting_compaction.is_none());
+                Ok(())
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1563,6 +1937,7 @@ mod tests {
                 "dataUrl":format!("data:image/png;base64,{}",base64::engine::general_purpose::STANDARD.encode(png.get_ref()))})
         }).collect();
         let original = Message {
+            native_command_id: None,
             compact: false,
             id: "images".into(),
             payload: json!({"prompt":"原图","clientUserMessageId":"images",
@@ -1619,6 +1994,7 @@ mod tests {
         let payload = json!({"clientUserMessageId":"image-message","prompt":"原内容","images":[image.clone(),image.clone(),image.clone()]});
         super::super::super::validate_input_images(&payload).unwrap();
         let original = Message {
+            native_command_id: None,
             compact: false,
             id: "image-message".into(),
             payload: payload.clone(),
@@ -2569,6 +2945,7 @@ mod tests {
     #[test]
     fn unconfirmed_intent_is_not_native_acceptance_and_dispatching_restarts_as_unknown() {
         let message = Message {
+            native_command_id: None,
             compact: false,
             id: "C".into(),
             payload: json!({"clientUserMessageId":"C","prompt":"C"}),

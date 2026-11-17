@@ -13,7 +13,7 @@ import {
 } from "../composer/options-state.js";
 import { pendingFeedbackReady } from "../composer/send-state.js";
 import { pending } from "./pending-state.js";
-import { claudeNativeQueue, isActiveThread, isClaude, threadReadOnly } from "../session/capabilities.js";
+import { claudeNativeQueue, isActiveThread, isClaude, privateInputScope, threadReadOnly } from "../session/capabilities.js";
 import { currentThreadDisplay } from "../session/thread-cache.js";
 
 export let compactionVersion = 0;
@@ -103,10 +103,18 @@ function setCompactionState(id, value, { required = false } = {}) {
     baselineTurnId: typeof value?.baselineTurnId === "string" ? value.baselineTurnId : null,
     baselineItemId: typeof value?.baselineItemId === "string" ? value.baselineItemId : null
   };
+  const previous = compactions.get(id);
   compactions.set(id, normalized);
+  try {
+    persistCompactions(required);
+  } catch (error) {
+    // 回执未能持久保存时请求不会提交，内存占位也必须回退，不能把输入区永久锁在“压缩中”。
+    if (previous) compactions.set(id, previous);
+    else compactions.delete(id);
+    throw error;
+  }
   ++compactionVersion;
   if (thread?.id === id) thread.compaction = normalizeCompaction(normalized);
-  persistCompactions(required);
   return normalized;
 }
 function compactionAdvanced(current, projection) {
@@ -205,7 +213,18 @@ export function renderCompactionBanner(root, id, compaction) {
 }
 async function applyCompactionReceipt(id, receiptId, receipt) {
   const current = compactions.get(id);
-  if (!current || current.receiptId !== receiptId || current.state === "idle") return;
+  if (!current || current.receiptId !== receiptId || current.state === "idle"
+      || current.deviceId && current.deviceId !== session?.device.id) return;
+  const scope = privateInputScope(session);
+  const refresh = async () => {
+    if (selectedId !== id || privateInputScope(session) !== scope) return;
+    try { await reloadThread(); }
+    catch (error) {
+      // 压缩受理与后续读取分开处理；读取失败不能把已确认回执倒退成送达未知。
+      if (selectedId === id && privateInputScope(session) === scope)
+        notice(`压缩回执已确认，但会话状态读取失败：${error.message}`, true);
+    }
+  };
   if (receipt.state === "pending") {
     updateComposer();
     return;
@@ -219,7 +238,7 @@ async function applyCompactionReceipt(id, receiptId, receipt) {
     setCompactionState(id, { state: "idle", turnId: current.turnId, itemId: current.itemId });
     notice(receipt.result?.message || "原生压缩请求未完成", true);
     updateComposer();
-    if (selectedId === id) await reloadThread();
+    await refresh();
     return;
   }
   if (receipt.state !== "completed") {
@@ -233,14 +252,14 @@ async function applyCompactionReceipt(id, receiptId, receipt) {
     if (current.state !== "running" && !current.nativeConfirmed)
       setCompactionState(id, { state: "idle", turnId: current.baselineTurnId, itemId: current.baselineItemId });
     updateComposer();
-    if (selectedId === id) await reloadThread();
+    await refresh();
     return;
   }
   const acknowledged = setCompactionState(id, { ...current, acknowledged: true });
   if (receipt.result?.compaction) reconcileCompaction(id, receipt.result.compaction);
   // 用户要求远程压缩完成时不再弹出提示；仍核对回执、解除压缩状态并刷新会话。
   updateComposer();
-  if (selectedId === id && compactions.get(id)?.receiptId === acknowledged.receiptId) await reloadThread();
+  if (compactions.get(id)?.receiptId === acknowledged.receiptId) await refresh();
 }
 async function resolveCompactionReceipt(id) {
   const current = compactions.get(id);
@@ -249,8 +268,10 @@ async function resolveCompactionReceipt(id) {
     notice("压缩回执属于旧设备授权。请在本机核对后人工解除锁定。", true);
     return;
   }
+  const scope = privateInputScope(session);
   try {
     const receipt = await api(`/api/receipts/${current.receiptId}`);
+    if (privateInputScope(session) !== scope) return;
     await applyCompactionReceipt(id, current.receiptId, receipt);
   } catch (error) {
     if (compactions.get(id)?.receiptId !== current.receiptId) return;
@@ -287,6 +308,8 @@ export function compactionModelChoice() {
 export async function compactContext() {
   if (stopping || busy || pending || threadReadOnly() || !connected || !selectedId
       || thread?.id !== selectedId || compactionLocked(selectedId)) return;
+  const scope = privateInputScope(session);
+  if (!scope) return;
   const id = selectedId, baseline = normalizeCompaction(thread.compaction), receiptId = randomId();
   const choice = compactionModelChoice(), choiceVersion = modelChoiceVersion;
   const choiceModel = selectedModel, choiceEffort = selectedEffort;
@@ -306,16 +329,21 @@ export async function compactContext() {
       ...(choice?.model ? { model: choice.model } : {}),
       ...(choice?.reasoningEffort ? { reasoningEffort: choice.reasoningEffort } : {})
     }, receiptId);
-    // 送达后交给原生设置状态展示，不保留已提交的本地覆盖值；菜单后来做出的新选择有独立版本，不能被清掉。
-    if (choice && selectedId === id && choiceVersion === modelChoiceVersion) {
+    // 更换授权后的迟到结果只属于原请求，不能清除新授权的模型选择或重写当前会话状态。
+    if (privateInputScope(session) !== scope) return;
+    // 仅确认受理或入队后清除覆盖；明确失败保留选择，菜单后来的新选择有独立版本，不能被旧回执清掉。
+    if (choice && receipt.state === "completed" && receipt.result?.ok !== false
+        && selectedId === id && choiceVersion === modelChoiceVersion) {
       if (selectedModel === choiceModel) setSelectedModel("");
       if (selectedEffort === choiceEffort) setSelectedEffort("");
     }
     await applyCompactionReceipt(id, receiptId, receipt);
   } catch (error) {
+    if (privateInputScope(session) !== scope) return;
     const current = compactions.get(id);
     if (current?.receiptId !== receiptId) return;
-    if (error.code && error.code !== 503) {
+    // 502/504 等代理错误不能证明请求未到达；明确未知优先保留回执，只有明确未提交或普通 4xx 才解除锁定。
+    if (!error.outcomeUnknown && (error.notSubmitted || error.code && error.code < 500)) {
       setCompactionState(id, { state: "idle", turnId: current.turnId, itemId: current.itemId });
       notice(error.message, true);
     } else {
@@ -324,8 +352,14 @@ export async function compactContext() {
     }
   } finally { updateComposer(); }
 }
-function compactionEventMatches(current, item, turnId) {
+function compactionEventMatches(current, item, turnId, completed = false) {
   if (!current || current.state === "idle") return true;
+  // 未取得本次原生身份时，任意旧完成事件都不能确认本次请求；等待开始事件、同次回执或重新读取。
+  if (completed && current.receiptId && !current.turnId
+      && (!current.itemId || current.itemId === "pending-manual-context-compaction")) return false;
+  // 新请求尚未取得原生身份时，上一条压缩的迟到完成事件不能代替本次回执或提前解除防重锁。
+  if (current.receiptId && !current.itemId && !current.turnId && current.baselineItemId
+      && item?.id === current.baselineItemId && turnId === current.baselineTurnId) return false;
   if (current.itemId && current.itemId !== "pending-manual-context-compaction"
       && item?.id && current.itemId !== item.id) return false;
   if (current.turnId && turnId && current.turnId !== turnId) return false;
@@ -339,9 +373,9 @@ export function receiveCompactionLifecycle(event, params) {
     : (params.turn?.items || []).filter(item => item?.type === "contextCompaction");
   let current = compactions.get(id), changed = false, completed = false;
   for (const item of items) {
-    if (!compactionEventMatches(current, item, turnId)) continue;
     const itemCompleted = event.method === "item/completed" || item.completed === true
       || ["completed", "failed", "interrupted", "cancelled", "canceled"].includes(item.status);
+    if (!compactionEventMatches(current, item, turnId, itemCompleted)) continue;
     if (itemCompleted) {
       setCompactionState(id, { state: "idle", turnId, itemId: item.id });
       current = compactions.get(id); changed = true; completed = true;

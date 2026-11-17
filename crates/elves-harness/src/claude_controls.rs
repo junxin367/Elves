@@ -104,6 +104,7 @@ impl Claude {
         argument: &str,
         expected_goal: Option<&Value>,
         authorization: &HarnessAuthorization,
+        command_id: Option<&str>,
     ) -> anyhow::Result<Value> {
         if !c.shared
             || !process.initialization["commands"]
@@ -115,14 +116,15 @@ impl Claude {
         let result = process
             .control(
                 json!({"subtype":"shared_native_command",
-            "id":uuid::Uuid::new_v4().to_string(),"name":name,"argument":argument,"expectedGoal":expected_goal}),
+            "id":command_id.map(str::to_owned).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            "name":name,"argument":argument,"expectedGoal":expected_goal}),
                 Some(authorization),
             )
             .await?;
         if name == "compact"
-            && result["nativeCommand"]["id"]
-                .as_str()
-                .is_none_or(str::is_empty)
+            && result["nativeCommand"]["id"].as_str().is_none_or(|actual| {
+                actual.is_empty() || command_id.is_some_and(|expected| actual != expected)
+            })
         {
             return Err(dispatched_unknown(ApiError::new(
                 503,
@@ -201,7 +203,7 @@ impl Claude {
                 process
             }
         };
-        self.execute_native_command(c, &process, action, payload, authorization, true)
+        self.execute_native_command(c, &process, action, payload, authorization, None)
             .await
     }
 
@@ -212,8 +214,9 @@ impl Claude {
         action: &str,
         payload: &Value,
         authorization: &HarnessAuthorization,
-        allow_queue: bool,
+        command_id: Option<&str>,
     ) -> anyhow::Result<Value> {
+        let allow_queue = command_id.is_none();
         if let Some(mode) = payload["permissionMode"].as_str() {
             c.permission_mode = Some(mode.to_owned());
         }
@@ -333,8 +336,16 @@ impl Claude {
             }
         }
         let expected_goal = (action == "updateGoal").then_some(&c.native_control["goal"]);
-        self.dispatch_native_command(c, process, name, argument, expected_goal, authorization)
-            .await
+        self.dispatch_native_command(
+            c,
+            process,
+            name,
+            argument,
+            expected_goal,
+            authorization,
+            command_id,
+        )
+        .await
     }
 }
 

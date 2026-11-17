@@ -2216,6 +2216,7 @@ impl Claude {
                 native_controls::goal_argument(payload)?,
                 None,
                 authorization,
+                None,
             )
             .await
         } else {
