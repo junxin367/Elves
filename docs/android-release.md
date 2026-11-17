@@ -17,7 +17,7 @@ Android 相关文件包括 Android 项目、内置 `assets/harness` 网页资源
 
 桌面版 `v<version>` 标签只触发桌面发布，不触发 Android 独立发布。Android 自动发布只由 `android-v<versionName>` 标签触发；手动运行 Android APK 工作流时，Release 的 `tag` 留空只构建并上传 Actions Artifacts。
 
-只编译 Windows 管理端安装包时执行 `.\scripts\build-windows-installer.ps1`。根目录 `.\build.ps1` 是组合入口：它先生成 Windows 安装包，再根据 Android 输入摘要决定是否同步构建 Android Release。明确要求构建 Android 时可运行 `.\scripts\build-android.ps1 -Configuration Release`。这些构建入口都不会自行递增 Android 版本或发布 GitHub Release。
+只编译 Elves Windows 安装包时执行 `.\scripts\build-windows-installer.ps1`。根目录 `.\build.ps1` 是组合入口：它先生成 Windows 安装包，再根据 Android 输入摘要决定是否同步构建 Android Release。明确要求构建 Android 时可运行 `.\scripts\build-android.ps1 -Configuration Release`。这些构建入口都不会自行递增 Android 版本或发布 GitHub Release。
 
 准备桌面管理端发版时，应从上一个已公开桌面 Release 对应标签比较到本次目标提交，并核对 Android 源码、APK 内置 `assets/harness` 网页资源、Android 构建与签名配置、共享脚本和工作流。另须以上一个 APK 和更新清单均校验有效的已公开 Android Release 为基线。若本次影响 Android，或基线缺失、仍有未交付的 Android 改动，则按独立版本规则构建并发布 Android；若可确认没有 Android 变更且现有 Android Release 与附件有效，才跳过并记录比较基线与依据。
 

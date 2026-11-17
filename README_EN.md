@@ -1,58 +1,84 @@
+Forked from [BigPizzaV3/CodexPlusPlus](https://github.com/BigPizzaV3/CodexPlusPlus).
+
 # Elves
 
-<p align="center"><img src="docs/images/icon.png" alt="Elves icon" width="128"></p>
-<p align="center"><a href="README.md">中文</a> | English</p>
+<p align="center"><img src="apps/elves/web/icon.png" alt="Elves icon" width="128"></p>
+<p align="center"><a href="README.md">中文</a> · English</p>
 
-Elves is the desktop client for Codex and Claude conversations, providers, and the local protocol proxy. It opens its local workspace automatically. Harness is the independent execution and management product behind that workspace: Codex runs through an independent app-server, and Claude uses the selected instance's native CLI. Remote sessions are one Harness capability for browsers, PWAs, and Android; disabling them does not affect Elves or the local proxy. Codex App injection has been removed.
+**One workspace for Codex, Claude, projects, conversations, and a local protocol proxy.**
 
-[Downloads](https://github.com/junxin367/Elves/releases) · [Windows client](docs/windows-remote-client.md) · [Mobile guide](docs/remote-access-mobile.md)
+Elves is a Windows desktop client. Opening it starts local Harness and enters the workspace without a remote address or access key. Harness independently handles execution and management: Codex uses its own app-server, and Claude uses the selected WSL instance's native CLI.
 
-## Navigation
+Browsers, PWAs, and Android connect through Harness's optional remote-session capability. Turning it off leaves desktop use and the local proxy available. Elves does not require Codex App and provides no page injection, desktop execution bridge, or separate manager application.
 
-The 52px left rail uses 36px icon buttons with 8px on each side. Hover displays each name. Existing project, Codex, and Claude icons remain in use.
+[Releases](https://github.com/junxin367/Elves/releases) · [Documentation](docs/README.md) · [Issues](https://github.com/junxin367/Elves/issues)
+
+## Features
 
 | Page | Features |
 | --- | --- |
-| Conversations | Existing conversation list, projects, and chat workspace; switching pages preserves the current conversation and draft |
-| Proxy settings | Provider and model configuration, protocol selection, local proxy status, request logs, and details |
-| Conversation management | Browse and filter local sessions; delete individual sessions or a filtered batch; historical repair and compression settings are removed |
-| Remote sessions | Web service, public routes, access keys, login lock, and device authorization |
-| Bottom settings | General, appearance, instances, models, reasoning depth, session naming, permissions, Skills, MCP, and hooks |
+| Conversations | Browse projects and instances, continue conversations, choose models and reasoning depth, handle queues and approvals, and inspect files and changes |
+| Proxy settings | Configure providers, models, protocols, and the local proxy; inspect status, request logs, and details |
+| Conversation management | Browse, filter, and delete local conversations individually or in batches |
+| Remote sessions | Configure web access, public routes, access keys, and device authorization |
+| Settings | Manage instances, model defaults, session naming, permissions, instructions, Skills, MCP, hooks, and appearance |
 
-On Windows, the bottom settings button opens settings directly. Other clients show only Settings and Log out. Appearance is stored per client; other preferences are shared through the same service. Stale saves are rejected, preserving unsaved input for review.
+Session naming uses one shared execution instance and model across the same Harness. Appearance is local to each client; other settings are shared through Harness. Drafts, attachments, and reading positions remain local. Model, reasoning, and extension capabilities depend on the selected native instance.
 
-## Install and start
+## Quick start
 
-Download `Elves-<version>-windows-x64-setup.exe` or the portable `Elves-<version>-windows-x64.exe`. Microsoft Edge WebView2 Runtime is required. The server needs a configured Codex CLI or Claude instance.
+Requirements: Windows x64, Microsoft Edge WebView2 Runtime, and a configured Codex CLI or WSL Claude instance. Custom providers additionally need a Base URL, API key, and model configuration.
 
-The installer deploys one application, `elves.exe`, plus its uninstaller. The same executable hosts Harness in the background. Upgrades remove the previous manager, launcher, task-board application, and their shortcuts while preserving user data.
+Check [Releases](https://github.com/junxin367/Elves/releases) for published packages, or build from source:
 
-1. Open **Elves**. It starts local Harness and opens the workspace without a server address or access key.
-2. Desktop authorization is independent from remote devices, keys, read-only policy, and the remote-session switch.
-3. Configure providers and models in **Proxy settings**. An enabled provider's local proxy starts automatically with Elves; its default port remains `45221`.
-4. Return to **Conversations**. Configure public access and device authorization in **Remote sessions** to connect from another device.
+| File | Purpose |
+| --- | --- |
+| `Elves-<version>-windows-x64-setup.exe` | Installer containing one Elves application and its uninstaller |
+| `Elves-<version>-windows-x64.exe` | Portable client |
 
-Closing the main window minimizes it to the tray and keeps Harness running. Exiting from the tray safely shuts down the backend owned by this client.
+1. Open **Elves** and wait for local Harness to prepare the workspace.
+2. Open bottom **Settings**, detect the intended instances, and configure model defaults, reasoning depth, and permissions.
+3. Return to **Conversations**, select an instance and project, then create or continue a conversation.
+4. For a custom provider, save its configuration in **Proxy settings** and select **Use**.
 
-## Data and updates
+When the active provider has its local proxy enabled, it starts automatically with Elves / Harness on default port `45221`. Responses API uses the configured Responses upstream directly; Chat Completions and Anthropic use their respective protocol conversions. Each model retains its protocol assignment.
 
-Shared settings, credentials, authorization, and logs remain under `~/.codex-session-delete/`. Window state and WebView2 data use `%LOCALAPPDATA%\com.elves.app\`, with compatibility for the previous data directory. Elves does not save or restore remote connection addresses. Uninstalling preserves user data.
+Closing the main window minimizes it to the tray. Exiting from the tray safely shuts down the backend owned by this client. The Windows bottom settings button opens settings directly.
 
-The client embeds web resources and verifies updates with SHA-256. Complete updates take effect on the next navigation. Native upgrades use the Windows installer and briefly close the client and its backend; the former manager-only hot-update procedure does not support this installation structure.
+## Web and mobile access
 
-Responses API requests use their configured upstream directly. Chat Completions and Anthropic conversions remain available. Model access and reasoning depth depend on the selected instance and provider. Session deletion is permanent and retains native execution and pending-write protections.
+Enable web access in **Remote sessions**, save an access key, and configure an address reachable from the other device. Browsers and PWAs sign in with that address and key. Android connects to the same Harness and has independent application versions and releases.
+
+The local workspace defaults to `127.0.0.1:45223`; remote web access defaults to port `45222`. Desktop authorization is independent of remote devices and policies. Disabling remote access, changing its read-only policy, or revoking a remote device does not sign out the local desktop client. Keep the Harness computer running while using remote access.
+
+See the [mobile guide](docs/remote-access-mobile.md) and [remote-session reference](docs/remote-access.md).
+
+## Data and upgrades
+
+- Shared settings, provider configuration, logs, remote keys, and device authorization retain the existing `~/.codex-session-delete/` directory.
+- Native configuration and history remain with their respective Codex / Claude instance. Window state and WebView2 cache use the client's own data directory.
+- Upgrade with a new Windows installer. Installation removes obsolete application entries while preserving user data; uninstalling also preserves settings, history, and login cache.
+- When an operation's outcome is unknown, retain its receipt and check the conversation before repeating a send or deletion.
 
 ## Development
+
+Install Node.js/npm, the Rust MSVC toolchain, Windows C++ build tools, and NSIS for the installer.
 
 ```powershell
 npm --prefix apps/elves-management ci
 npm --prefix apps/elves-management run check
-npm --prefix apps/elves-management run vite:build
 cargo fmt --all -- --check
-cargo check --workspace
+cargo check --workspace --locked
 .\scripts\build-windows-installer.ps1
 ```
 
-`apps/elves/` builds the only desktop application. `crates/elves-harness/` contains Harness execution and management, `elves-core` provides configuration and protocol proxying, and `elves-data` provides session storage access. `apps/elves-management/` contains shared web management components; it no longer builds a desktop manager. Commit generated `assets/harness/management/` alongside its source. The Windows build does not build Android. Android versions and signed releases remain independent.
+The installer script builds shared management assets, the client, installer, and portable executable under `dist/windows/`. It does not build Android. For a client-only build:
 
-See the [product standards](docs/product-standards.md), [web architecture](docs/harness-web-architecture.md), and [release documentation](docs/android-release.md) for the detailed contracts.
+```powershell
+npm --prefix apps/elves-management run vite:build
+.\scripts\build-windows-client.ps1
+```
+
+`apps/elves/` contains the only Windows application; `crates/elves-harness/` contains Harness execution and management. `elves-core` and `elves-data` provide configuration, protocol proxying, and session data access. Workspace assets live in `assets/harness/`. Commit `assets/harness/management/` alongside changes to `apps/elves-management/`. Android lives in `apps/elves-android/`, with independent versions and signing.
+
+See the [documentation index](docs/README.md), [product standards](docs/product-standards.md), and [Elves / Harness architecture](docs/harness-architecture.md).

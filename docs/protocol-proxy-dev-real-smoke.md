@@ -157,7 +157,6 @@ temp/dev-codex-smoke-run/<timestamp>/
 ```powershell
 cargo fmt
 cargo test -p elves-core --test protocol_proxy -- --test-threads=1
-cargo test -p elves-core --test launcher
 git diff --check
 ```
 

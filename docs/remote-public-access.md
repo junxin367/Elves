@@ -1,10 +1,10 @@
-# zrok / FRP 主入口切换
+# Harness 公网入口配置
 
-更新日期：2026-11-04。本文说明当前实现；原型和当时的运行验收保留在 [2026-10-23 验收报告](validation/remote-primary-switch-20261023/README.md)。本文不宣称当前运行环境已切换或通过真机验收。
+本文对应 Elves 左侧“远程会话”页面中的公网入口设置。公网入口只影响其他设备访问 Harness，不影响 Elves 本机授权、会话执行或本地代理。网页服务需要先启用，候选入口验证通过后才会用于远程会话。
 
 ## 主入口与第二线路
 
-“主入口”是管理器展示/复制的公网地址、设备首次登录地址和服务启动时选用的隧道。当前在 zrok 与 FRP 中选择一个主入口，ngrok 可独立开启为第二线路。
+“主入口”是“远程会话”页面展示和复制的公网地址、设备首次登录地址，以及远程网页服务启动时选用的隧道。在 zrok 与 FRP 中选择一个主入口，ngrok 可独立开启为第二线路。
 
 | 主入口选择 | 未选提供方 | ngrok |
 | --- | --- | --- |
@@ -39,10 +39,10 @@ ngrok 区块始终保留标题及独立开关；关闭时隐藏 Token 及操作�
 | `remote-access-primary.json` | 成功应用或关闭服务时保存的主入口选择；缺省为 zrok |
 | `remote-access-frp/draft.json` | 候选 FRP 配置 |
 | `remote-access-frp/active.json` | 已生效 FRP 配置 |
-| 管理器 `editingProvider` | 当前查看的表单，不表示正在使用的入口 |
+| 页面 `editingProvider` | 当前查看的表单，不表示正在使用的入口 |
 | 控制器主入口及运行状态 | 正在使用的提供方、地址、验证中及错误信息 |
 
-凭据只由本机管理接口处理，不出现在公网发现数据中。旧配置中可存在兼容性 HTTPS 字段，不能据此给当前表单增加证书要求。
+凭据读写受 Harness 管理权限约束，不出现在公网发现数据中。旧配置中可存在兼容性 HTTPS 字段，不能据此给当前表单增加证书要求。
 
 ## 地址切换后的设备行为
 
@@ -52,9 +52,9 @@ ngrok 区块始终保留标题及独立开关；关闭时隐藏 Token 及操作�
 
 ## 实现与验证定位
 
-- [`PrimaryRouteControls.tsx`](../apps/codex-elves-manager/src/components/PrimaryRouteControls.tsx)：编辑表单、保存/测试/应用、下载及结果反馈。
-- [`primary_route.rs`](../crates/codex-elves-core/src/remote_access/primary_route.rs)：候选验证、服务配置代次、切换、活动 FRP 替换及 ngrok 协调。
-- [`frp_tunnel.rs`](../crates/codex-elves-core/src/remote_access/frp_tunnel.rs)：配置、受管进程、回源及重试。
-- [`channels.js`](../assets/remote-access/channels.js)：网页选路和单次写入。
+- [`PrimaryRouteControls.tsx`](../apps/elves-management/src/components/PrimaryRouteControls.tsx)：编辑表单、保存/测试/应用、下载及结果反馈。
+- [`primary_route.rs`](../crates/elves-harness/src/primary_route.rs)：候选验证、服务配置代次、切换、活动 FRP 替换及 ngrok 协调。
+- [`frp_tunnel.rs`](../crates/elves-harness/src/frp_tunnel.rs)：配置、受管进程、回源及重试。
+- [`channels.js`](../assets/harness/channels.js)：网页选路和单次写入。
 
-使用步骤、授权和线路规则见 [远程会话](remote-access.md)；[HTTP 验收报告](validation/frp-http-20261023/README.md)只证明当时执行的具体场景，不替代当前版本运行验证。
+使用步骤、授权和线路规则见[远程会话](remote-access.md)。[主入口开发验收](validation/remote-primary-switch-20261023/README.md)与 [HTTP 验收报告](validation/frp-http-20261023/README.md)保留当时的实现和验证结果，不替代当前版本运行验证。

@@ -8,7 +8,7 @@ Android 客户端位于 `apps/elves-android`，使用 Java 17、Android Gradle P
 
 ## Windows 与 Android 构建入口
 
-日常只编译 Windows 管理端安装包时使用专用入口：
+日常只编译 Elves Windows 安装包时使用专用入口：
 
 ```powershell
 .\scripts\build-windows-installer.ps1
