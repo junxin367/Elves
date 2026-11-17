@@ -50,6 +50,7 @@ fn walk(root: &Path, directory: &Path, resources: &mut Vec<(String, &'static str
             Some("js" | "mjs") => "application/javascript; charset=utf-8",
             Some("css") => "text/css; charset=utf-8",
             Some("png") => "image/png",
+            Some("svg") => "image/svg+xml",
             Some("webmanifest") => "application/manifest+json; charset=utf-8",
             _ => continue,
         };

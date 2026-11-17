@@ -2,7 +2,7 @@ Forked from [BigPizzaV3/CodexPlusPlus](https://github.com/BigPizzaV3/CodexPlusPl
 
 # Elves
 
-<p align="center"><img src="apps/elves/web/icon.png" alt="Elves icon" width="128"></p>
+<p align="center"><img src="assets/harness/icons/elves-logo.svg" alt="Elves icon" width="128"></p>
 <p align="center"><a href="README.md">中文</a> · English</p>
 
 **One workspace for Codex, Claude, projects, conversations, and a local protocol proxy.**

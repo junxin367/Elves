@@ -109,7 +109,7 @@ export function shell() {
   app.innerHTML = `<div class="workspace">
     <div class="sidebar-backdrop"></div>
     <aside id="session-sidebar" class="sidebar" aria-label="会话侧边栏">
-      <div class="sidebar-header"><strong>✦ Elves</strong><div class="sidebar-header-actions"><button id="sidebar-type-filter" class="icon-button sidebar-type-filter" type="button" title="筛选会话实例" aria-label="筛选会话实例" aria-haspopup="menu"></button><button id="sidebar-view-toggle" class="icon-button sidebar-view-toggle" type="button" aria-label="切换会话视图" disabled></button><button id="sidebar-search-toggle" class="icon-button sidebar-search-toggle" type="button" title="搜索会话与项目" aria-label="搜索会话与项目" aria-controls="sidebar-search" aria-expanded="false" aria-pressed="false"></button></div></div>
+      <div class="sidebar-header"><strong class="sidebar-brand"><img src="/icons/elves-logo.svg" alt="" aria-hidden="true"><span>Elves</span></strong><div class="sidebar-header-actions"><button id="sidebar-type-filter" class="icon-button sidebar-type-filter" type="button" title="筛选会话实例" aria-label="筛选会话实例" aria-haspopup="menu"></button><button id="sidebar-view-toggle" class="icon-button sidebar-view-toggle" type="button" aria-label="切换会话视图" disabled></button><button id="sidebar-search-toggle" class="icon-button sidebar-search-toggle" type="button" title="搜索会话与项目" aria-label="搜索会话与项目" aria-controls="sidebar-search" aria-expanded="false" aria-pressed="false"></button></div></div>
       <div class="sidebar-action"><button id="new-chat" class="new-chat" type="button">＋ 新建会话</button><input id="sidebar-search" class="search" type="search" placeholder="搜索会话与项目" aria-label="搜索会话与项目" autocomplete="off" hidden></div>
       <div id="sidebar-content" class="sidebar-content"></div>
     </aside>

@@ -10,6 +10,14 @@
 
 README 的 fork 来源说明保持原值。历史发布说明、签名配置回执及验收记录保留当时的仓库归属；迁移代码不表示旧仓库的 Release、Issues 或 Secrets 已迁移。
 
+## 产品 logo 与图标
+
+产品统一使用用户提供的 `03-neon-separated.svg`，仓库唯一源文件为 `assets/harness/icons/elves-logo.svg`。网页、启动页及 README 直接使用 SVG；Windows 应用、托盘和安装程序使用多尺寸 ICO，PWA、Apple touch 及 Android 原生资源使用所需尺寸的 PNG。项目及 Codex、Claude 实例图标保留原值。
+
+资源名称须反映实际用途：`elves-app-icon`、`elves-startup-logo`、`elves-pwa-192`、`elves-pwa-512`、`elves-apple-touch-icon`，以及 Android 的 `elves_login_logo`、`elves_launcher_foreground`、`elves_launcher_monochrome`。使用 `npm --prefix apps/elves-management run assets:brand` 从唯一 SVG 源重建派生资源，不手工修改各端副本。
+
+Android 前景采用 75% 缩放，使原图约 78% 的图案在 108dp 画布内占约 63dp，保留 66dp 安全区域；背景色保持源 SVG 的 `#F6F4FA`，普通、圆形和单色图标共用这一边界。公开 SVG 与其他网页资源使用同一清单、MIME 和摘要校验。
+
 ## 远程项目视图
 
 项目目录合并独立 app-server 的已保存项目与同一 Codex Home 中 Codex App 添加的本地项目。按明确项目 ID、同一 Home 的迁移映射或唯一匹配的完整根目录集合去重；同名、共享部分目录的项目分别保留，不从历史会话工作目录生成项目。
@@ -39,6 +47,8 @@ Elves 与 Harness 工作区左侧导航宽 52px，由 36×36px 图标按钮及�
 ### Elves 安装、启动与 Harness
 
 安装包只部署一个 `elves.exe` 及卸载程序，桌面、开始菜单和完成页只提供“Elves”。Harness 执行与管理后端通过同一程序的 `--harness-service` 模式运行；共享管理前端不生成独立管理器，删除旧 launcher、任务看板和 Codex App 注入代码。
+
+安装包仅在用户明确要求时构建。普通修改、检查、提交推送或单独编译程序，不自动附带安装包构建。
 
 Elves 启动自动准备本机 Harness 并直接进入工作区，不读取远程地址、不要求访问密钥、不显示连接页，也不自动打开远程会话开关。本机入口默认固定回环端口 `45223`，本地代理默认 `45221`，远程网页默认 `45222`；远程监听不能占用前两者。本机初始化失败只显示实际原因与重试。
 

@@ -122,6 +122,7 @@ impl Manifest {
                             | "application/javascript; charset=utf-8"
                             | "application/manifest+json; charset=utf-8"
                             | "image/png"
+                            | "image/svg+xml"
                     ),
                 "网页资源清单包含无效或保留条目"
             );
@@ -1098,8 +1099,17 @@ mod tests {
     #[test]
     fn built_in_resources_match_public_entry_points_and_header_injection_is_rejected() {
         let snapshot = Snapshot::bundled();
+        snapshot.manifest.validate().unwrap();
         let paths: HashSet<_> = snapshot.files.keys().map(String::as_str).collect();
         assert!(paths.contains("/") && paths.contains("/app.js") && paths.contains("/style.css"));
+        let logo = snapshot
+            .manifest
+            .files
+            .iter()
+            .find(|file| file.path == "/icons/elves-logo.svg")
+            .unwrap();
+        assert_eq!(logo.content_type, "image/svg+xml");
+        assert!(snapshot.files["/icons/elves-logo.svg"].starts_with(b"<svg"));
         assert!(!paths.iter().any(|path| path.starts_with("/api/")));
         assert!(!valid_headers("Set-Cookie: session=not-allowed\r\n"));
         assert!(!valid_headers("X-Frame-Options: DENY\nSet-Cookie: x\r\n"));

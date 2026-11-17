@@ -11,8 +11,8 @@ InstallDir "$LOCALAPPDATA\Programs\Elves"
 InstallDirRegKey HKCU "Software\Elves" "InstallDir"
 RequestExecutionLevel admin
 SetCompressor /SOLID lzma
-!define MUI_ICON "${ROOT}\apps\elves\src-tauri\icons\icon.ico"
-!define MUI_UNICON "${ROOT}\apps\elves\src-tauri\icons\icon.ico"
+!define MUI_ICON "${ROOT}\apps\elves\src-tauri\icons\elves-app-icon.ico"
+!define MUI_UNICON "${ROOT}\apps\elves\src-tauri\icons\elves-app-icon.ico"
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES

@@ -1,5 +1,6 @@
 <resources>
-    <color name="launcher_background">#F6F3FA</color>
+    <!-- 用户指定 SVG 的画布背景色，需与品牌源文件和前景安全区域外的底色一致。 -->
+    <color name="launcher_background">#F6F4FA</color>
     <color name="login_background">#FFFFFF</color>
     <color name="login_text">#1F1F1F</color>
     <color name="login_muted">#7D7D7D</color>

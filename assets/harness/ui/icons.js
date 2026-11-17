@@ -2,6 +2,15 @@
 
 import { element } from "./dom.js";
 
+export function productLogo() {
+  // 用户指定产品标识直接使用 SVG；Codex、Claude 的实例图标仍沿用下方原有路径。
+  const node = element("img", "brand-mark");
+  node.src = "/icons/elves-logo.svg";
+  node.alt = "";
+  node.setAttribute("aria-hidden", "true");
+  return node;
+}
+
 export function icon(name) {
   const paths = {
     window: '<path d="M14 3h7v7M21 3l-9 9"/><path d="M10 5H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-5"/>',

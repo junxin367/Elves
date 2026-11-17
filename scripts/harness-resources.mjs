@@ -17,6 +17,8 @@ export const harnessResourceContentTypes = Object.freeze({
   ".mjs": "application/javascript; charset=utf-8",
   ".css": "text/css; charset=utf-8",
   ".png": "image/png",
+  // 用户指定品牌 SVG 直接用于网页；与各端内嵌资源表和缓存 MIME 校验同步。
+  ".svg": "image/svg+xml",
   ".webmanifest": "application/manifest+json; charset=utf-8",
 });
 

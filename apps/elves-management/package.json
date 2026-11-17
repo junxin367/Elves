@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "assets:brand": "node ../../scripts/generate-brand-assets.mjs",
     "dev": "vite --host 127.0.0.1 --port 1420",
     "build": "npm run check:harness && npm run vite:build && cargo build --profile release-fast -p elves --bin elves",
     "check": "npm run check:harness && tsc --noEmit -p tsconfig.json",
@@ -26,6 +27,7 @@
     "vite": "^6.0.0"
   },
   "devDependencies": {
+    "@resvg/resvg-js": "2.6.2",
     "@tailwindcss/vite": "^4.0.0",
     "@types/node": "^22.10.0",
     "@types/react": "^19.0.0",

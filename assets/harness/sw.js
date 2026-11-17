@@ -8,6 +8,7 @@ const allowedContentTypes = new Set([
   "application/javascript; charset=utf-8",
   "application/manifest+json; charset=utf-8",
   "image/png",
+  "image/svg+xml",
   "text/css; charset=utf-8",
   "text/html; charset=utf-8"
 ]);
@@ -23,7 +24,7 @@ const maximumOptionalInterruptions = 2;
 const deferredResourcePaths = new Set([
   "/markdown-renderer.js", "/vendor/marked.esm.js", "/vendor/dompurify.esm.js",
   "/vendor/mermaid.esm.js", "/manifest.webmanifest",
-  "/icons/icon-192.png", "/icons/icon-512.png", "/icons/apple-touch-icon.png"
+  "/icons/elves-pwa-192.png", "/icons/elves-pwa-512.png", "/icons/elves-apple-touch-icon.png"
 ]);
 const criticalResourceOrder = [
   "/", "/style.css", "/platform.js", "/pwa.js", "/markdown.js", "/app.js",

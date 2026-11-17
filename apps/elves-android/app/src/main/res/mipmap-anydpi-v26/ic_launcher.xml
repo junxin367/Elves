@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
     <background android:drawable="@color/launcher_background" />
-    <foreground android:drawable="@drawable/codex_elves_icon" />
-    <monochrome android:drawable="@drawable/ic_launcher_monochrome" />
+    <!-- 与品牌生成脚本的 75% 前景缩放、66dp 安全区域保持一致。 -->
+    <foreground android:drawable="@drawable/elves_launcher_foreground" />
+    <monochrome android:drawable="@drawable/elves_launcher_monochrome" />
 </adaptive-icon>

@@ -21,8 +21,8 @@ final class DiagnosticsPolicy {
         "/events-worker.js", "/channels.js", "/markdown.js", "/markdown-renderer.js",
         "/vendor/marked.esm.js", "/vendor/dompurify.esm.js", "/vendor/mermaid.esm.js",
         "/message-actions.js", "/platform.js", "/pwa.js", "/recovery-store.js", "/sw.js",
-        "/style.css", "/manifest.webmanifest", "/icons/icon-192.png", "/icons/icon-512.png",
-        "/icons/apple-touch-icon.png", "/api/connect", "/api/session", "/api/channels",
+        "/style.css", "/manifest.webmanifest", "/icons/elves-logo.svg", "/icons/elves-pwa-192.png", "/icons/elves-pwa-512.png",
+        "/icons/elves-apple-touch-icon.png", "/api/connect", "/api/session", "/api/channels",
         "/api/channel-events", "/api/events", "/api/events/ws", "/api/logout", "/api/diagnostics",
         "/api/workspace/change", "/api/workspace/changes", "/api/receipts", "/other"
     );

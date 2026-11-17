@@ -39,7 +39,7 @@
                 android:layout_height="40dp"
                 android:contentDescription="@null"
                 android:importantForAccessibility="no"
-                android:src="@drawable/ic_login_brand" />
+                android:src="@drawable/elves_login_logo" />
 
             <!-- 宽度不足时保留完整标题换行，不限制行数或省略文字。 -->
             <TextView

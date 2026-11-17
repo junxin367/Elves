@@ -66,7 +66,7 @@
 - 会话管理只保留浏览、筛选及单个/批量删除，不恢复历史会话修复和上下文压缩入口。
 - Windows 客户端点击底部设置直接打开设置；网页、PWA、Android 仅显示设置与退出两项菜单。
 - 快捷入口中文不能乱码；NSIS 编译必须使用 `/INPUTCHARSET UTF8`。
-- 项目标识、Codex 与 Claude 实例图标继续使用当前资源。
+- 产品 logo 以 `assets/harness/icons/elves-logo.svg` 为唯一源，网页和文档优先直接使用 SVG；原生图标用 `npm --prefix apps/elves-management run assets:brand` 生成，资源按实际用途命名。项目及 Codex、Claude 实例图标继续使用原有资源。
 
 ## 协议代理和模型配置约束
 
@@ -116,7 +116,9 @@ Harness 与工作区资源内嵌于唯一的 Elves 程序。更新采用新的 W
 
 ### Windows 安装包编译
 
-用户仅要求“编译”或“编译安装包”时，默认只编译 Windows 客户端安装包，执行：
+- 只有用户明确要求生成或编译安装包时，才执行安装包脚本。日常修改、修复、检查、提交和推送不得自动附带安装包构建，避免重复消耗构建时间。
+- 用户只要求“编译”时，按要求构建相关程序或前端，不默认生成安装包；要求仅检查或改代码时不以“交付完整”为由额外打包。
+- 用户明确要求 Windows 安装包时执行：
 
 ```powershell
 .\scripts\build-windows-installer.ps1

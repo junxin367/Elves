@@ -2,7 +2,7 @@
 
 # Elves
 
-<p align="center"><img src="apps/elves/web/icon.png" alt="Elves 图标" width="128"></p>
+<p align="center"><img src="assets/harness/icons/elves-logo.svg" alt="Elves 图标" width="128"></p>
 <p align="center">中文 · <a href="README_EN.md">English</a></p>
 
 **在一个工作区中使用 Codex、Claude，管理项目、会话和本地协议代理。**

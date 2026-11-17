@@ -4,7 +4,7 @@ import { clearRemoteChannels } from "../../channels.js";
 import { isAndroidContainer, postPlatformMessage } from "../../platform.js";
 import { confirmAction } from "../../ui/dialog.js";
 import { $, button, element } from "../../ui/dom.js";
-import { icon } from "../../ui/icons.js";
+import { icon, productLogo } from "../../ui/icons.js";
 import { notice } from "../../ui/notice.js";
 import { closePopup } from "../../ui/popup.js";
 import {
@@ -87,7 +87,7 @@ export function showLogin() {
   const page = element("div", "pair-page");
   const panel = element("main", "pair-panel");
   const heading = element("header", "pair-heading");
-  const mark = element("div", "brand-mark", "✦"); mark.setAttribute("aria-hidden", "true");
+  const mark = productLogo();
   const brand = element("div", "pair-brand");
   brand.append(mark, element("h1", "", "Elves"));
   heading.append(brand, element("p", "pair-description muted", "输入访问密钥，继续使用你的 Codex 会话。"));
@@ -325,7 +325,7 @@ export function showConnectionRecovery(error) {
   const page = element("div", "pair-page");
   const panel = element("main", "pair-panel");
   const heading = element("header", "pair-heading");
-  const mark = element("div", "brand-mark", "✦"); mark.setAttribute("aria-hidden", "true");
+  const mark = productLogo();
   const brand = element("div", "pair-brand");
   brand.append(mark, element("h1", "", "Elves"));
   heading.append(brand, element("p", "pair-description muted", "当前无法连接远程服务。"));

@@ -88,7 +88,7 @@ html{scrollbar-color:var(--muted) transparent}
 .pair-panel{flex-shrink:0;width:100%;max-width:420px;margin:0 auto}
 .pair-heading{display:flex;flex-direction:column;gap:10px;margin-bottom:28px}
 .pair-brand{display:flex;align-items:center;justify-content:flex-start;gap:12px;width:max-content;max-width:100%;min-width:0;margin-inline:0}
-.pair-heading .brand-mark{flex:0 0 40px;width:40px;height:40px;font-size:40px;line-height:1}
+.pair-heading .brand-mark{flex:0 0 40px;width:40px;height:40px;object-fit:contain}
 .pair-heading h1{min-width:0;max-width:100%;margin:0;font-size:2rem;font-weight:600;letter-spacing:-.035em;line-height:1.18;overflow-wrap:anywhere}
 .pair-description{margin:0;color:var(--muted);font-size:.92857rem;line-height:1.65;text-align:left}
 .pair-form{display:grid;gap:0;margin:0}
@@ -384,6 +384,8 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .sidebar{z-index:var(--layer-sidebar);padding:16px 12px 12px}
 .sidebar-header{gap:8px;padding:0 8px 16px}
 .sidebar-header strong{display:flex;align-items:center;min-width:0;line-height:24px}
+/* 用户指定产品 logo 使用原始 SVG；这里只约束显示尺寸，保留实例与项目原有图标。 */
+.sidebar-brand{gap:7px}.sidebar-brand>img{flex:0 0 24px;width:24px;height:24px;object-fit:contain}
 .sidebar-header-actions{display:flex;align-items:center;gap:0;flex-shrink:0}
 /* 用户要求顶部两图标更紧凑，新增类型筛选在其左侧；0px 容器间距、28px 按钮保留独立点击区域。 */
 .sidebar-view-toggle,.sidebar-search-toggle,.sidebar-type-filter{display:flex;align-items:center;justify-content:center;width:28px;height:var(--control-icon-size);padding:0;line-height:1;color:var(--muted);border-radius:var(--radius-control)}
