@@ -4,13 +4,13 @@ import { subscribeAndroidAmbientLight } from "../../platform.js";
 import { $, element } from "../../ui/dom.js";
 import { notice } from "../../ui/notice.js";
 import {
-  ambientLightStatus, appearance, appearanceSurfaceColors, appearanceTextColors,
+  ambientLightStatus, appearance, appearanceThemeColors,
   appearanceTransitionTimer, automaticAppearanceTheme, automaticThemeAtNight,
   automaticThemeCandidate, automaticThemeLightLuxMax, automaticThemeLightLuxMin,
   automaticThemeLuxShift, automaticThemeShiftProbe, automaticThemeStableMs,
   beginThemeDiagnosticTransition, clearThemeDiagnosticTimers, currentAutomaticThemeLightLux,
   currentFileReadingFontSize, defaultCodeFont, defaultUiFont, finishThemeDiagnosticTransition,
-  fontStack, localAppearance, mixColor, observeAutomaticThemeShift, observeThemeLight, readAppearance,
+  fontStack, localAppearance, observeAutomaticThemeShift, observeThemeLight, readAppearance,
   readRemoteBackground, recordThemeDiagnostic, remoteBackground, remoteBackgroundDataPattern,
   remoteBackgroundOperation, resetAutomaticThemeCompensation, setAmbientLightStatus, setAppearance,
   setAppearanceTransitionTimer, setAutomaticThemeCandidate, setAutomaticThemeLuxShift,
@@ -140,17 +140,13 @@ export function applyAppearance(save = false) {
   const root = document.documentElement;
   const themeChanged = root.dataset.theme && root.dataset.theme !== appearance.theme;
   if (themeChanged) root.classList.add("theme-transition");
-  const { background, foreground, accent, contrast } = appearance.colors[appearance.theme];
+  const palette = appearance.colors[appearance.theme];
+  const { background } = palette;
   root.dataset.theme = appearance.theme;
   root.style.colorScheme = appearance.theme;
-  const brightness = [1, 3, 5].map(index => parseInt(accent.slice(index, index + 2), 16));
-  const onAccent = brightness[0] * .299 + brightness[1] * .587 + brightness[2] * .114 > 150 ? "#171717" : "#ffffff";
   const values = {
-    bg: background, text: foreground, accent, "on-accent": onAccent,
-    ...appearanceTextColors(appearance.theme, { foreground, contrast }),
-    ...appearanceSurfaceColors(appearance.theme, { background, foreground, contrast }),
-    side: mixColor(background, foreground, .035), code: mixColor(background, foreground, .05),
-    hover: mixColor(background, foreground, .075), line: mixColor(background, foreground, .14),
+    // 所有入口、侧边页面及管理页继承同一套派生色；每次完整写入，不能残留上一主题的强调色或主按钮色。
+    ...appearanceThemeColors(appearance.theme, palette),
     "font-size": `${appearance.fontSize}px`,
     "ui-font-family": fontStack(appearance.uiFont, defaultUiFont),
     "code-font-family": fontStack(appearance.codeFont, defaultCodeFont),
@@ -158,7 +154,6 @@ export function applyAppearance(save = false) {
     "code-font-size": `${appearance.codeFontSize}px`,
     "conversation-max-width": `${appearance.conversationWidth}px`,
     "file-reading-font-size": `${currentFileReadingFontSize()}px`,
-    danger: appearance.theme === "dark" ? "#ff9c97" : "#b42318", green: appearance.theme === "dark" ? "#77c7a0" : "#168350"
   };
   for (const [name, value] of Object.entries(values)) root.style.setProperty(`--${name}`, value);
   if (themeChanged) {

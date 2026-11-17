@@ -21,7 +21,7 @@ import {
   applyAppearance, mountAutomaticThemeLightSetting, setAppearanceThemeMode, syncRemoteBackground
 } from "./apply.js";
 import {
-  appearance, appearanceThemes, conversationWidthMax, conversationWidthMin,
+  appearance, appearanceThemeColors, appearanceThemes, conversationWidthMax, conversationWidthMin,
   currentFileReadingFontSize, defaultAppearance, deleteRemoteBackground, fileReadingFontDefault,
   fileReadingFontMax, fileReadingFontMin, projectThreadLimits, readRemoteBackgroundFile,
   remoteBackground, remoteBackgroundBusy, remoteBackgroundError, remoteBackgroundOperation,
@@ -90,6 +90,7 @@ const appearanceColorPresets = ["#171717", "#3f3f46", "#71717a", "#d4d4d8", "#f4
   "#2563eb", "#7c3aed", "#db2777", "#dc2626", "#ea580c", "#16a34a"];
 function bindAppearanceColorValue(input, getColor, onChange) {
   // 用户要求 HEX 可直接修改、只有色块打开取色器；不保存输入到一半或非法的颜色，失焦时恢复实际色值。
+  input.setAttribute("data-appearance-escape", "restore");
   const reset = () => { input.value = getColor().toUpperCase(); input.setAttribute("aria-invalid", "false"); };
   input.oninput = () => {
     const value = input.value.trim(), valid = /^#[0-9a-f]{6}$/i.test(value);
@@ -111,6 +112,7 @@ function bindAppearanceFontSize(input, min, max, getValue, onChange) {
 }
 function bindAppearanceNumberValue(input, min, max, getValue, onChange, unit) {
   // 对比度与原字号共用数值确认交互，避免空值变成零；输入阶段只标记错误，不改已保存的外观。
+  input.setAttribute("data-appearance-escape", "restore");
   input.setAttribute("aria-description", `输入 ${min}～${max}${unit}，按 Enter 或离开输入框应用`);
   const valid = () => input.value.trim() !== "" && Number.isInteger(Number(input.value))
     && Number(input.value) >= min && Number(input.value) <= max;
@@ -326,7 +328,7 @@ export function openAppearance() {
     <pre class="appearance-code-preview">const greeting = "Hello, 你好";\n0123456789  () [] {} =&gt;</pre>
     <label class="appearance-field"><span>文件阅读字号</span><span class="appearance-number"><input id="appearance-file-reading-font" type="number" inputmode="numeric" min="${fileReadingFontMin}" max="${fileReadingFontMax}" step="1" aria-label="文件阅读字号" aria-describedby="appearance-file-reading-font-hint"><span>px</span></span></label>
     <div id="appearance-file-reading-font-hint" class="appearance-reading-font-hint"><span>用于变更预览与文件查看。</span><button type="button" id="appearance-file-reading-font-reset" class="text-button" title="恢复为 ${fileReadingFontDefault}px">恢复默认</button></div>
-    </div><p class="appearance-hint">选择“系统”使用当前设备默认字体；界面和代码默认字号均为 14px。</p></section>
+    </div><p class="appearance-hint">选择“系统”使用当前设备默认字体；界面默认字号为 14px，代码和文件阅读默认字号为 12px。</p></section>
     </details>
     </section>
     <section id="appearance-diagnostics-page" class="appearance-body appearance-settings-page" hidden>
@@ -780,6 +782,8 @@ export function openAppearance() {
     // 只处理顶层设置窗口；指令重新读取等确认弹窗继续使用自己的取消行为。
     if (event.key !== "Escape" || event.isComposing || !dialog.open
         || [...document.querySelectorAll("dialog[open]")].at(-1) !== dialog) return;
+    // 外观输入先恢复未确认的 HEX/数值；捕获阶段不能抢在输入框的 Escape 处理前关闭整个设置页。
+    if (event.target?.getAttribute?.("data-appearance-escape") === "restore") return;
     event.preventDefault();
     event.stopImmediatePropagation();
     // 设置中的所有 Select 共用关闭顺序：先关闭弹层并恢复焦点，再响应下一次返回。
@@ -846,7 +850,23 @@ export function openAppearance() {
   }
   const sync = () => {
     const selectedMode = appearance.themeMode === "auto" ? "auto" : appearance.theme;
-    for (const [mode, control] of modeButtons) control.setAttribute("aria-pressed", String(mode === selectedMode));
+    const modeColors = Object.fromEntries(["light", "dark"].map(mode =>
+      [mode, appearanceThemeColors(mode, appearance.palettes[appearance.themePreset][mode])]));
+    for (const [mode, control] of modeButtons) {
+      control.setAttribute("aria-pressed", String(mode === selectedMode));
+      // 用户要求现有外观逻辑统一：模式缩略图实时反映所选主题的独立明暗调色，不能仍显示固定黑白示意。
+      const preview = control.querySelector(".appearance-mode-preview"), sidebar = control.querySelector(".appearance-mode-sidebar");
+      sidebar.style.opacity = "1";
+      if (mode === "auto") {
+        preview.style.background = `linear-gradient(to right,${modeColors.light.bg} 50%,${modeColors.dark.bg} 50%)`;
+        sidebar.style.background = `linear-gradient(to right,${modeColors.light.side} 50%,${modeColors.dark.side} 50%)`;
+        preview.style.color = modeColors[appearance.theme].text;
+      } else {
+        preview.style.background = modeColors[mode].bg;
+        preview.style.color = modeColors[mode].text;
+        sidebar.style.background = modeColors[mode].side;
+      }
+    }
     syncAutomaticLightSetting();
     setSelectValue($("#appearance-project-thread-limit"), String(appearance.projectThreadLimit));
     $("#appearance-project-thread-limit").disabled = !connected || !sharedSettingsWritable(session);
@@ -865,7 +885,8 @@ export function openAppearance() {
     if (!hasBackground) $("#appearance-background-thumbnail").removeAttribute("src");
     $("#appearance-background-opacity").disabled = remoteBackgroundBusy || !hasBackground;
     $("#appearance-background-opacity").value = appearance.backgroundOpacity;
-    $("#appearance-background-opacity").style.setProperty("--range-fill", `${appearance.backgroundOpacity - 1}%`);
+    // 透明度范围 1～100，实际跨度是 99；最小值填充 0%、最大值填充 100%，与光照滑块的归一化规则一致。
+    $("#appearance-background-opacity").style.setProperty("--range-fill", `${(appearance.backgroundOpacity - 1) / 99 * 100}%`);
     $("#appearance-background-opacity-value").textContent = `${appearance.backgroundOpacity}%`;
     $("#appearance-background-fit").disabled = remoteBackgroundBusy || !hasBackground;
     setSelectValue($("#appearance-background-fit"), appearance.backgroundFit);

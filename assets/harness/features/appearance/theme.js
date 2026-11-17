@@ -41,8 +41,8 @@ export function defaultAppearance(theme = matchMedia("(prefers-color-scheme: dar
   const palettes = Object.fromEntries(Object.entries(appearanceThemes).map(([key, preset]) =>
     [key, { light: { ...preset.colors.light }, dark: { ...preset.colors.dark } }]));
   return { theme, themeMode: "manual", automaticThemeLightLux: automaticThemeLightLuxDefault,
-    // 用户要求字体默认参考 Codex：系统界面字体/系统等宽字体，均为 14px；保留已保存字号和独立文件阅读字号。
-    fontSize: 14, codeFontSize: 14, uiFont: "", codeFont: "", uiFontWeight: 400, codeFontWeight: 400,
+    // 用户要求默认字号为界面 14px、代码及文件阅读 12px；同步核对 fileReadingFontDefault、设置说明和 CSS 回退值，保留已保存字号。
+    fontSize: 14, codeFontSize: 12, uiFont: "", codeFont: "", uiFontWeight: 400, codeFontWeight: 400,
     conversationWidth: conversationWidthDefault, sessionTypes: { codex: true, claude: false }, sessionInstances: null, sessionFilter: "all",
     // 首次使用及“恢复默认外观”均选择 Elver；读取时继续保留已保存的主题和自定义配色。
     themePreset: "elver", palettes, colors: palettes.elver,
@@ -313,6 +313,8 @@ export function automaticAppearanceTheme(date = new Date(), currentTheme = appea
   return currentTheme;
 }
 export function mixColor(left, right, weight) {
+  // Codex 的混色权重在 0～1 内收敛；对比度为 0 或 100 时也不能生成负通道或越界 HEX。
+  weight = Math.min(1, Math.max(0, weight));
   return "#" + [1, 3, 5].map(index => Math.round(
     parseInt(left.slice(index, index + 2), 16) * (1 - weight) + parseInt(right.slice(index, index + 2), 16) * weight
   ).toString(16).padStart(2, "0")).join("");
@@ -335,8 +337,89 @@ export function appearanceTextColors(theme, { foreground, contrast: setting }) {
   // 使用原生三位 alpha，使背景图片与各层表面自然透出，style.css 的 thread-project 同步使用 muted。
   // 侧栏高亮与 appearanceSurfaceColors 的 hover 比例保持一致，但不让透明文字覆盖实色表面。
   return {
+    "text-secondary": appearanceAlphaColor(foreground, .65 + .1 * contrast),
     muted: appearanceAlphaColor(foreground, dark ? .42 + .13 * contrast : .45 + .1 * contrast),
     "sidebar-row-highlight": appearanceAlphaColor(foreground, dark ? .06 + .03 * contrast : .04 + .03 * contrast),
+  };
+}
+function appearanceLuminance(color) {
+  const channels = [1, 3, 5].map(index => {
+    const channel = parseInt(color.slice(index, index + 2), 16) / 255;
+    return channel <= .04045 ? channel / 12.92 : ((channel + .055) / 1.055) ** 2.4;
+  });
+  return channels[0] * .2126 + channels[1] * .7152 + channels[2] * .0722;
+}
+export function appearanceContrastRatio(left, right) {
+  const first = appearanceLuminance(left), second = appearanceLuminance(right);
+  return (Math.max(first, second) + .05) / (Math.min(first, second) + .05);
+}
+function appearanceReadableForeground(background, preferred) {
+  if (preferred && appearanceContrastRatio(background, preferred) >= 4.5) return preferred;
+  return appearanceContrastRatio(background, "#000000") >= appearanceContrastRatio(background, "#ffffff")
+    ? "#000000" : "#ffffff";
+}
+function appearanceAccessibleColor(color, background, minimum = 4.5) {
+  if (appearanceContrastRatio(color, background) >= minimum) return color;
+  const target = appearanceReadableForeground(background);
+  let low = 0, high = 1;
+  // 仅修正派生色的亮度，不改写用户填写的 HEX；16 次二分覆盖 8 位 RGB 的精度。
+  for (let index = 0; index < 16; index++) {
+    const middle = (low + high) / 2;
+    if (appearanceContrastRatio(mixColor(color, target, middle), background) >= minimum) high = middle;
+    else low = middle;
+  }
+  return mixColor(color, target, high);
+}
+export function appearanceThemeColors(theme, palette) {
+  const { background, foreground, contrast: setting } = palette;
+  const accent = /^#[0-9a-f]{6}$/i.test(palette.accent) ? palette.accent : foreground;
+  const dark = theme === "dark", contrast = appearanceContrast(theme, setting);
+  const surfaces = appearanceSurfaceColors(theme, palette);
+  const configuredContrast = Number.isInteger(setting) ? Math.min(100, Math.max(0, setting)) : dark ? 60 : 45;
+  // 用户要求整体参考 Codex：对比度同时驱动侧栏、边框、辅助文字、控件及强调底色。
+  // 45/60 为浅/深默认值；侧栏是原生 surfaceUnder，代码区是 editorBackground，不能继续共用固定 3.5%/5% 混色。
+  const side = dark
+    ? mixColor(background, "#000000", .16 + (configuredContrast - 60) * .0015)
+    : mixColor(background, foreground, .04 + (configuredContrast - 45) * .0012);
+  const accentText = appearanceAccessibleColor(dark
+    ? mixColor(accent, "#ffffff", .3 + .15 * contrast) : accent, background);
+  // 实色强调操作与普通主按钮分开：相对亮度超过 0.6 的明亮颜色保留黑字，其余优先白字；文字至少 4.5:1，焦点至少 3:1。
+  const onAccent = appearanceLuminance(accent) > .6 ? "#000000" : "#ffffff";
+  const accentSolid = appearanceAccessibleColor(accent, onAccent);
+  const accentHover = appearanceAccessibleColor(mixColor(accentSolid, onAccent, .08), onAccent);
+  const accentActive = appearanceAccessibleColor(mixColor(accentSolid, onAccent, .14), onAccent);
+  const selection = dark
+    ? mixColor("#000000", accent, .22 + .12 * contrast)
+    : mixColor(background, accent, .13 + .05 * contrast);
+  const primaryText = appearanceReadableForeground(foreground, surfaces["control-bg"]);
+  return {
+    bg: background, text: foreground, accent, "on-accent": onAccent,
+    ...appearanceTextColors(theme, palette), ...surfaces,
+    side, code: mixColor(background, dark ? foreground : "#ffffff", dark ? .07 : .12),
+    hover: appearanceAlphaColor(foreground, dark ? .06 + .03 * contrast : .04 + .03 * contrast),
+    line: appearanceAlphaColor(foreground, .06 + .04 * contrast),
+    "line-heavy": appearanceAlphaColor(foreground, dark ? .12 + .06 * contrast : .09 + .06 * contrast),
+    "line-light": appearanceAlphaColor(foreground, dark ? .03 + .02 * contrast : .04 + .02 * contrast),
+    "accent-text": accentText,
+    "accent-text-hover": appearanceAccessibleColor(mixColor(accentText, foreground, .18), background),
+    "accent-solid": accentSolid, "accent-solid-hover": accentHover, "accent-solid-active": accentActive,
+    "accent-soft": dark ? mixColor("#000000", accent, .2 + .08 * contrast)
+      : mixColor(background, accent, .11 + .04 * contrast),
+    "accent-soft-hover": dark ? mixColor("#000000", accent, .21 + .1 * contrast)
+      : mixColor(background, accent, .12 + .045 * contrast),
+    "accent-soft-active": selection,
+    "accent-indicator": appearanceAccessibleColor(accent, background, 3),
+    "focus-ring": appearanceAccessibleColor(dark
+      ? mixColor(background, accentText, .7 + .1 * contrast) : accent, background, 3),
+    "selection-bg": selection, "selection-text": appearanceReadableForeground(selection, foreground),
+    // 当前外观通过 HEX 独立配置，不借用 Codex 账号强调色来源；按原生自定义配色路径保留中性发送按钮和用户气泡。
+    "primary-bg": foreground, "primary-text": primaryText,
+    "primary-hover": appearanceAccessibleColor(mixColor(foreground, background, .08), primaryText),
+    "primary-active": appearanceAccessibleColor(mixColor(foreground, background, .14), primaryText),
+    "user-message-bg": appearanceAlphaColor(foreground, .05), "user-message-text": foreground,
+    "notice-bg": surfaces["control-bg"], "notice-text": foreground,
+    danger: dark ? "#ff9c97" : "#b42318", "on-danger": dark ? "#171717" : "#ffffff",
+    green: dark ? "#77c7a0" : "#168350",
   };
 }
 export function appearanceSurfaceColors(theme, { background, foreground, contrast: setting }) {

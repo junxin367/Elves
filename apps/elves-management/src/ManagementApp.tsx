@@ -22,16 +22,26 @@ const initialPage = document.documentElement.dataset.managementPage || new URLSe
 const serviceOrigin = parent.location.origin;
 let deleteSequence = 0;
 
-function hslColor(value: unknown): string | null {
+function hslColor(value: unknown, background?: unknown): string | null {
   if (typeof value !== "string") return null;
   // 注册过的 CSS 颜色变量会序列化为 rgb()；管理页必须继承当前客户端实际配色，不能只识别十六进制。
   const hex = /^#([\da-f]{3}|[\da-f]{6})$/i.exec(value.trim());
-  const rgb = /^rgb\(\s*(\d+(?:\.\d+)?)[,\s]+(\d+(?:\.\d+)?)[,\s]+(\d+(?:\.\d+)?)\s*\)$/i.exec(value.trim());
-  const channels = hex
+  const rgb = /^rgba?\(\s*(\d+(?:\.\d+)?)[,\s]+(\d+(?:\.\d+)?)[,\s]+(\d+(?:\.\d+)?)(?:\s*[,/]\s*(0(?:\.\d+)?|1(?:\.0+)?))?\s*\)$/i.exec(value.trim());
+  let channels = hex
     ? (hex[1].length === 3 ? [...hex[1]].map(char => char + char).join("") : hex[1])
         .match(/../g)!.map(channel => parseInt(channel, 16))
-    : rgb?.slice(1).map(Number);
+    : rgb?.slice(1, 4).map(Number);
   if (!channels || channels.some(channel => !Number.isFinite(channel) || channel < 0 || channel > 255)) return null;
+  // Codex 派生的边框、hover 和辅助文字带透明度；按父工作区背景合成后再转 HSL，不能丢弃并残留上个主题的值。
+  const alpha = rgb?.[4] === undefined ? 1 : Number(rgb[4]);
+  if (alpha < 1) {
+    const baseHex = typeof background === "string" ? /^#([\da-f]{6})$/i.exec(background.trim()) : null;
+    const baseRgb = typeof background === "string"
+      ? /^rgb\(\s*(\d+(?:\.\d+)?)[,\s]+(\d+(?:\.\d+)?)[,\s]+(\d+(?:\.\d+)?)\s*\)$/i.exec(background.trim()) : null;
+    const base = baseHex ? baseHex[1].match(/../g)!.map(channel => parseInt(channel, 16)) : baseRgb?.slice(1).map(Number);
+    if (!base || base.some(channel => !Number.isFinite(channel) || channel < 0 || channel > 255)) return null;
+    channels = channels.map((channel, index) => channel * alpha + base[index] * (1 - alpha));
+  }
   const [r, g, b] = channels.map(channel => channel / 255);
   const max = Math.max(r, g, b), min = Math.min(r, g, b), delta = max - min, light = (max + min) / 2;
   let hue = !delta ? 0 : max === r ? (g - b) / delta % 6 : max === g ? (b - r) / delta + 2 : (r - g) / delta + 4;
@@ -320,14 +330,21 @@ export function App() {
         document.documentElement.classList.toggle("dark", event.data.theme === "dark");
         document.documentElement.classList.toggle("light", event.data.theme === "light");
         // 外观仍按当前客户端保存；管理页只继承主工作区已确认的配色和字体，不另建一套主题偏好。
-        for (const [token, color] of Object.entries({
-          background: "bg", foreground: "text", card: "bg", "card-foreground": "text",
-          popover: "side", "popover-foreground": "text", primary: "accent", "primary-foreground": "on-accent",
-          secondary: "side", "secondary-foreground": "text", muted: "hover", "muted-foreground": "muted",
-          accent: "hover", "accent-foreground": "text", border: "line", input: "line", ring: "accent",
-          destructive: "danger", "shell-bg": "bg", "surface-raised": "side", "surface-sunken": "code"
+        // 主按钮使用中性前景，品牌强调与表单选中分别继承派生文字色/实色；旧网页包缺少字段时按同一前景/背景降级。
+        for (const [token, sources] of Object.entries({
+          background: ["bg"], foreground: ["text"], card: ["composer-bg", "bg"], "card-foreground": ["text"],
+          popover: ["control-bg", "side"], "popover-foreground": ["text"],
+          primary: ["primary-bg", "text"], "primary-foreground": ["primary-text", "bg"],
+          secondary: ["side"], "secondary-foreground": ["text"], muted: ["hover"],
+          "muted-foreground": ["text-secondary", "muted"], accent: ["hover"], "accent-foreground": ["text"],
+          border: ["line"], input: ["line"], ring: ["focus-ring", "accent"], destructive: ["danger"],
+          "destructive-foreground": ["on-danger", "bg"], "shell-bg": ["bg"],
+          "surface-raised": ["control-bg", "side"], "surface-sunken": ["code"],
+          "brand-accent": ["accent-text", "accent"], "control-accent": ["accent-solid", "accent"],
+          "control-accent-foreground": ["on-accent", "bg"],
+          "managed-selection": ["selection-bg", "hover"], "managed-selection-text": ["selection-text", "text"]
         })) {
-          const value = hslColor(event.data.colors?.[color]);
+          const value = sources.map(color => hslColor(event.data.colors?.[color], event.data.colors?.bg)).find(Boolean);
           if (value) document.documentElement.style.setProperty(`--${token}`, value);
         }
         const root = document.documentElement;

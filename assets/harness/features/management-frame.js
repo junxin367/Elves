@@ -16,7 +16,10 @@ export function createManagementPages() {
   const syncTheme = () => {
     const style = getComputedStyle(document.documentElement);
     send({ type: "management-theme", theme: style.colorScheme === "dark" ? "dark" : "light",
-      colors: Object.fromEntries(["bg", "text", "side", "hover", "line", "muted", "accent", "on-accent", "code", "danger"]
+      // 用户要求管理页沿用同一套外观语义：主按钮、强调色与焦点分开传递，不能再把所有主操作染成原始 HEX。
+      colors: Object.fromEntries(["bg", "text", "text-secondary", "side", "hover", "line", "muted", "accent",
+        "accent-text", "accent-solid", "accent-soft", "on-accent", "focus-ring", "primary-bg", "primary-text",
+        "composer-bg", "control-bg", "code", "danger", "on-danger", "selection-bg", "selection-text"]
         .map(name => [name, style.getPropertyValue(`--${name}`).trim()])),
       font: style.getPropertyValue("--ui-font-family").trim(), fontSize: parseFloat(style.fontSize),
       codeFont: style.getPropertyValue("--code-font-family").trim() });

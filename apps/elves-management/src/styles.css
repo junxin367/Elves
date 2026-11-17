@@ -83,6 +83,11 @@
 }
 
 :root {
+  /* 用户要求管理页与 Harness 共用外观：中性主按钮、实色选中控件和文字选区分别继承；旧缓存用现有变量回退。 */
+  --control-accent: var(--brand-accent);
+  --control-accent-foreground: var(--primary-foreground);
+  --managed-selection: var(--accent);
+  --managed-selection-text: var(--foreground);
   background: hsl(var(--background));
   color: hsl(var(--foreground));
   color-scheme: dark;
@@ -1193,7 +1198,7 @@ body {
 .relay-header-switch input {
   width: 15px;
   height: 15px;
-  accent-color: #2563eb;
+  accent-color: hsl(var(--control-accent));
 }
 
 .relay-profile-card {
@@ -1449,7 +1454,7 @@ body {
 .relay-editor-actions .local-proxy-toggle input {
   width: 14px;
   height: 14px;
-  accent-color: #2563eb;
+  accent-color: hsl(var(--control-accent));
   cursor: pointer;
 }
 
@@ -7266,3 +7271,9 @@ body {
     gap: 8px;
   }
 }
+
+/* 用户要求管理页表单与主按钮分色：开关、复选框和选区跟随 Harness，主按钮继续使用中性色。 */
+::selection{background:hsl(var(--managed-selection));color:hsl(var(--managed-selection-text))}
+input[type="checkbox"],input[type="radio"]{accent-color:hsl(var(--control-accent))}
+:is(.context-enabled-switch,.codex-update-toggle,.session-sync-toggle-control).active .context-switch-track{background:hsl(var(--control-accent))}
+:is(.context-enabled-switch,.codex-update-toggle,.session-sync-toggle-control).active .context-switch-thumb{background:hsl(var(--control-accent-foreground))}
