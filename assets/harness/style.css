@@ -684,8 +684,8 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .messages-shell{position:relative;display:flex;flex:1;min-width:0;min-height:0}
 /* 用户要求按钮对齐消息列/输入框的内容中轴：(容器宽 + 左留白 - 右留白) / 2；
    复用内容留白变量随侧栏展开/收起更新；窄屏两侧留白对称，在下方断点回到 50%，不移动消息列或输入框。 */
-/* 用户要求圆圈外边框加粗为 2px，保留原按钮直径和随主题变化的边框色。 */
-.scroll-to-bottom{position:absolute;left:calc(50% + (var(--content-padding-start) - var(--content-padding-end)) / 2);bottom:12px;transform:translateX(-50%);display:grid;place-items:center;width:var(--control-icon-size);height:var(--control-icon-size);padding:0;border:2px solid var(--line);border-radius:50%;background:var(--bg);color:var(--muted);box-shadow:0 2px 8px #0002;z-index:2}
+/* 用户要求消息区圆形按钮外边框为 1.5px，保留原按钮直径和随主题变化的边框色。 */
+.scroll-to-bottom{position:absolute;left:calc(50% + (var(--content-padding-start) - var(--content-padding-end)) / 2);bottom:12px;transform:translateX(-50%);display:grid;place-items:center;width:var(--control-icon-size);height:var(--control-icon-size);padding:0;border:1.5px solid var(--line);border-radius:50%;background:var(--bg);color:var(--muted);box-shadow:0 2px 8px #0002;z-index:2}
 .scroll-to-bottom[data-state=latest]>.ui-icon{transform:rotate(180deg)}
 .scroll-working-dots{display:flex;align-items:center;gap:3px}
 .scroll-working-dots>span{width:3px;height:3px;border-radius:50%;background:currentColor;animation:scroll-working-dot 1.2s ease-in-out infinite}
