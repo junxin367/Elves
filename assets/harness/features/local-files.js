@@ -9,7 +9,6 @@ import { api } from "./api.js";
 import { privateInputScope } from "./session/capabilities.js";
 import { fileOpenInMenu } from "./session/open-in.js";
 import { relatedSessionView } from "./session/related-state.js";
-import { workspaceSidePanel } from "./session/side-panel.js";
 
 function currentFileBrowserThreadId() {
   const parentThreadId = relatedSessionView?.kind === "side"
@@ -22,8 +21,9 @@ function localFileBrowserUrl(path) {
     throw new Error("当前会话没有可用的工作区文件");
   }
   const normalized = path.trim().replaceAll("\\", "/");
-  const segments = normalized.split("/").filter(Boolean);
-  if (!segments.length || segments.some(segment => segment === "." || segment === "..")) {
+  // 正文菜单支持 ./README.md；去掉当前目录段后继续保留对上级目录越界的拒绝。
+  const segments = normalized.split("/").filter(segment => segment && segment !== ".");
+  if (!segments.length || segments.some(segment => segment === "..")) {
     throw new Error("文件路径无效");
   }
   const url = new URL(location.href);
@@ -39,21 +39,17 @@ function localFileBrowserUrl(path) {
 }
 export async function openLocalFileInBrowser(path) {
   try {
-    // 用户要求 PC 的“浏览器”直接打开原文件；由已授权本地服务调用默认浏览器，不打开内置窗口或文件 HTTP 地址。
-    if (!isAndroidContainer() && (workspaceSidePanel || typeof window.__TAURI__?.core?.invoke === "function"
-        || matchMedia("(min-width:761px)").matches)) {
+    // 用户要求仅 Android 使用内置浏览器，其他端通过已授权服务调用系统默认浏览器打开原文件；
+    // 不能因窗口变窄或来自侧边会话而改用网页预览、新窗口或文件的默认编辑器。
+    if (!isAndroidContainer()) {
       const threadId = currentFileBrowserThreadId();
       if (!threadId || typeof path !== "string" || !path.trim())
         throw new Error("当前会话没有可用的工作区文件");
       await api("/api/workspace/open-browser", { threadId, path });
       return;
     }
-    const url = localFileBrowserUrl(path);
-    if (isAndroidContainer()) {
-      return openAndroidBrowser(url).catch(error => notice(error.message || "无法打开浏览器", true));
-    }
-    const popup = window.open(url, "_blank", "noopener,noreferrer");
-    if (!popup) notice("浏览器窗口被阻止，请允许打开新窗口后重试。", true);
+    return openAndroidBrowser(localFileBrowserUrl(path))
+      .catch(error => notice(error.message || "无法打开浏览器", true));
   } catch (error) {
     notice(error.message || "无法打开本地文件", true);
   }
@@ -89,10 +85,13 @@ export function localFileReferenceActions({ openFile } = {}) {
   };
   return { openFile: preview, getMenuOptions(path, line) {
     const opening = fileOpenInMenu(path, { getItem: () => owns() ? owner.item : null });
-    // 用户要求正文文件菜单固定此顺序；Explorer 定位所点文件，复制不附加行号，旧会话/授权的操作不得借用当前身份。
+    // 用户要求“浏览器打开”固定为第二项，复用 Android 内置/其他端系统默认浏览器；
+    // Explorer 定位所点文件，复制不附加行号，旧会话/授权的操作不得借用当前身份。
     return [
       { value: "openFile", label: "打开文件", icon: "folder", disabled: !owns() || typeof openFile !== "function",
         action: () => preview(path, line) },
+      { value: "openBrowser", label: "浏览器打开", icon: "globe", disabled: !owns(owner),
+        action: () => { if (owns(owner)) void openLocalFileInBrowser(path); } },
       { value: "revealFile", label: "在 File Explorer 打开", icon: "folderClosed", disabled: opening.disabled,
         action: () => opening.openTarget({ target: "fileManager" }) },
       { ...opening, value: "openIn", label: "打开方式", icon: "window" },

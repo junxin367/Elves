@@ -479,22 +479,25 @@ test("文件引用绑定忽略旧缓存中的纯文件名，只给真实路径�
   }
 });
 
-test("正文文件菜单固定四项，相对路径预览基于会话 cwd，旧会话不能借用当前身份", () => {
-  const opened = [], copied = [], native = [];
-  const context = nodeVm.createContext({ pageLeaving: false, selectedId: "main",
+test("正文文件菜单固定五项且浏览器打开位于第二，相对路径预览基于会话 cwd，旧会话不能借用当前身份", () => {
+  const opened = [], copied = [], native = [], browsers = [];
+  const context = nodeVm.createContext({ creating: false, pageLeaving: false, selectedId: "main",
     localFileReference,
     session: { device: { id: "device" } }, thread: { id: "main", cwd: "E:\\repo\\packages\\client", instanceId: "codex:local" },
     privateInputScope: value => value?.device.id,
     currentFileBrowserThreadId: () => context.selectedId, copyText: value => copied.push(value),
+    openLocalFileInBrowser: path => browsers.push(path),
     fileOpenInMenu: (path, { getItem }) => ({ disabled: !getItem(), submenu: [],
       openTarget: target => { if (getItem()) native.push([path, target.target]); } }) });
   nodeVm.runInContext(sourceSection("function localFileMenuOwner("), context);
   const actions = context.localFileReferenceActions({ openFile: (...value) => opened.push(value) });
   const options = actions.getMenuOptions("src/app.ts", 12);
   assert.deepEqual(Array.from(options, option => option.label), [
-    "打开文件", "在 File Explorer 打开", "打开方式", "复制路径"
+    "打开文件", "浏览器打开", "在 File Explorer 打开", "打开方式", "复制路径"
   ]);
-  options[0].action(); options[1].action(); options[3].action();
+  assert.equal(options[1].icon, "globe");
+  options[0].action(); options[1].action(); options[2].action(); options[4].action();
+  assert.deepEqual(browsers, ["src/app.ts"]);
   assert.deepEqual(opened, [["E:/repo/packages/client/src/app.ts", 12]]);
   assert.deepEqual(native, [["src/app.ts", "fileManager"]]); assert.deepEqual(copied, ["src/app.ts"]);
   actions.openFile("./README.md", null);
@@ -502,8 +505,9 @@ test("正文文件菜单固定四项，相对路径预览基于会话 cwd，旧�
   actions.openFile("E:\\repo\\packages\\client\\src\\absolute.ts", 4);
   assert.deepEqual(opened.at(-1), ["E:/repo/packages/client/src/absolute.ts", 4]);
   context.selectedId = "other";
-  options[0].action(); options[1].action(); options[3].action();
+  options[0].action(); options[1].action(); options[2].action(); options[4].action();
   assert.equal(opened.length, 3); assert.equal(native.length, 1); assert.equal(copied.length, 1);
+  assert.equal(browsers.length, 1, "旧菜单不能用新会话身份打开浏览器");
 });
 
 function localFileBrowserHarness({ android = false, desktop = true, nativeClient = false } = {}) {
@@ -544,15 +548,69 @@ test("窄版 Windows 客户端和 PC 侧边会话仍调用系统默认浏览器�
   assert.deepEqual(side.opened, []);
 });
 
-test("Android 与手机网页保留原文件打开方式，不请求电脑端默认浏览器", async () => {
-  for (const android of [true, false]) {
-    const h = localFileBrowserHarness({ android, desktop: false });
+test("Android 浏览器打开始终使用内置浏览器，不受窗口宽度影响或请求系统浏览器", async () => {
+  for (const desktop of [true, false]) {
+    const h = localFileBrowserHarness({ android: true, desktop });
     await h.context.openLocalFileInBrowser("docs/index.html");
     assert.deepEqual(h.requests, []);
-    assert.equal(h.opened[0][0], android ? "android" : "web");
+    assert.equal(h.opened[0][0], "android");
     assert.equal(new URL(h.opened[0][1]).pathname, "/api/workspace/view/thread-1/docs/index.html");
     assert.deepEqual(h.notices, []);
   }
+});
+
+test("非 Android 窄屏网页也使用系统默认浏览器，不改成网页弹窗", async () => {
+  const h = localFileBrowserHarness({ desktop: false });
+  await h.context.openLocalFileInBrowser("docs/index.html");
+  assert.deepEqual(h.requests, [["/api/workspace/open-browser", {
+    threadId: "thread-1", path: "docs/index.html"
+  }]]);
+  assert.deepEqual(h.opened, []);
+});
+
+test("正文浏览器菜单沿用平台入口和所属会话，切换授权后旧菜单不能再打开", async () => {
+  for (const android of [true, false]) {
+    const h = localFileBrowserHarness({ android, desktop: false });
+    Object.assign(h.context, { pageLeaving: false,
+      session: { device: { id: "menu-device" } }, thread: { id: "thread-1", cwd: "E:/repo" },
+      privateInputScope: value => value?.device.id, localFileReference, copyText() {},
+      fileOpenInMenu: () => ({ disabled: false, submenu: [], openTarget() {} }),
+    });
+    nodeVm.runInContext(sourceSection("function localFileMenuOwner("), h.context);
+    const options = h.context.localFileReferenceActions().getMenuOptions("./README.md", null);
+    assert.equal(options[1].value, "openBrowser");
+    assert.equal(options[1].disabled, false, "浏览器入口不依赖正文预览回调");
+    options[1].action();
+    await new Promise(resolve => setImmediate(resolve));
+    if (android) {
+      assert.equal(h.opened[0][0], "android");
+      assert.equal(new URL(h.opened[0][1]).pathname, "/api/workspace/view/thread-1/README.md");
+      assert.deepEqual(h.requests, []);
+    } else {
+      assert.deepEqual(h.requests[0], ["/api/workspace/open-browser", { threadId: "thread-1", path: "./README.md" }]);
+      assert.deepEqual(h.opened, []);
+    }
+    h.context.session = { device: { id: "other-device" } };
+    options[1].action();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(android ? h.opened.length : h.requests.length, 1);
+    assert.deepEqual(h.notices, []);
+  }
+});
+
+test("Android 浏览器文件地址保留绝对路径及编码，拒绝父级路径且失败不转系统浏览器", async () => {
+  const h = localFileBrowserHarness({ android: true });
+  await h.context.openLocalFileInBrowser("/home/junes/文档/文件 #1.html");
+  const url = new URL(h.opened[0][1]);
+  assert.equal(url.pathname, "/api/workspace/view/thread-1/%2Fhome/junes/%E6%96%87%E6%A1%A3/%E6%96%87%E4%BB%B6%20%231.html");
+  assert.equal(url.hash, "");
+  await h.context.openLocalFileInBrowser("../private.html");
+  assert.equal(h.opened.length, 1);
+  assert.equal(h.notices.at(-1)[0], "文件路径无效");
+  h.context.openAndroidBrowser = async () => { throw new Error("当前 App 不支持浏览器"); };
+  await h.context.openLocalFileInBrowser("./README.md");
+  assert.deepEqual(h.requests, []);
+  assert.deepEqual(h.notices.at(-1), ["当前 App 不支持浏览器", true]);
 });
 
 test("PC 原生文件打开失败只提示实际错误，不回退到 HTTP 预览或自动重复打开", async () => {
