@@ -681,6 +681,58 @@ test("正文文件菜单固定五项且浏览器打开位于第二，相对路�
   assert.equal(browsers.length, 1, "旧菜单不能用新会话身份打开浏览器");
 });
 
+test("缓存正文先绑定文件菜单，详情和实例信息补齐后同一绑定恢复可用，旧菜单不能跨目录或授权操作", () => {
+  const opened = [], copied = [], native = [];
+  const context = nodeVm.createContext({ creating: false, pageLeaving: false, selectedId: "main", thread: null,
+    localFileReference, session: { device: { id: "device", createdAtMs: 1 } },
+    privateInputScope: value => JSON.stringify([value?.device.id, value?.device.createdAtMs]),
+    currentFileBrowserThreadId: () => context.selectedId, copyText: value => copied.push(value),
+    fileOpenInMenu: (path, { getItem }) => ({ disabled: !getItem(), submenu: [],
+      openTarget: target => { if (getItem()) native.push([getItem().id, path, target.target]); } }) });
+  nodeVm.runInContext(sourceSection("function localFileMenuOwner("), context);
+  const actions = context.localFileReferenceActions({ openFile: (...value) => opened.push(value) });
+  assert.ok(actions.getMenuOptions("src/app.ts", 12).every(option => option.disabled));
+  context.thread = { id: "main", cwd: "E:/repo/packages/client" };
+  context.thread = { ...context.thread, instanceId: "codex:local" };
+  const options = actions.getMenuOptions("src/app.ts", 12);
+  assert.ok(options.every(option => !option.disabled), "无需重建正文或重新绑定即可恢复五项菜单");
+  options[0].action(); options[2].action(); options[4].action();
+  assert.deepEqual(opened, [["E:/repo/packages/client/src/app.ts", 12]]);
+  assert.deepEqual(native, [["main", "src/app.ts", "fileManager"]]);
+  assert.deepEqual(copied, ["src/app.ts"]);
+  context.thread = { ...context.thread, cwd: "E:/other" };
+  options[0].action(); options[2].action(); options[4].action();
+  assert.equal(opened.length, 1); assert.equal(native.length, 1); assert.equal(copied.length, 1);
+  actions.getMenuOptions("src/app.ts", 12)[0].action();
+  assert.deepEqual(opened.at(-1), ["E:/other/src/app.ts", 12]);
+  context.session = { device: { id: "device", createdAtMs: 2 } };
+  assert.ok(actions.getMenuOptions("src/app.ts", 12).every(option => option.disabled));
+  actions.openFile("src/app.ts", 12);
+  assert.equal(opened.length, 2, "同设备重新授权也不能复用旧正文的操作绑定");
+});
+
+test("侧边缓存文件菜单补齐父会话后使用原所属身份，切回父会话不能借用旧侧边绑定", () => {
+  const native = [];
+  const context = nodeVm.createContext({ creating: false, pageLeaving: false, selectedId: "side", thread: null,
+    localFileReference, session: { device: { id: "device" } }, parent: null,
+    privateInputScope: value => value?.device.id,
+    currentFileBrowserThreadId: () => context.parent || context.selectedId, copyText() {},
+    fileOpenInMenu: (path, { getItem }) => ({ disabled: !getItem(), submenu: [],
+      openTarget: target => { if (getItem()) native.push([getItem().id, path, target.target]); } }) });
+  nodeVm.runInContext(sourceSection("function localFileMenuOwner("), context);
+  const actions = context.localFileReferenceActions({ openFile() {} });
+  context.parent = "main";
+  context.thread = { id: "side", cwd: "E:/repo", instanceId: "codex:local" };
+  const options = actions.getMenuOptions("./README.md", null);
+  assert.ok(options.every(option => !option.disabled));
+  options[2].action();
+  assert.deepEqual(native, [["main", "./README.md", "fileManager"]]);
+  context.selectedId = "main"; context.thread = { ...context.thread, id: "main" };
+  options[2].action();
+  assert.equal(native.length, 1);
+  assert.ok(actions.getMenuOptions("./README.md", null).every(option => option.disabled));
+});
+
 function localFileBrowserHarness({ android = false, desktop = true, nativeClient = false } = {}) {
   const opened = [], requests = [], notices = [];
   const context = nodeVm.createContext({ nativeConnectionVersion: 1,

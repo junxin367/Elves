@@ -70,10 +70,14 @@ function localFileMenuOwner() {
 }
 
 export function localFileReferenceActions({ openFile } = {}) {
-  const owner = localFileMenuOwner();
-  const owns = () => !!owner && localFileMenuOwner()?.key === owner.key;
-  const preview = (path, line) => {
-    if (!owns()) return;
+  // 用户要求缓存正文恢复后文件菜单正常可用：渲染时只固定授权和所属会话，完整工作区身份在打开菜单或点击时读取。
+  // 不能永久捕获尚未返回的 thread，也不能让旧正文借用切换后的会话；每次打开的菜单仍固定自己的完整身份。
+  const scope = privateInputScope(session), sourceId = !creating ? selectedId : null;
+  const currentOwner = () => scope && sourceId && !creating && selectedId === sourceId
+    && privateInputScope(session) === scope ? localFileMenuOwner() : null;
+  const owns = owner => !!owner && currentOwner()?.key === owner.key;
+  const preview = (path, line, owner = currentOwner()) => {
+    if (!owns(owner)) return;
     const reference = localFileReference(path, true);
     if (!reference) return;
     path = reference.path;
@@ -84,20 +88,21 @@ export function localFileReferenceActions({ openFile } = {}) {
     return openFile?.(target, line ?? reference.line);
   };
   return { openFile: preview, getMenuOptions(path, line) {
-    const opening = fileOpenInMenu(path, { getItem: () => owns() ? owner.item : null });
+    const owner = currentOwner();
+    const opening = fileOpenInMenu(path, { getItem: () => owns(owner) ? owner.item : null });
     // 用户要求“浏览器打开”固定为第二项，复用 Android 内置/其他端系统默认浏览器；
     // Explorer 定位所点文件，复制不附加行号，旧会话/授权的操作不得借用当前身份。
     return [
-      { value: "openFile", label: "打开文件", icon: "folder", disabled: !owns() || typeof openFile !== "function",
-        action: () => preview(path, line) },
+      { value: "openFile", label: "打开文件", icon: "folder", disabled: !owns(owner) || typeof openFile !== "function",
+        action: () => preview(path, line, owner) },
       { value: "openBrowser", label: "浏览器打开", icon: "globe", disabled: !owns(owner),
         action: () => { if (owns(owner)) void openLocalFileInBrowser(path); } },
       // 用户要求所有 File Explorer 直达入口与 Open in 共用彩色应用图标，不再使用灰色线框文件夹。
       { value: "revealFile", label: "在 File Explorer 打开", renderIcon: () => applicationIcon("fileManager"), disabled: opening.disabled,
         action: () => opening.openTarget({ target: "fileManager" }) },
       { ...opening, value: "openIn", label: "打开方式", icon: "window" },
-      { value: "copyPath", label: "复制路径", icon: "copy", separatorBefore: true, disabled: !owns(),
-        action: () => { if (owns()) void copyText(path); } }
+      { value: "copyPath", label: "复制路径", icon: "copy", separatorBefore: true, disabled: !owns(owner),
+        action: () => { if (owns(owner)) void copyText(path); } }
     ];
   } };
 }
