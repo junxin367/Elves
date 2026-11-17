@@ -323,12 +323,14 @@ impl Conversation {
     }
 
     fn metrics(&self) -> Value {
-        if self.spent_requests.is_empty() {
-            return super::session_metrics::claude(&self.turns);
-        }
-        let mut turns = self.turns.clone();
-        turns.push(json!({"_metricsRequests":self.spent_requests}));
-        super::session_metrics::claude(&turns)
+        let metrics = if self.spent_requests.is_empty() {
+            super::session_metrics::claude(&self.turns)
+        } else {
+            let mut turns = self.turns.clone();
+            turns.push(json!({"_metricsRequests":self.spent_requests}));
+            super::session_metrics::claude(&turns)
+        };
+        super::session_metrics::with_cache_expiry(metrics, &self.native_id)
     }
 
     fn running_for_send(&self) -> bool {

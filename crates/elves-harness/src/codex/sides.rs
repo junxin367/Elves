@@ -484,6 +484,8 @@ impl SideThread {
                 return;
             };
             let observed_at = frame["emittedAtMs"].as_u64().unwrap_or_else(now_ms);
+            // 缓存默认时长沿用侧边自己的实际模型，不能借用父会话模型或父会话累计用量。
+            turn["_metricsModel"] = self.metadata["model"].clone();
             super::super::session_metrics::observe_codex_side(turn, frame, observed_at);
             return;
         }

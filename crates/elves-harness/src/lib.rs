@@ -1682,6 +1682,7 @@ impl HarnessController {
                 .await
                 .unwrap_or(Value::Null)
             };
+            let metrics = session_metrics::with_cache_expiry(metrics, id);
             return Ok(json!({"ok":true,"threadId":id,
                 "backend":if claude_thread {"claude"} else {"codex"},"metrics":metrics}));
         }

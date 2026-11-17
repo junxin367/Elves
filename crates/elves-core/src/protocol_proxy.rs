@@ -16,6 +16,14 @@ use crate::request_headers::{RequestContext, ResponsesRequestOperation, Upstream
 use crate::settings::SettingsStore;
 
 pub const DEFAULT_PROTOCOL_PROXY_PORT: u16 = 45221;
+
+/// 只读同一原生会话最新的缓存证据，不因统计轮询刷新时长。
+pub fn session_cache_expiry(
+    session_identity: &str,
+) -> Option<crate::cache_expiry::SessionCacheExpiry> {
+    crate::compaction_cache::session_expiry(session_identity)
+}
+
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const UPSTREAM_MODELS_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 const STREAM_IDLE_TIMEOUT_HIGH_OR_LOWER: Duration = Duration::from_secs(900);

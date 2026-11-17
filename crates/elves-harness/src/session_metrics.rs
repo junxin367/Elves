@@ -6,12 +6,81 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
+use elves_core::cache_expiry::{CacheExpiry, SessionCacheExpiry, infer_cache_expiry};
 use serde_json::{Value, json};
 
 const SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 // 用户要求统计不能拖慢会话：只定位当前会话文件，首次最多尾读 8 MiB，后续只读追加；不扫描子代理或整个归档。
 const MAX_READ_BYTES: u64 = 8 * 1024 * 1024;
 const CACHE_CAPACITY: usize = 64;
+
+pub(super) fn with_cache_expiry(mut metrics: Value, session_identity: &str) -> Value {
+    if let Some(snapshot) = crate::protocol_proxy::session_cache_expiry(session_identity)
+        && proxy_cache_matches(&metrics, &snapshot)
+    {
+        // 代理可见实际出站请求，优先于只根据原生模型推断的结果；读取不会重新发放 TTL。
+        if let Some(object) = metrics.as_object_mut() {
+            for field in [
+                "cacheExpiresAtMs",
+                "cacheRemainingMs",
+                "cacheObservedAtMs",
+                "cacheTtlMs",
+                "cacheExpirySource",
+            ] {
+                object.remove(field);
+            }
+        }
+        add_cache_expiry(&mut metrics, snapshot.expiry);
+    }
+    metrics
+}
+
+fn proxy_cache_matches(metrics: &Value, snapshot: &SessionCacheExpiry) -> bool {
+    // 禁用代理、更换模型或开始新轮次后，旧代理观察不能覆盖较新的原生缓存记录。
+    if metrics["cacheModel"]
+        .as_str()
+        .is_some_and(|model| !model.is_empty() && model != snapshot.model)
+        || snapshot
+            .turn_id
+            .as_deref()
+            .is_some_and(|id| metrics["turnId"].as_str() != Some(id))
+    {
+        return false;
+    }
+    !(snapshot.turn_id.is_none() || metrics["cacheExpirySource"] == "response")
+        || timestamp(&metrics["cacheObservedAtMs"]).is_none_or(|at| at <= snapshot.completed_at_ms)
+}
+
+fn add_native_cache_expiry(
+    metrics: &mut Value,
+    at: Option<u64>,
+    model: &str,
+    expiry: Option<CacheExpiry>,
+) {
+    if let Some(at) = at {
+        metrics["cacheObservedAtMs"] = json!(at);
+        metrics["cacheModel"] = json!(model);
+    }
+    add_cache_expiry(metrics, expiry);
+}
+
+fn add_cache_expiry(metrics: &mut Value, expiry: Option<CacheExpiry>) {
+    let Some(expiry) = expiry.filter(|expiry| expiry.expires_at_ms <= SAFE_INTEGER) else {
+        return;
+    };
+    let Some(object) = metrics.as_object_mut() else {
+        return;
+    };
+    let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    object.insert("cacheExpiresAtMs".to_owned(), json!(expiry.expires_at_ms));
+    object.insert(
+        "cacheRemainingMs".to_owned(),
+        json!(expiry.expires_at_ms.saturating_sub(now)),
+    );
+    object.insert("cacheObservedAtMs".to_owned(), json!(expiry.observed_at_ms));
+    object.insert("cacheTtlMs".to_owned(), json!(expiry.ttl_ms));
+    object.insert("cacheExpirySource".to_owned(), json!(expiry.source));
+}
 
 fn count(value: &Value) -> Option<u64> {
     value.as_u64().filter(|value| *value <= SAFE_INTEGER)
@@ -138,8 +207,23 @@ pub(super) fn observe_claude(turn: &mut Value, frame: &Value) {
     if input.saturating_add(output) > SAFE_INTEGER {
         return;
     }
+    // 用户要求按原生记录倒计时：同一请求的流式接替及历史重读保留首次时间，不用刷新到达时间续期。
+    let cache_observed = timestamp(&current["cacheObservedAtMs"])
+        .or_else(|| timestamp(&current["observedAtMs"]))
+        .or_else(|| timestamp(&frame["timestampMs"]));
+    let cache_expiry = cache_observed.and_then(|at| {
+        infer_cache_expiry(
+            "anthropic",
+            message["model"].as_str().unwrap_or(""),
+            &Value::Null,
+            raw,
+            at,
+            serde_json::from_value(current["cacheExpiry"].clone()).ok(),
+        )
+    });
     turn["_metricsRequests"][id] = json!({"inputTokens":input,"outputTokens":output,
-        "cachedInputTokens":cached_input,"steps":steps,"observedAtMs":frame["timestampMs"]});
+        "cachedInputTokens":cached_input,"steps":steps,"observedAtMs":frame["timestampMs"],
+        "cacheObservedAtMs":cache_observed,"cacheModel":message["model"],"cacheExpiry":cache_expiry});
 }
 
 pub(super) fn claude(turns: &[Value]) -> Value {
@@ -151,8 +235,18 @@ pub(super) fn claude(turns: &[Value]) -> Value {
     let mut total = 0_u64;
     let mut seen = HashSet::new();
     let mut any_usage = false;
+    let mut latest_cache = None;
     for turn in turns {
         for (id, usage) in turn["_metricsRequests"].as_object().into_iter().flatten() {
+            if let Some(at) = timestamp(&usage["cacheObservedAtMs"])
+                && latest_cache.as_ref().is_none_or(|(old, _, _)| at >= *old)
+            {
+                latest_cache = Some((
+                    at,
+                    serde_json::from_value::<CacheExpiry>(usage["cacheExpiry"].clone()).ok(),
+                    usage["cacheModel"].as_str().unwrap_or(""),
+                ));
+            }
             if seen.insert(id)
                 && let (Some(input), Some(output)) =
                     (count(&usage["inputTokens"]), count(&usage["outputTokens"]))
@@ -194,7 +288,7 @@ pub(super) fn claude(turns: &[Value]) -> Value {
         })
     });
     // 用户确认“步”为模型调用次数，“总”为当前原生会话累计；不把工具数量或子代理汇总混入。
-    summary(
+    let mut metrics = summary(
         "claude-native",
         latest.and_then(|turn| turn["id"].as_str()).unwrap_or(""),
         (any_usage && total <= SAFE_INTEGER).then_some(total),
@@ -206,7 +300,11 @@ pub(super) fn claude(turns: &[Value]) -> Value {
             timestamp(&turn["_metricsFirstTokenObservedAtMs"])?.checked_sub(start)
         }),
         (steps > 0 && cache_known).then_some(cached_input),
-    )
+    );
+    if let Some((at, expiry, model)) = latest_cache {
+        add_native_cache_expiry(&mut metrics, Some(at), model, expiry);
+    }
+    metrics
 }
 
 fn codex_side_time(value: &Value) -> Option<u64> {
@@ -238,8 +336,22 @@ pub(super) fn observe_codex_side(turn: &mut Value, frame: &Value, observed_at: u
     }
     let cached = count(&usage["cachedInputTokens"])
         .or_else(|| count(&turn["_metricsResponses"][response_id]["cachedInputTokens"]));
+    let previous = &turn["_metricsResponses"][response_id];
+    let cache_observed = timestamp(&previous["observedAtMs"]).unwrap_or(observed_at);
+    let model = params["model"]
+        .as_str()
+        .or_else(|| turn["_metricsModel"].as_str())
+        .unwrap_or("");
+    let cache_expiry = infer_cache_expiry(
+        "responses",
+        model,
+        &Value::Null,
+        usage,
+        cache_observed,
+        serde_json::from_value(previous["cacheExpiry"].clone()).ok(),
+    );
     turn["_metricsResponses"][response_id] = json!({"inputTokens":input,"outputTokens":output,
-        "turnTokens":total,"cachedInputTokens":cached,"observedAtMs":observed_at});
+        "turnTokens":total,"cachedInputTokens":cached,"observedAtMs":cache_observed,"cacheModel":model,"cacheExpiry":cache_expiry});
 }
 
 pub(super) fn codex_side(turns: &[Value], first_token: Option<(String, u64)>) -> Value {
@@ -250,8 +362,18 @@ pub(super) fn codex_side(turns: &[Value], first_token: Option<(String, u64)>) ->
     let mut total = 0_u64;
     let mut seen = HashSet::new();
     let mut any_usage = false;
+    let mut latest_cache = None;
     for turn in turns {
         for (id, usage) in turn["_metricsResponses"].as_object().into_iter().flatten() {
+            if let Some(at) = timestamp(&usage["observedAtMs"])
+                && latest_cache.as_ref().is_none_or(|(old, _, _)| at >= *old)
+            {
+                latest_cache = Some((
+                    at,
+                    serde_json::from_value::<CacheExpiry>(usage["cacheExpiry"].clone()).ok(),
+                    usage["cacheModel"].as_str().unwrap_or(""),
+                ));
+            }
             if seen.insert(id)
                 && let Some(tokens) = count(&usage["turnTokens"])
             {
@@ -294,7 +416,7 @@ pub(super) fn codex_side(turns: &[Value], first_token: Option<(String, u64)>) ->
     let first_token = first_token
         .filter(|(turn_id, _)| turn_id == latest_id)
         .and_then(|(_, observed)| start.and_then(|start| observed.checked_sub(start)));
-    summary(
+    let mut metrics = summary(
         "codex-side",
         latest_id,
         (any_usage && total <= SAFE_INTEGER).then_some(total),
@@ -302,11 +424,19 @@ pub(super) fn codex_side(turns: &[Value], first_token: Option<(String, u64)>) ->
         duration,
         first_token,
         (steps > 0 && cache_known).then_some(cached_input),
-    )
+    );
+    if let Some((at, expiry, model)) = latest_cache {
+        add_native_cache_expiry(&mut metrics, Some(at), model, expiry);
+    }
+    metrics
 }
 
 #[derive(Clone, Default)]
 struct CodexMetrics {
+    model: String,
+    cache_request: Value,
+    cache_expiry: Option<CacheExpiry>,
+    cache_observed_at: Option<u64>,
     turn_id: String,
     started: Option<u64>,
     ended: Option<u64>,
@@ -330,6 +460,7 @@ impl CodexMetrics {
             b"\"task_completed\"",
             b"\"task_aborted\"",
             b"\"turn_aborted\"",
+            b"\"turn_context\"",
         ]
         .iter()
         .any(|needle| line.windows(needle.len()).any(|part| part == *needle))
@@ -339,10 +470,27 @@ impl CodexMetrics {
         let Ok(row) = serde_json::from_slice::<Value>(line) else {
             return;
         };
+        let payload = &row["payload"];
+        if row["type"] == "turn_context" {
+            if let Some(model) = payload["model"].as_str() {
+                if self.model != model {
+                    self.cache_expiry = None;
+                    self.cache_observed_at = None;
+                }
+                self.model = model.to_owned();
+                // 保留原生记录明确提供的保留策略；没有记录时按该模型默认值估算。
+                self.cache_request = json!({});
+                for field in ["prompt_cache_options", "prompt_cache_retention"] {
+                    if let Some(value) = payload.get(field) {
+                        self.cache_request[field] = value.clone();
+                    }
+                }
+            }
+            return;
+        }
         if row["type"] != "event_msg" {
             return;
         }
-        let payload = &row["payload"];
         let at = timestamp(&row["timestamp"]);
         match payload["type"].as_str() {
             Some("task_started") => {
@@ -382,6 +530,17 @@ impl CodexMetrics {
                     return;
                 }
                 let last = &info["last_token_usage"];
+                if let Some(at) = at {
+                    self.cache_observed_at = Some(at);
+                    self.cache_expiry = infer_cache_expiry(
+                        "responses",
+                        &self.model,
+                        &self.cache_request,
+                        last,
+                        at,
+                        self.cache_expiry,
+                    );
+                }
                 if !self.turn_id.is_empty()
                     && let (Some(input), Some(output), Some(tokens)) = (
                         count(&last["input_tokens"]),
@@ -418,7 +577,7 @@ impl CodexMetrics {
         let first_token = first_token
             .filter(|(turn_id, _)| turn_id == &self.turn_id)
             .and_then(|(_, observed)| self.started.and_then(|start| observed.checked_sub(start)));
-        summary(
+        let mut metrics = summary(
             "codex-rollout",
             &self.turn_id,
             self.total,
@@ -431,7 +590,14 @@ impl CodexMetrics {
             duration,
             first_token,
             self.cached_input,
-        )
+        );
+        add_native_cache_expiry(
+            &mut metrics,
+            self.cache_observed_at,
+            &self.model,
+            self.cache_expiry,
+        );
+        metrics
     }
 }
 
@@ -448,7 +614,10 @@ pub(super) fn codex(home: &Path, id: &str, first_token: Option<(String, u64)>) -
     let Some(path) = super::context_usage::rollout_path(home, id) else {
         return Value::Null;
     };
-    read_codex_with_first_token(&path, first_token).unwrap_or(Value::Null)
+    with_cache_expiry(
+        read_codex_with_first_token(&path, first_token).unwrap_or(Value::Null),
+        id,
+    )
 }
 
 #[cfg(test)]
@@ -569,6 +738,110 @@ mod tests {
                 "last_token_usage":{"total_tokens":last,"input_tokens":last-20,"output_tokens":20,
                     "cached_input_tokens":(last-20)/2}}}),
         )
+    }
+
+    #[test]
+    fn session_metrics_claude_cache_ttl_comes_from_native_usage_and_replay_does_not_extend_it() {
+        let mut current = turn("cache");
+        let mut row = request("cache-request", 100, 40);
+        row["message"]["model"] = json!("claude-haiku-5-5");
+        row["message"]["usage"]["cache_creation"] = json!({"ephemeral_1h_input_tokens":30});
+        observe_claude(&mut current, &row);
+        let first = claude(&[current.clone()]);
+        assert_eq!(first["cacheExpiresAtMs"], 2000 + 3_600_000);
+        assert_eq!(first["cacheExpirySource"], "response");
+        row["timestampMs"] = json!(100_000);
+        observe_claude(&mut current, &row);
+        let replay = claude(&[current]);
+        assert_eq!(replay["cacheExpiresAtMs"], first["cacheExpiresAtMs"]);
+        assert_eq!(
+            replay["cacheRemainingMs"], 0,
+            "旧记录已过期，不能因读取旧历史重新激活缓存"
+        );
+    }
+
+    #[test]
+    fn session_metrics_old_proxy_observation_cannot_override_another_turn_model_or_new_native_response()
+     {
+        let mut snapshot = SessionCacheExpiry {
+            expiry: None,
+            model: "gpt-6.1-sol".into(),
+            turn_id: Some("turn".into()),
+            completed_at_ms: 1000,
+        };
+        assert!(proxy_cache_matches(
+            &json!({"turnId":"turn","cacheModel":"gpt-6.1-sol"}),
+            &snapshot
+        ));
+        assert!(!proxy_cache_matches(
+            &json!({"turnId":"next","cacheModel":"gpt-6.1-sol"}),
+            &snapshot
+        ));
+        assert!(!proxy_cache_matches(
+            &json!({"turnId":"turn","cacheModel":"claude-haiku-5-5"}),
+            &snapshot
+        ));
+        snapshot.turn_id = None;
+        assert!(!proxy_cache_matches(
+            &json!({"cacheModel":"gpt-6.1-sol","cacheObservedAtMs":2000}),
+            &snapshot
+        ));
+        snapshot.turn_id = Some("turn".into());
+        assert!(!proxy_cache_matches(
+            &json!({"turnId":"turn","cacheModel":"gpt-6.1-sol",
+            "cacheObservedAtMs":2000,"cacheExpirySource":"response"}),
+            &snapshot
+        ));
+    }
+
+    #[test]
+    fn session_metrics_claude_new_unknown_cache_result_does_not_inherit_an_old_models_ttl() {
+        let mut previous = turn("previous");
+        let mut row = request("previous-request", 100, 40);
+        row["message"]["usage"]["cache_creation"] = json!({"ephemeral_1h_input_tokens":30});
+        observe_claude(&mut previous, &row);
+        let mut current = turn("new-model");
+        row["message"]["id"] = json!("new-request");
+        row["message"]["usage"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cache_creation");
+        row["timestampMs"] = json!(3000);
+        observe_claude(&mut current, &row);
+        assert!(claude(&[previous, current])["cacheExpiresAtMs"].is_null());
+    }
+
+    #[test]
+    fn session_metrics_codex_native_model_default_and_request_hint_keep_original_timestamp() {
+        let mut parser = CodexMetrics::default();
+        parser.consume(
+            json!({"type":"turn_context","payload":{"model":"gpt-6.1-sol"}})
+                .to_string()
+                .as_bytes(),
+        );
+        let row = usage(2000, 1400);
+        parser.consume(row.to_string().as_bytes());
+        let at = timestamp(&row["timestamp"]).unwrap();
+        assert_eq!(parser.value()["cacheExpiresAtMs"], at + 1_800_000);
+        parser.consume(row.to_string().as_bytes());
+        assert_eq!(parser.value()["cacheExpiresAtMs"], at + 1_800_000);
+        parser.consume(json!({"type":"turn_context","payload":{"model":"gpt-5.5","prompt_cache_retention":"in_memory"}}).to_string().as_bytes());
+        parser.consume(usage(4000, 1400).to_string().as_bytes());
+        assert_eq!(parser.value()["cacheExpiresAtMs"], at + 300_000);
+        assert_eq!(parser.value()["cacheExpirySource"], "request");
+    }
+
+    #[test]
+    fn session_metrics_codex_side_cache_uses_own_model_and_response_identity() {
+        let mut current = json!({"id":"side-turn","_metricsModel":"gpt-6.1-sol","items":[{"type":"userMessage"}]});
+        let frame = json!({"params":{"responseId":"side-response","usage":{
+            "inputTokens":2048,"cachedInputTokens":1024,"outputTokens":5,"totalTokens":2053}}});
+        observe_codex_side(&mut current, &frame, 1000);
+        observe_codex_side(&mut current, &frame, 100_000);
+        let metrics = codex_side(&[current], None);
+        assert_eq!(metrics["cacheExpiresAtMs"], 1000 + 1_800_000);
+        assert_eq!(metrics["totalTokens"], 2053);
+        assert_eq!(metrics["steps"], 1);
     }
 
     #[test]

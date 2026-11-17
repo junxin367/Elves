@@ -1,6 +1,7 @@
 mod anthropic_images;
 pub mod app_paths;
 pub mod assets;
+pub mod cache_expiry;
 pub mod ccs_import;
 pub mod cli_wrapper;
 pub mod codex_home;

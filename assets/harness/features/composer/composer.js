@@ -723,7 +723,7 @@ export function syncComposerMetrics() {
       if (composerMetricsState !== state || state.controller !== controller || controller.signal.aborted
           || composerMetricsContext()?.key !== state.key
           || result?.ok !== true || result.threadId !== context.payload.threadId || result.backend !== context.payload.backend) return;
-      const value = normalizeComposerMetrics(result.metrics);
+      const value = normalizeComposerMetrics(result.metrics, state.value);
       // 新轮次可能先只返回累计或空统计；这时保留上一轮快照，等本轮速度、步数或 Token 实测值到达再替换。
       if (value && (!composerMetricsHasTurn(state.value) || composerMetricsHasTurn(value))) {
         state.value = value;

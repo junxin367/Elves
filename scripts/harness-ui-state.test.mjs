@@ -14890,7 +14890,7 @@ function composerMetricsHarness({ animate = false, reducedMotion = false } = {})
     };
     return item;
   };
-  const node = { hidden: true, dataset: {}, attributes: {}, children: [],
+  const node = { hidden: true, isConnected: true, dataset: {}, attributes: {}, children: [],
     style: { setProperty: (key, value) => properties.set(key, value) },
     replaceChildren(...children) { this.children = children; },
     setAttribute(key, value) { this.attributes[key] = value; } };
@@ -14965,6 +14965,71 @@ test("Token hover 按当前轮次单行展示实测字段，未返回字段整�
   h.advance(2001); c.syncComposerMetrics();
   h.complete(2, { firstTokenMs: null, durationMs: null, cacheHitRate: null }); await h.flush();
   assert.equal(h.node.title, "");
+});
+
+test("缓存倒计时在总 Token 后显示，满一分钟用分钟，到期隐藏", async () => {
+  const h = composerMetricsHarness(), c = h.context, now = c.Date.now();
+  for (const [remaining, label] of [[55 * 60_000, "缓存 55分"], [12 * 3_600_000, "缓存 720分"],
+    [119_000, "缓存 1分"], [60_000, "缓存 1分"], [59_999, "缓存 60秒"], [59_000, "缓存 59秒"], [1, "缓存 1秒"]]) {
+    assert.equal(c.composerMetricsCacheCountdown({ cacheExpiresAtMs: now + remaining }).label, label);
+  }
+  for (const expiry of [now, now - 1, null, NaN, "120000"])
+    assert.equal(c.composerMetricsCacheCountdown({ cacheExpiresAtMs: expiry }), null);
+  c.syncComposerMetrics(); h.complete(0, { cacheRemainingMs: 59_000, cacheObservedAtMs: 12,
+    cacheExpirySource: "response" }); await h.flush();
+  assert.equal(h.text(), "48tk/s  本轮 20步 1m  总 5m  缓存 59秒");
+  assert.match(h.node.children.at(-1).title, /响应缓存明细估算/);
+  const tick = () => {
+    const id = c.composerMetricsState.cacheTimer, task = h.timers.get(id);
+    h.timers.delete(id); h.advance(task.delay); task.callback();
+  };
+  tick();
+  assert.match(h.text(), /缓存 58秒$/);
+  assert.equal(h.requests.length, 1, "本地倒计时不触发统计请求");
+  h.advance(58_000); tick();
+  assert.equal(h.text(), "48tk/s  本轮 20步 1m  总 5m");
+  assert.equal(c.composerMetricsState.cacheTimer, null);
+});
+
+test("缓存截止时间以本机接收时刻换算，同一观察轮询及存档重读不会续期", async () => {
+  const h = composerMetricsHarness(), c = h.context;
+  c.syncComposerMetrics(); h.complete(0, { cacheRemainingMs: 3_300_000, cacheExpiresAtMs: 1,
+    cacheObservedAtMs: 200, cacheExpirySource: "request" }); await h.flush();
+  const expiry = c.composerMetricsState.value.cacheExpiresAtMs;
+  assert.equal(expiry, c.Date.now() + 3_300_000, "忽略服务端与客户端的绝对时钟差异");
+  assert.equal(Object.hasOwn(c.composerMetricsState.value, "cacheRemainingMs"), false);
+  h.advance(2001); c.syncComposerMetrics();
+  h.complete(1, { cacheRemainingMs: 3_300_000, cacheObservedAtMs: 200,
+    cacheExpirySource: "request" }); await h.flush();
+  assert.equal(c.composerMetricsState.value.cacheExpiresAtMs, expiry);
+  h.advance(3000);
+  assert.equal(c.normalizeComposerMetrics(c.composerMetricsState.value).cacheExpiresAtMs, expiry);
+  h.advance(2001); c.syncComposerMetrics();
+  h.complete(2, { cacheRemainingMs: 3_600_000, cacheObservedAtMs: 300,
+    cacheExpirySource: "response" }); await h.flush();
+  assert.ok(c.composerMetricsState.value.cacheExpiresAtMs > expiry, "新的真实缓存观察允许续期");
+  for (const remaining of [-1, 86_400_001, NaN, Infinity, "300000"])
+    assert.equal(c.normalizeComposerMetrics(h.value({ cacheRemainingMs: remaining })).cacheExpiresAtMs, null);
+});
+
+test("缓存倒计时无总用量时隐藏，切换会话、隐藏页面及离线均清理旧计时器", async () => {
+  for (const stop of [
+    c => { c.document.hidden = true; },
+    c => { c.connected = false; },
+    c => { c.pageLeaving = true; },
+    c => { c.selectedId = "other"; c.thread = { id: "other" }; ++c.selectionVersion; },
+  ]) {
+    const h = composerMetricsHarness(), c = h.context;
+    c.syncComposerMetrics(); h.complete(0, { cacheRemainingMs: 59_000, cacheObservedAtMs: 12 }); await h.flush();
+    const timer = c.composerMetricsState.cacheTimer;
+    assert.ok(h.timers.has(timer));
+    stop(c); c.syncComposerMetrics();
+    assert.equal(h.timers.has(timer), false);
+  }
+  const h = composerMetricsHarness(), c = h.context;
+  c.syncComposerMetrics(); h.complete(0, { totalTokens: null, cacheRemainingMs: 59_000 }); await h.flush();
+  assert.doesNotMatch(h.text(), /缓存/);
+  assert.equal(c.composerMetricsState.cacheTimer, null);
 });
 
 test("Token hover 本轮耗时沿用目标的天时分秒格式", async () => {

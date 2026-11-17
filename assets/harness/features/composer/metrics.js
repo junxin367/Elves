@@ -6,7 +6,7 @@ import { closePopup } from "../../ui/popup.js";
 import { closeComposerMenus } from "../../core/actions.js";
 import { formatDuration } from "../../core/util.js";
 import {
-  creating, nativeConnectionVersion, pageLeaving, selectedId, selectionVersion, session, thread,
+  connected, creating, nativeConnectionVersion, pageLeaving, selectedId, selectionVersion, session, thread,
   turns
 } from "../../core/state.js";
 import { messageVersion } from "../conversation/history-state.js";
@@ -23,14 +23,26 @@ function composerMetricsNumber(value) {
 export function composerMetricsHasTurn(value) {
   return ["tokensPerSecond", "steps", "turnTokens"].some(key => composerMetricsNumber(value?.[key]));
 }
-export function normalizeComposerMetrics(value) {
+export function normalizeComposerMetrics(value, previous = null) {
   if (!value || !["codex-rollout", "codex-side", "claude-native"].includes(value.source)
       || typeof value.turnId !== "string" || value.turnId.length > 120) return null;
   const result = { source: value.source, turnId: value.turnId };
-  for (const key of ["inputTokens", "outputTokens", "turnTokens", "steps", "totalTokens", "durationMs", "tokensPerSecond", "firstTokenMs"])
+  for (const key of ["inputTokens", "outputTokens", "turnTokens", "steps", "totalTokens", "durationMs", "tokensPerSecond", "firstTokenMs", "cacheExpiresAtMs", "cacheObservedAtMs", "cacheTtlMs"])
     result[key] = composerMetricsNumber(value[key])
       && (key === "tokensPerSecond" || Number.isSafeInteger(value[key])) ? value[key] : null;
   result.cacheHitRate = composerMetricsNumber(value.cacheHitRate) && value.cacheHitRate <= 1 ? value.cacheHitRate : null;
+  result.cacheExpirySource = ["response", "request", "model-default"].includes(value.cacheExpirySource) ? value.cacheExpirySource : null;
+  if (Object.hasOwn(value, "cacheRemainingMs")) {
+    // 允许最长 24h 的已知 TTL；接收时折算为本机截止时间，避免手机与服务端时钟偏差，存档仅保留截止时间。
+    result.cacheExpiresAtMs = Number.isSafeInteger(value.cacheRemainingMs)
+      && value.cacheRemainingMs >= 0 && value.cacheRemainingMs <= 86_400_000
+      ? Date.now() + value.cacheRemainingMs : null;
+    // 同一次缓存观察不会因统计轮询或网络延迟重新续期；只有实际的新模型请求才能延长倒计时。
+    if (result.cacheObservedAtMs != null && result.cacheObservedAtMs === previous?.cacheObservedAtMs
+        && result.cacheTtlMs === previous.cacheTtlMs && result.cacheExpirySource === previous.cacheExpirySource
+        && Number.isSafeInteger(previous.cacheExpiresAtMs) && result.cacheExpiresAtMs != null)
+      result.cacheExpiresAtMs = Math.min(result.cacheExpiresAtMs, previous.cacheExpiresAtMs);
+  }
   // 用户要求无数据时不显示；只有原生实际返回的可展示数值才算统计，零值仍是有效数据。
   return composerMetricsHasTurn(result) || composerMetricsNumber(result.totalTokens) ? result : null;
 }
@@ -42,6 +54,17 @@ function composerMetricsCompact(value) {
 function composerMetricsDuration(value) {
   if (!composerMetricsNumber(value)) return "";
   return value < 1000 ? `${value} 毫秒` : `${Number((value / 1000).toFixed(2))} 秒`;
+}
+export function composerMetricsCacheCountdown(value, now = Date.now()) {
+  if (!Number.isSafeInteger(value?.cacheExpiresAtMs) || value.cacheExpiresAtMs < 0) return null;
+  const remaining = value.cacheExpiresAtMs - now;
+  if (remaining <= 0) return null;
+  const seconds = Math.ceil(remaining / 1000), minutes = remaining >= 60_000;
+  // 用户要求“总”之后显示缓存倒计时：60 秒起只显示分钟，不足 60 秒才显示秒，到期隐藏。
+  const unit = minutes ? "分" : "秒", amount = minutes ? Math.floor(remaining / 60_000) : seconds;
+  return { seconds, unit, amount, label: `缓存 ${amount}${unit}`,
+    // 分钟展示只在下一次分钟变化时重绘，秒展示按秒更新；不能通过增加统计请求来驱动倒计时。
+    nextUpdateMs: Math.max(1, minutes ? remaining - amount * 60_000 + 1 : remaining - (seconds - 1) * 1000) };
 }
 function composerMetricNumber(state, key, value, format = String) {
   state.metricNumbers ||= new Map();
@@ -147,6 +170,7 @@ export function composerMetricsContext() {
 export function resetComposerMetrics() {
   if (composerMetricsState) {
     clearTimeout(composerMetricsState.timer);
+    clearTimeout(composerMetricsState.cacheTimer);
     composerMetricsState.controller?.abort();
     for (const record of composerMetricsState.metricNumbers?.values() || []) record.dispose?.();
   }
@@ -170,6 +194,7 @@ export function composerMetricsLatestTurn(state) {
 }
 export function renderComposerMetrics() {
   const node = $("#session-metrics"), state = composerMetricsState;
+  if (state) { clearTimeout(state.cacheTimer); state.cacheTimer = null; }
   if (!node) return;
   const value = state?.value;
   node.hidden = !value;
@@ -184,9 +209,11 @@ export function renderComposerMetrics() {
   if (composerMetricsNumber(metrics.turnTokens)) round.push(composerMetricsCompact(metrics.turnTokens));
   if (round.length) labels.push(`本轮 ${round.join(" ")}`);
   if (composerMetricsNumber(value.totalTokens)) labels.push(`总 ${composerMetricsCompact(value.totalTokens)}`);
+  const cache = composerMetricsNumber(value.totalTokens) ? composerMetricsCacheCountdown(value) : null;
+  if (cache) labels.push(cache.label);
   node.hidden = !labels.length;
   if (node.hidden) return;
-  const signature = JSON.stringify(labels);
+  const signature = JSON.stringify([labels, cache ? value.cacheExpirySource : null]);
   if (node.dataset.metrics !== signature) {
     node.dataset.metrics = signature;
     const groups = [], used = new Set();
@@ -209,6 +236,14 @@ export function renderComposerMetrics() {
       const group = element("span", "composer-metric-group", "总 ");
       group.append(number("totalTokens", value.totalTokens, composerMetricsCompact)); groups.push(group);
     }
+    if (cache) {
+      const group = element("span", "composer-metric-group", "缓存 ");
+      const basis = { response: "响应缓存明细", request: "请求缓存配置", "model-default": "模型默认规则" }[value.cacheExpirySource] || "已有缓存证据";
+      group.title = `缓存剩余时间按${basis}估算，实际可用性由上游决定。`;
+      group.setAttribute("aria-label", `${cache.label}，按${basis}估算`);
+      // 切换分/秒时使用独立数字记录，避免 1 分变为 59 秒被当作缓存时间增加。
+      group.append(number(`cache-${cache.unit}`, cache.amount), element("span", "", cache.unit)); groups.push(group);
+    }
     for (const [key, record] of state.metricNumbers || []) {
       if (!used.has(key)) { record.dispose?.(); state.metricNumbers.delete(key); }
     }
@@ -225,6 +260,12 @@ export function renderComposerMetrics() {
   node.setAttribute("aria-label", [labels.join("，"), description].filter(Boolean).join("。"));
   composerTooltips?.update?.(node, description);
   fitComposerMetrics();
+  if (connected && cache?.nextUpdateMs) {
+    state.cacheTimer = setTimeout(() => {
+      if (connected && composerMetricsState === state && composerMetricsContext()?.key === state.key && node.isConnected)
+        renderComposerMetrics();
+    }, cache.nextUpdateMs);
+  }
 }
 export function tokenCount(value) { return value >= 1000 ? `${Number((value / 1000).toFixed(1))}k` : String(Math.round(value)); }
 export function contextUsage(info) {

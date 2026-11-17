@@ -1,4 +1,4 @@
-//! Prompt-cache lease inference used only to choose the local compaction model.
+//! Prompt-cache lease inference for local compaction and session countdowns.
 //!
 //! Providers do not expose an absolute cache expiry. We therefore keep a
 //! bounded, in-memory lease derived from trustworthy usage evidence. Restarting
@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
+use crate::cache_expiry::{
+    SessionCacheExpiry, infer_cache_expiry_with_hint, merge_cache_usage, request_ttl,
+};
 use crate::request_headers::RequestContext;
 use crate::settings::RelayProfile;
 
@@ -320,6 +323,36 @@ fn leases() -> &'static Mutex<CacheLeaseStore> {
     LEASES.get_or_init(|| Mutex::new(CacheLeaseStore::default()))
 }
 
+#[derive(Clone)]
+struct CountdownObservation {
+    observation: u64,
+    snapshot: SessionCacheExpiry,
+}
+
+fn countdowns() -> &'static Mutex<HashMap<CacheLeaseKey, CountdownObservation>> {
+    static COUNTDOWNS: OnceLock<Mutex<HashMap<CacheLeaseKey, CountdownObservation>>> =
+        OnceLock::new();
+    COUNTDOWNS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn session_expiry(session_identity: &str) -> Option<SessionCacheExpiry> {
+    let session_identity = session_identity.trim();
+    if session_identity.is_empty() {
+        return None;
+    }
+    let store = countdowns().lock().ok()?;
+    // 用户要求缓存读写证据、请求配置、模型默认值依次兜底；只读最新请求的结果，未知新结果不能沿用旧模型的倒计时。
+    Some(
+        store
+            .iter()
+            .filter(|(key, _)| key.session_identity == session_identity)
+            .max_by_key(|(_, record)| record.observation)?
+            .1
+            .snapshot
+            .clone(),
+    )
+}
+
 pub(crate) fn lease_decision(
     relay: &RelayProfile,
     protocol: CacheProtocol,
@@ -359,6 +392,11 @@ pub(crate) struct CacheResponseObserver {
     terminal_success: bool,
     terminal_failure: bool,
     evidence: UsageEvidence,
+    countdown_key: CacheLeaseKey,
+    countdown_request_ttl: Option<Option<u64>>,
+    countdown_usage: Value,
+    countdown_model: String,
+    countdown_turn_id: Option<String>,
     pending: Vec<u8>,
     sse_scan_from: usize,
 }
@@ -377,15 +415,48 @@ impl CacheResponseObserver {
         if crate::layered_compaction::is_any_compaction_request(source_request) {
             return None;
         }
+        let key = cache_lease_key(
+            relay,
+            protocol,
+            endpoint,
+            source_request,
+            wire_request,
+            request_context,
+        )?;
+        let mut countdown_key = key.clone();
+        // WebSocket 连接头可能仍属于主会话：原生请求内的会话 ID 优先，普通自定义缓存路由键不能覆盖真实 thread-id。
+        let native_session = first_non_empty_string(
+            source_request,
+            &["/metadata/session_id", "/metadata/thread_id"],
+        )
+        .or_else(|| {
+            source_request["prompt_cache_key"]
+                .as_str()
+                .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| request_context.log_thread_id().map(ToOwned::to_owned));
+        if let Some(id) = native_session {
+            countdown_key.session_identity = id;
+        }
+        let countdown_model = source_request["model"]
+            .as_str()
+            .unwrap_or(&key.model)
+            .to_owned();
+        let countdown_turn_id = source_request
+            .pointer("/client_metadata/x-codex-turn-metadata")
+            .and_then(Value::as_str)
+            .and_then(|value| serde_json::from_str::<Value>(value).ok())
+            .and_then(|value| value["turn_id"].as_str().map(ToOwned::to_owned))
+            .or_else(|| first_non_empty_string(source_request, &["/metadata/turn_id"]))
+            .or_else(|| request_context.turn_id());
         Some(Self {
-            key: cache_lease_key(
-                relay,
-                protocol,
-                endpoint,
-                source_request,
-                wire_request,
-                request_context,
-            )?,
+            key,
+            countdown_key,
+            countdown_request_ttl: request_ttl(wire_request),
+            countdown_usage: Value::Null,
+            countdown_model,
+            countdown_turn_id,
             protocol,
             request_ttl_hint: request_cache_ttl_hint(wire_request),
             started_at,
@@ -420,6 +491,7 @@ impl CacheResponseObserver {
 
     pub(crate) fn observe_json_event(&mut self, payload: &Value) {
         observe_usage_candidates(&mut self.evidence, payload);
+        self.observe_countdown_usage(payload);
         let event_type = payload.get("type").and_then(Value::as_str);
         self.terminal_failure |= response_has_upstream_error(payload);
         self.terminal_success |= matches!(
@@ -436,10 +508,52 @@ impl CacheResponseObserver {
             self.consume_sse_blocks(true);
         } else if let Ok(payload) = serde_json::from_slice::<Value>(&self.pending) {
             observe_usage_candidates(&mut self.evidence, &payload);
+            self.observe_countdown_usage(&payload);
             self.terminal_success = non_stream_response_succeeded(&payload);
         }
         if !self.terminal_success || self.terminal_failure {
             return;
+        }
+        if let Ok(mut store) = countdowns().lock()
+            && store
+                .get(&self.countdown_key)
+                .is_none_or(|old| old.observation <= self.observation)
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let started_at = now.saturating_sub(self.started_at.elapsed().as_millis() as u64);
+            let expiry = infer_cache_expiry_with_hint(
+                self.protocol.as_str(),
+                &self.key.model,
+                self.countdown_request_ttl,
+                &self.countdown_usage,
+                started_at,
+                store
+                    .get(&self.countdown_key)
+                    .and_then(|old| old.snapshot.expiry),
+            );
+            store.insert(
+                self.countdown_key.clone(),
+                CountdownObservation {
+                    observation: self.observation,
+                    snapshot: SessionCacheExpiry {
+                        expiry,
+                        model: self.countdown_model,
+                        turn_id: self.countdown_turn_id,
+                        completed_at_ms: now,
+                    },
+                },
+            );
+            if store.len() > MAX_CACHE_LEASES
+                && let Some(oldest) = store
+                    .iter()
+                    .min_by_key(|(_, value)| value.observation)
+                    .map(|(key, _)| key.clone())
+            {
+                store.remove(&oldest);
+            }
         }
         let observed_ttl = leases().lock().ok().and_then(|mut store| {
             store.observe(
@@ -464,6 +578,20 @@ impl CacheResponseObserver {
                     "cacheCreation1hTokens": self.evidence.cache_creation_1h_tokens,
                 }),
             );
+        }
+    }
+
+    fn observe_countdown_usage(&mut self, payload: &Value) {
+        for usage in [
+            payload.get("usage"),
+            payload.pointer("/response/usage"),
+            payload.pointer("/message/usage"),
+            payload.pointer("/delta/usage"),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            merge_cache_usage(&mut self.countdown_usage, usage);
         }
     }
 
@@ -790,6 +918,108 @@ mod tests {
             window_identity: String::new(),
             prefix_sha256: suffix.to_string(),
         }
+    }
+
+    #[test]
+    fn countdown_uses_real_thread_identity_and_reading_does_not_renew_it() {
+        let relay = RelayProfile {
+            id: "countdown-relay".into(),
+            ..RelayProfile::default()
+        };
+        let request = json!({"model":"gpt-6.1-sol","prompt_cache_key":"another-cache-key",
+            "prompt_cache_options":{"ttl":"12h"}});
+        let context = RequestContext::from_http_request(
+            b"POST /v1/responses HTTP/1.1\r\nthread-id: countdown-native-session\r\n\r\n",
+        );
+        let mut observer = CacheResponseObserver::new(
+            &relay,
+            CacheProtocol::Responses,
+            "https://example.test/v1/responses",
+            &request,
+            &request,
+            &context,
+            false,
+            Instant::now(),
+        )
+        .unwrap();
+        observer.observe_bytes(br#"{"usage":{"input_tokens_details":{"cache_write_tokens_details":{"ttl_12h_tokens":2048}}}}"#);
+        observer.finish();
+        let expiry = session_expiry("countdown-native-session")
+            .unwrap()
+            .expiry
+            .unwrap();
+        assert_eq!(expiry.ttl_ms, 12 * 60 * 60 * 1000);
+        assert_eq!(
+            session_expiry("countdown-native-session")
+                .unwrap()
+                .expiry
+                .unwrap(),
+            expiry
+        );
+        assert!(session_expiry("another-cache-key").is_none());
+    }
+
+    #[test]
+    fn countdown_latest_unknown_model_hides_previous_provider_window() {
+        let relay = RelayProfile {
+            id: "countdown-model-switch".into(),
+            ..RelayProfile::default()
+        };
+        for model in ["gpt-6.1-sol", "unknown-model"] {
+            let request =
+                json!({"model":model,"prompt_cache_key":"countdown-model-switch-session"});
+            let mut observer = CacheResponseObserver::new(
+                &relay,
+                CacheProtocol::Responses,
+                "https://example.test/v1/responses",
+                &request,
+                &request,
+                &RequestContext::default(),
+                false,
+                Instant::now(),
+            )
+            .unwrap();
+            observer.observe_bytes(br#"{"usage":{"input_tokens_details":{"cached_tokens":2048}}}"#);
+            observer.finish();
+        }
+        assert!(
+            session_expiry("countdown-model-switch-session")
+                .unwrap()
+                .expiry
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn countdown_side_request_does_not_use_stale_parent_connection_headers() {
+        let relay = RelayProfile {
+            id: "countdown-side".into(),
+            ..RelayProfile::default()
+        };
+        let id = uuid::Uuid::new_v4().to_string();
+        let request = json!({"model":"gpt-6.1-sol","prompt_cache_key":id,
+            "client_metadata":{"x-codex-turn-metadata":"{\"turn_id\":\"side-turn\"}"}});
+        let context = RequestContext::from_http_request(
+            b"POST /v1/responses HTTP/1.1\r\nthread-id: countdown-parent-connection\r\n\r\n",
+        );
+        let mut observer = CacheResponseObserver::new(
+            &relay,
+            CacheProtocol::Responses,
+            "https://example.test/v1/responses",
+            &request,
+            &request,
+            &context,
+            false,
+            Instant::now(),
+        )
+        .unwrap();
+        observer.observe_bytes(br#"{"usage":{"input_tokens_details":{"cached_tokens":2048}}}"#);
+        observer.finish();
+        assert_eq!(
+            session_expiry(&id).unwrap().turn_id.as_deref(),
+            Some("side-turn")
+        );
+        assert!(session_expiry("countdown-parent-connection").is_none());
     }
 
     #[test]
