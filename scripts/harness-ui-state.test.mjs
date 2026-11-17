@@ -14634,7 +14634,7 @@ test("会话底栏统计按步数在前展示，百万与千单位一致，未�
 test("Token hover 按当前轮次单行展示实测字段，未返回字段整项隐藏", async () => {
   const h = composerMetricsHarness(), c = h.context;
   c.syncComposerMetrics(); h.complete(); await h.flush();
-  assert.equal(h.node.title, "首 Token 时间 1.24 秒 · 本轮耗时 18.62 秒 · 缓存命中率 96.8%");
+  assert.equal(h.node.title, "首 Token 时间 1.24 秒 · 本轮耗时 18s · 缓存命中率 96.8%");
   assert.doesNotMatch(h.node.title, /输入：|输出：|模型调用|会话累计/);
   h.advance(2001); c.syncComposerMetrics();
   h.complete(1, { firstTokenMs: 1, durationMs: null, cacheHitRate: null }); await h.flush();
@@ -14642,6 +14642,22 @@ test("Token hover 按当前轮次单行展示实测字段，未返回字段整�
   h.advance(2001); c.syncComposerMetrics();
   h.complete(2, { firstTokenMs: null, durationMs: null, cacheHitRate: null }); await h.flush();
   assert.equal(h.node.title, "");
+});
+
+test("Token hover 本轮耗时沿用目标的天时分秒格式", async () => {
+  const h = composerMetricsHarness(), c = h.context;
+  const cases = [
+    [5876390, "1h37m56s"],
+    [0, "0s"], [999, "0s"], [1000, "1s"], [18620, "18s"],
+    [59999, "59s"], [60000, "1m"], [61000, "1m1s"],
+    [3599999, "59m59s"], [3600000, "1h0m"],
+    [86400000, "1d0h0m"], [90061000, "1d1h1m1s"],
+  ];
+  for (const [index, [durationMs, expected]] of cases.entries()) {
+    h.advance(2001); c.syncComposerMetrics();
+    h.complete(index, { durationMs }); await h.flush();
+    assert.equal(h.node.title, `首 Token 时间 1.24 秒 · 本轮耗时 ${expected} · 缓存命中率 96.8%`);
+  }
 });
 
 test("侧边会话按自身身份读取 Token 统计，主会话迟到回执不能覆盖", async () => {
@@ -14657,7 +14673,7 @@ test("侧边会话按自身身份读取 Token 统计，主会话迟到回执不�
   h.complete(1, { source: "codex-side", turnId: "side-turn", steps: 2, turnTokens: 400, totalTokens: 400,
     tokensPerSecond: 25, firstTokenMs: 1000, durationMs: 4000, cacheHitRate: 0.4 }); await h.flush();
   assert.equal(h.text(), "25tk/s  本轮 2步 400  总 400");
-  assert.equal(h.node.title, "首 Token 时间 1 秒 · 本轮耗时 4 秒 · 缓存命中率 40%");
+  assert.equal(h.node.title, "首 Token 时间 1 秒 · 本轮耗时 4s · 缓存命中率 40%");
 });
 
 test("会话底栏统计重复输入不增加读取，后台优先级且与发送状态无依赖", async () => {
@@ -14715,7 +14731,7 @@ test("会话底栏统计新轮次保留上一轮数据，拒绝错会话响应�
   await h.flush();
   assert.equal(c.composerMetricsState.value.turnId, "next");
   assert.equal(h.text(), "100tk/s  本轮 1步 1.3k  总 5m");
-  assert.equal(h.node.title, "首 Token 时间 1.24 秒 · 本轮耗时 18.62 秒 · 缓存命中率 96.8%");
+  assert.equal(h.node.title, "首 Token 时间 1.24 秒 · 本轮耗时 18s · 缓存命中率 96.8%");
 });
 
 test("会话底栏统计空数据保持隐藏，部分数据仅展示已知项且保留真实零值", async () => {

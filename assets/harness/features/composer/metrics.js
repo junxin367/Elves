@@ -4,6 +4,7 @@ import { $, element } from "../../ui/dom.js";
 import { composerTooltips } from "../../ui/tooltip.js";
 import { closePopup } from "../../ui/popup.js";
 import { closeComposerMenus } from "../../core/actions.js";
+import { formatDuration } from "../../core/util.js";
 import {
   creating, nativeConnectionVersion, pageLeaving, selectedId, selectionVersion, session, thread,
   turns
@@ -216,7 +217,7 @@ export function renderComposerMetrics() {
   // 用户确认 hover 只保留当前轮次的一行实测摘要；未返回字段整项省略，三项均缺失或等待新轮次统计时不显示。
   const details = [];
   if (sameTurn && composerMetricsNumber(metrics?.firstTokenMs)) details.push(`首 Token 时间 ${composerMetricsDuration(metrics.firstTokenMs)}`);
-  if (sameTurn && composerMetricsNumber(metrics?.durationMs)) details.push(`本轮耗时 ${composerMetricsDuration(metrics.durationMs)}`);
+  if (sameTurn && composerMetricsNumber(metrics?.durationMs)) details.push(`本轮耗时 ${formatDuration(metrics.durationMs / 1000)}`);
   if (sameTurn && composerMetricsNumber(metrics?.cacheHitRate)) details.push(`缓存命中率 ${Number((metrics.cacheHitRate * 100).toFixed(1))}%`);
   const description = details.join(" · ");
   // 复用编辑区现有主题提示组件，不再创建一套 hover 配色或监听器。

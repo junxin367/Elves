@@ -2,6 +2,7 @@
 
 import { $ } from "../../ui/dom.js";
 import { notice } from "../../ui/notice.js";
+import { formatDuration } from "../../core/util.js";
 import { connected, pageLeaving, selectedId, session, thread } from "../../core/state.js";
 
 let goalEditorBaseViewport = {
@@ -36,17 +37,7 @@ function formatGoalTokens(value) {
   return new Intl.NumberFormat("zh-CN").format(Math.floor(value));
 }
 function formatGoalDuration(seconds) {
-  if (!Number.isFinite(seconds) || seconds < 0) return null;
-  let remaining = Math.floor(seconds);
-  const days = Math.floor(remaining / 86400); remaining %= 86400;
-  const hours = Math.floor(remaining / 3600); remaining %= 3600;
-  const minutes = Math.floor(remaining / 60); remaining %= 60;
-  const parts = [];
-  if (days) parts.push(`${days}d`);
-  if (hours || days) parts.push(`${hours}h`);
-  if (minutes || hours || days) parts.push(`${minutes}m`);
-  if (remaining || !parts.length) parts.push(`${remaining}s`);
-  return parts.join("");
+  return formatDuration(seconds);
 }
 let goalLiveTimer = null;
 function goalDurationSeconds(goal, now = Date.now()) {

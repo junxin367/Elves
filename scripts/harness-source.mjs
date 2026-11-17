@@ -86,6 +86,7 @@ export async function loadHarnessAppSource(root = defaultRoot) {
     const missing = name => !Object.hasOwn(context, name) && new RegExp(`\\b${name}\\(`).test(code);
     const definitions = [];
     if (missing("localAppearance")) definitions.push(section("function localAppearance(", "function legacySharedAppearance("));
+    if (missing("formatDuration")) definitions.push(section("function formatDuration("));
     for (const [setter, name] of setters) if (missing(setter)) definitions.push(`function ${setter}(value) { return ${name} = value; }`);
     if (missing("closeAppMenus"))
       definitions.push('function closeAppMenus() { if (typeof closeComposerMenus === "function") closeComposerMenus(); }');
