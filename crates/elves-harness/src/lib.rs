@@ -6545,7 +6545,7 @@ mod tests {
         authorization
     }
 
-    async fn harness_fixture_with_store(
+    async fn harness_authorization_fixture(
         saved: Option<Value>,
     ) -> (tempfile::TempDir, HarnessAuthorization) {
         let (directory, authorization) = service_dispatch_fixture().await;
@@ -6577,6 +6577,13 @@ mod tests {
             .devices
             .push(authorization.device.clone());
         let authorization = controller.authorization(authorization.device.clone(), Some("send"));
+        (directory, authorization)
+    }
+
+    async fn harness_fixture_with_store(
+        saved: Option<Value>,
+    ) -> (tempfile::TempDir, HarnessAuthorization) {
+        let (directory, authorization) = harness_authorization_fixture(saved).await;
         let script = directory.path().join("engine.cjs");
         std::fs::write(&script,r#"
 const fs=require('node:fs'),readline=require('node:readline'),crypto=require('node:crypto');
@@ -6724,6 +6731,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
  case 'test/seedHistory':
    if(p.finish){finish(p.threadId,p.status||'completed');break;}
    for(const frame of p.events||[])output(frame);
+   for(const context of p.contexts||[])if(t?.path)fs.appendFileSync(t.path,JSON.stringify({type:'turn_context',payload:context})+'\n');
    if(!p.turns)break;
    t.turns=p.turns;t.historyCursorLoop=p.cursorLoop===true;t.foreignHistoryTurn=p.foreignTurn===true;
    t.status={type:t.turns.some(turn=>turn.status==='inProgress')?'active':'idle'};
@@ -6743,6 +6751,8 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
      fs.appendFileSync(__dirname+'/model-inputs.jsonl',JSON.stringify({threadId:p.threadId,...context})+'\n');
    }
    const turn={id:crypto.randomUUID(),status:'inProgress',items:[{id:crypto.randomUUID(),type:'userMessage',content:p.input,clientUserMessageId:p.clientUserMessageId}]};
+   if(t.path)fs.appendFileSync(t.path,JSON.stringify({type:'turn_context',payload:{turn_id:turn.id,
+     collaboration_mode:p.collaborationMode||{mode:'default',settings:{developer_instructions:null}}}})+'\n');
    t.turns.push(turn);t.status={type:'active'};logTurn(t,'task_started',turn);
    event('turn/started',{threadId:p.threadId,turn});result={turn};
    const prompt=p.input.find(i=>i.type==='text')?.text||'';
@@ -10752,6 +10762,13 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
             .await
             .unwrap();
         let parent = main["threadId"].as_str().unwrap();
+        controller
+            .harness
+            .seed_test_history(json!({"threadId":parent,"contexts":[{
+                "turn_id":main["turnId"],"collaboration_mode":{"mode":"plan",
+                    "settings":{"developer_instructions":null}}}]}))
+            .await
+            .unwrap();
         let created = controller
             .call_authorized(
                 "createSideThread",
@@ -10776,6 +10793,14 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
         assert_eq!(fork["params"]["model"], "parent-selected");
         assert_eq!(fork["params"]["config"]["model_reasoning_effort"], "xhigh");
         assert_eq!(fork["params"]["config"]["thread_unload_delay_secs"], 0);
+        assert_eq!(fork["params"]["config"]["features.goals"], false);
+        assert!(
+            calls
+                .iter()
+                .filter(|call| call["method"] == "thread/start")
+                .all(|call| call["params"]["config"].get("features.goals").is_none()),
+            "临时侧边的目标覆盖不能写入主会话"
+        );
         assert_eq!(fork["params"]["approvalPolicy"], "on-request");
         assert_eq!(fork["params"]["approvalsReviewer"], "auto_review");
         assert_eq!(fork["params"]["sandbox"], "workspace-write");
@@ -10792,10 +10817,17 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
             .await
             .unwrap();
         controller
+            .harness
+            .seed_test_history(json!({"threadId":parent,"contexts":[{
+                "turn_id":main["turnId"],"collaboration_mode":{"mode":"default",
+                    "settings":{"developer_instructions":null}}}]}))
+            .await
+            .unwrap();
+        controller
             .call_authorized(
                 "send",
                 json!({"threadId":id,"prompt":"wait first side","clientUserMessageId":"inherited-permissions",
-                    "permissionMode":"full-access"}),
+                    "permissionMode":"full-access","collaborationMode":{"mode":"default"}}),
                 &authorization,
             )
             .await
@@ -10829,6 +10861,12 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
             first_turn["params"]["sandboxPolicy"]["type"],
             "workspaceWrite"
         );
+        assert_eq!(
+            first_turn["params"]["collaborationMode"],
+            json!({"mode":"plan","settings":{"model":"parent-selected",
+                "reasoning_effort":"xhigh","developer_instructions":null}}),
+            "父模式后续变化及客户端覆盖不能改变已有侧边的 Plan 模式"
+        );
         let second_turn = calls
             .iter()
             .find(|call| call["method"] == "turn/start" && call["params"]["threadId"] == second_id)
@@ -10836,6 +10874,11 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
         assert_eq!(second["thread"]["model"], "second-selected");
         assert_eq!(second["thread"]["reasoningEffort"], "low");
         assert_eq!(second_turn["params"]["approvalPolicy"], "never");
+        assert_eq!(
+            second_turn["params"]["collaborationMode"],
+            json!({"mode":"default","settings":{"model":"second-selected",
+                "reasoning_effort":"low","developer_instructions":null}})
+        );
         assert_eq!(
             second_turn["params"]["sandboxPolicy"]["type"],
             "dangerFullAccess"
@@ -10857,6 +10900,96 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
                 .unwrap()["thread"]["permissionMode"],
             "guardian-approvals",
             "父会话后续改变权限不能覆盖已有侧边"
+        );
+        controller.harness.release().await;
+    }
+
+    #[tokio::test]
+    async fn harness_service_side_mode_uses_retained_history_and_rejects_missing_context() {
+        let (directory, authorization) = harness_fixture().await;
+        let controller = &authorization.controller;
+        let main = controller
+            .call_authorized(
+                "create",
+                json!({"projectId":"project-a","prompt":"wait mode source"}),
+                &authorization,
+            )
+            .await
+            .unwrap();
+        let parent = main["threadId"].as_str().unwrap();
+        let turn_id = main["turnId"].as_str().unwrap();
+        controller
+            .harness
+            .seed_test_history(json!({"threadId":parent,"contexts":[
+                {"turn_id":turn_id,"collaboration_mode":{"mode":"plan",
+                    "settings":{"developer_instructions":"mode-fixture"}}},
+                {"turn_id":"reverted-turn","collaboration_mode":{"mode":"default"}}
+            ],"turns":[
+                {"id":turn_id,"status":"completed","items":[]},
+                {"id":"standalone-compaction","status":"completed",
+                    "items":[{"id":"compact","type":"contextCompaction"}]}
+            ]}))
+            .await
+            .unwrap();
+        let side = controller
+            .call_authorized(
+                "createSideThread",
+                json!({"threadId":parent}),
+                &authorization,
+            )
+            .await
+            .unwrap();
+        let id = side["threadId"].as_str().unwrap();
+        controller
+            .call_authorized(
+                "send",
+                json!({"threadId":id,"prompt":"wait inherited mode",
+                    "clientUserMessageId":"retained-mode","model":"changed-side-model",
+                    "reasoningEffort":"low"}),
+                &authorization,
+            )
+            .await
+            .unwrap();
+        let calls = harness_engine_requests(directory.path());
+        let start = calls
+            .iter()
+            .find(|call| call["method"] == "turn/start" && call["params"]["threadId"] == id)
+            .unwrap();
+        assert_eq!(
+            start["params"]["collaborationMode"],
+            json!({"mode":"plan","settings":{"model":"changed-side-model",
+                "reasoning_effort":"low","developer_instructions":"mode-fixture"}}),
+            "跳过独立压缩和已回退轮次，保留模式指令并使用侧边当前模型"
+        );
+        for mode in [Value::Null, json!({"mode":"unsupported"})] {
+            let contexts = if mode.is_null() {
+                json!([])
+            } else {
+                json!([{"turn_id":"missing-context","collaboration_mode":mode}])
+            };
+            controller
+                .harness
+                .seed_test_history(json!({"threadId":parent,"contexts":contexts,
+                    "turns":[{"id":"missing-context","status":"completed","items":[]}]}))
+                .await
+                .unwrap();
+            let failure = controller
+                .call_authorized(
+                    "createSideThread",
+                    json!({"threadId":parent}),
+                    &authorization,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(failure.downcast_ref::<ApiError>().unwrap().code, 503);
+        }
+        assert_eq!(
+            harness_engine_requests(directory.path())
+                .iter()
+                .filter(|call| call["method"] == "thread/fork")
+                .count(),
+            1,
+            "无法确认模式时必须在创建临时分支前失败"
         );
         controller.harness.release().await;
     }
@@ -11366,6 +11499,12 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
             );
             assert!(frames[expected - 1]["params"].get("model").is_none());
             assert!(frames[expected - 1]["params"].get("effort").is_none());
+            assert_eq!(
+                frames[expected - 1]["params"]["collaborationMode"],
+                json!({"mode":"default","settings":{"model":"gpt-6.1-sol",
+                    "reasoning_effort":"high","developer_instructions":null}}),
+                "排队续发也必须显式保留侧边模式和自身模型、深度"
+            );
         }
         assert!(
             !harness_engine_requests(directory.path())
@@ -12127,13 +12266,30 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
         controller.harness.release().await;
     }
 
-    #[tokio::test]
+    #[test]
     #[ignore = "显式提供隔离原生引擎后验收服务侧边会话"]
-    async fn harness_service_side_real_app_server_lifecycle() {
+    fn harness_service_side_real_app_server_lifecycle() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(check_service_side_real_app_server_lifecycle())
+        }));
+        // 断言、原生进程及模拟上游关闭均在验收主体完成；管道的阻塞读取不能让测试运行时无限等待。
+        runtime.shutdown_timeout(Duration::from_secs(3));
+        if let Err(failure) = result {
+            std::panic::resume_unwind(failure);
+        }
+    }
+
+    async fn check_service_side_real_app_server_lifecycle() {
         let executable = std::env::var_os("CODEX_ELVES_SERVICE_CHECK_EXE").unwrap();
-        let (directory, authorization) = harness_fixture().await;
+        // 原生验收直接安装指定引擎，不先创建随后被覆盖且未消费输出的模拟子进程。
+        let (directory, authorization) = harness_authorization_fixture(None).await;
         let controller = &authorization.controller;
         controller.harness.release().await;
+        eprintln!("原生侧边验收：准备隔离配置");
         let home = directory.path().join("side-codex-home");
         std::fs::create_dir_all(&home).unwrap();
         struct SettingsGuard(Option<PathBuf>);
@@ -12181,9 +12337,10 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
         std::fs::write(home.join("config.toml"),format!(
             "model=\"gpt-6-astra\"\nmodel_provider=\"side-test\"\napproval_policy=\"never\"\nsandbox_mode=\"read-only\"\n[model_providers.side-test]\nname=\"Isolated side test\"\nbase_url=\"http://127.0.0.1:{port}/v1\"\nwire_api=\"responses\"\nrequires_openai_auth=false\nsupports_websockets=false\n"
         )).unwrap();
+        eprintln!("原生侧边验收：启动独立 app-server");
         let mut command = tokio::process::Command::new(executable);
         command
-            .args(["app-server", "--stdio"])
+            .args(["app-server"])
             .env("CODEX_HOME", &home)
             .current_dir(directory.path())
             .stdin(std::process::Stdio::piped())
@@ -12199,6 +12356,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
             )
             .await;
         controller.harness.prepare().await.unwrap();
+        eprintln!("原生侧边验收：开始主会话和侧边轮次");
         async fn completed(auth: &HarnessAuthorization, id: &str) -> Value {
             tokio::time::timeout(Duration::from_secs(20), async {
                 loop {
@@ -12228,6 +12386,17 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
             .unwrap();
         let parent = main["threadId"].as_str().unwrap();
         completed(&authorization, parent).await;
+        controller
+            .harness
+            .start_test_turn(
+                json!({"threadId":parent,"input":[{"type":"text","text":"PARENT_PLAN_MODE"}],
+                    "collaborationMode":{"mode":"plan","settings":{"model":"gpt-6-astra",
+                        "reasoning_effort":"low","developer_instructions":null}}}),
+                &authorization,
+            )
+            .await
+            .unwrap();
+        completed(&authorization, parent).await;
         let created = controller
             .call_authorized(
                 "createSideThread",
@@ -12246,6 +12415,58 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
             let input = request["input"].to_string();
             input.contains("SIDE_NATIVE_INPUT") && input.contains("PARENT_NATIVE_CONTEXT")
         }));
+        fn effective_tools(request: &Value) -> String {
+            if request["tools"].is_array() {
+                return request["tools"].to_string();
+            }
+            request["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|item| {
+                    item["type"] == "additional_tools"
+                        && item["tools"].as_array().is_some_and(|tools| {
+                            tools.iter().any(|tool| tool["name"] == "functions")
+                        })
+                })
+                .unwrap()["tools"]
+                .to_string()
+        }
+        fn latest_mode(request: &Value) -> String {
+            request["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .rev()
+                .filter(|item| item["role"] == "developer")
+                .find_map(|item| {
+                    item["content"].as_array()?.iter().find_map(|content| {
+                        content["text"]
+                            .as_str()
+                            .filter(|text| text.starts_with("<collaboration_mode>"))
+                            .map(str::to_owned)
+                    })
+                })
+                .unwrap()
+        }
+        {
+            let captured = requests.lock().await;
+            let side_request = captured
+                .iter()
+                .find(|request| request["input"].to_string().contains("SIDE_NATIVE_INPUT"))
+                .unwrap();
+            assert!(latest_mode(side_request).contains("# Plan Mode"));
+            let tools = effective_tools(side_request);
+            for name in ["get_goal", "create_goal", "update_goal"] {
+                assert!(!tools.contains(name), "临时侧边仍注册了 {name}");
+                assert!(
+                    effective_tools(&captured[0]).contains(name),
+                    "父会话原生目标工具被侧边配置影响"
+                );
+            }
+        }
+        eprintln!("原生侧边验收：Plan 继承及目标工具隔离通过");
         controller
             .call_authorized("compact", json!({"threadId":id}), &authorization)
             .await
@@ -12282,8 +12503,11 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
                 .await
                 .is_ok()
         );
+        controller.harness.enabled.store(false, Ordering::Release);
         controller.harness.release().await;
         server.abort();
+        let _ = server.await;
+        eprintln!("原生侧边验收：原生引擎和模拟上游已停止");
     }
 
     async fn native_pin_fixture(options: Value) -> (tempfile::TempDir, HarnessAuthorization) {

@@ -119,6 +119,8 @@ pub(super) struct SideThread {
     pub queue_revision: u64,
     // 用户要求侧边继承创建时的主会话权限且不提供切换入口；只在本次临时会话内保存原生权限快照。
     permissions: Value,
+    // 用户要求显式继承创建时的 Plan/Default；后续父会话变化和客户端载荷不能改写该模式。
+    collaboration_mode: Value,
     bytes: usize,
 }
 
@@ -142,6 +144,7 @@ mod tests {
             queue_revision: 1,
             permissions: json!({"approvalPolicy":"on-request","approvalsReviewer":"user",
                 "sandboxPolicy":{"type":"readOnly"}}),
+            collaboration_mode: json!({"mode":"default","settings":{"developer_instructions":null}}),
             bytes: 0,
         }
     }
@@ -917,6 +920,9 @@ impl CodexHarness {
         {
             return Err(error(429, "临时侧边会话已达上限，请先关闭不再使用的会话"));
         }
+        let collaboration_mode = self
+            .side_collaboration_mode(parent, &identity["thread"])
+            .await?;
         // 与 App 一样把侧边规则追加到当前项目的开发者指令，不能覆盖用户已有的配置要求。
         let config = self
             .runtime
@@ -947,8 +953,9 @@ impl CodexHarness {
             .get(parent)
             .cloned()
             .unwrap_or(Value::Null);
+        // 用户要求临时侧边不向模型提供目标工具；仅覆盖本次 fork，不修改主会话或实例的 goals 配置。
         let mut params = json!({"threadId":parent,"ephemeral":true,"excludeTurns":true,"threadSource":"user",
-            "developerInstructions":instructions,"config":{"thread_unload_delay_secs":0}});
+            "developerInstructions":instructions,"config":{"thread_unload_delay_secs":0,"features.goals":false}});
         super::super::instance_settings::apply_codex_compaction_default(&config, &mut params);
         // 用户要求继承点击创建时的主会话选择，包括尚未发送的模型/深度；旧客户端再读原生及已保存设置。
         let model = payload["model"]
@@ -1079,6 +1086,7 @@ impl CodexHarness {
             queue: Data::default(),
             queue_revision: 1,
             permissions,
+            collaboration_mode,
             bytes: 0,
         };
         let mut projection = self.projection.lock().await;
@@ -1418,6 +1426,22 @@ impl CodexHarness {
             for (key, value) in side.permissions.as_object().into_iter().flatten() {
                 params[key] = value.clone();
             }
+            // 用户要求每个新轮次都保留继承的 Plan/Default，包括队列续发和压缩后的发送。
+            // collaborationMode 会优先决定模型与深度，因此必须同步侧边自身当前选择，保留源模式的自定义指令。
+            let model = params["model"]
+                .as_str()
+                .filter(|model| !model.is_empty())
+                .or_else(|| side.metadata["model"].as_str())
+                .ok_or_else(|| error(503, "无法确认侧边会话协作模式使用的模型"))?
+                .to_owned();
+            let effort = params
+                .get("effort")
+                .cloned()
+                .unwrap_or_else(|| side.metadata["reasoningEffort"].clone());
+            let mut mode = side.collaboration_mode.clone();
+            mode["settings"]["model"] = json!(model);
+            mode["settings"]["reasoning_effort"] = effort;
+            params["collaborationMode"] = mode;
         }
         if method == "turn/start"
             && let Err(failure) = self.apply_fast_to_turn(id, &mut params).await

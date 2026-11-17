@@ -17,6 +17,7 @@ mod read_cache;
 mod reads;
 mod runtime;
 mod settings;
+mod side_settings;
 mod sides;
 mod store;
 mod subagents;
@@ -85,6 +86,20 @@ impl CodexHarness {
             .request("test/seedHistory", payload, None)
             .await?;
         Ok(())
+    }
+    #[cfg(test)]
+    pub async fn start_test_turn(
+        &self,
+        payload: Value,
+        authorization: &HarnessAuthorization,
+    ) -> anyhow::Result<Value> {
+        anyhow::ensure!(
+            self.runtime.has_test_process(),
+            "只允许向显式安装的隔离测试引擎启动原生轮次"
+        );
+        self.runtime
+            .request("turn/start", payload, Some(authorization))
+            .await
     }
     #[cfg(test)]
     pub async fn seed_test_subagents(&self, payload: Value) -> anyhow::Result<()> {
