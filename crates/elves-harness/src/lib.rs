@@ -84,6 +84,7 @@ mod preferences;
 mod primary_route;
 mod prompt_optimization;
 mod recent_priority;
+mod scheduled_tasks;
 mod session_metrics;
 mod shared_settings;
 
@@ -489,6 +490,7 @@ pub struct HarnessController {
     claude: Arc<claude::Claude>,
     permissions: permissions::SessionPermissions,
     shared_settings: shared_settings::SharedSettings,
+    scheduled_tasks: Arc<scheduled_tasks::ScheduledTasks>,
     conversation_naming: Arc<conversation_naming::ConversationNaming>,
     harness_connected: AtomicBool,
     prompt_optimization: Arc<prompt_optimization::RemotePromptOptimization>,
@@ -572,6 +574,7 @@ impl HarnessController {
             claude: claude.clone(),
             permissions,
             shared_settings: shared_settings::SharedSettings::new(&state_dir),
+            scheduled_tasks: Arc::new(scheduled_tasks::ScheduledTasks::new(&state_dir)?),
             conversation_naming: conversation_naming::ConversationNaming::new(&state_dir)?,
             harness_connected: AtomicBool::new(false),
             prompt_optimization: Arc::new(prompt_optimization::RemotePromptOptimization::default()),
@@ -1364,6 +1367,12 @@ impl HarnessController {
         }
         if action == "harnessDiagnostics" {
             return self.harness_diagnostics(&payload, authorization).await;
+        }
+        if action.ends_with("ScheduledTask") {
+            return self
+                .scheduled_tasks
+                .action(self, action, &payload, authorization)
+                .await;
         }
         if action == "clearRecentPriority" {
             let invalid = || ApiError::new(400, "待清除的优先事项标识无效");
@@ -2602,6 +2611,7 @@ pub fn start_monitor() -> anyhow::Result<HarnessRuntime> {
             {
                 controller.reconcile(settings.remote_access).await;
             }
+            controller.scheduled_tasks.tick(&controller).await;
             tokio::select! {
                 _ = &mut receiver => break,
                 _ = tokio::time::sleep(Duration::from_secs(2)) => {}
@@ -4140,8 +4150,12 @@ async fn read(
             | "relatedThreads"
             | "sidePresence"
             | "harnessDiagnostics"
+            | "scheduledTasks"
     ) {
         return Err(ApiError::new(404, "不支持的读取操作"));
+    }
+    if action == "scheduledTasks" && !state.desktop {
+        return Err(ApiError::new(403, "定时任务仅可在 Elves 本机工作区使用"));
     }
     if action == "harnessDiagnostics" && !state.desktop {
         return Err(ApiError::new(403, "Harness 诊断仅可在 Elves 独立客户端使用"));
@@ -4172,6 +4186,15 @@ async fn read(
     }
     let guidance = HARNESS_READ_GUIDANCE;
     let authorization = state.controller.authorization(device, None);
+    if action == "scheduledTasks" {
+        let value = state.controller.scheduled_tasks.snapshot().await?;
+        let gzip = accepts_gzip(&headers);
+        let response = tokio::task::spawn_blocking(move || read_json_response(value, gzip))
+            .await
+            .map_err(|_| ApiError::new(503, "定时任务数据处理暂时失败，请重试读取"))??;
+        authorization.check().await.map_err(authorization_error)?;
+        return Ok(response);
+    }
     let value = state
         .controller
         .call_authorized(&action, payload.clone(), &authorization)
@@ -5083,8 +5106,16 @@ async fn action(
             | "rename"
             | "approve"
             | "answer"
+            | "createScheduledTask"
+            | "updateScheduledTask"
+            | "deleteScheduledTask"
+            | "toggleScheduledTask"
+            | "runScheduledTask"
     ) {
         return Err(ApiError::new(404, "不支持的会话操作"));
+    }
+    if action.ends_with("ScheduledTask") && !state.desktop {
+        return Err(ApiError::new(403, "定时任务仅可在 Elves 本机工作区使用"));
     }
     if matches!(action.as_str(), "approve" | "answer") && !state.settings.allow_approvals {
         return Err(ApiError::new(403, "远程审批与询问回答已关闭，请在桌面处理"));
