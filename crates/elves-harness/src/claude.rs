@@ -78,6 +78,27 @@ pub(super) fn api_error(failure: anyhow::Error) -> anyhow::Error {
     }
 }
 
+fn confirm_native_stop_for_removal(result: &Value) -> anyhow::Result<()> {
+    match result["stopped"].as_bool() {
+        Some(true) => Ok(()),
+        Some(false) => {
+            // 原生明确未停止时按实际原因拒绝移除，不把草稿、后台任务或画面未知误报为执行中。
+            let message = match result["reason"].as_str() {
+                Some("active") => "Claude 会话仍在执行或等待交互，请先停止任务或完成交互再移除",
+                Some("native_draft") => "Claude 终端有未发送的草稿，请先处理草稿再移除会话",
+                Some("background_work") => "Claude 会话仍有后台任务，请等任务结束后再移除",
+                Some("screen_unknown") => "无法确认 Claude 终端的输入状态，请在原生终端核对后重试",
+                Some("identity_unknown" | "identity_changed" | "state_changed") => {
+                    "未能确认 Claude 后台会话仍是原目标且处于空闲，请刷新后重试"
+                }
+                _ => "Claude 原生后台会话未停止，未移除会话",
+            };
+            Err(error(409, message))
+        }
+        None => Err(error(503, "未确认 Claude 原生后台会话已停止，未移除会话")),
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub(super) struct WslConfig {
@@ -2445,10 +2466,7 @@ impl Claude {
                         }
                     };
                     let result = self.shutdown_process(&process).await?;
-                    anyhow::ensure!(
-                        result["stopped"] == true,
-                        "Claude 原生会话仍在执行或等待交互，未删除远程会话"
-                    );
+                    confirm_native_stop_for_removal(&result)?;
                 }
                 self.change(|saved| {
                     let c = saved
@@ -4893,6 +4911,31 @@ fn project_frame(turn: &mut Value, frame: &Value) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_removal_distinguishes_native_block_reasons_from_missing_stop_confirmation() {
+        assert!(confirm_native_stop_for_removal(&json!({"stopped":true})).is_ok());
+        for (reason, context) in [
+            ("active", "仍在执行或等待交互"),
+            ("native_draft", "未发送的草稿"),
+            ("background_work", "仍有后台任务"),
+            ("screen_unknown", "无法确认 Claude 终端的输入状态"),
+            ("identity_unknown", "仍是原目标"),
+            ("state_changed", "仍是原目标"),
+            ("unrecognized", "未移除会话"),
+        ] {
+            let failure =
+                confirm_native_stop_for_removal(&json!({"stopped":false,"reason":reason}))
+                    .unwrap_err();
+            let failure = failure.downcast_ref::<ApiError>().unwrap();
+            assert_eq!(failure.code, 409);
+            assert!(failure.message.contains(context));
+            assert!(!failure.outcome_unknown);
+        }
+        let failure =
+            confirm_native_stop_for_removal(&json!({"reason":"native_draft"})).unwrap_err();
+        assert_eq!(failure.downcast_ref::<ApiError>().unwrap().code, 503);
+    }
 
     #[test]
     fn configured_and_saved_wsl_environments_share_the_same_validation_rules() {

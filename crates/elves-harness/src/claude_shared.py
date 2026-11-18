@@ -48,12 +48,34 @@ REWIND_REFUSALS = {
 }
 
 
+class _FaintCell(str):
+    __slots__ = ()
+
+
 class Screen:
     """只读取原版输出形成正文预览；最终 Markdown 和工具结果仍来自原生消息记录。"""
-    def __init__(self):
+    def __init__(self, *, track_intensity=False):
         self.lines = {}
         self.x = self.y = 0
         self.carry = ""
+        self.track_intensity = track_intensity
+        self.faint = False
+
+    def update_intensity(self, parameters):
+        codes = iter(parameters.split(";"))
+        for code in codes:
+            if code in ("38", "48", "58"):
+                # 扩展颜色的参数不是独立样式；例如 38;5;2 的 2 是颜色索引，不是淡显。
+                mode = next(codes, "")
+                if mode not in ("2", "5"):
+                    self.faint = False
+                    break
+                for _ in range(3 if mode == "2" else 1):
+                    next(codes, None)
+            elif code in ("", "0", "1", "22"):
+                self.faint = False
+            elif code == "2":
+                self.faint = True
 
     def feed(self, chunk):
         text, self.carry = self.carry + chunk, ""
@@ -129,8 +151,12 @@ class Screen:
                             else:
                                 line = self.lines.get(self.y, [])
                                 self.lines[self.y] = [" "] * min(self.x + 1, len(line)) + line[self.x + 1:]
+                        elif command == "m" and self.track_intensity:
+                            self.update_intensity(raw)
                     index = end + 1
                     continue
+                if kind == "c":
+                    self.faint = False
                 index += 2
                 continue
             if character == "\r":
@@ -147,7 +173,7 @@ class Screen:
                     if self.x:
                         line[self.x - 1] += character
                 else:
-                    line[self.x] = character
+                    line[self.x] = _FaintCell(character) if self.faint else character
                     self.x += 1
                     if unicodedata.east_asian_width(character) in ("W", "F"):
                         if len(line) <= self.x:
@@ -160,6 +186,26 @@ class Screen:
     def text(self):
         return ["".join(self.lines.get(row, [])).rstrip()
                 for row in range(max(self.lines, default=-1) + 1)]
+
+    def recovery_input_lines(self):
+        lines = self.text()
+        position = next((i for i in range(len(lines) - 1, -1, -1)
+                         if re.match(r"^\s*❯", lines[i])), None)
+        # 2.1.326/327 实测：失败后原版以 ANSI 淡显绘制恢复占位。只识别有完整下边框的精确占位，
+        # 普通样式的同文草稿、重绘后的输入、额外文本及无法读全的画面仍按原保护处理。
+        hint = "Once fixed, resend your message"
+        if (position is None or position + 1 == len(lines)
+                or not re.match(r"^\s*[─╌━]{6,}", lines[position + 1])
+                or lines[position].split("❯", 1)[1].strip() != hint):
+            return lines
+        cells = self.lines[position]
+        end = len(cells)
+        while end and not cells[end - 1].strip():
+            end -= 1
+        span = cells[end - len(hint):end]
+        if "".join(span) == hint and all(isinstance(cell, _FaintCell) for cell in span):
+            lines[position] = lines[position].split("❯", 1)[0] + "❯"
+        return lines
 
 
 def native_time(value):
@@ -3040,12 +3086,16 @@ class NativeSession:
         if (status.get("tempo") != "idle" or status.get("needs") or self.pending
                 or self.compaction.get("state") == "running"):
             return {"stopped": False, "reason": "active"}
-        lines = self.current_screen()
-        if not lines:
-            try:
-                lines = self.read_terminal_screen()
-            except (OSError, ValueError, RuntimeError, NativeError):
-                return {"stopped": False, "reason": "screen_unknown"}
+        # 最后一条原生记录是 API 错误且同一 REPL 明确空闲时，才用新快照识别恢复占位。
+        # 不能依赖缓存画面放行：用户可能已在原生终端输入真实草稿，画面读取失败则保留会话。
+        try:
+            if (live.get("sessionStatus") == "idle" and self.messages
+                    and self.messages[-1].get("isApiErrorMessage") is True):
+                lines = self.read_terminal_screen(ignore_recovery_placeholder=True)
+            else:
+                lines = self.current_screen() or self.read_terminal_screen()
+        except (OSError, ValueError, RuntimeError):
+            return {"stopped": False, "reason": "screen_unknown"}
         input_state = native_input_state(lines, allow_borderless=live.get("sessionStatus") == "idle")
         if input_state != "empty":
             return {"stopped": False, "reason": "native_draft" if input_state == "draft" else "screen_unknown"}
@@ -3361,11 +3411,11 @@ class NativeSession:
             content.append({"type": "image", "source": image})
         return content
 
-    def read_terminal_screen(self):
-        # 仅在用户回答时订阅一次新画面；每次读取等候最多 2 秒，最多 4 帧，不增加发送轮询。
+    def read_terminal_screen(self, *, ignore_recovery_placeholder=False):
+        # 按需订阅一次新画面；每次读取等候最多 2 秒，最多 4 帧，不增加发送轮询。
         # 单帧上限 16 MiB：长会话的 200 段终端快照可超过 1 MiB（2026-11-13 编辑交接验收实测），
         # 原 1 MiB 上限会让问答、确认框直接报“无法读取原生交互界面”；与 Rust MAX_FRAME_BYTES 同为 16 MiB。
-        screen = Screen()
+        screen = Screen(track_intensity=ignore_recovery_placeholder)
         with socket.socket(socket.AF_UNIX) as connection:
             connection.settimeout(2)
             connection.connect(self.address)
@@ -3379,7 +3429,7 @@ class NativeSession:
                     frame = json.loads(line)
                     if frame.get("type") == "snapshot":
                         screen.feed("".join(frame.get("streamTail", [])))
-                        return screen.text()
+                    return screen.recovery_input_lines() if ignore_recovery_placeholder else screen.text()
         raise NativeError("EQUESTIONCHANGED", "暂时无法读取原生交互界面，未发送交互按键")
 
     def verify_dialog(self, expected):

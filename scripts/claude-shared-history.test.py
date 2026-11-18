@@ -1445,6 +1445,49 @@ class SharedQueueHistoryTests(unittest.TestCase):
             self.assertEqual(native.shutdown()["reason"], reason)
         native.stop_job.assert_not_called()
 
+    def test_shutdown_checks_recovery_placeholder_against_the_fresh_screen(self):
+        native = NativeSession("native-cli", "test-session", "saved-job")
+        live = {"short": native.short, "sessionId": native.native_id, "tempo": "idle",
+                "state": "idle", "sessionStatus": "idle"}
+        native.lookup = lambda: live
+        native.read_messages = lambda: None
+        native.messages = [{"type": "assistant", "isApiErrorMessage": True}]
+        native.stop_job = MagicMock()
+        hint = "Once fixed, resend your message"
+        faint_hint = f"\x1b[39m\x1b[2m{hint}\x1b[22m"
+        # 缓存可能尚未反映终端新输入；回收必须以新订阅画面区分提示和真实草稿。
+        footer = "\r\n────────────────\r\n? for shortcuts"
+        native.screen.feed(f"❯ {faint_hint}{footer}")
+        cases = (
+            ("恢复占位", f"❯ {faint_hint}{footer}", None),
+            ("同文草稿", f"❯ \x1b[38;5;2m{hint}{footer}", "native_draft"),
+            ("亮色重绘", f"❯ {faint_hint}\r\x1b[2K❯ {hint}{footer}", "native_draft"),
+            ("混合样式", f"❯ \x1b[2mOnce fixed, \x1b[0mresend your message{footer}", "native_draft"),
+            ("多行草稿", f"❯ {faint_hint}\r\n真实输入{footer}", "native_draft"),
+            ("画面截断", f"❯ {faint_hint}", "native_draft"),
+            ("快照不可读", None, "screen_unknown"),
+        )
+        for label, snapshot, reason in cases:
+            with self.subTest(label=label), patch.object(namespace["socket"], "socket") as sock:
+                native.stop_job.reset_mock()
+                connection = sock.return_value.__enter__.return_value
+                frame = {"type": "snapshot", "streamTail": [snapshot]} if snapshot is not None else {}
+                connection.makefile.return_value.__enter__.return_value = io.BytesIO(
+                    (json.dumps(frame) + "\n").encode())
+                result = native.shutdown()
+                self.assertEqual(result.get("reason"), reason)
+                self.assertEqual(result["stopped"], reason is None)
+                self.assertEqual(native.stop_job.call_count, int(reason is None))
+                connection.sendall.assert_called_once()
+
+        # 旧错误或 pending 原生交互都不能因出现相同画面而放行。
+        native.stop_job.reset_mock()
+        native.messages.append({"type": "user", "message": {"content": "新一轮"}})
+        self.assertEqual(native.shutdown(), {"stopped": False, "reason": "native_draft"})
+        live.update(sessionStatus="waiting")
+        self.assertEqual(native.shutdown(), {"stopped": False, "reason": "active"})
+        native.stop_job.assert_not_called()
+
     def test_shutdown_rechecks_a_new_native_turn_before_stop(self):
         native = NativeSession("native-cli", "test-session", "saved-job")
         native.read_messages = lambda: None
