@@ -254,8 +254,8 @@ export function mountSettingsPage(screen, { onBack, fromLogin = false }) {
   screen.setAttribute("data-popup-host", "");
   screen.innerHTML = `<div class="appearance-layout">
     <nav class="appearance-nav" aria-label="设置导航">
-      <!-- 桌面工作区靠主导航切换，不显示关闭按钮；手机和登录前无主导航，保留返回入口。 -->
-      <header class="appearance-heading"><h2 id="appearance-title" tabindex="-1">设置</h2><button type="button" class="icon-button appearance-back" title="返回" aria-label="返回"></button></header>
+      <!-- 用户要求手机端保留顶部关闭按钮，不提供返回箭头；桌面端依靠主导航，系统返回仍按既有层级处理。 -->
+      <header class="appearance-heading"><h2 id="appearance-title" tabindex="-1">设置</h2><button type="button" class="icon-button appearance-close" title="关闭" aria-label="关闭"></button></header>
       <div class="appearance-nav-groups">
       ${settingsNavigation.map(group => `<div id="appearance-nav-${group.id}" class="appearance-nav-group" role="group" aria-labelledby="appearance-nav-${group.id}-title"${group.androidOnly ? " hidden" : ""}>
         <h3 id="appearance-nav-${group.id}-title" class="appearance-nav-group-title">${group.label}</h3>
@@ -372,7 +372,7 @@ export function mountSettingsPage(screen, { onBack, fromLogin = false }) {
         [{ value: "400", label: "常规" }, { value: "500", label: "中等" }, { value: "600", label: "半粗" }], String(weight)])
   ]) find(`#${id}-slot`).append(selectControl(id, label, options, value,
     id.endsWith("-font") ? "appearance-font-family" : ""));
-  const headingButton = find(".appearance-back");
+  const closeButton = find(".appearance-close");
   const primaryBody = find("#appearance-general-page");
   const panelHost = find(".appearance-panels");
   const generalEntry = find("#appearance-general-entry");
@@ -428,7 +428,7 @@ export function mountSettingsPage(screen, { onBack, fromLogin = false }) {
   }
   for (const group of settingsNavigation) for (const item of group.items)
     find(`#appearance-${item.id}-entry`).querySelector(".appearance-nav-icon").append(icon(item.icon));
-  headingButton.append(icon("back"));
+  closeButton.append(icon("close"));
   const loginReturn = find(".appearance-login-return button");
   loginReturn?.prepend(icon("back"));
   renderPwaCacheState();
@@ -726,7 +726,7 @@ export function mountSettingsPage(screen, { onBack, fromLogin = false }) {
     screen.inert = true;
     leaving = setTimeout(onBack, 220);
   };
-  headingButton.onclick = returnFromSettings;
+  closeButton.onclick = returnFromSettings;
   if (loginReturn) loginReturn.onclick = returnFromSettings;
   const onNativeBack = event => {
     if (event.defaultPrevented || !isOpen()) return;
