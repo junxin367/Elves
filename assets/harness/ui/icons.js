@@ -11,6 +11,13 @@ export function productLogo() {
   return node;
 }
 
+export function promptOptimizationIcon() {
+  // 用户要求工具栏和 / 菜单共用彩色星标；保留 Emoji 呈现，避免回退为单色矢量图。
+  const node = element("span", "prompt-optimize-emoji", "\u2728\uFE0F");
+  node.setAttribute("aria-hidden", "true");
+  return node;
+}
+
 export function icon(name) {
   const paths = {
     window: '<path d="M14 3h7v7M21 3l-9 9"/><path d="M10 5H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-5"/>',

@@ -13,7 +13,7 @@ import { mountSessionTools } from "../session-tools.js";
 import { copyText } from "../ui/clipboard.js";
 import { confirmAction } from "../ui/dialog.js";
 import { $, button, element } from "../ui/dom.js";
-import { icon } from "../ui/icons.js";
+import { icon, promptOptimizationIcon } from "../ui/icons.js";
 import { notice } from "../ui/notice.js";
 import { activePopup, closePopup, openPopup, togglePopup } from "../ui/popup.js";
 import { selectControl, setSelectValue } from "../ui/select.js";
@@ -140,10 +140,8 @@ export function shell() {
   setWorkspaceOpenIn(mountWorkspaceOpenIn({ anchor: $("#open-session-tools"),
     beforeOpen: () => { sessionMenu?.close(); closeComposerMenus(); } }));
   $("#related-session-back").onclick = () => void returnToParentSession().catch(error => notice(error.message, true));
-  // 用户要求提示词优化始终使用同一个彩色 ✨，完成后也不切换单色图标；再次点击恢复原文的行为保持不变。
-  const optimizeEmoji = element("span", "prompt-optimize-emoji", "\u2728\uFE0F");
-  optimizeEmoji.setAttribute("aria-hidden", "true");
-  $("#prompt-optimize").replaceChildren(optimizeEmoji);
+  // 提示词优化在普通、加载及完成状态都保留与 / 菜单相同的彩色图标，再次点击仍恢复原文。
+  $("#prompt-optimize").replaceChildren(promptOptimizationIcon());
   $("#prompt-optimize").onclick = () => void activatePromptOptimization();
   $("#fast-button").onclick = () => void toggleRemoteFast();
   $("#prompt-optimize").oncontextmenu = event => {

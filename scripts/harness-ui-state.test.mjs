@@ -16646,7 +16646,8 @@ test("编辑区加号保持正常前景色和交互背景，提示词优化始�
     $: () => control,
     element: (tag, className, textContent) => ({ tag, className, textContent, setAttribute() {} }),
   });
-  rawVm.runInContext(sourceSection("  const optimizeEmoji =", '  $("#prompt-optimize").onclick'), context);
+  rawVm.runInContext(sourceSection("function promptOptimizationIcon(", "function icon(")
+    + sourceSection('  $("#prompt-optimize").replaceChildren(', '  $("#prompt-optimize").onclick'), context);
   assert.equal(control.children.length, 1, "工具栏只创建彩色图标，不保留完成态单色替代图标");
   assert.equal(control.children[0].className, "prompt-optimize-emoji");
   assert.equal(control.children[0].textContent, "\u2728\uFE0F");
@@ -16703,7 +16704,7 @@ function claudeSlashMenuHarness() {
     skillIdentity: skill => `${skill.name}\0${skill.path}`, skillVisibleName: skill => skill.name,
     currentThreadDisplay: () => null, contextUsage: () => null, compactUsageDescription: () => "",
     compactCommandIcon: () => element("span"), goalComposerIcon: () => element("span"),
-    promptOptimizationCommandIcon: () => element("span"), activatePromptOptimization() {},
+    activatePromptOptimization() {},
     selectCompactCommand() {}, selectGoalCommand() {},
     closePopup() {}, closeContextUsageTip() {}, fitComposerMenu() {},
     closeSkillMenu: () => { menu.hidden = true; },
@@ -16716,6 +16717,8 @@ function claudeSlashMenuHarness() {
   });
   vm.runInContext(sourceSection("function slashQu", "function com")
     + sourceSection("function promptOptimizationCommandMatches(", "function compactCommandIcon(")
+    + sourceSection("function promptOptimizationIcon(", "function icon(")
+    + sourceSection("function promptOptimizationCommandIcon(", "function goalComposerIcon(")
     + sourceSection("function slashMe", "function ren")
     + (sourceSection("function normalizeSl", "function cat") + "\n" + sourceSection("function renderSkillMenu", "function act"))
     + (sourceSection("function cat") + "\n" + sourceSection("function activeS", "function sel") + "\n" + sourceSection("function selectS", "function rem"))
@@ -16766,6 +16769,9 @@ test("斜杠菜单提供提示词优化，支持搜索并保留命令外输入",
   c.activatePromptOptimization = () => { activated += 1; }; c.rememberDraft = () => { drafts += 1; };
   c.renderSkillMenu();
   const option = h.menu.children[1].children[0];
+  assert.match(option.children[0].className, /\bprompt-optimize-emoji\b/);
+  assert.equal(option.children[0].textContent, "\u2728\uFE0F", "斜杠菜单与工具栏使用同一个彩色图标");
+  assert.equal(option.children[0].getAttribute("aria-hidden"), "true");
   assert.equal(option.children[1].children[0].textContent, "提示词优化");
   option.onclick();
   assert.equal(h.prompt.value, "请整理需求 ");

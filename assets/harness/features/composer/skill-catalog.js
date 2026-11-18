@@ -1,7 +1,7 @@
 // Skill 目录：可选 Skill 与全局目录的状态、目录缓存与刷新判断、斜杠命令匹配。
 
 import { $, element } from "../../ui/dom.js";
-import { icon } from "../../ui/icons.js";
+import { icon, promptOptimizationIcon } from "../../ui/icons.js";
 import { sidebar, thread } from "../../core/state.js";
 
 export const catalogCacheMs = 60 * 60 * 1000;
@@ -52,7 +52,7 @@ export function compactCommandIcon() {
   return node;
 }
 export function promptOptimizationCommandIcon() {
-  const node = icon("sparkles");
+  const node = promptOptimizationIcon();
   node.classList.add("slash-command-icon");
   return node;
 }
