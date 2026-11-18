@@ -1,4 +1,4 @@
-// 设置对话框：外观、字体、颜色选择器、通知与缓存状态等设置页面。
+// 设置页：外观、字体、颜色选择器、通知与缓存状态等设置分类。
 
 import { exportAndroidDiagnostics, sendAndroidDiagnostics } from "../../diagnostics.js";
 import { mountInstancePermissions } from "../../permissions.js";
@@ -232,33 +232,39 @@ function openAppearanceColorPicker(trigger, label, color, onChange) {
     render();
   } });
   if (typeof node.showPopover === "function") node.setAttribute("popover", "manual");
-  (trigger.closest("dialog") || document.body).append(node);
+  (trigger.closest("dialog,[data-popup-host]") || document.body).append(node);
   render();
   if (node.hasAttribute("popover")) node.showPopover();
   fitPopup(); plane.focus({ preventScroll: true });
 }
-export function openAppearance() {
+export function mountSettingsPage(screen, { onBack, fromLogin = false }) {
   closeComposerMenus(); closePopup(); sessionMenu?.close();
-  const trigger = document.activeElement;
   const androidContainer = isAndroidContainer();
-  const previousDialog = $("#appearance-dialog");
-  if (previousDialog?.open) previousDialog.close();
-  previousDialog?.remove();
-  const dialog = element("dialog", "appearance-dialog appearance-screen");
-  dialog.id = "appearance-dialog";
-  dialog.setAttribute("aria-labelledby", "appearance-title");
-  dialog.innerHTML = `<div class="appearance-layout">
+  let disposed = false;
+  const isOpen = () => !disposed && screen.isConnected && !screen.hidden;
+  const ownsPopup = () => !!activePopup && screen.contains(activePopup.trigger);
+  const find = selector => $(selector, screen);
+  const loginMobileMedia = fromLogin ? matchMedia("(max-width: 760px), (hover: none) and (pointer: coarse)") : null;
+  const syncLoginLayout = () => { screen.dataset.settingsMobile = String(androidContainer || loginMobileMedia.matches); };
+  if (loginMobileMedia) {
+    syncLoginLayout();
+    loginMobileMedia.addEventListener("change", syncLoginLayout);
+  }
+  screen.setAttribute("aria-labelledby", "appearance-title");
+  screen.setAttribute("data-popup-host", "");
+  screen.innerHTML = `<div class="appearance-layout">
     <nav class="appearance-nav" aria-label="设置导航">
-      <!-- 用户要求标题与关闭按钮固定在设置子导航顶部，不占右侧内容的高度。 -->
-      <header class="appearance-heading"><h2 id="appearance-title">设置</h2><button type="button" class="icon-button" title="关闭设置" aria-label="关闭设置"></button></header>
+      <!-- 桌面工作区靠主导航切换，不显示关闭按钮；手机和登录前无主导航，保留返回入口。 -->
+      <header class="appearance-heading"><h2 id="appearance-title" tabindex="-1">设置</h2><button type="button" class="icon-button appearance-back" title="返回" aria-label="返回"></button></header>
       <div class="appearance-nav-groups">
       ${settingsNavigation.map(group => `<div id="appearance-nav-${group.id}" class="appearance-nav-group" role="group" aria-labelledby="appearance-nav-${group.id}-title"${group.androidOnly ? " hidden" : ""}>
         <h3 id="appearance-nav-${group.id}-title" class="appearance-nav-group-title">${group.label}</h3>
-        ${group.items.map(item => `<button type="button" id="appearance-${item.id}-entry" class="appearance-nav-item" aria-label="打开${item.label}" aria-controls="appearance-${item.id}-page" aria-selected="${item.id === "general"}"${group.androidOnly ? " hidden" : ""}><span class="appearance-nav-icon"></span><span>${item.label}</span></button>`).join("")}
+        ${group.items.map(item => `<button type="button" id="appearance-${item.id}-entry" class="appearance-nav-item" aria-label="打开${item.label}" aria-controls="appearance-${item.id}-page"${item.id === "general" ? ' aria-current="page"' : ""}${group.androidOnly ? " hidden" : ""}><span class="appearance-nav-icon"></span><span>${item.label}</span></button>`).join("")}
       </div>`).join("")}
       </div>
     </nav>
     <div class="appearance-main">
+    ${fromLogin ? `<div class="appearance-login-return"><button type="button" class="text-button">返回登录</button></div>` : ""}
     <div class="appearance-panels">
     <section id="appearance-general-page" class="appearance-body appearance-settings-page">
     <!-- 用户确认“个人 → 会话”改为“常规”；Claude 专属选项移入所选实例，不再混在设备显示偏好中。 -->
@@ -270,6 +276,9 @@ export function openAppearance() {
     <div class="appearance-field appearance-thread-limit-field"><span>每个项目显示会话数</span><div id="appearance-project-thread-limit-slot"></div></div>
     <div id="appearance-cache-state" class="appearance-field" role="status"></div>
     </div></section>
+    ${androidContainer ? `<section id="appearance-app-section" class="appearance-section" hidden><h4>应用</h4><div class="appearance-card">
+    <div class="appearance-field"><span>应用版本</span><button type="button" class="text-button appearance-version" id="appearance-app-version" disabled></button></div>
+    </div></section>` : ""}
     </section>
     ${instanceSettingPages.map(page => `<section id="appearance-${page.id}-page" class="appearance-body appearance-settings-page" hidden>
     <h3 class="appearance-panel-title">${page.label}</h3>
@@ -298,9 +307,11 @@ export function openAppearance() {
     <textarea id="instruction-content" class="instruction-content" aria-label="自定义指令内容" spellcheck="false" disabled></textarea>
     <p id="instruction-status" class="appearance-hint" role="status"></p>
     <p class="appearance-hint">保存至所选实例的用户级全局指令文件，重新加载后生效。</p>
+    <!-- 用户要求取消设置的通用完成栏；需要版本核对的指令仍在本页显式保存。 -->
+    <div class="appearance-action-buttons"><button id="instruction-reload" type="button">重新读取</button><button id="instruction-save" type="button" class="primary" disabled>保存指令</button></div>
     </div></section>
     <section id="appearance-customization-page" class="appearance-body appearance-settings-page" hidden>
-    <h3 class="appearance-panel-title">外观</h3>
+    <header class="appearance-panel-heading"><h3 class="appearance-panel-title">外观</h3><button type="button" id="appearance-reset">恢复默认外观</button></header>
     <p class="appearance-hint">外观设置仅保存在当前客户端。</p>
     <!-- 用户要求单层设置页使用分组卡片，不再添加主题/字体/背景的内部导航。 -->
     <section class="appearance-section"><h4>视觉风格</h4>
@@ -344,29 +355,13 @@ export function openAppearance() {
     <p id="appearance-diagnostics-status" class="appearance-notification-status" role="status" hidden></p>
     </section>
     </div>
-    <div class="appearance-actions"><button type="button" class="appearance-version" id="appearance-app-version" hidden disabled></button><div class="appearance-action-buttons"><button type="button" id="appearance-reset">恢复默认外观</button><button id="instruction-reload" type="button" hidden>重新读取</button><button id="instruction-save" type="button" class="primary" hidden disabled>保存指令</button><button type="button" class="primary" id="appearance-close">完成</button></div></div>
     </div></div>`;
-  document.body.append(dialog);
   const wrapSettingsPage = page => {
     if (page.querySelector(":scope > .appearance-page-content")) return;
     const content = element("div", "appearance-page-content");
     content.append(...page.childNodes); page.append(content);
   };
-  for (const page of dialog.querySelectorAll(".appearance-settings-page")) wrapSettingsPage(page);
-  // 用户要求保留左侧主导航：只有真实可见的主导航才占位，不能按窗口宽度推断（窄 PC 仍有，手机横屏也可能没有）。
-  const mainNavigation = $(".remote-shell > .main-navigation");
-  const settingsNav = $(".appearance-nav", dialog);
-  const syncSettingsOffset = () => {
-    if (!dialog.open) return;
-    const main = mainNavigation?.getBoundingClientRect();
-    dialog.style.setProperty("--settings-main-nav-offset", `${main?.width > 0 ? Math.max(0, main.right) : 0}px`);
-    // 1000px 内容上限和原居中规则不变，使用设置子导航的新实际右边界。
-    dialog.style.setProperty("--settings-content-offset", `${settingsNav.getBoundingClientRect().right}px`);
-  };
-  const settingsResize = typeof ResizeObserver === "function" ? new ResizeObserver(syncSettingsOffset) : null;
-  settingsResize?.observe(settingsNav);
-  if (mainNavigation) settingsResize?.observe(mainNavigation);
-  window.addEventListener("resize", syncSettingsOffset);
+  for (const page of screen.querySelectorAll(".appearance-settings-page")) wrapSettingsPage(page);
   // 用户要求设置复用主题 Select：指令实例与两种字重也使用统一组件。
   for (const [id, label, options, value] of [
     ["instruction-instance", "会话实例", [], ""],
@@ -375,24 +370,23 @@ export function openAppearance() {
     ...[["ui", "界面字重", appearance.uiFontWeight], ["code", "代码字重", appearance.codeFontWeight]]
       .map(([kind, label, weight]) => [`appearance-${kind}-font-weight`, label,
         [{ value: "400", label: "常规" }, { value: "500", label: "中等" }, { value: "600", label: "半粗" }], String(weight)])
-  ]) $(`#${id}-slot`, dialog).append(selectControl(id, label, options, value,
+  ]) find(`#${id}-slot`).append(selectControl(id, label, options, value,
     id.endsWith("-font") ? "appearance-font-family" : ""));
-  const headingButton = $(".appearance-heading button", dialog);
-  const primaryBody = $("#appearance-general-page", dialog);
-  const panelHost = $(".appearance-panels", dialog);
-  const generalEntry = $("#appearance-general-entry", dialog);
-  const customizationEntry = $("#appearance-customization-entry", dialog);
-  const customizationPage = $("#appearance-customization-page", dialog);
-  const entryButton = $("#appearance-notifications-entry", dialog);
-  const diagnosticsEntry = $("#appearance-diagnostics-entry", dialog);
-  const diagnosticsPage = $("#appearance-diagnostics-page", dialog);
-  const resetButton = $("#appearance-reset", dialog);
-  const notificationVersionButton = $("#appearance-app-version", dialog);
+  const headingButton = find(".appearance-back");
+  const primaryBody = find("#appearance-general-page");
+  const panelHost = find(".appearance-panels");
+  const generalEntry = find("#appearance-general-entry");
+  const customizationEntry = find("#appearance-customization-entry");
+  const customizationPage = find("#appearance-customization-page");
+  const notificationEntry = find("#appearance-notifications-entry");
+  const diagnosticsEntry = find("#appearance-diagnostics-entry");
+  const diagnosticsPage = find("#appearance-diagnostics-page");
+  const resetButton = find("#appearance-reset");
   if (androidContainer) {
-    const diagnosticsField = $("#appearance-diagnostics-field", dialog);
-    const diagnosticsStatus = $("#appearance-diagnostics-status", dialog);
-    const exportButton = $("#appearance-diagnostics-export", dialog);
-    const sendButton = $("#appearance-diagnostics-send", dialog);
+    const diagnosticsField = find("#appearance-diagnostics-field");
+    const diagnosticsStatus = find("#appearance-diagnostics-status");
+    const exportButton = find("#appearance-diagnostics-export");
+    const sendButton = find("#appearance-diagnostics-send");
     diagnosticsField.hidden = diagnosticsStatus.hidden = false;
     let diagnosticsSupported = false, diagnosticsBusy = false;
     const update = () => {
@@ -400,7 +394,7 @@ export function openAppearance() {
       sendButton.disabled = !diagnosticsSupported || diagnosticsBusy || !session || !connected;
     };
     void getAndroidAppInfo().then(info => {
-      if (!dialog.isConnected) return;
+      if (!isOpen()) return;
       diagnosticsSupported = info?.diagnosticsVersion === 1;
       diagnosticsStatus.textContent = diagnosticsSupported
         ? "记录运行日志，便于排查问题。"
@@ -408,17 +402,17 @@ export function openAppearance() {
       update();
     }).catch(() => {});
     const run = async sending => {
-      if (diagnosticsBusy || !diagnosticsSupported) return;
+      if (!isOpen() || diagnosticsBusy || !diagnosticsSupported) return;
       diagnosticsBusy = true;
       diagnosticsStatus.textContent = sending ? "正在发送诊断日志…" : "正在准备诊断日志…";
       update();
       try {
         if (sending) await sendAndroidDiagnostics();
         else await exportAndroidDiagnostics();
-        if (dialog.isConnected) diagnosticsStatus.textContent = sending
+        if (isOpen()) diagnosticsStatus.textContent = sending
           ? "电脑端已收到诊断日志。" : "已打开系统分享，可选择保存或发送日志文件。";
       } catch (error) {
-        if (dialog.isConnected) diagnosticsStatus.textContent = error.message;
+        if (isOpen()) diagnosticsStatus.textContent = error.message;
       } finally {
         diagnosticsBusy = false;
         update();
@@ -428,24 +422,21 @@ export function openAppearance() {
     sendButton.onclick = () => { void run(true); };
   }
   if (androidContainer) {
-    $("#appearance-nav-tools", dialog).hidden = false;
-    entryButton.hidden = false;
+    find("#appearance-nav-tools").hidden = false;
+    notificationEntry.hidden = false;
     diagnosticsEntry.hidden = false;
   }
   for (const group of settingsNavigation) for (const item of group.items)
-    $(`#appearance-${item.id}-entry`, dialog).querySelector(".appearance-nav-icon").append(icon(item.icon));
-  headingButton.append(icon("close"));
+    find(`#appearance-${item.id}-entry`).querySelector(".appearance-nav-icon").append(icon(item.icon));
+  headingButton.append(icon("back"));
+  const loginReturn = find(".appearance-login-return button");
+  loginReturn?.prepend(icon("back"));
   renderPwaCacheState();
-  const versionButton = notificationVersionButton;
   let notificationPage = null;
   let notificationPageRevision = 0;
-  let notificationPageVisible = false;
   let notificationPageUnsubscribe = null;
   let activeNotificationPage = null;
   let notificationOperations = 0;
-  let androidVersionLoaded = false;
-  let subpageEntry = null;
-  const notificationEntry = entryButton;
   const updateNotificationOperationState = () => {
     notificationEntry.disabled = notificationOperations > 0;
     activeNotificationPage?.setBusy(notificationOperations > 0);
@@ -464,108 +455,70 @@ export function openAppearance() {
     notificationOperations = Math.max(0, notificationOperations - 1);
     updateNotificationOperationState();
   };
-  const notificationPageIsCurrent = (page, revision) => androidContainer && notificationPageVisible
+  const notificationPageIsCurrent = (page, revision) => androidContainer && isOpen()
     && notificationPage === page && notificationPageRevision === revision && page.isConnected
-    && dialog.isConnected && dialog.open;
-  const setSettingsNav = entry => {
-    for (const item of dialog.querySelectorAll(".appearance-nav-item"))
-      item.setAttribute("aria-selected", String(item === entry));
-  };
-  const selectSettingsPage = (page, entry, { focus = false } = {}) => {
-    if (!page?.isConnected) return;
-    wrapSettingsPage(page);
-    closePopup();
-    for (const panel of panelHost.querySelectorAll(".appearance-settings-page"))
-      panel.hidden = panel !== page;
-    // 用户要求指令按钮使用底部“完成”的位置；该页只显示重新读取和保存，切换到其他页时恢复“完成”。
-    const instructions = page.id === "appearance-instructions-page";
-    for (const id of ["instruction-reload", "instruction-save"])
-      $(`#${id}`, dialog).hidden = !instructions;
-    $("#appearance-close", dialog).hidden = instructions;
-    resetButton.hidden = page !== customizationPage;
-    setSettingsNav(entry);
-    page.scrollTop = 0;
-    if (focus) entry?.focus({ preventScroll: true });
+    && !page.hidden;
+  const clearNotificationPage = () => {
+    if (!notificationPage) return;
+    notificationPageRevision++;
+    notificationPageUnsubscribe?.();
+    notificationPageUnsubscribe = null;
+    activeNotificationPage = null;
+    notificationPage.remove();
+    notificationPage = null;
   };
   const showAppearancePage = (page, pageTitle, entry) => {
-    subpageEntry = entry;
-    selectSettingsPage(page, entry);
-    // 用户要求设置内容按分组显示，导航保持单层；标题始终为“设置”，不增加返回箭头或页内面包屑。
+    if (!isOpen() || !page?.isConnected) return false;
+    wrapSettingsPage(page);
+    closePopup();
+    if (page !== notificationPage) clearNotificationPage();
+    for (const panel of panelHost.querySelectorAll(".appearance-settings-page"))
+      panel.hidden = panel !== page;
+    for (const item of screen.querySelectorAll(".appearance-nav-item")) {
+      if (item === entry) item.setAttribute("aria-current", "page");
+      else item.removeAttribute("aria-current");
+    }
+    // 设置子导航仍为单层，各功能在自己的页面内操作。
     page.setAttribute("aria-label", pageTitle);
-    versionButton.hidden = !androidVersionLoaded;
+    page.scrollTop = 0;
+    return true;
   };
-  const restoreAppearanceRoot = () => {
-    if (!subpageEntry) return;
-    const returnEntry = subpageEntry;
-    subpageEntry = null;
-    notificationPageVisible = false;
-    notificationPageRevision++;
-    notificationPageUnsubscribe?.();
-    notificationPageUnsubscribe = null;
-    activeNotificationPage?.systemSettingsButton.remove();
-    activeNotificationPage = null;
-    notificationPage?.remove();
-    notificationPage = null;
-    selectSettingsPage(primaryBody, generalEntry);
-    dialog.classList.remove("appearance-subpage-open");
-    resetButton.hidden = false;
-    versionButton.hidden = !androidVersionLoaded;
-    updateNotificationOperationState();
-    returnEntry.focus({ preventScroll: true });
+  customizationEntry.onclick = () => showAppearancePage(customizationPage, "外观", customizationEntry);
+  const instructionsEntry = find("#appearance-instructions-entry");
+  instructionsEntry.onclick = () => {
+    if (showAppearancePage(find("#appearance-instructions-page"), "自定义指令", instructionsEntry))
+      void remoteSettings.show("instructions");
   };
-  customizationEntry.onclick = () => {
-    if (!dialog.isConnected || !dialog.open) return;
-    showAppearancePage(customizationPage, "外观", customizationEntry);
-  };
-  for (const [name, label] of [["instructions", "自定义指令"]]) {
-    const entry = $(`#appearance-${name}-entry`, dialog);
-    entry.onclick = () => {
-      showAppearancePage($(`#appearance-${name}-page`, dialog), label, entry);
-      void remoteSettings.show(name);
-    };
-  }
   for (const page of instanceSettingPages) {
-    const entry = $(`#appearance-${page.id}-entry`, dialog);
+    const entry = find(`#appearance-${page.id}-entry`);
     entry.onclick = () => {
-      showAppearancePage($(`#appearance-${page.id}-page`, dialog), page.label, entry);
-      void instancePages.get(page.id).show();
+      if (showAppearancePage(find(`#appearance-${page.id}-page`), page.label, entry))
+        void instancePages.get(page.id).show();
     };
   }
-  $("#appearance-shortcuts-entry", dialog).onclick = () => showAppearancePage(
-    $("#appearance-shortcuts-page", dialog), "快捷键", $("#appearance-shortcuts-entry", dialog));
-  $("#appearance-naming-entry", dialog).onclick = () => {
-    showAppearancePage($("#appearance-naming-page", dialog), "会话命名", $("#appearance-naming-entry", dialog));
-    void namingSettings.show();
+  find("#appearance-shortcuts-entry").onclick = () => showAppearancePage(
+    find("#appearance-shortcuts-page"), "快捷键", find("#appearance-shortcuts-entry"));
+  find("#appearance-naming-entry").onclick = () => {
+    if (showAppearancePage(find("#appearance-naming-page"), "会话命名", find("#appearance-naming-entry")))
+      void namingSettings.show();
   };
-  $("#appearance-permissions-entry", dialog).onclick = async () => {
-    showAppearancePage($("#appearance-permissions-page", dialog), "权限", $("#appearance-permissions-entry", dialog));
+  find("#appearance-permissions-entry").onclick = async () => {
+    const page = find("#appearance-permissions-page");
+    if (!showAppearancePage(page, "权限", find("#appearance-permissions-entry"))) return;
     try {
       await settingsEnvironments();
-      await instancePermissions.show(settingsInstance || activeInstanceId());
+      if (isOpen() && !page.hidden) await instancePermissions.show(settingsInstance || activeInstanceId());
     } catch (error) {
-      if (dialog.isConnected) notice(error.message, true);
+      if (isOpen() && !page.hidden) notice(error.message, true);
     }
   };
-  generalEntry.onclick = () => {
-    if (!dialog.isConnected || !dialog.open) return;
-    if (subpageEntry) restoreAppearanceRoot();
-    else selectSettingsPage(primaryBody, generalEntry, { focus: true });
-  };
+  generalEntry.onclick = () => showAppearancePage(primaryBody, "常规", generalEntry);
   diagnosticsEntry.onclick = () => {
-    if (!dialog.isConnected || !dialog.open || diagnosticsEntry.hidden) return;
-    showAppearancePage(diagnosticsPage, "诊断日志", diagnosticsEntry);
+    if (!diagnosticsEntry.hidden) showAppearancePage(diagnosticsPage, "诊断日志", diagnosticsEntry);
   };
-  if (androidContainer) entryButton.onclick = () => {
-    if (!dialog.isConnected || !dialog.open) return;
-    notificationPageVisible = false;
-    notificationPageRevision++;
-    notificationPageUnsubscribe?.();
-    notificationPageUnsubscribe = null;
-    activeNotificationPage?.systemSettingsButton.remove();
-    activeNotificationPage = null;
-    notificationPage?.remove();
-    notificationPage = null;
-    notificationPageVisible = true;
+  if (androidContainer) notificationEntry.onclick = () => {
+    if (!isOpen() || notificationOperations) return;
+    clearNotificationPage();
     const revision = ++notificationPageRevision;
     const page = element("div", "appearance-body appearance-settings-page appearance-subpage appearance-notifications-page");
     page.id = "appearance-notifications-page";
@@ -632,9 +585,7 @@ export function openAppearance() {
       categories.setAttribute("aria-disabled", String(!state?.settings.enabled));
       systemSettingsButton.disabled = busy || !state;
     };
-    const pageApi = { setBusy, systemSettingsButton,
-      syncShared() { if (state) renderStatus(state); } };
-    activeNotificationPage = pageApi;
+    activeNotificationPage = { setBusy, syncShared() { if (state) renderStatus(state); } };
     let changedVersion = 0;
     let queuedChangedStatus = null;
     const renderStatus = value => {
@@ -763,58 +714,60 @@ export function openAppearance() {
     void readSettings();
     updateNotificationOperationState();
   };
-  let closing = false;
-  const closeAppearance = returnValue => {
-    if (!dialog.open || closing) return;
-    closing = true;
-    // 用户要求 PC 设置立即开关；手机沿用 220ms 滑入/滑出及原生返回行为。
-    if (matchMedia("(min-width: 761px)").matches) {
-      dialog.close(returnValue); closing = false; return;
+  let leaving = null;
+  const returnFromSettings = () => {
+    if (!isOpen() || leaving !== null) return;
+    if (screen.dataset.settingsMobile !== "true" || matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      onBack(); return;
     }
-    dialog.classList.remove("appearance-screen-visible");
-    setTimeout(() => {
-      if (dialog.open) dialog.close(returnValue);
-      closing = false;
-    }, 220);
+    if (screen.contains(document.activeElement)) document.activeElement.blur();
+    // 手机保留 220ms 整页退出过渡，与 CSS 的入场/退出时长一致；等待期间不重复返回。
+    screen.dataset.settingsLeaving = "true";
+    screen.inert = true;
+    leaving = setTimeout(onBack, 220);
   };
+  headingButton.onclick = returnFromSettings;
+  if (loginReturn) loginReturn.onclick = returnFromSettings;
   const onNativeBack = event => {
-    if (!dialog.open || !dialog.isConnected || [...document.querySelectorAll("dialog[open]")].at(-1) !== dialog) return;
+    if (event.defaultPrevented || !isOpen()) return;
+    const dialog = [...document.querySelectorAll("dialog[open]")].at(-1);
+    if (dialog) {
+      if (dialog.id === "confirmation-dialog") { event.preventDefault(); dialog.close("cancel"); }
+      return;
+    }
     event.preventDefault();
-    if (activePopup?.trigger.closest("dialog") === dialog) closePopup(true);
-    else closeAppearance();
+    if (activePopup) closePopup(true);
+    else returnFromSettings();
   };
   const onAppearanceEscape = event => {
-    // 只处理顶层设置窗口；指令重新读取等确认弹窗继续使用自己的取消行为。
-    if (event.key !== "Escape" || event.isComposing || !dialog.open
-        || [...document.querySelectorAll("dialog[open]")].at(-1) !== dialog) return;
+    // 设置是普通页面；其上的确认弹窗优先处理返回，设置内先退出编辑或下拉，再返回原页面。
+    if (event.key !== "Escape" || event.defaultPrevented || event.isComposing || !isOpen() || $("dialog[open]")) return;
     // 外观输入先恢复未确认的 HEX/数值；捕获阶段不能抢在输入框的 Escape 处理前关闭整个设置页。
     if (event.target?.getAttribute?.("data-appearance-escape") === "restore") return;
     event.preventDefault();
     event.stopImmediatePropagation();
-    // 设置中的所有 Select 共用关闭顺序：先关闭弹层并恢复焦点，再响应下一次返回。
-    if (activePopup?.trigger.closest("dialog") === dialog) closePopup(true);
-    else closeAppearance();
+    if (activePopup) closePopup(true);
+    else returnFromSettings();
   };
   if (androidContainer) {
-    window.addEventListener("codex-elves-native-back", onNativeBack);
-  }
-  window.addEventListener("keydown", onAppearanceEscape, true);
-  if (androidContainer) {
+    // 原生返回先于隐藏会话的返回处理；有真正的弹窗时交还它自己的处理器。
+    window.addEventListener("codex-elves-native-back", onNativeBack, true);
+    const versionButton = find("#appearance-app-version");
     void getAndroidAppInfo().then(info => {
-      if (!info || !dialog.isConnected || !dialog.open || !versionButton.isConnected) return;
-      androidVersionLoaded = true;
+      if (!isOpen() || !info?.versionName) return;
       versionButton.textContent = `v${info.versionName}`;
       versionButton.disabled = !info.updateSupported;
       versionButton.title = info.updateSupported ? "点击检查更新" : "当前应用暂不支持在线更新";
       versionButton.setAttribute("aria-label", info.updateSupported
         ? `当前应用版本 v${info.versionName}，点击检查更新`
         : `当前应用版本 v${info.versionName}，暂不支持在线更新`);
-      versionButton.hidden = false;
+      find("#appearance-app-section").hidden = false;
     }).catch(() => {});
+    versionButton.onclick = () => {
+      if (isOpen() && !versionButton.disabled) postPlatformMessage("check-app-update");
+    };
   }
-  versionButton.onclick = () => {
-    if (dialog.isConnected && dialog.open && !versionButton.disabled) postPlatformMessage("check-app-update");
-  };
+  window.addEventListener("keydown", onAppearanceEscape, true);
   const modeButtons = new Map();
   for (const [mode, label] of [["auto", "自动"], ["light", "浅色"], ["dark", "深色"]]) {
     const control = button("", `${label}模式`, () =>
@@ -824,22 +777,22 @@ export function openAppearance() {
     preview.setAttribute("aria-hidden", "true");
     preview.append(element("span", "appearance-mode-sidebar"), element("span", "appearance-mode-lines"));
     control.append(preview, element("span", "appearance-mode-label", label));
-    modeButtons.set(mode, control); $("#appearance-theme-slot").append(control);
+    modeButtons.set(mode, control); find("#appearance-theme-slot").append(control);
   }
-  $("#appearance-preset-slot").append(selectControl("appearance-preset", "主题",
+  find("#appearance-preset-slot").append(selectControl("appearance-preset", "主题",
     Object.entries(appearanceThemes).map(([value, preset]) => ({ value, label: preset.label })), appearance.themePreset));
-  const syncAutomaticLightSetting = mountAutomaticThemeLightSetting($("#appearance-auto-light-setting"));
-  $("#appearance-project-thread-limit-slot").append(selectControl("appearance-project-thread-limit", "每个项目显示会话数",
+  const syncAutomaticLightSetting = mountAutomaticThemeLightSetting(find("#appearance-auto-light-setting"));
+  find("#appearance-project-thread-limit-slot").append(selectControl("appearance-project-thread-limit", "每个项目显示会话数",
     projectThreadLimits.map(value => ({ value: String(value), label: `${value}个` })), String(appearance.projectThreadLimit)));
-  const backgroundAction = $("#appearance-background-action", dialog);
-  const backgroundOpacityInput = $("#appearance-background-opacity", dialog);
+  const backgroundAction = find("#appearance-background-action");
+  const backgroundOpacityInput = find("#appearance-background-opacity");
   const syncBackgroundOpacity = bindAppearanceNumberValue(backgroundOpacityInput, backgroundOpacityMin, backgroundOpacityMax,
     () => appearance.backgroundOpacity, value => { appearance.backgroundOpacity = value; applyAppearance(true); }, "%");
-  $("#appearance-background-fit-slot").append(selectControl("appearance-background-fit", "图片铺法", [
+  find("#appearance-background-fit-slot").append(selectControl("appearance-background-fit", "图片铺法", [
     { value: "cover", label: "铺满裁切" }, { value: "contain", label: "完整不裁" }
   ], appearance.backgroundFit));
   // 用户要求只增加普通按钮配色，复用现有色盘、HEX 校验和主题/明暗隔离，不改其他设置项。
-  const colorHost = $("#appearance-colors", dialog);
+  const colorHost = find("#appearance-colors");
   const colorFields = [["accent", "强调色"], ["background", "背景"], ["foreground", "前景"], ["button", "按钮颜色"]];
   const getColor = name => name === "button"
     ? appearanceButtonColor(appearance.colors[appearance.theme]) ?? appearance.colors[appearance.theme].foreground
@@ -863,7 +816,7 @@ export function openAppearance() {
     row.append(element("span", "", label), control); colorHost.append(row);
     return { name, swatch, syncValue };
   });
-  const contrastInput = $("#appearance-contrast", dialog), contrastOutput = $("#appearance-contrast-value", dialog);
+  const contrastInput = find("#appearance-contrast"), contrastOutput = find("#appearance-contrast-value");
   const syncThemePreviews = () => {
     const selectedMode = appearance.themeMode === "auto" ? "auto" : appearance.theme;
     const modeColors = Object.fromEntries(["light", "dark"].map(mode =>
@@ -895,27 +848,27 @@ export function openAppearance() {
   const sync = () => {
     syncThemePreviews();
     syncAutomaticLightSetting();
-    setSelectValue($("#appearance-project-thread-limit"), String(appearance.projectThreadLimit));
-    $("#appearance-project-thread-limit").disabled = !connected || !sharedSettingsWritable(session);
-    $("#appearance-conversation-width").disabled = !connected || !sharedSettingsWritable(session);
-    $("#appearance-shared-settings-status", dialog).textContent = sharedSettingsState.saving ? "正在同步到所有客户端…"
+    setSelectValue(find("#appearance-project-thread-limit"), String(appearance.projectThreadLimit));
+    find("#appearance-project-thread-limit").disabled = !connected || !sharedSettingsWritable(session);
+    find("#appearance-conversation-width").disabled = !connected || !sharedSettingsWritable(session);
+    find("#appearance-shared-settings-status").textContent = sharedSettingsState.saving ? "正在同步到所有客户端…"
       : sharedSettingsState.error || (!sharedSettingsState.ready ? "正在读取服务端共享设置…" : session?.readOnly ? "共享设置为只读。" : "");
     const hasBackground = !!remoteBackground.dataUrl;
     backgroundAction.disabled = remoteBackgroundBusy;
     backgroundAction.replaceChildren(icon(hasBackground ? "trash" : "image"),
       element("span", "", hasBackground ? "移除" : "上传"));
     resetButton.disabled = remoteBackgroundBusy;
-    $("#appearance-background-preview").hidden = !hasBackground;
-    $("#appearance-background-name").textContent = remoteBackground.name;
-    if (hasBackground && $("#appearance-background-thumbnail").getAttribute("src") !== remoteBackground.dataUrl)
-      $("#appearance-background-thumbnail").src = remoteBackground.dataUrl;
-    if (!hasBackground) $("#appearance-background-thumbnail").removeAttribute("src");
+    find("#appearance-background-preview").hidden = !hasBackground;
+    find("#appearance-background-name").textContent = remoteBackground.name;
+    if (hasBackground && find("#appearance-background-thumbnail").getAttribute("src") !== remoteBackground.dataUrl)
+      find("#appearance-background-thumbnail").src = remoteBackground.dataUrl;
+    if (!hasBackground) find("#appearance-background-thumbnail").removeAttribute("src");
     backgroundOpacityInput.disabled = remoteBackgroundBusy || !hasBackground;
     syncBackgroundOpacity();
-    $("#appearance-background-fit").disabled = remoteBackgroundBusy || !hasBackground;
-    setSelectValue($("#appearance-background-fit"), appearance.backgroundFit);
-    $("#appearance-background-status").hidden = !remoteBackgroundError;
-    $("#appearance-background-status").textContent = remoteBackgroundError;
+    find("#appearance-background-fit").disabled = remoteBackgroundBusy || !hasBackground;
+    setSelectValue(find("#appearance-background-fit"), appearance.backgroundFit);
+    find("#appearance-background-status").hidden = !remoteBackgroundError;
+    find("#appearance-background-status").textContent = remoteBackgroundError;
     for (const { name, swatch, syncValue } of colorControls) {
       const color = getColor(name);
       swatch.style.setProperty("--swatch", color);
@@ -923,29 +876,29 @@ export function openAppearance() {
       swatch.setAttribute("aria-description", color.toUpperCase());
       if (activePopup?.trigger === swatch) activePopup.syncColor?.(color);
     }
-    if (document.activeElement !== $("#appearance-font")) $("#appearance-font").value = appearance.fontSize;
-    setSelectValue($("#appearance-preset"), appearance.themePreset);
+    if (document.activeElement !== find("#appearance-font")) find("#appearance-font").value = appearance.fontSize;
+    setSelectValue(find("#appearance-preset"), appearance.themePreset);
     for (const [id, value] of [["ui-font", appearance.uiFont], ["code-font", appearance.codeFont]])
-      setSelectValue($(`#appearance-${id}`, dialog), value);
+      setSelectValue(find(`#appearance-${id}`), value);
     for (const [id, value] of [["code-font-size", appearance.codeFontSize], ["conversation-width", appearance.conversationWidth]]) {
-      const control = $(`#appearance-${id}`, dialog);
+      const control = find(`#appearance-${id}`);
       if (document.activeElement !== control) control.value = value;
     }
-    setSelectValue($("#appearance-ui-font-weight", dialog), appearance.uiFontWeight);
-    setSelectValue($("#appearance-code-font-weight", dialog), appearance.codeFontWeight);
+    setSelectValue(find("#appearance-ui-font-weight"), appearance.uiFontWeight);
+    setSelectValue(find("#appearance-code-font-weight"), appearance.codeFontWeight);
     renderSessionInstances();
     const readingFontSize = currentFileReadingFontSize();
-    if (document.activeElement !== $("#appearance-file-reading-font")) $("#appearance-file-reading-font").value = readingFontSize;
-    $("#appearance-file-reading-font-reset").disabled = readingFontSize === fileReadingFontDefault;
+    if (document.activeElement !== find("#appearance-file-reading-font")) find("#appearance-file-reading-font").value = readingFontSize;
+    find("#appearance-file-reading-font-reset").disabled = readingFontSize === fileReadingFontDefault;
   };
   sync.lightReading = syncAutomaticLightSetting.lightReading;
   setSyncAppearanceThemeControls(sync);
   let settingsInstance = "";
   const permissionCache = settingsPageCache("permissions"), instructionCache = settingsPageCache("instructions");
-  const remoteSettings = mountRemoteSettings(dialog, { cache: instructionCache, loadInstances: settingsEnvironments,
+  const remoteSettings = mountRemoteSettings(screen, { cache: instructionCache, loadInstances: settingsEnvironments,
     preferredInstance: () => settingsInstance || activeInstanceId() });
   const instancePermissions = mountInstancePermissions({
-    page: $("#instance-permissions", dialog), element, selectControl, setSelectOptions, setSelectValue, api,
+    page: find("#instance-permissions"), element, selectControl, setSelectOptions, setSelectValue, api,
     getInstances: availableSessionInstances, readOnly: () => !session || session.readOnly || !connected,
     authorizationScope: () => privateInputScope(session),
     cache: permissionCache,
@@ -954,10 +907,10 @@ export function openAppearance() {
     onSaved(id, result) { rememberInstancePermissionCatalog(id, result); updateComposer(); }
   });
   const instancePages = new Map(instanceSettingPages.map(page => [page.id,
-    mountInstanceSettingsPage({ page: $(`#appearance-${page.id}-settings`, dialog), section: page.section,
+    mountInstanceSettingsPage({ page: find(`#appearance-${page.id}-settings`), section: page.section,
       getSelectedInstance: () => settingsInstance, setSelectedInstance: value => { settingsInstance = value; } })]));
-  mountShortcuts($("#appearance-shortcuts-settings", dialog));
-  const namingSettings = mountConversationNaming($("#appearance-naming-settings", dialog));
+  mountShortcuts(find("#appearance-shortcuts-settings"));
+  const namingSettings = mountConversationNaming(find("#appearance-naming-settings"));
   // 用户要求可提前准备的设置按操作意图预读：只在导航悬停或聚焦时准备目标，不因打开设置扫描全部 CLI。
   for (const [id, prepare] of [
     ["permissions", () => permissionCache.read(settingsInstance || activeInstanceId(), { background: true })],
@@ -968,9 +921,9 @@ export function openAppearance() {
         id ? settingsPageCache("naming-models").read(id, { background: true }) : null]);
     }]
   ]) {
-    const entry = $(`#appearance-${id}-entry`, dialog);
+    const entry = find(`#appearance-${id}-entry`);
     entry.onpointerenter = entry.onfocus = () => {
-      if (dialog.open && connected && session && privateInputScope(session) === sharedSettingsState.scope)
+      if (isOpen() && connected && session && privateInputScope(session) === sharedSettingsState.scope)
         void prepare().catch(() => {});
     };
   }
@@ -982,38 +935,39 @@ export function openAppearance() {
     // 拖动时只同步主题预览和百分比，不重复刷新无关设置项。
     applyAppearance(true); syncThemePreviews();
   };
-  $("#appearance-conversation-width", dialog).onchange = event => {
+  // 用户要求普通设置改动即保存；输入校验和原有共享设置回执不依赖页面返回或“完成”按钮。
+  find("#appearance-conversation-width").onchange = event => {
     const value = Number(event.target.value);
     if (!Number.isInteger(value) || value < conversationWidthMin || value > conversationWidthMax) {
       event.target.value = appearance.conversationWidth;
       notice(`会话正文宽度上限请填写 ${conversationWidthMin}～${conversationWidthMax}px。`, true); return;
     }
-    void saveSharedSettings({ conversationWidth: value }).catch(error => { sync(); notice(error.message, true); });
+    void saveSharedSettings({ conversationWidth: value }).catch(error => { if (isOpen()) sync(); notice(error.message, true); });
   };
-  $("#appearance-preset", dialog).onchange = event => {
+  find("#appearance-preset").onchange = event => {
     appearance.themePreset = event.target.value;
     appearance.colors = appearance.palettes[appearance.themePreset];
     applyAppearance(true); sync();
   };
   for (const [id, key] of [["ui-font", "uiFont"], ["code-font", "codeFont"]])
-    $(`#appearance-${id}`, dialog).onchange = event => {
+    find(`#appearance-${id}`).onchange = event => {
       const value = event.target.value.trim();
       if (!validFontFamily(value)) { event.target.value = appearance[key]; return; }
       appearance[key] = value; applyAppearance(true);
     };
   for (const [id, key] of [["ui-font-weight", "uiFontWeight"], ["code-font-weight", "codeFontWeight"]])
-    $(`#appearance-${id}`, dialog).onchange = event => {
+    find(`#appearance-${id}`).onchange = event => {
     const value = Number(event.target.value);
     if (![400, 500, 600].includes(value)) {
       event.target.value = appearance[key]; return;
     }
     appearance[key] = value; applyAppearance(true);
   };
-  $("#appearance-project-thread-limit").onchange = event => {
+  find("#appearance-project-thread-limit").onchange = event => {
     void saveSharedSettings({ projectThreadLimit: Number(event.target.value) })
-      .catch(error => { sync(); notice(error.message, true); });
+      .catch(error => { if (isOpen()) sync(); notice(error.message, true); });
   };
-  $("#appearance-background-input").onchange = async event => {
+  find("#appearance-background-input").onchange = async event => {
     const file = event.target.files?.[0]; event.target.value = "";
     if (!file || remoteBackgroundBusy) return;
     const operation = setRemoteBackgroundOperation(remoteBackgroundOperation + 1);
@@ -1037,7 +991,7 @@ export function openAppearance() {
   };
   backgroundAction.onclick = async () => {
     if (remoteBackgroundBusy) return;
-    if (!remoteBackground.dataUrl) { $("#appearance-background-input").click(); return; }
+    if (!remoteBackground.dataUrl) { find("#appearance-background-input").click(); return; }
     const operation = setRemoteBackgroundOperation(remoteBackgroundOperation + 1);
     setRemoteBackgroundBusy(true); setRemoteBackgroundError("");
     syncAppearanceThemeControls?.();
@@ -1055,26 +1009,26 @@ export function openAppearance() {
       }
     }
   };
-  $("#appearance-background-fit").onchange = event => {
+  find("#appearance-background-fit").onchange = event => {
     appearance.backgroundFit = event.target.value;
     applyAppearance(true); sync();
   };
   for (const [id, key, min, max] of [["font", "fontSize", 10, 20], ["code-font-size", "codeFontSize", 8, 24],
     ["file-reading-font", "fileReadingFontSize", fileReadingFontMin, fileReadingFontMax]]) {
-    bindAppearanceFontSize($(`#appearance-${id}`, dialog), min, max,
+    bindAppearanceFontSize(find(`#appearance-${id}`), min, max,
       () => key === "fileReadingFontSize" ? currentFileReadingFontSize() : appearance[key],
       value => { appearance[key] = value; applyAppearance(true); sync(); });
   }
-  $("#appearance-file-reading-font-reset").onclick = () => {
+  find("#appearance-file-reading-font-reset").onclick = () => {
     appearance.fileReadingFontSize = fileReadingFontDefault; applyAppearance(true); sync();
   };
-  $("#appearance-reset").onclick = async () => {
-    if (remoteBackgroundBusy || !dialog.isConnected || !dialog.open) return;
+  resetButton.onclick = async () => {
+    if (remoteBackgroundBusy || !isOpen()) return;
     const scope = privateInputScope(session);
     // 用户要求外观恢复先二次确认；名称明确为“恢复默认外观”，只恢复当前客户端外观，不重置共享设置。
     if (!await confirmAction("恢复默认外观",
       "将恢复当前客户端的默认配色、字体和字号，并移除背景图片。是否继续？",
-      "恢复默认外观", true) || remoteBackgroundBusy || !dialog.isConnected || !dialog.open
+      "恢复默认外观", true) || remoteBackgroundBusy || !isOpen()
         || scope !== privateInputScope(session)) return;
     const operation = setRemoteBackgroundOperation(remoteBackgroundOperation + 1);
     setRemoteBackgroundBusy(true); setRemoteBackgroundError(""); sync();
@@ -1099,59 +1053,38 @@ export function openAppearance() {
       }
     }
   };
-  $("#appearance-close").onclick = () => closeAppearance();
-  // 主导航只避让显示；仍用模态设置锁住背景，点击留出的导航不关闭或切页。
-  headingButton.onclick = () => closeAppearance();
-  dialog.oncancel = event => {
-    event.preventDefault();
-    if (activePopup?.trigger.closest("dialog") === dialog) closePopup(true);
-    else closeAppearance();
-  };
-  dialog.onclose = () => {
-    unsubscribeShared();
-    settingsResize?.disconnect();
-    window.removeEventListener("resize", syncSettingsOffset);
-    remoteSettings.dispose();
-    namingSettings.dispose();
-    instancePermissions.dispose();
-    for (const page of instancePages.values()) page.dispose();
-    if (syncAppearanceThemeControls === sync) setSyncAppearanceThemeControls(null);
-    dialog.classList.remove("appearance-screen-visible");
-    dialog.classList.remove("appearance-subpage-open");
-    notificationPageRevision++;
-    notificationPageVisible = false;
-    subpageEntry = null;
-    notificationPageUnsubscribe?.();
-    notificationPageUnsubscribe = null;
-    activeNotificationPage?.systemSettingsButton.remove();
-    activeNotificationPage = null;
-    notificationPage?.remove();
-    notificationPage = null;
-    window.removeEventListener("codex-elves-native-back", onNativeBack);
-    window.removeEventListener("keydown", onAppearanceEscape, true);
-    if (activePopup?.trigger.closest("dialog") === dialog) closePopup();
-    document.body.classList.toggle("modal-open", !!document.querySelector("dialog[open]"));
-    if (trigger?.isConnected && document.activeElement === document.body) trigger.focus();
-  };
   const unsubscribeShared = subscribeSharedSettings(change => {
-    if (!dialog.isConnected || !dialog.open) return;
+    if (!isOpen()) return;
     sync();
     // 原生通知服务可能先收到相同设置；页面须直接使用共享快照，不能等待本机再次发出变更事件。
     activeNotificationPage?.syncShared();
     activeNotificationPage?.setBusy(notificationOperations > 0);
     if (change.instance) {
-      if (!$("#appearance-permissions-page", dialog).hidden) instancePermissions.refreshInstance(change.instanceId);
-      if (change.instructionsChanged !== false && !$("#appearance-instructions-page", dialog).hidden)
+      if (!find("#appearance-permissions-page").hidden) instancePermissions.refreshInstance(change.instanceId);
+      if (change.instructionsChanged !== false && !find("#appearance-instructions-page").hidden)
         remoteSettings.refreshInstance(change.instanceId);
     }
   });
-  document.body.classList.add("modal-open");
-  dialog.showModal();
-  syncSettingsOffset();
   // 用户要求可行时提前准备实例设置；只预读本次当前实例，点击实例页时复用缓存或同一请求，不扫描其他 CLI。
   if (session && connected) void instancePages.get("types").show();
-  if (matchMedia("(min-width: 761px)").matches) dialog.classList.add("appearance-screen-visible");
-  else requestAnimationFrame(() => {
-    if (dialog.isConnected && dialog.open) dialog.classList.add("appearance-screen-visible");
-  });
+  find("#appearance-title").focus({ preventScroll: true });
+  return () => {
+    if (disposed) return;
+    disposed = true;
+    clearTimeout(leaving);
+    screen.inert = false;
+    delete screen.dataset.settingsLeaving;
+    loginMobileMedia?.removeEventListener("change", syncLoginLayout);
+    if (ownsPopup()) closePopup();
+    unsubscribeShared();
+    remoteSettings.dispose();
+    namingSettings.dispose();
+    instancePermissions.dispose();
+    for (const page of instancePages.values()) page.dispose();
+    if (syncAppearanceThemeControls === sync) setSyncAppearanceThemeControls(null);
+    clearNotificationPage();
+    window.removeEventListener("codex-elves-native-back", onNativeBack, true);
+    window.removeEventListener("keydown", onAppearanceEscape, true);
+    screen.replaceChildren();
+  };
 }

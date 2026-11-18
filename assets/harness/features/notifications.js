@@ -5,6 +5,7 @@ import { $ } from "../ui/dom.js";
 import { notice } from "../ui/notice.js";
 import { selectThread } from "../core/actions.js";
 import { pageLeaving, session } from "../core/state.js";
+import { showConversationPage } from "./main-navigation.js";
 import { initialAuthenticationRequired } from "./session/connection-state.js";
 
 export let pendingNotificationOpen = null;
@@ -21,6 +22,8 @@ function openNotificationThread(threadId) {
     pendingNotificationOpen = threadId;
     return;
   }
+  // 通知跳转需要显示目标会话，不能在已改为独立页面的设置后面切换。
+  showConversationPage();
   void selectThread(threadId).catch(error => notice(`无法打开通知关联的会话：${error.message}`, true));
 }
 export function drainPendingNotificationOpen() {

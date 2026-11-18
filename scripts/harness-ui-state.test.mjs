@@ -17,6 +17,7 @@ import { messageActionState, renderMessageActions } from "../assets/harness/mess
 async function navigationFixture(native = false, transport = native ? "desktop" : "remote",
   { mobile = false, android = false } = {}) {
   const source = await loadHarnessAppSource();
+  const document = { activeElement: null };
   const node = (tag, className = "") => ({
     tag, className, children: [], attributes: {}, dataset: {}, hidden: false, isConnected: true,
     classList: {
@@ -26,6 +27,9 @@ async function navigationFixture(native = false, transport = native ? "desktop" 
     },
     setAttribute(name, value) { this.attributes[name] = value; },
     removeAttribute(name) { delete this.attributes[name]; },
+    contains(target) { return target === this || this.children.some(child => child === target || child.contains?.(target)); },
+    focus() { document.activeElement = this; },
+    blur() { if (document.activeElement === this) document.activeElement = null; },
     append(...children) {
       for (const child of children) {
         child.remove?.();
@@ -58,13 +62,21 @@ async function navigationFixture(native = false, transport = native ? "desktop" 
   const openPage = page => opened.push(page);
   openPage.setVisible = value => visibility.push(value);
   openPage.dispose = () => callbacks.disposed++;
+  const settingViews = [];
   const context = {
+    document,
     session: { transport, capabilities: { management: true } },
     workspace, openPage, element: node, icon: name => ({ name }),
     button: (text, label, action, className) => Object.assign(node("button", className), { label, action }),
     closePopup() {}, togglePopup: control => { context.popup = control; }, openPopup() {},
     requestAnimationFrame: callback => animation.push(callback),
-    openSettings: () => callbacks.settings++, logout: () => callbacks.logout++,
+    openSettings: (host, { onBack }) => {
+      callbacks.settings++;
+      const record = { host, onBack, disposed: false };
+      settingViews.push(record);
+      return () => { record.disposed = true; };
+    },
+    logout: () => callbacks.logout++,
     matchMedia: () => media, isAndroidContainer: () => android,
     ...(native ? { __ELVES_CLIENT__: { open() {} } } : {}),
   };
@@ -74,7 +86,7 @@ async function navigationFixture(native = false, transport = native ? "desktop" 
   const [navigation] = context.navigation.shell.children;
   const footer = sidebar.children.find(child => child.className.includes("mobile-sidebar-footer"));
   return { context, workspace, messages, callbacks, opened, visibility, animation, sidebar, sidebarContent, footer, media, listeners,
-    navigation, settingsArea: navigation.children[1], buttons: navigation.children[0].children,
+    navigation, settingViews, settingsPage: context.navigation.settingsPage, settingsArea: navigation.children[1], buttons: navigation.children[0].children,
     settings: navigation.children[1].children[0] || footer.children[0].children[0],
     logout: footer?.children[0].children.find(child => child.id === "logout") };
 }
@@ -117,13 +129,47 @@ test("导航底部设置按客户端区分：Windows 直接打开，网页仅有
   assert.equal(web.context.popup, web.settings);
   assert.deepEqual(Array.from(web.settings.menuOptions, entry => entry.label), ["设置", "退出"]);
   web.settings.menuOptions[0].action();
+  assert.equal(web.settings.attributes["aria-current"], "page");
+  assert.equal(web.settingsPage.hidden, false);
   web.settings.menuOptions[1].action();
   assert.deepEqual(web.callbacks, { settings: 1, logout: 1, disposed: 0 });
   const native = await navigationFixture(true);
   native.settings.action();
   assert.equal(native.callbacks.settings, 1);
+  assert.equal(native.settings.attributes["aria-current"], "page");
   assert.equal(native.settings.menuOptions, undefined);
   assert.equal(native.context.popup, undefined);
+});
+
+test("设置作为主导航页面切换，保留会话节点与管理内容，返回前提交输入框失焦", async () => {
+  const fixture = await navigationFixture(true);
+  const { buttons, settings, settingsPage, settingViews, workspace, messages, context } = fixture;
+  buttons[2].action();
+  settings.action();
+  assert.equal(settingViews[0].host, settingsPage);
+  assert.equal(context.navigation.shell.children.at(-1), settingsPage);
+  assert.equal(context.navigation.management.hidden, true);
+  assert.equal(workspace.hidden && workspace.inert, true);
+  assert.equal(settings.attributes["aria-current"], "page");
+  assert.equal(buttons[2].attributes["aria-current"], undefined);
+  let blurred = false;
+  const input = { blur() { blurred = true; assert.equal(settingViews[0].disposed, false); } };
+  settingsPage.append(input);
+  context.document.activeElement = input;
+  settingViews[0].onBack();
+  assert.equal(blurred, true);
+  assert.equal(settingViews[0].disposed, true);
+  assert.equal(settingsPage.hidden, true);
+  assert.equal(context.navigation.management.hidden, false);
+  assert.equal(buttons[2].attributes["aria-current"], "page");
+  settings.action();
+  messages.scrollTop = 0;
+  buttons[0].action();
+  assert.equal(settingViews[1].disposed, true);
+  assert.equal(settings.attributes["aria-current"], undefined);
+  assert.equal(messages.scrollTop, 320);
+  assert.equal(workspace.draft, "保留当前输入");
+  assert.equal(context.navigation.shell.children[1], workspace);
 });
 
 test("手机网页与 Android 恢复列表底部独立设置和退出按钮，设置不再弹菜单", async () => {
@@ -140,6 +186,10 @@ test("手机网页与 Android 恢复列表底部独立设置和退出按钮，�
     fixture.settings.action();
     assert.equal(fixture.callbacks.settings, 1);
     assert.equal(fixture.context.popup, undefined);
+    assert.equal(fixture.settingsPage.dataset.settingsMobile, "true");
+    fixture.settingViews[0].onBack();
+    assert.equal(fixture.workspace.hidden, false);
+    assert.equal(fixture.context.document.activeElement, fixture.settings);
     fixture.logout.action();
     assert.equal(fixture.callbacks.logout, 1, "退出沿用传入的原有确认回调");
   }
@@ -174,6 +224,7 @@ test("Windows 窄窗口仍保留 PC 主导航与直接设置入口，不出现�
   assert.equal(fixture.buttons.length, 4);
   fixture.settings.action();
   assert.equal(fixture.callbacks.settings, 1);
+  assert.equal(fixture.settingsPage.dataset.settingsMobile, "false");
   assert.equal(fixture.context.popup, undefined);
 });
 
@@ -3472,16 +3523,16 @@ test("新会话设置默认仅 Codex、正文950和界面14代码阅读12px字�
 
 function appearanceResetHarness() {
   const confirmation = deferred(), deletion = deferred(), calls = [];
-  const control = {}, dialog = { open: true, isConnected: true };
+  const control = {}, screen = { hidden: false, isConnected: true };
   const original = { theme: "dark", fontSize: 18, themePreset: "custom" };
   const background = { dataUrl: "data:image/png;base64,fixture", name: "custom.png" };
   const defaults = { theme: "dark", fontSize: 14, themePreset: "chatgpt" };
   const context = vm.createContext({ nativeConnectionVersion: 1,
-    dialog, session: { device: { id: "appearance-device", createdAtMs: 1 } },
+    resetButton: control, isOpen: () => !screen.hidden && screen.isConnected,
+    session: { device: { id: "appearance-device", createdAtMs: 1 } },
     appearance: original, remoteBackground: background, remoteBackgroundBusy: false,
     remoteBackgroundError: "", remoteBackgroundOperation: 3, creating: true,
     privateInputScope: value => JSON.stringify([value?.device?.id, value?.device?.createdAtMs]),
-    $: selector => selector === "#appearance-reset" ? control : null,
     confirmAction: (...values) => { calls.push(["confirm", ...values]); return confirmation.promise; },
     deleteRemoteBackground: () => { calls.push(["deleteBackground"]); return deletion.promise; },
     defaultAppearance: theme => { calls.push(["defaults", theme]); return defaults; },
@@ -3496,9 +3547,9 @@ function appearanceResetHarness() {
     sync: () => calls.push(["sync"]),
     syncAppearanceThemeControls: () => calls.push(["syncControls"]),
   });
-  vm.runInContext(sourceSection('  $("#appearance-reset").onclick = async () => {',
-    '  $("#appearance-close").onclick ='), context);
-  return { context, control, dialog, original, background, defaults, calls, confirmation, deletion,
+  vm.runInContext(sourceSection("  resetButton.onclick = async () => {",
+    "  const unsubscribeShared ="), context);
+  return { context, control, screen, original, background, defaults, calls, confirmation, deletion,
     flush: () => new Promise(resolve => setImmediate(resolve)) };
 }
 
@@ -3538,14 +3589,14 @@ test("外观恢复默认仅在确认后删除背景并保存默认设置，完�
     ["updateComposer"], ["closeMenu"], ["loadSidebar", null, true], ["syncControls"]
   ]);
   assert.equal(h.context.remoteBackgroundBusy, false);
-  assert.equal(h.dialog.open, true);
+  assert.equal(h.screen.hidden, false);
 });
 
 test("外观恢复默认在关闭设置、更换授权或背景操作进行中时不执行，删除失败保留原设置", async () => {
   for (const change of ["closed", "removed", "device", "reauthorize", "busy"]) {
     const h = appearanceResetHarness(), operation = h.control.onclick();
-    if (change === "closed") h.dialog.open = false;
-    else if (change === "removed") h.dialog.isConnected = false;
+    if (change === "closed") h.screen.hidden = true;
+    else if (change === "removed") h.screen.isConnected = false;
     else if (change === "device") h.context.session.device.id = "another-device";
     else if (change === "reauthorize") h.context.session.device.createdAtMs = 2;
     else h.context.remoteBackgroundBusy = true;
@@ -5546,7 +5597,7 @@ function instructionSettingsHarness(api) {
     connected: true, session: { device: { id: "instruction-device" } },
     privateInputScope: () => "instruction-device", confirmAction: async () => true,
     $: (id, dialog) => dialog.nodes.get(id), sidebar: { projects: [] } });
-  vm.runInContext((sourceSection("const normalizeInstructionText =") + sourceSection("const appearanceFontFamilies =", "function openAppearance(")), context);
+  vm.runInContext((sourceSection("const normalizeInstructionText =") + sourceSection("const appearanceFontFamilies =", "function mountSettingsPage(")), context);
   function mount({ withDetectionControls = false } = {}) {
     const nodes = new Map();
     for (const name of ["content", "status", "save", "reload", "path"])
@@ -12365,7 +12416,7 @@ function sideCreationNavigationHarness() {
     selectedSkills: [{ name: "M-skill", path: "/M/SKILL.md" }], selectedGoal: null,
     editingQueuedMessage: null, editingMessage: null, pendingSteer: null,
     readScope: null, sidebar: null, sessionTools: null, recoveryErrorSilenceDepth: 0,
-    initialAuthenticationRequired: false, pendingNotificationOpen: null,
+    initialAuthenticationRequired: false, pendingNotificationOpen: null, showConversationPage() {},
     document: { body, hidden: false, querySelectorAll: () => [] },
     window: { addEventListener: (_name, listener) => listeners.push(listener) },
     matchMedia: () => ({ matches: true }), $: selector => nodes.get(selector),
@@ -15795,6 +15846,7 @@ test("编辑区主题提示接管并恢复 title，保留无障碍说明，触�
   document.documentElement.dataset.inputModality = "keyboard";
   listeners.get("focusin")({ target: trigger }); flush();
   assert.equal(nodes.length, 1);
+  assert.equal(nodes[0].style.left, "100px", "键盘聚焦仍以控件为锚点");
   trigger.hidden = true; observers.at(-1).callback();
   assert.equal(nodes.length, 0);
   assert.equal(trigger.getAttribute("title"), "选择模型");
@@ -15813,6 +15865,18 @@ test("编辑区主题提示接管并恢复 title，保留无障碍说明，触�
   listeners.get("pointerover")({ target: metrics, pointerType: "mouse" }); flush();
   assert.equal(nodes[0].className, "composer-tooltip composer-metrics-tooltip");
   listeners.get("pointerout")({ target: metrics, relatedTarget: null });
+  const side = document.documentElement.dataset;
+  side.workspaceSidePanel = side.workspaceSidePanelVisible = "true";
+  listeners.get("pointerover")({ target: metrics, pointerType: "mouse", clientX: 114, clientY: 203 });
+  listeners.get("pointermove")({ target: metrics, pointerType: "mouse", clientX: 204, clientY: 226 });
+  flush();
+  assert.equal(nodes[0].style.left, "144px", "用侧边页最后一次悬停的鼠标横坐标居中");
+  assert.equal(nodes[0].style.top, "192px", "鼠标上方 6px，不使用控件上边缘");
+  listeners.get("pointermove")({ target: metrics, pointerType: "mouse", clientX: 130, clientY: 220 });
+  assert.equal(nodes[0].style.left, "144px", "气泡显示后不随鼠标抖动");
+  side.workspaceSidePanelVisible = "false"; observers.at(-1).callback();
+  assert.equal(nodes.length, 0, "隐藏侧边标签时收起原气泡");
+  side.workspaceSidePanelVisible = "true";
   const compaction = element("button");
   const details = "压缩模型：actual-model\n压缩前：1,000 Token";
   compaction.isCompaction = true; compaction.setAttribute("title", details);
@@ -15960,6 +16024,48 @@ test("Token hover 按当前轮次单行展示实测字段，未返回字段整�
   h.advance(2001); c.syncComposerMetrics();
   h.complete(2, { firstTokenMs: null, durationMs: null, cacheHitRate: null }); await h.flush();
   assert.equal(h.node.title, "");
+});
+
+test("Token hover 只展示本轮工具实测区间并集和去重后的上下文压缩耗时", async () => {
+  const h = composerMetricsHarness(), c = h.context;
+  const turn = c.turns.get("turn-current");
+  const tool = (id, fields) => ({ id, type: "commandExecution", status: "completed", ...fields });
+  const compact = (id, fields) => ({ id, type: "contextCompaction", status: "completed", ...fields });
+  Object.assign(turn, { turnStartedAtMs: 1000, turnCompletedAtMs: 30000, itemsComplete: true, items: [
+    tool("parallel-a", { startedAtMs: 2000, completedAtMs: 6000 }),
+    tool("parallel-b", { startedAtMs: 4000, completedAtMs: 8000 }),
+    tool("event-pair", { startedAtMs: 9500, hoverObservedStartedAtMs: 10000, hoverObservedCompletedAtMs: 12000 }),
+    tool("different-clocks", { startedAtMs: 14000, hoverObservedCompletedAtMs: 16000 }),
+    tool("outside-turn", { startedAtMs: 200, completedAtMs: 1500 }),
+    tool("unsettled", { startedAtMs: 18000, completedAtMs: 22000, status: "inProgress" }),
+    tool("question", { type: "dynamicToolCall", tool: "request_user_input", startedAtMs: 18000, completedAtMs: 22000 }),
+    compact("compact-a", { nativeId: "native-a", durationMs: 1500, completedAtMs: 13500 }),
+    compact("duplicate-a", { nativeId: "native-a", startedAtMs: 11000, completedAtMs: 13500 }),
+    compact("compact-b", { hoverObservedStartedAtMs: 14000, hoverObservedCompletedAtMs: 15500 }),
+    compact("finish-only", { hoverObservedCompletedAtMs: 16000 }),
+    compact("noop", { outcome: "noop", durationMs: 5800 }),
+    compact("manual", { source: "manual", durationMs: 1000 }),
+  ] });
+  c.syncComposerMetrics(); h.complete(); await h.flush();
+  assert.match(h.node.title, /工具耗时 8s（按事件计时） · 上下文压缩耗时 3s（按事件计时）$/u);
+  assert.equal(h.text(), "48tk/s  本轮 20步 1m  总 5m", "新增数据不进入底栏");
+  assert.equal(h.requests.length, 1, "新增数据不发起额外读取");
+  turn.itemsComplete = false; c.messageVersion++; c.renderComposerMetrics();
+  assert.doesNotMatch(h.node.title, /工具耗时|压缩耗时/u);
+  turn.itemsComplete = true; turn.items = [tool("zero", { startedAtMs: 2000, completedAtMs: 2000 })];
+  c.messageVersion++; c.renderComposerMetrics();
+  assert.match(h.node.title, /工具耗时 0 毫秒$/u, "同一个轮次对象发生实时变化后仍重新计算");
+  c.turns.set("next-turn", { id: "next-turn", items: turn.items }); c.renderComposerMetrics();
+  assert.equal(h.node.title, "", "等新轮统计时不沿用上一轮的 hover");
+
+  const claude = composerMetricsHarness(), ctx = claude.context;
+  ctx.backend = "claude";
+  ctx.turns.get("turn-current").items = [
+    tool("native", { toolCallAtMs: 1000, toolResultAtMs: 1250 }),
+    tool("other-clock", { toolCallAtMs: 2100, completedAtMs: 5300 }),
+  ];
+  ctx.syncComposerMetrics(); claude.complete(0, { source: "claude-native" }); await claude.flush();
+  assert.match(claude.node.title, /工具耗时 250 毫秒（调用至结果）$/u);
 });
 
 test("缓存倒计时在总 Token 后显示，满一分钟用分钟，到期隐藏", async () => {

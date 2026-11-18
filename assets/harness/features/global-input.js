@@ -42,7 +42,7 @@ export function installGlobalInputHandlers() {
   window.addEventListener("blur", checkModelMenuFocus);
   document.addEventListener("keydown", event => {
     if (event.isComposing) return;
-    if (handleSideThreadShortcut(event)) return;
+    if (!$(".workspace[hidden]") && handleSideThreadShortcut(event)) return;
     if (event.key === "Tab") document.documentElement.dataset.inputModality = "keyboard";
     if (event.key === "Escape") {
       if (queueDrag) { event.preventDefault(); finishQueueDrag(); return; }

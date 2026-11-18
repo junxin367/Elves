@@ -25,7 +25,7 @@ import { app, connected, creating, nativeConnectionVersion, selectedId, session,
 import { api } from "./api.js";
 import { disposeMainNavigation, isElvesClient, mountMainNavigation } from "./main-navigation.js";
 import { createManagementPages } from "./management-frame.js";
-import { openAppearance } from "./appearance/dialog.js";
+import { mountSettingsPage } from "./appearance/dialog.js";
 import { setApprovalSignature } from "./approval-state.js";
 import { fitClaudeUsageTip, mountClaudeUsage, resetClaudeUsage } from "./composer/claude-usage.js";
 import { closeSkillMenu, fitApprovalArea, fitComposerMenu, renderModelMenu } from "./composer/composer-menus.js";
@@ -407,7 +407,7 @@ export function shell() {
     }
     catch (error) { notice(error.message, true); if (settingsButton.isConnected) settingsButton.disabled = false; }
   };
-  mountMainNavigation({ workspace, openSettings: openAppearance, logout, openPage: createManagementPages() });
+  mountMainNavigation({ workspace, openSettings: mountSettingsPage, logout, openPage: createManagementPages() });
   $("#connection-state").onclick = refreshConnectionFromIndicator;
   const toolsTrigger = $("#open-session-tools");
   toolsTrigger.append(icon("tools"));

@@ -1,4 +1,4 @@
-// 用户要求四个主入口固定排序，切换管理页面时保留当前会话、草稿、侧边标签及阅读位置。
+// 用户要求四个主入口固定排序，设置固定底部；切页保留当前会话、草稿、侧边标签及阅读位置。
 import { button, element } from "../ui/dom.js";
 import { icon } from "../ui/icons.js";
 import { closePopup, openPopup, togglePopup } from "../ui/popup.js";
@@ -44,17 +44,29 @@ export function mountMainNavigation({ workspace, openSettings, logout, openPage 
   const management = element("main", "management-workspace");
   management.id = "management-workspace";
   management.hidden = true;
+  const settingsPage = element("main", "appearance-screen");
+  settingsPage.id = "settings-workspace";
+  settingsPage.hidden = true;
   let current = "conversation", savedPosition = null;
+  let settingsFrom = "conversation", disposeSettings = null;
   const items = mainNavigationItems.filter(item => item.id === "conversation" || canManageHarness());
   const controls = new Map();
+  const canChoose = id => id === "conversation" || id === "settings"
+    || canManageHarness() && items.some(item => item.id === id);
   const choose = id => {
-    if (current === id || !items.some(item => item.id === id)
-        || id !== "conversation" && !canManageHarness()) return;
+    if (current === id || !canChoose(id)) return;
     closePopup();
+    if (current === "settings") {
+      // 数值框失焦时保存有效值；主动切页时先失焦，再卸载设置，不能吞掉最后一次编辑。
+      if (settingsPage.contains(document.activeElement)) document.activeElement.blur();
+      disposeSettings?.();
+      disposeSettings = null;
+    }
     if (current === "conversation") {
       const messages = workspace.querySelector("#messages");
       savedPosition = messages ? { node: messages, top: messages.scrollTop } : null;
     }
+    if (id === "settings") settingsFrom = current;
     current = id;
     for (const [page, control] of controls) {
       control.classList.toggle("selected", page === current);
@@ -64,13 +76,23 @@ export function mountMainNavigation({ workspace, openSettings, logout, openPage 
     // 隐藏而不销毁会话 DOM，实时消息和会话操作继续使用原来的实例与授权。
     workspace.hidden = current !== "conversation";
     workspace.inert = workspace.hidden;
-    management.hidden = current === "conversation";
+    // 设置与会话管理占同一内容列并共享选中状态；只隐藏会话或管理页，不用弹窗锁住主导航。
+    settingsPage.hidden = current !== "settings";
+    management.hidden = current === "conversation" || current === "settings";
     openPage.setVisible?.(!management.hidden);
     if (current === "conversation") {
       if (savedPosition?.node.isConnected) savedPosition.node.scrollTop = savedPosition.top;
       requestAnimationFrame(() => {
         if (current === "conversation" && savedPosition?.node.isConnected)
           savedPosition.node.scrollTop = savedPosition.top;
+      });
+    } else if (current === "settings") {
+      disposeSettings = openSettings(settingsPage, {
+        onBack: () => {
+          const destination = canChoose(settingsFrom) ? settingsFrom : "conversation";
+          choose(destination);
+          (mobileNavigation ? controls.get("settings") : controls.get(destination))?.focus({ preventScroll: true });
+        }
       });
     } else {
       management.setAttribute("aria-label", items.find(page => page.id === current).label);
@@ -91,10 +113,12 @@ export function mountMainNavigation({ workspace, openSettings, logout, openPage 
   }
   const settings = button("", "设置", () => {
     // 用户要求手机恢复旧版底部两个独立按钮；PC 网页保留菜单，Windows 仍直接打开设置。
-    if (isElvesClient() || mobileNavigation) openSettings();
+    if (isElvesClient() || mobileNavigation) choose("settings");
     else togglePopup(settings);
   }, "main-navigation-button");
   settings.id = "appearance-button";
+  settings.dataset.page = "settings";
+  controls.set("settings", settings);
   settings.append(icon("settings"));
   if (!isElvesClient()) {
     settings.setAttribute("aria-haspopup", "menu");
@@ -102,7 +126,7 @@ export function mountMainNavigation({ workspace, openSettings, logout, openPage 
     settings.popupDirection = "up";
     settings.popupWidth = 160;
     settings.menuOptions = [
-      { label: "设置", icon: "settings", action: openSettings },
+      { label: "设置", icon: "settings", action: () => choose("settings") },
       { label: "退出", icon: "logout", action: logout }
     ];
     settings.onkeydown = event => {
@@ -126,13 +150,17 @@ export function mountMainNavigation({ workspace, openSettings, logout, openPage 
     if (mobile !== mobileNavigation) closePopup();
     mobileNavigation = mobile;
     shell.dataset.mobileNavigation = String(mobile);
+    settingsPage.dataset.settingsMobile = String(mobile);
     footer.hidden = !mobile;
     settings.className = mobile ? "footer-button" : "main-navigation-button";
+    settings.classList.toggle("selected", current === "settings");
     settings.replaceChildren(icon("settings"), ...(mobile ? [element("span", "", "设置")] : []));
     if (mobile || isElvesClient()) {
       settings.removeAttribute("aria-haspopup");
       settings.removeAttribute("aria-expanded");
+      settings.setAttribute("aria-controls", settingsPage.id);
     } else {
+      settings.removeAttribute("aria-controls");
       settings.setAttribute("aria-haspopup", "menu");
       settings.setAttribute("aria-expanded", "false");
     }
@@ -144,11 +172,12 @@ export function mountMainNavigation({ workspace, openSettings, logout, openPage 
   chooseNavigation = choose;
   navigation.append(pages, settingsArea);
   workspace.before(shell);
-  shell.append(navigation, workspace, management);
+  shell.append(navigation, workspace, management, settingsPage);
   disposeNavigation = () => {
     mobileMedia.removeEventListener("change", syncMobileNavigation);
     footer.remove();
+    disposeSettings?.();
     openPage.dispose?.();
   };
-  return { choose, shell, management };
+  return { choose, shell, management, settingsPage };
 }

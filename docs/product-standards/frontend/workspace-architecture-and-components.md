@@ -27,7 +27,7 @@ Elves 与 Harness 共用工作区网页，位于 `assets/harness/`。会话工�
 | `messages/` | 正文条目 `items.js` 与条目展示 `item-presentation.js`、用户消息 `user-content.js`、消息编辑 `message-edit.js`、媒体 `media.js` 与 `media-state.js`、工具输出 `tool-output.js` 与工具识别 `tool-info.js`、子代理 `subagents.js`、活动分组 `activity.js` 与 `activity-state.js`、变更文件 `edited-files.js` |
 | `queue/` | 排队消息 `queue.js`、队列共享状态 `state.js`、排队编辑 `queued-edit.js` 与恢复 `queued-edit-recovery.js`、发送显示 `sent-display.js` |
 | `goal/` | 目标输入 `composer.js` 与提交确认 `composer-submission.js`、目标状态 `status.js`、共享状态 `state.js` |
-| `appearance/` | 外观模型与主题 `theme.js`、外观应用 `apply.js`、设置对话框 `dialog.js` |
+| `appearance/` | 外观模型与主题 `theme.js`、外观应用 `apply.js`、设置页面 `dialog.js` |
 | `settings/` | 环境、指令与回顾设置 `remote-settings.js` |
 | 根 | 接口调用 `api.js`、页面骨架 `shell.js` 与共享引用 `shell-state.js`、审批面板 `approvals.js`、审批请求 `approval-requests.js` 与状态 `approval-state.js`、通知 `notifications.js`、Claude 控制提示 `claude-notices.js`、全局输入 `global-input.js`、本机文件 `local-files.js` |
 
@@ -59,6 +59,8 @@ Elves 与 Harness 共用工作区网页，位于 `assets/harness/`。会话工�
 ## 统一导航与共享管理页面
 
 `features/main-navigation.js` 按[主导航规范](../core/product-behavior.md#统一左侧主导航)挂载导航，切换时隐藏而不销毁会话 DOM；`features/management-frame.js` 保留单个管理 iframe，负责页面切换、主题同步、配置更新事件和会话删除回传。因旧容器会为缓存文档返回禁止嵌入响应头，父页读取固定同源 `/management/index.html` 后写入 `srcdoc`；脚本与样式均使用 `/management/` 绝对资源路径，API 沿用当前服务 Cookie。消息须同时检查 Origin、frame 窗口及当前设备，授权变化卸载整个管理页。
+
+[设置页](../core/product-behavior.md#远程设置分类与实例配置)由主导航在独立内容区挂载，和管理 iframe 分开；登录页使用同一个设置挂载函数，返回时显示原登录表单。离开设置清理当次页面的监听与读取结果订阅，各分类仍通过自身接口保存。
 
 管理前端源码位于 `apps/elves-management/src/ManagementApp.tsx`，已有页面组件在 `management-screens.tsx` 中复用；Rust 管理命令位于 `crates/elves-harness/src/management/`，不再生成管理器二进制。前端修改后先运行 `npm --prefix apps/elves-management run check` 和 `run build:frontend`，再构建内嵌网页的客户端。Git 只保存源码、配置与依赖锁定文件；生成的 `assets/harness/management/` 整体忽略，不提交入口 HTML 或哈希资源。直接运行 Cargo 时若生成资源缺失，构建明确失败并提示先准备前端。
 

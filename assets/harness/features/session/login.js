@@ -12,7 +12,7 @@ import {
 } from "../../core/state.js";
 import { randomId } from "../../core/util.js";
 import { api } from "../api.js";
-import { openAppearance } from "../appearance/dialog.js";
+import { mountSettingsPage } from "../appearance/dialog.js";
 import { disposeMainNavigation, isElvesClient } from "../main-navigation.js";
 import { setApprovalSignature } from "../approval-state.js";
 import { resetNewChatBranch, setCreationProject } from "../composer/creation-state.js";
@@ -96,7 +96,6 @@ export function showLogin() {
   setSidebarBusy(false);
   setSidebarPreferenceScope(null);
   $("#confirmation-dialog")?.close("cancel");
-  $("#appearance-dialog")?.close();
   app.replaceChildren();
   const page = element("div", "pair-page");
   const panel = element("main", "pair-panel");
@@ -137,6 +136,7 @@ export function showLogin() {
   form.append(label, field, hint, submit, status);
   let submitting = false, authenticated = false, loginLocked = false, checkingLoginStatus = true;
   let statusRequest = null, statusTimer = null, lockVersion = 0, disposed = false, pageHidden = false, loginStatusChecked = false;
+  let disposeLoginSettings = null;
   function setError(message = "", invalid = false) {
     hint.textContent = message;
     hint.hidden = !message;
@@ -221,6 +221,7 @@ export function showLogin() {
   }
   setLoginPageCleanup(() => {
     disposed = true;
+    disposeLoginSettings?.();
     stopLoginStatusRead();
     document.removeEventListener("visibilitychange", handleLoginVisibility);
     window.removeEventListener("pagehide", handleLoginPageHide);
@@ -309,7 +310,20 @@ export function showLogin() {
   const helpTitle = element("summary"); helpTitle.append(document.createTextNode("在哪里获取访问密钥？"), icon("chevron"));
   help.append(helpTitle, element("p", "muted", "访问密钥由Elves 的「远程会话」页面设置，请使用设置时保存的密钥。它不是 OpenAI API Key。"));
   const footer = element("footer", "pair-footer");
-  const appearanceButton = button("", "设置", openAppearance, "pair-appearance-button text-button");
+  const appearanceButton = button("", "设置", () => {
+    if (disposed || disposeLoginSettings) return;
+    // 登录前没有主导航；设置仍作为整页显示，返回时恢复原登录表单，不重新授权。
+    const screen = element("main", "appearance-screen appearance-login-screen");
+    page.hidden = page.inert = true;
+    app.append(screen);
+    const unmount = mountSettingsPage(screen, { fromLogin: true, onBack: () => {
+      if (screen.contains(document.activeElement)) document.activeElement.blur();
+      disposeLoginSettings?.();
+      page.hidden = page.inert = false;
+      appearanceButton.focus({ preventScroll: true });
+    } });
+    disposeLoginSettings = () => { unmount(); screen.remove(); disposeLoginSettings = null; };
+  }, "pair-appearance-button text-button");
   appearanceButton.append(icon("settings"), element("span", "", "设置"));
   footer.append(element("small", "muted", "密钥勿外传"), appearanceButton);
   panel.append(heading, form, help, footer); page.append(panel); app.append(page); updateForm();

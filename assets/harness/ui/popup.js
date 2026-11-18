@@ -67,7 +67,7 @@ export function openPopup(trigger, { query = "", edge = null, focus = true, focu
   const choices = selecting ? trigger.selectOptions : trigger.menuOptions;
   activePopup = { node, trigger, list, input, query, position, index: Math.max(0, choices.findIndex(option => option.value === trigger.value)), choices: [] };
   trigger.setAttribute("aria-expanded", "true"); trigger.setAttribute("aria-controls", node.id);
-  const host = trigger.closest("dialog") || document.body;
+  const host = trigger.closest("dialog,[data-popup-host]") || document.body;
   if (trigger.popupDismissLayer) {
     const dismiss = element("div", "session-tools-menu-dismiss");
     dismiss.onpointerdown = event => { event.preventDefault(); event.stopPropagation(); };
