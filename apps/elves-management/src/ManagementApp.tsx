@@ -327,15 +327,17 @@ export function App() {
       if (event.data?.type === "management-config-changed") void checkConfiguration();
       if (event.data?.type === "management-theme" && ["light", "dark"].includes(event.data.theme)) {
         setTheme(event.data.theme);
-        document.documentElement.classList.toggle("dark", event.data.theme === "dark");
-        document.documentElement.classList.toggle("light", event.data.theme === "light");
-        // 仅普通按钮接收用户自定义颜色；旧页面和未自定义的主题保留原配色，不能残留上一个主题的按钮色。
-        document.documentElement.dataset.customButtonColor = String(event.data.customButtonColor === true);
+        const root = document.documentElement;
+        const { colors } = event.data;
+        root.classList.toggle("dark", event.data.theme === "dark");
+        root.classList.toggle("light", event.data.theme === "light");
+        // 用户要求管理卡片与设置卡片沿用默认主题的同一套派生色；旧父页回退时，卡片底色与按钮配色须成对使用旧表面。
+        const cardButtonSource = hslColor(colors?.["appearance-card-bg"]) === null ? "button-composer" : "button-card";
         // 外观仍按当前客户端保存；管理页只继承主工作区已确认的配色和字体，不另建一套主题偏好。
         // 原有 primary 语义保持中性前景；普通按钮单独继承按钮色，品牌与表单继续使用原强调色。
         // 旧网页包缺少字段时按同一前景/背景降级，不将按钮颜色传播到其他控件。
         for (const [token, sources] of Object.entries({
-          background: ["bg"], foreground: ["text"], card: ["composer-bg", "bg"], "card-foreground": ["text"],
+          background: ["bg"], foreground: ["text"], card: ["appearance-card-bg", "composer-bg", "bg"], "card-foreground": ["text"],
           popover: ["control-bg", "side"], "popover-foreground": ["text"],
           primary: ["primary-bg", "text"], "primary-foreground": ["primary-text", "bg"],
           secondary: ["side"], "secondary-foreground": ["text"], muted: ["hover"],
@@ -347,22 +349,22 @@ export function App() {
           "control-accent-foreground": ["on-accent", "bg"],
           "managed-selection": ["selection-bg", "hover"], "managed-selection-text": ["selection-text", "text"]
         })) {
-          const value = sources.map(color => hslColor(event.data.colors?.[color], event.data.colors?.bg)).find(Boolean);
-          if (value) document.documentElement.style.setProperty(`--${token}`, value);
+          const value = sources.map(color => hslColor(colors?.[color], colors?.bg)).find(Boolean);
+          if (value) root.style.setProperty(`--${token}`, value);
         }
-        const root = document.documentElement;
-        // 普通按钮的各表面令牌由同源父页派生；旧缓存未提供某一整组时回退到页面组，不能保留上一主题的值。
-        for (const [target, source] of [["managed-button", "button"], ["managed-button-card", "button-composer"],
+        // 不以是否自定义按钮色为条件：未配置的主题也接收同一套中性三态；缺少表面组时不保留上一主题的值。
+        for (const [target, source] of [["managed-button", "button"], ["managed-button-card", cardButtonSource],
           ["managed-button-modal", "button-control"]]) {
           const variants = ["bg", "text", "hover", "active"].map(part =>
-            [part, hslColor(event.data.colors?.[`${source}-${part}`])] as const);
+            [part, hslColor(colors?.[`${source}-${part}`])] as const);
           const complete = variants.every(([, value]) => value !== null);
+          if (target === "managed-button") root.dataset.managedButtonPalette = String(complete);
           for (const [part, value] of variants) {
             const name = part === "bg" ? `--${target}` : `--${target}-${part}`;
             if (complete && value) root.style.setProperty(name, value);
             else root.style.removeProperty(name);
           }
-          const outline = event.data.colors?.[`${source}-outline`];
+          const outline = colors?.[`${source}-outline`];
           if (complete && typeof outline === "string" && /^#[0-9a-f]{6}$/i.test(outline))
             root.style.setProperty(`--${target}-outline`, outline);
           else if (complete) root.style.setProperty(`--${target}-outline`, "transparent");

@@ -431,7 +431,7 @@ export function appearanceThemeColors(theme, palette) {
   const primaryHover = appearanceAccessibleColor(mixColor(foreground, background, .08), primaryText);
   const primaryActive = appearanceAccessibleColor(mixColor(foreground, background, .14), primaryText);
   const customButton = appearanceButtonColor(palette);
-  // 设置卡片沿用 68% 输入框表面 + 32% 页面背景；背景和按钮引用同一份舍入后的实色。
+  // 设置和管理卡片共用 68% 输入框表面 + 32% 页面背景；背景和按钮引用同一份舍入后的实色。
   const card = mixColor(background, surfaces["composer-bg"], .68);
   const buttons = {};
   // 与 style.css 的审批/设置卡片及管理页的 card/popover 表面对齐；不改变发送、危险、强调按钮和无自定义色主题。

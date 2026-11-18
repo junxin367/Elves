@@ -7292,11 +7292,12 @@ input[type="checkbox"],input[type="radio"]{accent-color:hsl(var(--control-accent
   --normal-button-active:var(--managed-button-modal-active,var(--managed-button-active,var(--primary)));
   --normal-button-outline:var(--managed-button-modal-outline,var(--managed-button-outline,transparent))
 }
-:root[data-custom-button-color="true"] .normal-button{
+/* 同一组字色、底色与悬停/按下色也适用于没有自定义按钮色的主题；尚未收到完整色组时保留组件默认样式。 */
+:root[data-managed-button-palette="true"] .normal-button{
   background:hsl(var(--normal-button-bg,var(--managed-button,var(--primary))));
   color:hsl(var(--normal-button-text,var(--managed-button-text,var(--primary-foreground))));
   outline:1px solid var(--normal-button-outline,var(--managed-button-outline,transparent));outline-offset:-1px;
   transition-property:transform,opacity
 }
-:root[data-custom-button-color="true"] .normal-button:hover:not(:disabled){background:hsl(var(--normal-button-hover,var(--managed-button-hover,var(--primary))))}
-:root[data-custom-button-color="true"] .normal-button:active:not(:disabled){background:hsl(var(--normal-button-active,var(--managed-button-active,var(--primary))))}
+:root[data-managed-button-palette="true"] .normal-button:hover:not(:disabled){background:hsl(var(--normal-button-hover,var(--managed-button-hover,var(--primary))))}
+:root[data-managed-button-palette="true"] .normal-button:active:not(:disabled){background:hsl(var(--normal-button-active,var(--managed-button-active,var(--primary))))}

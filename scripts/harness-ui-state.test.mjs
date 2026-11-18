@@ -15553,7 +15553,7 @@ test("自定义普通主按钮按实际页面、卡片和弹窗背景派生白�
   assert.equal(colors["appearance-card-bg"], "#2d2d2d");
   assert.equal(colors["button-card-bg"], "#12883e"); assert.equal(colors["button-card-text"], "#ffffff");
   assert.equal(colors["button-composer-bg"], "#16a34a");
-  assert.equal(colors["button-composer-text"], "#000000", "更亮的管理页卡片不能借用页脚的白字方案");
+  assert.equal(colors["button-composer-text"], "#000000", "更亮的输入框表面不能借用页脚的白字方案");
   assert.equal(colors["button-control-bg"], "#16a34a", "8 位颜色不能满足两项下限时保留原色");
   assert.deepEqual(palette, saved);
   const light = context.appearanceThemeColors("light", { ...palette, background: "#ffffff", foreground: "#3b3b3b", contrast: 45 });
