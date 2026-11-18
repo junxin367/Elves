@@ -65,7 +65,7 @@ export function mountConversationNaming(page) {
     field.append(copy, control); card.append(field);
     return field;
   };
-  row(namingLabels.enabled, "首条普通消息成功接收后生成标题，适用于所有 Codex、Claude 实例的主会话。", enabled);
+  row(namingLabels.enabled, "首条普通消息成功接收后生成标题，适用于同一 Harness 的 Codex、Claude 主会话及 Codex 侧边会话。", enabled);
   // 用户要求实例与模型是关联选择：同一行从左到右先实例、后模型；切换实例后清空旧模型并重新读取目录。
   const targetSelectors = element("div", "conversation-naming-target-selectors");
   targetSelectors.append(instances, models);

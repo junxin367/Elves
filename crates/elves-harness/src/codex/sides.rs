@@ -1208,6 +1208,7 @@ impl CodexHarness {
         let generation = self.side_generation(id).await?;
         match action {
             "send" => self.send_side(id, payload, authorization).await,
+            "rename" => self.rename_side(id, payload, authorization).await,
             "removeQueued" | "reorderQueued" | "beginQueuedEdit" | "editQueued"
             | "cancelQueuedEdit" | "dismissQueuedEdit" => {
                 self.edit_queue(id, action, payload, authorization).await
@@ -1321,6 +1322,44 @@ impl CodexHarness {
         authorization: &HarnessAuthorization,
     ) -> anyhow::Result<Value> {
         self.submit_side(id, payload, authorization, false).await
+    }
+
+    async fn rename_side(
+        &self,
+        id: &str,
+        payload: &Value,
+        authorization: &HarnessAuthorization,
+    ) -> anyhow::Result<Value> {
+        let title = required(payload, "title")?.trim();
+        if title.is_empty() || title.chars().count() > 200 {
+            return Err(error(400, "标题需为 1–200 个字符"));
+        }
+        let expected = payload["expectedName"].as_str().map(str::to_owned);
+        let permit = authorization.prepare_dispatch().await?;
+        let mut projection = self.projection.lock().await;
+        let side = projection
+            .sides
+            .threads
+            .get(id)
+            .ok_or_else(|| error(409, "此会话不是服务创建的侧边会话"))?;
+        if side.closed || side.expired || side.closing {
+            return Err(error(410, "侧边会话已关闭，不能修改名称"));
+        }
+        let current = side.metadata["name"].as_str().unwrap_or("").to_owned();
+        if expected.as_deref().is_some_and(|expected| expected != current) {
+            return Err(error(409, "会话名称已变化，已丢弃自动命名结果"));
+        }
+        permit.commit(|| {
+            projection
+                .sides
+                .threads
+                .get_mut(id)
+                .ok_or_else(|| error(409, "此会话不是服务创建的侧边会话"))?
+                .metadata["name"] = json!(title);
+            Ok(())
+        })?;
+        projection.side_changed(id);
+        Ok(json!({"ok":true,"threadId":id,"title":title}))
     }
 
     async fn submit_side(
@@ -1559,19 +1598,14 @@ impl CodexHarness {
         if let Some(sent) = side.sent.get_mut(client) {
             sent.1 = result.clone();
         }
-        // 沿用侧边命名约定：首条已接受的有效文字取 15 个 Unicode 码点，后续消息不覆盖名称。
+        // 沿用 Codex App 侧边命名约定：首条已接受的有效文字取 15 个 Unicode 码点，后续消息不覆盖默认名。
         if side.metadata["name"] == "侧边聊天" {
             if let Some(text) = payload["prompt"]
                 .as_str()
                 .filter(|text| !text.trim().is_empty())
             {
                 side.metadata["name"] = json!(
-                    text.split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .chars()
-                        .take(15)
-                        .collect::<String>()
+                    super::super::conversation_naming::side_title_from_message(text)
                 );
             }
         }

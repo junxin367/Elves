@@ -436,15 +436,9 @@ impl CodexHarness {
         if side.named {
             return;
         }
-        let title: String = payload["prompt"]
-            .as_str()
-            .unwrap_or("")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(15)
-            .collect();
+        let title = super::super::conversation_naming::side_title_from_message(
+            payload["prompt"].as_str().unwrap_or(""),
+        );
         if title.is_empty() {
             return;
         }
@@ -459,12 +453,19 @@ impl CodexHarness {
             .await
             .is_ok()
         {
-            let _ = self.store.lock().await.commit(|data| {
+            let parent = side.parent.clone();
+            let saved = self.store.lock().await.commit(|data| {
                 if let Some(side) = data.persistent_sides.get_mut(id) {
                     side.named = true;
                 }
                 Ok(())
             });
+            if saved.is_ok() {
+                self.projection.lock().await.push(json!({
+                    "method":"remote/relatedThreadsChanged",
+                    "params":{"threadId":parent,"title":title}
+                }));
+            }
         }
     }
 }

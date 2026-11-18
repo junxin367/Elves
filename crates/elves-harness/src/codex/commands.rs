@@ -148,6 +148,12 @@ impl CodexHarness {
                     json!({"method":"thread/name/updated","params":{"threadId":id,"name":title}});
                 self.catalog.observe(&event).await;
                 self.projection.lock().await.push(event);
+                if let Some(parent) = attached_parent_id(&identity["thread"]) {
+                    self.projection.lock().await.push(json!({
+                        "method":"remote/relatedThreadsChanged",
+                        "params":{"threadId":parent,"title":title}
+                    }));
+                }
                 Ok(json!({"ok":true,"threadId":id}))
             }
             "markRead" => {

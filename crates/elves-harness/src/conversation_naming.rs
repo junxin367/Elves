@@ -103,6 +103,8 @@ pub(super) fn validate(value: &Value) -> Result<Settings, ApiError> {
 #[serde(default, rename_all = "camelCase")]
 struct Record {
     owner: String,
+    // 侧边会话只执行首条消息命名，不参与主会话的压缩后标题更新计数。
+    side: bool,
     manual: bool,
     attempted: bool,
     generated_title: Option<String>,
@@ -281,7 +283,12 @@ impl ConversationNaming {
     ) {
         let should_refresh = {
             let mut state = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(record) = state.saved.records.get_mut(id).filter(|r| !r.manual) else {
+            let Some(record) = state
+                .saved
+                .records
+                .get_mut(id)
+                .filter(|r| !r.manual && !r.side)
+            else {
                 return;
             };
             let mut changed = false;
@@ -379,14 +386,14 @@ impl ConversationNaming {
                 if !settings.enabled {
                     return anyhow::Ok(());
                 }
-                if super::claude::Claude::is_subagent_id(&id)
-                    || controller.harness.any_side(&id).await
-                {
+                if super::claude::Claude::is_subagent_id(&id) {
                     return Ok(());
                 }
+                let side = controller.harness.any_side(&id).await;
                 let mut state = service.runtime.lock().unwrap_or_else(|e| e.into_inner());
                 let record = state.saved.records.entry(id.clone()).or_default();
                 record.owner = owner;
+                record.side = side;
                 record.updated_at = super::now_ms();
                 let initial =
                     !record.manual && !record.attempted && record.generated_title.is_none();
@@ -453,7 +460,7 @@ impl ConversationNaming {
                 return Ok(());
             };
             // 首次任务已经启动后，不因收到同一回执、首轮完成或下一条消息再发起首次命名。
-            let refresh_compaction = if record.generated_title.is_none() {
+            let refresh_compaction = if record.generated_title.is_none() || record.side {
                 if record.attempted || initial_prompt.is_none() {
                     return Ok(());
                 }
@@ -795,6 +802,36 @@ pub(super) fn first_user_message(turns: &[Value]) -> Option<String> {
         .map(|item| item_text(item).chars().take(FIRST_INPUT_CHARS).collect())
 }
 
+pub(super) fn first_side_user_message(turns: &[Value]) -> Option<String> {
+    for turn in turns {
+        for item in turn["items"].as_array().into_iter().flatten() {
+            if item["type"] != "userMessage" {
+                continue;
+            }
+            let text = item_text(item);
+            if text.starts_with("Side conversation boundary.") || text.trim().is_empty() {
+                continue;
+            }
+            return Some(
+                text.trim()
+                    .chars()
+                    .take(FIRST_INPUT_CHARS)
+                    .collect(),
+            );
+        }
+    }
+    None
+}
+
+pub(super) fn side_title_from_message(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(15)
+        .collect()
+}
+
 fn item_text(item: &Value) -> String {
     item["text"]
         .as_str()
@@ -909,6 +946,47 @@ mod tests {
             first_user_message(&[json!({"items":[{"type":"agentMessage","text":"无法读取仓库"}]})])
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn side_naming_skips_boundary_and_never_refreshes_after_compaction() {
+        let turns = vec![
+            json!({"items":[{"type":"userMessage","text":"Side conversation boundary.\nInherited parent history."}]}),
+            json!({"items":[{"type":"userMessage","text":"  分析侧边会话命名逻辑  "},
+                {"type":"agentMessage","text":"结果"}]}),
+        ];
+        assert_eq!(
+            first_side_user_message(&turns).as_deref(),
+            Some("分析侧边会话命名逻辑")
+        );
+        assert_eq!(
+            side_title_from_message("中文标题与英文混合内容"),
+            "中文标题与英文混合内容"
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let service = ConversationNaming::new(directory.path()).unwrap();
+        service
+            .runtime
+            .lock()
+            .unwrap()
+            .saved
+            .records
+            .insert(
+                "side".into(),
+                Record {
+                    side: true,
+                    generated_title: Some("侧边标题".into()),
+                    ..Default::default()
+                },
+            );
+        service.observe(&compaction("side", "boundary", "compact-turn"));
+        for index in 0..10 {
+            service.observe(&completed_turn("side", &format!("turn-{index}")));
+        }
+        let state = service.runtime.lock().unwrap();
+        assert!(state.pending.is_empty());
+        assert!(state.saved.records["side"].refresh_window.is_none());
     }
 
     #[tokio::test]
@@ -1224,6 +1302,58 @@ mod tests {
         wait_idle(service).await;
         assert_eq!(inputs.lock().unwrap().len(), 5);
         assert_eq!(native_title(&authorization, &id).await, "新压缩边界后的标题");
+        release_engine(&authorization).await;
+    }
+
+    #[tokio::test]
+    async fn conversation_naming_names_side_once_without_compaction_refresh() {
+        let (_directory, authorization, parent, _generation) = naming_fixture(false, false).await;
+        let controller = &authorization.controller;
+        let service = &controller.conversation_naming;
+        wait_idle(service).await;
+        let side_generation = TestGeneration {
+            text: r#"{"title":"侧边自动标题","description":"侧边命名"}"#.into(),
+            started: Arc::new(tokio::sync::Notify::new()),
+            release: None,
+            inputs: Arc::default(),
+        };
+        *service.test_generation.lock().unwrap() = Some(side_generation.clone());
+        let side = controller
+            .call_authorized(
+                "createSideThread",
+                json!({"threadId":parent}),
+                &authorization,
+            )
+            .await
+            .unwrap();
+        let side_id = side["threadId"].as_str().unwrap().to_owned();
+        controller
+            .call_authorized(
+                "send",
+                json!({"threadId":side_id,"prompt":"wait 侧边首次命名","clientUserMessageId":"side-naming"}),
+                &authorization,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            side_generation.started.notified(),
+        )
+        .await
+        .unwrap();
+        wait_idle(service).await;
+        assert_eq!(native_title(&authorization, &side_id).await, "侧边自动标题");
+        assert_eq!(side_generation.inputs.lock().unwrap().len(), 1);
+        controller.publish_event(compaction(&side_id, "side-boundary", "side-compact"));
+        for index in 0..8 {
+            controller.publish_event(completed_turn(&side_id, &format!("side-turn-{index}")));
+        }
+        wait_idle(service).await;
+        assert_eq!(
+            side_generation.inputs.lock().unwrap().len(),
+            1,
+            "侧边会话不应执行压缩后的标题更新"
+        );
         release_engine(&authorization).await;
     }
 
