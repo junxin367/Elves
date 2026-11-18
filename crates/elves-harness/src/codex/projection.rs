@@ -260,6 +260,7 @@ impl Projection {
                 "goal",
                 "tokenUsage",
                 "readState",
+                "lastTurnOutcome",
             ] {
                 if let Some(value) = snapshot.get(field) {
                     thread[field] = value.clone();
@@ -295,10 +296,16 @@ impl Projection {
                         .iter()
                         .any(|flag| flag == "waitingOnApproval" || flag == "waitingOnUserInput")
                 });
+        let failed = matches!(
+            thread["lastTurnOutcome"]["kind"].as_str(),
+            Some("failed" | "rateLimit")
+        ) || thread["lastTurnOutcome"]["status"] == "failed";
         thread["priority"] = json!({
             "status":thread["status"],"active":active,"eligible":true,
             "attentionState":if waiting {"waiting"} else if active {"active"}
-                else if thread["hasUnreadTurn"] == true {"unread"} else {"idle"}
+                else if failed {"error"}
+                else if thread["hasUnreadTurn"] == true {"unread"} else {"idle"},
+            "error":failed
         });
         self.decorate_compaction(thread_id, &mut thread);
         thread
@@ -761,7 +768,7 @@ impl Projection {
                     }
                 }
             }
-            "thread/readState/updated" => {
+            "thread/readState/updated" | "thread/readState/changed" => {
                 if self.threads.get(&id)
                     .is_none_or(|thread| thread["readState"] != frame["params"]["readState"])
                 {
@@ -782,9 +789,32 @@ impl Projection {
                         *observation = (turn_id.to_owned(), None);
                     }
                     self.started(&id, turn_id);
+                    self.threads.entry(id.clone()).or_insert_with(|| json!({}))
+                        ["lastTurnOutcome"] = Value::Null;
                 }
             }
             "turn/completed" => {
+                let turn = &frame["params"]["turn"];
+                let turn_status = if !turn["error"].is_null() {
+                    "failed"
+                } else {
+                    turn["status"].as_str().unwrap_or("completed")
+                };
+                let outcome = json!({
+                    "turnId": turn["id"],
+                    "status": turn_status,
+                    "kind": turn_outcome_kind(turn),
+                    "error": turn["error"],
+                    "completedAtMs": frame["params"]["completedAtMs"]
+                        .as_u64()
+                        .or_else(|| turn["completedAtMs"].as_u64())
+                });
+                self.threads.entry(id.clone()).or_insert_with(|| json!({}))
+                    ["lastTurnOutcome"] = outcome;
+                // 完成事件本身就是新内容的权威边界；当前打开端随后会发 readState changed
+                // 清除它，其他端则直接从同一投影得到未读，避免等到点击会话才补出蓝点。
+                self.threads.entry(id.clone()).or_insert_with(|| json!({}))
+                    ["hasUnreadTurn"] = json!(true);
                 if let Some(turn_id) = frame["params"]["turn"]["id"].as_str() {
                     let key = format!("{id}:{turn_id}");
                     if self.completed.contains(&key) {
@@ -1009,6 +1039,25 @@ impl Projection {
         json!({"ok":true,"schemaVersion":1,"notificationEpoch":self.epoch,
             "notificationCursor":self.notification_sequence,"reset":reset,"truncated":false,
             "pending":pending,"events":events})
+    }
+}
+
+fn turn_outcome_kind(turn: &Value) -> &'static str {
+    let status = turn["status"].as_str().unwrap_or("");
+    if turn["error"].is_null() && status != "failed" {
+        return "completed";
+    }
+    let error = turn["error"].to_string().to_ascii_lowercase();
+    if turn["error"]["statusCode"].as_u64() == Some(429)
+        || turn["error"]["code"].as_u64() == Some(429)
+        || error.contains("rate limit")
+        || error.contains("ratelimit")
+        || error.contains("too many requests")
+        || error.contains("quota")
+    {
+        "rateLimit"
+    } else {
+        "failed"
     }
 }
 
@@ -1339,6 +1388,32 @@ mod tests {
         assert_eq!(idle["priority"]["active"], false);
         assert_eq!(idle["priority"]["attentionState"], "idle");
         assert_eq!(idle["hasUnreadTurn"], false);
+    }
+
+    #[test]
+    fn harness_read_state_changed_and_failed_turns_update_sidebar_projection() {
+        let mut projection = Projection::default();
+        let cached = crate::codex_service::normalize_thread(&json!({
+            "id":"main","cwd":"test","status":{"type":"idle"},"hasUnreadTurn":false
+        }))
+        .unwrap();
+        projection.ingest(json!({"method":"thread/readState/changed","params":{
+            "threadId":"main","readState":{"firstUnread":{"turnId":"turn-a"},"revision":"r1"}
+        }}));
+        assert_eq!(projection.thread("main", cached.clone())["hasUnreadTurn"], true);
+        projection.ingest(json!({"method":"thread/readState/changed","params":{
+            "threadId":"main","readState":{"firstUnread":null,"revision":"r2"}
+        }}));
+        assert_eq!(projection.thread("main", cached.clone())["hasUnreadTurn"], false);
+        projection.ingest(json!({"method":"turn/completed","params":{
+            "threadId":"main","turn":{"id":"turn-b","status":"failed",
+                "error":{"statusCode":429,"message":"rate limit exceeded"}}
+        }}));
+        let failed = projection.thread("main", cached);
+        assert_eq!(failed["lastTurnOutcome"]["kind"], "rateLimit");
+        assert_eq!(failed["hasUnreadTurn"], true);
+        assert_eq!(failed["priority"]["attentionState"], "error");
+        assert_eq!(failed["priority"]["error"], true);
     }
 
     #[test]

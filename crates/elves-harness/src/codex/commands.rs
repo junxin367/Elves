@@ -167,12 +167,13 @@ impl CodexHarness {
                             Some(authorization),
                         )
                         .await?;
-                    self.catalog
-                        .observe(&json!({
-                            "method":"thread/readState/updated",
-                            "params":{"threadId":id,"readState":read["readState"]}
-                        }))
-                        .await;
+                    let event = json!({
+                        "method":"thread/readState/changed",
+                        "emittedAtMs":crate::now_ms(),
+                        "params":{"threadId":id,"readState":read["readState"]}
+                    });
+                    self.catalog.observe(&event).await;
+                    self.projection.lock().await.ingest(event);
                     if !identity["readState"]["firstUnread"].is_null()
                         && read["readState"].get("firstUnread").is_some_and(Value::is_null)
                     {

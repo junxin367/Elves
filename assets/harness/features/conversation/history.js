@@ -52,7 +52,7 @@ import {
 import {
   discardPersistentThreadDisplay, threadDisplayKey, threadDisplays, threadEphemeralState
 } from "../session/thread-cache.js";
-import { rememberThreadDisplay } from "../session/thread-display.js";
+import { rememberThreadDisplay, renderOutcomeMarker } from "../session/thread-display.js";
 import { threadDeleted } from "../sidebar/deletion-state.js";
 
 export async function loadHistory(older = false, version = selectionVersion, itemsTurnId = null) {
@@ -485,6 +485,7 @@ export async function reloadThread() {
       if (thread?.id !== id) throw new Error("会话返回内容与当前会话不一致");
       setThreadReadFailed(false);
       rememberThreadDisplay();
+      if (typeof renderOutcomeMarker === "function") renderOutcomeMarker(thread);
       applyRelatedThreadMetadata(thread);
       mergeBlockingRequestsRead(id, thread, requestsReadVersion);
       if (questionReadVersion !== questionVersion && notifiedQuestions)

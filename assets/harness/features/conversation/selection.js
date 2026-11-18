@@ -81,7 +81,7 @@ import {
   currentThreadDisplay, discardPersistentThreadDisplay, optionalCachedRead,
   persistentThreadDisplayAllowed, readScope, rememberReadingPosition, threadEphemeralState
 } from "../session/thread-cache.js";
-import { rememberThreadDisplay } from "../session/thread-display.js";
+import { rememberThreadDisplay, renderOutcomeMarker } from "../session/thread-display.js";
 import { closeMobileSidebar, sessionMenu, sessionTools } from "../shell-state.js";
 import { threadDeleted } from "../sidebar/deletion-state.js";
 import { applyThreadDeletion } from "../sidebar/thread-deletion.js";
@@ -212,6 +212,7 @@ export async function selectThread(id, { closeSidebar = true, force = false, rel
   let cached = force || initialSide || preparedView ? null : restoreTranscript(id);
   if (initialSide) {
     rememberThreadDisplay();
+    if (typeof renderOutcomeMarker === "function") renderOutcomeMarker(thread);
     setHistoryInitialized(true); setTranscriptChecking(false);
     setRecentHistoryPage({ turns: [], transcriptEvents: [], historyCursor: null,
       followMessages: true, scrollTop: 0, sideHistoryVersion: 1 });
@@ -252,6 +253,7 @@ export async function selectThread(id, { closeSidebar = true, force = false, rel
     ...(sidebar?.projects || []).flatMap(project => project.threads || [])].find(item => item.id === id);
   $("#thread-title").textContent = initialSide?.title || relatedSessionView?.name || summary?.title || cached?.title || "正在打开会话";
   $("#thread-path").textContent = threadLocation(initialSide) || threadLocation(summary) || threadLocation(cached) || "正在读取会话设置…";
+  if (typeof renderOutcomeMarker === "function") renderOutcomeMarker(initialSide || cached || null);
   renderSidebar(); updateComposer();
   if (exitTransition) {
     const scope = privateInputScope(session);

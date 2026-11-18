@@ -545,6 +545,7 @@ fn normalize_thread_metadata_with_preview(
             "eligible": true
         },
         "hasUnreadTurn": unread,
+        "lastTurnOutcome": thread.get("lastTurnOutcome").cloned().unwrap_or(Value::Null),
         "readOnly": false,
         "viewKind": "main",
         "parentThreadId": Value::Null,

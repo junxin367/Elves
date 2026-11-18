@@ -43,6 +43,67 @@ export function mergeIncompleteSidebar(previous, current) {
       threads: mergeRows(oldProjects.get(project.id)?.threads || [], project.threads) }))
   };
 }
+function forEachSidebarThread(value, callback) {
+  if (!value) return;
+  for (const item of [...(value.recent || []), ...(value.pinnedThreads || [])]) callback(item);
+  for (const project of value.projects || [])
+    for (const item of project.threads || []) callback(item);
+}
+function updateSidebarThread(id, callback) {
+  if (!sidebar || typeof id !== "string" || !id) return false;
+  let changed = false;
+  forEachSidebarThread(sidebar, item => {
+    if (item.id !== id) return;
+    changed = callback(item) || changed;
+  });
+  return changed;
+}
+function turnOutcome(turn) {
+  const status = turn?.error != null ? "failed" : typeof turn?.status === "string" ? turn.status : "completed";
+  const errorText = JSON.stringify(turn?.error ?? "").toLowerCase();
+  const kind = status === "failed"
+    ? (turn?.error?.statusCode === 429 || turn?.error?.code === 429
+      || /rate\s*limit|ratelimit|too many requests|quota/u.test(errorText) ? "rateLimit" : "failed")
+    : "completed";
+  return {
+    turnId: typeof turn?.id === "string" ? turn.id : null,
+    status, kind, error: turn?.error ?? null,
+    ...(Number.isFinite(turn?.completedAtMs) ? { completedAtMs: turn.completedAtMs } : {})
+  };
+}
+export function applySidebarThreadOutcome(id, turn, { unread = false } = {}) {
+  return updateSidebarThread(id, item => {
+    const next = turnOutcome(turn);
+    const previous = item.lastTurnOutcome;
+    item.lastTurnOutcome = next;
+    item.status = turn?.status || item.status;
+    const unreadChanged = unread && ["completed", "failed"].includes(next.status) && item.hasUnreadTurn !== true;
+    if (unreadChanged) item.hasUnreadTurn = true;
+    return unreadChanged || JSON.stringify(previous) !== JSON.stringify(next);
+  });
+}
+export function applySidebarThreadReadState(id, readState) {
+  if (!readState || typeof readState !== "object" || !Object.hasOwn(readState, "firstUnread")) return false;
+  const unread = readState.firstUnread !== null;
+  return updateSidebarThread(id, item => {
+    const changed = item.hasUnreadTurn !== unread || JSON.stringify(item.readState) !== JSON.stringify(readState);
+    item.readState = readState;
+    item.hasUnreadTurn = unread;
+    if (!unread && item.priority?.attentionState === "unread")
+      item.priority = { ...item.priority, attentionState: "idle" };
+    else if (unread && item.priority?.attentionState === "idle")
+      item.priority = { ...item.priority, attentionState: "unread" };
+    return changed;
+  });
+}
+export function applySidebarThreadTitle(id, title) {
+  if (typeof title !== "string") return false;
+  return updateSidebarThread(id, item => {
+    if (item.title === title) return false;
+    item.title = title;
+    return true;
+  });
+}
 export let clientUnreadBadgeTimer = null, clientUnreadBadgeRequest = null;
 export function setClientUnreadBadgeTimer(value) { return clientUnreadBadgeTimer = value; }
 export function setClientUnreadBadgeRequest(value) { return clientUnreadBadgeRequest = value; }
@@ -65,7 +126,7 @@ export function clientUnreadThreadCount(value) {
     const attention = sidebarAttentionState(item);
     // 明确的 hasUnreadTurn=false 是已读抑制，不能被尚未同步的旧 priority 未读标记重新计入。
     const hasUnread = typeof item.hasUnreadTurn === "boolean" ? item.hasUnreadTurn : attention === "unread";
-    if (hasUnread && attention === "unread" && !sidebarThreadActive(item)) unread.add(item.id);
+    if (hasUnread && ["unread", "error"].includes(attention) && !sidebarThreadActive(item)) unread.add(item.id);
   }
   return unread.size;
 }
@@ -139,6 +200,8 @@ export function sidebarAttentionState(item) {
   const type = typeof status === "string" ? status : status?.type;
   if (requests || side?.waiting || own === "waiting" || !own && (type === "waiting" || (status?.activeFlags || []).some(flag =>
     flag === "waitingOnApproval" || flag === "waitingOnUserInput"))) return "waiting";
+  if (item.lastTurnOutcome?.status === "failed"
+      || ["failed", "rateLimit"].includes(item.lastTurnOutcome?.kind)) return "error";
   if (side?.unread || own === "unread" || item.hasUnreadTurn) return "unread";
   return side?.active || own === "active" || !own && (type === "active" || type === "inProgress") ? "active" : "idle";
 }

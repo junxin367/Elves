@@ -305,6 +305,7 @@ impl Catalog {
                 | "thread/unarchived"
                 | "thread/project/updated"
                 | "thread/readState/updated"
+                | "thread/readState/changed"
         ) {
             return;
         }
@@ -351,7 +352,7 @@ impl Catalog {
                 }
                 state.dirty |= !state.complete;
             }
-            "thread/readState/updated" => {
+            "thread/readState/updated" | "thread/readState/changed" => {
                 if let Some(thread) = state.rows.get_mut(id) {
                     thread["readState"] = params["readState"].clone();
                     thread["hasUnreadTurn"] = json!(!params["readState"]["firstUnread"].is_null());
@@ -379,13 +380,21 @@ impl Catalog {
 }
 
 fn rows(page: &Value) -> BTreeMap<String, Value> {
+    let read_states = page["readStates"].as_object();
     page["data"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|row| {
-            let thread = metadata(row)?;
-            Some((thread["id"].as_str()?.to_owned(), thread))
+            let mut thread = metadata(row)?;
+            let id = thread["id"].as_str()?.to_owned();
+            // Codex App Server 将可读状态放在 thread/list.readStates，而不是每个 thread 行内。
+            // 目录首屏必须在同一次快照中合并它，否则完成事件后的未读状态只能等 thread/read 才出现。
+            if let Some(read_state) = read_states.and_then(|states| states.get(&id)) {
+                thread["readState"] = read_state.clone();
+                thread["hasUnreadTurn"] = json!(!read_state["firstUnread"].is_null());
+            }
+            Some((id, thread))
         })
         .collect()
 }
@@ -608,6 +617,16 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
         drop(state);
         catalog.reset().await;
         assert!(!catalog.state.lock().await.loaded);
+    }
+
+    #[test]
+    fn thread_list_read_states_are_merged_into_sidebar_rows() {
+        let value = rows(&json!({
+            "data":[{"id":"thread-a","cwd":"C:/workspace","status":{"type":"idle"}}],
+            "readStates":{"thread-a":{"firstUnread":{"turnId":"turn-a"},"revision":"r1"}}
+        }));
+        assert_eq!(value["thread-a"]["hasUnreadTurn"], true);
+        assert_eq!(value["thread-a"]["readState"]["revision"], "r1");
     }
 
     #[tokio::test]
