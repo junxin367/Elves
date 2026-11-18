@@ -97,10 +97,12 @@ export function localFileReferenceActions({ openFile } = {}) {
         action: () => preview(path, line, owner) },
       { value: "openBrowser", label: "浏览器打开", icon: "globe", disabled: !owns(owner),
         action: () => { if (owns(owner)) void openLocalFileInBrowser(path); } },
-      // 用户要求所有 File Explorer 直达入口与 Open in 共用彩色应用图标，不再使用灰色线框文件夹。
-      { value: "revealFile", label: "在 File Explorer 打开", renderIcon: () => applicationIcon("fileManager"), disabled: opening.disabled,
-        action: () => opening.openTarget({ target: "fileManager" }) },
-      { ...opening, value: "openIn", label: "打开方式", icon: "window" },
+      // 用户要求远程 PC 和手机移除 Explorer、打开方式；仅本机保留入口，并与 Open in 共用彩色应用图标。
+      ...(opening ? [
+        { value: "revealFile", label: "在 File Explorer 打开", renderIcon: () => applicationIcon("fileManager"), disabled: opening.disabled,
+          action: () => opening.openTarget({ target: "fileManager" }) },
+        { ...opening, value: "openIn", label: "打开方式", icon: "window" }
+      ] : []),
       { value: "copyPath", label: "复制路径", icon: "copy", separatorBefore: true, disabled: !owns(owner),
         action: () => { if (owns(owner)) void copyText(path); } }
     ];

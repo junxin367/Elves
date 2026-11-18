@@ -677,7 +677,7 @@ test("文件阅读链接保留原打开回调，正文纯文件名不新增点�
   assert.equal(plain.opened.length, 0);
 });
 
-test("正文文件菜单固定五项且浏览器打开位于第二，相对路径预览基于会话 cwd，旧会话不能借用当前身份", () => {
+test("本机正文文件菜单固定五项且浏览器打开位于第二，相对路径预览基于会话 cwd，旧会话不能借用当前身份", () => {
   const opened = [], copied = [], native = [], browsers = [];
   const context = nodeVm.createContext({ creating: false, pageLeaving: false, selectedId: "main",
     localFileReference,
@@ -3079,7 +3079,7 @@ test("会话菜单分离子智能体读取和侧边写入，并按连接代次�
   assert.deepEqual(Array.from(context.permissions(context.readContext())), [false, false]);
 });
 
-test("会话列表右键菜单固定六项顺序，复制子菜单使用工作路径和带 WSL 名称的原生会话 ID", () => {
+test("本机会话列表右键菜单固定六项顺序，复制子菜单使用工作路径和带 WSL 名称的原生会话 ID", () => {
   const copied = [], context = nodeVm.createContext({
     copyText: value => copied.push(value),
   });
@@ -3105,7 +3105,8 @@ test("会话列表右键菜单固定六项顺序，复制子菜单使用工作�
     "claude-us native-session-id",
   ]);
   const local = context.threadMenuOptions({ id: "local-id", instanceId: "codex:local",
-    cwd: "\\\\wsl.localhost\\claude-us\\home\\junes" }, { ...callbacks, pinned: true });
+    cwd: "\\\\wsl.localhost\\claude-us\\home\\junes" }, {
+      ...callbacks, pinned: true, openIn: { disabled: true } });
   assert.equal(local[1].label, "取消置顶");
   assert.equal(local[2].disabled, true);
   assert.equal(local[4].disabled, true);
@@ -4009,17 +4010,64 @@ test("Open in 的 Git Bash 和 WSL 使用安装程序图标，无效图片回退
   }
 });
 
+test("远程 PC、手机、PWA 和 Android 移除宿主机应用入口，伪造原生桥或缺少本机身份也不开放", () => {
+  for (const fixture of [
+    { label: "PC 网页", width: 1440 },
+    { label: "手机网页", width: 390 },
+    { label: "PWA", width: 390, standalone: true },
+    { label: "Android", width: 390, android: true },
+    { label: "伪造原生客户端", width: 1440, native: true },
+    { label: "缺少本机身份", width: 1440, native: true, transport: null },
+    { label: "本机缺少能力", width: 1440, native: true, transport: "desktop", capability: false },
+  ]) {
+    const opened = [], copied = [], browsers = [], requests = [];
+    const item = { id: "main", cwd: "E:/repo", instanceId: "codex:local" };
+    const context = rawVm.createContext({ nativeConnectionVersion: 1, pageLeaving: false, creating: false,
+      selectedId: item.id, thread: item, sidebar: { recent: [item] },
+      session: { transport: fixture.transport === null ? undefined : fixture.transport || "remote",
+        device: { id: "device" }, capabilities: { workspaceOpenIn: fixture.capability !== false } },
+      window: fixture.native ? { __TAURI__: { core: { invoke() { requests.push("native"); } } } } : {},
+      innerWidth: fixture.width, navigator: { standalone: fixture.standalone },
+      isAndroidContainer: () => fixture.android, relatedSessionView: null, workspaceSidePanel: false,
+      threadReadOnly: () => false, privateInputScope: value => value?.device.id,
+      currentFileBrowserThreadId: () => item.id, localFileReference,
+      copyText: path => copied.push(path), openLocalFileInBrowser: path => browsers.push(path),
+      api: (...args) => { requests.push(args); } });
+    rawVm.runInContext(
+      workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function workspaceOpenInAvailable("),
+        workspaceOpenInSource.indexOf("export function applicationIcon(")).replace(/^export /gm, "")
+      + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function sidebarOpenInContext("))
+        .replace(/^export /gm, "")
+      + sourceSection("function localFileMenuOwner(")
+      + sourceSection("function threadMenuOptions(", "function syncClientUnreadBadge("), context);
+    assert.equal(context.clientOpenInContext(), null, fixture.label);
+    const openIn = context.threadOpenInMenu(item);
+    assert.equal(openIn, null, fixture.label);
+    assert.equal(context.fileOpenInMenu("src/app.ts", { getItem: () => item }), null, fixture.label);
+    assert.deepEqual(Array.from(context.threadMenuOptions(item, { openIn }), option => option.value),
+      ["rename", "pin", "openWindow", "copy", "deleteThread"], fixture.label);
+    const files = context.localFileReferenceActions({ openFile: (...args) => opened.push(args) })
+      .getMenuOptions("src/app.ts", 12);
+    assert.deepEqual(Array.from(files, option => option.value), ["openFile", "openBrowser", "copyPath"], fixture.label);
+    files.forEach(option => option.action());
+    assert.deepEqual(opened, [["E:/repo/src/app.ts", 12]], fixture.label);
+    assert.deepEqual(browsers, ["src/app.ts"], fixture.label);
+    assert.deepEqual(copied, ["src/app.ts"], fixture.label);
+    assert.equal(requests.length, 0, fixture.label);
+  }
+});
+
 test("Open in 按执行实例显示 WSL，Windows 挂载目录保留 WSL 身份且更换用户使旧请求失效", () => {
   const context = rawVm.createContext({
     window: { __TAURI__: { core: { invoke() {} } } }, pageLeaving: false, creating: false,
-    selectedId: "main", nativeConnectionVersion: 1, session: { capabilities: { workspaceOpenIn: true } },
+    selectedId: "main", nativeConnectionVersion: 1, session: { transport: "desktop", capabilities: { workspaceOpenIn: true } },
     thread: { id: "main", instanceId: "claude:wsl:fixture", wslDistribution: "claude-test",
       wslUser: "junes", cwd: "E:\\code" },
     threadReadOnly: () => false, relatedSessionView: null, workspaceSidePanel: false,
     privateInputScope: () => "scope",
   });
-  rawVm.runInContext(workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("export function clientOpenInContext("),
-    workspaceOpenInSource.indexOf("export function applicationIcon(")).replace(/^export /, ""), context);
+  rawVm.runInContext(workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function workspaceOpenInAvailable("),
+    workspaceOpenInSource.indexOf("export function applicationIcon(")).replace(/^export /gm, ""), context);
   const first = context.clientOpenInContext();
   assert.equal(first.wslInstance, true);
   context.thread.wslUser = "other";
@@ -4068,7 +4116,7 @@ test("会话右键打开方式按该行读取并启动，切换当前聊天不�
     wslDistribution: "claude-us", wslUser: "junes", cwd: "E:\\项目" };
   const context = rawVm.createContext({ nativeConnectionVersion: 1, pageLeaving: false,
     selectedId: "another-session", sidebar: { recent: [item] },
-    session: { device: { id: "device", createdAtMs: 1 }, capabilities: { workspaceOpenIn: true } },
+    session: { transport: "desktop", device: { id: "device", createdAtMs: 1 }, capabilities: { workspaceOpenIn: true } },
     privateInputScope: value => JSON.stringify(value.device), threadReadOnly: () => false,
     sessionStorage: copied, localStorage: preferences, randomId: () => "fixture-request",
     AbortController, setTimeout, clearTimeout, notice() {},
@@ -4084,6 +4132,8 @@ test("会话右键打开方式按该行读取并启动，切换当前聊天不�
       workspaceOpenInSource.indexOf("const applicationPaths ="))
     + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function normalizeTargets("),
       workspaceOpenInSource.indexOf("export function mountWorkspaceOpenIn("))
+    + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function workspaceOpenInAvailable("),
+      workspaceOpenInSource.indexOf("export function clientOpenInContext("))
     + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function sidebarOpenInContext("))
       .replace(/^export /gm, ""), context);
   const menu = context.threadOpenInMenu(item);
@@ -4098,12 +4148,12 @@ test("会话右键打开方式按该行读取并启动，切换当前聊天不�
   assert.equal(copied.records.size, 0, "成功后清除待确认请求");
 });
 
-test("会话右键打开方式在异步准备后复核授权和删除状态，不派发过期点击", async () => {
-  for (const change of ["authorization", "deletion", "instance"]) {
+test("会话右键打开方式在异步准备后复核授权、入口身份、能力和删除状态，不派发过期点击", async () => {
+  for (const change of ["authorization", "transport", "capability", "deletion", "instance"]) {
     const item = { id: "right-clicked", cwd: "E:\\项目", instanceId: "codex:local" };
     let available = true, writes = 0;
     const context = rawVm.createContext({ nativeConnectionVersion: 1, pageLeaving: false,
-      sidebar: { recent: [item] }, session: { device: { id: "device" }, capabilities: { workspaceOpenIn: true } },
+      sidebar: { recent: [item] }, session: { transport: "desktop", device: { id: "device" }, capabilities: { workspaceOpenIn: true } },
       privateInputScope: value => value.device.id, threadReadOnly: () => false,
       notice() {}, performWorkspaceOpenIn: async () => { ++writes; },
       api: async () => ({ ok: true, root: item.cwd, targets: [
@@ -4114,11 +4164,15 @@ test("会话右键打开方式在异步准备后复核授权和删除状态，�
         workspaceOpenInSource.indexOf("const applicationPaths ="))
       + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function normalizeTargets("),
         workspaceOpenInSource.indexOf("function preferenceKey("))
+      + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function workspaceOpenInAvailable("),
+        workspaceOpenInSource.indexOf("export function clientOpenInContext("))
       + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function sidebarOpenInContext("))
         .replace(/^export /gm, ""), context);
     const targets = await context.threadOpenInMenu(item, { isAvailable: () => available }).submenu({});
     context.api = async () => {
       if (change === "authorization") context.session.device.id = "other-device";
+      else if (change === "transport") context.session.transport = "remote";
+      else if (change === "capability") context.session.capabilities.workspaceOpenIn = false;
       else if (change === "deletion") available = false;
       else item.instanceId = "claude:wsl:other";
       return { ok: true, root: item.cwd, targets: [
@@ -4136,7 +4190,7 @@ test("正文文件打开方式携带所点相对路径，保留图标列表且�
   preferences.setItem("existing-workspace-preference", "vscode");
   const item = { id: "main", cwd: "E:\\repo\\packages\\client", instanceId: "codex:local" };
   const context = rawVm.createContext({ nativeConnectionVersion: 1, pageLeaving: false,
-    session: { device: { id: "device" }, capabilities: { workspaceOpenIn: true } },
+    session: { transport: "desktop", device: { id: "device" }, capabilities: { workspaceOpenIn: true } },
     privateInputScope: value => value.device.id, threadReadOnly: () => false,
     AbortController, setTimeout, clearTimeout, notice() {}, sessionStorage: disk, localStorage: preferences,
     randomId: () => "file-request", validateRemoteReceipt: value => value,
@@ -4151,6 +4205,8 @@ test("正文文件打开方式携带所点相对路径，保留图标列表且�
     workspaceOpenInSource.indexOf("const applicationPaths ="))
     + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function normalizeTargets("),
       workspaceOpenInSource.indexOf("export function mountWorkspaceOpenIn("))
+    + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function workspaceOpenInAvailable("),
+      workspaceOpenInSource.indexOf("export function clientOpenInContext("))
     + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function sidebarOpenInContext("))
       .replace(/^export /gm, ""), context);
   const menu = context.fileOpenInMenu("src/app.ts", { getItem: () => item });
@@ -4171,7 +4227,7 @@ test("正文不同文件的打开回执分别保留，结果未知不自动重�
   const item = { id: "main", cwd: "E:\\repo", instanceId: "codex:local" };
   let sequence = 0;
   const context = rawVm.createContext({ nativeConnectionVersion: 1, pageLeaving: false,
-    session: { device: { id: "device" }, capabilities: { workspaceOpenIn: true } },
+    session: { transport: "desktop", device: { id: "device" }, capabilities: { workspaceOpenIn: true } },
     privateInputScope: value => value.device.id, threadReadOnly: () => false,
     AbortController, setTimeout, clearTimeout, notice: value => notices.push(value), sessionStorage: disk,
     localStorage: storage(), randomId: () => `file-request-${++sequence}`, validateRemoteReceipt: value => value,
@@ -4184,6 +4240,8 @@ test("正文不同文件的打开回执分别保留，结果未知不自动重�
     workspaceOpenInSource.indexOf("const applicationPaths ="))
     + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function normalizeTargets("),
       workspaceOpenInSource.indexOf("export function mountWorkspaceOpenIn("))
+    + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function workspaceOpenInAvailable("),
+      workspaceOpenInSource.indexOf("export function clientOpenInContext("))
     + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function sidebarOpenInContext("))
       .replace(/^export /gm, ""), context);
   for (const path of ["src/first.ts", "./README.md"])
@@ -8001,7 +8059,7 @@ test("失败与中断的工具条目不能渲染成功勾号", () => {
 test("Claude 内置工具按原生动作展示，工作摘要不把内置工具称为集成", () => {
   const context = nodeVm.createContext({ nativeConnectionVersion: 1, URL, skillReadInfo: () => null, reasoningPreviewText: () => "" });
   nodeVm.runInContext(sourceSection("function readableToolName(", "function reasoningPreviewText("), context);
-  nodeVm.runInContext(sourceSection("function wor"), context);
+  nodeVm.runInContext(sourceSection("function workGroupSummary("), context);
   const claude = (tool, args = {}) => ({ type: "dynamicToolCall", source: "claude", tool, arguments: args, status: "completed" });
   const shown = item => {
     const { icon, description, explore } = context.genericToolPresentation(item);

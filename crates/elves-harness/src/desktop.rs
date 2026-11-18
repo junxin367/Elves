@@ -533,6 +533,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(local_session["transport"], "desktop");
+        assert_eq!(
+            local_session["capabilities"]["workspaceOpenIn"],
+            cfg!(windows)
+        );
         let remote_session: Value = client
             .get(format!("{remote_url}/api/session"))
             .header("Cookie", &remote_cookie)
@@ -546,6 +550,38 @@ mod tests {
             .unwrap();
         assert_eq!(remote_session["transport"], "remote");
         assert_eq!(remote_session["capabilities"]["management"], false);
+        assert_eq!(remote_session["capabilities"]["workspaceOpenIn"], false);
+        // 用户要求远程 PC、手机和 Android 均无宿主机启动能力；伪造原生标记与旧缓存直接请求也不能绕过。
+        for path in ["/api/workspace/open-in-targets", "/api/workspace/open-in"] {
+            for user_agent in [
+                "Mozilla/5.0 Windows",
+                "Mozilla/5.0 iPhone Mobile",
+                "Elves Android",
+            ] {
+                let denied = client
+                    .post(format!("{remote_url}{path}"))
+                    .header("Origin", &remote_url)
+                    .header("Cookie", &remote_cookie)
+                    .header("User-Agent", user_agent)
+                    .header("X-Elves-Client", "desktop")
+                    .header("Idempotency-Key", "remote-open-in-denied")
+                    .json(&json!({"threadId":"unknown-session","target":"fileManager"}))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(denied.status(), 403, "{path} {user_agent}");
+            }
+            // 本机请求继续进入原有参数校验；使用空参数避免真的读取会话或启动应用。
+            let local = client
+                .post(format!("{local_url}{path}"))
+                .header("Origin", &local_url)
+                .header("Cookie", &local_cookie)
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(local.status(), 400, "{path}");
+        }
         assert_eq!(
             client
                 .get(format!("{local_url}/api/session"))

@@ -1,4 +1,4 @@
-//! 独立远程服务的工作区打开能力，不依赖 Codex App、管理器或桌面桥接。
+//! 本机 Harness 的工作区打开能力，不依赖 Codex App、管理器或桌面桥接。
 use std::path::{Path, PathBuf};
 
 use axum::Json;
@@ -11,6 +11,13 @@ use super::{ApiError, WebState};
 
 #[cfg(windows)]
 mod windows;
+
+const DESKTOP_ONLY: &str = "仅 Elves 本机客户端支持打开工作区应用";
+
+pub(super) fn available(state: &WebState, device: &super::Device) -> bool {
+    // 用户要求远程 PC 和手机屏蔽宿主机应用入口；必须同时核对真实本机监听与本机授权，不能相信客户端标记。
+    state.desktop && device.key_id == super::desktop::DEVICE_KEY_ID
+}
 
 const TARGETS: &[(&str, &str)] = &[
     ("vscode", "VS Code"),
@@ -218,6 +225,9 @@ pub(super) async fn targets(
     Json(payload): Json<Value>,
 ) -> Result<Response, ApiError> {
     let device = super::authorized(&state, &headers).await?;
+    if !available(&state, &device) {
+        return Err(ApiError::new(403, DESKTOP_ONLY));
+    }
     let authorization = state.controller.authorization(device, None);
     authorization
         .check()
@@ -261,6 +271,9 @@ pub(super) async fn open(
     Json(payload): Json<Value>,
 ) -> Result<Response, ApiError> {
     let device = super::authorized(&state, &headers).await?;
+    if !available(&state, &device) {
+        return Err(ApiError::new(403, DESKTOP_ONLY));
+    }
     let authorization = state
         .controller
         .authorization(device, Some("openWorkspace"));
@@ -301,6 +314,10 @@ pub(super) async fn dispatch(
     payload: Value,
     authorization: &super::HarnessAuthorization,
 ) -> Result<Value, ApiError> {
+    // 通用 action 也可能直接到达这里；旧网页缓存或手工 RPC 不能绕过远程入口限制。
+    if authorization.device.key_id != super::desktop::DEVICE_KEY_ID {
+        return Err(ApiError::new(403, DESKTOP_ONLY));
+    }
     let identity = validate_open(&payload)?;
     // 这里只复用目录解析；启动权限始终由原请求的 authorization 和实时策略复核。
     let state = WebState {
@@ -334,7 +351,7 @@ pub(super) async fn dispatch(
         .prepare_dispatch()
         .await
         .map_err(super::authorization_error)?;
-    // 与原注入功能一致，启动前重新检测应用、复核授权；只在服务所在电脑启动一次，不复用 Codex App。
+    // 启动前重新检测应用、复核授权；只在本机启动一次，不复用 Codex App。
     let outcome = tokio::task::spawn_blocking(move || {
         permit.commit(|| launch(&application, &root).map_err(anyhow::Error::from))
     })
@@ -371,6 +388,23 @@ fn launch(_: &Application, _: &Path) -> Result<LaunchOutcome, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn remote_open_workspace_action_is_rejected_before_engine_lookup() {
+        let (_directory, authorization) = crate::tests::service_dispatch_fixture().await;
+        let error = authorization
+            .controller
+            .call_authorized(
+                "openWorkspace",
+                json!({"threadId":"unknown-session","path":"src/app.ts","target":"fileManager"}),
+                &authorization,
+            )
+            .await
+            .unwrap_err();
+        let error = error.downcast_ref::<ApiError>().unwrap();
+        assert_eq!(error.code, 403);
+        assert_eq!(error.message, DESKTOP_ONLY);
+    }
 
     #[test]
     fn file_open_in_accepts_only_identity_path_and_known_target() {

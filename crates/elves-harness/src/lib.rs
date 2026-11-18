@@ -3566,7 +3566,8 @@ async fn session(
         "goalComposer":native_write_available,"compactionQueueSend":native_write_available,
         "sendText":native_write_available || service_connected,
         "sideThreads":true,"serviceSideThreads":true,"subagents":true,"serviceSubagents":true,
-        "sessionMetrics":true,"workspaceOpenIn":cfg!(windows),
+        // 用户要求仅本机开放宿主机应用启动；远程 PC、手机与 Android 不声明此能力。
+        "sessionMetrics":true,"workspaceOpenIn":cfg!(windows) && open_in::available(&state, &device),
         "claudeSessions":true,"claudeProjectTrust":true,"claudeSubscriptionUsage":true}});
     response["capabilities"]["sideIdleRelease"] = json!(true);
     response["transport"] = json!(if state.desktop { "desktop" } else { "remote" });

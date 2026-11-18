@@ -1,4 +1,4 @@
-// 独立客户端的工作区打开入口；目录、应用检测与启动均由远程服务独立完成。
+// 本机客户端的工作区打开入口；目录、应用检测与启动均由独立 Harness 完成。
 import { button, element } from "../../ui/dom.js";
 import { icon } from "../../ui/icons.js";
 import { notice } from "../../ui/notice.js";
@@ -21,10 +21,15 @@ const applicationPaths = {
   fileManager: '<path d="M2 6a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2Z"/>'
 };
 
+function workspaceOpenInAvailable() {
+  // 用户要求远程 PC、手机、PWA 和 Android 屏蔽宿主机应用入口；本机身份必须来自服务端，不能只判断原生桥或屏幕尺寸。
+  return session?.transport === "desktop" && session?.capabilities?.workspaceOpenIn === true;
+}
+
 export function clientOpenInContext() {
-  // 用户要求仅接入 Windows 独立客户端；普通网页、Android、关联阅读页及无会话页面不新增入口。
+  // 顶部入口另要求 Windows 独立客户端；关联阅读页及无会话页面不新增入口。
   if (typeof window.__TAURI__?.core?.invoke !== "function" || pageLeaving || creating || !selectedId
-      || thread?.id !== selectedId || !session?.capabilities?.workspaceOpenIn || threadReadOnly()
+      || thread?.id !== selectedId || !workspaceOpenInAvailable() || threadReadOnly()
       || relatedSessionView || workspaceSidePanel) return null;
   const scope = privateInputScope(session);
   if (!scope) return null;
@@ -300,7 +305,7 @@ export function mountWorkspaceOpenIn({ anchor, beforeOpen = () => {} }) {
 }
 
 function sidebarOpenInContext(item) {
-  if (pageLeaving || !item?.id || !session?.capabilities?.workspaceOpenIn
+  if (pageLeaving || !item?.id || !workspaceOpenInAvailable()
       || threadReadOnly(item.id)) return null;
   const scope = privateInputScope(session);
   if (!scope) return null;
@@ -312,8 +317,9 @@ function sidebarOpenInContext(item) {
 }
 
 export function threadOpenInMenu(item, { isAvailable = () => true } = {}) {
+  if (!workspaceOpenInAvailable()) return null;
   const context = sidebarOpenInContext(item);
-  // 用户要求“打开方式”跟随被右键的会话，PC 网页和客户端均复用独立服务；不切换聊天或借用当前选中会话。
+  // 本机“打开方式”跟随被右键的会话；不切换聊天或借用当前选中会话。
   const current = () => isAvailable() ? sidebarOpenInContext([
     ...(sidebar?.recent || []), ...(sidebar?.pinnedThreads || []),
     ...(sidebar?.projects || []).flatMap(project => project.threads || [])
@@ -322,6 +328,7 @@ export function threadOpenInMenu(item, { isAvailable = () => true } = {}) {
 }
 
 export function fileOpenInMenu(path, { getItem } = {}) {
+  if (!workspaceOpenInAvailable()) return null;
   // 文件路径只附着于原会话身份；实际相对目录、Windows/WSL 映射及文件权限均由独立服务验证。
   const current = () => {
     const context = sidebarOpenInContext(getItem?.());
