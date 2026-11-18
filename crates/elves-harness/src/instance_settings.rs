@@ -614,7 +614,8 @@ fn extension_view(section: &str, backend: &str, document: &Value) -> Result<Valu
                     })
                 })
                 .collect::<Vec<_>>();
-            json!({"data":rows,"message":"显示用户级配置中的 MCP 服务；项目和插件服务继续由原生 CLI 管理。"})
+            // MCP 列表不显示常规说明，仍只展示用户级配置，不接管项目或插件服务。
+            json!({"data":rows})
         }
         "hooks" => {
             let rows = document["hooks"]["state"]

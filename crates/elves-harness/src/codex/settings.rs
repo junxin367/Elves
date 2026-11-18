@@ -109,10 +109,11 @@ impl CodexHarness {
                         })
                     })
                     .collect::<Vec<_>>();
+                // Skills 列表不显示常规说明，保留部分读取失败提示及组织技能的只读限制。
                 Ok(json!({"data":rows,"message":
                     if entry["errors"].as_array().is_some_and(|errors|!errors.is_empty()) {
                         "部分技能读取失败，请在原生 CLI 中核对技能文件。"
-                    } else {"显示所选实例用户目录中的原生技能，组织管理的技能保持只读。"}}))
+                    } else {""}}))
             })
             .await
     }
