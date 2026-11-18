@@ -1374,7 +1374,7 @@ impl HarnessController {
             let priority = &self.harness.recent_priority;
             let observed = priority.revision();
             // 各端传的是点击时看到的候选会话；服务重新读取原生状态，不信任页面报告的已读、空闲或归属。
-            let sidebar = self
+            let mut sidebar = self
                 .call_backend("sidebar", json!({"enabledInstanceIds":payload["enabledInstanceIds"]}), authorization)
                 .await
                 .and_then(|value| native_result(value).map_err(Into::into))
@@ -1382,6 +1382,8 @@ impl HarnessController {
                     error.downcast_ref::<ApiError>().cloned()
                         .unwrap_or_else(|| ApiError::new(503, "无法核对会话状态，优先事项未清除"))
                 })?;
+            self.hydrate_priority_unread_state(&mut sidebar, &ids, authorization)
+                .await;
             let removed = authorization.prepare_dispatch().await?
                 .commit(|| priority.clear(&sidebar, &ids, observed))?;
             if removed != 0 {
@@ -2052,6 +2054,70 @@ impl HarnessController {
         )
         .recorded(self.harness.call(action, payload, Some(authorization)))
         .await
+    }
+
+    async fn hydrate_priority_unread_state(
+        &self,
+        sidebar: &mut Value,
+        requested: &HashSet<&str>,
+        authorization: &HarnessAuthorization,
+    ) {
+        let targets = ["recent", "pinnedThreads"]
+            .into_iter()
+            .flat_map(|key| {
+                sidebar[key]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|row| {
+                        let id = notification_thread_id(&row["id"])?;
+                        (requested.contains(id) && row["hasUnreadTurn"].is_null())
+                            .then(|| id.to_owned())
+                    })
+            })
+            .collect::<HashSet<_>>();
+        if targets.is_empty() {
+            return;
+        }
+
+        // 用户要求优先事项清除必须依据实际已读状态；原生 thread/list 对 notLoaded 会话不返回已读字段，
+        // 这里只补读本次目标，读取失败继续保留 null，不能把未知状态直接当成已读。
+        let mut resolved = HashMap::new();
+        for id in targets {
+            let Ok(value) = self
+                .call_backend("thread", json!({"threadId":id}), authorization)
+                .await
+            else {
+                continue;
+            };
+            let thread = &value["thread"];
+            if thread["id"].as_str() != Some(id.as_str()) {
+                continue;
+            }
+            let Some(unread) = thread["hasUnreadTurn"].as_bool() else {
+                continue;
+            };
+            resolved.insert(id, (unread, thread["readState"].clone()));
+        }
+
+        for key in ["recent", "pinnedThreads"] {
+            for row in sidebar[key]
+                .as_array_mut()
+                .into_iter()
+                .flatten()
+            {
+                let Some(id) = notification_thread_id(&row["id"]) else {
+                    continue;
+                };
+                let Some((unread, read_state)) = resolved.get(id) else {
+                    continue;
+                };
+                row["hasUnreadTurn"] = json!(*unread);
+                if !read_state.is_null() {
+                    row["readState"] = read_state.clone();
+                }
+            }
+        }
     }
 
     fn publish_backend_event(&self, source: &str, mut event: Value) {
@@ -6036,6 +6102,69 @@ mod tests {
         idle["recent"][2]["sideThreadAttention"] = Value::Null;
         restored.annotate(&mut idle, restored.revision());
         assert_eq!(idle["recentPriorityIds"], json!(["side-owner", "running"]));
+    }
+
+    #[tokio::test]
+    async fn recent_priority_hydrates_unknown_codex_unread_state_before_clear() {
+        struct HydratingCatalog(std::sync::Mutex<Value>);
+        #[async_trait]
+        impl TestRemoteBackend for HydratingCatalog {
+            async fn call(&self, action: &str, payload: Value) -> anyhow::Result<Value> {
+                match action {
+                    "sidebar" => Ok(self.0.lock().unwrap().clone()),
+                    "thread" => Ok(json!({
+                        "ok":true,
+                        "thread":{
+                            "id":payload["threadId"],
+                            "hasUnreadTurn":false,
+                            "readState":{"firstUnread":null,"revision":"r1"}
+                        }
+                    })),
+                    _ => anyhow::bail!("unexpected priority hydration action: {action}"),
+                }
+            }
+        }
+
+        let (_directory, remote) = harness_authorization_fixture(None).await;
+        let controller = &remote.controller;
+        let id = "codex-unknown-unread";
+        let catalog = Arc::new(HydratingCatalog(std::sync::Mutex::new(json!({
+            "ok":true,
+            "nativeBridge":"harness",
+            "complete":true,
+            "sideThreadsComplete":true,
+            "projects":[],
+            "pinnedThreads":[],
+            "recent":[{
+                "id":id,
+                "backend":"codex",
+                "instanceId":"codex:local",
+                "status":{"type":"notLoaded"},
+                "priority":{"status":{"type":"notLoaded"},"active":false,"eligible":true,"attentionState":"idle"},
+                "hasUnreadTurn":null,
+                "requestsKnown":true,
+                "requests":[],
+                "parentThreadId":null,
+                "attachedToThreadId":null,
+                "ephemeral":false,
+                "serviceSide":false,
+                "threadSource":"user"
+            }]
+        }))));
+        assert!(controller.test_backend.set(catalog).is_ok());
+        controller.harness.recent_priority.promote(id);
+
+        let receipt = controller
+            .execute(
+                remote.device.clone(),
+                "clear-unknown-unread".into(),
+                "clearRecentPriority".into(),
+                json!({"threadIds":[id],"enabledInstanceIds":["codex:local"]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt["state"], "completed");
+        assert_eq!(receipt["result"]["removed"], 1);
     }
 
     #[test]
