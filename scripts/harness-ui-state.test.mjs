@@ -15722,7 +15722,7 @@ test("外观切换会重新写入全部表面变量，保存时不修改用户�
   } };
   const initial = JSON.stringify(appearance.colors);
   const context = nodeVm.createContext({ nativeConnectionVersion: 1,
-    appearance, appearanceTransitionTimer: null, editingMessage: null, document: {
+    appearance, appearanceTransition: null, editingMessage: null, document: {
       documentElement: { dataset: {}, style: { setProperty: (name, value) => styles.set(name, value) },
         classList: { add() {}, remove() {} } },
     },

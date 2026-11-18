@@ -5,7 +5,7 @@ import { $, element } from "../../ui/dom.js";
 import { notice } from "../../ui/notice.js";
 import {
   ambientLightStatus, appearance, appearanceButtonColor, appearanceThemeColors,
-  appearanceTransitionTimer, automaticAppearanceTheme, automaticThemeAtNight,
+  automaticAppearanceTheme, automaticThemeAtNight,
   automaticThemeCandidate, automaticThemeLightLuxMax, automaticThemeLightLuxMin,
   automaticThemeLuxShift, automaticThemeShiftProbe, automaticThemeStableMs,
   beginThemeDiagnosticTransition, clearThemeDiagnosticTimers, currentAutomaticThemeLightLux,
@@ -13,7 +13,7 @@ import {
   fontStack, localAppearance, observeAutomaticThemeShift, observeThemeLight, readAppearance,
   readRemoteBackground, recordThemeDiagnostic, remoteBackground, remoteBackgroundDataPattern,
   remoteBackgroundOperation, resetAutomaticThemeCompensation, setAmbientLightStatus, setAppearance,
-  setAppearanceTransitionTimer, setAutomaticThemeCandidate, setAutomaticThemeLuxShift,
+  setAutomaticThemeCandidate, setAutomaticThemeLuxShift,
   setAutomaticThemeShiftProbe, setRemoteBackground, setRemoteBackgroundError,
   setRemoteBackgroundOperation, syncAppearanceThemeControls
 } from "./theme.js";
@@ -22,6 +22,8 @@ import { resizeComposerInput, resizeEditorInput } from "../composer/prompt-edito
 import { scheduleMermaidBlocks } from "../messages/media-state.js";
 import { editingMessage } from "../messages/message-edit.js";
 import { workspaceSidePanel } from "../session/side-panel.js";
+
+let appearanceTransition = null;
 
 export function syncRemoteBackground() {
   const image = $("#remote-background");
@@ -158,10 +160,7 @@ export function applyAppearance(save = false) {
     "file-reading-font-size": `${currentFileReadingFontSize()}px`,
   };
   for (const [name, value] of Object.entries(values)) root.style.setProperty(`--${name}`, value);
-  if (themeChanged) {
-    clearTimeout(appearanceTransitionTimer);
-    setAppearanceTransitionTimer(setTimeout(() => root.classList.remove("theme-transition"), 300));
-  }
+  if (themeChanged || appearanceTransition) settleAppearanceTransition(root);
   $('meta[name="theme-color"]')?.setAttribute("content", background);
   syncRemoteBackground();
   if (save) {
@@ -173,6 +172,21 @@ export function applyAppearance(save = false) {
   refitComposerMenus();
   if ($("#messages")) scheduleMermaidBlocks();
 }
+
+function settleAppearanceTransition(root) {
+  // 不按 300ms 定时截断：首帧延迟、反向切换和减少动态效果都以浏览器本次真正运行的过渡为准。
+  const colors = root.getAnimations?.().filter(animation => animation.transitionProperty?.startsWith("--")) ?? [];
+  const pending = Promise.allSettled(colors.map(animation => animation.finished));
+  appearanceTransition = pending;
+  void pending.then(() => {
+    if (appearanceTransition !== pending) return;
+    // 结束通知可能早于子控件应用最后一帧；先在停用二次过渡时完成布局，再恢复控件自己的动效。
+    void root.offsetWidth;
+    appearanceTransition = null;
+    root.classList.remove("theme-transition");
+  });
+}
+
 // 启动时应用外观、读取远程背景，并开始自动主题、主题诊断与环境光订阅。
 export function startAppearance() {
   applyAutomaticAppearance(false, { immediate: true, reason: "startup" });

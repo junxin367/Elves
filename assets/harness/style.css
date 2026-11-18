@@ -1,5 +1,6 @@
 @property --bg{syntax:"<color>";inherits:true;initial-value:#ffffff}
 @property --composer-bg{syntax:"<color>";inherits:true;initial-value:#ffffff}
+@property --appearance-card-bg{syntax:"<color>";inherits:true;initial-value:#ffffff}
 @property --composer-hover{syntax:"<color>";inherits:true;initial-value:#f3f3f3}
 @property --control-bg{syntax:"<color>";inherits:true;initial-value:#ffffff}
 @property --control-hover{syntax:"<color>";inherits:true;initial-value:#f3f3f3}
@@ -11,6 +12,7 @@
 @property --muted{syntax:"<color>";inherits:true;initial-value:#717171}
 @property --line{syntax:"<color>";inherits:true;initial-value:#e8e8e8}
 @property --hover{syntax:"<color>";inherits:true;initial-value:#eeeeee}
+@property --sidebar-row-highlight{syntax:"<color>";inherits:true;initial-value:rgba(31,31,31,.053)}
 @property --code{syntax:"<color>";inherits:true;initial-value:#f7f7f7}
 @property --accent{syntax:"<color>";inherits:true;initial-value:#171717}
 @property --on-accent{syntax:"<color>";inherits:true;initial-value:#ffffff}
@@ -41,14 +43,28 @@
 @property --notice-text{syntax:"<color>";inherits:true;initial-value:#1f1f1f}
 @property --danger{syntax:"<color>";inherits:true;initial-value:#b42318}
 @property --green{syntax:"<color>";inherits:true;initial-value:#168350}
-/* 用户要求明暗过渡覆盖各语义色；普通主按钮的字、底色作为一组同时切换，避免在两套配色之间出现低对比度。 */
-html.theme-transition{transition:--bg 300ms linear,--composer-bg 300ms linear,--composer-hover 300ms linear,--control-bg 300ms linear,--control-hover 300ms linear,--menu-divider 300ms linear,--tooltip-bg 300ms linear,--tooltip-text 300ms linear,--side 300ms linear,--text 300ms linear,--text-secondary 300ms linear,--muted 300ms linear,--line 300ms linear,--hover 300ms linear,--code 300ms linear,--accent 300ms linear,--on-accent 300ms linear,--accent-text 300ms linear,--accent-text-hover 300ms linear,--accent-solid 300ms linear,--accent-solid-hover 300ms linear,--accent-solid-active 300ms linear,--accent-soft 300ms linear,--accent-soft-hover 300ms linear,--accent-soft-active 300ms linear,--accent-indicator 300ms linear,--focus-ring 300ms linear,--selection-bg 300ms linear,--selection-text 300ms linear,--primary-bg 300ms linear,--primary-text 300ms linear,--primary-hover 300ms linear,--primary-active 300ms linear,--user-message-bg 300ms linear,--user-message-text 300ms linear,--notice-bg 300ms linear,--notice-text 300ms linear,--danger 300ms linear,--green 300ms linear}
+/* 用户要求卡片、页面、侧栏和控件同帧过渡。300ms 是原有整页时长，JS 等实际过渡结束；期间不叠加控件自己的颜色动效。 */
+html.theme-transition{
+  --duration-control-color:0s;
+  transition-property:--bg,--composer-bg,--appearance-card-bg,--composer-hover,--control-bg,--control-hover,--menu-divider,--tooltip-bg,--tooltip-text,
+    --side,--text,--text-secondary,--muted,--line,--hover,--sidebar-row-highlight,--code,--accent,--on-accent,
+    --accent-text,--accent-text-hover,--accent-solid,--accent-solid-hover,--accent-solid-active,--accent-soft,--accent-soft-hover,
+    --accent-soft-active,--accent-indicator,--focus-ring,--selection-bg,--selection-text,--primary-bg,--primary-text,--primary-hover,
+    --primary-active,--user-message-bg,--user-message-text,--notice-bg,--notice-text,--danger,--green;
+  transition-duration:300ms;
+  transition-timing-function:linear
+}
 @media(prefers-reduced-motion:reduce){html.theme-transition{transition:none}}
+/* 不支持按实时底色取字色时，打开设置仍可整套切换，不显示对比度不足的中间帧。 */
+@supports not (color:contrast-color(#fff)){
+  html.theme-transition:has(.appearance-screen[open]){transition:none}
+}
 :root{font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;color-scheme:light dark;--bg:#fff;--side:#f9f9f9;--text:#1f1f1f;--muted:#717171;--line:#e8e8e8;--hover:#eee;--code:#f7f7f7;--accent:#171717;--on-accent:#fff;--danger:#b42318;--green:#168350;--skill:#3f86c7;--font-size:1rem;font-size:var(--font-size)}
 /* 页面启动或旧缓存尚未写入派生变量时仍使用当前前景/背景；正常运行由 appearanceThemeColors 完整覆盖。 */
 :root{--text-secondary:var(--muted);--accent-text:var(--accent);--accent-text-hover:var(--accent);--accent-solid:var(--accent);--accent-solid-hover:var(--accent);--accent-solid-active:var(--accent);--accent-soft:var(--hover);--accent-soft-hover:var(--hover);--accent-soft-active:var(--hover);--accent-indicator:var(--accent);--focus-ring:var(--accent);--selection-bg:var(--hover);--selection-text:var(--text);--primary-bg:var(--text);--primary-text:var(--bg);--primary-hover:color-mix(in srgb,var(--text) 92%,var(--bg));--primary-active:color-mix(in srgb,var(--text) 86%,var(--bg));--user-message-bg:var(--hover);--user-message-text:var(--text);--notice-bg:var(--control-bg,var(--side));--notice-text:var(--text)}
 :root{--control-icon-size:32px;--control-inline-size:28px;--control-toolbar-size:32px;--control-menu-height:36px;--prompt-editor-max-height:180px;--popup-max-height:80dvh}
-:root{--button-bg:var(--primary-bg);--button-text:var(--primary-text);--button-hover:var(--primary-hover);--button-active:var(--primary-active)}
+:root{--button-bg:var(--primary-bg);--button-text:var(--primary-text);--button-hover:var(--primary-hover);--button-active:var(--primary-active);
+  --appearance-card-bg:color-mix(in srgb,var(--composer-bg) 68%,var(--bg));--appearance-nav-selection:color-mix(in srgb,var(--text) 8%,var(--side))}
 /* 用户要求输入框发送/停止共用按钮固定为 28px；桌面、手机共用此值，独立于工具栏的 32px/36px 尺寸。 */
 :root{--composer-send-size:28px}
 /* 用户要求 PC 主导航为 52px：36px 按钮加左右各 8px；手机网页与 Android 由 data-mobile-navigation 取消整列占位。 */
@@ -455,7 +471,7 @@ input:focus,textarea:focus,.prompt-editor:focus,select:focus,button:focus-visibl
 .agent-message.commentary{font-size:calc(var(--font-size)*.93)}
 @media(max-width:760px){.composer-toolbar{margin-left:-7px}.composer-toolbar>.composer-controls{gap:2px}.composer-toolbar .model-button{max-width:100%;min-width:0}.context-info{font-size:calc(var(--font-size)*.72)}.conversation-header .icon-button{padding:5px;font-size:18px}.user-bubble{font-size:var(--font-size)}.appearance-font input{max-width:120px}}
 :root{--radius-control:8px;--radius-popup:12px;--layer-sidebar:20;--layer-session-menu:18;--layer-menu:200;--layer-toast:600;--duration-control:150ms;--duration-popup:200ms}
-button,input,textarea,.prompt-editor{transition:background-color var(--duration-control),border-color var(--duration-control),opacity var(--duration-control)}
+button,input,textarea,.prompt-editor{transition:background-color var(--duration-control-color,var(--duration-control)),border-color var(--duration-control-color,var(--duration-control)),opacity var(--duration-control)}
 button:disabled:hover{background:transparent}
 input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px solid var(--focus-ring);outline-offset:2px}
 :root[data-input-modality=pointer] :is(button,input,textarea,select,.prompt-editor):focus{outline:none;box-shadow:none}
@@ -1282,7 +1298,7 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .appearance-notification-rows{display:flex;flex-direction:column;gap:4px}
 .appearance-notification-row{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:32px;padding:4px 8px;border-radius:8px;font-size:calc(var(--font-size)*.9);line-height:1.4}
 .appearance-notification-switch{appearance:none;-webkit-appearance:none;position:relative;width:32px;height:20px;min-width:32px;margin:0;padding:0;border:1px solid var(--line);border-radius:999px;background:var(--line);cursor:pointer}
-.appearance-notification-switch::after{content:"";position:absolute;top:1px;left:1px;width:16px;height:16px;border-radius:50%;background:var(--bg);transition:transform var(--duration-control),background-color var(--duration-control)}
+.appearance-notification-switch::after{content:"";position:absolute;top:1px;left:1px;width:16px;height:16px;border-radius:50%;background:var(--bg);transition:transform var(--duration-control),background-color var(--duration-control-color,var(--duration-control))}
 .appearance-notification-rows[aria-busy=true] .appearance-notification-switch::after{opacity:0}
 .appearance-notification-switch:checked{border-color:var(--accent-solid);background:var(--accent-solid)}
 .appearance-notification-switch:checked::after{transform:translateX(12px);background:var(--on-accent)}
@@ -1313,7 +1329,7 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .appearance-nav-item{display:flex;align-items:center;gap:10px;width:100%;min-height:34px;padding:7px 10px;border:0;border-radius:10px;background:transparent;color:var(--text);font:inherit;line-height:1.42857;text-align:left;white-space:nowrap}
 .appearance-nav-item:hover,.appearance-nav-item:focus-visible{background:var(--hover)}
 /* 选中态采用效果稿的中性圆角底色，不加粗或显示强调色竖线；颜色由当前主题文字与侧栏背景派生。 */
-.appearance-nav-item[aria-selected=true]{background:color-mix(in srgb,var(--text) 8%,var(--side))}
+.appearance-nav-item[aria-selected=true]{background:var(--appearance-nav-selection)}
 .appearance-nav-item[hidden]{display:none}
 .appearance-nav-icon{display:grid;place-items:center;flex:0 0 1.14286rem;width:1.14286rem;height:1.14286rem}
 .appearance-nav-icon>.ui-icon{width:100%;height:100%}
@@ -1812,6 +1828,24 @@ body{font-weight:var(--ui-font-weight,400)}
 .appearance-section{margin:0 0 30px;min-width:0}
 .appearance-section>h4{margin:0 0 14px;color:var(--muted);font-size:.92857rem;line-height:1.5;font-weight:600}
 .appearance-card{min-width:0;border:1px solid var(--line);border-radius:16px;background:var(--appearance-card-bg,color-mix(in srgb,var(--composer-bg) 68%,var(--bg)));overflow:hidden}
+/* 用户要求设置明暗切换时文字不随底色一起变成灰色：仅过渡期间按各处实际表面选字色，结束后恢复用户调色及文字层级。 */
+@supports (color:contrast-color(#fff)){
+  html.theme-transition .appearance-screen{--settings-frame-bg:var(--bg)}
+  html.theme-transition .appearance-screen :is(.appearance-nav,.appearance-font-preview){--settings-frame-bg:var(--side)}
+  html.theme-transition .appearance-screen .appearance-card{--settings-frame-bg:var(--appearance-card-bg)}
+  html.theme-transition .appearance-screen .appearance-code-preview{--settings-frame-bg:var(--code)}
+  html.theme-transition .appearance-screen .ui-popup{--settings-frame-bg:var(--control-bg)}
+  html.theme-transition .appearance-screen :is(.select-trigger,textarea,input:not([type=range],[type=checkbox],[type=radio],[type=file],[type=color],[type=hidden])){--settings-frame-bg:var(--composer-bg)}
+  html.theme-transition .appearance-screen .select-trigger:is(:focus-visible,[aria-expanded=true]){--settings-frame-bg:var(--composer-hover)}
+  @media(hover:hover) and (pointer:fine){
+    html.theme-transition .appearance-screen .select-trigger:hover:not(:disabled){--settings-frame-bg:var(--composer-hover)}
+  }
+  html.theme-transition :is(.appearance-screen,.appearance-screen :is(.appearance-nav,.appearance-card,.appearance-font-preview,.appearance-code-preview,
+    .ui-popup,.select-trigger,textarea,input:not([type=range],[type=checkbox],[type=radio],[type=file],[type=color],[type=hidden]))){
+    --text:contrast-color(var(--settings-frame-bg));--text-secondary:var(--text);--muted:var(--text);color:var(--text)
+  }
+  html.theme-transition .appearance-nav-item[aria-selected=true]{color:contrast-color(var(--appearance-nav-selection))}
+}
 .appearance-card+.appearance-card{margin-top:16px}
 .appearance-card .appearance-field{min-height:54px;gap:16px;margin:0;padding:12px 16px;border-bottom:1px solid var(--line);font-size:1rem;line-height:1.5}
 .appearance-card>.appearance-field:last-child,.appearance-card #appearance-auto-light-setting .appearance-field{border-bottom:0}

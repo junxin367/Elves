@@ -129,8 +129,6 @@ export let syncAppearanceThemeControls = null;
 export function setSyncAppearanceThemeControls(value) { return syncAppearanceThemeControls = value; }
 export let appearance = readAppearance();
 export function setAppearance(value) { return appearance = value; }
-export let appearanceTransitionTimer = null;
-export function setAppearanceTransitionTimer(value) { return appearanceTransitionTimer = value; }
 const remoteBackgroundKey = "remote-session";
 const remoteBackgroundMimes = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 export const remoteBackgroundDataPattern = /^data:image\/(?:png|jpeg|webp|gif);base64,[a-z0-9+/=]+$/i;
