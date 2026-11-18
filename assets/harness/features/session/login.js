@@ -54,6 +54,19 @@ import {
   collapsedSidebarSections, projectVisibleThreadCounts, sidebarReadRefreshSuppressions
 } from "../sidebar/list-state.js";
 
+function createPairHeading(description) {
+  const heading = element("header", "pair-heading");
+  const brand = element("div", "pair-brand");
+  const mark = productLogo();
+  // 覆盖安装或连接恢复期间沿用登录页的 40px 标识；先声明宽高，避免样式未生效时按 SVG 原始尺寸撑开页面。
+  mark.width = 40;
+  mark.height = 40;
+  brand.append(mark, element("h1", "", "Elves"));
+  heading.append(brand);
+  if (description) heading.append(element("p", "pair-description muted", description));
+  return heading;
+}
+
 export function showLogin() {
   if (isElvesClient()) { void recoverNativeAuthentication(); return; }
   disposeMainNavigation();
@@ -87,11 +100,7 @@ export function showLogin() {
   app.replaceChildren();
   const page = element("div", "pair-page");
   const panel = element("main", "pair-panel");
-  const heading = element("header", "pair-heading");
-  const mark = productLogo();
-  const brand = element("div", "pair-brand");
-  brand.append(mark, element("h1", "", "Elves"));
-  heading.append(brand, element("p", "pair-description muted", "输入访问密钥，继续使用你的 Codex 会话。"));
+  const heading = createPairHeading("输入访问密钥，继续使用你的 Codex 会话。");
   const form = element("form", "pair-form");
   form.noValidate = true;
   const label = element("label", "pair-label", "访问密钥"); label.htmlFor = "access-key";
@@ -316,14 +325,13 @@ function showNativeConnectionRecovery(error = null, working = false) {
   loginPageCleanup?.();
   closePopup();
   const page = element("div", "pair-page"), panel = element("main", "pair-panel");
-  const brand = element("div", "pair-brand");
-  brand.append(productLogo(), element("h1", "", "Elves"));
+  const heading = createPairHeading();
   const message = element("p", `pair-status ${error ? "error-text" : "muted"}`,
     error?.message || "正在恢复本机会话…");
   message.setAttribute("role", error ? "alert" : "status");
   const retry = button("重试本机连接", "重试本机连接", () => void recoverNativeAuthentication(), "primary pair-submit");
   retry.hidden = working;
-  panel.append(brand, message, retry, element("p", "muted", "Elves 独立客户端无需输入访问密钥。"));
+  panel.append(heading, message, retry, element("p", "muted", "Elves 独立客户端无需输入访问密钥。"));
   page.append(panel);
   app.replaceChildren(page);
   announceAppReady();
@@ -366,11 +374,7 @@ export function showConnectionRecovery(error) {
   loginPageCleanup?.();
   const page = element("div", "pair-page");
   const panel = element("main", "pair-panel");
-  const heading = element("header", "pair-heading");
-  const mark = productLogo();
-  const brand = element("div", "pair-brand");
-  brand.append(mark, element("h1", "", "Elves"));
-  heading.append(brand, element("p", "pair-description muted", "当前无法连接远程服务。"));
+  const heading = createPairHeading("当前无法连接远程服务。");
   const message = element("p", "pair-status error-text", connectionErrorMessage(error));
   message.setAttribute("role", "alert");
   const retry = element("button", "primary pair-submit", "重新连接");

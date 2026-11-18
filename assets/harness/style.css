@@ -162,8 +162,8 @@ html{scrollbar-color:var(--muted) transparent}
 .pair-panel{flex-shrink:0;width:100%;max-width:420px;margin:0 auto}
 .pair-heading{display:flex;flex-direction:column;gap:10px;margin-bottom:28px}
 .pair-brand{display:flex;align-items:center;justify-content:flex-start;gap:12px;width:max-content;max-width:100%;min-width:0;margin-inline:0}
-.pair-heading .brand-mark{flex:0 0 40px;width:40px;height:40px;object-fit:contain}
-.pair-heading h1{min-width:0;max-width:100%;margin:0;font-size:2rem;font-weight:600;letter-spacing:-.035em;line-height:1.18;overflow-wrap:anywhere}
+.pair-brand>.brand-mark{flex:none;object-fit:contain}
+.pair-heading h1{min-width:0;max-width:100%;margin:0;font-size:2rem;font-weight:600;line-height:1.18;overflow-wrap:anywhere}
 .pair-description{margin:0;color:var(--muted);font-size:.92857rem;line-height:1.65;text-align:left}
 .pair-form{display:grid;gap:0;margin:0}
 .pair-label{margin-bottom:8px;font-size:.85714rem;font-weight:500;line-height:1.5}

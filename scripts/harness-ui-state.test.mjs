@@ -197,12 +197,12 @@ async function nativeAuthenticationFixture(failure = null) {
   const source = await loadHarnessAppSource();
   let complete, recoveries = 0, connections = 0, remembered = 0;
   const nativeResult = new Promise((resolve, reject) => { complete = () => failure ? reject(failure) : resolve(); });
-  const tags = [], messages = [];
+  const tags = [], messages = [], marks = [];
   const context = rawVm.createContext({
     __ELVES_CLIENT__: { recoverAuthentication() { recoveries++; return nativeResult; } },
     isElvesClient: () => true, connecting: null,
     element(tag, className, text) { tags.push(tag); if (text) messages.push(text); return { append() {}, setAttribute() {} }; },
-    button() { return {}; }, productLogo() { return {}; },
+    button() { return {}; }, productLogo() { const mark = {}; marks.push(mark); return mark; },
     app: { replaceChildren() {} }, announceAppReady() {}, disposeMainNavigation() {},
     loginPageCleanup: null, closePopup() {}, disconnect() {}, cancelConnectionProbe() {},
     rememberPageInputs() { remembered++; },
@@ -211,14 +211,16 @@ async function nativeAuthenticationFixture(failure = null) {
     clearPrivateInputs() { assert.fail("本机恢复不能清理草稿"); },
     showLogin() { assert.fail("本机恢复不能显示远程密码页"); },
   });
-  rawVm.runInContext(source.section("let nativeAuthenticationRecovery = null;", "function showConnectionRecovery("), context);
-  return { context, complete, tags, messages, counts: () => ({ recoveries, connections, remembered }) };
+  rawVm.runInContext(source.section("function createPairHeading(", "function showLogin(")
+    + source.section("let nativeAuthenticationRecovery = null;", "function showConnectionRecovery("), context);
+  return { context, complete, tags, messages, marks, counts: () => ({ recoveries, connections, remembered }) };
 }
 
 test("本机授权恢复合并重复 401 并保留草稿，不显示密码或重发写操作", async () => {
   const fixture = await nativeAuthenticationFixture();
   rawVm.runInContext("requireAuthentication(); requireAuthentication();", fixture.context);
   assert.deepEqual(fixture.counts(), { recoveries: 1, connections: 0, remembered: 1 });
+  assert.deepEqual(fixture.marks, [{ width: 40, height: 40 }], "恢复中也不能依赖样式表限制品牌图尺寸");
   fixture.complete();
   await rawVm.runInContext("nativeAuthenticationRecovery", fixture.context);
   assert.deepEqual(fixture.counts(), { recoveries: 1, connections: 1, remembered: 1 });
@@ -232,6 +234,7 @@ test("本机恢复失败显示真实错误和重试，不自动循环或退回�
   await rawVm.runInContext("nativeAuthenticationRecovery", fixture.context);
   assert.deepEqual(fixture.counts(), { recoveries: 1, connections: 0, remembered: 1 });
   assert.ok(fixture.messages.includes("Harness 本机端口不可用"));
+  assert.deepEqual(fixture.marks, [{ width: 40, height: 40 }, { width: 40, height: 40 }]);
   assert.equal(fixture.tags.includes("input"), false);
 });
 
