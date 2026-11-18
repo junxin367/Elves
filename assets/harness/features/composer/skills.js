@@ -72,8 +72,8 @@ export function slashMenuEntries(query = slashQuery()) {
     .map(skill => ({ type: "skill", enabled: true, skill })));
   if (compactCommandMatches(query.query) && (!isClaude() || claudeCommandSupported("compact")))
     entries.push({ type: "compact", enabled: compactCommandAvailable() });
-  // 用户要求分支紧接“压缩”，临时侧边及其他不支持的实例直接移除，不显示禁用占位。
-  if (threadForkAllowed() && ["fork", "分支", "在新聊天中分支"].some(value => value.includes(query.query)))
+  // 用户要求分支紧接“压缩”并与回复菜单同名；保留旧搜索词，不支持的会话不显示禁用占位。
+  if (threadForkAllowed() && ["fork", "分支到新聊天", "在新聊天中分支"].some(value => value.includes(query.query)))
     entries.push({ type: "fork", enabled: forkCommandAvailable(query) });
   if (!temporarySideThread() && goalCommandMatches(query.query) && (!isClaude() || claudeCommandSupported("goal")))
     entries.push({ type: "goal", enabled: !goalComposerReason() });
@@ -106,7 +106,7 @@ export function renderSkillMenu(message) {
     if (entry.type !== "skill") {
       const goal = entry.type === "goal", optimize = entry.type === "promptOptimize", fork = entry.type === "fork";
       const usage = entry.type === "compact" ? contextUsage(currentThreadDisplay()?.tokenUsage) : null;
-      const label = fork ? "在新聊天中分支" : optimize ? "提示词优化" : goal ? "目标" : "压缩";
+      const label = fork ? "分支到新聊天" : optimize ? "提示词优化" : goal ? "目标" : "压缩";
       const reason = goal ? goalComposerReason() : "";
       const action = fork ? selectForkCommand : optimize ? selectPromptOptimizationCommand : goal ? () => selectGoalCommand() : selectCompactCommand;
       const node = button("", reason || label, action,

@@ -30,7 +30,7 @@ export async function openForkResult(record, result) {
   }
   if (scope === privateInputScope(session)) {
     const warning = [result.warning, result.permissionWarning].filter(value => typeof value === "string" && value).join("；");
-    notice(warning || "已在新聊天中分支", !!warning);
+    notice(warning || "已分支到新聊天", !!warning);
   }
 }
 export async function forkThread(turnId = null, sourceId = selectedId) {

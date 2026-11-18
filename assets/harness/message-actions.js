@@ -89,11 +89,11 @@ export function renderMessageActions(root, item, options, callbacks) {
   if (state.canCopy) panel.append(action("copy", user ? "复制用户消息" : "复制回复", callbacks.copy));
   if (state.canEdit) panel.append(action("edit", "编辑并再次发送", callbacks.edit));
   if (state.canFork) {
-    // 用户要求回复下方 ⋯ 菜单；不支持的侧边/子智能体不创建按钮，不能仅置灰。
+    // 用户要求回复下方 ⋯ 菜单与 /fork 同名为“分支到新聊天”；不支持的侧边/子智能体不创建按钮。
     const more = action("more", "更多操作", () => togglePopup(more));
     more.classList.add("message-more-button");
     more.setAttribute("aria-haspopup", "menu"); more.setAttribute("aria-expanded", "false");
-    more.menuOptions = [{ value: "fork", label: "在新聊天中分支", icon: "fork",
+    more.menuOptions = [{ value: "fork", label: "分支到新聊天", icon: "fork",
       disabled: state.forkDisabled, action: () => callbacks.fork(state.forkTurnId) }];
     binding.more = more;
     panel.append(more);

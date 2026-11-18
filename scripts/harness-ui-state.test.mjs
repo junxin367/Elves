@@ -16534,7 +16534,7 @@ test("回复更多菜单只在可分支的已结束主会话回复上生成，�
   renderMessageActions(root, item, options, callbacks);
   const more = root.messageActionBinding.more;
   assert.equal(more.attributes["aria-haspopup"], "menu");
-  assert.equal(more.menuOptions[0].label, "在新聊天中分支");
+  assert.equal(more.menuOptions[0].label, "分支到新聊天");
   more.menuOptions[0].action();
   assert.deepEqual(forks, ["old-turn"]);
   renderMessageActions(root, item, { ...options, forkSupported: false }, callbacks);
@@ -16574,11 +16574,11 @@ test("斜杠分支紧随压缩，支持中文和 fork 筛选，侧边同时移�
   vm.runInContext(sourceSection("function forkCommandAvailable(", "function slashMenuEntries(")
     + sourceSection("function selectForkCommand(", "function selectPromptOptimizationCommand("), c);
   assert.deepEqual(Array.from(c.slashMenuEntries(), entry => entry.type), ["compact", "fork", "goal", "promptOptimize"]);
-  for (const query of ["/fork", "/分支", "/在新聊天"]) {
+  for (const query of ["/fork", "/分支", "/分支到新聊天", "/在新聊天"]) {
     h.prompt.value = query; h.prompt.selectionStart = h.prompt.selectionEnd = query.length;
     assert.deepEqual(Array.from(c.slashMenuEntries(), entry => entry.type), ["fork"]);
     c.renderSkillMenu();
-    assert.equal(h.menu.children[1].children[0].children[1].children[0].textContent, "在新聊天中分支");
+    assert.equal(h.menu.children[1].children[0].children[1].children[0].textContent, "分支到新聊天");
   }
   c.selectForkCommand();
   assert.equal(h.prompt.value, "");
