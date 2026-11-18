@@ -7061,8 +7061,9 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
             .kill_on_drop(true);
         #[cfg(windows)]
         command.creation_flags(crate::windows_create_hidden_process());
-        let process =
+        let mut process =
             crate::codex_service::RunningService::for_test(command.spawn().unwrap()).unwrap();
+        process.codex_home = Some(directory.path().join("codex-home"));
         authorization
             .controller
             .harness
@@ -7231,6 +7232,90 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn harness_external_writer_read_preserves_history_and_recovers_without_resume() {
+        let (directory, authorization) = harness_fixture().await;
+        let controller = &authorization.controller;
+        let id = uuid::Uuid::new_v4().to_string();
+        controller
+            .harness
+            .seed_test_subagents(json!({"rows":[{
+                "id":id,"name":"外部持有的会话","cwd":directory.path(),"ephemeral":false,
+                "threadSource":"user","source":"vscode","status":{"type":"idle"},
+                "turns":[],"createdAt":1,"updatedAt":1
+            }]}))
+            .await
+            .unwrap();
+        let read = || controller.call_authorized("thread", json!({"threadId":id}), &authorization);
+        let initial = read().await.unwrap();
+        assert_eq!(initial["thread"]["externalWriter"], false);
+        let locks = directory.path().join("codex-home/thread-writer-locks");
+        assert!(!locks.exists(), "读取不能创建原生锁目录");
+        std::fs::create_dir_all(&locks).unwrap();
+        let lock_path = locks.join(format!("{id}.lock"));
+        let owner = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .unwrap();
+        std::fs::write(&lock_path, b"native-lock-marker").unwrap();
+        assert_eq!(
+            read().await.unwrap()["thread"]["externalWriter"],
+            false,
+            "未被加锁的残留文件不能显示外部占用"
+        );
+        owner.lock().unwrap();
+        let blocked = read().await.unwrap();
+        assert_eq!(blocked["thread"]["externalWriter"], true);
+        assert_eq!(blocked["thread"]["readOnly"], true);
+        assert_eq!(
+            blocked["thread"]["readOnlyReason"],
+            "请先在那边关闭会话，才能在这里继续。"
+        );
+        controller
+            .call_authorized("history", json!({"threadId":id}), &authorization)
+            .await
+            .unwrap();
+        owner.unlock().unwrap();
+        let released = read().await.unwrap();
+        assert_eq!(released["thread"]["externalWriter"], false);
+        assert_eq!(released["thread"]["readOnly"], false);
+        assert_eq!(std::fs::read(&lock_path).unwrap(), b"native-lock-marker");
+        assert!(
+            harness_engine_requests(directory.path())
+                .iter()
+                .all(|frame| !matches!(
+                    frame["method"].as_str(),
+                    Some(
+                        "thread/resume"
+                            | "turn/start"
+                            | "thread/fork"
+                            | "thread/delete"
+                            | "thread/unsubscribe"
+                    )
+                )),
+            "检查和重试只读取，不产生写操作"
+        );
+        // 模拟原生连接已由本服务恢复并持有 writer；同代次的锁不能阻止本服务继续输入。
+        controller
+            .call_authorized(
+                "send",
+                json!({"threadId":id,"prompt":"测试自身写入者"}),
+                &authorization,
+            )
+            .await
+            .unwrap();
+        owner.lock().unwrap();
+        let own = read().await.unwrap();
+        assert_eq!(own["thread"]["externalWriter"], false);
+        assert_eq!(own["thread"]["readOnly"], false);
+        owner.unlock().unwrap();
+        drop(owner);
+        controller.harness.enabled.store(false, Ordering::Release);
+        controller.harness.release().await;
     }
 
     fn harness_history_requests(directory: &FsPath) -> Vec<Value> {

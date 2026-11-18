@@ -210,6 +210,17 @@ html{scrollbar-color:var(--muted) transparent}
  * resizeComposerInput 按 min-height 自动增高，手机沿用下方独立的 80px 规则。 */
 @media(min-width:761px){.composer .prompt-editor{height:80px;min-height:80px}}
 .composer-anchor{position:relative;min-width:0}
+/* 用户要求占用提示在原输入框位置就地替换：复用 .composer-area/.composer-anchor 的底部布局、宽度与边距；只保留重试，不另做浮层或分叉入口。 */
+.thread-ownership-banner{display:flex;align-items:center;gap:12px;min-width:0;min-height:76px;padding:16px 20px;border:1px solid var(--line);border-radius:24px;background:var(--composer-bg,var(--side));color:var(--text)}
+.thread-ownership-banner>.thread-ownership-copy{display:flex;flex:1;flex-direction:column;gap:4px;min-width:0;line-height:1.5;overflow-wrap:anywhere}
+.thread-ownership-banner strong{font-size:1rem;font-weight:600}
+.thread-ownership-copy>span{font-size:.85714rem;color:var(--muted)}
+#thread-ownership-icon{display:flex;flex-shrink:0}
+#thread-ownership-icon>.ui-icon{width:18px;height:18px}
+.thread-ownership-actions{display:flex;flex-shrink:0;align-items:center;border-inline-start:1px solid var(--line);padding-inline-start:12px}
+.thread-ownership-actions>.text-button{min-width:64px;min-height:32px;font-size:.85714rem;white-space:nowrap}
+.composer-anchor:has(.thread-ownership-banner:not([hidden]))>.composer-metrics{display:none}
+@media(max-width:760px){.thread-ownership-banner{gap:8px;padding:12px;border-radius:20px}.thread-ownership-actions{padding-inline-start:8px}.thread-ownership-actions>.text-button{min-width:56px}}
 /* 用户确认额度放在输入框下方现有空位：20px 高度复用 .composer-area 已有的至少 20px 下边距。
  * 绝对定位不参与布局，禁止为额度增加 margin/padding/行高或移动输入框；右侧保持原内侧对齐。 */
 /* 用户确认两个额度的分隔圆点两侧各由 10px 收至 5px；单项名称与百分比仍保持下方 5px 间距。

@@ -432,6 +432,17 @@ impl CodexHarness {
         thread["fastMode"] = json!(self.fast_preference(id).await);
         self.decorate_persistent_side(&response["thread"], &mut thread).await;
         self.decorate_idle_release(id, &mut thread).await;
+        let owned_generation = self.loaded.lock().await.get(id).cloned();
+        let external_writer = self
+            .runtime
+            .external_thread_writer(id, owned_generation.as_deref())
+            .await?;
+        thread["externalWriter"] = json!(external_writer);
+        if external_writer {
+            // 用户要求外部占用时用提示替换编辑器；只读保护复用所有输入入口，草稿和队列不清理。
+            thread["readOnly"] = json!(true);
+            thread["readOnlyReason"] = json!("请先在那边关闭会话，才能在这里继续。");
+        }
         Ok(json!({"ok":true,"thread":thread,"nativeBridge":"harness"}))
     }
 

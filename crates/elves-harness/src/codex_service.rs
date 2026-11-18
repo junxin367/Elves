@@ -28,6 +28,8 @@ pub trait ServiceDispatchGuard: Send + Sync {
 
 pub(crate) struct RunningService {
     pub(crate) child: Child,
+    // 占用检查绑定实际启动的实例目录，不能借用后来切换的设置或其他 Codex Home。
+    pub(crate) codex_home: Option<PathBuf>,
     pub(crate) stdin: mpsc::Sender<WriteFrame>,
     pub(crate) stdout: BufReader<ChildStdout>,
 }
@@ -42,6 +44,7 @@ impl RunningService {
         let stdout = BufReader::new(child.stdout.take().context("missing stdout")?);
         Ok(Self {
             child,
+            codex_home: None,
             stdin,
             stdout,
         })
@@ -150,6 +153,7 @@ async fn spawn_candidate(
     }
     Ok(RunningService {
         child,
+        codex_home: Some(codex_home.to_path_buf()),
         stdin,
         stdout: BufReader::new(stdout),
     })

@@ -9981,6 +9981,140 @@ test("后台事件不会重建历史请求或整页刷新；前台后可以正�
   await read;
 });
 
+function threadOwnershipHarness() {
+  const focusCalls = [], notices = [], reads = [];
+  let resolveRead, rejectRead;
+  const makeNode = () => ({ hidden: false, disabled: false, textContent: "", attributes: {},
+    classList: { toggle() {}, remove() {} }, setAttribute(key, value) { this.attributes[key] = value; } });
+  const nodes = new Map([".workspace", "#composer", "#thread-ownership", "#thread-ownership-retry",
+    "#side-thread-expired", "#open-sidebar", "#connection-state", "#open-session-tools",
+    "#related-session-back", "#pending-area", "#prompt"].map(key => [key, makeNode()]));
+  const draft = { text: "保留未发送草稿", attachments: [{ name: "kept.png" }] };
+  const queue = [{ id: "queued", text: "保留排队消息" }];
+  const context = {
+    selectedId: "owned", selectionToken: "selection-a", nativeConnectionVersion: 4, scope: "device-a",
+    session: { readOnly: false }, thread: { id: "owned", backend: "codex", externalWriter: true, readOnly: true },
+    relatedSessionView: null, relatedThreadViews: new Map(), relatedBackPending: false,
+    connected: true, pageLeaving: false, document: { hidden: false }, expired: false,
+    threadOwnershipRetry: null, draft, queue,
+    privateInputScope: () => context.scope, normalizeRelatedView: value => value,
+    sideThreadExpired: () => context.expired, validRelatedThreadId: () => true,
+    syncSideThreadPresence() {}, syncRelatedModelDisplay() {}, syncSideThreadUnread() {},
+    scheduleRelatedSessionCheck() {}, syncRelatedSidebarLayout: null, sessionMenu: null,
+    $: key => nodes.get(key), notice: (message, error) => notices.push({ message, error }),
+    setThreadOwnershipRetry: value => { context.threadOwnershipRetry = value; },
+    reloadThread() {
+      reads.push(context.selectedId);
+      return new Promise((resolve, reject) => { resolveRead = resolve; rejectRead = reject; });
+    }
+  };
+  nodes.get("#prompt").value = draft.text;
+  nodes.get("#prompt").disabled = true;
+  nodes.get("#prompt").focus = options => focusCalls.push(options);
+  vm.createContext(context);
+  vm.runInContext([
+    sourceSection("function threadOwnedElsewhere(", "function threadActionReadOnly("),
+    sourceSection("function syncRelatedSessionLayout()", "function finishRelatedSessionExit("),
+    sourceSection("function currentThreadOwnershipRetry(", "function syncPendingFeedbackTimer(")
+  ].join("\n"), context);
+  context.syncRelatedSessionLayout(); context.renderThreadOwnership();
+  return { context, nodes, focusCalls, notices, reads, draft, queue,
+    resolve() { resolveRead(); }, reject(error) { rejectRead(error); },
+    release() {
+      context.thread = { ...context.thread, externalWriter: false, readOnly: false };
+      nodes.get("#prompt").disabled = false;
+      context.syncRelatedSessionLayout();
+    }
+  };
+}
+
+test("其他 Codex 持有时原编辑器隐藏，提示仅提供重试且保留草稿和队列", () => {
+  const h = threadOwnershipHarness();
+  assert.equal(h.nodes.get("#composer").hidden, true);
+  assert.equal(h.nodes.get("#thread-ownership").hidden, false);
+  assert.equal(h.context.threadReadOnly(), true);
+  assert.equal(h.nodes.get("#prompt").value, h.draft.text);
+  assert.equal(h.context.draft, h.draft); assert.equal(h.context.queue, h.queue);
+  const inputArea = sourceSection('<div class="composer-area">', '    </main>');
+  assert.ok(inputArea.indexOf('id="thread-ownership"') > inputArea.indexOf('class="composer-anchor"'),
+    "占用提示复用原输入框的会话底部容器");
+  assert.ok(inputArea.indexOf('id="thread-ownership"') < inputArea.indexOf('<form id="composer"'),
+    "提示在原编辑器相邻位置替换，不放入消息区或页头");
+  const banner = sourceSection('<div id="thread-ownership"', '<form id="composer"');
+  assert.match(banner, /在另一个应用中打开/);
+  assert.match(banner, /请先在那边关闭会话，才能在这里继续。/);
+  assert.match(banner, /thread-ownership-retry/);
+  assert.doesNotMatch(banner, /fork|分叉/);
+  h.context.thread = { id: "another", backend: "codex", externalWriter: true, readOnly: true };
+  assert.equal(h.context.threadOwnedElsewhere(), false, "其他会话的状态不能隐藏当前编辑器");
+  h.context.thread = { id: "owned", backend: "claude", externalWriter: true };
+  assert.equal(h.context.threadOwnedElsewhere(), false, "本功能只处理 Codex 的原生 writer");
+});
+
+test("外部占用仅限制当前会话，新建及侧栏菜单仍遵守设备只读和离线限制", () => {
+  const h = threadOwnershipHarness(), newChat = { disabled: true }, rowMenu = { disabled: true };
+  h.nodes.set("#new-chat", newChat); h.context.sidebarBusy = false;
+  h.context.document.querySelectorAll = () => [rowMenu];
+  const apply = () => vm.runInContext(
+    sourceSection('$("#new-chat").disabled =', '  // 用户要求主会话和侧边队列编辑时仍可选择后续模型')
+      + sourceSection('for (const control of document.querySelectorAll(".row-menu-button"))', '  fitPopup();'), h.context);
+  apply(); assert.equal(newChat.disabled, false); assert.equal(rowMenu.disabled, false);
+  h.context.session.readOnly = true; apply();
+  assert.equal(newChat.disabled, true); assert.equal(rowMenu.disabled, true);
+  h.context.session.readOnly = false; h.context.connected = false; apply();
+  assert.equal(newChat.disabled, true); assert.equal(rowMenu.disabled, true);
+  h.context.connected = true; h.context.thread.externalWriter = false; apply();
+  assert.equal(newChat.disabled, true); assert.equal(rowMenu.disabled, true);
+});
+
+test("占用重试只核对一次，仍被持有时保留提示和原输入", async () => {
+  const h = threadOwnershipHarness(), retry = h.nodes.get("#thread-ownership-retry");
+  const pending = h.context.retryThreadOwnership();
+  assert.equal(retry.disabled, true); assert.equal(retry.attributes["aria-busy"], "true");
+  assert.equal(retry.textContent, "重试中…");
+  await h.context.retryThreadOwnership();
+  assert.deepEqual(h.reads, ["owned"]);
+  h.resolve(); await pending;
+  assert.equal(h.nodes.get("#composer").hidden, true);
+  assert.equal(retry.disabled, false); assert.equal(retry.textContent, "重试");
+  assert.equal(retry.attributes["aria-busy"], "false");
+  assert.equal(h.nodes.get("#prompt").value, h.draft.text);
+  assert.deepEqual(h.focusCalls, []); assert.deepEqual(h.notices, []);
+});
+
+test("确认外部锁释放后恢复原编辑器，手动重试可继续原草稿", async () => {
+  const h = threadOwnershipHarness(), pending = h.context.retryThreadOwnership();
+  h.release(); h.resolve(); await pending;
+  assert.equal(h.nodes.get("#composer").hidden, false);
+  assert.equal(h.nodes.get("#thread-ownership").hidden, true);
+  assert.equal(h.context.threadReadOnly(), false);
+  assert.equal(h.nodes.get("#prompt").value, h.draft.text);
+  assert.equal(h.context.queue, h.queue);
+  assert.deepEqual(h.focusCalls.map(options => options.preventScroll), [true]);
+});
+
+test("占用检查失败保留提示与输入，离线不发起重试", async () => {
+  const h = threadOwnershipHarness(), pending = h.context.retryThreadOwnership();
+  h.reject(new Error("读取失败")); await pending;
+  assert.equal(h.nodes.get("#composer").hidden, true);
+  assert.equal(h.nodes.get("#prompt").value, h.draft.text);
+  assert.deepEqual(h.notices, [{ message: "检查会话占用失败：读取失败", error: true }]);
+  h.context.connected = false; h.context.renderThreadOwnership();
+  assert.equal(h.nodes.get("#thread-ownership-retry").disabled, true);
+  await h.context.retryThreadOwnership(); assert.deepEqual(h.reads, ["owned"]);
+});
+
+for (const change of ["selectedId", "selectionToken", "scope", "nativeConnectionVersion"])
+  test(`切换${change}后迟到的占用重试不抢焦点、不清理草稿`, async () => {
+    const h = threadOwnershipHarness(), pending = h.context.retryThreadOwnership();
+    h.context[change] = change === "nativeConnectionVersion" ? 5 : "changed";
+    h.release(); h.resolve(); await pending;
+    assert.deepEqual(h.focusCalls, []);
+    assert.deepEqual(h.notices, []);
+    assert.equal(h.context.queue, h.queue);
+    assert.equal(h.nodes.get("#prompt").value, h.draft.text);
+  });
+
 // 摘自 119 的 closed-test-probe.json；测试不依赖本机 dist 取证目录。
 const expiredSideProbe = {
   threadId: "01a19a9a-0435-70b1-b979-e041ed4e25ed",

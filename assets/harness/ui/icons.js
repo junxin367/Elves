@@ -34,6 +34,7 @@ export function icon(name) {
     // 用户要求本地文件与文件夹使用两种简洁图标，预览中心与选择菜单共用。
     document: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/>',
     pin: '<path d="m16 3 5 5-4 1-3 5-4-4 5-3Z"/><path d="m10 14-7 7"/>',
+    lock: '<rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/>',
     plus: '<path d="M12 5v14M5 12h14"/>', check: '<path d="m5 12 4 4L19 6"/>',
     image: '<rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8" cy="8" r="1.5"/><path d="m21 15-6-6L3 21"/>',
     shield: '<path d="M12 3 4 6v6c0 4.5 5 7.7 8 9 3-1.3 8-4.5 8-9V6Z"/><path d="m8.5 11.5 2.5 2.5 4.5-5"/>',

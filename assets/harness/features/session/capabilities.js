@@ -78,6 +78,10 @@ export function threadForkAllowed(id = selectedId) {
     && !["side", "subagent"].includes(thread.viewKind) && !normalizeRelatedView(relatedThreadViews.get(id), id)
     && relatedSessionView?.threadId !== id;
 }
+export function threadOwnedElsewhere(id = selectedId) {
+  return !!id && thread?.id === id && thread.backend !== "claude"
+    && thread.externalWriter === true;
+}
 export function threadReadOnly(id = selectedId) {
   return !!session?.readOnly || !!id && (
     thread?.id === id && (thread.readOnly === true || thread.viewKind === "subagent")

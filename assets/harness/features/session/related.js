@@ -26,7 +26,7 @@ import {
 } from "../conversation/selection-state.js";
 import { markVisibleThreadRead } from "../messages/user-content.js";
 import {
-  normalizeRelatedView, privateInputScope, sideThreadsEnabled, subagentsEnabled, threadReadOnly,
+  normalizeRelatedView, privateInputScope, sideThreadsEnabled, subagentsEnabled, threadOwnedElsewhere, threadReadOnly,
   validRelatedThreadId
 } from "./capabilities.js";
 import {
@@ -88,7 +88,11 @@ export function syncRelatedSessionLayout() {
   syncRelatedModelDisplay();
   const expired = sideThreadExpired();
   const composer = $("#composer");
-  if (composer) composer.hidden = view?.kind === "subagent" || expired;
+  const externalWriter = threadOwnedElsewhere();
+  // 用户要求其他 Codex 持有时隐藏原编辑器，保留节点与草稿；解除占用后沿用原输入内容。
+  if (composer) composer.hidden = view?.kind === "subagent" || expired || externalWriter;
+  const ownershipBanner = $("#thread-ownership");
+  if (ownershipBanner) ownershipBanner.hidden = !externalWriter || expired || view?.kind === "subagent";
   const expiredBanner = $("#side-thread-expired");
   if (expiredBanner) {
     expiredBanner.hidden = !expired;

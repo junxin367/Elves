@@ -60,7 +60,7 @@ import { updatePromptOptimization } from "./prompt-optimization.js";
 import {
   clearPendingFeedbackTimer, composerDiagnosticState, pendingFeedbackDelay, pendingFeedbackReady,
   prepareClaudeProjectCreation, queuedEditHasOriginalImages, sending, setComposerDiagnosticState,
-  setPendingFeedbackTimer, setSending
+  setPendingFeedbackTimer, setSending, setThreadOwnershipRetry, threadOwnershipRetry
 } from "./send-state.js";
 import { selectedSkills } from "./skill-catalog.js";
 import { compactCommandAvailable, renderSkillMenu } from "./skills.js";
@@ -86,7 +86,7 @@ import { editingQueuedMessage, queueVersion, queuedEditActions } from "../queue/
 import { claudeCommandSupported } from "../session/action-capabilities.js";
 import {
   activeBackend, backendCapability, claudeNativeQueue, isActiveThread, isClaude, privateInputScope,
-  queueCapability, serviceSideThread, temporarySideThread, threadReadOnly, threadReadOnlyMessage
+  queueCapability, serviceSideThread, temporarySideThread, threadOwnedElsewhere, threadReadOnly, threadReadOnlyMessage
 } from "../session/capabilities.js";
 import { recordRuntimeDiagnostic, stream } from "../session/connection-state.js";
 import {
@@ -106,6 +106,41 @@ import {
   threadDeleted, threadDeletionChecks, threadDeletionKey, threadDeletionLocked, threadDeletions
 } from "../sidebar/deletion-state.js";
 import { checkThreadDeletion } from "../sidebar/thread-deletion.js";
+
+function currentThreadOwnershipRetry(record = threadOwnershipRetry) {
+  return !!record && !pageLeaving && record.threadId === selectedId && record.selectionToken === selectionToken
+    && record.scope === privateInputScope(session) && record.connectionVersion === nativeConnectionVersion;
+}
+function renderThreadOwnership() {
+  const retry = $("#thread-ownership-retry");
+  if (!retry) return;
+  const checking = currentThreadOwnershipRetry();
+  retry.disabled = !connected || checking;
+  retry.textContent = checking ? "重试中…" : "重试";
+  retry.setAttribute("aria-busy", String(checking));
+}
+export async function retryThreadOwnership() {
+  if (!threadOwnedElsewhere() || !connected || currentThreadOwnershipRetry()) return;
+  const record = { threadId: selectedId, selectionToken, scope: privateInputScope(session),
+    connectionVersion: nativeConnectionVersion };
+  setThreadOwnershipRetry(record);
+  renderThreadOwnership();
+  try {
+    // 用户要求这里只重新核对占用；不恢复其他客户端的会话、不创建分支，也不重发草稿或排队消息。
+    await reloadThread();
+    if (currentThreadOwnershipRetry(record) && !document.hidden && !threadOwnedElsewhere()
+        && !threadReadOnly() && !$("#composer")?.hidden && !$("#prompt")?.disabled)
+      $("#prompt")?.focus({ preventScroll: true });
+  } catch (error) {
+    if (currentThreadOwnershipRetry(record)) notice(
+      `检查会话占用失败：${error.message}`, true);
+  } finally {
+    if (threadOwnershipRetry === record) {
+      setThreadOwnershipRetry(null);
+      renderThreadOwnership();
+    }
+  }
+}
 
 export function syncPendingFeedbackTimer() {
   clearPendingFeedbackTimer();
@@ -148,6 +183,7 @@ export function updateComposer({ followEnd = false } = {}) {
   sessionTools?.updateContext();
   syncRelatedSessionLayout();
   if (!$("#composer")) return;
+  renderThreadOwnership();
   if (typeof restoreUnfinishedQueuedMessageEdit === "function") restoreUnfinishedQueuedMessageEdit();
   // 先恢复当前会话的缓存及保存状态，再决定发送按钮是否等待该会话的 Fast 写入。
   updateRemoteFast();
@@ -292,7 +328,8 @@ export function updateComposer({ followEnd = false } = {}) {
     || editingQueuedMessage?.state === "starting" || (!creating && !selectedId);
   syncRequestedSideInput();
   syncWorkspaceSidePanelState();
-  $("#new-chat").disabled = threadReadOnly() || !connected && !(session?.capabilities?.claudeSessions && stream?.readyState === EventSource.OPEN);
+  // 外部占用只限制当前会话，仍允许新建其他聊天及使用侧栏菜单。
+  $("#new-chat").disabled = session?.readOnly || threadReadOnly() && !threadOwnedElsewhere() || !connected && !(session?.capabilities?.claudeSessions && stream?.readyState === EventSource.OPEN);
   // 用户要求主会话和侧边队列编辑时仍可选择后续模型；执行中选择不写进排队消息，后续新发送才应用。
   $("#model-button").disabled = !sessionTypeEnabled || threadReadOnly() || deleting
     || !!(editingMessage || editingQueuedMessage) && (busy || stopping || !!pending || !connected);
@@ -300,7 +337,7 @@ export function updateComposer({ followEnd = false } = {}) {
   syncNewChatProjectPicker();
   if (backendSelect) backendSelect.disabled = !creating || threadReadOnly() || busy || stopping || !!pending;
   updatePromptOptimization();
-  for (const control of document.querySelectorAll(".row-menu-button")) control.disabled = threadReadOnly() || sidebarBusy || !connected;
+  for (const control of document.querySelectorAll(".row-menu-button")) control.disabled = session?.readOnly || threadReadOnly() && !threadOwnedElsewhere() || sidebarBusy || !connected;
   fitPopup();
   $("#prompt").placeholder = threadReadOnly() ? threadReadOnlyMessage() : compacting && !editing && !goalMode
     ? queueOnly ? "继续输入，发送后会排队等待压缩完成…" : "可继续编辑草稿，压缩期间暂不能发送…"
@@ -329,7 +366,7 @@ export function updateComposer({ followEnd = false } = {}) {
   syncClaudeUsage();
   syncComposerMetrics();
   if ($("#skill-menu") && !$("#skill-menu").hidden) renderSkillMenu();
-  if (threadReadOnly()) closeComposerMenus({ keepContextUsage: true });
+  if (threadReadOnly()) closeComposerMenus({ keepContextUsage: !threadOwnedElsewhere() });
   refitComposerMenus();
   $("#pending-area").replaceChildren();
   if (!sessionTypeEnabled) $("#pending-area").append(element("div", "pending-banner",

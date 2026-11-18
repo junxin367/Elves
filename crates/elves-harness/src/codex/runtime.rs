@@ -1,5 +1,6 @@
 //! Codex 仅是执行引擎；连接、请求关联和事件接收由 Harness 统一管理。
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -36,6 +37,24 @@ fn is_empty_rollout_metadata_failure(failure: &anyhow::Error) -> bool {
         })
 }
 
+fn thread_writer_locked(home: &Path, id: &str) -> anyhow::Result<bool> {
+    // 原生 writer 使用 UUID 锁名；仅检查现有文件的 OS 锁，不创建、删除锁文件或连接持有者。
+    if uuid::Uuid::parse_str(id).is_err() {
+        return Ok(false);
+    }
+    let file =
+        match std::fs::File::open(home.join("thread-writer-locks").join(format!("{id}.lock"))) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error).context("读取 Codex 会话写入锁失败"),
+        };
+    match file.try_lock_shared() {
+        Ok(()) => Ok(false),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+        Err(std::fs::TryLockError::Error(error)) => Err(error).context("检查 Codex 会话写入锁失败"),
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct UnsupportedMethod;
 
@@ -63,6 +82,7 @@ pub(super) struct Connection {
     pub generation: String,
     pub generation_index: u64,
     pub user_agent: OnceLock<String>,
+    codex_home: Option<PathBuf>,
     alive: Arc<AtomicBool>,
     stdin: mpsc::Sender<WriteFrame>,
     write_gate: Mutex<()>,
@@ -150,6 +170,7 @@ impl Runtime {
             .send(json!({"method":"harness/connected","_generation":generation,"_generationIndex":generation_index}))
             .await
             .context("会话事件接收器已关闭")?;
+        let codex_home = service.codex_home.clone();
         let reader = execution::spawn_service(self.audit.clone(), "engine-reader", async move {
             // 持续接收事件，不能像请求兜底通道那样在等待响应时丢弃通知和审批。
             let mut child = service.child;
@@ -203,6 +224,7 @@ impl Runtime {
             generation,
             generation_index,
             user_agent: OnceLock::new(),
+            codex_home,
             alive,
             stdin: service.stdin,
             write_gate: Mutex::new(()),
@@ -329,6 +351,25 @@ impl Runtime {
             .filter(|connection| connection.generation == generation && connection.alive.load(Ordering::Acquire));
         let Some(connection) = connection else { return Ok(None) };
         connection.request("thread/goal/get", json!({"threadId":id}), None).await.map(Some)
+    }
+
+    pub(super) async fn external_thread_writer(
+        &self,
+        id: &str,
+        owned_generation: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let connection = self.connection().await?;
+        // 用户要求其他 Codex 持有时隐藏输入框；本服务同代次的原生 writer 不能误判为外部占用。
+        if owned_generation == Some(connection.generation.as_str()) {
+            return Ok(false);
+        }
+        let Some(home) = connection.codex_home.clone() else {
+            return Ok(false);
+        };
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || thread_writer_locked(&home, &id))
+            .await
+            .context("检查 Codex 会话占用失败")?
     }
 
     pub async fn invalidate_read(&self, scope: &str) {

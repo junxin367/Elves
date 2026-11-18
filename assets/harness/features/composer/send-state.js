@@ -3,6 +3,8 @@
 import { confirmAction } from "../../ui/dialog.js";
 import { api } from "../api.js";
 
+export let threadOwnershipRetry = null;
+export function setThreadOwnershipRetry(value) { return threadOwnershipRetry = value; }
 export let sending = null;
 export function setSending(value) { return sending = value; }
 export let composerDiagnosticState = "";
