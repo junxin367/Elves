@@ -395,14 +395,14 @@ html{scrollbar-color:var(--muted) transparent}
 .appearance-field{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:12px 0;font-size:calc(var(--font-size)*.9)}
 .appearance-field input[type=color]{width:50px;height:34px;padding:3px;cursor:pointer}
 .appearance-font{display:flex;align-items:center;gap:10px;min-width:0}
-/* 字号已改为数值输入，旧滑条重置仅保留给光照阈值，不能再覆盖字号输入框的背景、边框和宽度。 */
-#appearance-auto-light-lux{appearance:none;-webkit-appearance:none;width:160px;max-width:100%;min-width:48px;height:32px;flex:1 1 160px;padding:0;margin:0;border:0;border-radius:0;background:transparent;cursor:pointer;--range-fill:40%}
-#appearance-background-opacity{appearance:none;-webkit-appearance:none;width:160px;max-width:100%;min-width:48px;height:32px;flex:1 1 160px;padding:0;margin:0;border:0;border-radius:0;background:transparent;cursor:pointer;--range-fill:34%}
-#appearance-background-opacity::-webkit-slider-runnable-track,#appearance-auto-light-lux::-webkit-slider-runnable-track{height:4px;border:0;border-radius:4px;background:linear-gradient(to right,var(--accent-solid) 0 var(--range-fill),var(--line) var(--range-fill) 100%)}
-#appearance-background-opacity::-webkit-slider-thumb,#appearance-auto-light-lux::-webkit-slider-thumb{appearance:none;-webkit-appearance:none;width:14px;height:14px;margin-top:-5px;border:0;border-radius:50%;background:var(--accent-solid);box-shadow:none}
-#appearance-background-opacity::-moz-range-track,#appearance-auto-light-lux::-moz-range-track{height:4px;border:0;border-radius:4px;background:var(--line)}
-#appearance-background-opacity::-moz-range-progress,#appearance-auto-light-lux::-moz-range-progress{height:4px;border-radius:4px;background:var(--accent-solid)}
-#appearance-background-opacity::-moz-range-thumb,#appearance-auto-light-lux::-moz-range-thumb{width:14px;height:14px;border:0;border-radius:50%;background:var(--accent-solid);box-shadow:none}
+/* 用户要求对比度滑块复用光照阈值样式；透明度数字框不再套用滑轨的背景和尺寸。 */
+#appearance-contrast,#appearance-auto-light-lux{appearance:none;-webkit-appearance:none;width:160px;max-width:100%;min-width:48px;height:32px;flex:1 1 160px;padding:0;margin:0;border:0;border-radius:0;background:transparent;cursor:pointer;--range-fill:0%}
+#appearance-contrast::-webkit-slider-runnable-track,#appearance-auto-light-lux::-webkit-slider-runnable-track{height:4px;border:0;border-radius:4px;background:linear-gradient(to right,var(--accent-solid) 0 var(--range-fill),var(--line) var(--range-fill) 100%)}
+#appearance-contrast::-webkit-slider-thumb,#appearance-auto-light-lux::-webkit-slider-thumb{appearance:none;-webkit-appearance:none;width:14px;height:14px;margin-top:-5px;border:0;border-radius:50%;background:var(--accent-solid);box-shadow:none}
+#appearance-contrast::-moz-range-track,#appearance-auto-light-lux::-moz-range-track{height:4px;border:0;border-radius:4px;background:var(--line)}
+#appearance-contrast::-moz-range-progress,#appearance-auto-light-lux::-moz-range-progress{height:4px;border-radius:4px;background:var(--accent-solid)}
+#appearance-contrast::-moz-range-thumb,#appearance-auto-light-lux::-moz-range-thumb{width:14px;height:14px;border:0;border-radius:50%;background:var(--accent-solid);box-shadow:none}
+#appearance-contrast-value{min-width:4.5ch;text-align:right;font-variant-numeric:tabular-nums}
 .appearance-reading-font-hint{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:-4px 0 12px;color:var(--muted);font-size:calc(var(--font-size)*.78);line-height:1.5}
 .appearance-reading-font-hint>.text-button{flex-shrink:0;padding:3px 0;font-size:inherit}
 .appearance-background-field{flex-direction:row;align-items:center;gap:12px}
@@ -712,7 +712,8 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
   .project-picker-popup .popup-option,.backend-picker-popup .popup-option{min-height:36px;padding:4px 9px}
 }
 /* 用户要求颜色值可直接编辑，只有色块按钮打开取色器；两者作为同一组排列，不能嵌套可交互输入框。 */
-.appearance-color-control{display:inline-flex;align-items:center;gap:6px;min-width:0;max-width:100%}
+/* 窄屏换行时色块和 HEX 保持一组，仍与其他设置控件右对齐。 */
+.appearance-color-control{display:inline-flex;align-items:center;gap:6px;min-width:0;max-width:100%;margin-inline-start:auto}
 .color-swatch{display:grid;place-items:center;flex:0 0 32px;width:32px;min-width:32px;height:32px;padding:7px;border:1px solid var(--line);border-radius:999px;background:transparent}
 .color-swatch:hover{background:var(--hover)}
 .appearance-color-control>.appearance-color-value{flex:0 1 90px;width:90px;min-width:72px;height:32px;padding:6px 8px;border-radius:8px}

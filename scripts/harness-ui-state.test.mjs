@@ -3343,6 +3343,12 @@ test("新会话设置默认仅 Codex、正文950和界面14代码阅读12px字�
   assert.equal(defaults.fontSize, 14); assert.equal(defaults.codeFontSize, 12);
   assert.equal(defaults.fileReadingFontSize, 12);
   assert.equal(defaults.uiFont, ""); assert.equal(defaults.codeFont, "");
+  assert.equal(defaults.themePreset, "elver");
+  assert.deepEqual(JSON.parse(JSON.stringify(defaults.colors)), {
+    light: { background: "#ffffff", foreground: "#3b3b3b", accent: "#16a34a", button: "#16a34a", contrast: 45 },
+    dark: { background: "#1e1e1e", foreground: "#cccccc", accent: "#16a34a", button: "#16a34a", contrast: 60 }
+  });
+  assert.equal(defaults.backgroundOpacity, 35);
   disk.setItem("codex-elves-web-appearance", JSON.stringify({ fontSize: 17, codeFontSize: 18, fileReadingFontSize: 13, conversationWidth: 100000,
     uiFont: "Consolas;url(invalid)", colors: { dark: { background: "#232323" } } }));
   const migrated = context.readAppearance();
@@ -3353,6 +3359,15 @@ test("新会话设置默认仅 Codex、正文950和界面14代码阅读12px字�
   assert.equal(migrated.palettes["vscode-plus"].dark.background, "#1f1f1f");
   migrated.palettes["vscode-plus"].dark.background = "#123456";
   assert.equal(migrated.palettes.chatgpt.dark.background, "#232323");
+  disk.setItem("codex-elves-web-appearance", JSON.stringify({ theme: "dark", themePreset: "vscode-plus",
+    palettes: { elver: { light: { button: "#123456", contrast: 0 } },
+      "vscode-plus": { dark: { button: "#abcdef", contrast: 100 } } }, backgroundOpacity: 1 }));
+  const configured = context.readAppearance();
+  assert.equal(configured.themePreset, "vscode-plus");
+  assert.equal(configured.colors.dark.button, "#abcdef"); assert.equal(configured.colors.dark.contrast, 100);
+  assert.equal(configured.palettes.elver.light.button, "#123456"); assert.equal(configured.palettes.elver.light.contrast, 0);
+  assert.equal(configured.palettes.elver.dark.button, "#16a34a"); assert.equal(configured.palettes.elver.dark.contrast, 60);
+  assert.equal(configured.backgroundOpacity, 1);
 });
 
 function appearanceResetHarness() {
@@ -15180,9 +15195,12 @@ test("主会话保留背景透明度与铺法，侧边页不重绘图片或叠�
   assert.equal(image.hidden, true);
 });
 
+const appearanceColorModelSource = sourceSection("const appearanceContrastMin =", "const backgroundOpacityMin =")
+  + sourceSection("function mix");
+
 test("外观表面与原生 Codex 默认调色一致，并区分输入框、控件及浅色普通提示", () => {
   const context = nodeVm.createContext();
-  nodeVm.runInContext(sourceSection("function mix"), context);
+  nodeVm.runInContext(appearanceColorModelSource, context);
   const dark = context.appearanceSurfaceColors("dark", { background: "#181818", foreground: "#ffffff" });
   assert.equal(dark["composer-bg"], "#363636");
   assert.equal(dark["control-bg"], "#2d2d2d");
@@ -15198,7 +15216,7 @@ test("外观表面与原生 Codex 默认调色一致，并区分输入框、控�
 
 test("自定义背景和前景分别参与明暗调色，不复用默认主题色或透明表面", () => {
   const context = nodeVm.createContext();
-  nodeVm.runInContext(sourceSection("function mix"), context);
+  nodeVm.runInContext(appearanceColorModelSource, context);
   const dark = context.appearanceSurfaceColors("dark", { background: "#102030", foreground: "#f0e0d0" });
   assert.equal(dark["control-bg"], "#24313e");
   assert.equal(dark["composer-bg"], "#2d3944");
@@ -15213,7 +15231,7 @@ test("自定义背景和前景分别参与明暗调色，不复用默认主题�
 
 test("模型按钮 hover 在输入框上合成，深色分组线增强，浅色仍沿用原线色", () => {
   const context = nodeVm.createContext();
-  nodeVm.runInContext(sourceSection("function mix"), context);
+  nodeVm.runInContext(appearanceColorModelSource, context);
   const dark = context.appearanceSurfaceColors("dark", { background: "#1e1e1e", foreground: "#d4d4d4" });
   assert.equal(dark["composer-bg"], "#353535");
   assert.equal(dark["composer-hover"], "#414141", "模型按钮应高亮，不能变成更暗的页面 hover");
@@ -15256,15 +15274,18 @@ test("设置 HEX 可独立编辑，非法草稿不保存，失焦或 Escape 恢�
   assert.equal(input.value, "#2563EB", "换主题或通过取色器选择后显示当前真实色值");
 });
 
-test("三类字号输入在确认后保存整数，空值、小数和越界值恢复，重复失焦不重复保存", () => {
-  const context = nodeVm.createContext();
+test("字号和背景透明度在确认后保存整数，非法或禁用输入恢复，重复失焦不重复保存", () => {
+  const document = { activeElement: null };
+  const context = nodeVm.createContext({ document });
   nodeVm.runInContext(sourceSection("function bindAppearanceFontSize(", "function appearanceHexToHsv("), context);
-  for (const [min, max, initial] of [[10, 20, 14], [8, 24, 14], [6, 14, 12]]) {
+  for (const [min, max, initial, unit] of [[10, 20, 14, "px"], [8, 24, 14, "px"], [6, 14, 12, "px"], [1, 100, 35, "%"]]) {
     let size = initial, saves = 0;
     const attributes = new Map(), input = { value: String(initial),
       setAttribute: (key, value) => attributes.set(key, value),
-      getAttribute: key => attributes.get(key) ?? null, blur() { this.onblur(); } };
-    context.bindAppearanceFontSize(input, min, max, () => size, value => { size = value; saves++; });
+      getAttribute: key => attributes.get(key) ?? null, blur() { document.activeElement = null; this.onblur(); } };
+    const get = () => size, change = value => { size = value; saves++; };
+    const sync = unit === "%" ? context.bindAppearanceNumberValue(input, min, max, get, change, unit)
+      : context.bindAppearanceFontSize(input, min, max, get, change);
     for (const invalid of ["", "not-a-number", "12.5", String(min - 1), String(max + 1)]) {
       input.value = invalid; input.oninput();
       assert.equal(input.getAttribute("aria-invalid"), "true");
@@ -15284,6 +15305,13 @@ test("三类字号输入在确认后保存整数，空值、小数和越界值�
     input.onkeydown({ key: "Escape", preventDefault() {}, stopPropagation() {} });
     assert.equal(input.value, String(min));
     assert.equal(size, min); assert.equal(saves, 2);
+    if (unit === "%") {
+      document.activeElement = input; input.value = "70"; input.oninput(); sync();
+      assert.equal(input.value, "70", "同步设置时保留正在编辑的透明度");
+      input.disabled = true; input.onchange(); sync();
+      assert.equal(input.value, String(min), "背景不可用时不提交旧草稿");
+      assert.equal(size, min); assert.equal(saves, 2);
+    }
   }
 });
 
@@ -15304,7 +15332,7 @@ test("外观切换会重新写入全部表面变量，保存时不修改用户�
     resizeEditorInput() {}, refitComposerMenus() {}, clearTimeout() {}, setTimeout: () => 1,
     localStorage: { setItem: (_key, value) => saved.push(JSON.parse(value)) },
   });
-  nodeVm.runInContext((sourceSection("function mix") + "\n" + sourceSection("function applyAp", "function sta")), context);
+  nodeVm.runInContext(appearanceColorModelSource + "\n" + sourceSection("function applyAp", "function sta"), context);
   context.applyAppearance(true);
   assert.equal(styles.get("--control-bg"), "#24313e");
   appearance.theme = "light";

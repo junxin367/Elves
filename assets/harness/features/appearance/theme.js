@@ -10,10 +10,10 @@ const appearancePresets = {
 };
 // 用户要求主题与明暗模式独立；各套主题分别保存浅色/深色调色，切换主题不覆盖其他主题的自定义颜色。
 export const appearanceThemes = {
-  // 用户指定截图配色命名为 Elver 并作为默认：两种模式均用绿色强调色；深色对比度 60%，浅色沿用 45%。
+  // 用户要求默认值取 Elver 预设：明暗均使用 #16A34A 作为强调色和普通按钮色，对比度分别为 45% 和 60%。
   elver: { label: "Elver", colors: {
-    light: { background: "#ffffff", foreground: "#3b3b3b", accent: "#16a34a", contrast: 45 },
-    dark: { background: "#1e1e1e", foreground: "#cccccc", accent: "#16a34a", contrast: 60 }
+    light: { background: "#ffffff", foreground: "#3b3b3b", accent: "#16a34a", button: "#16a34a", contrast: 45 },
+    dark: { background: "#1e1e1e", foreground: "#cccccc", accent: "#16a34a", button: "#16a34a", contrast: 60 }
   } },
   chatgpt: { label: "ChatGPT", colors: appearancePresets },
   "vscode-plus": { label: "VS Code Plus", colors: {
@@ -29,6 +29,9 @@ export const validFontFamily = value => typeof value === "string" && value.lengt
   && !/[{};<>\u0000-\u001f]/u.test(value);
 export const fontStack = (family, fallback) => family ? `${JSON.stringify(family)},${fallback}` : fallback;
 export const projectThreadLimits = [5, 10, 20, 50];
+// 对比度滑块和背景透明度数字框保留原有百分比范围，与本地设置读取同步，步长均为 1。
+export const appearanceContrastMin = 0, appearanceContrastMax = 100;
+export const backgroundOpacityMin = 1, backgroundOpacityMax = 100;
 // 用户要求文件阅读字号统一控制变更预览和文件查看，范围 6～14px、默认 12px、步长 1px；文件列表继续使用原字号。
 export const fileReadingFontMin = 6, fileReadingFontMax = 14, fileReadingFontDefault = 12;
 // 用户要求光照阈值范围为 5～40 lux、默认 10 lux、步长 1 lux；存储校验和滑块共用此范围，已保存的有效选择继续保留。
@@ -65,7 +68,8 @@ export function readAppearance() {
       if ([400, 500, 600].includes(saved[key])) value[key] = saved[key];
     if (Number.isInteger(saved.codeFontSize)) value.codeFontSize = Math.min(24, Math.max(8, saved.codeFontSize));
     value.automaticThemeLightLux = normalizeAutomaticThemeLightLux(saved.automaticThemeLightLux);
-    if (Number.isInteger(saved.backgroundOpacity)) value.backgroundOpacity = Math.min(100, Math.max(1, saved.backgroundOpacity));
+    if (Number.isInteger(saved.backgroundOpacity))
+      value.backgroundOpacity = Math.min(backgroundOpacityMax, Math.max(backgroundOpacityMin, saved.backgroundOpacity));
     if (["cover", "contain"].includes(saved.backgroundFit)) value.backgroundFit = saved.backgroundFit;
     if (Number.isInteger(saved.fontSize)) value.fontSize = Math.min(20, Math.max(10, saved.fontSize));
     if (Number.isInteger(saved.fileReadingFontSize))
@@ -79,7 +83,8 @@ export function readAppearance() {
       const contrast = saved.palettes?.[preset]?.[theme]?.contrast
         ?? (preset === value.themePreset ? saved.colors?.[theme]?.contrast : null);
       // 旧设置缺失此项时保留默认值；零值有效，损坏或小数值不能改变当前调色。
-      if (Number.isInteger(contrast)) value.palettes[preset][theme].contrast = Math.min(100, Math.max(0, contrast));
+      if (Number.isInteger(contrast))
+        value.palettes[preset][theme].contrast = Math.min(appearanceContrastMax, Math.max(appearanceContrastMin, contrast));
     }
     value.colors = value.palettes[value.themePreset];
   } catch {}
@@ -323,7 +328,7 @@ function appearanceContrast(theme, value) {
   // 对齐 Codex 原生对比度曲线：45/60 是浅/深色默认值，60 是变化灵敏度的分母；
   // 高于默认值后加倍增强，保持默认表面颜色不变；与各套 appearanceThemes 默认值同步核对。
   const baseline = theme === "dark" ? 60 : 45;
-  const setting = Number.isInteger(value) ? Math.min(100, Math.max(0, value)) : baseline;
+  const setting = Number.isInteger(value) ? Math.min(appearanceContrastMax, Math.max(appearanceContrastMin, value)) : baseline;
   const scaled = setting / 100 + (setting - baseline) / 60 * .7;
   return setting <= baseline ? scaled : baseline / 100 + (scaled - baseline / 100) * 2;
 }
@@ -371,7 +376,7 @@ function appearanceAccessibleColor(color, background, minimum = 4.5) {
   return mixColor(color, target, high);
 }
 export function appearanceButtonColor(palette) {
-  // 用户要求普通按钮独立配色；旧设置和未自定义的主题不填固定值，继续沿用原来的前景色派生。
+  // Elver 自带默认按钮色；没有按钮色的其他主题继续沿用前景色派生。
   return /^#[0-9a-f]{6}$/i.test(palette.button) ? palette.button : null;
 }
 export function appearanceThemeColors(theme, palette) {
@@ -379,7 +384,8 @@ export function appearanceThemeColors(theme, palette) {
   const accent = /^#[0-9a-f]{6}$/i.test(palette.accent) ? palette.accent : foreground;
   const dark = theme === "dark", contrast = appearanceContrast(theme, setting);
   const surfaces = appearanceSurfaceColors(theme, palette);
-  const configuredContrast = Number.isInteger(setting) ? Math.min(100, Math.max(0, setting)) : dark ? 60 : 45;
+  const configuredContrast = Number.isInteger(setting)
+    ? Math.min(appearanceContrastMax, Math.max(appearanceContrastMin, setting)) : dark ? 60 : 45;
   // 用户要求整体参考 Codex：对比度同时驱动侧栏、边框、辅助文字、控件及强调底色。
   // 45/60 为浅/深默认值；侧栏是原生 surfaceUnder，代码区是 editorBackground，不能继续共用固定 3.5%/5% 混色。
   const side = dark

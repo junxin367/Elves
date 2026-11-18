@@ -143,7 +143,7 @@ export function applyAppearance(save = false) {
   const palette = appearance.colors[appearance.theme];
   const { background } = palette;
   root.dataset.theme = appearance.theme;
-  // 管理页只在用户明确选择按钮颜色时覆盖常规按钮，旧设置继续使用原有默认/hover。
+  // 管理页在当前调色提供独立按钮色时同步覆盖普通按钮，包括 Elver 预设；其他主题保留原有默认和悬停色。
   root.dataset.customButtonColor = String(appearanceButtonColor(palette) !== null);
   root.style.colorScheme = appearance.theme;
   const values = {

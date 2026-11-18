@@ -21,7 +21,8 @@ import {
   applyAppearance, mountAutomaticThemeLightSetting, setAppearanceThemeMode, syncRemoteBackground
 } from "./apply.js";
 import {
-  appearance, appearanceButtonColor, appearanceThemeColors, appearanceThemes, conversationWidthMax, conversationWidthMin,
+  appearance, appearanceButtonColor, appearanceContrastMax, appearanceContrastMin, appearanceThemeColors, appearanceThemes,
+  backgroundOpacityMax, backgroundOpacityMin, conversationWidthMax, conversationWidthMin,
   currentFileReadingFontSize, defaultAppearance, deleteRemoteBackground, fileReadingFontDefault,
   fileReadingFontMax, fileReadingFontMin, projectThreadLimits, readRemoteBackgroundFile,
   remoteBackground, remoteBackgroundBusy, remoteBackgroundError, remoteBackgroundOperation,
@@ -112,14 +113,14 @@ function bindAppearanceFontSize(input, min, max, getValue, onChange) {
   bindAppearanceNumberValue(input, min, max, getValue, onChange, "px");
 }
 function bindAppearanceNumberValue(input, min, max, getValue, onChange, unit) {
-  // 对比度与原字号共用数值确认交互，避免空值变成零；输入阶段只标记错误，不改已保存的外观。
+  // 背景透明度与字号共用数值确认交互，避免空值变成零；输入阶段只标记错误，不改已保存的外观。
   input.setAttribute("data-appearance-escape", "restore");
   input.setAttribute("aria-description", `输入 ${min}～${max}${unit}，按 Enter 或离开输入框应用`);
   const valid = () => input.value.trim() !== "" && Number.isInteger(Number(input.value))
     && Number(input.value) >= min && Number(input.value) <= max;
   const reset = () => { input.value = String(getValue()); input.setAttribute("aria-invalid", "false"); };
   const commit = () => {
-    if (valid() && Number(input.value) !== getValue()) onChange(Number(input.value));
+    if (!input.disabled && valid() && Number(input.value) !== getValue()) onChange(Number(input.value));
     reset();
   };
   input.oninput = () => input.setAttribute("aria-invalid", String(!valid()));
@@ -132,6 +133,7 @@ function bindAppearanceNumberValue(input, min, max, getValue, onChange, unit) {
     else commit();
     input.blur();
   };
+  return () => { if (input.disabled || document.activeElement !== input) reset(); };
 }
 function appearanceHexToHsv(hex) {
   if (!/^#[0-9a-f]{6}$/i.test(hex)) return null;
@@ -306,14 +308,15 @@ export function openAppearance() {
     <div class="appearance-card">
       <div class="appearance-field"><span>主题</span><div id="appearance-preset-slot"></div></div>
       <div id="appearance-colors"></div>
-      <!-- 用户要求增加独立对比度；每套主题/明暗模式分别保存，复用现有数字输入样式，不改动颜色选择器。 -->
-      <label class="appearance-field"><span>对比度</span><span class="appearance-number"><input id="appearance-contrast" type="number" inputmode="numeric" min="0" max="100" step="1" aria-label="外观对比度"><span>%</span></span></label>
+      <!-- 用户要求对比度使用滑块，拖动时实时应用，只更新当前主题的明暗模式。 -->
+      <label class="appearance-field"><span>对比度</span><span class="appearance-font"><input id="appearance-contrast" type="range" min="${appearanceContrastMin}" max="${appearanceContrastMax}" step="1" aria-label="外观对比度"><output id="appearance-contrast-value" for="appearance-contrast" aria-hidden="true"></output></span></label>
       <div class="appearance-field"><span>界面字体</span><div id="appearance-ui-font-slot"></div></div>
     </div></section>
     <section class="appearance-section"><h4>背景图片</h4><div class="appearance-card">
     <div class="appearance-field appearance-background-field"><span>图片</span><div class="appearance-background-actions"><input id="appearance-background-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden><button type="button" id="appearance-background-action"></button></div></div>
     <div id="appearance-background-preview" class="appearance-background-preview" hidden><img id="appearance-background-thumbnail" alt=""><span id="appearance-background-name"></span></div>
-    <label class="appearance-field"><span>透明度</span><span class="appearance-font"><input id="appearance-background-opacity" type="range" min="1" max="100" step="1" aria-label="背景透明度"><output id="appearance-background-opacity-value"></output></span></label>
+    <!-- 用户要求背景透明度改为数字输入，保留 1～100% 和无背景图片时禁用的约束。 -->
+    <label class="appearance-field"><span>透明度</span><span class="appearance-number"><input id="appearance-background-opacity" type="number" inputmode="numeric" min="${backgroundOpacityMin}" max="${backgroundOpacityMax}" step="1" aria-label="背景透明度"><span>%</span></span></label>
     <div class="appearance-field"><span>图片铺法</span><div id="appearance-background-fit-slot"></div></div>
     <p id="appearance-background-status" class="appearance-background-status" role="status" hidden></p>
     </div></section>
@@ -827,34 +830,40 @@ export function openAppearance() {
   const syncAutomaticLightSetting = mountAutomaticThemeLightSetting($("#appearance-auto-light-setting"));
   $("#appearance-project-thread-limit-slot").append(selectControl("appearance-project-thread-limit", "每个项目显示会话数",
     projectThreadLimits.map(value => ({ value: String(value), label: `${value}个` })), String(appearance.projectThreadLimit)));
-  const backgroundAction = $("#appearance-background-action");
+  const backgroundAction = $("#appearance-background-action", dialog);
+  const backgroundOpacityInput = $("#appearance-background-opacity", dialog);
+  const syncBackgroundOpacity = bindAppearanceNumberValue(backgroundOpacityInput, backgroundOpacityMin, backgroundOpacityMax,
+    () => appearance.backgroundOpacity, value => { appearance.backgroundOpacity = value; applyAppearance(true); }, "%");
   $("#appearance-background-fit-slot").append(selectControl("appearance-background-fit", "图片铺法", [
     { value: "cover", label: "铺满裁切" }, { value: "contain", label: "完整不裁" }
   ], appearance.backgroundFit));
   // 用户要求只增加普通按钮配色，复用现有色盘、HEX 校验和主题/明暗隔离，不改其他设置项。
+  const colorHost = $("#appearance-colors", dialog);
   const colorFields = [["accent", "强调色"], ["background", "背景"], ["foreground", "前景"], ["button", "按钮颜色"]];
   const getColor = name => name === "button"
     ? appearanceButtonColor(appearance.colors[appearance.theme]) ?? appearance.colors[appearance.theme].foreground
     : appearance.colors[appearance.theme][name];
   const setColor = (name, color) => { appearance.colors[appearance.theme][name] = color; applyAppearance(true); sync(); };
-  const colorValueSync = new Map();
-  for (const [name, label] of colorFields) {
+  const colorControls = colorFields.map(([name, label]) => {
     const row = element("div", "appearance-field");
     const control = element("div", "appearance-color-control");
     const swatch = button("", name === "button" ? label : `${label}颜色`, () => openAppearanceColorPicker(swatch, label,
       getColor(name), color => setColor(name, color)), "color-swatch");
-    swatch.id = `appearance-${name}`;
+    // 色块 ID 与主导航的 appearance-button 区分，颜色更新直接使用本行节点。
+    swatch.id = `appearance-${name}-swatch`;
     swatch.setAttribute("aria-haspopup", "dialog"); swatch.setAttribute("aria-expanded", "false");
     swatch.append(element("span", "appearance-color-dot"));
     const hex = element("input", "color-hex appearance-color-value");
     hex.id = `appearance-${name}-hex`; hex.type = "text"; hex.maxLength = 7;
     hex.spellcheck = false; hex.autocomplete = "off";
     hex.setAttribute("aria-label", name === "button" ? "按钮色值" : `${label}色值`);
-    colorValueSync.set(name, bindAppearanceColorValue(hex, () => getColor(name), color => setColor(name, color)));
+    const syncValue = bindAppearanceColorValue(hex, () => getColor(name), color => setColor(name, color));
     control.append(swatch, hex);
-    row.append(element("span", "", label), control); $("#appearance-colors").append(row);
-  }
-  const sync = () => {
+    row.append(element("span", "", label), control); colorHost.append(row);
+    return { name, swatch, syncValue };
+  });
+  const contrastInput = $("#appearance-contrast", dialog), contrastOutput = $("#appearance-contrast-value", dialog);
+  const syncThemePreviews = () => {
     const selectedMode = appearance.themeMode === "auto" ? "auto" : appearance.theme;
     const modeColors = Object.fromEntries(["light", "dark"].map(mode =>
       [mode, appearanceThemeColors(mode, appearance.palettes[appearance.themePreset][mode])]));
@@ -873,6 +882,17 @@ export function openAppearance() {
         sidebar.style.background = modeColors[mode].side;
       }
     }
+    const contrast = appearance.colors[appearance.theme].contrast;
+    const label = `${contrast}%`;
+    contrastInput.value = String(contrast);
+    contrastInput.setAttribute("aria-valuetext", label);
+    contrastOutput.textContent = label;
+    // 滑块填充按 0～100 的跨度归一化，两个端点恰好为 0% 和 100%。
+    contrastInput.style.setProperty("--range-fill",
+      `${(contrast - appearanceContrastMin) / (appearanceContrastMax - appearanceContrastMin) * 100}%`);
+  };
+  const sync = () => {
+    syncThemePreviews();
     syncAutomaticLightSetting();
     setSelectValue($("#appearance-project-thread-limit"), String(appearance.projectThreadLimit));
     $("#appearance-project-thread-limit").disabled = !connected || !sharedSettingsWritable(session);
@@ -889,24 +909,19 @@ export function openAppearance() {
     if (hasBackground && $("#appearance-background-thumbnail").getAttribute("src") !== remoteBackground.dataUrl)
       $("#appearance-background-thumbnail").src = remoteBackground.dataUrl;
     if (!hasBackground) $("#appearance-background-thumbnail").removeAttribute("src");
-    $("#appearance-background-opacity").disabled = remoteBackgroundBusy || !hasBackground;
-    $("#appearance-background-opacity").value = appearance.backgroundOpacity;
-    // 透明度范围 1～100，实际跨度是 99；最小值填充 0%、最大值填充 100%，与光照滑块的归一化规则一致。
-    $("#appearance-background-opacity").style.setProperty("--range-fill", `${(appearance.backgroundOpacity - 1) / 99 * 100}%`);
-    $("#appearance-background-opacity-value").textContent = `${appearance.backgroundOpacity}%`;
+    backgroundOpacityInput.disabled = remoteBackgroundBusy || !hasBackground;
+    syncBackgroundOpacity();
     $("#appearance-background-fit").disabled = remoteBackgroundBusy || !hasBackground;
     setSelectValue($("#appearance-background-fit"), appearance.backgroundFit);
     $("#appearance-background-status").hidden = !remoteBackgroundError;
     $("#appearance-background-status").textContent = remoteBackgroundError;
-    for (const [name] of colorFields) {
-      const color = getColor(name), swatch = $(`#appearance-${name}`);
+    for (const { name, swatch, syncValue } of colorControls) {
+      const color = getColor(name);
       swatch.style.setProperty("--swatch", color);
-      colorValueSync.get(name)?.();
+      syncValue();
       swatch.setAttribute("aria-description", color.toUpperCase());
       if (activePopup?.trigger === swatch) activePopup.syncColor?.(color);
     }
-    const contrastInput = $("#appearance-contrast", dialog);
-    if (document.activeElement !== contrastInput) contrastInput.value = appearance.colors[appearance.theme].contrast;
     if (document.activeElement !== $("#appearance-font")) $("#appearance-font").value = appearance.fontSize;
     setSelectValue($("#appearance-preset"), appearance.themePreset);
     for (const [id, value] of [["ui-font", appearance.uiFont], ["code-font", appearance.codeFont]])
@@ -959,9 +974,13 @@ export function openAppearance() {
     };
   }
   sync();
-  bindAppearanceNumberValue($("#appearance-contrast", dialog), 0, 100,
-    () => appearance.colors[appearance.theme].contrast,
-    value => { appearance.colors[appearance.theme].contrast = value; applyAppearance(true); sync(); }, "%");
+  contrastInput.oninput = () => {
+    const value = contrastInput.valueAsNumber, palette = appearance.colors[appearance.theme];
+    if (!Number.isInteger(value) || value < appearanceContrastMin || value > appearanceContrastMax || value === palette.contrast) return;
+    palette.contrast = value;
+    // 拖动时只同步主题预览和百分比，不重复刷新无关设置项。
+    applyAppearance(true); syncThemePreviews();
+  };
   $("#appearance-conversation-width", dialog).onchange = event => {
     const value = Number(event.target.value);
     if (!Number.isInteger(value) || value < conversationWidthMin || value > conversationWidthMax) {
@@ -1034,10 +1053,6 @@ export function openAppearance() {
         syncAppearanceThemeControls?.();
       }
     }
-  };
-  $("#appearance-background-opacity").oninput = event => {
-    appearance.backgroundOpacity = Number(event.target.value);
-    applyAppearance(true); sync();
   };
   $("#appearance-background-fit").onchange = event => {
     appearance.backgroundFit = event.target.value;
