@@ -2,11 +2,12 @@
 
 日常开发使用 `.\scripts\build-windows-client.ps1`。该入口检查 Harness 网页、准备共享管理页面，再用 `release-fast` 增量编译客户端并生成便携程序，不构建安装包或 Android。
 
-完整优化的客户端使用 `.\scripts\build-windows-client.ps1 -Profile release`。用户明确需要安装包时运行 `.\scripts\build-windows-installer.ps1`，默认同样使用 `release`；`-Profile release-fast` 仅供显式选择的本机调试包。
+完整优化的客户端使用 `.\scripts\build-windows-client.ps1 -Profile release`。用户明确需要安装包时运行 `.\scripts\build-windows-installer.ps1`，默认同样使用 `release`；`-Profile release-fast` 仅供显式选择的本机调试包。需要缩短本地安装包压缩等待时，可追加 `-FastCompression`，该模式取消 NSIS 固实压缩，安装包体积可能增大。
 
 ## 编译与资源处理
 
 - `release-fast` 只将五个工作区 crate 的 `opt-level` 调整为 `1`，保留增量编译及 256 个代码生成单元。第三方依赖及其构建脚本和过程宏沿用原来的配置，不通过通配覆盖改变其优化参数。`release` 保持完整优化。
+- 安装包默认使用固实 LZMA；`-FastCompression` 只改变 NSIS 压缩方式，不改变客户端编译 profile、安装文件或运行时行为，适合本地反复验收，正式发布仍使用默认压缩。
 - 网页只在不依赖业务代码的 `elves-assets` 中内嵌一次，Harness 和客户端共用资源表。资源通过非内联函数访问，减少网页字节变化向大型业务 crate 的编译传播。
 - 资源构建脚本在运行时读取当前包目录，并使用相对路径监视资源变化；生成的资源表内容不变时不重写文件。网页仍全部内嵌，不增加运行时文件依赖。
 - JS 语法和导出链接检查共用一个 Node 子进程，源码通过标准输入传递；继续检查分层、循环依赖、预加载及各端扫描规则，且不执行页面代码。
@@ -48,6 +49,20 @@ npm --prefix apps/elves-management run build:frontend -- --force
 验证覆盖批量解析对语法错误、缺失导出、缺失模块、静态环的拦截及不执行模块；前端缓存覆盖输入变化、产物变动或缺失、缓存损坏、强制重建、失败不写缓存和失败后的恢复，共 17 项。
 
 另通过 11 项现有 Rust 回归，覆盖资源版本与清单、资源和 API 授权边界、客户端本机凭据、摘要校验、离线与原子更新。共享管理前端检查、Rust 格式检查及程序内嵌网页与工具字节核对均通过。
+
+## 2026-11-18 快速安装包实测
+
+本轮基线为同一工作区此前的正式 `release` 安装包构建，快速结果使用 `-Profile release-fast -FastCompression`。两次均复用本机依赖缓存；完整命令墙钟时间取 PowerShell 进程实际运行时长。
+
+| 阶段 | 正式 `release` 基线 | 快速本地包 | 变化 |
+| --- | ---: | ---: | ---: |
+| Harness 检查 | 未单独计时 | 0.86 s | 新增分阶段计时 |
+| 管理前端 | 2.17 s | 0.43 s（缓存命中） | 节省 1.74 s，快 80.2% |
+| Rust 客户端 | 177.66 s | 128.91 s（`release-fast`） | 节省 48.75 s，快 27.4% |
+| 完整命令墙钟 | 225.10 s | 198.76 s | 节省 26.35 s，快 11.7% |
+| NSIS | 旧流程未单独计时 | 64.30 s（非固实 LZMA） | 无直接基线 |
+
+快速包安装程序为 18,593,424 bytes，客户端为 81,886,208 bytes；体积同时受 `release-fast` 优化等级影响，不能把差异全部归因于 NSIS 压缩方式。正式发布仍使用默认 `release` 和固实 LZMA。
 
 相关检查入口：
 

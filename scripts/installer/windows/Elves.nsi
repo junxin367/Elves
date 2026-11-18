@@ -10,7 +10,12 @@ OutFile "${ROOT}\dist\windows\Elves-${VERSION}-windows-x64-setup.exe"
 InstallDir "$LOCALAPPDATA\Programs\Elves"
 InstallDirRegKey HKCU "Software\Elves" "InstallDir"
 RequestExecutionLevel admin
+!ifdef FAST_COMPRESSION
+; 快速本地包取消固实压缩，减少重复打包等待；正式包仍使用固实 LZMA 以保持较小体积。
+SetCompressor lzma
+!else
 SetCompressor /SOLID lzma
+!endif
 !define MUI_ICON "${ROOT}\apps\elves\src-tauri\icons\elves-app-icon.ico"
 !define MUI_UNICON "${ROOT}\apps\elves\src-tauri\icons\elves-app-icon.ico"
 !insertmacro MUI_PAGE_WELCOME

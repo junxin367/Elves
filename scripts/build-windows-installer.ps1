@@ -2,7 +2,8 @@ param(
     [string]$Version = "",
     [string]$MakensisPath = "",
     [ValidateSet("release", "release-fast")]
-    [string]$Profile = "release"
+    [string]$Profile = "release",
+    [switch]$FastCompression
 )
 
 Set-StrictMode -Version Latest
@@ -125,6 +126,7 @@ else {
 if ($env:CARGO_BUILD_TARGET) { $CargoTargetDir = Join-Path $CargoTargetDir $env:CARGO_BUILD_TARGET }
 $ReleaseDir = Join-Path $CargoTargetDir $Profile
 $ReleaseMirrorDir = Join-Path $CargoTargetDir "release"
+$installerClock = [Diagnostics.Stopwatch]::StartNew()
 
 $NodePath = Resolve-ToolPath -Name "node.exe" -ExplicitPath "" -FallbackPaths @()
 $NsisPath = Resolve-ToolPath `
@@ -149,7 +151,10 @@ Invoke-Checked -FilePath $NodePath -Arguments @($BuildInputVerifier, $RepoRoot, 
 Invoke-Checked -FilePath $NodePath -Arguments @($ToolRuntimeVerifier, $RepoRoot, "--source-only") -WorkingDirectory $RepoRoot
 # 用户要求日常编译提速：安装包默认仍用 release 完整优化；显式 -Profile release-fast 仅用于本机调试包。
 # 客户端入口负责共享管理前端的摘要复用与单次 Cargo 构建，并同时生成经过 PE 校验的便携程序。
+$clientClock = [Diagnostics.Stopwatch]::StartNew()
 & (Join-Path $RepoRoot "scripts\build-windows-client.ps1") -Version $ResolvedVersion -Profile $Profile
+if ($LASTEXITCODE -ne 0) { throw "Elves client build failed with exit code: $LASTEXITCODE" }
+Write-Output "[TIME] Client stage: $([math]::Round($clientClock.Elapsed.TotalSeconds, 2)) s"
 Invoke-Checked -FilePath $NodePath -Arguments @($BuildInputVerifier, $RepoRoot, $ReleaseDir) -WorkingDirectory $RepoRoot
 
 New-Item -ItemType Directory -Path $DistAppDir -Force | Out-Null
@@ -188,10 +193,19 @@ Invoke-Checked -FilePath $NodePath -Arguments @($ToolRuntimeVerifier, $RepoRoot,
 Invoke-Checked -FilePath $NodePath -Arguments @($ToolRuntimeVerifier, $RepoRoot, "--embedded", (Join-Path $DistAppDir "elves.exe")) -WorkingDirectory $RepoRoot
 Invoke-Checked -FilePath $NodePath -Arguments @($BuildInputVerifier, $RepoRoot, $DistAppDir) -WorkingDirectory $RepoRoot
 
-Invoke-Checked `
-    -FilePath $NsisPath `
-    -Arguments @("/INPUTCHARSET", "UTF8", "/DVERSION=$ResolvedVersion", $InstallerScript) `
-    -WorkingDirectory $InstallerScriptDir
+$nsisArguments = @("/INPUTCHARSET", "UTF8", "/DVERSION=$ResolvedVersion")
+if ($FastCompression) {
+    # 用户要求日常安装包缩短压缩等待；快速模式只取消固实压缩，不改变客户端代码或安装内容。
+    $nsisArguments += "/DFAST_COMPRESSION"
+    Write-Output "[INFO] NSIS compression: fast non-solid LZMA"
+}
+else {
+    Write-Output "[INFO] NSIS compression: solid LZMA"
+}
+$nsisArguments += $InstallerScript
+$nsisClock = [Diagnostics.Stopwatch]::StartNew()
+Invoke-Checked -FilePath $NsisPath -Arguments $nsisArguments -WorkingDirectory $InstallerScriptDir
+Write-Output "[TIME] NSIS: $([math]::Round($nsisClock.Elapsed.TotalSeconds, 2)) s"
 
 if (!(Test-Path -LiteralPath $InstallerPath)) {
     throw "Installer was not created: $InstallerPath"
@@ -203,5 +217,6 @@ $LastWriteTime = $InstallerItem.LastWriteTime
 Write-Output "[OK] Installer: $InstallerPath"
 Write-Output "[OK] Size: $Length bytes"
 Write-Output "[OK] Updated: $LastWriteTime"
+Write-Output "[TIME] Installer total: $([math]::Round($installerClock.Elapsed.TotalSeconds, 2)) s"
 
 Start-CargoCacheCleanup -RepoRoot $RepoRoot -MaxSizeGiB 20
