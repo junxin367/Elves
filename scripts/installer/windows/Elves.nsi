@@ -11,8 +11,8 @@ InstallDir "$LOCALAPPDATA\Programs\Elves"
 InstallDirRegKey HKCU "Software\Elves" "InstallDir"
 RequestExecutionLevel admin
 !ifdef FAST_COMPRESSION
-; 快速本地包取消固实压缩，减少重复打包等待；正式包仍使用固实 LZMA 以保持较小体积。
-SetCompressor lzma
+; 快速本地包使用 zlib，减少重复打包等待；正式包仍使用固实 LZMA 以保持较小体积。
+SetCompressor zlib
 !else
 SetCompressor /SOLID lzma
 !endif

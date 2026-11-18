@@ -197,7 +197,7 @@ $nsisArguments = @("/INPUTCHARSET", "UTF8", "/DVERSION=$ResolvedVersion")
 if ($FastCompression) {
     # 用户要求日常安装包缩短压缩等待；快速模式只取消固实压缩，不改变客户端代码或安装内容。
     $nsisArguments += "/DFAST_COMPRESSION"
-    Write-Output "[INFO] NSIS compression: fast non-solid LZMA"
+    Write-Output "[INFO] NSIS compression: fast zlib"
 }
 else {
     Write-Output "[INFO] NSIS compression: solid LZMA"

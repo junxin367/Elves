@@ -2,12 +2,12 @@
 
 日常开发使用 `.\scripts\build-windows-client.ps1`。该入口检查 Harness 网页、准备共享管理页面，再用 `release-fast` 增量编译客户端并生成便携程序，不构建安装包或 Android。
 
-完整优化的客户端使用 `.\scripts\build-windows-client.ps1 -Profile release`。用户明确需要安装包时运行 `.\scripts\build-windows-installer.ps1`，默认同样使用 `release`；`-Profile release-fast` 仅供显式选择的本机调试包。需要缩短本地安装包压缩等待时，可追加 `-FastCompression`，该模式取消 NSIS 固实压缩，安装包体积可能增大。
+完整优化的客户端使用 `.\scripts\build-windows-client.ps1 -Profile release`。用户明确需要安装包时运行 `.\scripts\build-windows-installer.ps1`，默认同样使用 `release`；`-Profile release-fast` 仅供显式选择的本机调试包。需要缩短本地安装包压缩等待时，可追加 `-FastCompression`，该模式改用 NSIS zlib，安装包体积可能增大。
 
 ## 编译与资源处理
 
 - `release-fast` 只将五个工作区 crate 的 `opt-level` 调整为 `1`，保留增量编译及 256 个代码生成单元。第三方依赖及其构建脚本和过程宏沿用原来的配置，不通过通配覆盖改变其优化参数。`release` 保持完整优化。
-- 安装包默认使用固实 LZMA；`-FastCompression` 只改变 NSIS 压缩方式，不改变客户端编译 profile、安装文件或运行时行为，适合本地反复验收，正式发布仍使用默认压缩。
+- 安装包默认使用固实 LZMA；`-FastCompression` 只将本地包改用 zlib，不改变客户端编译 profile、安装文件或运行时行为，适合本地反复验收，正式发布仍使用默认压缩。
 - 网页只在不依赖业务代码的 `elves-assets` 中内嵌一次，Harness 和客户端共用资源表。资源通过非内联函数访问，减少网页字节变化向大型业务 crate 的编译传播。
 - 资源构建脚本在运行时读取当前包目录，并使用相对路径监视资源变化；生成的资源表内容不变时不重写文件。网页仍全部内嵌，不增加运行时文件依赖。
 - JS 语法和导出链接检查共用一个 Node 子进程，源码通过标准输入传递；继续检查分层、循环依赖、预加载及各端扫描规则，且不执行页面代码。
@@ -62,7 +62,9 @@ npm --prefix apps/elves-management run build:frontend -- --force
 | 完整命令墙钟 | 225.10 s | 198.76 s | 节省 26.35 s，快 11.7% |
 | NSIS | 旧流程未单独计时 | 64.30 s（非固实 LZMA） | 无直接基线 |
 
-快速包安装程序为 18,593,424 bytes，客户端为 81,886,208 bytes；体积同时受 `release-fast` 优化等级影响，不能把差异全部归因于 NSIS 压缩方式。正式发布仍使用默认 `release` 和固实 LZMA。
+上一轮非固实 LZMA 快速包安装程序为 18,593,424 bytes，客户端为 81,886,208 bytes；体积同时受 `release-fast` 优化等级影响，不能把差异全部归因于 NSIS 压缩方式。正式发布仍使用默认 `release` 和固实 LZMA。
+
+同一 `release-fast` 缓存改用 zlib 再次构建时，Harness 检查为 `0.89s`、前端缓存命中为 `0.44s`、Rust 编译为 `20.40s`、NSIS 为 `19.01s`、完整命令为 `44.76s`。最终快速安装包为 `28,034,053 bytes`；相较非固实 LZMA，zlib 牺牲体积换取更短的打包等待。该 `44.76s` 是热缓存结果，不能与前面的冷 Rust 构建总耗时直接相减。
 
 相关检查入口：
 
