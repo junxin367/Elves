@@ -1384,8 +1384,50 @@ impl HarnessController {
                 })?;
             self.hydrate_priority_unread_state(&mut sidebar, &ids, authorization)
                 .await;
-            let removed = authorization.prepare_dispatch().await?
-                .commit(|| priority.clear(&sidebar, &ids, observed))?;
+            let clear_result = authorization
+                .prepare_dispatch()
+                .await?
+                .commit(|| priority.clear(&sidebar, &ids, observed));
+            let mut requested_sample = ids.iter().copied().take(32).collect::<Vec<_>>();
+            requested_sample.sort_unstable();
+            match &clear_result {
+                Ok(removed) => {
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "remote_access.priority_clear",
+                        json!({
+                            "requestId":authorization.request_id,
+                            "deviceId":authorization.device.id,
+                            "requestedCount":ids.len(),
+                            "requestedIdsSample":requested_sample,
+                            "removed":removed,
+                            "observedRevision":observed,
+                            "currentRevision":priority.revision(),
+                            "sideThreadsComplete":sidebar["sideThreadsComplete"],
+                            "sideThreadsError":sidebar["sideThreadsError"],
+                            "outcome":"completed",
+                        }),
+                    );
+                }
+                Err(error) => {
+                    let message = error.to_string().chars().take(512).collect::<String>();
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "remote_access.priority_clear",
+                        json!({
+                            "requestId":authorization.request_id,
+                            "deviceId":authorization.device.id,
+                            "requestedCount":ids.len(),
+                            "requestedIdsSample":requested_sample,
+                            "observedRevision":observed,
+                            "currentRevision":priority.revision(),
+                            "sideThreadsComplete":sidebar["sideThreadsComplete"],
+                            "sideThreadsError":sidebar["sideThreadsError"],
+                            "outcome":"failed",
+                            "error":message,
+                        }),
+                    );
+                }
+            }
+            let removed = clear_result?;
             if removed != 0 {
                 self.publish_event(json!({"method":"remote/sidebarChanged","params":{"reason":"priority"}}));
             }
@@ -2082,19 +2124,58 @@ impl HarnessController {
 
         // 用户要求优先事项清除必须依据实际已读状态；原生 thread/list 对 notLoaded 会话不返回已读字段，
         // 这里只补读本次目标，读取失败继续保留 null，不能把未知状态直接当成已读。
+        let started = Instant::now();
+        let target_count = targets.len();
         let mut resolved = HashMap::new();
+        let mut failure_count = 0usize;
+        let mut failure_samples = Vec::new();
+        let record_failure = |samples: &mut Vec<Value>,
+                              count: &mut usize,
+                              thread_id: &str,
+                              stage: &str,
+                              detail: Value| {
+            *count += 1;
+            if samples.len() < 32 {
+                samples.push(json!({"threadId":thread_id,"stage":stage,"detail":detail}));
+            }
+        };
         for id in targets {
-            let Ok(value) = self
+            let value = match self
                 .call_backend("thread", json!({"threadId":id}), authorization)
                 .await
-            else {
-                continue;
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    let message = error.to_string().chars().take(512).collect::<String>();
+                    record_failure(
+                        &mut failure_samples,
+                        &mut failure_count,
+                        &id,
+                        "thread_read_error",
+                        json!({"message":message}),
+                    );
+                    continue;
+                }
             };
             let thread = &value["thread"];
             if thread["id"].as_str() != Some(id.as_str()) {
+                record_failure(
+                    &mut failure_samples,
+                    &mut failure_count,
+                    &id,
+                    "thread_identity_mismatch",
+                    json!({"returnedId":thread["id"]}),
+                );
                 continue;
             }
             let Some(unread) = thread["hasUnreadTurn"].as_bool() else {
+                record_failure(
+                    &mut failure_samples,
+                    &mut failure_count,
+                    &id,
+                    "unread_state_missing",
+                    json!({"hasUnreadTurn":thread["hasUnreadTurn"],"readState":thread["readState"]}),
+                );
                 continue;
             };
             resolved.insert(id, (unread, thread["readState"].clone()));
@@ -2118,6 +2199,22 @@ impl HarnessController {
                 }
             }
         }
+        let mut requested_sample = requested.iter().copied().take(32).collect::<Vec<_>>();
+        requested_sample.sort_unstable();
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "remote_access.priority_unread_hydration",
+            json!({
+                "requestId":authorization.request_id,
+                "deviceId":authorization.device.id,
+                "requestedCount":requested.len(),
+                "requestedIdsSample":requested_sample,
+                "targetCount":target_count,
+                "resolvedCount":resolved.len(),
+                "failureCount":failure_count,
+                "failureSamples":failure_samples,
+                "durationMs":started.elapsed().as_millis(),
+            }),
+        );
     }
 
     fn publish_backend_event(&self, source: &str, mut event: Value) {
@@ -6125,7 +6222,16 @@ mod tests {
             }
         }
 
-        let (_directory, remote) = harness_authorization_fixture(None).await;
+        let (directory, remote) = harness_authorization_fixture(None).await;
+        struct ResetDiagnosticLog;
+        impl Drop for ResetDiagnosticLog {
+            fn drop(&mut self) {
+                crate::diagnostic_log::set_diagnostic_log_path_for_tests(None);
+            }
+        }
+        let log_path = directory.path().join("priority-diagnostics.jsonl");
+        crate::diagnostic_log::set_diagnostic_log_path_for_tests(Some(log_path.clone()));
+        let _reset_log = ResetDiagnosticLog;
         let controller = &remote.controller;
         let id = "codex-unknown-unread";
         let catalog = Arc::new(HydratingCatalog(std::sync::Mutex::new(json!({
@@ -6165,6 +6271,11 @@ mod tests {
             .unwrap();
         assert_eq!(receipt["state"], "completed");
         assert_eq!(receipt["result"]["removed"], 1);
+        let log = std::fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("\"event\":\"remote_access.priority_unread_hydration\""));
+        assert!(log.contains("\"resolvedCount\":1"));
+        assert!(log.contains("\"event\":\"remote_access.priority_clear\""));
+        assert!(log.contains("\"removed\":1"));
     }
 
     #[test]
