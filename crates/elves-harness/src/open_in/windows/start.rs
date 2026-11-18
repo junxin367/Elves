@@ -1,18 +1,16 @@
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::process::Command;
 
 use windows::Win32::Foundation::{CloseHandle, ERROR_NO_ASSOCIATION};
-use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Threading::GetProcessId;
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
-    AssocIsDangerous, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS,
-    SHELLEXECUTEINFOW, SHGFI_EXETYPE, SHGetFileInfoW, SHOpenFolderAndSelectItems,
-    SHParseDisplayName, ShellExecuteExW,
+    SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    SHOpenFolderAndSelectItems, SHParseDisplayName, ShellExecuteExW,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::PCWSTR;
@@ -57,51 +55,9 @@ pub(super) fn reveal_file(path: &Path) -> io::Result<()> {
 pub(super) fn open_with_default_app(path: &Path) -> io::Result<Option<u32>> {
     let _apartment = crate::windows_integration::ComApartment::init()
         .map_err(|error| io::Error::other(error.to_string()))?;
-    let extension = path
-        .extension()
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| io::Error::other("该文件没有可用的 Windows 默认应用"))?;
-    let extension = extension.to_ascii_lowercase();
-    let mut association = OsString::from(".");
-    association.push(&extension);
-    let association = wide(&association);
     let file = wide(OsStr::new(&super::display_path(path).replace('/', r"\")));
-    // 正文的 Default app 只打开关联文档；应用、脚本和快捷方式不能经文件菜单直接执行。
-    // 补充 Windows 风险分类未覆盖的安装包、Shell 搜索和常见脚本类型，再检查实际可执行文件格式。
-    if matches!(
-        extension.to_str().unwrap_or_default(),
-        "application"
-            | "appinstaller"
-            | "appx"
-            | "appxbundle"
-            | "msix"
-            | "msixbundle"
-            | "search-ms"
-            | "searchconnector-ms"
-            | "diagcab"
-            | "xll"
-            | "jar"
-            | "py"
-            | "pyw"
-            | "rb"
-            | "sh"
-            | "psm1"
-    ) || unsafe { AssocIsDangerous(PCWSTR(association.as_ptr())).as_bool() }
-        || unsafe {
-            SHGetFileInfoW(
-                PCWSTR(file.as_ptr()),
-                FILE_FLAGS_AND_ATTRIBUTES::default(),
-                None,
-                0,
-                SHGFI_EXETYPE,
-            ) != 0
-        }
-    {
-        return Err(io::Error::other(
-            "此文件可能执行程序或脚本，请在 File Explorer 中确认后打开",
-        ));
-    }
-    // 将原文件作为 Shell 的文件参数，不拼接命令或改用浏览器；空 verb 使用系统当前默认关联。
+    // 用户要求本机独立客户端直接使用 Windows 当前默认关联，包括程序、脚本、安装包和快捷方式；
+    // 不在 Elves 再做二次扩展名/危险关联拦截，但仍只交给 Shell 打开已授权、已校验的原文件。
     let mut info = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
         fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
@@ -235,19 +191,19 @@ mod tests {
     }
 
     #[test]
-    fn default_app_refuses_windows_execution_and_installation_targets() {
+    fn default_app_delegates_execution_and_installation_targets_to_windows_shell() {
         for file in [
-            "package.EXE",
-            "example.lnk",
-            "run.ps1",
-            "run.py",
-            "setup.msix",
-            "test.search-ms",
+            r"C:\__elves_default_app_missing__\package.EXE",
+            r"C:\__elves_default_app_missing__\example.lnk",
+            r"C:\__elves_default_app_missing__\run.ps1",
+            r"C:\__elves_default_app_missing__\run.py",
+            r"C:\__elves_default_app_missing__\setup.msix",
+            r"C:\__elves_default_app_missing__\test.search-ms",
         ] {
             let error = open_with_default_app(Path::new(file)).unwrap_err();
             assert!(
-                error.to_string().contains("File Explorer"),
-                "{file}: {error}"
+                !error.to_string().contains("File Explorer"),
+                "{file} was blocked by the Elves-side safety filter: {error}"
             );
         }
     }
