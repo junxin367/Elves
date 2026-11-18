@@ -79,6 +79,7 @@ struct ClientState {
 struct DesktopIdentity {
     url: Url,
     cookie: String,
+    device_id: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -285,7 +286,13 @@ async fn authorize_workspace(app: &tauri::AppHandle) -> Result<Url, String> {
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|error| error.to_string())?;
-    let mut cookie = None;
+    let device_id_from = |response: &serde_json::Value| {
+        response["device"]["id"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    let mut credentials = None;
     if let Some(current) = identity
         .as_ref()
         .filter(|current| current.url.origin() == url.origin())
@@ -298,12 +305,16 @@ async fn authorize_workspace(app: &tauri::AppHandle) -> Result<Url, String> {
             )
             .send()
             .await;
-        if response.is_ok_and(|response| response.status().is_success()) {
-            cookie = Some(current.cookie.clone());
+        if let Ok(response) = response
+            && response.status().is_success()
+            && let Ok(body) = response.json::<serde_json::Value>().await
+            && let Some(id) = device_id_from(&body)
+        {
+            credentials = Some((current.cookie.clone(), id));
         }
     }
-    let cookie = match cookie {
-        Some(cookie) => cookie,
+    let (cookie, device_id) = match credentials {
+        Some(credentials) => credentials,
         None => {
             let response = client
                 .post(url.join("api/connect").map_err(|error| error.to_string())?)
@@ -318,7 +329,7 @@ async fn authorize_workspace(app: &tauri::AppHandle) -> Result<Url, String> {
                     response.status()
                 ));
             }
-            response
+            let cookie = response
                 .headers()
                 .get("set-cookie")
                 .and_then(|value| value.to_str().ok())
@@ -326,7 +337,13 @@ async fn authorize_workspace(app: &tauri::AppHandle) -> Result<Url, String> {
                 .and_then(|value| value.strip_prefix("elves_desktop="))
                 .filter(|value| !value.is_empty() && value.len() <= 256)
                 .ok_or("Harness 本机授权回执缺失")?
-                .to_owned()
+                .to_owned();
+            let body = response
+                .json::<serde_json::Value>()
+                .await
+                .map_err(|_| "Harness 本机授权回执无效")?;
+            let device_id = device_id_from(&body).ok_or("Harness 本机设备标识缺失")?;
+            (cookie, device_id)
         }
     };
     let view = app
@@ -371,6 +388,7 @@ async fn authorize_workspace(app: &tauri::AppHandle) -> Result<Url, String> {
     *identity = Some(DesktopIdentity {
         url: url.clone(),
         cookie: stored_cookie,
+        device_id,
     });
     Ok(url)
 }
@@ -444,12 +462,46 @@ fn trusted_input_page(webview: &tauri::Webview, state: &ClientState) -> Result<(
     Ok(())
 }
 
+async fn local_input_payload(
+    inputs: Vec<crate::local_inputs::CapturedInput>,
+    staged: bool,
+    clipboard: bool,
+    state: &ClientState,
+    source: &Url,
+) -> Result<serde_json::Value, String> {
+    if !staged {
+        // 旧缓存仍读取旧格式；新页面显式请求流式回执，不能把大文件放入 IPC JSON。
+        return tokio::task::spawn_blocking(move || {
+            serde_json::to_value(crate::local_inputs::read_legacy(inputs)?)
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|_| "读取附件任务已中断。")?;
+    }
+    if inputs.is_empty() {
+        return Ok(serde_json::json!([]));
+    }
+    let device_id = {
+        let identity = state.desktop_identity.lock().await;
+        let identity = identity
+            .as_ref()
+            .filter(|identity| identity.url.origin() == source.origin())
+            .ok_or("本机附件授权已变化，请重新添加。")?;
+        identity.device_id.clone()
+    };
+    let directory = elves_harness::paths::default_app_state_dir();
+    tokio::task::spawn_blocking(move || crate::local_inputs::stage(inputs, clipboard, &directory, &device_id))
+        .await
+        .map_err(|_| "本机附件暂存任务已中断。")?
+}
+
 #[tauri::command]
 async fn client_choose_inputs(
     webview: tauri::Webview,
     state: tauri::State<'_, ClientState>,
     folders: Option<bool>,
-) -> Result<Vec<crate::local_inputs::LocalInput>, String> {
+    staged: Option<bool>,
+) -> Result<serde_json::Value, String> {
     trusted_input_page(&webview, &state)?;
     let source = webview.url().map_err(|error| error.to_string())?;
     let parent = webview
@@ -469,26 +521,32 @@ async fn client_choose_inputs(
     if webview.url().ok().as_ref() != Some(&source) {
         return Err("会话页面已变化，请重新选择附件。".into());
     }
-    let inputs = tokio::task::spawn_blocking(move || crate::local_inputs::read(paths))
+    let inputs = tokio::task::spawn_blocking(move || crate::local_inputs::capture(paths))
         .await
         .map_err(|_| "读取附件任务已中断。")??;
     trusted_input_page(&webview, &state)?;
     if webview.url().ok().as_ref() != Some(&source) {
         return Err("会话页面已变化，请重新选择附件。".into());
     }
-    Ok(inputs)
+    let result = local_input_payload(inputs, staged == Some(true), false, &state, &source).await?;
+    trusted_input_page(&webview, &state)?;
+    if webview.url().ok().as_ref() != Some(&source) {
+        return Err("会话页面已变化，请重新选择附件。".into());
+    }
+    Ok(result)
 }
 
 #[tauri::command]
 async fn client_paste_inputs(
     webview: tauri::Webview,
     state: tauri::State<'_, ClientState>,
-) -> Result<Vec<crate::local_inputs::LocalInput>, String> {
+    staged: Option<bool>,
+) -> Result<serde_json::Value, String> {
     trusted_input_page(&webview, &state)?;
     let source = webview.url().map_err(|error| error.to_string())?;
     let inputs =
         tokio::task::spawn_blocking(
-            || crate::local_inputs::read(crate::local_inputs::clipboard()?),
+            || crate::local_inputs::capture(crate::local_inputs::clipboard()?),
         )
         .await
         .map_err(|_| "读取剪贴板附件任务已中断。")??;
@@ -496,7 +554,12 @@ async fn client_paste_inputs(
     if webview.url().ok().as_ref() != Some(&source) {
         return Err("会话页面已变化，请重新粘贴附件。".into());
     }
-    Ok(inputs)
+    let result = local_input_payload(inputs, staged == Some(true), true, &state, &source).await?;
+    trusted_input_page(&webview, &state)?;
+    if webview.url().ok().as_ref() != Some(&source) {
+        return Err("会话页面已变化，请重新粘贴附件。".into());
+    }
+    Ok(result)
 }
 
 #[tauri::command]

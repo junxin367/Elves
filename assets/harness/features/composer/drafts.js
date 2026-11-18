@@ -127,6 +127,7 @@ export function rememberDraft() {
     || draft.attachments.length !== previous.attachments.length
     || draft.attachments.some((image, index) => ["kind", "name", "mime", "size", "dataUrl", "source", "url"]
       .some(name => image[name] !== previous.attachments[index]?.[name])
+      || JSON.stringify(image.staged || null) !== JSON.stringify(previous.attachments[index]?.staged || null)
       || JSON.stringify(image.files || []) !== JSON.stringify(previous.attachments[index]?.files || [])
       || JSON.stringify(image.directories || []) !== JSON.stringify(previous.attachments[index]?.directories || []))
     || (draft.goalMode || null) !== (previous.goalMode || null)

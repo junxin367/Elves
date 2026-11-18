@@ -11,6 +11,7 @@ pub use elves_core::local_proxy_service;
 pub use elves_core::model_capabilities;
 pub use elves_core::model_catalog;
 pub use elves_core::paths;
+pub use input_files::stage_desktop_files;
 pub use elves_core::ports;
 pub use elves_core::prompt_optimize;
 pub use elves_core::protocol_proxy;
@@ -2745,6 +2746,15 @@ fn scoped_router(
         .fold(Router::new(), |router, &(path, _, _)| {
             router.route(path, get(static_web_asset))
         });
+    let static_routes = if desktop {
+        static_routes.route(
+            "/api/desktop/input-files",
+            // 用户要求只在本机取消文件容量限制：流式附件独立于通用 JSON 操作，远程入口不注册。
+            post(input_files::desktop_upload).layer(DefaultBodyLimit::disable()),
+        )
+    } else {
+        static_routes
+    };
     static_routes
         .route("/side-thread", get(static_web_asset))
         .route("/app-resources.json", get(static_web_asset))
@@ -3038,6 +3048,8 @@ async fn access_boundary_response(
         Some("管理功能仅可在 Elves 独立客户端使用")
     } else if path == PREVIEW_WINDOW_PATH {
         Some("独立预览仅可在 Elves 本机客户端使用")
+    } else if path == "/api/desktop/input-files" {
+        Some("本机附件暂存仅可在 Elves 独立客户端使用")
     } else {
         None
     };
@@ -4308,7 +4320,6 @@ fn validate_goal_composer_payload(action: &str, payload: &Value) -> Result<(), A
         return Err(ApiError::new(400, "项目 ID 无效"));
     }
     validate_input_images(payload)?;
-    input_files::validate(payload)?;
     let has_images = object
         .get("images")
         .and_then(Value::as_array)
@@ -4833,7 +4844,10 @@ async fn action(
         action.as_str(),
         "send" | "create" | "setGoal" | "editQueued"
     ) {
-        input_files::validate(&payload)?;
+        input_files::validate_for_device(
+            &payload,
+            state.desktop && device.key_id == desktop::DEVICE_KEY_ID,
+        )?;
     } else if payload.get("files").is_some() {
         return Err(ApiError::new(400, "当前操作不接受文件和文件夹附件"));
     }

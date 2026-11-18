@@ -7,7 +7,10 @@
       pick: folders => window.__TAURI__.core.invoke("client_choose_inputs", { folders: folders === true }),
       // 新版直接打开同一个选择窗口；旧网页的文件/文件夹独立调用仍通过 pick 兼容。
       pickAny: () => window.__TAURI__.core.invoke("client_choose_inputs", {}),
-      paste: () => window.__TAURI__.core.invoke("client_paste_inputs")
+      paste: () => window.__TAURI__.core.invoke("client_paste_inputs"),
+      // 新页面使用本机暂存引用，不把文件内容通过 IPC 交给 WebView；旧缓存沿用原方法。
+      pickStaged: () => window.__TAURI__.core.invoke("client_choose_inputs", { staged: true }),
+      pasteStaged: () => window.__TAURI__.core.invoke("client_paste_inputs", { staged: true })
     })
   });
 })();

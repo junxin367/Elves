@@ -8,13 +8,18 @@ export function localInputBridge() {
 
 export function isLocalInput(entry) { return entry?.kind === "file" || entry?.kind === "folder"; }
 
+const stagedSlotId = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/u;
 export function copyLocalInput(entry) {
+  if (entry.staged) {
+    const { id, index, entries } = entry.staged;
+    return { kind: entry.kind, name: entry.name, size: entry.size, staged: { id, index, entries } };
+  }
   return { kind: entry.kind, name: entry.name, size: entry.size,
     files: entry.files.map(({ path, data }) => ({ path, data })), directories: [...entry.directories] };
 }
 
-// 与原生 local_inputs.rs、服务端 input_files.rs 同步；根附件 16 项、目录项 512 项、合计 12 MiB。
-export function validateLocalInputs(inputs) {
+// 与原生 local_inputs.rs、服务端 input_files.rs 同步。12 MiB 仅用于内联内容，本机暂存只校验引用及目录项。
+export function validateLocalInputs(inputs, { allowStaged = false } = {}) {
   if (!Array.isArray(inputs) || inputs.length > 16) throw new Error("每条消息最多添加 16 个文件或文件夹");
   let total = 0, entries = inputs.length;
   const component = name => typeof name === "string" && !!name && new TextEncoder().encode(name).length <= 255
@@ -24,8 +29,20 @@ export function validateLocalInputs(inputs) {
   const relative = path => typeof path === "string" && new TextEncoder().encode(path).length <= 4096
     && path.split("/").length <= 32 && path.split("/").every(component);
   for (const input of inputs) {
-    if (!isLocalInput(input) || !component(input.name) || !Number.isSafeInteger(input.size) || input.size < 0
-        || !Array.isArray(input.files) || !Array.isArray(input.directories)
+    if (!isLocalInput(input) || !component(input.name) || !Number.isSafeInteger(input.size) || input.size < 0)
+      throw new Error("文件或文件夹附件无效，请重新选择");
+    if (input.staged != null) {
+      const { id, index, entries: count } = input.staged;
+      if (!allowStaged || "files" in input || "directories" in input
+          || typeof id !== "string" || !stagedSlotId.test(id)
+          || !Number.isInteger(index) || index < 0 || index >= 16
+          || !Number.isInteger(count) || count < 0 || count >= 512 || input.kind === "file" && count !== 1)
+        throw new Error("本机附件引用无效，请重新添加");
+      entries += count;
+      if (entries > 512) throw new Error("每条消息最多包含 512 个文件和目录项");
+      continue;
+    }
+    if (!Array.isArray(input.files) || !Array.isArray(input.directories)
         || input.kind === "file" && (input.directories.length || input.files.length !== 1 || input.files[0]?.path !== input.name))
       throw new Error("文件或文件夹附件无效，请重新选择");
     const paths = [...input.directories, ...input.files.map(file => file?.path)];

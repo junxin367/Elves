@@ -12,7 +12,7 @@ elves-data = { path = "../elves-data" }
 aes-gcm.workspace = true
 anyhow.workspace = true
 async-trait = "0.1"
-axum = { version = "0.8", features = ["json", "tokio", "http1", "ws"], default-features = false }
+axum = { version = "0.8", features = ["json", "tokio", "http1", "ws", "multipart"], default-features = false }
 axum-server = { version = "0.8", features = ["tls-rustls-no-provider"], default-features = false }
 base64.workspace = true
 calamine = { version = "0.38", default-features = false }
@@ -36,7 +36,8 @@ serde_json.workspace = true
 sha2.workspace = true
 tar.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util", "net"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "net"] }
 tokio-tungstenite.workspace = true
 toml.workspace = true
 toml_edit.workspace = true
@@ -60,6 +61,3 @@ windows = { version = "0.58", features = [
   "Win32_UI_Shell_Common",
   "Win32_UI_WindowsAndMessaging",
 ] }
-
-[dev-dependencies]
-tempfile.workspace = true

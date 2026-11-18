@@ -1,7 +1,7 @@
 import { remoteMediaCandidates, remoteMediaUrl } from "./channels.js";
 import { sha256Hex } from "./sha256.js";
 import { copyLocalInput, isLocalInput, localInputBridge, validateLocalInputs } from "./local-inputs.js";
-import { captureTransferInputs, hasTransferFiles, readTransferInputs } from "./transfer-inputs.js";
+import { captureTransferInputs, hasTransferFiles, readTransferInputs, stageTransferredInputs } from "./transfer-inputs.js";
 import { icon } from "./ui/icons.js";
 
 // 用户要求 Codex/Claude 单条固定最多 8 张；添加、粘贴、拖拽与草稿/队列恢复共用此值，并与 Rust MAX_INPUT_IMAGE_COUNT 同步。
@@ -939,6 +939,7 @@ export function handleComposerImagePaste(event) {
 }
 
 export function composerLocalInputsSupported() { return !!localInputBridge(); }
+function desktopStagedInputsSupported() { return typeof localInputBridge()?.pickStaged === "function"; }
 export function composerCanAddLocalInputs() {
   return composerLocalInputsSupported() && !disabled && !locked && !readingFiles;
 }
@@ -951,9 +952,9 @@ async function addLocalInputs(read, fallback = null, classifyImages = false) {
     const next = await read();
     if (version !== attachmentVersion) return;
     if (next.length) {
-      const checked = validateLocalInputs(next), images = [], inputs = [];
+      const checked = validateLocalInputs(next, { allowStaged: desktopStagedInputsSupported() }), images = [], inputs = [];
       for (const entry of checked) {
-        if (classifyImages && entry.kind === "file" && imageFileExtensions.test(entry.name)) {
+        if (classifyImages && !entry.staged && entry.kind === "file" && imageFileExtensions.test(entry.name)) {
           const bytes = Uint8Array.from(atob(entry.files[0].data), character => character.charCodeAt(0));
           images.push(Object.assign(new Blob([bytes]), { name: entry.name }));
         } else inputs.push(entry);
@@ -983,35 +984,56 @@ async function addLocalInputs(read, fallback = null, classifyImages = false) {
 }
 
 function validateAttachmentBatch(inputs, images) {
-  validateLocalInputs([...attachments.filter(isLocalInput), ...inputs]);
+  const files = [...attachments.filter(isLocalInput), ...inputs];
+  validateLocalInputs(files, { allowStaged: files.some(entry => entry.staged) && desktopStagedInputsSupported() });
   if (attachments.filter(entry => !isLocalInput(entry)).length + images.length > MAX_IMAGE_COUNT)
     throw new Error(`每条消息最多添加 ${MAX_IMAGE_COUNT} 张图片`);
   const total = [...attachments, ...images].reduce((sum, entry) => sum + (entry.kind === "inline" ? entry.size : 0), 0);
   if (total > MAX_TOTAL_BYTES) throw new Error("图片总大小不能超过 12 MiB");
 }
 
+let localInputUpload = null;
 async function addTransferredInputs(captured) {
   if (disabled || locked || readingFiles) { showNotice("当前不能添加附件，请先完成读取或退出编辑", true); return; }
   const version = attachmentVersion;
   readingFiles = true; renderComposerAttachments(); changeListener();
   try {
+    const forDesktop = desktopStagedInputsSupported();
     const batch = await readTransferInputs(captured, { isImageFile: imageInputFile,
-      isCurrent: () => version === attachmentVersion });
+      isCurrent: () => version === attachmentVersion, forDesktop });
     if (version !== attachmentVersion) return;
-    validateAttachmentBatch(batch.inputs, batch.images.map(file => ({ kind: "inline", size: file.size })));
+    // 大文件先核对图片和数量，避免混合批次中的另一项无效时仍在本机写入大文件。
+    const checkInputs = forDesktop ? [] : batch.inputs;
+    if (forDesktop) {
+      const existing = attachments.filter(isLocalInput);
+      if (existing.length + batch.inputs.length > 16)
+        throw new Error("每条消息最多添加 16 个文件或文件夹");
+      const entries = entry => 1 + (entry.staged?.entries ?? (entry.files.length + entry.directories.length));
+      if ([...existing, ...batch.inputs].reduce((count, entry) => count + entries(entry), 0) > 512)
+        throw new Error("每条消息最多包含 512 个文件和目录项");
+    }
+    validateAttachmentBatch(checkInputs, batch.images.map(file => ({ kind: "inline", size: file.size })));
+    if (forDesktop && batch.inputs.length) localInputUpload = new AbortController();
+    const signal = localInputUpload?.signal;
     const images = [];
     for (const file of batch.images) {
       images.push(await readImageFile(file));
       if (version !== attachmentVersion) return;
-      validateAttachmentBatch(batch.inputs, images);
+      validateAttachmentBatch(checkInputs, images);
     }
-    validateAttachmentBatch(batch.inputs, images);
-    attachments.push(...batch.inputs, ...images);
+    let inputs = batch.inputs;
+    if (forDesktop && inputs.length) {
+      inputs = await stageTransferredInputs(inputs, batch.blobs, signal);
+      if (version !== attachmentVersion) return;
+    }
+    validateAttachmentBatch(inputs, images);
+    attachments.push(...inputs, ...images);
   } catch (error) {
     if (version === attachmentVersion)
       showNotice(error?.message || "无法读取附件，请重新拖入或粘贴", true);
   } finally {
     if (version === attachmentVersion) {
+      localInputUpload = null;
       readingFiles = false; renderComposerAttachments(); changeListener();
       composerPrompt?.focus({ preventScroll: true });
     }
@@ -1021,6 +1043,7 @@ async function addTransferredInputs(captured) {
 export function chooseComposerLocalInputs() {
   const bridge = localInputBridge();
   if (!bridge || !composerCanAddLocalInputs()) return;
+  if (typeof bridge.pickStaged === "function") return addLocalInputs(() => bridge.pickStaged());
   if (typeof bridge.pickAny === "function") return addLocalInputs(() => bridge.pickAny());
   // 网页资源可能比客户端更新；旧版仍一键选文件，说明文件夹的替代入口，不恢复二级菜单。
   const version = attachmentVersion;
@@ -1030,6 +1053,11 @@ export function chooseComposerLocalInputs() {
       showNotice("此客户端版本只能在窗口中选文件。可拖放或粘贴文件夹，更新 Elves 后可在同一窗口选择。");
     return inputs;
   });
+}
+
+function pasteLocalInputs() {
+  const bridge = localInputBridge();
+  return typeof bridge?.pasteStaged === "function" ? bridge.pasteStaged() : bridge?.paste() || [];
 }
 
 export function handleComposerLocalPaste(event) {
@@ -1055,7 +1083,7 @@ export function handleComposerLocalPaste(event) {
     return true;
   }
   event.preventDefault();
-  void addLocalInputs(() => localInputBridge().paste(),
+  void addLocalInputs(pasteLocalInputs,
     captured.length ? () => addTransferredInputs(captured) : null, true);
   return true;
 }
@@ -1068,7 +1096,7 @@ export function handleComposerLocalPasteShortcut(event) {
   // 文字、截图或文件已经产生 paste 时由上方处理，不能重复添加，也不截断浏览器的原有快捷键。
   setTimeout(() => {
     if (version === attachmentVersion && shortcut === localPasteShortcut)
-      void addLocalInputs(() => localInputBridge().paste(), null, true);
+      void addLocalInputs(pasteLocalInputs, null, true);
   }, 0);
 }
 
@@ -1107,11 +1135,13 @@ export function composerRemoteAttachmentSources() {
 
 export function setComposerAttachments(value = [], { readOnly = false, removableRemote = false } = {}) {
   attachmentVersion += 1;
+  localInputUpload?.abort();
+  localInputUpload = null;
   readingFiles = false;
   let imageCount = 0;
   attachments = Array.isArray(value) ? value.flatMap(entry => {
     if (isLocalInput(entry)) {
-      try { return validateLocalInputs([entry]); } catch { return []; }
+      try { return validateLocalInputs([entry], { allowStaged: desktopStagedInputsSupported() }); } catch { return []; }
     }
     if (entry?.kind === "inline" && supportedMimes.has(entry.mime)
         && typeof entry.dataUrl === "string" && Number.isFinite(entry.size) && imageCount++ < MAX_IMAGE_COUNT)

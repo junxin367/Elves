@@ -33,11 +33,13 @@ function base64(bytes) {
   return btoa(binary);
 }
 
-export async function readTransferInputs(captured, { isImageFile = () => false, isCurrent = () => true } = {}) {
+export async function readTransferInputs(captured, {
+  isImageFile = () => false, isCurrent = () => true, forDesktop = false
+} = {}) {
   if (!Array.isArray(captured) || captured.length > 24)
     throw new Error("一次最多添加 8 张图片和 16 个文件或文件夹");
   if (!captured.length) throw new Error("浏览器未提供可读取的附件，请重新拖入或使用独立客户端粘贴文件夹");
-  const images = [], inputs = [];
+  const images = [], inputs = [], blobs = [];
   let total = 0, entries = 0, roots = 0;
   const deadline = Date.now() + 30000;
   const check = () => {
@@ -65,6 +67,13 @@ export async function readTransferInputs(captured, { isImageFile = () => false, 
   async function readFile(file, path, input) {
     check();
     if (!(file instanceof Blob)) throw new Error("浏览器未提供可读取的文件内容");
+    if (forDesktop) {
+      // 本机 WebView 拖放只保留浏览器授予的 Blob；不整文件读进内存，也不限制附件总容量。
+      input.size += file.size;
+      input.files.push({ path, size: file.size });
+      blobs.push(file);
+      return;
+    }
     if (total + file.size > MAX_BYTES) throw new Error("文件和文件夹总大小不能超过 12 MiB");
     const bytes = new Uint8Array(await wait(file.arrayBuffer()));
     if (bytes.length !== file.size || total + bytes.length > MAX_BYTES)
@@ -151,5 +160,24 @@ export async function readTransferInputs(captured, { isImageFile = () => false, 
     inputs.push(input);
   }
   check();
-  return { images, inputs: validateLocalInputs(inputs) };
+  return forDesktop ? { images, inputs, blobs } : { images, inputs: validateLocalInputs(inputs) };
+}
+
+export async function stageTransferredInputs(inputs, blobs, signal) {
+  if (!inputs.length) return [];
+  const body = new FormData();
+  body.append("manifest", JSON.stringify(inputs));
+  // 仅本机页面走专用回环入口；服务还会独立核对监听和本机授权，消息接口不接收大文件内容。
+  for (const blob of blobs) body.append("file", blob, "input");
+  const response = await fetch("/api/desktop/input-files", {
+    method: "POST", body, signal, cache: "no-store", redirect: "error", credentials: "same-origin"
+  });
+  const result = await response.json().catch(() => null);
+  if (!response.ok || result?.ok !== true)
+    throw new Error(result?.message || `本机附件暂存失败（HTTP ${response.status}）`);
+  const staged = validateLocalInputs(result.inputs, { allowStaged: true });
+  if (staged.length !== inputs.length || staged.some((entry, index) =>
+    !entry.staged || entry.kind !== inputs[index].kind || entry.name !== inputs[index].name || entry.size !== inputs[index].size))
+    throw new Error("本机附件暂存回执不完整，请重新添加");
+  return staged;
 }

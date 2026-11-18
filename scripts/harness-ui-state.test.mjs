@@ -9,7 +9,7 @@ import { mountInstancePermissions, permissionLabel, permissionModeKnown, permiss
 import { menuHorizontalLeft } from "../assets/harness/ui/position.js";
 import { localFileReference } from "../assets/harness/file-reference.js";
 import { copyLocalInput, isLocalInput, localInputBridge, validateLocalInputs } from "../assets/harness/local-inputs.js";
-import { captureTransferInputs, hasTransferFiles, readTransferInputs } from "../assets/harness/transfer-inputs.js";
+import { captureTransferInputs, hasTransferFiles, readTransferInputs, stageTransferredInputs } from "../assets/harness/transfer-inputs.js";
 import { marked, Renderer } from "../assets/harness/vendor/marked.esm.js";
 import { defaultSharedSettings } from "../assets/harness/features/settings/shared-state.js";
 import { messageActionState, renderMessageActions } from "../assets/harness/message-actions.js";
@@ -1327,7 +1327,7 @@ async function localAttachmentHarness() {
   const context = vm.createContext({
     nativeConnectionVersion: 1, Blob, Uint8Array, TextEncoder, TextDecoder, atob,
     isLocalInput, copyLocalInput, validateLocalInputs,
-    captureTransferInputs, hasTransferFiles, readTransferInputs,
+    AbortController, captureTransferInputs, hasTransferFiles, readTransferInputs, stageTransferredInputs,
     FileReader: class {
       readAsDataURL(blob) {
         void blob.arrayBuffer().then(bytes => {
@@ -1404,6 +1404,33 @@ test("浏览器目录和文件读取拒绝超限、越界和迟到结果，不�
   current = false; finish(attachmentTestFile("a.txt"));
   await assert.rejects(() => pending, { name: "AbortError" });
   assert.equal(second, false);
+});
+
+test("本机附件拖入 40 MiB 只暂存文件流，草稿及发送保留引用，远程仍拒绝", async () => {
+  const h = await localAttachmentHarness(), c = h.context;
+  const file = attachmentTestFile("大文件.bin", new Uint8Array(40 * 1024 * 1024 + 17));
+  file.arrayBuffer = () => assert.fail("本机不能整文件读进 WebView 内存");
+  const entry = { kind: "file", name: file.name, size: file.size,
+    staged: { id: "00000000-0000-4000-8000-000000000001", index: 0, entries: 1 } };
+  h.bridge.pickStaged = async () => [entry];
+  const calls = [];
+  c.stageTransferredInputs = async (manifest, blobs, signal) => {
+    calls.push({ manifest, blobs, signal });
+    return [entry];
+  };
+  await c.addTransferredInputs([{ file }]);
+  assert.deepEqual(h.notices, []);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].blobs[0], file);
+  assert.deepEqual(calls[0].manifest[0].files, [{ path: file.name, size: file.size }]);
+  const draft = c.composerAttachmentSnapshot();
+  c.clearComposerAttachments();
+  c.setComposerAttachments(draft);
+  assert.deepEqual(JSON.parse(JSON.stringify(c.composerLocalInputsPayload())), [entry]);
+  assert.throws(() => validateLocalInputs([entry]), /引用无效/);
+  assert.throws(() => validateLocalInputs([entry, { ...entry, kind: "folder",
+    staged: { ...entry.staged, entries: 510 } }], { allowStaged: true }), /512/);
+  await assert.rejects(() => readTransferInputs([{ file }]), /12 MiB/);
 });
 
 test("现代目录 handle 同样保留目录，捕获拒绝不会降级为空文件", async () => {
