@@ -828,6 +828,13 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .local-file-reference{font-family:"JetBrains Mono",Consolas,monospace;font-size:.9em;background:var(--code);border-radius:4px;padding:2px 4px;overflow-wrap:anywhere}
 .markdown a.local-file-reference{color:var(--skill);background:transparent;padding:0;text-decoration:none;cursor:pointer}
 .markdown a.local-file-reference:hover{text-decoration:underline;text-underline-offset:3px}
+/* 正文用文件图标加原标签；1em 图标跟随正文阅读字号，垂直下移 1/8 em 与文字基线对齐。 */
+.markdown a.message-file-reference{display:inline-flex;align-items:baseline;gap:4px;max-width:100%;font:inherit;font-weight:600;color:var(--accent-text)}
+.message-file-reference>.ui-icon{width:1em;height:1em;position:relative;top:.125em}
+.message-file-label{min-width:0;overflow-wrap:anywhere}
+.markdown a.message-file-reference:hover{color:var(--accent-text-hover);text-decoration:none}
+.markdown a.message-file-reference:hover>.message-file-label{text-decoration:underline}
+.markdown a.message-file-reference:focus-visible{outline:1px solid var(--focus-ring);outline-offset:-1px}
 /* 正文文件菜单与会话列表共用二级弹层；宽度下限 240px 在 markdown.js 中维护，为 Explorer 文案预留空间。 */
 .local-file-reference-popup .popup-option-label>span{white-space:normal}
 .attachment-placeholder{display:block;margin-top:8px;color:var(--muted);font-size:.85714rem}

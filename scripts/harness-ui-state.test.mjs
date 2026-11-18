@@ -609,7 +609,7 @@ test("正文文件引用接受相对和绝对路径，纯文件名及文件名�
 });
 
 test("正文 Markdown 只给有路径的文字、代码和链接添加文件操作，纯文件名无文件菜单元数据", () => {
-  const context = rawVm.createContext({ localFileReference, videoPreviewMarkup: () => "",
+  const context = rawVm.createContext({ URL, localFileReference, videoPreviewMarkup: () => "",
     dependencies: { marked, Renderer, createDOMPurify: () => ({ addHook() {}, sanitize: html => html }) } });
   rawVm.runInContext(markdownRendererSource.replace(/^import .*;$/gm, "").replace(/^export /gm, "")
     + "\nglobalThis.fixture = createMarkdownRenderer(dependencies);", context);
@@ -619,19 +619,40 @@ test("正文 Markdown 只给有路径的文字、代码和链接添加文件操�
   const files = context.fixture.markdown("src/app.ts `./README.md` [app.ts](src/app.ts#L12)");
   assert.equal((files.match(/data-local-file-path=/g) || []).length, 3);
   assert.match(files, /data-local-file-path="src\/app\.ts" data-local-file-line="12"/);
-  assert.match(context.fixture.markdown("[README.md](README.md)", [], { fileDocument: true }),
-    /data-local-file-path="README\.md"/, "文件预览文档仍保留其相对文档链接");
+  const artifacts = context.fixture.markdown(
+    "[安装包（19.2 MiB）](E:/repo/out/setup.exe) · [便携版](E:/repo/out/portable.exe) · [ ](src/app.ts)");
+  for (const [path, label] of [["E:/repo/out/setup.exe", "安装包（19.2 MiB）"],
+    ["E:/repo/out/portable.exe", "便携版"], ["src/app.ts", "app.ts"]]) {
+    assert.ok(artifacts.includes(`data-local-file-path="${path}" title="${path}"><span class="message-file-label">${label}</span>`));
+  }
+  assert.match(context.fixture.markdown("[**说明** &amp; 示例](./README.md:9)"),
+    /data-local-file-line="9"[^>]*><span class="message-file-label"><strong>说明<\/strong> &amp; 示例<\/span>/);
+  const imageLabel = context.fixture.markdown("[![封面](image)](./README.md)", [{ source: "image", url: "/api/images/00000000000000000000" }]);
+  assert.equal((imageLabel.match(/<a\b/g) || []).length, 1, "文件标签里的图像不生成第二个交互目标");
+  assert.doesNotMatch(imageLabel, /<(?:img|button)\b/);
+  assert.match(imageLabel, /class="message-file-label">封面<\/span>/);
+  const webLink = context.fixture.markdown("[网页](https://example.com/report)");
+  assert.match(webLink, /target="_blank"[^>]*>网页<\/a>/);
+  assert.doesNotMatch(webLink, /message-file-reference/);
+  const documentLink = context.fixture.markdown("[文档说明](README.md)", [], { fileDocument: true });
+  assert.match(documentLink, /data-local-file-path="README\.md"[^>]*>README\.md<\/a>/,
+    "文件预览文档仍保留原有相对链接和展示");
+  assert.doesNotMatch(documentLink, /message-file-reference/);
 });
 
 test("文件引用绑定忽略旧缓存中的纯文件名，只给真实路径绑定右键和长按", () => {
-  const link = path => ({ dataset: { localFilePath: path }, events: new Map(),
+  const link = (path, messageFile = false) => ({ dataset: { localFilePath: path }, events: new Map(), icons: [],
+    classList: { contains: className => messageFile && className === "message-file-reference" },
+    prepend(icon) { this.icons.unshift(icon); },
     addEventListener(name, action) { this.events.set(name, action); } });
-  const links = [link("README.md"), link("app.ts:12"), link("src/app.ts"), link("./README.md")];
-  const context = rawVm.createContext({ localFileReference });
+  const links = [link("README.md", true), link("app.ts:12"), link("src/app.ts", true), link("./README.md")];
+  const context = rawVm.createContext({ localFileReference, icon: name => name });
   rawVm.runInContext(markdownSource.slice(markdownSource.indexOf("export function bindLocalFileReferences("),
     markdownSource.indexOf('\ndocument.addEventListener("click"')).replace(/^export /, ""), context);
   context.bindLocalFileReferences({ querySelectorAll: () => links });
+  context.bindLocalFileReferences({ querySelectorAll: () => links });
   assert.equal(links[0].events.size, 0); assert.equal(links[1].events.size, 0);
+  assert.deepEqual(links.map(value => value.icons), [[], [], ["document"], []]);
   for (const value of links.slice(2)) {
     assert.ok(value.events.has("contextmenu")); assert.ok(value.events.has("pointerdown"));
   }
@@ -641,7 +662,7 @@ function fileReferenceClickHarness({ path = "src/VolcengineTtsHttpClient.java#L1
   const opened = [], menus = [], closed = [], queries = [], timers = new Map(), state = { disabled: false };
   let timer = 0;
   const link = { dataset: { localFilePath: path }, textContent: "VolcengineTtsHttpClient.java", isConnected: true,
-    events: new Map(), getBoundingClientRect: () => ({ left: 10, bottom: 30 }),
+    classList: { contains: () => false }, events: new Map(), getBoundingClientRect: () => ({ left: 10, bottom: 30 }),
     addEventListener(name, callback) {
       this.events.set(name, [...(this.events.get(name) || []), callback]);
     } };

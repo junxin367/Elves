@@ -1,4 +1,5 @@
 import { localFileReference } from "./file-reference.js";
+import { icon } from "./ui/icons.js";
 import { activePopup, closePopup, openPopup } from "./ui/popup.js";
 
 // 格式增强不属于登录和会话请求的启动依赖；未就绪时只显示安全的纯文本。
@@ -276,7 +277,8 @@ function showLocalFileMenu(link, position, { openFile, openBrowser, getMenuOptio
   // 240px 为“在 File Explorer 打开”及左右图标预留空间，子菜单继续沿用 Open in 的 178px。
   link.popupWidth = 240;
   link.popupAutoWidth = true;
-  link.setAttribute("aria-label", `文件引用操作：${path}`);
+  const label = link.querySelector(".message-file-label")?.textContent.trim();
+  link.setAttribute("aria-label", `文件引用操作：${label ? `${label}（${path}）` : path}`);
   localFileMenuTrigger = link;
   openPopup(link, { position });
 }
@@ -288,6 +290,8 @@ export function bindLocalFileReferences(root, { openFile, openBrowser, getMenuOp
     if (!localFileReference(link.dataset.localFilePath, true, allowFilename)) continue;
     if (link.dataset.localFileMenuBound === "true") continue;
     link.dataset.localFileMenuBound = "true";
+    // 正文使用现有文档图标，清洗后再插入；文件预览文档内的链接沿用原样式。
+    if (link.classList.contains("message-file-reference")) link.prepend(icon("document"));
     let press = null;
     const cancel = suppress => {
       if (!press) return;

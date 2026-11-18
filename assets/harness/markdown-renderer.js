@@ -62,8 +62,13 @@ export function createMarkdownRenderer({ marked, Renderer, createDOMPurify }) {
         .map(name => name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})(?![\\p{L}\\p{N}_:./-])`, "gu")
       : null;
     const skillPlaceholder = skill => `<span class="message-skill-reference" title="${escapeHtml(skill.path)}">${escapeHtml(skill.displayName || skill.name)}</span>`;
-    let linkDepth = 0;
-    const fileLink = reference => `<a class="local-file-reference" href="#project-file" data-local-file-path="${escapeHtml(reference.path)}"${reference.line ? ` data-local-file-line="${reference.line}"` : ""} title="${escapeHtml(reference.path)}">${escapeHtml(reference.name)}</a>`;
+    let linkDepth = 0, inFileLabel = false;
+    // 正文文件引用保留 Markdown 的显示标签，空标签仍用文件名；真实路径和行号继续独立交给原文件操作。
+    const fileLink = (reference, label = "") => {
+      const text = label.trim() || escapeHtml(reference.name);
+      const content = fileDocument ? text : `<span class="message-file-label">${text}</span>`;
+      return `<a class="local-file-reference${fileDocument ? "" : " message-file-reference"}" href="#project-file" data-local-file-path="${escapeHtml(reference.path)}"${reference.line ? ` data-local-file-line="${reference.line}"` : ""} title="${escapeHtml(reference.path)}">${content}</a>`;
+    };
     const renderPaths = text => {
       const pattern = /(?:file:\/\/\/|\/?[a-z]:[\\/]|\.{1,2}[\\/]|\/)?[\p{L}\p{N}_.@+~-]+(?:[\\/][\p{L}\p{N}_.@+~-]+)*(?::[1-9]\d*(?::[1-9]\d*)?|#L[1-9]\d*(?:C\d+)?)?/giu;
       let result = "", start = 0;
@@ -101,14 +106,19 @@ export function createMarkdownRenderer({ marked, Renderer, createDOMPurify }) {
     renderer.html = ({ text }) => escapeHtml(text);
 
     renderer.link = function (token) {
+      // 标签是同一个文件入口的行内内容，不能再生成内层链接或媒体控件。
+      if (inFileLabel) return inlineContent(this, token);
       const video = registeredVideos.get(token.href);
       const preview = videoPreviewMarkup(video, token.text);
       if (preview && linkDepth === 0) return preview;
+      const local = isLocalReference(token.href);
+      const reference = local && localFileReference(token.href, true, fileDocument);
       let label;
       linkDepth++;
+      inFileLabel = !!reference && !fileDocument;
       try { label = inlineContent(this, token); }
-      finally { linkDepth--; }
-      if (userMessage && isLocalReference(token.href)) {
+      finally { inFileLabel = false; linkDepth--; }
+      if (userMessage && local) {
         const text = token.tokens ? this.parser.parseInline(token.tokens, this.parser.textRenderer) : token.text;
         const skill = skillLink?.(token.href, text);
         if (skill) return skillPlaceholder(skill);
@@ -119,16 +129,13 @@ export function createMarkdownRenderer({ marked, Renderer, createDOMPurify }) {
         const title = token.title ? ` title="${escapeHtml(token.title)}"` : "";
         return `<a href="${escapeHtml(href)}"${title} target="_blank" rel="noopener noreferrer">${label}</a>`;
       }
-      if (isLocalReference(token.href)) {
-        const reference = localFileReference(token.href, true, fileDocument);
-        if (reference) return fileLink(reference);
-        return label;
-      }
+      if (reference) return fileLink(reference, fileDocument ? "" : label);
       return label;
     };
 
     renderer.image = token => {
       const alt = String(token.text ?? "");
+      if (inFileLabel) return escapeHtml(alt);
       const source = String(token.href ?? "");
       const video = videoPreviewMarkup(registeredVideos.get(source), alt);
       if (video) return video;
