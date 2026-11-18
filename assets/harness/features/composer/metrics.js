@@ -27,6 +27,7 @@ export function normalizeComposerMetrics(value, previous = null) {
   if (!value || !["codex-rollout", "codex-side", "claude-native"].includes(value.source)
       || typeof value.turnId !== "string" || value.turnId.length > 120) return null;
   const result = { source: value.source, turnId: value.turnId };
+  if (value.source === "codex-side" && value.totalIncomplete === true) result.totalIncomplete = true;
   for (const key of ["inputTokens", "outputTokens", "turnTokens", "steps", "totalTokens", "durationMs", "tokensPerSecond", "firstTokenMs", "cacheExpiresAtMs", "cacheObservedAtMs", "cacheTtlMs"])
     result[key] = composerMetricsNumber(value[key])
       && (key === "tokensPerSecond" || Number.isSafeInteger(value[key])) ? value[key] : null;
@@ -44,7 +45,7 @@ export function normalizeComposerMetrics(value, previous = null) {
       result.cacheExpiresAtMs = Math.min(result.cacheExpiresAtMs, previous.cacheExpiresAtMs);
   }
   // 用户要求无数据时不显示；只有原生实际返回的可展示数值才算统计，零值仍是有效数据。
-  return composerMetricsHasTurn(result) || composerMetricsNumber(result.totalTokens) ? result : null;
+  return composerMetricsHasTurn(result) || composerMetricsNumber(result.totalTokens) || result.totalIncomplete ? result : null;
 }
 function composerMetricsCompact(value) {
   if (!composerMetricsNumber(value)) return "—";
@@ -162,10 +163,15 @@ function composerMetricNumber(state, key, value, format = String) {
 export function composerMetricsContext() {
   const owner = privateInputScope(session), instanceId = activeInstanceId();
   if (!owner || !instanceId || creating || !selectedId || thread?.id !== selectedId
-      || thread.viewKind === "subagent" || pageLeaving || document.hidden
+      || thread.viewKind === "subagent" || thread.sideThreadClosed || pageLeaving || document.hidden
+      || document.documentElement?.dataset?.workspaceSidePanelVisible === "false"
       || session?.capabilities?.sessionMetrics !== true) return null;
-  return { key: JSON.stringify([owner, instanceId, selectedId, selectionVersion, nativeConnectionVersion]),
-    payload: { threadId: selectedId, instanceId, backend: activeBackend() } };
+  const backend = activeBackend();
+  // 侧边只承认独立统计源；旧缓存及迟到的主会话统计不能填入侧边底栏。
+  const source = thread.viewKind === "side" || thread.serviceSide === true ? "codex-side"
+    : backend === "claude" ? "claude-native" : "codex-rollout";
+  return { key: JSON.stringify([owner, instanceId, selectedId, source, selectionVersion, nativeConnectionVersion]),
+    source, payload: { threadId: selectedId, instanceId, backend } };
 }
 export function resetComposerMetrics() {
   if (composerMetricsState) {

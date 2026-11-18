@@ -121,6 +121,7 @@ impl Projection {
             side.closed = true;
             side.closing = false;
             side.turns.clear();
+            side.metrics = Default::default();
             side.sent.clear();
             side.clear_queue();
         }
@@ -824,7 +825,7 @@ impl Projection {
     pub fn side_session_metrics(&self, thread_id: &str) -> Option<Value> {
         let side = self.sides.threads.get(thread_id)?;
         // 用户要求侧边统计只使用侧边自己的响应和首 Token，不能回退到父会话 rollout。
-        Some(super::super::session_metrics::codex_side(
+        Some(side.metrics.value(
             &side.turns,
             self.session_first_token(thread_id),
         ))

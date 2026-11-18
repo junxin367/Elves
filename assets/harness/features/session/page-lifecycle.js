@@ -41,7 +41,8 @@ function rememberPromptFocus(target = document.activeElement) {
 }
 function restorePromptFocus() {
   const snapshot = promptFocusSnapshot;
-  if (!snapshot || document.hidden || document.hasFocus?.() === false) return;
+  if (!snapshot || document.hidden || document.hasFocus?.() === false
+      || document.documentElement?.dataset?.workspaceSidePanelVisible === "false") return;
   const prompt = $("#prompt");
   const active = document.activeElement;
   if (snapshot.prompt !== prompt || snapshot.threadId !== selectedId || snapshot.selectionToken !== selectionToken
@@ -159,7 +160,8 @@ export function installPageLifecycle() {
     const id = new URLSearchParams(location.hash.slice(1)).get("thread");
     const view = normalizeRelatedView(event.state?.[relatedHistoryKey], id);
     if (id && (relatedExitTransition || id !== selectedId || JSON.stringify(view) !== JSON.stringify(relatedSessionView)))
-      void selectThread(id, { closeSidebar: false, relatedView: view }).catch(error => notice(error.message, true));
+      void selectThread(id, { closeSidebar: false, relatedView: view, focusSideInput: view?.kind === "side" })
+        .catch(error => notice(error.message, true));
     else if (!id && selectedId) showWelcome();
   });
 }

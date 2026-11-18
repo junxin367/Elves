@@ -76,6 +76,7 @@ import {
   dismissSideCreation, finishRelatedSessionExit, isMissingThreadError, prepareRelatedSessionExit,
   relatedViewForThread, sideThreadExpired, syncRelatedSessionLayout
 } from "../session/related.js";
+import { requestSideComposerFocus, syncRequestedSideInput } from "../session/side-panel.js";
 import {
   currentThreadDisplay, discardPersistentThreadDisplay, optionalCachedRead,
   persistentThreadDisplayAllowed, readScope, rememberReadingPosition, threadEphemeralState
@@ -121,11 +122,12 @@ export async function startNewChat(projectId, { focus = true, closeSidebar = tru
   if (focus) $("#prompt").focus();
 }
 export async function selectThread(id, { closeSidebar = true, force = false, relatedView = undefined, replaceHistory = false,
-  initialThread = null, preparedView = false, onViewReady = null } = {}) {
+  initialThread = null, preparedView = false, onViewReady = null, focusSideInput = false } = {}) {
   if (!validRelatedThreadId(id) || !session) return;
   setSuppressAutomaticNewChat(false);
   const navigationVersion = setRelatedSelectionVersion(relatedSelectionVersion + 1);
   const nextRelatedView = relatedView === undefined ? relatedViewForThread(id) : normalizeRelatedView(relatedView, id);
+  const focusRelatedInput = focusSideInput && nextRelatedView?.kind === "side";
   if (nextRelatedView
       && (nextRelatedView.kind === "side" ? !sideThreadsEnabled() : !subagentsEnabled())) {
     const parent = nextRelatedView.openedFromThreadId || nextRelatedView.parentThreadId;
@@ -159,12 +161,14 @@ export async function selectThread(id, { closeSidebar = true, force = false, rel
   if (!force && selectedId === id && !creating
       && JSON.stringify(nextRelatedView) === JSON.stringify(normalizeRelatedView(relatedSessionView, id))
       && (thread?.id === id || historyInitialized || selectionController || historyLoading)) {
+    if (focusRelatedInput) requestSideComposerFocus(id);
     setRelatedSessionView(nextRelatedView);
     syncRelatedSessionLayout(); syncThreadHash(id, { replace: replaceHistory });
     if (closeSidebar) { closePopup(); closeMobileSidebar(); }
     if (returningToParent && sessionMenu?.isSuspended()) sessionMenu.resume();
     if (selectedThreadReadIncomplete() && !selectionController && !threadRequest && !historyRequest)
       await reloadThread();
+    if (focusRelatedInput) syncRequestedSideInput();
     return;
   }
   stopGoalLiveTimer();
@@ -186,6 +190,7 @@ export async function selectThread(id, { closeSidebar = true, force = false, rel
   const version = setSelectionVersion(selectionVersion + 1);
   setSelectionToken(randomId());
   setSelectedId(id); setCreating(false); setThread(initialSide); turns.clear(); transcriptEvents.clear(); setHistoryCursor(null); setHistoryInitialized(false);
+  if (focusRelatedInput) requestSideComposerFocus(id);
   // 用户反馈切换会话后旧消息被补插、时序错乱：清空旧轮次后，之前已被原生接替的成功记录以本次读取的历史为准。
   settleSentMessageDisplays(id);
   setConnection(backendAvailable() && stream?.readyState === EventSource.OPEN);
@@ -256,6 +261,7 @@ export async function selectThread(id, { closeSidebar = true, force = false, rel
   }
   syncThreadHash(id, { replace: replaceHistory });
   onViewReady?.();
+  if (focusRelatedInput) syncRequestedSideInput();
   if (returningToParent && sessionMenu?.isSuspended() && !relatedSessionView && selectedId === id) {
     sessionMenu.resume();
   }

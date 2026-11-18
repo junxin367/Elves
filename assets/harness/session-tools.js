@@ -149,6 +149,7 @@ export function mountSessionTools(options) {
     updateContext(); beforeOpen?.();
     currentContext.expanded = !currentContext.expanded; syncLayout();
     toggle.focus({ preventScroll: true });
+    if (currentContext.expanded) currentContext.tabs.get(currentContext.active)?.renderer.focusComposer?.();
   }, "icon-button workspace-reader-toggle");
   toggle.hidden = true;
   toggle.setAttribute("aria-controls", dock.id);
@@ -299,6 +300,7 @@ export function mountSessionTools(options) {
       else if (item.kind === "change") void existing.renderer.openChange(item.file, item.list);
       else if (item.kind === "changes") existing.renderer.open("changes");
       else void existing.renderer.open();
+      if (reveal) existing.renderer.focusComposer?.();
       return existing;
     }
     const id = `${owner}-${++sequence}`;
@@ -310,7 +312,11 @@ export function mountSessionTools(options) {
       : item.path ? displayWorkspacePath(item.path) : label;
     const tab = node("div", "workspace-reader-tab");
     tab.setAttribute("role", "presentation");
-    const button = control("", title, () => { if (ownsTab()) selectTab(record); }, "workspace-reader-tab-select");
+    const button = control("", title, () => {
+      if (!ownsTab()) return;
+      selectTab(record);
+      record.renderer.focusComposer?.();
+    }, "workspace-reader-tab-select");
     button.id = `${id}-tab`; button.setAttribute("role", "tab");
     button.setAttribute("aria-controls", id);
     const symbol = node("span", "workspace-reader-tab-icon");
@@ -375,7 +381,10 @@ export function mountSessionTools(options) {
       : mountSessionFiles(rendererOptions);
     const record = { key, item, tab, button, view, renderer };
     tabs.set(key, record); selectTab(record);
-    if (side) renderer.open();
+    if (side) {
+      renderer.open();
+      if (reveal) renderer.focusComposer?.();
+    }
     else if (item.kind === "changes") renderer.open("changes");
     else if (item.kind === "change") void renderer.openChange(item.file, item.list);
     else if (item.kind === "files") void renderer.open();
@@ -530,17 +539,32 @@ function mountWorkspaceSideThread(workspace, item, createSideThread, updateThrea
   address.hash = new URLSearchParams({ thread: item.threadId }).toString();
   frame.src = address.href; frame.title = item.title;
   frame.referrerPolicy = "no-referrer";
-  let visible = false, mediaPreview = null;
+  let visible = false, mediaPreview = null, composerReady = false, focusPending = false;
   const closePreview = () => { mediaPreview?.close(); mediaPreview = null; };
+  const cancelFocus = () => {
+    focusPending = false;
+    document.removeEventListener("pointerdown", cancelFocus, true);
+    document.removeEventListener("keydown", cancelFocus, true);
+  };
+  const transferFocus = () => {
+    if (!visible || !focusPending || !composerReady) return;
+    cancelFocus();
+    if (document.hidden || document.hasFocus?.() === false || document.querySelector("dialog[open]")) return;
+    frame.contentWindow?.postMessage({ type: "codex-elves-side-panel-focus", threadId: item.threadId }, address.origin);
+  };
   const sync = () => frame.contentWindow?.postMessage({
     type: "codex-elves-side-panel-visibility", visible,
   }, address.origin);
-  const loaded = () => { closePreview(); sync(); };
+  const loaded = () => { composerReady = false; closePreview(); sync(); };
   const onMessage = event => {
     if (event.source !== frame.contentWindow || event.origin !== address.origin) return;
     if (event.data?.type === "codex-elves-side-panel-state" && event.data.threadId === item.threadId
         && typeof event.data.running === "boolean"
-        && (event.data.unread === undefined || typeof event.data.unread === "boolean")) updateThreadState?.(event.data);
+        && (event.data.unread === undefined || typeof event.data.unread === "boolean")) {
+      updateThreadState?.(event.data);
+      composerReady = event.data.composerReady === true;
+      transferFocus();
+    }
     else if (visible && event.data?.type === "codex-elves-create-side-thread") createSideThread?.();
     else if (visible && event.data?.type === "codex-elves-workspace-media-preview"
         && ["image", "video"].includes(event.data.kind) && typeof event.data.source === "string"
@@ -554,10 +578,24 @@ function mountWorkspaceSideThread(workspace, item, createSideThread, updateThrea
   frame.addEventListener("load", loaded);
   window.addEventListener("message", onMessage);
   workspace.append(frame);
-  return { open() {}, setVisible(value) {
-    if (visible !== value) { visible = value; if (!visible) closePreview(); sync(); }
-  },
+  return {
+    open() {},
+    focusComposer() {
+      if (!visible || item.kind !== "side") return;
+      // 新 iframe 等输入框可写再转移焦点；等待期间用户在主页面继续操作即取消这一次请求。
+      focusPending = true;
+      document.addEventListener("pointerdown", cancelFocus, true);
+      document.addEventListener("keydown", cancelFocus, true);
+      transferFocus();
+    },
+    setVisible(value) {
+      if (visible === value) return;
+      visible = value;
+      if (!visible) { cancelFocus(); closePreview(); }
+      sync();
+    },
     dispose() {
+      cancelFocus();
       frame.removeEventListener("load", loaded); window.removeEventListener("message", onMessage); frame.remove();
       // 切换会话/项目/授权或关闭来源标签时结束其整页预览，不让旧资源留在新会话之上。
       closePreview();

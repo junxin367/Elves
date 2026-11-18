@@ -12994,6 +12994,14 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
         assert!(history.to_string().contains("SIDE_NATIVE_INPUT"));
         assert!(history.to_string().contains("SIDE_NATIVE_REPLY"));
         assert!(!history.to_string().contains("PARENT_NATIVE_CONTEXT"));
+        let side_usage = controller
+            .call_authorized("sessionMetrics", json!({"threadId":id}), &authorization)
+            .await
+            .unwrap();
+        assert_eq!(side_usage["metrics"]["source"], "codex-side");
+        assert_eq!(side_usage["metrics"]["steps"], 1);
+        assert_eq!(side_usage["metrics"]["turnTokens"], 20);
+        assert_eq!(side_usage["metrics"]["totalTokens"], 20);
         assert!(requests.lock().await.iter().any(|request| {
             let input = request["input"].to_string();
             input.contains("SIDE_NATIVE_INPUT") && input.contains("PARENT_NATIVE_CONTEXT")

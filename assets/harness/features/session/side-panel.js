@@ -1,10 +1,11 @@
 // PC 侧边会话/子智能体面板与独立会话窗口的页面模式，以及向外层标签同步执行与未读状态。
 
-import { connected, creating, pageLeaving, selectedId, session, thread } from "../../core/state.js";
-import { reloadThread } from "../../core/actions.js";
+import { connected, creating, pageLeaving, selectedId, selectionVersion, session, thread } from "../../core/state.js";
+import { reloadThread, updateComposer } from "../../core/actions.js";
 import { randomId } from "../../core/util.js";
+import { $ } from "../../ui/dom.js";
 import { api } from "../api.js";
-import { privateInputScope } from "./capabilities.js";
+import { privateInputScope, threadReadOnly } from "./capabilities.js";
 import { markVisibleThreadRead } from "../messages/user-content.js";
 import { sidebarAttentionState } from "../sidebar/list-state.js";
 
@@ -51,6 +52,40 @@ export function installSessionWindowTitleSync() {
   bind();
 }
 let workspaceSidePanelStateSignature = "";
+function sideComposerEditor(id) {
+  if (!session || !id || id !== selectedId || thread?.id !== id || thread.viewKind !== "side"
+      || creating || pageLeaving || document.hidden || threadReadOnly(id)
+      || thread.sideThreadExpired || thread.sideThreadClosed) return null;
+  const prompt = $("#prompt");
+  return prompt?.isConnected && !prompt.disabled && prompt.isContentEditable
+    && !prompt.closest("[hidden],[inert]") && !document.querySelector("dialog[open]") ? prompt : null;
+}
+function focusSideComposer(id) {
+  // 用户要求主动打开可写侧边后就能输入；不改变草稿内容、选区或正文滚动位置。
+  if (workspaceSidePanel && document.documentElement.dataset.workspaceSidePanelVisible !== "true") return;
+  sideComposerEditor(id)?.focus({ preventScroll: true });
+}
+let requestedSideInput = null;
+export function requestSideComposerFocus(id) {
+  const scope = privateInputScope(session);
+  if (scope && !workspaceSidePanel && id === selectedId)
+    requestedSideInput = { id, scope, version: selectionVersion };
+}
+export function syncRequestedSideInput() {
+  const request = requestedSideInput;
+  if (!request) return;
+  if (request.id !== selectedId || request.version !== selectionVersion || request.scope !== privateInputScope(session)
+      || pageLeaving || document.hidden || document.hasFocus?.() === false
+      || thread?.id === selectedId && (thread.viewKind !== "side" || threadReadOnly() || thread.sideThreadExpired || thread.sideThreadClosed)) {
+    requestedSideInput = null;
+    return;
+  }
+  // 手机详情与连接补读可能并行；由真正启用当前输入框的那次更新消费请求。
+  const prompt = sideComposerEditor(request.id);
+  if (!prompt) return;
+  requestedSideInput = null;
+  prompt.focus({ preventScroll: true });
+}
 export function syncWorkspaceSidePanelState(force = false) {
   if (!workspaceSidePanel || window.parent === window || creating || !selectedId || thread?.id !== selectedId) return;
   const status = thread.status?.status || thread.status;
@@ -62,23 +97,31 @@ export function syncWorkspaceSidePanelState(force = false) {
   // 用户要求侧边标签显示真实执行状态：沿用原生状态及等待判断，不把发送中、排队或待确认占位当成执行中。
   const running = connected && !pageLeaving && ["active", "inProgress", "running"].includes(type)
     && attention !== "waiting";
-  const signature = JSON.stringify([selectedId, running, unread]);
+  const composerReady = !!sideComposerEditor(selectedId);
+  const signature = JSON.stringify([selectedId, running, unread, composerReady]);
   if (!force && signature === workspaceSidePanelStateSignature) return;
   workspaceSidePanelStateSignature = signature;
-  window.parent.postMessage({ type: "codex-elves-side-panel-state", threadId: selectedId, running, unread }, location.origin);
+  window.parent.postMessage({ type: "codex-elves-side-panel-state", threadId: selectedId, running, unread, composerReady }, location.origin);
 }
 // PC 侧边面板接收外层标签的显隐通知，只对实际显示的标签确认已读。
 export function installSidePanelMessageListener() {
+  for (const type of ["pointerdown", "keydown", "visibilitychange"])
+    document.addEventListener(type, () => { requestedSideInput = null; }, true);
   // 页面后台与外层标签隐藏都结束查看租约；失联或直接关页由服务端 90 秒租约兜底，不派发模型操作。
   document.addEventListener("visibilitychange", () => syncSideThreadPresence());
   window.addEventListener("pagehide", () => syncSideThreadPresence(true));
   window.addEventListener("pageshow", () => syncSideThreadPresence());
   window.addEventListener("message", event => {
-    if (!workspaceSidePanel || event.source !== window.parent || event.origin !== location.origin
-        || event.data?.type !== "codex-elves-side-panel-visibility" || typeof event.data.visible !== "boolean") return;
+    if (!workspaceSidePanel || window.parent === window || event.source !== window.parent || event.origin !== location.origin) return;
+    if (event.data?.type === "codex-elves-side-panel-focus") {
+      focusSideComposer(event.data.threadId);
+      return;
+    }
+    if (event.data?.type !== "codex-elves-side-panel-visibility" || typeof event.data.visible !== "boolean") return;
     // iframe 的 document.hidden 不随标签隐藏改变；只对实际显示的侧边标签确认已读，后台标签继续保留未读状态。
     document.documentElement.dataset.workspaceSidePanelVisible = String(event.data.visible);
     syncSideThreadPresence();
+    updateComposer(); // 切换可见标签立即开始或停止该侧边自己的统计读取。
     syncWorkspaceSidePanelState(true);
     if (event.data.visible) {
       // 标签从隐藏恢复时重新开启原只读补齐；隐藏期间不会轮询或为了查看而 resume 原生线程。

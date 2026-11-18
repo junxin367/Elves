@@ -97,7 +97,7 @@ import {
   ownsRelatedOperation, renderRelatedOperationStatus, syncRelatedSessionLayout,
   updateSideCreationStatus
 } from "../session/related.js";
-import { syncWorkspaceSidePanelState } from "../session/side-panel.js";
+import { syncRequestedSideInput, syncWorkspaceSidePanelState } from "../session/side-panel.js";
 import { currentThreadDisplay } from "../session/thread-cache.js";
 import { rememberThreadDisplay, syncRelatedModelDisplay } from "../session/thread-display.js";
 import { sessionTools, workspaceOpenIn } from "../shell-state.js";
@@ -147,7 +147,6 @@ export function updateComposer({ followEnd = false } = {}) {
   workspaceOpenIn?.updateContext();
   sessionTools?.updateContext();
   syncRelatedSessionLayout();
-  syncWorkspaceSidePanelState();
   if (!$("#composer")) return;
   if (typeof restoreUnfinishedQueuedMessageEdit === "function") restoreUnfinishedQueuedMessageEdit();
   // 先恢复当前会话的缓存及保存状态，再决定发送按钮是否等待该会话的 Fast 写入。
@@ -293,6 +292,8 @@ export function updateComposer({ followEnd = false } = {}) {
   }
   $("#prompt").disabled = !sessionTypeEnabled || threadReadOnly() || deleting || !!editingMessage || editing && (busy || !!pending)
     || editingQueuedMessage?.state === "starting" || (!creating && !selectedId);
+  syncRequestedSideInput();
+  syncWorkspaceSidePanelState();
   $("#new-chat").disabled = threadReadOnly() || !connected && !(session?.capabilities?.claudeSessions && stream?.readyState === EventSource.OPEN);
   // 用户要求主会话和侧边队列编辑时仍可选择后续模型；执行中选择不写进排队消息，后续新发送才应用。
   $("#model-button").disabled = !sessionTypeEnabled || threadReadOnly() || deleting
@@ -704,7 +705,8 @@ export function syncComposerMetrics() {
   if (!context) { resetComposerMetrics(); return; }
   if (composerMetricsState?.key !== context.key) {
     resetComposerMetrics();
-    setComposerMetricsState({ key: context.key, value: normalizeComposerMetrics(currentThreadDisplay()?.sessionMetrics),
+    const saved = currentThreadDisplay()?.sessionMetrics;
+    setComposerMetricsState({ key: context.key, value: saved?.source === context.source ? normalizeComposerMetrics(saved) : null,
       checkedAt: 0, pending: false, controller: null, timer: null, fingerprint: "", retryAt: 0 });
   }
   const state = composerMetricsState, active = isActiveThread();
@@ -728,10 +730,11 @@ export function syncComposerMetrics() {
     .then(result => {
       if (composerMetricsState !== state || state.controller !== controller || controller.signal.aborted
           || composerMetricsContext()?.key !== state.key
-          || result?.ok !== true || result.threadId !== context.payload.threadId || result.backend !== context.payload.backend) return;
+          || result?.ok !== true || result.threadId !== context.payload.threadId || result.backend !== context.payload.backend
+          || result.metrics?.source !== context.source) return;
       const value = normalizeComposerMetrics(result.metrics, state.value);
       // 新轮次可能先只返回累计或空统计；这时保留上一轮快照，等本轮速度、步数或 Token 实测值到达再替换。
-      if (value && (!composerMetricsHasTurn(state.value) || composerMetricsHasTurn(value))) {
+      if (value && (value.totalIncomplete || !composerMetricsHasTurn(state.value) || composerMetricsHasTurn(value))) {
         state.value = value;
         if (thread?.id === result.threadId) thread.sessionMetrics = value;
         rememberThreadDisplay({ id: result.threadId, sessionMetrics: value }, { persist: !isActiveThread() });

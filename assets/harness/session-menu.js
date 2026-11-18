@@ -240,7 +240,7 @@ export function mountSessionMenu({
     layer.classList.add("session-related-menu-suspended");
     layer.hidden = true;
   }
-  function resume() {
+  function resume({ focus = true } = {}) {
     if (!opened || !suspended) return;
     suspended = false;
     layer.classList.remove("session-related-menu-suspended");
@@ -254,7 +254,8 @@ export function mountSessionMenu({
     (window.requestAnimationFrame || (cb => setTimeout(cb, 16)))(() => {
       if (opened && !suspended) {
         fit();
-        if (opened && !suspended) focusEdge(false);
+        // 打开侧边时菜单保留原状态，但不能把焦点从侧边输入框移回菜单。
+        if (focus && opened && !suspended) focusEdge(false);
       }
     });
   }

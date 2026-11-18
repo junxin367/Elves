@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 use super::super::{ApiError, HarnessAuthorization, now_ms};
 use super::store::{Data, Queued};
 use super::{CodexHarness, error, required};
+use crate::session_metrics::CodexSideMetrics;
 
 // 用户要求移除正文容量兜底：正文和会话数量不再触发终止；闲置退订由 side_idle 独立管理。
 // 待发送附件/队列沿用独立的 16 MiB、100 条准入限制；不用于限制已经接收的历史正文。
@@ -105,6 +106,7 @@ pub(super) struct SideThread {
     pub generation: String,
     pub metadata: Value,
     pub turns: Vec<Value>,
+    pub metrics: CodexSideMetrics,
     pub closed: bool,
     pub expired: bool,
     pub closing: bool,
@@ -130,6 +132,7 @@ mod tests {
             generation: "engine".into(),
             metadata: json!({"id":"side","cwd":"test","name":"侧边聊天","ephemeral":true,"status":{"type":"idle"}}),
             turns: Vec::new(),
+            metrics: CodexSideMetrics::default(),
             closed: false,
             expired: false,
             closing: false,
@@ -243,26 +246,25 @@ mod tests {
         side.observe(&json!({"method":"turn/started","params":{"turn":{
             "id":"turn","startedAt":1,"status":"inProgress","items":[
                 {"id":"input","type":"userMessage","content":[{"type":"text","text":"侧边输入"}]}]}}}));
-        let response = json!({"method":"rawResponse/completed","emittedAtMs":3000,
-            "params":{"turnId":"turn","responseId":"response","usage":{
-                "inputTokens":100,"cachedInputTokens":20,"outputTokens":40,"totalTokens":140}}});
+        let usage = |turn_id, cumulative| json!({"method":"thread/tokenUsage/updated","emittedAtMs":3000,
+            "params":{"turnId":turn_id,"tokenUsage":{"total":{"totalTokens":cumulative},"last":{
+                "inputTokens":100,"cachedInputTokens":20,"outputTokens":40,"totalTokens":140}}}});
+        side.observe(&usage("turn", 1000));
+        assert!(side.metrics.value(&side.turns, None).is_null(), "首个模型输出之前不累计 fork 继承快照");
+        side.observe(&json!({"method":"item/completed","params":{"turnId":"turn",
+            "item":{"id":"reply","type":"agentMessage","text":"侧边回复"}}}));
+        side.observe(&usage("other-turn", 1140));
+        side.observe(&usage("turn", 1000));
+        let response = usage("turn", 1140);
         side.observe(&response);
         side.observe(&response);
-        side.observe(
-            &json!({"method":"thread/tokenUsage/updated","params":{"turnId":"turn",
-            "tokenUsage":{"total":{"totalTokens":999999}}}}),
-        );
-        let metrics = super::super::super::session_metrics::codex_side(&side.turns, None);
+        let metrics = side.metrics.value(&side.turns, None);
         assert_eq!(metrics["source"], "codex-side");
         assert_eq!(metrics["totalTokens"], 140);
         assert_eq!(metrics["steps"], 1);
-        assert!(
-            side.history(&json!({"threadId":"side"})).unwrap()["data"][0]
-                .get("_metricsResponses")
-                .is_none()
-        );
+        assert!(!side.history(&json!({"threadId":"side"})).unwrap().to_string().contains("totalTokens"));
         side.expire();
-        let retained = super::super::super::session_metrics::codex_side(&side.turns, None);
+        let retained = side.metrics.value(&side.turns, None);
         assert_eq!(retained["totalTokens"], 140);
         assert_eq!(retained["turnTokens"], 140);
     }
@@ -499,18 +501,24 @@ impl SideThread {
 
     fn observe(&mut self, frame: &Value) {
         let params = &frame["params"];
-        if frame["method"] == "rawResponse/completed" {
+        if frame["method"] == "thread/tokenUsage/updated" {
             let Some(turn) = self
                 .turns
-                .iter_mut()
-                .find(|turn| turn["id"] == params["turnId"])
+                .last()
+                .filter(|turn| turn["id"] == params["turnId"] && turn["status"] == "inProgress")
             else {
                 return;
             };
+            let Some(id) = turn["id"].as_str() else { return; };
+            // 首次通知可能仅复述 fork 带入的用量。等侧边收到模型条目，不能把刚写入的用户消息当作模型输出。
+            let has_model_output = turn["items"].as_array().into_iter().flatten().any(|item| {
+                matches!(item["type"].as_str(), Some("agentMessage" | "reasoning" | "plan"
+                    | "dynamicToolCall" | "mcpToolCall" | "commandExecution" | "webSearch"
+                    | "fileChange" | "imageGeneration" | "collabAgentToolCall"))
+            });
             let observed_at = frame["emittedAtMs"].as_u64().unwrap_or_else(now_ms);
-            // 缓存默认时长沿用侧边自己的实际模型，不能借用父会话模型或父会话累计用量。
-            turn["_metricsModel"] = self.metadata["model"].clone();
-            super::super::session_metrics::observe_codex_side(turn, frame, observed_at);
+            self.metrics.observe(id, &params["tokenUsage"], self.metadata["model"].as_str().unwrap_or(""),
+                observed_at, has_model_output);
             return;
         }
         match frame["method"].as_str().unwrap_or("") {
@@ -519,6 +527,7 @@ impl SideThread {
                     self.closed = true;
                     self.closing = false;
                     self.turns.clear();
+                    self.metrics = CodexSideMetrics::default();
                     self.sent.clear();
                     self.clear_queue();
                 } else {
@@ -664,12 +673,7 @@ impl SideThread {
             ));
         }
         let mut turns: Vec<_> = self.turns.iter().rev().cloned().collect();
-        // 侧边统计只经 sessionMetrics 返回，原始 responseId 汇总表不混入历史正文协议。
-        for turn in &mut turns {
-            if let Some(fields) = turn.as_object_mut() {
-                fields.remove("_metricsResponses");
-            }
-        }
+        // 侧边用量独立存放，历史接口只返回正文。
         // 只展示创建之后的侧边输入；模型继承的主会话上下文不混入侧边聊天区。
         if let Some(id) = payload["turnId"].as_str() {
             let turn = turns
@@ -1093,6 +1097,7 @@ impl CodexHarness {
             generation: connection.generation.clone(),
             metadata,
             turns: Vec::new(),
+            metrics: CodexSideMetrics::default(),
             closed: false,
             expired: false,
             closing: false,

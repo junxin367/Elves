@@ -429,11 +429,11 @@ export async function openRelatedThread(item, kind, parentThreadId = selectedId,
     { openedFromThreadId: parentThreadId, ephemeral: item.ephemeral });
   if (!view) return;
   if (kind === "side") {
-    if (sessionMenu?.isSuspended()) sessionMenu.resume();
+    if (sessionMenu?.isSuspended()) sessionMenu.resume({ focus: false });
   } else sessionMenu?.close();
   closePopup(); closeComposerMenus();
   await selectThread(item.id, { closeSidebar: false, relatedView: { ...view, owner, returnToParent: true },
-    initialThread, replaceHistory, preparedView, onViewReady });
+    initialThread, replaceHistory, preparedView, onViewReady, focusSideInput: kind === "side" });
   if (kind === "side" && selectedId === item.id)
     await markVisibleThreadRead(item.id, { opened: true });
 }

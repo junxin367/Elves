@@ -220,6 +220,15 @@ html{scrollbar-color:var(--muted) transparent}
 .composer-metric-track::before{content:attr(data-digits);display:block;white-space:pre;line-height:1em}
 @media(prefers-reduced-motion:reduce){.composer-metric-animating>.composer-metric-value{color:inherit}.composer-metric-rolling{display:none}}
 @media(max-width:760px){.composer-anchor>.composer-metrics{gap:7px}}
+/* 用户要求侧边底栏显示完整统计：窄侧栏按组折行；单行仍占用原有的 20px 底部空间。 */
+html[data-workspace-side-panel=true] .composer-area:has(.composer-metrics:not([hidden])),
+.workspace.related-session-view .composer-area:has(.composer-metrics:not([hidden])){
+  padding-bottom:max(0px,calc(env(safe-area-inset-bottom) - 20px))
+}
+html[data-workspace-side-panel=true] .composer-anchor>.composer-metrics,
+.workspace.related-session-view .composer-anchor>.composer-metrics{
+  position:static;display:flex;flex-wrap:wrap;gap:0 7px;max-width:none;height:auto;min-height:20px;padding-inline:14px;overflow:visible
+}
 .claude-usage-window{display:inline-flex;gap:5px}
 .claude-usage-percent{font-weight:400}
 .claude-usage-dot{color:var(--muted)}

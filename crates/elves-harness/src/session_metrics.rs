@@ -317,118 +317,100 @@ fn codex_side_time(value: &Value) -> Option<u64> {
     })
 }
 
-// 用户要求侧边 Token 单独计算：只接收本侧边创建后的 rawResponse/completed，按 responseId 接替去重，不读取父会话累计值。
-pub(super) fn observe_codex_side(turn: &mut Value, frame: &Value, observed_at: u64) {
-    let params = &frame["params"];
-    let Some(response_id) = params["responseId"].as_str().filter(|id| !id.is_empty()) else {
-        return;
-    };
-    let usage = &params["usage"];
-    let (Some(input), Some(output), Some(total)) = (
-        count(&usage["inputTokens"]),
-        count(&usage["outputTokens"]),
-        count(&usage["totalTokens"]),
-    ) else {
-        return;
-    };
-    if total == 0 || input.saturating_add(output) > SAFE_INTEGER {
-        return;
-    }
-    let cached = count(&usage["cachedInputTokens"])
-        .or_else(|| count(&turn["_metricsResponses"][response_id]["cachedInputTokens"]));
-    let previous = &turn["_metricsResponses"][response_id];
-    let cache_observed = timestamp(&previous["observedAtMs"]).unwrap_or(observed_at);
-    let model = params["model"]
-        .as_str()
-        .or_else(|| turn["_metricsModel"].as_str())
-        .unwrap_or("");
-    let cache_expiry = infer_cache_expiry(
-        "responses",
-        model,
-        &Value::Null,
-        usage,
-        cache_observed,
-        serde_json::from_value(previous["cacheExpiry"].clone()).ok(),
-    );
-    turn["_metricsResponses"][response_id] = json!({"inputTokens":input,"outputTokens":output,
-        "turnTokens":total,"cachedInputTokens":cached,"observedAtMs":cache_observed,"cacheModel":model,"cacheExpiry":cache_expiry});
+#[derive(Default)]
+pub(super) struct CodexSideMetrics {
+    native_total: Option<u64>,
+    total: u64,
+    total_incomplete: bool,
+    round: Option<CodexSideRound>,
+    cache: Option<(u64, String, Option<CacheExpiry>)>,
 }
 
-pub(super) fn codex_side(turns: &[Value], first_token: Option<(String, u64)>) -> Value {
-    let Some(latest) = turns.last() else {
-        return Value::Null;
-    };
-    let latest_id = latest["id"].as_str().unwrap_or("");
-    let mut total = 0_u64;
-    let mut seen = HashSet::new();
-    let mut any_usage = false;
-    let mut latest_cache = None;
-    for turn in turns {
-        for (id, usage) in turn["_metricsResponses"].as_object().into_iter().flatten() {
-            if let Some(at) = timestamp(&usage["observedAtMs"])
-                && latest_cache.as_ref().is_none_or(|(old, _, _)| at >= *old)
-            {
-                latest_cache = Some((
-                    at,
-                    serde_json::from_value::<CacheExpiry>(usage["cacheExpiry"].clone()).ok(),
-                    usage["cacheModel"].as_str().unwrap_or(""),
-                ));
-            }
-            if seen.insert(id)
-                && let Some(tokens) = count(&usage["turnTokens"])
-            {
-                total = total.saturating_add(tokens);
-                any_usage = true;
-            }
+#[derive(Default)]
+struct CodexSideRound {
+    id: String,
+    input: u64,
+    output: u64,
+    tokens: u64,
+    steps: u64,
+    cached_input: Option<u64>,
+    observed_at: u64,
+    incomplete: bool,
+}
+
+impl CodexSideMetrics {
+    pub(super) fn observe(&mut self, turn_id: &str, usage: &Value, model: &str, at: u64, has_model_output: bool) {
+        let last = &usage["last"];
+        let (Some(native_total), Some(tokens), Some(input), Some(output)) = (
+            count(&usage["total"]["totalTokens"]),
+            count(&last["totalTokens"]),
+            count(&last["inputTokens"]),
+            count(&last["outputTokens"]),
+        ) else { return; };
+        // 用户要求独立记账：只累加侧边当前轮次的请求用量；含父历史的原生累计值仅用于判重和检查缺口。
+        // 压缩后的上下文估算只有 totalTokens，没有相加匹配的输入/输出，不算模型调用。
+        if tokens == 0 || input + output != tokens { return; }
+        let Some(base) = native_total.checked_sub(tokens) else { return; };
+        if self.round.is_none() && !has_model_output {
+            // 首次真实模型输出前的用量可能是 fork 继承快照，先作基线，不能记为侧边用量。
+            self.native_total = self.native_total.max(Some(native_total));
+            return;
         }
-    }
-    let mut input = 0_u64;
-    let mut output = 0_u64;
-    let mut tokens = 0_u64;
-    let mut cached_input = 0_u64;
-    let mut cache_known = true;
-    let mut observed = None;
-    let mut steps = 0_u64;
-    for usage in latest["_metricsResponses"]
-        .as_object()
-        .into_iter()
-        .flat_map(|responses| responses.values())
-    {
-        input = input.saturating_add(count(&usage["inputTokens"]).unwrap_or(0));
-        output = output.saturating_add(count(&usage["outputTokens"]).unwrap_or(0));
-        tokens = tokens.saturating_add(count(&usage["turnTokens"]).unwrap_or(0));
-        steps += 1;
-        if let Some(cached) = count(&usage["cachedInputTokens"]) {
-            cached_input = cached_input.saturating_add(cached);
-        } else {
-            cache_known = false;
+        if self.native_total.is_some_and(|previous| base < previous) { return; }
+        let gap = self.native_total.is_some_and(|previous| base > previous);
+        self.native_total = Some(native_total);
+        self.total_incomplete |= gap;
+        self.total = self.total.saturating_add(tokens);
+        if self.round.as_ref().is_none_or(|round| round.id != turn_id) {
+            self.round = Some(CodexSideRound {
+                id: turn_id.to_owned(), cached_input: Some(0), ..Default::default()
+            });
         }
-        observed = observed.max(timestamp(&usage["observedAtMs"]));
+        let round = self.round.as_mut().unwrap();
+        round.input = round.input.saturating_add(input);
+        round.output = round.output.saturating_add(output);
+        round.tokens = round.tokens.saturating_add(tokens);
+        round.steps += 1;
+        round.cached_input = round.cached_input.zip(count(&last["cachedInputTokens"]))
+            .map(|(total, cached)| total.saturating_add(cached));
+        round.observed_at = at;
+        round.incomplete |= gap;
+        let previous = self.cache.as_ref().filter(|(_, name, _)| name == model)
+            .and_then(|(_, _, expiry)| *expiry);
+        let expiry = infer_cache_expiry("responses", model, &Value::Null, last, at, previous);
+        self.cache = Some((at, model.to_owned(), expiry));
     }
-    let start = codex_side_time(&latest["turnStartedAtMs"])
-        .or_else(|| codex_side_time(&latest["startedAt"]));
-    let duration = count(&latest["durationMs"]).or_else(|| {
-        let end = codex_side_time(&latest["turnCompletedAtMs"])
-            .or_else(|| codex_side_time(&latest["completedAt"]))
-            .or(observed)?;
-        end.checked_sub(start?)
-    });
-    let first_token = first_token
-        .filter(|(turn_id, _)| turn_id == latest_id)
-        .and_then(|(_, observed)| start.and_then(|start| observed.checked_sub(start)));
-    let mut metrics = summary(
-        "codex-side",
-        latest_id,
-        (any_usage && total <= SAFE_INTEGER).then_some(total),
-        (steps > 0 && tokens <= SAFE_INTEGER).then_some((input, output, tokens, steps)),
-        duration,
-        first_token,
-        (steps > 0 && cache_known).then_some(cached_input),
-    );
-    if let Some((at, expiry, model)) = latest_cache {
-        add_native_cache_expiry(&mut metrics, Some(at), model, expiry);
+
+    pub(super) fn value(&self, turns: &[Value], first_token: Option<(String, u64)>) -> Value {
+        let Some(round) = &self.round else { return Value::Null; };
+        let Some(turn) = turns.iter().rev().find(|turn| turn["id"] == round.id) else {
+            return Value::Null;
+        };
+        let start = codex_side_time(&turn["turnStartedAtMs"]).or_else(|| codex_side_time(&turn["startedAt"]));
+        let duration = count(&turn["durationMs"]).or_else(|| {
+            let end = codex_side_time(&turn["turnCompletedAtMs"])
+                .or_else(|| codex_side_time(&turn["completedAt"]))
+                .unwrap_or(round.observed_at);
+            end.checked_sub(start?)
+        });
+        let first_token = first_token.filter(|(id, _)| id == &round.id)
+            .and_then(|(_, observed)| start.and_then(|start| observed.checked_sub(start)));
+        let mut metrics = summary(
+            "codex-side", &round.id,
+            (!self.total_incomplete && self.total <= SAFE_INTEGER).then_some(self.total),
+            (!round.incomplete && round.tokens <= SAFE_INTEGER)
+                .then_some((round.input, round.output, round.tokens, round.steps)),
+            duration, first_token, round.cached_input,
+        );
+        if self.total_incomplete {
+            // 覆盖先前已显示的合计；缺口不能沿用之前的数字当作当前总量。
+            metrics["totalIncomplete"] = json!(true);
+        }
+        if let Some((at, model, expiry)) = &self.cache {
+            add_native_cache_expiry(&mut metrics, Some(*at), model, *expiry);
+        }
+        metrics
     }
-    metrics
 }
 
 #[derive(Clone, Default)]
@@ -859,36 +841,35 @@ mod tests {
     }
 
     #[test]
-    fn session_metrics_codex_side_cache_uses_own_model_and_response_identity() {
-        let mut current = json!({"id":"side-turn","_metricsModel":"gpt-6.1-sol","items":[{"type":"userMessage"}]});
-        let frame = json!({"params":{"responseId":"side-response","usage":{
-            "inputTokens":2048,"cachedInputTokens":1024,"outputTokens":5,"totalTokens":2053}}});
-        observe_codex_side(&mut current, &frame, 1000);
-        observe_codex_side(&mut current, &frame, 100_000);
-        let metrics = codex_side(&[current], None);
+    fn session_metrics_codex_side_cache_uses_own_model_and_does_not_renew_replayed_usage() {
+        let current = json!({"id":"side-turn"});
+        let usage = json!({"total":{"totalTokens":12053},"last":{
+            "inputTokens":2048,"cachedInputTokens":1024,"outputTokens":5,"totalTokens":2053}});
+        let mut side = CodexSideMetrics::default();
+        side.observe("side-turn", &usage, "gpt-6.1-sol", 1000, true);
+        side.observe("side-turn", &usage, "gpt-6.1-sol", 100_000, true);
+        let metrics = side.value(&[current], None);
         assert_eq!(metrics["cacheExpiresAtMs"], 1000 + 1_800_000);
         assert_eq!(metrics["totalTokens"], 2053);
         assert_eq!(metrics["steps"], 1);
     }
 
     #[test]
-    fn session_metrics_codex_side_uses_only_own_responses_and_deduplicates_response_ids() {
-        let mut current = json!({"id":"side-turn","startedAt":1,"completedAt":5,
+    fn session_metrics_codex_side_sums_only_last_usage_and_deduplicates_native_totals() {
+        let current = json!({"id":"side-turn","startedAt":1,"completedAt":5,
             "tokenUsage":{"total":{"totalTokens":999999}},"items":[{"type":"userMessage"}]});
-        for (response_id, input, cached, output) in [
-            ("response-a", 100, 20, 40),
-            ("response-a", 100, 20, 40),
-            ("response-b", 200, 100, 60),
+        let mut side = CodexSideMetrics::default();
+        for (cumulative, input, cached, output) in [
+            (100140, 100, 20, 40),
+            (100140, 100, 20, 40),
+            (100400, 200, 100, 60),
         ] {
-            observe_codex_side(
-                &mut current,
-                &json!({"params":{"turnId":"side-turn","responseId":response_id,
-                "usage":{"inputTokens":input,"cachedInputTokens":cached,"outputTokens":output,
-                    "totalTokens":input+output}}}),
-                3000,
-            );
+            side.observe("side-turn",
+                &json!({"total":{"totalTokens":cumulative},"last":{
+                    "inputTokens":input,"cachedInputTokens":cached,"outputTokens":output,"totalTokens":input+output}}),
+                "", 3000, true);
         }
-        let value = codex_side(&[current], Some(("side-turn".into(), 2000)));
+        let value = side.value(&[current], Some(("side-turn".into(), 2000)));
         assert_eq!(value["source"], "codex-side");
         assert_eq!(value["totalTokens"], 400);
         assert_eq!(value["turnTokens"], 400);
@@ -900,17 +881,32 @@ mod tests {
 
     #[test]
     fn session_metrics_codex_side_missing_cache_does_not_hide_other_usage() {
-        let mut current = json!({"id":"side-turn","startedAt":1,"items":[{"type":"userMessage"}]});
-        observe_codex_side(
-            &mut current,
-            &json!({"params":{"turnId":"side-turn","responseId":"response",
-            "usage":{"inputTokens":100,"outputTokens":40,"totalTokens":140}}}),
-            3000,
-        );
-        let value = codex_side(&[current], None);
+        let current = json!({"id":"side-turn","startedAt":1,"items":[{"type":"userMessage"}]});
+        let mut side = CodexSideMetrics::default();
+        side.observe("side-turn", &json!({"total":{"totalTokens":1140},"last":{
+            "inputTokens":100,"outputTokens":40,"totalTokens":140}}), "", 3000, true);
+        let value = side.value(&[current], None);
         assert_eq!(value["turnTokens"], 140);
         assert_eq!(value["durationMs"], 2000);
         assert!(value["cacheHitRate"].is_null());
+    }
+
+    #[test]
+    fn session_metrics_codex_side_skips_context_estimates_and_flags_usage_gaps() {
+        let turns = [json!({"id":"first"}), json!({"id":"second"}), json!({"id":"third"})];
+        let mut side = CodexSideMetrics::default();
+        let usage = |total| json!({"total":{"totalTokens":total},
+            "last":{"inputTokens":100,"outputTokens":40,"totalTokens":140}});
+        side.observe("first", &usage(1140), "", 1000, true);
+        side.observe("second", &json!({"total":{"totalTokens":1140},
+            "last":{"inputTokens":0,"outputTokens":0,"totalTokens":887}}), "", 1200, true);
+        assert_eq!(side.value(&turns, None)["turnId"], "first");
+        side.observe("second", &usage(1420), "", 2000, true);
+        assert!(side.value(&turns, None)["totalTokens"].is_null());
+        assert!(side.value(&turns, None)["turnTokens"].is_null());
+        side.observe("third", &usage(1560), "", 3000, true);
+        assert!(side.value(&turns, None)["totalTokens"].is_null());
+        assert_eq!(side.value(&turns, None)["turnTokens"], 140);
     }
 
     #[test]

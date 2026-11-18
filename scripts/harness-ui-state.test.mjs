@@ -7454,7 +7454,7 @@ test("压缩期间的队列编辑保留发送按钮、输入框和附件操作",
   h.context.updateComposer();
   assert.equal(h.send.disabled, false);
   assert.equal(h.send.dataset.action, "send");
-  nodeVm.runInContext(sourceSection('  $("#prompt").disabled =', '  $("#new-chat").disabled ='), h.context);
+  nodeVm.runInContext(sourceSection('  $("#prompt").disabled =', '  syncRequestedSideInput();'), h.context);
   assert.equal(h.prompt.disabled, false);
   h.context.setComposerAttachmentsDisabled = value => { h.context.attachmentsDisabled = value; };
   nodeVm.runInContext(sourceSection("  setComposerAttachmentsDisabled(", '  const add = $("#composer-add");'), h.context);
@@ -12081,6 +12081,7 @@ function sideCreationNavigationHarness() {
     applyRelatedThreadMetadata() {}, replaceTranscriptEvents() {}, refreshTranscriptEvents() {},
     currentCompaction: () => null, syncEditableMessageMetadata() {}, scheduleMessages() {},
     isActiveThread: () => false, markVisibleThreadRead: async () => {},
+    requestSideComposerFocus() {}, syncRequestedSideInput: () => prompt.focus(),
     sessionMenuIsOpen: () => false, notice: message => notices.push(message),
     sessionMenu: {
       isOpen: () => false, isSuspended: () => false, close() {}, resume() {},
@@ -12406,25 +12407,62 @@ test("隐藏的侧边标签即使请求打开确认也不标记已读，显示�
   assert.equal(context.thread.hasUnreadTurn, false);
 });
 
-test("侧边页面只接收同源父页面的可见状态，其他来源不能触发已读", async () => {
-  const parent = {}, handlers = new Map(), marked = [], document = { documentElement: { dataset: {} } };
+test("侧边页面只接受同源父页面的显隐和聚焦请求，只聚焦可见且可编辑的侧边", async () => {
+  const parent = {}, handlers = new Map(), marked = [], focused = [], synced = [];
+  const document = { documentElement: { dataset: { workspaceSidePanelVisible: "false" } }, querySelector: () => null,
+    addEventListener: (name, fn) => handlers.set(name, fn) };
+  const prompt = { isConnected: true, isContentEditable: true, disabled: false,
+    closest: () => null, focus: options => focused.push(options.preventScroll) };
   const context = nodeVm.createContext({ nativeConnectionVersion: 1,
     workspaceSidePanel: true, window: { parent, addEventListener: (name, fn) => handlers.set(name, fn) },
     location: { origin: "http://127.0.0.1:45222" }, document,
+    session: { readOnly: false }, privateInputScope: () => "scope", selectedId: "side-a", selectionVersion: 1,
+    thread: { id: "side-a", viewKind: "side" }, creating: false, pageLeaving: false,
+    $: () => prompt, threadReadOnly: () => context.session.readOnly,
     markVisibleThreadRead: async () => marked.push(true),
     syncWorkspaceSidePanelState() {}, syncSideThreadPresence() {}, reloadThread: async () => {},
+    updateComposer: () => synced.push(document.documentElement.dataset.workspaceSidePanelVisible),
   });
-  nodeVm.runInContext(sourceSection('window.addEventListener("message", event => {\n    if (!workspaceSidePanel', "\n}\n"), context);
+  nodeVm.runInContext(sourceSection("function sideComposerEditor(", "function syncWorkspaceSidePanelState(")
+    + sourceSection("function installSidePanelMessageListener(", "let sidePresenceViewId"), context);
+  context.installSidePanelMessageListener();
   const listener = handlers.get("message"), data = { type: "codex-elves-side-panel-visibility", visible: true };
+  const focus = { type: "codex-elves-side-panel-focus", threadId: "side-a" };
+  listener({ source: parent, origin: context.location.origin, data: focus });
+  assert.equal(focused.length, 0, "不可见时不能索取输入焦点");
   listener({ source: {}, origin: context.location.origin, data });
   listener({ source: parent, origin: "https://other.example", data });
   assert.equal(marked.length, 0);
   listener({ source: parent, origin: context.location.origin, data });
   assert.equal(marked.length, 1);
   assert.equal(document.documentElement.dataset.workspaceSidePanelVisible, "true");
+  listener({ source: {}, origin: context.location.origin, data: focus });
+  listener({ source: parent, origin: "https://other.example", data: focus });
+  listener({ source: parent, origin: context.location.origin, data: { ...focus, threadId: "side-b" } });
+  assert.equal(focused.length, 0);
+  listener({ source: parent, origin: context.location.origin, data: focus });
+  assert.deepEqual(focused, [true]);
+  context.session.readOnly = true;
+  listener({ source: parent, origin: context.location.origin, data: focus });
+  context.session.readOnly = false; context.thread.sideThreadExpired = true;
+  listener({ source: parent, origin: context.location.origin, data: focus });
+  assert.deepEqual(focused, [true], "只读或已过期时不聚焦");
+  context.thread.sideThreadExpired = false;
+  context.workspaceSidePanel = false;
+  context.requestSideComposerFocus("side-a");
+  handlers.get("pointerdown")();
+  context.syncRequestedSideInput();
+  assert.deepEqual(focused, [true], "异步等待期间的新输入意图取消旧聚焦");
+  context.requestSideComposerFocus("side-a");
+  prompt.disabled = true; context.syncRequestedSideInput();
+  prompt.disabled = false; context.syncRequestedSideInput();
+  context.syncRequestedSideInput();
+  assert.deepEqual(focused, [true, true], "手机只在输入框可编辑后聚焦一次");
+  context.workspaceSidePanel = true;
   listener({ source: parent, origin: context.location.origin, data: { ...data, visible: false } });
   assert.equal(marked.length, 1);
   assert.equal(document.documentElement.dataset.workspaceSidePanelVisible, "false");
+  assert.deepEqual(synced, ["true", "false"]);
 });
 
 test("侧边查看租约只为可见页面续期，隐藏、切换与旧授权停止续租", () => {
@@ -12481,7 +12519,7 @@ test("主会话和侧边的完整请求快照同步审批与异步问答，旧�
     sourceSection("function replaceAsyncQuestions(", "function setQuestionReceipt("),
     sourceSection("function replaceRequestSnapshot(", "async function submitBlockingRequest("),
     sourceSection("function sidebarAttentionState("),
-    sourceSection("function syncWorkspaceSidePanelState(", "function installSidePanelMessageListener("),
+    sourceSection("function sideComposerEditor(", "function installSidePanelMessageListener("),
   ].join("\n"), context);
   const snapshot = requestsRevision => ({ requestsEpoch: "native-epoch", requestsRevision });
   const approval = { id: "approve", method: "item/commandExecution/requestApproval" };
@@ -12547,10 +12585,11 @@ test("侧边标签执行状态沿用原生状态并去重，排队占位和等�
   const context = nodeVm.createContext({ nativeConnectionVersion: 1,
     workspaceSidePanel: true, window: { parent }, location: { origin: "http://127.0.0.1:45222" },
     workspaceSidePanelStateSignature: "", creating: false, selectedId: "side-a", connected: true, pageLeaving: false,
+    session: { device: { id: "fixture-device" } },
     thread: { id: "side-a", status: { type: "active" } },
   });
   nodeVm.runInContext(sourceSection("function sidebarAttentionState(")
-    + sourceSection("function syncWorkspaceSidePanelState(", "function installSidePanelMessageListener("), context);
+    + sourceSection("function sideComposerEditor(", "function installSidePanelMessageListener("), context);
   context.syncWorkspaceSidePanelState();
   assert.equal(sent.at(-1).running, true);
   assert.equal(sent.at(-1).threadId, "side-a");
@@ -15609,17 +15648,29 @@ test("Token hover 本轮耗时沿用目标的天时分秒格式", async () => {
 test("侧边会话按自身身份读取 Token 统计，主会话迟到回执不能覆盖", async () => {
   const h = composerMetricsHarness(), c = h.context;
   c.syncComposerMetrics();
-  c.selectedId = "side-session"; c.thread = { id: "side-session", viewKind: "side" };
+  c.selectedId = "side-session"; c.thread = { id: "side-session", viewKind: "side", sessionMetrics: h.value() };
   c.turns = new Map([["side-turn", { id: "side-turn", status: "completed" }]]); ++c.selectionVersion;
   c.syncComposerMetrics();
   assert.equal(h.requests.length, 2);
   assert.equal(h.requests[1].payload.threadId, "side-session");
   h.complete(0); await h.flush();
   assert.equal(c.composerMetricsState.value, null);
-  h.complete(1, { source: "codex-side", turnId: "side-turn", steps: 2, turnTokens: 400, totalTokens: 400,
+  h.complete(1); await h.flush();
+  assert.equal(c.composerMetricsState.value, null, "即使请求 ID 匹配，也不采信主会话统计源");
+  h.advance(2001); c.syncComposerMetrics();
+  h.complete(2, { source: "codex-side", turnId: "side-turn", steps: 2, turnTokens: 400, totalTokens: 400,
     tokensPerSecond: 25, firstTokenMs: 1000, durationMs: 4000, cacheHitRate: 0.4 }); await h.flush();
   assert.equal(h.text(), "25tk/s  本轮 2步 400  总 400");
   assert.equal(h.node.title, "首 Token 时间 1 秒 · 本轮耗时 4s · 缓存命中率 40%");
+  h.advance(2001); c.syncComposerMetrics();
+  h.complete(3, { source: "codex-side", turnId: "side-turn", steps: null, turnTokens: null,
+    totalTokens: null, tokensPerSecond: null, totalIncomplete: true }); await h.flush();
+  assert.equal(h.node.hidden, true, "有缺口时不能继续展示先前的总量");
+  h.advance(2001); c.syncComposerMetrics();
+  c.document.documentElement = { dataset: { workspaceSidePanelVisible: "false" } };
+  c.syncComposerMetrics();
+  assert.equal(h.requests[4].signal.aborted, true, "外层隐藏标签立即停止侧边统计");
+  assert.equal(h.timers.size, 0);
 });
 
 test("会话底栏统计重复输入不增加读取，后台优先级且与发送状态无依赖", async () => {
