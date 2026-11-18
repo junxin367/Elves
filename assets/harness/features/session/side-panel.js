@@ -3,6 +3,7 @@
 import { connected, creating, pageLeaving, selectedId, selectionVersion, session, thread } from "../../core/state.js";
 import { reloadThread, updateComposer } from "../../core/actions.js";
 import { randomId } from "../../core/util.js";
+import { desktopWindowBridge } from "../../platform.js";
 import { $ } from "../../ui/dom.js";
 import { api } from "../api.js";
 import { privateInputScope, threadReadOnly } from "./capabilities.js";
@@ -16,9 +17,13 @@ export const workspaceSidePanel = location.pathname === "/side-thread";
 // 按页面地址标记独立会话窗口或 PC 侧边面板模式，样式据此隐藏侧栏等区域。
 export function applyWorkspaceWindowMode() {
   // 用户要求独立窗口保留完整会话/标签页，仅隐藏左侧列表；不能复用会禁用顶部与标签功能的侧边 iframe 模式。
-  if (!workspaceSidePanel && new URLSearchParams(location.search).get("sessionWindow") === "1")
+  // 远程旧链接仍可进入原会话，但 sessionWindow 参数不再让网页进入独立窗口布局。
+  if (!workspaceSidePanel && session?.transport === "desktop" && desktopWindowBridge("open")
+      && new URLSearchParams(location.search).get("sessionWindow") === "1")
     document.documentElement.dataset.sessionWindow = "true";
-  if (workspaceSidePanel) {
+  else delete document.documentElement.dataset.sessionWindow;
+  // 侧边 iframe 可在鉴权完成前收到外层显隐通知，二次应用窗口模式不能重置它。
+  if (workspaceSidePanel && document.documentElement.dataset.workspaceSidePanel !== "true") {
     document.documentElement.dataset.workspaceSidePanel = "true";
     document.documentElement.dataset.workspaceSidePanelVisible = "false";
   }
@@ -27,10 +32,12 @@ export function applyWorkspaceWindowMode() {
 // 页面标题跟随顶部会话标题，Windows 客户端监听页面标题变化后更新原生窗口标题，不向网页开放窗口命令。
 // 顶部标题在多处更新，且 shell() 会重建整个 #app，因此只监听 #app 子节点替换并重新绑定标题元素；
 // 默认标题“远程会话”及无标题时回退页面原标题。文件预览页由 workspace-preview.js 自行设置文件标题。
+let sessionWindowTitleSyncInstalled = false;
 export function installSessionWindowTitleSync() {
-  if (document.documentElement.dataset.sessionWindow !== "true") return;
+  if (sessionWindowTitleSyncInstalled || document.documentElement.dataset.sessionWindow !== "true") return;
   const host = document.getElementById("app");
   if (!host) return;
+  sessionWindowTitleSyncInstalled = true;
   const fallback = document.title;
   let heading = null, applied = fallback;
   const sync = () => {

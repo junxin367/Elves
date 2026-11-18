@@ -235,17 +235,17 @@ test("本机恢复失败显示真实错误和重试，不自动循环或退回�
   assert.equal(fixture.tags.includes("input"), false);
 });
 
-test("PWA 不从旧缓存恢复管理页面或管理脚本", async () => {
+test("PWA 不从旧缓存恢复本机管理资源或独立文件预览", async () => {
   const source = await readFile(new URL("../assets/harness/sw.js", import.meta.url), "utf8");
   const handlers = new Map();
   const context = rawVm.createContext({
     self: { location: { origin: "https://elves.example" }, addEventListener: (type, handler) => handlers.set(type, handler) },
     URL, Response, Promise,
-    cachedResource() { assert.fail("被禁止的管理页不能访问旧缓存"); },
-    noteForegroundDemand() { assert.fail("被禁止的管理页不能触发资源下载"); },
+    cachedResource() { assert.fail("本机资源不能访问远程旧缓存"); },
+    noteForegroundDemand() { assert.fail("本机资源不能触发远程资源下载"); },
   });
   rawVm.runInContext(source.slice(source.indexOf('self.addEventListener("fetch",')), context);
-  for (const path of ["/management", "/management/index.html", "/management/assets/old.js"]) {
+  for (const path of ["/management", "/management/index.html", "/management/assets/old.js", "/file-preview.html"]) {
     let pending;
     handlers.get("fetch")({ request: { url: `https://elves.example${path}`, method: "GET" },
       respondWith(response) { pending = response; }, waitUntil() {} });
@@ -3106,18 +3106,95 @@ test("本机会话列表右键菜单固定六项顺序，复制子菜单使用�
   ]);
   const local = context.threadMenuOptions({ id: "local-id", instanceId: "codex:local",
     cwd: "\\\\wsl.localhost\\claude-us\\home\\junes" }, {
-      ...callbacks, pinned: true, openIn: { disabled: true } });
+      ...callbacks, pinned: true, independentWindow: true, openIn: { disabled: true } });
   assert.equal(local[1].label, "取消置顶");
-  assert.equal(local[2].disabled, true);
+  assert.equal(local[2].disabled, false);
   assert.equal(local[4].disabled, true);
   local[3].submenu[1].action();
   assert.equal(copied.at(-1), "local-id", "WSL 目录不能将本机会话改成 WSL 实例");
   const missing = context.threadMenuOptions({ id: "wsl-id", instanceId: "claude:wsl:fixture" }, callbacks);
-  assert.ok(missing[3].submenu.every(option => option.disabled), "缺少路径或 WSL 名称时保留禁用项");
+  assert.ok(missing.find(option => option.value === "copy").submenu.every(option => option.disabled),
+    "缺少路径或 WSL 名称时保留禁用项");
   const pending = context.threadMenuOptions({ id: "local-id" }, { ...callbacks, deletion: { state: "confirming" },
     independentWindow: true, openIn: { submenu: [], disabled: false } });
   assert.ok([0, 1, 2, 4, 5].every(index => pending[index].disabled));
   assert.equal(options.some(option => option.label === "复制会话命令" || option.label === "打开会话"), false);
+});
+
+test("独立窗口只限可信本机，远程旧链接、文件右键和旧菜单回调都不能打开窗口", async () => {
+  const previewSource = await readFile(new URL("../assets/harness/workspace-preview.js", import.meta.url), "utf8");
+  const section = (source, start, end) => {
+    const first = source.indexOf(start), last = source.indexOf(end, first + start.length);
+    assert.ok(first >= 0 && last > first);
+    return source.slice(first, last).replace(/^export /gm, "");
+  };
+  const windowActions = [
+    section(platform, "export function isAndroidContainer(", "export function performAndroidHapticFeedback("),
+    section(previewSource, "export function normalizeWorkspacePreview(", "function publishAppearance("),
+    section(previewSource, "export function openWorkspacePreviewWindow(", "function applyAppearance("),
+    sourceSection("function openWorkspaceFileContextMenu(", "function renameSidebarThread("),
+    sourceSection("function applyWorkspaceWindowMode(", "function installSessionWindowTitleSync("),
+  ].join("\n");
+  const item = { id: "thread-a" }, file = { kind: "change", path: "src/main.rs", repository: "nested", section: "staged" };
+  for (const fixture of [
+    { label: "本机", local: true, bridge: true },
+    { label: "远程 PC" },
+    { label: "远程手机", width: 390 },
+    { label: "PWA" },
+    { label: "Android 宽屏", android: true },
+    { label: "远程即使有桥也不可打开", bridge: true },
+    { label: "没有原生桥的本机入口", local: true },
+  ]) {
+    const opened = [], previews = [], popups = [], notices = [];
+    const owner = { threadId: item.id, deviceId: "device-a", cacheScope: "device-a" };
+    const trigger = { isConnected: true, setAttribute() {}, getAttribute() { return null; } };
+    const context = rawVm.createContext({
+      URLSearchParams,
+      window: { open: (...args) => popups.push(args) },
+      location: { search: "?sessionWindow=1", hash: "#thread=thread-a" },
+      document: { documentElement: { dataset: {} } }, workspaceSidePanel: false,
+      __ELVES_CLIENT__: fixture.bridge ? { open: id => opened.push(id), openPreview: target => previews.push(target) } : null,
+      __TAURI__: fixture.bridge ? { core: { invoke() {} } } : null,
+      ElvesAndroid: fixture.android ? { postMessage() {} } : null,
+      session: { transport: fixture.local ? "desktop" : "remote", device: { id: owner.deviceId } },
+      validRelatedThreadId: id => id === item.id, privateInputScope: value => value?.device.id,
+      matchMedia: () => ({ matches: (fixture.width || 1440) >= 761 }),
+      publishAppearance() {}, notice: message => notices.push(message), openPopup() {},
+    });
+    rawVm.runInContext(windowActions, context);
+    context.applyWorkspaceWindowMode();
+    const supported = fixture.local && fixture.bridge;
+    // 同时确认本机授权和原生桥后才解释布局参数；远程地址中的会话定位不变。
+    assert.equal(context.document.documentElement.dataset.sessionWindow, supported ? "true" : undefined, fixture.label);
+    assert.equal(context.location.hash, "#thread=thread-a");
+    assert.equal(context.independentThreadWindowAvailable(), !!supported, fixture.label);
+    context.openIndependentThreadWindow(item);
+    let stopped = 0;
+    context.openWorkspaceFileContextMenu({ currentTarget: trigger,
+      preventDefault: () => ++stopped, stopPropagation: () => ++stopped }, file, owner);
+    assert.equal(stopped, supported ? 2 : 0, fixture.label);
+    if (supported) {
+      assert.deepEqual(opened, [item.id]);
+      trigger.menuOptions[0].action();
+      assert.deepEqual(JSON.parse(JSON.stringify(previews)), [{ ...file, threadId: item.id }]);
+      context.session.transport = "remote";
+      trigger.menuOptions[0].action();
+      assert.equal(previews.length, 1, "旧回调不能用变化后的授权打开独立窗口");
+    } else {
+      assert.equal(trigger.menuOptions, undefined, fixture.label);
+      assert.deepEqual(opened, [], fixture.label);
+    }
+    const previewCount = previews.length;
+    context.openWorkspacePreviewWindow({ ...file, threadId: item.id }, context.session);
+    assert.equal(previews.length, previewCount, fixture.label);
+    assert.deepEqual(popups, [], fixture.label);
+    assert.deepEqual(notices, [], fixture.label);
+    context.workspaceSidePanel = true;
+    context.applyWorkspaceWindowMode();
+    context.document.documentElement.dataset.workspaceSidePanelVisible = "true";
+    context.applyWorkspaceWindowMode();
+    assert.equal(context.document.documentElement.dataset.workspaceSidePanelVisible, "true");
+  }
 });
 
 test("Claude 原生子代理身份走本类型路由，读取能力独立于侧边会话且详情保持只读", () => {
@@ -4060,7 +4137,7 @@ test("远程 PC、手机、PWA 和 Android 移除宿主机应用入口，伪造�
     assert.equal(openIn, null, fixture.label);
     assert.equal(context.fileOpenInMenu("src/app.ts", { getItem: () => item }), null, fixture.label);
     assert.deepEqual(Array.from(context.threadMenuOptions(item, { openIn }), option => option.value),
-      ["rename", "pin", "openWindow", "copy", "deleteThread"], fixture.label);
+      ["rename", "pin", "copy", "deleteThread"], fixture.label);
     const files = context.localFileReferenceActions({ openFile: (...args) => opened.push(args) })
       .getMenuOptions("src/app.ts", 12);
     assert.deepEqual(Array.from(files, option => option.value), ["openFile", "openBrowser", "copyPath"], fixture.label);
@@ -13726,6 +13803,7 @@ function initialPageHarness({ readOnly = false, suppress = false } = {}) {
     recoveryGeneration: 0, recoveryStore: { observe: async () => null },
     sessionRecoveryReads: new WeakMap(), restorePrivateInputs: async () => {},
     restoreReadViews: async () => {}, setAuthenticationRequired() {}, restoreSmallInputRecoveries() {},
+    applyWorkspaceWindowMode() { assert.equal(h.context.session, latest); }, installSessionWindowTitleSync() {},
     postPlatformMessage() {}, restoreGoalComposerDrafts() {}, setConnection() {}, openStream() {},
     startConnectionPoll() {}, recoverQuestionReceipts() {}, resolvePending() {}, drainPendingNotificationOpen() {},
     readConnectionSession: async () => latest, suppressAutomaticNewChat: suppress,

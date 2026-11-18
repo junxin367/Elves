@@ -44,7 +44,7 @@ import { installNativeProjectListener, openPendingNativeProject } from "./featur
 import { handleInitialConnectionError, requireAuthentication, showLogin } from "./features/session/login.js";
 import { installPageLifecycle, retryConnectionRecovery } from "./features/session/page-lifecycle.js";
 import {
-  applyWorkspaceWindowMode, installSessionWindowTitleSync, installSidePanelMessageListener
+  applyWorkspaceWindowMode, installSidePanelMessageListener
 } from "./features/session/side-panel.js";
 import { shell } from "./features/shell.js";
 import { installSidebarPreferenceSync } from "./features/sidebar/actions.js";
@@ -73,7 +73,6 @@ restoreGoalComposerRecoveries();
 restoreQueuedEdits();
 restoreCompactions();
 applyWorkspaceWindowMode();
-installSessionWindowTitleSync();
 startAppearance();
 installLocalFileOpenListener();
 installComposerMenuViewportListeners();

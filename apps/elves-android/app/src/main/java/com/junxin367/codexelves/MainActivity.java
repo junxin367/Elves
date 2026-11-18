@@ -935,6 +935,10 @@ public final class MainActivity extends Activity {
             || resourcePath.startsWith("/api/management/"))) {
             return errorResponse(403, "管理功能仅可在 Elves 独立客户端使用");
         }
+        // 用户要求远程隐藏独立窗口；拒绝旧缓存的独立文件页，保留工作区内的文件读取和预览。
+        if (sameOrigin && "/file-preview.html".equals(resourcePath)) {
+            return errorResponse(403, "独立预览仅可在 Elves 本机客户端使用");
+        }
         if (!sameOrigin && !ServiceOrigin.allowsChannelRequest(
             uri.toString(), request.getMethod(), request.getRequestHeaders()
         )) {

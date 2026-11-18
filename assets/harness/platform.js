@@ -219,6 +219,13 @@ export function isAndroidContainer() {
   return typeof (globalThis.ElvesAndroid || globalThis.CodexElvesAndroid)?.postMessage === "function";
 }
 
+export function desktopWindowBridge(method) {
+  const bridge = globalThis.__ELVES_CLIENT__;
+  // 用户要求远程会话不打开独立窗口；网页地址、PC 屏幕尺寸和 Android 容器都不代表本机原生窗口能力。
+  return !isAndroidContainer() && typeof globalThis.__TAURI__?.core?.invoke === "function"
+    && typeof bridge?.[method] === "function" ? bridge : null;
+}
+
 export function performAndroidHapticFeedback(kind) {
   if (typeof kind !== "string" || !Object.hasOwn(androidHapticTypes, kind)) return false;
   const type = androidHapticTypes[kind];

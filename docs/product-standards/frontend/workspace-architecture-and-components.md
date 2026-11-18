@@ -97,7 +97,7 @@ Elves 与 Harness 共用工作区网页，位于 `assets/harness/`。会话工�
 | `apps/elves-android/app/build.gradle` 的 `bundledWebResources` | APK 内置网页包 |
 | `scripts/update-remote-service.ps1` 的 `Get-RemoteUpdateSource` | 正式服务更新的目标清单与内嵌资源核对 |
 
-服务端对清单内全部资源统一返回 `Cache-Control: no-cache` 并以 ETag 复验。此前 `session-tools.js`、`session-files.js`、`workspace-preview.js`、`session-menu.js`、`file-preview.html` 未列入静态资源判定，返回 `no-store`；现与其他版本壳资源一致。`/side-thread` 与缓存恢复页仍为 `no-store`。
+服务端对清单内全部资源统一返回 `Cache-Control: no-cache` 并以 ETag 复验。`file-preview.html` 只进入本机客户端清单；远程服务、PWA 和 Android 不向网络或缓存开放这个独立预览页，`session-tools.js`、`session-files.js` 等页面内预览资源继续共享。`/side-thread` 与缓存恢复页仍为 `no-store`。
 
 新增模块的步骤：
 

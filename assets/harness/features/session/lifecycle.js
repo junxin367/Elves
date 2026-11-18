@@ -58,6 +58,7 @@ import { readConnectionSession, setConnection, syncConnectionState } from "./con
 import { loadSessionInstances } from "./instance-catalog.js";
 import { stopRelatedSessionTimers } from "./related-state.js";
 import { resetRelatedSessions } from "./related.js";
+import { applyWorkspaceWindowMode, installSessionWindowTitleSync } from "./side-panel.js";
 import { rememberReadingPosition } from "./thread-cache.js";
 import { restoreReadViews } from "./thread-display.js";
 import { sessionMenu } from "../shell-state.js";
@@ -283,6 +284,8 @@ async function connectPage(signal) {
   postPlatformMessage("authenticated");
   syncSharedSettings(session);
   setPageLeaving(false);
+  applyWorkspaceWindowMode();
+  installSessionWindowTitleSync();
   setConnected(false); shell(); restoreGoalComposerDrafts();
   void loadSessionInstances().then(() => loadSidebar(null, { fresh: true })).catch(() => {});
   if (sidebar) renderSidebar();

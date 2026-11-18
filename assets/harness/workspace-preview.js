@@ -1,5 +1,6 @@
 import { activateRemoteChannels, clearRemoteChannels, requestRemote } from "./channels.js";
 import { safeInlineImageSource, fitMediaPreview, bindMediaPreviewDismiss } from "./attachments.js";
+import { desktopWindowBridge } from "./platform.js";
 import { mountWorkspacePreview } from "./session-tools.js";
 
 const appearanceKey = "codex-elves-preview-appearance";
@@ -30,15 +31,6 @@ export function normalizeWorkspacePreview(value) {
   return result;
 }
 
-export function workspacePreviewUrl(origin, value) {
-  const target = normalizeWorkspacePreview(value);
-  if (!target) throw new Error("文件预览目标无效。");
-  const url = new URL("/file-preview.html", origin);
-  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) throw new Error("文件预览服务地址无效。");
-  url.hash = new URLSearchParams(Object.entries(target).map(([key, value]) => [key, String(value)])).toString();
-  return url.href;
-}
-
 function publishAppearance() {
   const root = document.documentElement, style = getComputedStyle(root);
   const values = Object.fromEntries([...colorTokens, ...sizeTokens, ...fontTokens]
@@ -54,21 +46,14 @@ function publishAppearance() {
   }
 }
 
-export function openWorkspacePreviewWindow(value, onError = () => {}) {
+export function openWorkspacePreviewWindow(value, session, onError = () => {}) {
+  const bridge = desktopWindowBridge("openPreview");
+  if (session?.transport !== "desktop" || !bridge) return;
   try {
     const target = normalizeWorkspacePreview(value);
     if (!target) throw new Error("文件预览目标无效。");
     publishAppearance();
-    const bridge = window.__ELVES_CLIENT__;
-    if (typeof bridge?.openPreview === "function") {
-      void Promise.resolve(bridge.openPreview(target)).catch(error => onError(String(error?.message || error)));
-      return;
-    }
-    if (typeof window.__TAURI__?.core?.invoke === "function")
-      throw new Error("当前客户端版本尚不支持独立文件预览，请更新客户端。");
-    const popup = window.open(workspacePreviewUrl(location.origin, target), "_blank", "popup,width=1280,height=860");
-    if (!popup) throw new Error("预览窗口被浏览器阻止，请允许弹出窗口后重试。");
-    popup.opener = null;
+    void Promise.resolve(bridge.openPreview(target)).catch(error => onError(String(error?.message || error)));
   } catch (error) { onError(error.message || "无法打开文件预览窗口。"); }
 }
 
@@ -132,15 +117,20 @@ function startPreviewPage() {
   const params = new URLSearchParams(location.hash.slice(1)), raw = Object.fromEntries(params);
   if (raw.line != null) raw.line = /^\d+$/.test(raw.line) ? Number(raw.line) : NaN;
   const target = normalizeWorkspacePreview(raw);
-  const showError = message => {
+  const showError = (message, retryable = true) => {
     renderer?.dispose(); renderer = null; clearRemoteChannels();
     const status = document.createElement("p"); status.className = "session-tools-status error-text";
     status.setAttribute("role", "status"); status.textContent = message;
+    if (!retryable) { host.replaceChildren(status); return; }
     const retry = document.createElement("button"); retry.type = "button"; retry.textContent = "重试";
     retry.onclick = () => void load(); host.replaceChildren(status, retry);
   };
   async function load() {
     const version = ++generation; request?.abort(); renderer?.dispose(); renderer = null; clearRemoteChannels();
+    // 旧缓存打开此页时也不允许远程独立读取；本机页面还须由会话接口确认本机授权。
+    if (!desktopWindowBridge("openPreview")) {
+      showError("独立预览仅可在 Elves 本机客户端使用。", false); return;
+    }
     host.textContent = "正在读取文件预览…";
     request = new AbortController();
     const controller = request, timeout = setTimeout(() => controller.abort(), 15000);
@@ -153,6 +143,9 @@ function startPreviewPage() {
         return data;
       });
       if (version !== generation || controller.signal.aborted) return;
+      if (session.transport !== "desktop") {
+        showError("独立预览仅可在 Elves 本机客户端使用。", false); return;
+      }
       if (typeof session.device?.id !== "string") throw new Error("远程授权响应无效。");
       activateRemoteChannels(session.device.id); host.replaceChildren();
       const context = { deviceId: session.device.id, cacheScope: JSON.stringify([session.device.id, session.device.createdAtMs ?? null]),

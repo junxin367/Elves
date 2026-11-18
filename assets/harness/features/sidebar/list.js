@@ -44,7 +44,7 @@ function clientUnreadBadgeAvailable() {
   return !workspaceSidePanel && typeof window.__CODEX_ELVES_UNREAD_BADGE__?.setCount === "function";
 }
 
-// 本机菜单固定为重命名、置顶、独立窗口、复制、打开方式、删除；远程 PC 和手机移除打开方式，不留禁用占位。
+// 本机菜单固定为重命名、置顶、独立窗口、复制、打开方式、删除；远程各端移除独立窗口和打开方式，不留禁用占位。
 // 复制和本机打开方式使用二级菜单。
 // WSL 会话 ID 必须带真实发行版名称，优先复制后端明确提供的 nativeId，不把 CLI 命令当作 ID。
 export function threadMenuOptions(item, {
@@ -68,8 +68,8 @@ export function threadMenuOptions(item, {
   return [
     { value: "rename", label: "重命名", icon: "edit", disabled: !!deletion, action: rename },
     { value: "pin", label: pinned ? "取消置顶" : "置顶", icon: "pin", disabled: !!deletion, action: togglePinned },
-    { value: "openWindow", label: "独立窗口打开", icon: "window",
-      disabled: !!deletion || !independentWindow, action: openWindow },
+    ...(independentWindow ? [{ value: "openWindow", label: "独立窗口打开", icon: "window",
+      disabled: !!deletion, action: openWindow }] : []),
     { value: "copy", label: "复制", icon: "copy", separatorBefore: true,
       submenu: copies, submenuKey: JSON.stringify([projectPath, copiedId]), submenuWidth: 200 },
     ...(openIn ? [{ ...openIn, value: "openIn", label: "打开方式", icon: "folder",

@@ -724,6 +724,13 @@ self.addEventListener("fetch", event => {
     })));
     return;
   }
+  // 远程 PWA 不能从旧缓存恢复仅限本机的独立文件窗口。
+  if (url.pathname === "/file-preview.html") {
+    event.respondWith(Promise.resolve(new Response("独立预览仅可在 Elves 本机客户端使用", {
+      status: 403, headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" }
+    })));
+    return;
+  }
   if (url.pathname === "/api" || url.pathname.startsWith("/api/")) {
     // API 本身不能区分周期轮询和主动恢复。这里只延后新任务，
     // 正在下载的任务是否抢占由页面携带的 busy/preempt 生命周期决定。

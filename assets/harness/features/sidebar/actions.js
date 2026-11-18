@@ -1,6 +1,6 @@
 // 侧栏会话操作：行菜单与长按、侧栏视图偏好、重命名、工作区文件菜单与独立窗口；删除会话在 thread-deletion.js，删除记录在 deletion-state.js。
 
-import { isAndroidContainer } from "../../platform.js";
+import { desktopWindowBridge } from "../../platform.js";
 import { normalizeWorkspacePreview, openWorkspacePreviewWindow } from "../../workspace-preview.js";
 import { $, button, element } from "../../ui/dom.js";
 import { icon } from "../../ui/icons.js";
@@ -177,7 +177,7 @@ export async function changeSidebar(payload) {
   }
 }
 export function openWorkspaceFileContextMenu(event, preview, context) {
-  if (!independentThreadWindowAvailable()) return;
+  if (!independentWindowAvailable("openPreview")) return;
   const target = normalizeWorkspacePreview({ ...preview, ...(context.threadId ? { threadId: context.threadId }
     : context.creating && context.projectId ? { projectId: context.projectId } : {}) });
   const trigger = event.currentTarget;
@@ -187,31 +187,26 @@ export function openWorkspaceFileContextMenu(event, preview, context) {
   trigger.setAttribute("aria-haspopup", "menu");
   trigger.menuOptions = [{ value: "openPreviewWindow", label: "在独立窗口中打开", icon: "window", action: () => {
     // 文件菜单保存原会话/项目身份；切换页面后不能借用当前会话，授权改变后不再打开旧内容。
-    if (context.deviceId !== session?.device.id || context.cacheScope !== privateInputScope(session)) return;
-    openWorkspacePreviewWindow(target, message => notice(message, true));
+    if (!independentWindowAvailable("openPreview") || context.deviceId !== session?.device.id
+        || context.cacheScope !== privateInputScope(session)) return;
+    openWorkspacePreviewWindow(target, session, message => notice(message, true));
   } }];
   openPopup(trigger, { position: event.clientX || event.clientY ? { x: event.clientX, y: event.clientY } : null });
 }
+function independentWindowAvailable(method) {
+  // 会话行与文件／变更菜单都只接受已获服务端确认的本机工作区，不以浏览器弹窗代替原生窗口。
+  return session?.transport === "desktop" && !!desktopWindowBridge(method)
+    && matchMedia("(min-width:761px)").matches;
+}
 export function independentThreadWindowAvailable() {
-  return !isAndroidContainer() && matchMedia("(min-width:761px)").matches;
+  return independentWindowAvailable("open");
 }
 export function openIndependentThreadWindow(item) {
   if (!independentThreadWindowAvailable() || !validRelatedThreadId(item?.id)) return;
   try {
-    const bridge = window.__ELVES_CLIENT__;
-    if (typeof bridge?.open === "function") {
-      void Promise.resolve(bridge.open(item.id)).catch(error => notice(String(error?.message || error || "无法打开独立窗口"), true));
-      return;
-    }
-    if (typeof window.__TAURI__?.core?.invoke === "function") {
-      notice("当前客户端版本尚不支持独立会话窗口，请更新客户端。", true); return;
-    }
-    // PC 网页使用浏览器独立窗口；只传当前来源和会话 ID，不复制访问密钥，也不切换原页面。
-    const url = new URL("/", location.origin);
-    url.search = "sessionWindow=1"; url.hash = `thread=${encodeURIComponent(item.id)}`;
-    const popup = window.open(url.href, "_blank", "popup,width=1280,height=860");
-    if (popup) popup.opener = null;
-    else notice("独立窗口被浏览器阻止，请允许弹出窗口后重试。", true);
+    const bridge = desktopWindowBridge("open");
+    if (bridge) void Promise.resolve(bridge.open(item.id))
+      .catch(error => notice(String(error?.message || error || "无法打开独立窗口"), true));
   } catch (error) {
     notice(error.message || "无法打开独立窗口", true);
   }

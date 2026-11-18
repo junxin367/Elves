@@ -2488,7 +2488,7 @@ fn build_app_resources_manifest(
 ) -> AppResourcesManifest {
     let mut files: Vec<_> = assets
         .iter()
-        .filter(|(path, _)| desktop || !management_page_path(path))
+        .filter(|(path, _)| desktop || !desktop_only_web_page(path))
         .map(|(path, asset)| AppResourceFile {
             path: (*path).to_string(),
             content_type: asset.content_type.to_string(),
@@ -2554,6 +2554,13 @@ fn management_page_path(path: &str) -> bool {
 
 fn management_request_path(path: &str) -> bool {
     management_page_path(path) || path == "/api/management" || path.starts_with("/api/management/")
+}
+
+// 独立文件窗口只由本机客户端打开；远程资源清单与 PWA、Android 缓存拦截要同时排除此页面。
+const PREVIEW_WINDOW_PATH: &str = "/file-preview.html";
+
+fn desktop_only_web_page(path: &str) -> bool {
+    management_page_path(path) || path == PREVIEW_WINDOW_PATH
 }
 
 fn strong_etag(bytes: &[u8]) -> HeaderValue {
@@ -3026,10 +3033,17 @@ async fn access_boundary_response(
     mut request: Request,
     next: Next,
 ) -> Response {
-    // 用户要求全部管理页面与接口只在本机客户端开放；在解析请求体、路由及缓存复验之前拒绝远程访问。
-    if !state.desktop && management_request_path(request.uri().path()) {
-        let mut response =
-            ApiError::new(403, "管理功能仅可在 Elves 独立客户端使用").into_response();
+    let path = request.uri().path();
+    let desktop_only_message = if management_request_path(path) {
+        Some("管理功能仅可在 Elves 独立客户端使用")
+    } else if path == PREVIEW_WINDOW_PATH {
+        Some("独立预览仅可在 Elves 本机客户端使用")
+    } else {
+        None
+    };
+    // 用户要求远程不打开独立预览。按实际服务入口在路由、缓存复验和鉴权前拒绝，不影响普通文件及变更读取。
+    if !state.desktop && let Some(message) = desktop_only_message {
+        let mut response = ApiError::new(403, message).into_response();
         response
             .headers_mut()
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -17818,8 +17832,19 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
         assert!(!paths.contains(&"/cache-recovery.html"));
         assert!(!paths.contains(&"/cache-recovery.js"));
         assert!(!paths.contains(&"/side-thread"));
+        assert!(!paths.contains(&PREVIEW_WINDOW_PATH));
         assert!(paths.iter().all(|path| !path.starts_with("/api/")));
         assert!(paths.contains(&"/session-files.js"));
+        assert!(build_app_resources_manifest(web_assets(), true).files.iter()
+            .any(|file| file.path == PREVIEW_WINDOW_PATH));
+        let legacy_preview = client
+            .get(format!("{base_url}{PREVIEW_WINDOW_PATH}"))
+            .header(reqwest::header::IF_NONE_MATCH, "*")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(legacy_preview.status(), StatusCode::FORBIDDEN);
+        assert_eq!(legacy_preview.headers()[header::CACHE_CONTROL], "no-store");
 
         let mut main_page = None;
         for (path, frame_options, ancestors) in [
