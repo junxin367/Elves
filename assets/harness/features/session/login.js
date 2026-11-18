@@ -51,8 +51,7 @@ import {
 } from "../shell-state.js";
 import { setSidebarBusy, setSidebarPreferenceScope } from "../sidebar/actions.js";
 import {
-  collapsedSidebarSections, projectVisibleThreadCounts, recentPrioritySelectionSuppressions,
-  setRecentPriorityIds, sidebarReadRefreshSuppressions
+  collapsedSidebarSections, projectVisibleThreadCounts, sidebarReadRefreshSuppressions
 } from "../sidebar/list-state.js";
 
 export function showLogin() {
@@ -70,7 +69,7 @@ export function showLogin() {
   setEditingMessage(null); setEditingQueuedMessage(null);
   setSession(null);
   setSuppressAutomaticNewChat(false);
-  setSidebar(null); setRecentPriorityIds(null); recentPrioritySelectionSuppressions.clear();
+  setSidebar(null);
   sidebarReadRefreshSuppressions.clear();
   setSelectedId(null); setThread(null); setCreating(false);
   projectVisibleThreadCounts.clear(); collapsedSidebarSections.clear();

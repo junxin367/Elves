@@ -35,6 +35,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
 
 use super::execution;
+use super::recent_priority::RecentPriority;
 use super::{ApiError, HarnessAuthorization, HarnessController};
 use crate::codex_service::ServiceDispatchGuard;
 use catalog::Catalog;
@@ -44,6 +45,7 @@ use store::{Queued, Store};
 
 pub(super) struct CodexHarness {
     pub audit: Arc<execution::Audit>,
+    pub recent_priority: Arc<RecentPriority>,
     runtime: Arc<Runtime>,
     catalog: Arc<Catalog>,
     projection: Arc<Mutex<Projection>>,
@@ -123,7 +125,8 @@ impl CodexHarness {
         let (events, receiver) = mpsc::channel(512);
         let audit = Arc::new(execution::Audit::default());
         let store = Store::open(directory)?;
-        let mut initial_projection = Projection::default();
+        let recent_priority = Arc::new(RecentPriority::new(directory));
+        let mut initial_projection = Projection::with_recent_priority(recent_priority.clone());
         for (id, side) in &store.data.persistent_sides {
             initial_projection.persistent_sides.insert(id.clone(), side.parent.clone());
         }
@@ -135,6 +138,7 @@ impl CodexHarness {
         let projection = Arc::new(Mutex::new(initial_projection));
         Ok(Arc::new(Self {
             audit: audit.clone(),
+            recent_priority,
             runtime: Arc::new(Runtime::new(events, audit.clone())),
             catalog: Arc::new(Catalog::default()),
             projection: projection.clone(),

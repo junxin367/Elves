@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use serde_json::{Value, json};
 
 use super::super::now_ms;
+use super::super::recent_priority::RecentPriority;
 
 const MAX_EVENTS: usize = 2048;
 const MAX_NOTIFICATIONS: usize = 256;
@@ -20,6 +22,7 @@ struct PlanSnapshot {
 }
 
 pub(super) struct Projection {
+    recent_priority: Option<Arc<RecentPriority>>,
     pub epoch: String,
     pub sequence: u64,
     pub generation: String,
@@ -51,6 +54,7 @@ pub(super) struct Projection {
 impl Default for Projection {
     fn default() -> Self {
         Self {
+            recent_priority: None,
             epoch: format!("harness-{}", uuid::Uuid::new_v4()),
             sequence: 0,
             generation: String::new(),
@@ -79,13 +83,53 @@ impl Default for Projection {
 }
 
 impl Projection {
+    pub fn with_recent_priority(recent_priority: Arc<RecentPriority>) -> Self {
+        Self {
+            recent_priority: Some(recent_priority),
+            ..Self::default()
+        }
+    }
+
+    fn priority_runtime_changed(&self) {
+        if let Some(priority) = &self.recent_priority {
+            priority.runtime_changed();
+        }
+    }
+
+    fn promote_priority<'a>(&'a self, mut id: &'a str) {
+        let Some(priority) = &self.recent_priority else { return };
+        // 侧边的真实执行及审批沿用主会话的注意状态，不能把侧边子会话单独列入优先事项。
+        let mut visited = HashSet::new();
+        loop {
+            if !visited.insert(id) || self.is_deleted(id) || self.hidden_threads.contains(id) {
+                return;
+            }
+            if let Some(parent) = self
+                .sides
+                .threads
+                .get(id)
+                .map(|side| &side.parent)
+                .or_else(|| self.persistent_sides.get(id))
+            {
+                id = parent;
+            } else {
+                break;
+            }
+        }
+        priority.promote(id);
+    }
+
     pub fn is_deleted(&self, id: &str) -> bool {
         self.deleted_threads.contains(id)
     }
 
     pub fn forget_deleted_thread(&mut self, id: &str) {
         // 删除事实跨引擎重连保留；迟到的原生快照、状态和审批不能复活此 ID。
-        self.deleted_threads.insert(id.to_owned());
+        if self.deleted_threads.insert(id.to_owned())
+            && let Some(priority) = &self.recent_priority
+        {
+            priority.forget(id);
+        }
         if let Some(parent) = self.persistent_sides.remove(id) {
             self.push(json!({"method":"remote/relatedThreadsChanged","params":{"threadId":parent,"closedThreadIds":[id]}}));
         }
@@ -476,6 +520,7 @@ impl Projection {
                 return;
             }
             self.generation_index = index;
+            self.priority_runtime_changed();
             self.generation = generation.clone();
             self.epoch = format!("harness-{}", uuid::Uuid::new_v4());
             self.events.clear();
@@ -589,6 +634,9 @@ impl Projection {
         if frame.get("id").is_some() {
             // 请求与普通通知分开保存；审批必须回复原连接和原请求 ID。
             let key = request_key(&generation, &frame["id"]);
+            if !self.requests.contains_key(&key) {
+                self.promote_priority(&id);
+            }
             self.requests.insert(key.clone(), frame.clone());
             self.notify(
                 &id,
@@ -649,6 +697,11 @@ impl Projection {
                 }
             }
             "thread/status/changed" => {
+                if self.threads.get(&id)
+                    .is_none_or(|thread| thread["status"] != frame["params"]["status"])
+                {
+                    self.priority_runtime_changed();
+                }
                 self.threads.entry(id.clone()).or_insert_with(|| json!({}))["status"] =
                     frame["params"]["status"].clone();
             }
@@ -669,6 +722,11 @@ impl Projection {
                 }
             }
             "thread/readState/updated" => {
+                if self.threads.get(&id)
+                    .is_none_or(|thread| thread["readState"] != frame["params"]["readState"])
+                {
+                    self.priority_runtime_changed();
+                }
                 let thread = self.threads.entry(id.clone()).or_insert_with(|| json!({}));
                 thread["readState"] = frame["params"]["readState"].clone();
                 thread["hasUnreadTurn"] =
@@ -697,6 +755,7 @@ impl Projection {
                         self.completed.pop_front();
                     }
                 }
+                self.priority_runtime_changed();
                 self.queue_turn_outcomes.insert(
                     id.clone(),
                     json!({
@@ -790,6 +849,7 @@ impl Projection {
                 self.resolve(&key);
             }
             "harness/disconnected" => {
+                self.priority_runtime_changed();
                 let sides: Vec<_> = self.sides.threads.keys().cloned().collect();
                 for id in sides {
                     self.expire_side(&id);
@@ -812,6 +872,9 @@ impl Projection {
 
     pub fn started(&mut self, thread_id: &str, turn_id: &str) {
         if !self.completed.contains(&format!("{thread_id}:{turn_id}")) {
+            if self.active.get(thread_id).is_none_or(|active| active != turn_id) {
+                self.promote_priority(thread_id);
+            }
             self.active.insert(thread_id.to_owned(), turn_id.to_owned());
         }
     }
@@ -833,6 +896,9 @@ impl Projection {
 
     pub fn resolve(&mut self, key: &str) {
         let request = self.requests.remove(key);
+        if request.is_some() {
+            self.priority_runtime_changed();
+        }
         if let Some(previous) = self.pending_notifications.remove(key) {
             self.notification_sequence += 1;
             let mut event = previous;
@@ -904,6 +970,35 @@ impl Projection {
             "notificationCursor":self.notification_sequence,"reset":reset,"truncated":false,
             "pending":pending,"events":events})
     }
+}
+
+#[cfg(test)]
+#[test]
+fn recent_priority_uses_native_activity_without_replaying_completed_rounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let priority = Arc::new(RecentPriority::new(dir.path()));
+    let mut projection = Projection::with_recent_priority(priority.clone());
+    projection.persistent_sides.insert("side".into(), "main".into());
+    let mut sidebar = json!({"recent":[
+        {"id":"main","status":{"type":"idle"},"hasUnreadTurn":false},
+        {"id":"idle","status":{"type":"idle"},"hasUnreadTurn":false}
+    ]});
+    projection.ingest(json!({"method":"thread/status/changed","params":{"threadId":"idle","status":{"type":"idle"}}}));
+    priority.annotate(&mut sidebar, priority.revision());
+    assert_eq!(sidebar["recentPriorityIds"], json!([]));
+    let started = json!({"method":"turn/started","params":{"threadId":"side","turn":{"id":"first"}}});
+    projection.ingest(started.clone());
+    priority.annotate(&mut sidebar, priority.revision());
+    assert_eq!(sidebar["recentPriorityIds"], json!(["main"]));
+    projection.ingest(json!({"method":"turn/completed","params":{"threadId":"side","turn":{"id":"first","status":"completed"}}}));
+    priority.clear(&sidebar, &HashSet::from(["main"]), priority.revision()).unwrap();
+    // 测试引擎重复发旧轮次通知时，优先事项不复活；真正的新轮才再次加入。
+    projection.ingest(started);
+    priority.annotate(&mut sidebar, priority.revision());
+    assert_eq!(sidebar["recentPriorityIds"], json!([]));
+    projection.ingest(json!({"method":"turn/started","params":{"threadId":"side","turn":{"id":"second"}}}));
+    priority.annotate(&mut sidebar, priority.revision());
+    assert_eq!(sidebar["recentPriorityIds"], json!(["main"]));
 }
 
 pub(super) fn request_key(generation: &str, id: &Value) -> String {

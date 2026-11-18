@@ -1,4 +1,4 @@
-// 侧栏列表：分页读取、最近/项目分组渲染与客户端未读角标同步；本地已读、优先显示与折叠分组等状态在 list-state.js。
+// 侧栏列表：分页读取、最近/项目分组渲染、共享优先事项与客户端未读角标同步。
 
 import { $, button, element } from "../../ui/dom.js";
 import { copyText } from "../../ui/clipboard.js";
@@ -6,7 +6,7 @@ import { icon } from "../../ui/icons.js";
 import { notice } from "../../ui/notice.js";
 import { activePopup, closePopup, fitPopup, openPopup, renderPopup, togglePopup } from "../../ui/popup.js";
 import { setSelectOptions } from "../../ui/select.js";
-import { selectThread } from "../../core/actions.js";
+import { mutate, selectThread } from "../../core/actions.js";
 import { connected, pageLeaving, selectedId, session, setSidebar, sidebar, thread } from "../../core/state.js";
 import { api, promoteReadPriority } from "../api.js";
 import { appearance } from "../appearance/theme.js";
@@ -31,14 +31,14 @@ import { projectTypeVisible, renderSessionFilter, sessionTypeVisible } from "./f
 import {
   clientUnreadBadgeRequest, clientUnreadBadgeTimer, clientUnreadThreadCount, collapsed,
   collapsedSidebarSections, markSidebarThreadReadLocally, mergeIncompleteSidebar,
-  projectVisibleThreadCounts, recentLimit, recentPriorityIds, recentPriorityKnownIds,
-  recentPriorityOpenedAt, recentPrioritySelectionSuppressions, search,
-  setClientUnreadBadgeRequest, setClientUnreadBadgeTimer, setRecentLimit, setRecentPriorityIds,
-  setRecentPriorityKnownIds, setRecentPriorityOpenedAt, setSidebarFilterDeviceId, setSidebarRequest,
+  projectVisibleThreadCounts, recentLimit, search,
+  setClientUnreadBadgeRequest, setClientUnreadBadgeTimer, setRecentLimit, setSidebarFilterDeviceId, setSidebarRequest,
   setSidebarVersion, sidebarAttentionState, sidebarFilterDeviceId, sidebarReadRefreshSuppressions,
   sidebarRecentDateGroups, sidebarRequest, sidebarThreadActive, sidebarTimestamp, sidebarUpdatedAt, sidebarVersion
 } from "./list-state.js";
 import { checkThreadDeletion, deleteSidebarThread, threadDeletionConflict } from "./thread-deletion.js";
+
+let priorityClearRequest = null;
 
 function clientUnreadBadgeAvailable() {
   return !workspaceSidePanel && typeof window.__CODEX_ELVES_UNREAD_BADGE__?.setCount === "function";
@@ -148,8 +148,6 @@ export async function loadSidebar(cursor = null, { fresh = false, resourcePriori
   if (sidebarFilterDeviceId !== deviceId) {
     setSidebarFilterDeviceId(deviceId);
     restoreSidebarPreferences();
-    setRecentPriorityIds(null);
-    recentPrioritySelectionSuppressions.clear();
     sidebarReadRefreshSuppressions.clear();
     projectVisibleThreadCounts.clear(); collapsedSidebarSections.clear();
   }
@@ -233,6 +231,32 @@ function restoreSidebarPopup(state) {
   trigger.setAttribute("aria-controls", popup.node.id);
   renderPopup();
 }
+
+async function clearRecentPriority(ids, scope) {
+  if (!scope || scope !== privateInputScope(session) || session.readOnly || !connected
+      || priorityClearRequest?.scope === scope || !ids.length) return;
+  const request = { scope };
+  const current = () => scope === privateInputScope(session);
+  priorityClearRequest = request;
+  renderSidebar();
+  try {
+    // 只发送点击时的候选项；不乐观删行，服务器核对后由原有侧栏事件同步到所有在线端。
+    // 单次请求最多提交 4096 个会话 ID，与服务端 MAX_CLEAR_IDS 一致；不截断显示名单。
+    const result = await mutate("clearRecentPriority", { threadIds: ids.slice(0, 4096),
+      enabledInstanceIds: enabledInstanceIds() });
+    if (current() && !result.removed) notice("没有仍可清除的已读会话。");
+  } catch (error) {
+    if (current()) notice(error.message, true);
+  } finally {
+    if (current()) {
+      try { await loadSidebar(null, { fresh: true }); }
+      catch (error) { if (current()) notice(error.message, true); }
+    }
+    if (priorityClearRequest === request) priorityClearRequest = null;
+    if (current()) renderSidebar();
+  }
+}
+
 export function recentPriorityMenuOptions(showPinned, togglePinnedSection) {
   // 用户要求勾选后显示“√”，表示显示置顶分组，不是把优先事项中的全部会话设为置顶。
   return [{ value: "pinned", label: "置顶", icon: "pin", checkable: true,
@@ -417,7 +441,6 @@ export function renderSidebar() {
     return group;
   }
   if (preferences.mode === "project") {
-    setRecentPriorityIds(null);
     const pinnedChildren = sortThreads(sidebar.pinnedThreads.filter(matches), preferences.pinned)
       .map(item => row(item, "pinned"));
     pinnedChildren.push(...sidebar.projects.filter(project => project.pinned).map(projectGroup).filter(Boolean));
@@ -433,42 +456,27 @@ export function renderSidebar() {
       if (mergedIds.has(item.id)) continue;
       mergedIds.add(item.id); mergedRecent.push(item);
     }
-    const eligible = item => item.priority?.eligible !== false;
-    const needsPriority = item => eligible(item) && attentionFor(item) !== "idle";
-    const attentionOrder = { waiting: 0, unread: 1, active: 2, idle: 3 };
-    // Keep an already-promoted thread sticky, but do not promote the selected
-    // thread from a selection-only refresh until a real activity event arrives.
-    const candidates = mergedRecent.filter(item => needsPriority(item)
-      && !(item.id === selectedId && recentPrioritySelectionSuppressions.has(item.id))).sort((left, right) =>
-      attentionOrder[attentionFor(left)] - attentionOrder[attentionFor(right)]
-      || sidebarUpdatedAt(right) - sidebarUpdatedAt(left));
-    if (recentPriorityIds === null) {
-      setRecentPriorityOpenedAt(Date.now());
-      setRecentPriorityKnownIds(new Set(mergedRecent.map(item => item.id)));
-      setRecentPriorityIds(new Set(candidates.map(item => item.id)));
-    } else {
-      const available = new Set(mergedRecent.filter(eligible).map(item => item.id));
-      const created = mergedRecent.filter(item => eligible(item) && !recentPriorityKnownIds.has(item.id)
-        && sidebarTimestamp(item.createdAt) >= Math.floor(recentPriorityOpenedAt / 1000) * 1000);
-      setRecentPriorityIds(new Set([
-        ...created.map(item => item.id), ...[...recentPriorityIds].filter(id => available.has(id)),
-        ...candidates.map(item => item.id)
-      ]));
-      for (const item of mergedRecent) recentPriorityKnownIds.add(item.id);
-    }
+    // 用户要求独立客户端、网页和 Android 共用优先事项。冷启动/恢复只投影服务名单；
+    // 旧服务没有名单时只显示当前待处理会话，不伪造可写的共享状态。
+    const priorityIds = new Set(Array.isArray(sidebar.recentPriorityIds) ? sidebar.recentPriorityIds
+      : mergedRecent.filter(item => item.priority?.eligible !== false && attentionFor(item) !== "idle").map(item => item.id));
     // 日期分组始终按原生最近活动展示；仅打开旧会话不重排，也不继承桌面的手动会话顺序。
     const recent = sortThreads(mergedRecent.filter(matches), "updated_at");
     const recentById = new Map(recent.map(item => [item.id, item]));
-    const priority = [...recentPriorityIds].flatMap(id => recentById.has(id) ? [recentById.get(id)] : []);
+    const priority = [...priorityIds].flatMap(id => recentById.has(id) ? [recentById.get(id)] : []);
+    const knownClearable = new Set(sidebar.recentPriorityClearableIds || []);
+    const clearIds = new Set(mergedRecent.filter(item => priorityIds.has(item.id)
+      && knownClearable.has(item.id) && attentionFor(item) === "idle").map(item => item.id));
     const actions = element("span", "priority-section-actions");
-    const clear = priority.some(item => sidebarAttentionState(item) === "idle")
-      ? button("", "清除已读会话", () => {
-        for (const item of mergedRecent)
-          if (!needsPriority(item)) recentPriorityIds.delete(item.id);
-        renderSidebar();
-      }, "priority-clear-button") : null;
-    if (clear) { clear.id = "clear-recent-priority"; clear.append(icon("eraser")); actions.append(clear); }
     const scope = privateInputScope(session);
+    if (priority.some(item => clearIds.has(item.id))) {
+      const clearing = !!scope && priorityClearRequest?.scope === scope;
+      const clear = button("", clearing ? "正在清除已读会话" : "清除已读会话",
+        () => clearRecentPriority([...clearIds], scope), "priority-clear-button");
+      clear.id = "clear-recent-priority";
+      clear.disabled = clearing || !scope || !connected || session.readOnly;
+      clear.append(icon("eraser")); actions.append(clear);
+    }
     const options = button("", "优先事项设置", () => togglePopup(options), "icon-button priority-options-button");
     options.id = "recent-priority-options";
     options.setAttribute("aria-haspopup", "menu"); options.setAttribute("aria-expanded", "false");
@@ -493,7 +501,7 @@ export function renderSidebar() {
         null, { keepEmpty: true });
     }
     // 置顶分组开启时不在日期分组重复显示；有未读/执行状态的置顶会话仍保留原有优先事项提升。
-    const dated = recent.filter(item => !recentPriorityIds.has(item.id)
+    const dated = recent.filter(item => !priorityIds.has(item.id)
       && (!preferences.showPinned || !pinnedIds.has(item.id)));
     const visible = search ? dated : dated.slice(0, recentLimit);
     for (const group of sidebarRecentDateGroups(visible)) {

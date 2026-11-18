@@ -1391,6 +1391,8 @@ impl Claude {
     }
 
     pub async fn merge_sidebar_instances(&self, sidebar: &mut Value, enabled: Option<&[String]>) {
+        let waiting: std::collections::HashSet<_> = self.requests.lock().await.iter()
+            .filter(|(_, requests)| !requests.is_empty()).map(|(id, _)| id.clone()).collect();
         let saved = self.saved.lock().await;
         let mut rows: Vec<_> = saved
             .conversations
@@ -1402,6 +1404,10 @@ impl Claude {
             .collect();
         rows.sort_by_key(|row| std::cmp::Reverse(row["updatedAt"].as_u64().unwrap_or(0)));
         for mut row in rows {
+            if row["id"].as_str().is_some_and(|id| waiting.contains(id)) {
+                // 侧栏只需要知道还有待处理请求，不发送审批参数；不能把这类会话当作已读空闲项清出。
+                row["priority"]["attentionState"] = json!("waiting");
+            }
             // 用户要求共享 App 添加的项目；历史 Claude 记录中的 App 项目 ID 映射到同一目录的原生 ID。
             if let Some(project) =
                 sidebar["projects"]

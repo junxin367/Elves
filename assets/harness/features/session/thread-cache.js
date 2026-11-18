@@ -140,7 +140,8 @@ export function cachedReadingPosition(snapshot, position) {
   return { followMessages: false, scrollTop: position.scrollTop || 0, anchor: containsAnchor ? anchor : null };
 }
 export function sidebarSnapshot(value) {
-  const { unreadSideThreads, ...snapshot } = value;
+  // 保留最后确认的优先事项显示；本地冷启动缓存不携带允许清除的状态证据。
+  const { unreadSideThreads, recentPriorityClearableIds, ...snapshot } = value;
   // 用户要求项目对齐桌面已保存项目；升级后的离线缓存也只保留已保存项目，旧合成项目的会话回到最近列表。
   const projects = value.projects.filter(project => !project.synthetic);
   const projectIds = new Set(projects.map(project => project.id));

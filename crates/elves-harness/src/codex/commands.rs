@@ -167,6 +167,15 @@ impl CodexHarness {
                             "params":{"threadId":id,"readState":read["readState"]}
                         }))
                         .await;
+                    if !identity["readState"]["firstUnread"].is_null()
+                        && read["readState"].get("firstUnread").is_some_and(Value::is_null)
+                    {
+                        // 已读只刷新各端的清除资格；即使原生只返回回执，也不能直接移出共享名单。
+                        self.recent_priority.runtime_changed();
+                        self.projection.lock().await.push(json!({
+                            "method":"remote/sidebarChanged","params":{"threadId":id,"reason":"priorityRead"}
+                        }));
+                    }
                 }
                 Ok(json!({"ok":true,"threadId":id}))
             }

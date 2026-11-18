@@ -36,7 +36,6 @@ import {
   filterDeletedSidebar, setThreadDeletion, threadDeleted, threadDeletionChecks, threadDeletionKey,
   threadDeletions
 } from "./deletion-state.js";
-import { recentPriorityIds, recentPriorityKnownIds, recentPrioritySelectionSuppressions } from "./list-state.js";
 
 export function applyThreadDeletion(id, deviceId = session?.device.id) {
   transcriptCache.remove(deviceId, id);
@@ -84,8 +83,6 @@ export function applyThreadDeletion(id, deviceId = session?.device.id) {
   if (goalEditPending?.deviceId === deviceId && goalEditPending.payload.threadId === id) setGoalEditPending(null);
   if (pending?.deviceId === deviceId && (pending.payload?.threadId === id
       || goalComposerAction(pending.action, pending.payload) && goalRecordThreadId(pending) === id)) savePending(null);
-  recentPriorityIds?.delete(id); recentPriorityKnownIds.delete(id);
-  recentPrioritySelectionSuppressions.delete(id);
   filterDeletedSidebar(sidebar);
   if (sidebar) cacheDisplayData("sidebar", "main", sidebarSnapshot(sidebar));
   const hash = new URLSearchParams(location.hash.slice(1));

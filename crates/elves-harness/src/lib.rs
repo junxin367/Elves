@@ -81,6 +81,7 @@ mod permissions;
 mod preferences;
 mod primary_route;
 mod prompt_optimization;
+mod recent_priority;
 mod session_metrics;
 mod shared_settings;
 
@@ -1359,6 +1360,33 @@ impl HarnessController {
                 .await
                 .map_err(Into::into);
         }
+        if action == "clearRecentPriority" {
+            let invalid = || ApiError::new(400, "待清除的优先事项标识无效");
+            let ids = payload["threadIds"]
+                .as_array()
+                .filter(|ids| !ids.is_empty() && ids.len() <= recent_priority::MAX_CLEAR_IDS)
+                .ok_or_else(invalid)?
+                .iter()
+                .map(|id| notification_thread_id(id).ok_or_else(invalid))
+                .collect::<Result<std::collections::HashSet<_>, _>>()?;
+            let priority = &self.harness.recent_priority;
+            let observed = priority.revision();
+            // 各端传的是点击时看到的候选会话；服务重新读取原生状态，不信任页面报告的已读、空闲或归属。
+            let sidebar = self
+                .call_backend("sidebar", json!({"enabledInstanceIds":payload["enabledInstanceIds"]}), authorization)
+                .await
+                .and_then(|value| native_result(value).map_err(Into::into))
+                .map_err(|error| {
+                    error.downcast_ref::<ApiError>().cloned()
+                        .unwrap_or_else(|| ApiError::new(503, "无法核对会话状态，优先事项未清除"))
+                })?;
+            let removed = authorization.prepare_dispatch().await?
+                .commit(|| priority.clear(&sidebar, &ids, observed))?;
+            if removed != 0 {
+                self.publish_event(json!({"method":"remote/sidebarChanged","params":{"reason":"priority"}}));
+            }
+            return Ok(json!({"ok":true,"removed":removed}));
+        }
         if action == "setPermissions" {
             let id = payload["threadId"]
                 .as_str()
@@ -1502,7 +1530,23 @@ impl HarnessController {
             .flatten();
         let naming_input = matches!(action, "create" | "send")
             .then(|| json!({"threadId":payload["threadId"],"prompt":payload["prompt"]}));
+        let priority = &self.harness.recent_priority;
+        let observed_priority = (action == "sidebar").then(|| priority.revision());
         let mut value = self.call_backend(action, payload, authorization).await?;
+        if let Some(observed) = observed_priority
+            && value["ok"] == true
+            && priority.annotate(&mut value, observed)
+        {
+            self.publish_event(json!({"method":"remote/sidebarChanged","params":{"reason":"priority"}}));
+        }
+        // 没有首轮的主会话分支也应出现在所有端；仅浏览和恢复旧会话不产生创建回执。
+        if value["ok"] == true
+            && matches!(action, "create" | "forkThread")
+            && let Some(id) = value["conversationId"].as_str().or_else(|| value["threadId"].as_str())
+        {
+            priority.promote(id);
+            self.publish_event(json!({"method":"remote/sidebarChanged","params":{"reason":"priority"}}));
+        }
         if let Some(input) = naming_input {
             self.conversation_naming
                 .accepted(action, &input, &value, &authorization.device.id);
@@ -1999,6 +2043,22 @@ impl HarnessController {
     }
 
     fn publish_backend_event(&self, source: &str, mut event: Value) {
+        // Codex 在原生投影接受事件时维护名单；不能在轮询转发历史事件时再次加入已清除项。
+        if source == "claude"
+            && let Some(id) = event["params"]["threadId"].as_str()
+            && claude::Claude::owns_id(id) && !claude::Claude::is_subagent_id(id)
+        {
+            let priority = &self.harness.recent_priority;
+            match event["method"].as_str() {
+                Some("thread/deleted") => priority.forget(id),
+                Some("thread/started" | "turn/started") => priority.promote(id),
+                Some("remote/requestsChanged") if event["params"]["requests"].as_array().is_some_and(|requests| !requests.is_empty()) =>
+                    priority.promote(id),
+                Some("turn/completed" | "remote/requestsChanged" | "remote/sidebarChanged") =>
+                    priority.runtime_changed(),
+                _ => {}
+            }
+        }
         event["_runtimeSource"] = json!(source);
         self.publish_event(event);
     }
@@ -4665,6 +4725,7 @@ async fn action(
             | "optimizePrompt"
             | "cancelPromptOptimize"
             | "markRead"
+            | "clearRecentPriority"
             | "removeQueued"
             | "reorderQueued"
             | "beginQueuedEdit"
@@ -5844,6 +5905,116 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn recent_priority_is_shared_across_authorized_clients_and_preserved_when_read() {
+        struct PriorityCatalog(std::sync::Mutex<Value>);
+        #[async_trait]
+        impl TestRemoteBackend for PriorityCatalog {
+            async fn call(&self, action: &str, payload: Value) -> anyhow::Result<Value> {
+                let mut catalog = self.0.lock().unwrap();
+                match action {
+                    "sidebar" => Ok(catalog.clone()),
+                    "markRead" => {
+                        for row in catalog["recent"].as_array_mut().unwrap() {
+                            if row["id"] == payload["threadId"] {
+                                row["hasUnreadTurn"] = json!(false);
+                            }
+                        }
+                        Ok(json!({"ok":true}))
+                    }
+                    _ => anyhow::bail!("优先事项清除不允许调用原生写操作：{action}"),
+                }
+            }
+        }
+        let (dir, remote) = harness_authorization_fixture(None).await;
+        let controller = &remote.controller;
+        let desktop = Device {
+            id: "priority-desktop".into(),
+            key_id: desktop::DEVICE_KEY_ID.into(),
+            ..remote.device.clone()
+        };
+        *controller.desktop_device.lock().await = Some(desktop.clone());
+        controller.desktop_running.store(true, Ordering::Release);
+        let local = controller.authorization(desktop, None);
+        let catalog = Arc::new(PriorityCatalog(std::sync::Mutex::new(json!({"ok":true,
+            "nativeBridge":"harness","complete":true,"sideThreadsComplete":true,"projects":[],"pinnedThreads":[],
+            "recent":[
+                {"id":"unread","status":{"type":"idle"},"hasUnreadTurn":true},
+                {"id":"running","status":{"type":"active"},"hasUnreadTurn":false},
+                {"id":"side-owner","status":{"type":"idle"},"hasUnreadTurn":false,"sideThreadAttention":{"waiting":true}},
+                {"id":"side-child","status":{"type":"active"},"parentThreadId":"side-owner"},
+                {"id":"old","status":{"type":"idle"},"hasUnreadTurn":false}
+            ]}))));
+        assert!(controller.test_backend.set(catalog.clone()).is_ok());
+        let query = json!({"enabledInstanceIds":["codex:local"]});
+        let local_list = controller.call_authorized("sidebar", query.clone(), &local).await.unwrap();
+        assert_eq!(local_list["recentPriorityIds"], json!(["side-owner", "unread", "running"]));
+        controller.call_authorized("markRead", json!({"threadId":"unread"}), &remote).await.unwrap();
+        let reopened = controller.call_authorized("sidebar", query.clone(), &remote).await.unwrap();
+        assert_eq!(reopened["recentPriorityIds"], local_list["recentPriorityIds"]);
+        assert_eq!(reopened["recentPriorityClearableIds"], json!(["unread"]));
+        let mut events = controller.events.subscribe();
+        let clear = json!({"threadIds":["side-owner","unread","running","side-child","old"],
+            "enabledInstanceIds":["codex:local"]});
+        controller.publish_access_policy(&RemoteAccessSettings {
+            enabled: true, read_only: true, ..Default::default()
+        });
+        let blocked = controller.execute(remote.device.clone(), "read-only-priority".into(),
+            "clearRecentPriority".into(), clear.clone()).await.unwrap_err();
+        assert_eq!(blocked.code, 403);
+        controller.publish_access_policy(&RemoteAccessSettings { enabled: true, ..Default::default() });
+        let receipt = controller.execute(remote.device.clone(), "clear-priority-test".into(),
+            "clearRecentPriority".into(), clear).await.unwrap();
+        assert_eq!(receipt["state"], "completed");
+        assert_eq!(receipt["result"]["removed"], 1);
+        let event = events.try_recv().unwrap();
+        assert_eq!(event["method"], "remote/sidebarChanged");
+        assert_eq!(event["params"]["reason"], "priority");
+        let local_list = controller.call_authorized("sidebar", query, &local).await.unwrap();
+        assert_eq!(local_list["recentPriorityIds"], json!(["side-owner", "running"]));
+        let restored = recent_priority::RecentPriority::new(dir.path());
+        let mut idle = catalog.0.lock().unwrap().clone();
+        idle["recent"][1]["status"]["type"] = json!("idle");
+        idle["recent"][2]["sideThreadAttention"] = Value::Null;
+        restored.annotate(&mut idle, restored.revision());
+        assert_eq!(idle["recentPriorityIds"], json!(["side-owner", "running"]));
+    }
+
+    #[test]
+    fn recent_priority_keeps_unknown_or_new_work_and_rejects_late_catalog_promotions() {
+        let dir = tempfile::tempdir().unwrap();
+        let priority = recent_priority::RecentPriority::new(dir.path());
+        priority.promote("active-again");
+        priority.promote("done");
+        priority.promote("unknown");
+        let idle = json!({"sideThreadsComplete":true,"recent":[
+            {"id":"active-again","status":{"type":"idle"},"hasUnreadTurn":false},
+            {"id":"done","status":{"type":"notLoaded"},"hasUnreadTurn":false},
+            {"id":"unknown","status":{"type":"unknown"},"hasUnreadTurn":false}
+        ]});
+        let observed = priority.revision();
+        priority.promote("active-again");
+        let ids = std::collections::HashSet::from(["active-again","done","unknown"]);
+        let stale = priority.clear(&idle, &ids, observed).unwrap_err();
+        assert_eq!(stale.downcast_ref::<ApiError>().unwrap().code, 409);
+        let mut now = idle.clone();
+        now["recent"][0]["status"]["type"] = json!("active");
+        let mut incomplete = now.clone();
+        incomplete["sideThreadsComplete"] = json!(false);
+        assert_eq!(priority.clear(&incomplete, &ids, priority.revision()).unwrap(), 0);
+        let observed = priority.revision();
+        assert_eq!(priority.clear(&now, &ids, observed).unwrap(), 1);
+        now["recent"][1]["hasUnreadTurn"] = json!(true);
+        priority.annotate(&mut now, observed);
+        assert_eq!(now["recentPriorityIds"], json!(["unknown","active-again"]));
+        priority.promote("done");
+        priority.annotate(&mut now, priority.revision());
+        assert_eq!(now["recentPriorityIds"], json!(["done","unknown","active-again"]));
+        priority.forget("unknown");
+        priority.annotate(&mut now, priority.revision());
+        assert_eq!(now["recentPriorityIds"], json!(["done","active-again"]));
+    }
 
     #[tokio::test]
     async fn claude_subagent_write_actions_are_rejected_before_any_engine_dispatch() {

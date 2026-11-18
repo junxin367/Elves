@@ -1,4 +1,4 @@
-// 侧栏列表状态：本地已读与优先显示、未读角标计时、侧栏读取请求与折叠分组。
+// 侧栏列表状态：本地已读、未读角标计时、侧栏读取请求与折叠分组。
 
 import { selectedId, session, sidebar } from "../../core/state.js";
 import { claudeThreadId } from "../session/capabilities.js";
@@ -11,15 +11,8 @@ export const projectVisibleThreadCounts = new Map();
 export const collapsedSidebarSections = new Set();
 export let recentLimit = 40;
 export function setRecentLimit(value) { return recentLimit = value; }
-export let recentPriorityIds = null;
-export function setRecentPriorityIds(value) { return recentPriorityIds = value; }
-// Opening an older thread can refresh its runtime state without starting work.
-export const recentPrioritySelectionSuppressions = new Set();
 // Marking a thread read must not turn a selection-only refresh into a list reorder.
 export const sidebarReadRefreshSuppressions = new Set();
-export let recentPriorityKnownIds = new Set(), recentPriorityOpenedAt = 0;
-export function setRecentPriorityKnownIds(value) { return recentPriorityKnownIds = value; }
-export function setRecentPriorityOpenedAt(value) { return recentPriorityOpenedAt = value; }
 export let sidebarFilterDeviceId = null;
 export function setSidebarFilterDeviceId(value) { return sidebarFilterDeviceId = value; }
 export let sidebarRequest = null;

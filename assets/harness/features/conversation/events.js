@@ -53,10 +53,7 @@ import { currentThreadDisplay, readScope, threadDisplayKey, threadDisplays } fro
 import { rememberBackgroundThreadDisplay, rememberThreadDisplay } from "../session/thread-display.js";
 import { sessionMenu } from "../shell-state.js";
 import { threadDeleted } from "../sidebar/deletion-state.js";
-import {
-  recentPrioritySelectionSuppressions,
-  sidebarReadRefreshSuppressions
-} from "../sidebar/list-state.js";
+import { sidebarReadRefreshSuppressions } from "../sidebar/list-state.js";
 import { applyThreadDeletion } from "../sidebar/thread-deletion.js";
 
 function receiveClaudeHistory(params) {
@@ -189,16 +186,8 @@ export function receive(event) {
     receiveDiagnosticRequest(params);
     return;
   }
-  if (typeof eventThreadId === "string") {
-    if (["thread/started", "turn/started", "turn/completed"].includes(event.method))
-      sidebarReadRefreshSuppressions.delete(eventThreadId);
-    const runtimeStatus = params.status?.status ?? params.status;
-    const runtimeType = typeof runtimeStatus === "string" ? runtimeStatus : runtimeStatus?.type;
-    if (["thread/started", "turn/started", "remote/requestsChanged"].includes(event.method)
-        || event.method === "thread/status/changed"
-          && ["active", "inProgress", "running", "pending"].includes(runtimeType))
-      recentPrioritySelectionSuppressions.delete(eventThreadId);
-  }
+  if (typeof eventThreadId === "string" && ["thread/started", "turn/started", "turn/completed"].includes(event.method))
+    sidebarReadRefreshSuppressions.delete(eventThreadId);
   if (event.method === "remote/relatedThreadsChanged") {
     void retireNativeSideThreads(Array.isArray(params.closedThreadIds) ? params.closedThreadIds : [])
       .catch(error => notice(error.message, true));
@@ -426,7 +415,7 @@ export function receive(event) {
     void refreshSkillCatalog().catch(() => {});
   }
   if (!suppressSidebarRefresh && ["thread/started", "turn/started", "turn/completed", "remote/sidebarChanged", "thread/name/updated", "thread/status/changed",
-    "project/changed", "thread/project/updated",
+    "project/changed", "thread/project/updated", "thread/readState/updated",
     "remote/requestsChanged", "serverRequest/resolved"].includes(event.method)) {
     scheduleSidebarRefresh();
   }

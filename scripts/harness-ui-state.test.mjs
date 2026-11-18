@@ -8410,6 +8410,7 @@ function recentSidebarHarness({ disk = storage(), showPinned = false } = {}) {
     document, element, Date, Set, Map, selectedId: "running", thread: { id: "running" },
     session: { device: { id: "device-a", createdAtMs: 1 }, readOnly: false },
     sidebar: { recent: [running, pinned, unread, regular], pinnedThreads: [pinned, unread], projects: [],
+      recentPriorityIds: [running.id, unread.id], recentPriorityClearableIds: [],
       preferences: { mode: "list", chats: "updated_at", pinned: "manual", projects: "manual" } },
     sidebarFilters: { mode: null, chats: null, pinned: null, projects: null, showPinned },
     sidebarPreferenceScope: '["device-a",1]',
@@ -8426,14 +8427,15 @@ function recentSidebarHarness({ disk = storage(), showPinned = false } = {}) {
     restoreSidebarPreferences() {}, appearance: { projectThreadLimit: 5 }, search: "", enabled: null,
     sessionTypeVisible: item => !context.enabled || context.enabled.has(item.instanceId),
     projectTypeVisible: () => true, collapsed: new Set(), collapsedSidebarSections: new Set(),
-    projectVisibleThreadCounts: new Map(), recentLimit: 40, recentPriorityIds: null,
+    projectVisibleThreadCounts: new Map(), recentLimit: 40,
     threadDeletions: new Map(),
     threadDeletionKey: id => JSON.stringify(["device-a", id]),
     threadDeletionChecks: new Set(), threadDeletionConflict: () => false,
     independentThreadWindowAvailable: () => false, threadOpenInMenu: () => [],
     threadMenuOptions: () => [], bindSidebarRowMenu() {},
     rowMenu: (id, label, options) => Object.assign(element("button", "row-menu-button"), { id, menuOptions: options }),
-    recentPriorityKnownIds: new Set(), recentPriorityOpenedAt: 0, recentPrioritySelectionSuppressions: new Set(),
+    priorityClearRequest: null, enabledInstanceIds: () => ["codex:local"],
+    loadSidebar: async () => {},
     activePopup: null, fitPopup() {}, renderPopup: () => renders.push(context.activePopup),
     closePopup: () => { context.activePopup = null; },
     togglePopup: trigger => { context.activePopup = { trigger, node: { id: "active-popup" } }; },
@@ -8484,10 +8486,21 @@ test("最近会话更名优先事项，双滑杆固定为最后一个操作，�
   assert.equal(h.sections().some(section => section.label === "优先级"), false);
   assert.equal(h.node("recent-priority-options").children[0].dataset.icon, "slidersHorizontal");
   h.context.sidebar.recent[0].priority = { attentionState: "idle", active: false };
+  h.context.sidebar.recentPriorityClearableIds = ["running"];
+  h.context.mutate = async (action, payload) => {
+    assert.equal(action, "clearRecentPriority");
+    assert.deepEqual(Array.from(payload.threadIds), ["running"]);
+    return { ok: true, removed: 1 };
+  };
+  h.context.loadSidebar = async (_cursor, options) => {
+    assert.equal(options.fresh, true);
+    h.context.sidebar.recentPriorityIds = ["pinned-unread"];
+    h.context.sidebar.recentPriorityClearableIds = [];
+  };
   h.context.renderSidebar();
   assert.deepEqual(h.section("优先事项").heading.querySelector(".priority-section-actions").children.map(node => node.id),
     ["clear-recent-priority", "recent-priority-options"]);
-  h.node("clear-recent-priority").onclick();
+  await h.node("clear-recent-priority").onclick();
   assert.equal(h.node("clear-recent-priority"), null);
   assert.equal(h.section("优先事项").heading.querySelector(".priority-section-actions").children.at(-1).id,
     "recent-priority-options");
@@ -8495,6 +8508,49 @@ test("最近会话更名优先事项，双滑杆固定为最后一个操作，�
   assert.deepEqual(h.selected, []);
   const css = await readFile(new URL("../assets/harness/style.css", import.meta.url), "utf8");
   assert.match(css, /\.priority-section-actions\{[^}]*flex:0 0 auto[^}]*margin-left:auto/);
+});
+
+test("另一端冷启动保留已读优先事项，同步清除后不因本地已读恢复或旧目录重新加入", async () => {
+  const desktop = recentSidebarHarness(), mobile = recentSidebarHarness();
+  desktop.running.priority = { attentionState: "idle", active: false };
+  desktop.running.hasUnreadTurn = false;
+  const server = structuredClone(desktop.context.sidebar);
+  server.recentPriorityClearableIds = [desktop.running.id];
+  const apply = (client, snapshot) => {
+    client.context.sidebar = structuredClone(snapshot);
+    client.context.renderSidebar();
+  };
+  apply(desktop, server);
+  mobile.context.session.device.id = "mobile";
+  // Android 共用网页资源；冷启动可先读取只展示的缓存，再接受服务名单。
+  vm.runInContext(sourceSection("function sidebarSnapshot(", "function clearReadViews("), mobile.context);
+  apply(mobile, mobile.context.sidebarSnapshot(server));
+  assert.deepEqual(mobile.ids(mobile.section("优先事项")), ["running", "pinned-unread"]);
+  assert.equal(mobile.node("clear-recent-priority"), null, "展示缓存不能触发共享写操作");
+  apply(mobile, server);
+  mobile.context.session.readOnly = true;
+  mobile.context.renderSidebar();
+  assert.equal(mobile.node("clear-recent-priority").disabled, true);
+  let sent = 0;
+  mobile.context.mutate = async () => ++sent;
+  await mobile.node("clear-recent-priority").onclick();
+  assert.equal(sent, 0);
+
+  let finish;
+  desktop.context.mutate = () => new Promise(resolve => { finish = resolve; });
+  desktop.context.loadSidebar = async () => apply(desktop, server);
+  const pending = desktop.node("clear-recent-priority").onclick();
+  assert.equal(desktop.node("clear-recent-priority").disabled, true);
+  assert.ok(desktop.ids(desktop.section("优先事项")).includes("running"), "确认前不乐观移除");
+  server.recentPriorityIds = ["pinned-unread"];
+  server.recentPriorityClearableIds = [];
+  finish({ ok: true, removed: 1 });
+  await pending;
+  apply(mobile, server);
+  assert.deepEqual(mobile.ids(mobile.section("优先事项")), ["pinned-unread"]);
+  assert.deepEqual(desktop.ids(desktop.section("优先事项")), ["pinned-unread"]);
+  assert.ok(mobile.ids(mobile.section("今天")).includes("running"));
+  assert.deepEqual(desktop.selected, []);
 });
 
 test("置顶选项开启后在优先事项下方列出会话，日期分组去重且刷新保持同一菜单", () => {
@@ -8539,7 +8595,7 @@ test("最近置顶分组遵循实例与搜索筛选，取消置顶后同步移�
 test("空优先事项仍可开启置顶分组，折叠和切换项目视图不遗失显示偏好", () => {
   const h = recentSidebarHarness();
   h.context.sidebar.recent = [h.pinned, h.regular]; h.context.sidebar.pinnedThreads = [h.pinned];
-  h.context.recentPriorityIds = null;
+  h.context.sidebar.recentPriorityIds = [];
   h.context.renderSidebar();
   assert.equal(h.ids(h.section("优先事项")).length, 0);
   h.node("recent-priority-options").menuOptions[0].action();

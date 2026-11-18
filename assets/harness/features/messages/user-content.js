@@ -14,7 +14,7 @@ import { syncSideThreadUnread } from "../session/related-state.js";
 import { sessionMenu } from "../shell-state.js";
 import { threadDeleted, threadDeletionLocked } from "../sidebar/deletion-state.js";
 import {
-  markSidebarThreadReadLocally, recentPrioritySelectionSuppressions, sidebarReadRefreshSuppressions
+  markSidebarThreadReadLocally, sidebarReadRefreshSuppressions
 } from "../sidebar/list-state.js";
 
 export const readMarkRequests = new Map();
@@ -169,7 +169,6 @@ export async function markVisibleThreadRead(id = selectedId, { opened = false } 
       || !opened && !followMessages) return;
   if (readMarkRequests.has(id)) return readMarkRequests.get(id);
   const deviceId = session.device.id, readVersion = messageVersion;
-  recentPrioritySelectionSuppressions.add(id);
   sidebarReadRefreshSuppressions.add(id);
   setTimeout(() => sidebarReadRefreshSuppressions.delete(id), 5_000);
   const request = (async () => {
@@ -177,13 +176,9 @@ export async function markVisibleThreadRead(id = selectedId, { opened = false } 
       await mutate("markRead", { threadId: id });
     } catch (error) {
       sidebarReadRefreshSuppressions.delete(id);
-      recentPrioritySelectionSuppressions.delete(id);
       throw error;
     }
-    if (session?.device.id !== deviceId) {
-      recentPrioritySelectionSuppressions.delete(id);
-      return;
-    }
+    if (session?.device.id !== deviceId) return;
     if (selectedId === id && thread?.id === id && readVersion === messageVersion)
       thread.hasUnreadTurn = false;
     sessionMenu?.markSideThreadRead(id);
