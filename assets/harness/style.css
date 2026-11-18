@@ -1267,16 +1267,19 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .appearance-notification-categories[aria-disabled=true]{opacity:.45}
 .appearance-notification-action{font-size:calc(var(--font-size)*.82)}
 .appearance-notification-action:disabled{opacity:1;cursor:wait}
-.appearance-screen{position:fixed;inset:0;width:100%;max-width:none;height:100dvh;max-height:none;margin:0;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);border:0;border-radius:0;background:var(--bg);transform:translate3d(100%,0,0);transition:transform .22s ease-out;will-change:transform;overflow:hidden}
-.appearance-dialog.appearance-screen[open]{width:100%;max-width:none;height:100dvh;max-height:none;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);border-radius:0}
+/* 设置从实际可见的主导航右边开始，偏移由 dialog.js 同步；无主导航时恢复全宽，交互仍是模态。 */
+.appearance-screen{position:fixed;inset:0 0 0 var(--settings-main-nav-offset,0px);width:auto;max-width:none;height:100dvh;max-height:none;margin:0;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);border:0;border-radius:0;background:var(--bg);transform:translate3d(100%,0,0);transition:transform .22s ease-out;will-change:transform;overflow:hidden}
+.appearance-dialog.appearance-screen[open]{max-height:none;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);border-radius:0}
 .appearance-screen[open]{display:flex;flex-direction:column;transform:translate3d(100%,0,0)}
 .appearance-screen.appearance-screen-visible{transform:translate3d(0,0,0)}
 .appearance-screen::backdrop{background:transparent}
-.appearance-screen .appearance-heading{min-height:56px;padding:10px 16px;border-bottom:1px solid var(--line)}
+.appearance-screen .appearance-heading{gap:4px;padding:20px 12px 8px 20px}
 .appearance-screen .appearance-heading h2{font-size:1.07143rem;font-weight:600}
+.appearance-heading .icon-button:is(:hover,:focus-visible){background:var(--hover)}
 .appearance-layout{display:flex;flex:1;min-width:0;min-height:0}
-/* 用户确认的设置导航：PC 宽 222px、默认行高 34px，按分组排布；图标随程序字号缩放。 */
-.appearance-nav{display:flex;flex:0 0 222px;width:222px;min-width:0;flex-direction:column;padding:20px 10px;border-right:1px solid var(--line);background:var(--side);overflow:auto}
+/* 子导航仍为 222px，只有分组列表滚动；标题和关闭按钮不跟随列表滚动。 */
+.appearance-nav{display:flex;flex:0 0 222px;width:222px;min-width:0;flex-direction:column;border-right:1px solid var(--line);background:var(--side);overflow:hidden}
+.appearance-nav-groups{flex:1;min-height:0;padding:8px 10px 20px;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin}
 .appearance-nav-group{flex:none}
 .appearance-nav-group+.appearance-nav-group{margin-top:28px}
 .appearance-nav-group[hidden]{display:none}
@@ -1289,6 +1292,7 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .appearance-nav-item[hidden]{display:none}
 .appearance-nav-icon{display:grid;place-items:center;flex:0 0 1.14286rem;width:1.14286rem;height:1.14286rem}
 .appearance-nav-icon>.ui-icon{width:100%;height:100%}
+.appearance-main{display:flex;flex:1;flex-direction:column;min-width:0;min-height:0}
 .appearance-panels{display:flex;flex:1;min-width:0;min-height:0;background:var(--bg)}
 .appearance-panels>.appearance-settings-page{flex:1;min-width:0;min-height:0;overflow:auto;padding:24px 28px;scrollbar-width:thin}
 .appearance-panel-title{margin:0 0 22px;font-size:1.14286rem;font-weight:600;line-height:1.4}
@@ -1502,13 +1506,14 @@ html[data-session-window=true] .workspace>.sidebar,html[data-session-window=true
 @media(max-width:760px){
   /* 用户要求手机导航从效果稿首版 124px 收窄到默认 104px，并保留 44px 触摸行高；
      7.42857rem = 104 / 默认 14px，放大程序字号时同步放宽，避免“自定义指令”等五字标题被截断。 */
-  .appearance-nav{flex-basis:max(104px,7.42857rem);width:max(104px,7.42857rem);padding:16px 4px}
+  .appearance-nav{flex-basis:max(104px,7.42857rem);width:max(104px,7.42857rem)}
+  .appearance-nav-groups{padding:6px 4px 16px}
   .appearance-nav-group+.appearance-nav-group{margin-top:24px}
   .appearance-nav-group-title{margin-bottom:5px;padding-inline:6px;font-size:.78571rem;line-height:1.81818}
   .appearance-nav-item{min-height:44px;gap:6px;padding:8px 6px;border-radius:9px;font-size:.85714rem;line-height:1.5}
   .appearance-nav-icon{flex-basis:1rem;width:1rem;height:1rem}
   .appearance-panels>.appearance-settings-page{padding:20px 16px}
-  .appearance-screen .appearance-heading{padding:6px 12px}
+  .appearance-screen .appearance-heading{padding:12px 6px 4px 10px}
   .appearance-screen .appearance-actions{padding-left:14px;padding-right:14px}
 }
 
@@ -1730,8 +1735,8 @@ body{font-weight:var(--ui-font-weight,400)}
   }
   .appearance-panels{--layout-content-limit:1000px;--layout-content-gutter:28px}
   .appearance-panels>.appearance-settings-page{padding:32px 0 40px}
-  /* 222px 与 PC .appearance-nav 宽度同步，仅供首帧回退；打开后由 app.js 按导航的实际右边界更新。 */
-  .appearance-page-content{width:calc(2 * var(--content-half-width));min-width:0;margin-inline-start:max(var(--layout-content-gutter),calc(50vw - var(--settings-content-offset,222px) - var(--content-half-width)))}
+  /* 222px 与 PC 子导航同步，仅供首帧回退；dialog.js 按实际右边界更新，已包含主导航偏移。 */
+  .appearance-page-content{width:calc(2 * var(--content-half-width));min-width:0;margin-inline-start:max(var(--layout-content-gutter),calc(50vw - var(--settings-content-offset,calc(222px + var(--settings-main-nav-offset,0px))) - var(--content-half-width)))}
   .appearance-screen,.appearance-screen[open],.appearance-screen.appearance-screen-visible{
     transform:none;transition:none;animation:none;will-change:auto
   }

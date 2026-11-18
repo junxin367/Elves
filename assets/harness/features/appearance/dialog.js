@@ -247,14 +247,18 @@ export function openAppearance() {
   const dialog = element("dialog", "appearance-dialog appearance-screen");
   dialog.id = "appearance-dialog";
   dialog.setAttribute("aria-labelledby", "appearance-title");
-  dialog.innerHTML = `<div class="appearance-heading"><h2 id="appearance-title">设置</h2><button type="button" class="icon-button" title="关闭设置" aria-label="关闭设置"></button></div>
-    <div class="appearance-layout">
+  dialog.innerHTML = `<div class="appearance-layout">
     <nav class="appearance-nav" aria-label="设置导航">
+      <!-- 用户要求标题与关闭按钮固定在设置子导航顶部，不占右侧内容的高度。 -->
+      <header class="appearance-heading"><h2 id="appearance-title">设置</h2><button type="button" class="icon-button" title="关闭设置" aria-label="关闭设置"></button></header>
+      <div class="appearance-nav-groups">
       ${settingsNavigation.map(group => `<div id="appearance-nav-${group.id}" class="appearance-nav-group" role="group" aria-labelledby="appearance-nav-${group.id}-title"${group.androidOnly ? " hidden" : ""}>
         <h3 id="appearance-nav-${group.id}-title" class="appearance-nav-group-title">${group.label}</h3>
         ${group.items.map(item => `<button type="button" id="appearance-${item.id}-entry" class="appearance-nav-item" aria-label="打开${item.label}" aria-controls="appearance-${item.id}-page" aria-selected="${item.id === "general"}"${group.androidOnly ? " hidden" : ""}><span class="appearance-nav-icon"></span><span>${item.label}</span></button>`).join("")}
       </div>`).join("")}
+      </div>
     </nav>
+    <div class="appearance-main">
     <div class="appearance-panels">
     <section id="appearance-general-page" class="appearance-body appearance-settings-page">
     <!-- 用户确认“个人 → 会话”改为“常规”；Claude 专属选项移入所选实例，不再混在设备显示偏好中。 -->
@@ -340,8 +344,9 @@ export function openAppearance() {
     <div id="appearance-diagnostics-field" class="appearance-field" hidden><span>运行日志</span><div class="appearance-action-buttons"><button type="button" id="appearance-diagnostics-export" disabled>导出</button><button type="button" id="appearance-diagnostics-send" disabled>发送到电脑</button></div></div>
     <p id="appearance-diagnostics-status" class="appearance-notification-status" role="status" hidden></p>
     </section>
-    </div></div>
-    <div class="appearance-actions"><button type="button" class="appearance-version" id="appearance-app-version" hidden disabled></button><div class="appearance-action-buttons"><button type="button" id="appearance-reset">恢复默认外观</button><button id="instruction-reload" type="button" hidden>重新读取</button><button id="instruction-save" type="button" class="primary" hidden disabled>保存指令</button><button type="button" class="primary" id="appearance-close">完成</button></div></div>`;
+    </div>
+    <div class="appearance-actions"><button type="button" class="appearance-version" id="appearance-app-version" hidden disabled></button><div class="appearance-action-buttons"><button type="button" id="appearance-reset">恢复默认外观</button><button id="instruction-reload" type="button" hidden>重新读取</button><button id="instruction-save" type="button" class="primary" hidden disabled>保存指令</button><button type="button" class="primary" id="appearance-close">完成</button></div></div>
+    </div></div>`;
   document.body.append(dialog);
   const wrapSettingsPage = page => {
     if (page.querySelector(":scope > .appearance-page-content")) return;
@@ -349,13 +354,19 @@ export function openAppearance() {
     content.append(...page.childNodes); page.append(content);
   };
   for (const page of dialog.querySelectorAll(".appearance-settings-page")) wrapSettingsPage(page);
-  // 设置内容实际保留 1000px，不把滚动条算进正文；PC 与手机导航宽度不同，居中始终读取实际右边界。
+  // 用户要求保留左侧主导航：只有真实可见的主导航才占位，不能按窗口宽度推断（窄 PC 仍有，手机横屏也可能没有）。
+  const mainNavigation = $(".remote-shell > .main-navigation");
+  const settingsNav = $(".appearance-nav", dialog);
   const syncSettingsOffset = () => {
-    if (dialog.open) dialog.style.setProperty("--settings-content-offset",
-      `${$(".appearance-nav", dialog).getBoundingClientRect().right}px`);
+    if (!dialog.open) return;
+    const main = mainNavigation?.getBoundingClientRect();
+    dialog.style.setProperty("--settings-main-nav-offset", `${main?.width > 0 ? Math.max(0, main.right) : 0}px`);
+    // 1000px 内容上限和原居中规则不变，使用设置子导航的新实际右边界。
+    dialog.style.setProperty("--settings-content-offset", `${settingsNav.getBoundingClientRect().right}px`);
   };
   const settingsResize = typeof ResizeObserver === "function" ? new ResizeObserver(syncSettingsOffset) : null;
-  settingsResize?.observe($(".appearance-nav", dialog));
+  settingsResize?.observe(settingsNav);
+  if (mainNavigation) settingsResize?.observe(mainNavigation);
   window.addEventListener("resize", syncSettingsOffset);
   // 用户要求设置复用主题 Select：指令实例与两种字重也使用统一组件。
   for (const [id, label, options, value] of [
@@ -367,7 +378,6 @@ export function openAppearance() {
         [{ value: "400", label: "常规" }, { value: "500", label: "中等" }, { value: "600", label: "半粗" }], String(weight)])
   ]) $(`#${id}-slot`, dialog).append(selectControl(id, label, options, value,
     id.endsWith("-font") ? "appearance-font-family" : ""));
-  const title = $("#appearance-title", dialog);
   const headingButton = $(".appearance-heading button", dialog);
   const primaryBody = $("#appearance-general-page", dialog);
   const panelHost = $(".appearance-panels", dialog);
@@ -483,10 +493,6 @@ export function openAppearance() {
     selectSettingsPage(page, entry);
     // 用户要求设置内容按分组显示，导航保持单层；标题始终为“设置”，不增加返回箭头或页内面包屑。
     page.setAttribute("aria-label", pageTitle);
-    title.textContent = "设置";
-    headingButton.title = "关闭设置";
-    headingButton.setAttribute("aria-label", "关闭设置");
-    headingButton.replaceChildren(icon("close"));
     versionButton.hidden = !androidVersionLoaded;
   };
   const restoreAppearanceRoot = () => {
@@ -503,10 +509,6 @@ export function openAppearance() {
     notificationPage = null;
     selectSettingsPage(primaryBody, generalEntry);
     dialog.classList.remove("appearance-subpage-open");
-    title.textContent = "设置";
-    headingButton.title = "关闭设置";
-    headingButton.setAttribute("aria-label", "关闭设置");
-    headingButton.replaceChildren(icon("close"));
     resetButton.hidden = false;
     versionButton.hidden = !androidVersionLoaded;
     updateNotificationOperationState();
@@ -1099,24 +1101,8 @@ export function openAppearance() {
     }
   };
   $("#appearance-close").onclick = () => closeAppearance();
+  // 主导航只避让显示；仍用模态设置锁住背景，点击留出的导航不关闭或切页。
   headingButton.onclick = () => closeAppearance();
-  let backdropPressed = false;
-  const onBackdrop = event => {
-    const box = dialog.getBoundingClientRect();
-    return event.target === dialog && (event.clientX < box.left || event.clientX > box.right || event.clientY < box.top || event.clientY > box.bottom);
-  };
-  dialog.onpointerdown = event => { backdropPressed = onBackdrop(event); };
-  dialog.onpointermove = event => { if (!onBackdrop(event)) backdropPressed = false; };
-  dialog.onpointercancel = () => { backdropPressed = false; };
-  dialog.onclick = event => {
-    const close = backdropPressed && onBackdrop(event);
-    backdropPressed = false;
-    if (!close) return;
-    // 触摸在 pointerup 后仍会派发点击，等它命中遮罩后再关闭，避免落到背景元素。
-    event.preventDefault();
-    event.stopPropagation();
-    closeAppearance();
-  };
   dialog.oncancel = event => {
     event.preventDefault();
     if (activePopup?.trigger.closest("dialog") === dialog) closePopup(true);
@@ -1162,9 +1148,9 @@ export function openAppearance() {
   });
   document.body.classList.add("modal-open");
   dialog.showModal();
+  syncSettingsOffset();
   // 用户要求可行时提前准备实例设置；只预读本次当前实例，点击实例页时复用缓存或同一请求，不扫描其他 CLI。
   if (session && connected) void instancePages.get("types").show();
-  syncSettingsOffset();
   if (matchMedia("(min-width: 761px)").matches) dialog.classList.add("appearance-screen-visible");
   else requestAnimationFrame(() => {
     if (dialog.isConnected && dialog.open) dialog.classList.add("appearance-screen-visible");
