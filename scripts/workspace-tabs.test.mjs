@@ -7,9 +7,17 @@ const source = await readFile(new URL("../assets/harness/session-tools.js", impo
 const wrapper = source.slice(source.indexOf("export function mountSessionTools("),
   source.indexOf("function mountSessionToolPages(")).replace(/^export /gm, "");
 
-function harness({ desktop = true, android = false, sidePanel = false, createSideThread, openImagePreview, openVideoPreview } = {}) {
+function harness({ desktop = true, android = false, sidePanel = false, parentWindow, createSideThread, openImagePreview, openVideoPreview } = {}) {
   const renderers = [], disk = new Map(), observers = [], messageListeners = new Set();
-  const document = { activeElement: null, querySelector: () => null };
+  const documentListeners = new Map();
+  const document = { activeElement: null, hidden: false, querySelector: () => null,
+    documentElement: { dataset: { workspaceSidePanelVisible: "true" } },
+    addEventListener(name, action) {
+      if (!documentListeners.has(name)) documentListeners.set(name, new Set());
+      documentListeners.get(name).add(action);
+    },
+    removeEventListener(name, action) { documentListeners.get(name)?.delete(action); }
+  };
   class Element {
     constructor(tag, className = "", text = "") {
       this.tag = tag; this.className = className; this.textContent = text;
@@ -107,6 +115,7 @@ function harness({ desktop = true, android = false, sidePanel = false, createSid
     mountSessionToolPages: options => renderer(options, "changes"),
     mountSessionFiles: options => renderer(options, "files"),
   });
+  context.window.parent = parentWindow || context.window;
   vm.runInContext(wrapper, context);
   const api = context.mountSessionTools({ workspace, trigger, getContext: () => state, sidePanel,
     createSideThread, openImagePreview, openVideoPreview });
@@ -117,7 +126,7 @@ function harness({ desktop = true, android = false, sidePanel = false, createSid
   const selected = () => visibleTabs().find(tab => tab.children[0].getAttribute("aria-selected") === "true");
   return { api, state, workspace, sidebar, conversation, trigger, dock, separator, views,
     tablist, header, toolbar, toggle, empty, renderers, document, media, disk, observers, selected, visibleTabs, visibleViews, messageListeners,
-    message: event => { for (const callback of messageListeners) callback(event); } };
+    message: event => { for (const callback of [...messageListeners]) callback(event); } };
 }
 
 test("桌面文件、变更与详情保留多个标签，重复路径复用，切换保留原视图", () => {
@@ -735,4 +744,97 @@ test("侧边快捷键请求只接受同源可见 iframe，切换后暂停，切�
   assert.equal(created.length, 3);
   assert.equal(h.messageListeners.size, 0);
   h.api.dispose();
+});
+
+test("侧边正文打开文件转交外层同级标签，保留侧边页面、行号和读取身份", () => {
+  const h = harness();
+  h.api.openSideThread({ id: "side-a", title: "侧边 A" });
+  const frame = h.views.children[0].children[0], frameView = h.views.children[0];
+  const draft = { text: "侧边原草稿", scroll: 120 };
+  frame.draft = draft; frame.readingPosition = 260;
+  frame.contentWindow = { postMessage() {} };
+  const child = harness({ sidePanel: true, parentWindow: { postMessage(data, origin) {
+    h.message({ source: frame.contentWindow, origin, data });
+  } } });
+  child.state.threadId = "side-a";
+  child.api.openFile("E:/repo/src/app.js", 12);
+  assert.equal(child.renderers.length, 0, "侧边不创建内部整页文件预览");
+  assert.equal(h.tablist.children.length, 2);
+  assert.equal(frameView.hidden, true);
+  assert.equal(frame.isConnected, true); assert.equal(frame.draft, draft);
+  assert.equal(frame.readingPosition, 260);
+  const file = h.renderers[0];
+  assert.deepEqual(file.calls, [["file", "E:/repo/src/app.js", 12]]);
+  assert.equal(file.options.getContext().threadId, "side-a", "文件读取使用来源侧边而非当前主会话");
+  h.api.openSideThread({ id: "side-a" });
+  child.api.openFile("E:/repo/src/app.js", 25);
+  assert.equal(h.tablist.children.length, 2, "重复文件复用原来源标签");
+  assert.deepEqual(file.calls.at(-1), ["file", "E:/repo/src/app.js", 25]);
+  h.api.openSideThread({ id: "side-a" });
+  assert.equal(h.views.children[0].children[0], frame);
+  assert.equal(frame.draft, draft); assert.equal(frame.readingPosition, 260);
+  h.api.dispose(); child.api.dispose();
+});
+
+test("侧边文件转交拒绝其他来源、隐藏页面、非法消息及授权失效", () => {
+  const h = harness(); h.api.openSideThread({ id: "side-a" });
+  const frame = h.views.children[0].children[0]; frame.contentWindow = { postMessage() {} };
+  const data = { type: "codex-elves-workspace-open-file", threadId: "side-a", path: "src/app.js", line: 8 };
+  const event = { source: frame.contentWindow, origin: "http://127.0.0.1:45222", data };
+  h.message({ ...event, source: {} }); h.message({ ...event, origin: "https://other.example" });
+  for (const changes of [{ threadId: "other" }, { path: "" }, { path: {} }, { path: "x".repeat(32769) },
+    { path: "src/\0bad" }, { line: -1 }, { line: "8" }, { line: 1.5 }]) h.message({ ...event, data: { ...data, ...changes } });
+  assert.equal(h.renderers.length, 0);
+  h.toggle.emit("click"); h.message(event);
+  assert.equal(h.renderers.length, 0, "隐藏面板不接收旧侧边打开请求");
+  h.toggle.emit("click"); h.state.threadId = "thread-b"; h.api.updateContext(); h.message(event);
+  assert.equal(h.renderers.length, 0, "后台主会话不能在当前会话打开文件");
+  h.state.threadId = "thread-a"; h.api.updateContext();
+  h.state.cacheScope = "scope-b"; h.message(event);
+  assert.equal(h.renderers.length, 0, "授权改变后即使布局尚未刷新也拒绝旧请求");
+  h.api.updateContext(); h.message(event); assert.equal(h.messageListeners.size, 0);
+  h.api.dispose();
+});
+
+test("侧边与主会话及不同侧边的同名文件分别读取，切换后保留来源标签", () => {
+  const h = harness(), path = "/repo/readme.md";
+  h.api.openFile(path); const mainFile = h.renderers[0];
+  const sendFrom = (id, kind = "side") => {
+    h.api[kind === "side" ? "openSideThread" : "openSubagent"]({ id });
+    const frame = h.visibleViews()[0].children[0]; frame.contentWindow = { postMessage() {} };
+    h.message({ source: frame.contentWindow, origin: "http://127.0.0.1:45222",
+      data: { type: "codex-elves-workspace-open-file", threadId: id, path, line: 4 } });
+  };
+  sendFrom("side-a"); const sideA = h.renderers[1];
+  sendFrom("side-b"); const sideB = h.renderers[2];
+  sendFrom("agent-a", "subagent"); const agent = h.renderers[3];
+  assert.equal(h.tablist.children.length, 7);
+  assert.deepEqual([mainFile, sideA, sideB, agent].map(file => file.options.getContext().threadId),
+    ["thread-a", "side-a", "side-b", "agent-a"]);
+  sideA.options.embedded.onOpenFile("/repo/other.md", 9);
+  const nested = h.renderers[4]; assert.equal(nested.options.getContext().threadId, "side-a");
+  h.state.threadId = "thread-b"; h.api.updateContext();
+  assert.equal(h.visibleTabs().length, 0);
+  assert.equal(sideA.options.getContext().threadId, "side-a", "后台读取不借用新的主会话");
+  h.state.threadId = "thread-a"; h.api.updateContext();
+  assert.equal(h.visibleTabs().length, 8);
+  h.state.cacheScope = "scope-b"; h.api.updateContext();
+  assert.equal(sideA.options.getContext().threadId, undefined);
+  assert.equal(h.visibleTabs().length, 0); h.api.dispose();
+});
+
+test("嵌入侧边的隐藏、离开及关闭状态不再转交文件，普通手机和 Android 保留原页预览", () => {
+  const sent = [], h = harness({ sidePanel: true, parentWindow: { postMessage: (...args) => sent.push(args) } });
+  h.api.openFile("src/app.js", 3); assert.equal(sent.length, 1);
+  assert.equal(sent[0][0].threadId, "thread-a"); assert.equal(sent[0][1], "http://127.0.0.1:45222");
+  h.document.hidden = true; h.api.openFile("src/app.js");
+  h.document.hidden = false; h.document.documentElement.dataset.workspaceSidePanelVisible = "false";
+  h.api.openFile("src/app.js"); assert.equal(sent.length, 1);
+  h.document.documentElement.dataset.workspaceSidePanelVisible = "true";
+  h.api.dispose(); h.api.openFile("src/app.js"); assert.equal(sent.length, 1);
+  for (const options of [{ desktop: false }, { android: true }]) {
+    const mobile = harness(options); mobile.api.openFile("src/app.js", 7);
+    assert.equal(mobile.renderers.length, 1); assert.deepEqual(mobile.renderers[0].calls, [["file", "src/app.js", 7]]);
+    mobile.api.dispose();
+  }
 });

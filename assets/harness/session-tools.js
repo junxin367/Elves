@@ -228,7 +228,7 @@ export function mountSessionTools(options) {
   function tabKey(item) {
     if (item.kind === "side" || item.kind === "subagent") return JSON.stringify([item.kind, item.threadId]);
     if (item.kind === "side-creation") return JSON.stringify(["side-creation", item.requestId]);
-    if (item.kind === "file") return JSON.stringify(["file", item.path.replaceAll("\\", "/")]);
+    if (item.kind === "file") return JSON.stringify(["file", item.sourceThreadId || "", item.path.replaceAll("\\", "/")]);
     if (item.kind === "change") return JSON.stringify(["change", detailKey(item.file)]);
     return item.kind;
   }
@@ -357,11 +357,14 @@ export function mountSessionTools(options) {
       event.preventDefault(); event.stopPropagation(); closeTab(key);
     });
     const embedded = { id, onClose: () => { if (ownsTab()) closeTab(key); },
-      onOpenFile: (path, line) => { if (ownsTab()) openTab({ kind: "file", path, line }); },
+      onOpenFile: (path, line) => { if (ownsTab()) openTab({ kind: "file", path, line, sourceThreadId: item.sourceThreadId }); },
       onOpenChange: (file, list) => { if (ownsTab()) openTab({ kind: "change", file, list }); } };
     // 后台标签的迟到读取只更新所属会话，不能从当前主会话借用 threadId/projectId；授权变化立即失效。
     const rendererOptions = { ...options, workspace: view, beforeOpen: undefined, embedded,
-      getContext: () => authorizationIdentity(context.value) === authorizationIdentity() ? context.value : {} };
+      // 侧边正文文件固定使用来源侧边的读取身份；切换主会话或同名路径不能改借另一实例。
+      getContext: () => authorizationIdentity(context.value) !== authorizationIdentity() ? {}
+        : item.sourceThreadId ? { ...context.value, threadId: item.sourceThreadId, creating: false, projectId: null }
+        : context.value };
     // 每个标签保留自己的阅读 DOM、滚动和请求；详情不重复写变更列表的持久缓存。
     // 用户要求子会话参照侧边会话在右侧标签显示，复用独立 iframe 和保留状态；子智能体仍由原生元数据约束为只读。
     const renderer = threadTab ? mountWorkspaceSideThread(view, item, () => {
@@ -374,6 +377,10 @@ export function mountSessionTools(options) {
       return resource.kind === "video"
         ? options.openVideoPreview?.(trigger, resource.source, resource.poster, resource.name)
         : options.openImagePreview?.(trigger, { originalImageSource: resource.source, alt: resource.name });
+    }, (path, line) => {
+      // 用户要求侧边正文文件打开在外层同级标签，保留原 iframe、输入草稿和阅读位置。
+      if (ownsTab() && desktop() && context.active === key)
+        openTab({ kind: "file", path, line, sourceThreadId: item.threadId });
     })
       : item.kind === "side-creation" ? mountWorkspaceSideCreation(view)
       : item.kind === "changes" || item.kind === "change"
@@ -398,7 +405,16 @@ export function mountSessionTools(options) {
     else mobilePages().open(name);
   }
   function openFile(path, line) {
-    if (typeof path !== "string" || !path) return;
+    if (disposed || typeof path !== "string" || !path) return;
+    if (options.sidePanel && window.parent !== window) {
+      const source = getContext();
+      if (document.hidden || document.documentElement.dataset.workspaceSidePanelVisible !== "true"
+          || typeof source?.threadId !== "string" || !/^[A-Za-z0-9_-]{1,120}$/.test(source.threadId)) return;
+      // 用户要求左键及菜单“打开文件”交给外层标签栏，侧边页面不能被整页预览替换。
+      window.parent.postMessage({ type: "codex-elves-workspace-open-file", threadId: source.threadId, path,
+        ...(Number.isSafeInteger(line) && line > 0 ? { line } : {}) }, new URL(window.location.href).origin);
+      return;
+    }
     updateContext();
     if (desktop()) openTab({ kind: "file", path, line });
     else mobilePages().openFile(path, line);
@@ -530,7 +546,7 @@ function mountWorkspaceSideCreation(workspace) {
   };
 }
 
-function mountWorkspaceSideThread(workspace, item, createSideThread, updateThreadState, openMediaPreview) {
+function mountWorkspaceSideThread(workspace, item, createSideThread, updateThreadState, openMediaPreview, openFile) {
   // 每个侧边会话/子智能体使用独立页面上下文，隔离输入、选中会话、滚动和实时连接，不能借用主聊天的全局发送状态。
   // 子智能体沿用原生读取返回的只读身份，不创建会话副本或开放发送。
   // 专用入口仅允许同源嵌入，不修改普通首页的禁止嵌入策略；关闭标签只卸载页面，不关闭服务端会话。
@@ -564,6 +580,14 @@ function mountWorkspaceSideThread(workspace, item, createSideThread, updateThrea
       updateThreadState?.(event.data);
       composerReady = event.data.composerReady === true;
       transferFocus();
+    }
+    // 路径最多 32768 字符，与本模块其他文件路径字段的上限一致；行号只接受正整数。
+    else if (visible && event.data?.type === "codex-elves-workspace-open-file"
+        && event.data.threadId === item.threadId && typeof event.data.path === "string"
+        && event.data.path.trim() && event.data.path.length <= 32768 && !event.data.path.includes("\0")
+        && (event.data.line === undefined || Number.isSafeInteger(event.data.line) && event.data.line > 0)) {
+      // 只接受同源、当前可见的来源 iframe；文件仍走原工作区授权及路径校验，不采信网页传入的其他会话身份。
+      openFile?.(event.data.path, event.data.line);
     }
     else if (visible && event.data?.type === "codex-elves-create-side-thread") createSideThread?.();
     else if (visible && event.data?.type === "codex-elves-workspace-media-preview"
