@@ -207,6 +207,10 @@ export function receive(event) {
     scheduleSidebarRefresh();
     return;
   }
+  if (event.method === "remote/sideIdleReleased") {
+    if (eventThreadId === selectedId) scheduleReload();
+    return;
+  }
   if (event.method === "remote/sidebarChanged" && eventThreadId === selectedId
       && relatedSessionView?.kind === "side" && typeof params.title === "string" && params.title !== thread?.title)
     scheduleReload();

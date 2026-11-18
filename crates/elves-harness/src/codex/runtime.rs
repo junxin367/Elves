@@ -311,6 +311,26 @@ impl Runtime {
         result
     }
 
+    pub(super) async fn idle_side_request(&self, generation: &str, id: &str,
+        guard: Option<&dyn ServiceDispatchGuard>) -> anyhow::Result<Option<Value>> {
+        // 仅供已核对安全空闲的服务自有侧边使用；不能为了后台回收启动新引擎或复用设备写入授权。
+        let connection = self.connection.lock().await.clone()
+            .filter(|connection| connection.generation == generation && connection.alive.load(Ordering::Acquire));
+        let Some(connection) = connection else { return Ok(None) };
+        let method = if guard.is_some() { "thread/unsubscribe" } else { "thread/read" };
+        execution::transport("app-server-stdio", method, guard.is_some());
+        let result = connection.request(method, json!({"threadId":id,"includeTurns":false}), guard).await;
+        if guard.is_some() { self.reads.invalidate(id).await; }
+        result.map(Some)
+    }
+
+    pub(super) async fn idle_side_goal(&self, generation: &str, id: &str) -> anyhow::Result<Option<Value>> {
+        let connection = self.connection.lock().await.clone()
+            .filter(|connection| connection.generation == generation && connection.alive.load(Ordering::Acquire));
+        let Some(connection) = connection else { return Ok(None) };
+        connection.request("thread/goal/get", json!({"threadId":id}), None).await.map(Some)
+    }
+
     pub async fn invalidate_read(&self, scope: &str) {
         self.reads.invalidate(scope).await;
     }

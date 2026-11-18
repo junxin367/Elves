@@ -1,6 +1,10 @@
 // PC 侧边会话/子智能体面板与独立会话窗口的页面模式，以及向外层标签同步执行与未读状态。
 
-import { connected, creating, pageLeaving, selectedId, thread } from "../../core/state.js";
+import { connected, creating, pageLeaving, selectedId, session, thread } from "../../core/state.js";
+import { reloadThread } from "../../core/actions.js";
+import { randomId } from "../../core/util.js";
+import { api } from "../api.js";
+import { privateInputScope } from "./capabilities.js";
 import { markVisibleThreadRead } from "../messages/user-content.js";
 import { sidebarAttentionState } from "../sidebar/list-state.js";
 
@@ -65,12 +69,50 @@ export function syncWorkspaceSidePanelState(force = false) {
 }
 // PC 侧边面板接收外层标签的显隐通知，只对实际显示的标签确认已读。
 export function installSidePanelMessageListener() {
+  // 页面后台与外层标签隐藏都结束查看租约；失联或直接关页由服务端 90 秒租约兜底，不派发模型操作。
+  document.addEventListener("visibilitychange", () => syncSideThreadPresence());
+  window.addEventListener("pagehide", () => syncSideThreadPresence(true));
+  window.addEventListener("pageshow", () => syncSideThreadPresence());
   window.addEventListener("message", event => {
     if (!workspaceSidePanel || event.source !== window.parent || event.origin !== location.origin
         || event.data?.type !== "codex-elves-side-panel-visibility" || typeof event.data.visible !== "boolean") return;
     // iframe 的 document.hidden 不随标签隐藏改变；只对实际显示的侧边标签确认已读，后台标签继续保留未读状态。
     document.documentElement.dataset.workspaceSidePanelVisible = String(event.data.visible);
+    syncSideThreadPresence();
     syncWorkspaceSidePanelState(true);
-    if (event.data.visible) void markVisibleThreadRead().catch(() => {});
+    if (event.data.visible) {
+      // 标签从隐藏恢复时重新开启原只读补齐；隐藏期间不会轮询或为了查看而 resume 原生线程。
+      void reloadThread().catch(() => {});
+      void markVisibleThreadRead().catch(() => {});
+    }
   });
+}
+
+let sidePresenceViewId = null, sidePresenceSequence = 0, sidePresenceRecord = null, sidePresenceTimer = null;
+// 与服务端 side_idle::VIEW_LEASE 的 90 秒同步：30 秒续租只代表当前页面实际可见，历史轮询不续租。
+const SIDE_PRESENCE_INTERVAL = 30000;
+export function syncSideThreadPresence(leaving = false) {
+  clearTimeout(sidePresenceTimer); sidePresenceTimer = null;
+  const scope = privateInputScope(session);
+  const eligible = !!scope && session?.capabilities?.sideIdleRelease === true && thread?.id === selectedId
+    && thread.serviceSide === true && !thread.sideThreadClosed && !thread.sideThreadExpired;
+  const visible = eligible && connected && !leaving && !pageLeaving && !document.hidden
+    && (!workspaceSidePanel || document.documentElement.dataset.workspaceSidePanelVisible === "true");
+  const id = eligible ? selectedId : null;
+  const previous = sidePresenceRecord, now = Date.now();
+  const send = (threadId, isVisible) => {
+    sidePresenceViewId ||= randomId();
+    void api("/api/read/sidePresence", { threadId, viewId: sidePresenceViewId,
+      sequence: ++sidePresenceSequence, visible: isVisible }, undefined, undefined,
+    { resourcePriority: "background" }).catch(() => {});
+  };
+  if (previous?.scope === scope && previous.visible && (previous.id !== id || !visible))
+    send(previous.id, false);
+  const changed = !previous || previous.scope !== scope || previous.id !== id || previous.visible !== visible;
+  if (!id) { sidePresenceRecord = null; return; }
+  if (visible && (changed || now - previous.sentAt >= SIDE_PRESENCE_INTERVAL)) send(id, true);
+  sidePresenceRecord = { scope, id, visible,
+    sentAt: visible && (changed || now - previous.sentAt >= SIDE_PRESENCE_INTERVAL) ? now : previous?.sentAt ?? now };
+  if (visible) sidePresenceTimer = setTimeout(() => syncSideThreadPresence(),
+    Math.max(1, SIDE_PRESENCE_INTERVAL - (Date.now() - sidePresenceRecord.sentAt)));
 }

@@ -19,6 +19,7 @@ mod reads;
 mod runtime;
 mod settings;
 mod side_settings;
+mod side_idle;
 mod sides;
 mod store;
 mod subagents;
@@ -51,6 +52,8 @@ pub(super) struct CodexHarness {
     receiver: Mutex<Option<mpsc::Receiver<Value>>>,
     worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
     queue_worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    side_idle_worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    side_idle: Arc<Mutex<side_idle::SideIdle>>,
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     queue_recovery_after: Mutex<HashMap<String, std::time::Instant>>,
     loaded: Mutex<HashMap<String, String>>,
@@ -69,6 +72,7 @@ impl Drop for CodexHarness {
         if let Some(worker) = self.queue_worker.get_mut().take() {
             worker.abort();
         }
+        if let Some(worker) = self.side_idle_worker.get_mut().take() { worker.abort(); }
     }
 }
 
@@ -139,6 +143,8 @@ impl CodexHarness {
             receiver: Mutex::new(Some(receiver)),
             worker: Mutex::new(None),
             queue_worker: Mutex::new(None),
+            side_idle_worker: Mutex::new(None),
+            side_idle: Arc::new(Mutex::new(side_idle::SideIdle::default())),
             locks: Mutex::new(HashMap::new()),
             queue_recovery_after: Mutex::new(HashMap::new()),
             loaded: Mutex::new(HashMap::new()),
@@ -183,6 +189,11 @@ impl CodexHarness {
                 async move {
                     while let Some(frame) = receiver.recv().await {
                         let Some(service) = weak.upgrade() else { break };
+                        if matches!(frame["method"].as_str(), Some("harness/connected" | "harness/disconnected"))
+                            || frame["_generation"] == service.projection.lock().await.generation
+                        {
+                            service.side_idle.lock().await.observe(&frame);
+                        }
                         // 加载标记只属于当前独立引擎；收到卸载事件后清除旧代次记录。
                         let generation = frame["_generation"].as_str().unwrap_or("");
                         if frame["method"] == "thread/deleted"
@@ -211,7 +222,7 @@ impl CodexHarness {
                             }
                             continue;
                         }
-                        if frame["method"] == "thread/closed"
+                        if frame["method"] == "thread/closed" || frame["method"] == "thread/unloaded"
                             || frame["method"] == "thread/status/changed"
                                 && frame["params"]["status"]["type"] == "notLoaded"
                         {
@@ -257,9 +268,22 @@ impl CodexHarness {
                     }
                 },
             ));
+            let weak = Arc::downgrade(self);
+            *self.side_idle_worker.lock().await = Some(execution::spawn_service(
+                self.audit.clone(), "side-idle-release", async move {
+                    let mut tick = tokio::time::interval(side_idle::CHECK_INTERVAL);
+                    loop {
+                        tick.tick().await;
+                        let Some(service) = weak.upgrade() else { break };
+                        if service.enabled.load(Ordering::Acquire) { service.release_idle_sides().await; }
+                    }
+                },
+            ));
         }
         drop(worker);
         let connection = self.runtime.connection().await?;
+        // start 可先于排队的连接事件完成；按单调代次登记，旧连接事件不能清掉新侧边的回收记录。
+        self.side_idle.lock().await.connected(&connection.generation, connection.generation_index);
         self.projection
             .lock()
             .await
@@ -356,6 +380,7 @@ impl CodexHarness {
         self.catalog.reset().await;
         self.runtime.shutdown().await;
         self.loaded.lock().await.clear();
+        self.side_idle.lock().await.clear_loaded();
     }
 
     pub(crate) async fn thread_lock(&self, id: &str) -> Arc<Mutex<()>> {
@@ -412,6 +437,7 @@ impl CodexHarness {
             }
         }
         self.remember_settings(id, &response).await?;
+        let persistent_side = thread["serviceSide"] == true;
         // 用户要求远程会话独立于 Codex App；只登记本服务原生引擎的加载代次。
         let mut loaded = self.loaded.lock().await;
         self.projection
@@ -420,6 +446,9 @@ impl CodexHarness {
             .threads
             .insert(id.to_owned(), thread);
         loaded.insert(id.to_owned(), connection.generation.clone());
+        if persistent_side {
+            self.side_idle.lock().await.loaded(id, &connection.generation, false);
+        }
         Ok(())
     }
 
@@ -505,7 +534,7 @@ impl CodexHarness {
             } else {
                 false
             };
-        if !retained_side && !retained_deletion && !local_project {
+        if !retained_side && !retained_deletion && !local_project && action != "sidePresence" {
             self.start().await.map_err(|failure| {
                 if action == "deleteThread" {
                     deletion::delete_preflight_failure(failure)
@@ -515,6 +544,8 @@ impl CodexHarness {
             })?;
         }
         let result = match action {
+            "sidePresence" => self.side_presence(&payload,
+                authorization.context("侧边页面状态缺少设备授权")?).await,
             "events" => {
                 self.runtime.check_health().await?;
                 // 只通过独立引擎刷新目录；Catalog 自身合并请求并限制读取频率。

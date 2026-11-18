@@ -6,11 +6,8 @@ use super::super::{ApiError, HarnessAuthorization, now_ms};
 use super::store::{Data, Queued};
 use super::{CodexHarness, error, required};
 
-// 用户要求服务独立管理且过期后仍可读取：最多保留 16 个未关闭会话（含过期），每个正文最多 16 MiB，
-// 合计正文上限约 256 MiB；达到上限明确停止接受新输入，不静默截断或落盘恢复。
-const MAX_OPEN_SIDES: usize = 16;
-const MAX_HISTORY_BYTES: usize = 16 * 1024 * 1024;
-// 侧边待发队列与正文分别限制为 16 MiB，条数沿用主会话的 100 条上限，避免临时图片无限占用内存。
+// 用户要求移除正文容量兜底：正文和会话数量不再触发终止；闲置退订由 side_idle 独立管理。
+// 待发送附件/队列沿用独立的 16 MiB、100 条准入限制；不用于限制已经接收的历史正文。
 const MAX_QUEUE_BYTES: usize = 16 * 1024 * 1024;
 
 // 用户要求与 Codex App 保持相同任务边界：继承历史仅供参考，侧边只能执行边界后的新要求。
@@ -121,7 +118,6 @@ pub(super) struct SideThread {
     permissions: Value,
     // 用户要求显式继承创建时的 Plan/Default；后续父会话变化和客户端载荷不能改写该模式。
     collaboration_mode: Value,
-    bytes: usize,
 }
 
 #[cfg(test)]
@@ -145,8 +141,20 @@ mod tests {
             permissions: json!({"approvalPolicy":"on-request","approvalsReviewer":"user",
                 "sandboxPolicy":{"type":"readOnly"}}),
             collaboration_mode: json!({"mode":"default","settings":{"developer_instructions":null}}),
-            bytes: 0,
         }
+    }
+
+    #[test]
+    fn harness_service_side_history_above_16_mib_remains_complete() {
+        let mut side = side();
+        side.observe(&json!({"method":"turn/started","params":{"turn":{
+            "id":"large-turn","status":"inProgress","items":[]}}}));
+        let text = "x".repeat(17 * 1024 * 1024);
+        side.observe(&json!({"method":"item/completed","params":{"turnId":"large-turn",
+            "item":{"id":"large-output","type":"agentMessage","text":text}}}));
+        assert!(!side.incomplete, "用户已移除正文容量兜底，超过旧 16 MiB 不应阻断会话");
+        let history = side.history(&json!({"threadId":"side"})).unwrap();
+        assert_eq!(history["data"][0]["items"][0]["text"].as_str().unwrap().len(), 17 * 1024 * 1024);
     }
 
     #[test]
@@ -390,6 +398,7 @@ impl SideThread {
         view["inheritedTurnIds"] = json!([]);
         view["sideThreadClosed"] = json!(self.closed);
         view["sideThreadExpired"] = json!(self.expired);
+        view["sideIdleReleased"] = json!(self.metadata["sideIdleReleased"] == true);
         view["hasUnreadTurn"] = json!(self.unread);
         view["readOnly"] = json!(self.closed || self.closing || self.expired);
         view["editableMessage"] = Value::Null;
@@ -482,13 +491,6 @@ impl SideThread {
         let index = items
             .iter()
             .position(|previous| previous["id"] == item["id"]);
-        let previous_bytes = index.map_or(0, |index| items[index].to_string().len());
-        let next_bytes = self.bytes.saturating_sub(previous_bytes) + item.to_string().len();
-        if next_bytes > MAX_HISTORY_BYTES {
-            self.incomplete = true;
-            return;
-        }
-        self.bytes = next_bytes;
         match index {
             Some(index) => items[index] = item,
             None => items.push(item),
@@ -519,7 +521,6 @@ impl SideThread {
                     self.turns.clear();
                     self.sent.clear();
                     self.clear_queue();
-                    self.bytes = 0;
                 } else {
                     self.expire();
                 }
@@ -827,7 +828,9 @@ impl CodexHarness {
         if side.closed {
             return Err(error(410, "侧边会话已关闭，内容已释放"));
         }
-        let thread = projection.thread(id, side.view()?);
+        let mut thread = projection.thread(id, side.view()?);
+        drop(projection);
+        self.decorate_idle_release(id, &mut thread).await;
         Ok(json!({"ok":true,"thread":thread,"nativeBridge":"harness"}))
     }
 
@@ -868,7 +871,6 @@ impl CodexHarness {
         related["sideThreadsComplete"] = json!(persistent_errors.is_empty());
         related["sideThreadsError"] = if persistent_errors.is_empty() { Value::Null }
             else { json!(persistent_errors.join("；")) };
-        let persistent_enabled = self.persistent_sides_enabled().await?;
         let projection = self.projection.lock().await;
         let mut rows = Vec::new();
         for detail in &persistent_views {
@@ -889,15 +891,7 @@ impl CodexHarness {
         }
         rows.sort_by_key(|row| row["createdAtMs"].as_u64().unwrap_or(0));
         related["sideThreads"] = json!(rows);
-        related["canCreateSideThread"] = json!(
-            persistent_enabled || projection
-                .sides
-                .threads
-                .values()
-                .filter(|side| !side.closed)
-                .count()
-                < MAX_OPEN_SIDES
-        );
+        related["canCreateSideThread"] = json!(true);
         Ok(related)
     }
 
@@ -925,19 +919,6 @@ impl CodexHarness {
             if identity["thread"].get("attachedToThreadId").is_none() {
                 return Err(error(409, "当前原生引擎未返回侧边关联字段，持久侧边未创建；请升级独立 Codex CLI"));
             }
-        }
-        if !persistent && self
-            .projection
-            .lock()
-            .await
-            .sides
-            .threads
-            .values()
-            .filter(|side| !side.closed)
-            .count()
-            >= MAX_OPEN_SIDES
-        {
-            return Err(error(429, "临时侧边会话已达上限，请先关闭不再使用的会话"));
         }
         let collaboration_mode = self
             .side_collaboration_mode(parent, &identity["thread"])
@@ -1122,7 +1103,6 @@ impl CodexHarness {
             queue_revision: 1,
             permissions,
             collaboration_mode,
-            bytes: 0,
         };
         let mut projection = self.projection.lock().await;
         if projection.generation != connection.generation {
@@ -1133,7 +1113,7 @@ impl CodexHarness {
             }
             .into());
         }
-        // 只保留最近 512 个条目；过期但未关闭的正文仍计入 16 个会话上限，主动关闭才释放正文。
+        // 只清理已关闭的旧身份记录；过期侧边保留已取得的正文，用户明确关闭时才释放。
         if projection.sides.threads.len() >= 512 {
             if let Some(old) = projection
                 .sides
@@ -1152,6 +1132,7 @@ impl CodexHarness {
             .lock()
             .await
             .insert(id.clone(), connection.generation.clone());
+        self.side_idle.lock().await.loaded(&id, &connection.generation, true);
         Ok(json!({"ok":true,"threadId":id,"parentThreadId":parent,"thread":view}))
     }
 

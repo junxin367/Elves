@@ -3568,6 +3568,7 @@ async fn session(
         "sideThreads":true,"serviceSideThreads":true,"subagents":true,"serviceSubagents":true,
         "sessionMetrics":true,"workspaceOpenIn":cfg!(windows),
         "claudeSessions":true,"claudeProjectTrust":true,"claudeSubscriptionUsage":true}});
+    response["capabilities"]["sideIdleRelease"] = json!(true);
     response["transport"] = json!(if state.desktop { "desktop" } else { "remote" });
     // 管理权限由服务端真实入口决定，普通网页或 Android 不能通过伪造客户端标记取得能力。
     response["capabilities"]["management"] = json!(state.desktop && management::available());
@@ -3753,6 +3754,7 @@ async fn read(
             | "promptOptimization"
             | "notifications"
             | "relatedThreads"
+            | "sidePresence"
     ) {
         return Err(ApiError::new(404, "不支持的读取操作"));
     }
@@ -6719,6 +6721,8 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
    break;
  }
  case 'thread/unsubscribe':
+   if(sidePolicy.idleEventBurst)for(let index=0;index<1024;index++)event('thread/status/changed',{threadId:'idle-background',status:{type:'idle'}});
+   if(sidePolicy.idleUnsubscribeError){output({id:q.id,error:{code:-32000,message:'idle unsubscribe outcome unknown'}});return;}
    if(t?.ephemeral&&sidePolicy.unsubscribeError){output({id:q.id,error:{code:sidePolicy.unsubscribeError,message:'side unsubscribe fixture failure'}});return;}
    if(!t){result={status:'notLoaded'};break;}
    if(t.ephemeral){threads.delete(p.threadId);modelContexts.delete(p.threadId);}else t.status={type:'notLoaded'};
@@ -6855,6 +6859,9 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
    sandbox_workspace_write:{writable_roots:[],network_access:false},
    features:{fast_mode:fastPolicy.configFast!==false},service_tier:fastPolicy.defaultTier||null}};break;
  default: output({id:q.id,error:{code:-32601,message:'unsupported: '+q.method}});return;
+ }
+ if(q.method==='thread/read'&&sidePolicy.idleReadDelayMs&&p.threadId===sidePolicy.idleReadId){
+   setTimeout(()=>output({id:q.id,result}),sidePolicy.idleReadDelayMs);return;
  }
  output({id:q.id,result});
 });
@@ -11190,6 +11197,207 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     }
 
     #[tokio::test]
+    async fn harness_service_side_idle_presence_expiry_and_persistent_resume() {
+        let (directory, authorization) = harness_fixture().await;
+        let controller = &authorization.controller;
+        let parent = controller.call_authorized("create", json!({"projectId":"project-a","prompt":"父上下文"}),
+            &authorization).await.unwrap()["threadId"].as_str().unwrap().to_owned();
+        std::fs::write(directory.path().join("remote-instance-preferences.json"),
+            r#"{"instances":{"codex:local":{"persistentSideThreads":true}}}"#).unwrap();
+        let id = controller.call_authorized("createSideThread", json!({"threadId":parent}), &authorization)
+            .await.unwrap()["threadId"].as_str().unwrap().to_owned();
+        controller.call_authorized("send", json!({"threadId":id,"prompt":"持久侧边保留历史",
+            "clientUserMessageId":"idle-first"}), &authorization).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        controller.harness.release_idle_sides_for_test().await;
+        assert!(!harness_engine_requests(directory.path()).iter().any(|frame| frame["method"] == "thread/unsubscribe"));
+        // 同一设备两个页面分别租约，关闭一页不能使另一页仍在看的侧边被退订。
+        for page in ["page-a", "page-b"] {
+            controller.call_authorized("sidePresence", json!({"threadId":id,"viewId":page,"sequence":1,"visible":true}),
+                &authorization).await.unwrap();
+        }
+        controller.call_authorized("sidePresence", json!({"threadId":id,"viewId":"page-a","sequence":2,"visible":false}),
+            &authorization).await.unwrap();
+        controller.harness.age_side_for_test(&id, 10801).await;
+        controller.harness.release_idle_sides_for_test().await;
+        assert!(!harness_engine_requests(directory.path()).iter().any(|frame| frame["method"] == "thread/unsubscribe"));
+        controller.call_authorized("sidePresence", json!({"threadId":id,"viewId":"page-b","sequence":2,"visible":false}),
+            &authorization).await.unwrap();
+        controller.call_authorized("sidePresence", json!({"threadId":id,"viewId":"page-b","sequence":1,"visible":true}),
+            &authorization).await.unwrap();
+        controller.harness.age_side_for_test(&id, 10801).await;
+        controller.harness.release_idle_sides_for_test().await;
+        let detail = controller.call_authorized("thread", json!({"threadId":id}), &authorization).await.unwrap();
+        assert_eq!(detail["thread"]["ephemeral"], false);
+        assert_ne!(detail["thread"]["sideThreadExpired"], true);
+        let history = controller.call_authorized("history", json!({"threadId":id}), &authorization).await.unwrap();
+        assert!(history.to_string().contains("持久侧边保留历史"));
+        assert!(!harness_engine_requests(directory.path()).iter().any(|frame| frame["method"] == "thread/resume"),
+            "闲置后读取不应恢复执行");
+        let sent = controller.call_authorized("send", json!({"threadId":id,"prompt":"退订后继续",
+            "clientUserMessageId":"idle-second"}), &authorization).await.unwrap();
+        assert_eq!(sent["deliveryState"], "accepted");
+        let requests = harness_engine_requests(directory.path());
+        assert_eq!(requests.iter().filter(|frame| frame["method"] == "thread/unsubscribe").count(), 1);
+        assert_eq!(requests.iter().filter(|frame| frame["method"] == "thread/resume").count(), 1);
+        assert!(!requests.iter().any(|frame| matches!(frame["method"].as_str(), Some("thread/delete" | "turn/interrupt"))));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        controller.call_authorized("sidePresence", json!({"threadId":id,"viewId":"lost-page","sequence":1,"visible":true}),
+            &authorization).await.unwrap();
+        controller.harness.expire_side_views_for_test().await;
+        controller.harness.age_side_for_test(&id, 10801).await;
+        controller.harness.release_idle_sides_for_test().await;
+        assert_eq!(harness_engine_requests(directory.path()).iter().filter(|frame| frame["method"] == "thread/unsubscribe").count(), 2,
+            "页面直接离开且没有隐藏回执时，过期租约不能永久阻止闲置回收");
+        controller.harness.enabled.store(false, Ordering::Release);
+        controller.harness.release().await;
+    }
+
+    #[tokio::test]
+    async fn harness_service_side_idle_keeps_running_queue_questions_and_unknown_results() {
+        let (directory, authorization) = harness_fixture().await;
+        let controller = &authorization.controller;
+        let parent = controller.call_authorized("create", json!({"projectId":"project-a","prompt":"父上下文"}),
+            &authorization).await.unwrap()["threadId"].as_str().unwrap().to_owned();
+        let id = controller.call_authorized("createSideThread", json!({"threadId":parent}), &authorization)
+            .await.unwrap()["threadId"].as_str().unwrap().to_owned();
+        controller.call_authorized("send", json!({"threadId":id,"prompt":"wait 执行中",
+            "clientUserMessageId":"idle-active"}), &authorization).await.unwrap();
+        controller.harness.age_side_for_test(&id, 10801).await;
+        controller.harness.release_idle_sides_for_test().await;
+        controller.call_authorized("send", json!({"threadId":id,"prompt":"队列保留",
+            "clientUserMessageId":"idle-queued"}), &authorization).await.unwrap();
+        controller.call_authorized("stop", json!({"threadId":id}), &authorization).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        controller.harness.age_side_for_test(&id, 10801).await;
+        controller.harness.release_idle_sides_for_test().await;
+        assert!(!harness_engine_requests(directory.path()).iter().any(|frame| frame["method"] == "thread/unsubscribe"),
+            "暂停队列也不能被闲置回收清理");
+        let queue = controller.call_authorized("queue", json!({"threadId":id}), &authorization).await.unwrap();
+        controller.call_authorized("removeQueued", json!({"threadId":id,"messageId":queue["queuedMessages"][0]["id"]}),
+            &authorization).await.unwrap();
+        // 原生未知状态、待处理问答仍需保留，不能仅依赖计时器判断为空闲。
+        controller.harness.seed_test_history(json!({"threadId":id,"events":[
+            {"method":"thread/status/changed","params":{"threadId":id,"status":{"type":"unknown"}}}
+        ]})).await.unwrap();
+        let mut policy = json!({"readOverrides":{}});
+        policy["readOverrides"][&id] = json!({"status":{"type":"unknown"}});
+        std::fs::write(directory.path().join("side-policy.json"), policy.to_string()).unwrap();
+        controller.harness.age_side_for_test(&id, 10801).await;
+        controller.harness.release_idle_sides_for_test().await;
+        assert!(!harness_engine_requests(directory.path()).iter().any(|frame| frame["method"] == "thread/unsubscribe"));
+        std::fs::write(directory.path().join("side-policy.json"), "{}").unwrap();
+        controller.harness.seed_test_history(json!({"threadId":id,"events":[
+            {"method":"thread/status/changed","params":{"threadId":id,"status":{"type":"idle"}}},
+            {"id":991,"method":"item/tool/requestUserInput","params":{"threadId":id,"questions":[
+                {"id":"idle-question","header":"确认","question":"保留待处理问答","options":[]}
+            ]}}
+        ]})).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        controller.harness.age_side_for_test(&id, 10801).await;
+        controller.harness.release_idle_sides_for_test().await;
+        assert!(!harness_engine_requests(directory.path()).iter().any(|frame| frame["method"] == "thread/unsubscribe"));
+        controller.harness.enabled.store(false, Ordering::Release);
+        controller.harness.release().await;
+    }
+
+    #[tokio::test]
+    async fn harness_service_side_idle_persistent_overage_and_unknown_unsubscribe() {
+        let (directory, authorization) = harness_fixture().await;
+        let controller = &authorization.controller;
+        let parent = controller.call_authorized("create", json!({"projectId":"project-a","prompt":"父上下文"}),
+            &authorization).await.unwrap()["threadId"].as_str().unwrap().to_owned();
+        std::fs::write(directory.path().join("remote-instance-preferences.json"),
+            r#"{"instances":{"codex:local":{"persistentSideThreads":true}}}"#).unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..11 {
+            ids.push(controller.call_authorized("createSideThread", json!({"threadId":parent}), &authorization)
+                .await.unwrap()["threadId"].as_str().unwrap().to_owned());
+        }
+        std::fs::write(directory.path().join("side-policy.json"), r#"{"idleEventBurst":true}"#).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), controller.harness.release_idle_sides_for_test()).await
+            .expect("回收不能持租约锁等待 RPC，阻断其他会话的流式事件");
+        let requests = harness_engine_requests(directory.path());
+        let unsubscribes: Vec<_> = requests.iter().filter(|frame| frame["method"] == "thread/unsubscribe").collect();
+        assert_eq!(unsubscribes.len(), 1, "超过 10 个未活动持久加载项时只回收最早的超出项");
+        assert_eq!(unsubscribes[0]["params"]["threadId"], ids[0]);
+        std::fs::write(directory.path().join("side-policy.json"), r#"{"idleUnsubscribeError":true}"#).unwrap();
+        controller.harness.age_side_for_test(&ids[1], 10801).await;
+        controller.harness.release_idle_sides_for_test().await;
+        controller.harness.release_idle_sides_for_test().await;
+        assert_eq!(harness_engine_requests(directory.path()).iter()
+            .filter(|frame| frame["method"] == "thread/unsubscribe" && frame["params"]["threadId"] == ids[1]).count(), 1,
+            "退订结果未知不能自动重试或误报成功");
+        let detail = controller.call_authorized("thread", json!({"threadId":ids[1]}), &authorization).await.unwrap();
+        assert_ne!(detail["thread"]["sideThreadExpired"], true);
+        assert_eq!(detail["thread"]["sideIdleReleaseUnknown"], true);
+        assert!(controller.call_authorized("send", json!({"threadId":ids[1],"prompt":"不能越过未知退订",
+            "clientUserMessageId":"idle-unknown-barrier"}), &authorization).await.is_err());
+        controller.harness.enabled.store(false, Ordering::Release);
+        controller.harness.release().await;
+    }
+
+    #[tokio::test]
+    async fn harness_service_side_idle_new_view_cancels_before_unsubscribe() {
+        let (directory, authorization) = harness_fixture().await;
+        let controller = &authorization.controller;
+        let parent = controller.call_authorized("create", json!({"projectId":"project-a","prompt":"父上下文"}),
+            &authorization).await.unwrap()["threadId"].as_str().unwrap().to_owned();
+        std::fs::write(directory.path().join("remote-instance-preferences.json"),
+            r#"{"instances":{"codex:local":{"persistentSideThreads":true}}}"#).unwrap();
+        let id = controller.call_authorized("createSideThread", json!({"threadId":parent}), &authorization)
+            .await.unwrap()["threadId"].as_str().unwrap().to_owned();
+        std::fs::write(directory.path().join("side-policy.json"),
+            json!({"idleReadDelayMs":300,"idleReadId":id}).to_string()).unwrap();
+        let previous = harness_engine_requests(directory.path()).len();
+        controller.harness.age_side_for_test(&id, 10801).await;
+        let harness = controller.harness.clone();
+        let release = tokio::spawn(async move { harness.release_idle_sides_for_test().await; });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !harness_engine_requests(directory.path()).iter().skip(previous).any(|frame|
+                frame["method"] == "thread/read" && frame["params"]["threadId"] == id)
+            { tokio::time::sleep(Duration::from_millis(10)).await; }
+        }).await.unwrap();
+        controller.call_authorized("sidePresence", json!({"threadId":id,"viewId":"reopened-page",
+            "sequence":1,"visible":true}), &authorization).await.unwrap();
+        release.await.unwrap();
+        assert!(!harness_engine_requests(directory.path()).iter().any(|frame| frame["method"] == "thread/unsubscribe"),
+            "只读预检期间重新打开侧边时，最终派发必须取消旧闲置候选");
+        controller.harness.enabled.store(false, Ordering::Release);
+        controller.harness.release().await;
+    }
+
+    #[tokio::test]
+    async fn harness_service_side_idle_temporary_history_and_capacity_removal() {
+        let (directory, authorization) = harness_fixture().await;
+        let controller = &authorization.controller;
+        let parent = controller.call_authorized("create", json!({"projectId":"project-a","prompt":"父上下文"}),
+            &authorization).await.unwrap()["threadId"].as_str().unwrap().to_owned();
+        let mut ids = Vec::new();
+        for _ in 0..17 {
+            ids.push(controller.call_authorized("createSideThread", json!({"threadId":parent}), &authorization)
+                .await.unwrap()["threadId"].as_str().unwrap().to_owned());
+        }
+        let id = &ids[0];
+        controller.call_authorized("send", json!({"threadId":id,"prompt":"闲置前已取得的正文",
+            "clientUserMessageId":"idle-temporary"}), &authorization).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        controller.harness.age_side_for_test(id, 10801).await;
+        controller.harness.release_idle_sides_for_test().await;
+        let detail = controller.call_authorized("thread", json!({"threadId":id}), &authorization).await.unwrap();
+        assert_eq!(detail["thread"]["sideIdleReleased"], true);
+        assert_eq!(detail["thread"]["readOnly"], true);
+        let history = controller.call_authorized("history", json!({"threadId":id}), &authorization).await.unwrap();
+        assert!(history.to_string().contains("闲置前已取得的正文"));
+        assert!(controller.call_authorized("send", json!({"threadId":id,"prompt":"不自动复活",
+            "clientUserMessageId":"idle-expired"}), &authorization).await.is_err());
+        let requests = harness_engine_requests(directory.path());
+        assert_eq!(requests.iter().filter(|frame| frame["method"] == "thread/unsubscribe").count(), 1);
+        controller.harness.enabled.store(false, Ordering::Release);
+        controller.harness.release().await;
+    }
+
+    #[tokio::test]
     async fn harness_service_side_boundary_initialization_holds_child_lock() {
         let (directory, authorization) = harness_fixture().await;
         let controller = &authorization.controller;
@@ -12942,6 +13150,23 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
         let metrics = recovered.call_authorized("sessionMetrics", json!({"threadId":persistent_id}), &recovered_auth).await.unwrap();
         assert_eq!(metrics["metrics"]["source"], "codex-side");
         assert_eq!(metrics["metrics"]["totalTokens"], 20, "持久侧边统计不能累加父会话用量");
+        // 重启后只读不会加载线程；先明确执行一轮，确保下面验收的确是“加载后闲置退订”，而非原本就 notLoaded。
+        recovered.call_authorized("send", json!({"threadId":persistent_id,"prompt":"PERSISTENT_BEFORE_IDLE",
+            "clientUserMessageId":"persistent-before-idle"}), &recovered_auth).await.unwrap();
+        completed(&recovered_auth, persistent_id).await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let before_idle = recovered.call_authorized("thread", json!({"threadId":persistent_id}), &recovered_auth).await.unwrap();
+        assert_eq!(before_idle["thread"]["status"]["type"], "idle");
+        recovered.harness.age_side_for_test(persistent_id, 10801).await;
+        recovered.harness.release_idle_sides_for_test().await;
+        let unloaded = recovered.call_authorized("thread", json!({"threadId":persistent_id}), &recovered_auth).await.unwrap();
+        assert_eq!(unloaded["thread"]["status"]["type"], "notLoaded");
+        assert_ne!(unloaded["thread"]["sideThreadExpired"], true);
+        recovered.call_authorized("send", json!({"threadId":persistent_id,"prompt":"PERSISTENT_AFTER_IDLE",
+            "clientUserMessageId":"persistent-after-idle"}), &recovered_auth).await.unwrap();
+        let resumed = completed(&recovered_auth, persistent_id).await;
+        assert!(resumed.to_string().contains("PERSISTENT_AFTER_IDLE"));
+        assert!(resumed.to_string().contains("PERSISTENT_NATIVE_INPUT"));
         recovered.call_authorized("deleteThread", json!({"threadId":parent}), &recovered_auth).await.unwrap();
         recovered.harness.enabled.store(false, Ordering::Release);
         recovered.harness.release().await;

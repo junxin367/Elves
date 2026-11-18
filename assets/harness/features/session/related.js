@@ -39,7 +39,7 @@ import {
   sideCreationHistoryKey, sideCreationView, stopRelatedSessionTimers, syncSideThreadUnread,
   transientHistoryView
 } from "./related-state.js";
-import { workspaceSidePanel } from "./side-panel.js";
+import { syncSideThreadPresence, workspaceSidePanel } from "./side-panel.js";
 import { discardPersistentThreadDisplay, readScope, threadDisplayKey, threadDisplays } from "./thread-cache.js";
 import { syncRelatedModelDisplay } from "./thread-display.js";
 import { sessionMenu, sessionTools, setSessionMenu, syncRelatedSidebarLayout } from "../shell-state.js";
@@ -62,6 +62,7 @@ export function relatedViewForThread(id) {
     || normalizeRelatedView(relatedThreadViews.get(id), id);
 }
 export function syncRelatedSessionLayout() {
+  syncSideThreadPresence();
   let view = normalizeRelatedView(relatedSessionView, selectedId);
   if (!view && thread?.id === selectedId && thread.viewKind === "subagent"
       && typeof thread.parentThreadId === "string" && validRelatedThreadId(thread.parentThreadId)
@@ -89,7 +90,14 @@ export function syncRelatedSessionLayout() {
   const composer = $("#composer");
   if (composer) composer.hidden = view?.kind === "subagent" || expired;
   const expiredBanner = $("#side-thread-expired");
-  if (expiredBanner) expiredBanner.hidden = !expired;
+  if (expiredBanner) {
+    expiredBanner.hidden = !expired;
+    const label = expiredBanner.querySelector?.("strong"), description = expiredBanner.querySelector?.("span");
+    if (label) label.textContent = thread?.sideIdleReleased ? "临时侧边已闲置退订" : "侧边会话已过期";
+    if (description) description.textContent = thread?.sideIdleReleased
+      ? "已保留当前消息供查看；临时会话无法恢复执行，请新建侧边会话继续。"
+      : "该会话已结束，当前仅可查看已保留的消息。";
+  }
   const pendingArea = $("#pending-area");
   if (pendingArea) pendingArea.hidden = view?.kind === "subagent";
   syncSideThreadUnread();
@@ -231,13 +239,15 @@ export function scheduleRelatedSessionCheck() {
   const view = normalizeRelatedView(relatedSessionView, selectedId);
   if (view
       && (view.kind === "subagent" ? subagentsEnabled() : sideThreadsEnabled())
-      && connected && !document.hidden) {
+      && connected && !document.hidden
+      && (!workspaceSidePanel || document.documentElement.dataset.workspaceSidePanelVisible === "true")) {
     const id = selectedId, scope = privateInputScope(session), version = selectionVersion;
     // 用户要求 Codex 仅保留服务模式；关联会话统一每 2 秒只读补齐，隐藏或离页时停止，不恢复执行。
     setRelatedSessionCheckTimer(setTimeout(async () => {
       setRelatedSessionCheckTimer(null);
       if (scope !== privateInputScope(session) || selectedId !== id || version !== selectionVersion
-          || document.hidden || !connected || relatedSessionView?.kind !== view.kind) return;
+          || document.hidden || !connected || relatedSessionView?.kind !== view.kind
+          || workspaceSidePanel && document.documentElement.dataset.workspaceSidePanelVisible !== "true") return;
       try { await reloadThread(); } catch {}
       if (scope === privateInputScope(session) && selectedId === id && version === selectionVersion)
         scheduleRelatedSessionCheck();

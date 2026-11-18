@@ -19,6 +19,9 @@ impl CodexHarness {
         }
         if let Some(id) = payload["threadId"].as_str() {
             self.check_deletion_barrier(id).await?;
+            if action != "markRead" && action != "closeSideThread" {
+                self.check_side_idle_barrier(id).await?;
+            }
         }
         if action == "setFast" {
             return self.set_fast(&payload, authorization).await;

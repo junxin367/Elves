@@ -431,6 +431,7 @@ impl CodexHarness {
         }
         thread["fastMode"] = json!(self.fast_preference(id).await);
         self.decorate_persistent_side(&response["thread"], &mut thread).await;
+        self.decorate_idle_release(id, &mut thread).await;
         Ok(json!({"ok":true,"thread":thread,"nativeBridge":"harness"}))
     }
 

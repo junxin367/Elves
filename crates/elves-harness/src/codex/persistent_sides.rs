@@ -349,6 +349,7 @@ impl CodexHarness {
             .lock()
             .await
             .insert(id.to_owned(), generation.to_owned());
+        self.side_idle.lock().await.loaded(id, generation, false);
         let mut view = normalize_session_response(fork)?;
         self.decorate_persistent_side(raw, &mut view).await;
         let mut projection = self.projection.lock().await;

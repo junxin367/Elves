@@ -9764,7 +9764,7 @@ function sideExpiryHarness(response) {
     creating: false, relatedBackPending: false, connected: true, sidebar: { unreadSideThreads: [{ id }] },
     sessionMenu: { markSideThreadRead: value => menuChanges.push(["read", value]),
       removeThread: value => menuChanges.push(["remove", value]), updateContext() {}, reposition() {} },
-    syncRelatedModelDisplay() {}, syncRelatedSidebarLayout: null, markSidebarThreadReadLocally() {},
+    syncRelatedModelDisplay() {}, syncSideThreadPresence() {}, syncRelatedSidebarLayout: null, markSidebarThreadReadLocally() {},
     $: selector => nodes.get(selector), renderMessages() {}, renderSidebar() {},
     resetRelatedSessions() { assert.fail("缺失识别不得清除当前侧边关系"); },
     showWelcome() { assert.fail("侧边过期或暂未加载不得跳到欢迎页"); },
@@ -9787,7 +9787,7 @@ function sideExpiryHarness(response) {
   });
   vm.runInContext([
     sourceSection("function pri", "function isA"),
-    (sourceSection("function syncRelatedSess", "function fin") + "\n" + sourceSection("function syncSid", "function ses")),
+    (sourceSection("function syncRelatedSess", "function fin") + "\n" + sourceSection("function syncSideThreadUnread(", "function ses")),
     sourceSection("function scheduleRelatedSessionCheck()", "function resetRelatedSessions("),
     (sourceSection("function threadE", "function per") + "\n" + sourceSection("function retireM", "function his")),
     sourceSection("async function reloadThr", "function ret"),
@@ -12339,7 +12339,7 @@ test("侧边页面只接收同源父页面的可见状态，其他来源不能�
     workspaceSidePanel: true, window: { parent, addEventListener: (name, fn) => handlers.set(name, fn) },
     location: { origin: "http://127.0.0.1:45222" }, document,
     markVisibleThreadRead: async () => marked.push(true),
-    syncWorkspaceSidePanelState() {},
+    syncWorkspaceSidePanelState() {}, syncSideThreadPresence() {}, reloadThread: async () => {},
   });
   nodeVm.runInContext(sourceSection('window.addEventListener("message", event => {\n    if (!workspaceSidePanel', "\n}\n"), context);
   const listener = handlers.get("message"), data = { type: "codex-elves-side-panel-visibility", visible: true };
@@ -12352,6 +12352,41 @@ test("侧边页面只接收同源父页面的可见状态，其他来源不能�
   listener({ source: parent, origin: context.location.origin, data: { ...data, visible: false } });
   assert.equal(marked.length, 1);
   assert.equal(document.documentElement.dataset.workspaceSidePanelVisible, "false");
+});
+
+test("侧边查看租约只为可见页面续期，隐藏、切换与旧授权停止续租", () => {
+  let now = 1000;
+  const timers = new Map(), calls = [];
+  const c = nodeVm.createContext({
+    sidePresenceViewId: null, sidePresenceSequence: 0, sidePresenceRecord: null, sidePresenceTimer: null,
+    SIDE_PRESENCE_INTERVAL: 30000, Date: { now: () => now },
+    session: { device: { id: "device" }, capabilities: { sideIdleRelease: true } },
+    scope: "scope-a", privateInputScope: () => c.scope, randomId: () => "page-id",
+    selectedId: "side-a", thread: { id: "side-a", serviceSide: true }, connected: true,
+    creating: false, pageLeaving: false, workspaceSidePanel: true,
+    document: { hidden: false, documentElement: { dataset: { workspaceSidePanelVisible: "false" } } },
+    api: async (path, payload) => { calls.push({ path, payload }); return { ok: true }; },
+    clearTimeout: token => timers.delete(token),
+    setTimeout: (callback, delay) => { const token = {}; timers.set(token, { callback, delay }); return token; },
+  });
+  nodeVm.runInContext(sourceSection("function syncSideThreadPresence("), c);
+  c.syncSideThreadPresence(); assert.equal(calls.length, 0, "隐藏的 iframe 不能延长查看租约");
+  c.document.documentElement.dataset.workspaceSidePanelVisible = "true";
+  c.syncSideThreadPresence(); assert.equal(calls[0].payload.visible, true);
+  c.syncSideThreadPresence(); assert.equal(calls.length, 1, "普通重绘不重复发送心跳");
+  assert.equal([...timers.values()][0].delay, 30000);
+  now += 30000; [...timers.values()][0].callback(); assert.equal(calls.length, 2);
+  c.document.hidden = true; c.syncSideThreadPresence();
+  assert.equal(calls.at(-1).payload.visible, false); assert.equal(timers.size, 0);
+  c.document.hidden = false; c.syncSideThreadPresence();
+  c.selectedId = "side-b"; c.thread = { id: "side-b", serviceSide: true }; c.syncSideThreadPresence();
+  assert.equal(calls.at(-2).payload.threadId, "side-a"); assert.equal(calls.at(-2).payload.visible, false);
+  assert.equal(calls.at(-1).payload.threadId, "side-b");
+  const previous = calls.length; c.scope = "scope-b"; c.syncSideThreadPresence();
+  assert.equal(calls.length, previous + 1, "新授权不能代替旧授权提交隐藏旧页面");
+  assert.ok(calls.every((call, index) => call.path === "/api/read/sidePresence"
+    && call.payload.viewId === "page-id" && call.payload.sequence === index + 1));
+  c.syncSideThreadPresence(true); assert.equal(calls.at(-1).payload.visible, false); assert.equal(timers.size, 0);
 });
 
 test("主会话和侧边的完整请求快照同步审批与异步问答，旧快照不恢复已处理请求", () => {
