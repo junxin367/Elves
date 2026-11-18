@@ -10171,7 +10171,7 @@ test("其他 Codex 持有时原编辑器隐藏，提示仅提供重试且保留�
   assert.ok(inputArea.indexOf('id="thread-ownership"') < inputArea.indexOf('<form id="composer"'),
     "提示在原编辑器相邻位置替换，不放入消息区或页头");
   const banner = sourceSection('<div id="thread-ownership"', '<form id="composer"');
-  assert.match(banner, /在另一个应用中打开/);
+  assert.match(banner, /<strong>已在另一个应用中打开<\/strong>/);
   assert.match(banner, /请先在那边关闭会话，才能在这里继续。/);
   assert.match(banner, /thread-ownership-retry/);
   assert.doesNotMatch(banner, /fork|分叉/);
