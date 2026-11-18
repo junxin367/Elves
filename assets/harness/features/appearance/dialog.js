@@ -270,7 +270,6 @@ export function openAppearance() {
     <div class="appearance-field appearance-thread-limit-field"><span>每个项目显示会话数</span><div id="appearance-project-thread-limit-slot"></div></div>
     <div id="appearance-cache-state" class="appearance-field" role="status"></div>
     </div></section>
-    <p class="appearance-hint">外观页面的主题、字体、配色与背景图片由各客户端独立保存。</p>
     </section>
     ${instanceSettingPages.map(page => `<section id="appearance-${page.id}-page" class="appearance-body appearance-settings-page" hidden>
     <h3 class="appearance-panel-title">${page.label}</h3>
@@ -336,7 +335,7 @@ export function openAppearance() {
     <pre class="appearance-code-preview">const greeting = "Hello, 你好";\n0123456789  () [] {} =&gt;</pre>
     <label class="appearance-field"><span>文件阅读字号</span><span class="appearance-number"><input id="appearance-file-reading-font" type="number" inputmode="numeric" min="${fileReadingFontMin}" max="${fileReadingFontMax}" step="1" aria-label="文件阅读字号" aria-describedby="appearance-file-reading-font-hint"><span>px</span></span></label>
     <div id="appearance-file-reading-font-hint" class="appearance-reading-font-hint"><span>用于变更预览与文件查看。</span><button type="button" id="appearance-file-reading-font-reset" class="text-button" title="恢复为 ${fileReadingFontDefault}px">恢复默认</button></div>
-    </div><p class="appearance-hint">选择“系统”使用当前设备默认字体；界面默认字号为 14px，代码和文件阅读默认字号为 12px。</p></section>
+    </div></section>
     </details>
     </section>
     <section id="appearance-diagnostics-page" class="appearance-body appearance-settings-page" hidden>
