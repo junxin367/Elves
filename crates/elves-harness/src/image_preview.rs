@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
-use std::io::Cursor;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Cursor, Seek};
 
 use image::codecs::png::PngDecoder;
 use image::codecs::webp::{WebPDecoder, WebPEncoder};
@@ -57,15 +58,37 @@ impl PreviewCache {
 
 pub(super) fn thumbnail(source: &LoadedImage) -> Option<LoadedImage> {
     let format = image::guess_format(&source.bytes).ok()?;
+    thumbnail_from(
+        || Some(Cursor::new(source.bytes.as_slice())),
+        format,
+        source.bytes.len() as u64,
+    )
+}
+
+pub(super) fn file_thumbnail(file: &File, format: ImageFormat, size: u64) -> Option<LoadedImage> {
+    // 缩略图与放大预览复用已核验的同一文件句柄，不重新按路径查找，也不把原图读入 Vec。
+    let open = || {
+        let mut reader = BufReader::new(file.try_clone().ok()?);
+        reader.rewind().ok()?;
+        Some(reader)
+    };
+    thumbnail_from(open, format, size)
+}
+
+fn thumbnail_from<R: BufRead + Seek>(
+    open: impl Fn() -> Option<R>,
+    format: ImageFormat,
+    original_size: u64,
+) -> Option<LoadedImage> {
     // 动图继续使用原始内容，避免把 GIF、APNG 或动画 WebP 静默变成首帧。
     if format == ImageFormat::Gif
         || format == ImageFormat::Png
-            && PngDecoder::new(Cursor::new(&source.bytes))
+            && PngDecoder::new(open()?)
                 .ok()?
                 .is_apng()
                 .ok()?
         || format == ImageFormat::WebP
-            && WebPDecoder::new(Cursor::new(&source.bytes))
+            && WebPDecoder::new(open()?)
                 .ok()?
                 .has_animation()
     {
@@ -75,7 +98,7 @@ pub(super) fn thumbnail(source: &LoadedImage) -> Option<LoadedImage> {
     limits.max_alloc = Some(MAX_DECODED_BYTES);
     limits.max_image_width = Some(super::MAX_REMOTE_IMAGE_DIMENSION);
     limits.max_image_height = Some(super::MAX_REMOTE_IMAGE_DIMENSION);
-    let mut reader = ImageReader::with_format(Cursor::new(&source.bytes), format);
+    let mut reader = ImageReader::with_format(open()?, format);
     reader.limits(limits);
     let mut decoder = reader.into_decoder().ok()?;
     let (width, height) = decoder.dimensions();
@@ -108,7 +131,7 @@ pub(super) fn thumbnail(source: &LoadedImage) -> Option<LoadedImage> {
         )
         .ok()?;
     // 小文件或转换后没有节省流量时保留原图。
-    (bytes.len() < source.bytes.len()).then_some(LoadedImage {
+    ((bytes.len() as u64) < original_size).then_some(LoadedImage {
         bytes,
         mime: "image/webp",
     })

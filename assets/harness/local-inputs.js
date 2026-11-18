@@ -9,6 +9,22 @@ export function localInputBridge() {
 export function isLocalInput(entry) { return entry?.kind === "file" || entry?.kind === "folder"; }
 
 const stagedSlotId = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/u;
+export const desktopImagePattern = /^\/api\/desktop\/input-files\/[0-9a-f-]{36}\/(?:[0-9]|1[0-5])\/image$/u;
+
+export function stagedImageUrl(entry) {
+  const slot = entry?.staged;
+  return slot && typeof slot.id === "string" && stagedSlotId.test(slot.id)
+    && Number.isInteger(slot.index) && slot.index >= 0 && slot.index < 16 && slot.entries === 1
+    ? `/api/desktop/input-files/${slot.id}/${slot.index}/image` : null;
+}
+
+export function imageAttachmentPayload(entry) {
+  const { name, mime, size } = entry;
+  return entry.kind === "staged-image"
+    ? { name, mime, size, staged: { ...entry.staged } }
+    : { name, mime, dataUrl: entry.dataUrl, size };
+}
+
 export function copyLocalInput(entry) {
   if (entry.staged) {
     const { id, index, entries } = entry.staged;

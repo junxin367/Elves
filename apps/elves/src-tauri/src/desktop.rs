@@ -466,6 +466,7 @@ async fn local_input_payload(
     inputs: Vec<crate::local_inputs::CapturedInput>,
     staged: bool,
     clipboard: bool,
+    stage_images: bool,
     state: &ClientState,
     source: &Url,
 ) -> Result<serde_json::Value, String> {
@@ -490,7 +491,7 @@ async fn local_input_payload(
         identity.device_id.clone()
     };
     let directory = elves_harness::paths::default_app_state_dir();
-    tokio::task::spawn_blocking(move || crate::local_inputs::stage(inputs, clipboard, &directory, &device_id))
+    tokio::task::spawn_blocking(move || crate::local_inputs::stage(inputs, clipboard, stage_images, &directory, &device_id))
         .await
         .map_err(|_| "本机附件暂存任务已中断。")?
 }
@@ -528,7 +529,7 @@ async fn client_choose_inputs(
     if webview.url().ok().as_ref() != Some(&source) {
         return Err("会话页面已变化，请重新选择附件。".into());
     }
-    let result = local_input_payload(inputs, staged == Some(true), false, &state, &source).await?;
+    let result = local_input_payload(inputs, staged == Some(true), false, false, &state, &source).await?;
     trusted_input_page(&webview, &state)?;
     if webview.url().ok().as_ref() != Some(&source) {
         return Err("会话页面已变化，请重新选择附件。".into());
@@ -541,6 +542,7 @@ async fn client_paste_inputs(
     webview: tauri::Webview,
     state: tauri::State<'_, ClientState>,
     staged: Option<bool>,
+    stage_images: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     trusted_input_page(&webview, &state)?;
     let source = webview.url().map_err(|error| error.to_string())?;
@@ -554,7 +556,7 @@ async fn client_paste_inputs(
     if webview.url().ok().as_ref() != Some(&source) {
         return Err("会话页面已变化，请重新粘贴附件。".into());
     }
-    let result = local_input_payload(inputs, staged == Some(true), true, &state, &source).await?;
+    let result = local_input_payload(inputs, staged == Some(true), true, stage_images == Some(true), &state, &source).await?;
     trusted_input_page(&webview, &state)?;
     if webview.url().ok().as_ref() != Some(&source) {
         return Err("会话页面已变化，请重新粘贴附件。".into());

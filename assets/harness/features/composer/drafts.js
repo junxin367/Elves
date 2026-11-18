@@ -197,8 +197,8 @@ export function matchingDraft(draft, payload) {
     && (draft.permissionMode || "configured") === ((submitted || payload).permissionMode || "configured")
     && composerPrompt(draft.text, draft.skills, payload.goalMode === true) === payload.prompt
     && sameSkills(draft.skills, payload.skills || [])
-    && JSON.stringify((draft.attachments || []).filter(entry => entry.kind === "inline")
-      .map(({ name, mime, dataUrl, size }) => ({ name, mime, dataUrl, size })))
+    && JSON.stringify((draft.attachments || []).filter(entry => ["inline", "staged-image"].includes(entry.kind))
+      .map(({ name, mime, dataUrl, size, staged }) => staged ? { name, mime, size, staged } : { name, mime, dataUrl, size }))
       === JSON.stringify(payload.images || [])
     // 文件/文件夹随草稿保存；旧发送回执不能清除后来选择的同名但内容不同的本机附件。
     && JSON.stringify((draft.attachments || []).filter(entry => ["file", "folder"].includes(entry.kind)))

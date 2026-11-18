@@ -66,6 +66,7 @@ mod context_usage;
 mod conversation_naming;
 mod credentials;
 mod desktop;
+mod desktop_images;
 mod diagnostics;
 mod document_preview;
 pub(crate) mod execution;
@@ -114,7 +115,7 @@ const MAX_REMOTE_INLINE_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_REMOTE_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
 const MAX_REMOTE_IMAGE_DIMENSION: u32 = 16_384;
 const MAX_REMOTE_IMAGE_PIXELS: u64 = 100_000_000;
-// 用户要求 Codex/Claude 单条固定最多 8 张，含队列保留+新增；与 attachments.js 同步，大小/格式上限不变。
+// 用户要求 Codex/Claude 单条固定最多 8 张，含队列保留与新增；字节额度仅适用于内联图片。
 const MAX_INPUT_IMAGE_COUNT: usize = 8;
 const MAX_INPUT_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_INPUT_IMAGES_TOTAL_BYTES: usize = 12 * 1024 * 1024;
@@ -1675,6 +1676,16 @@ impl HarnessController {
                 return Err(ApiError::new(409, "该 Codex 实例的执行接入尚未支持").into());
             }
         }
+        if desktop_images::has_refs(&payload) {
+            // 已解析所属会话及实例后才接收本机图片，不能把引用送到 WSL 或从远程指定本机文件。
+            if authorization.device.key_id != desktop::DEVICE_KEY_ID || claude_thread
+                || requested == Some("claude")
+                || !matches!(action, "send" | "create" | "setGoal" | "editQueued")
+            {
+                return Err(ApiError::new(403, "本机原图仅支持 Elves 的本机 Codex 会话").into());
+            }
+            desktop_images::resolve(self.state_dir.clone(), &mut payload, authorization).await?;
+        }
         if payload.get("files").is_some() {
             if !matches!(action, "send" | "create" | "setGoal" | "editQueued") {
                 return Err(ApiError::new(400, "当前操作不接受文件和文件夹附件").into());
@@ -2752,6 +2763,8 @@ fn scoped_router(
             // 用户要求只在本机取消文件容量限制：流式附件独立于通用 JSON 操作，远程入口不注册。
             post(input_files::desktop_upload).layer(DefaultBodyLimit::disable()),
         )
+        .route("/api/desktop/input-files/{batch}/{index}/image", get(desktop_images::preview))
+        .route("/api/desktop/input-files/{batch}/{index}/image/thumbnail", get(desktop_images::thumbnail))
     } else {
         static_routes
     };
@@ -3048,7 +3061,7 @@ async fn access_boundary_response(
         Some("管理功能仅可在 Elves 独立客户端使用")
     } else if path == PREVIEW_WINDOW_PATH {
         Some("独立预览仅可在 Elves 本机客户端使用")
-    } else if path == "/api/desktop/input-files" {
+    } else if path == "/api/desktop/input-files" || path.starts_with("/api/desktop/input-files/") {
         Some("本机附件暂存仅可在 Elves 独立客户端使用")
     } else {
         None
@@ -3655,6 +3668,8 @@ async fn session(
         // 用户要求仅本机开放宿主机应用启动；远程 PC、手机与 Android 不声明此能力。
         "sessionMetrics":true,"workspaceOpenIn":cfg!(windows) && open_in::available(&state, &device),
         "claudeSessions":true,"claudeProjectTrust":true,"claudeSubscriptionUsage":true}});
+    response["capabilities"]["desktopCodexImageInput"] =
+        json!(state.desktop && device.key_id == desktop::DEVICE_KEY_ID && native_write_available);
     response["capabilities"]["sideIdleRelease"] = json!(true);
     response["transport"] = json!(if state.desktop { "desktop" } else { "remote" });
     // 管理权限由服务端真实入口决定，普通网页或 Android 不能通过伪造客户端标记取得能力。
@@ -4482,6 +4497,10 @@ fn validate_input_images(payload: &Value) -> Result<(), ApiError> {
         let object = image
             .as_object()
             .ok_or_else(|| ApiError::new(400, "图片附件参数无效"))?;
+        if object.contains_key("staged") {
+            desktop_images::validate_ref(image)?;
+            continue;
+        }
         if object
             .keys()
             .any(|key| !matches!(key.as_str(), "name" | "mime" | "dataUrl" | "size"))
@@ -4856,6 +4875,10 @@ async fn action(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    if desktop_images::has_refs(&payload) && (!state.desktop || device.key_id != desktop::DEVICE_KEY_ID
+        || !matches!(action.as_str(), "send" | "create" | "setGoal" | "editQueued")) {
+        return Err(ApiError::new(403, "本机原图仅支持 Elves 的本机 Codex 会话"));
+    }
     if action == "optimizePrompt" {
         validate_prompt_optimization_payload(&payload)?;
         payload["requestId"] = json!(prompt_optimization_request_id(&device.id, &id)?);
@@ -4927,6 +4950,12 @@ async fn image_response(
         .controller
         .registered_image(&id)
         .ok_or_else(|| ApiError::new(404, "图片不存在或已过期"))?;
+    if state.desktop && let RegisteredImageSource::Path(path) = &image.source
+        && let Some((batch, index)) = input_files::staged_file_identity(&state.controller.state_dir, &device.id, path)
+    {
+        // 正文和队列继续用原有图片地址，仅本机本人可走暂存原图的流式读取。
+        return desktop_images::response(&state, device, batch.to_owned(), index, Some(path.clone()), thumbnail).await;
+    }
     let permit = if thumbnail {
         Some(
             state

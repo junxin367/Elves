@@ -63,7 +63,7 @@ import { createSubagentIcon, subagentName } from "./messages/subagents.js";
 import { markVisibleThreadRead } from "./messages/user-content.js";
 import { setPendingNotificationOpen } from "./notifications.js";
 import {
-  isActiveThread, isClaude, privateInputScope, sideThreadsEnabled, subagentsEnabled, threadReadOnly
+  activeBackend, isActiveThread, isClaude, privateInputScope, sideThreadsEnabled, subagentsEnabled, threadReadOnly
 } from "./session/capabilities.js";
 import {
   connectionRttDescription, currentChannelMeasurements, loginPageCleanup,
@@ -158,7 +158,8 @@ export function shell() {
     prompt: $("#prompt"),
     onChange: () => { rememberDraft(); updateComposer(); },
     notice,
-    onPreview: openImagePreview
+    onPreview: openImagePreview,
+    allowDesktopImages: () => session?.capabilities?.desktopCodexImageInput === true && activeBackend() === "codex"
   });
   setComposerScroll(mountComposerScroll());
   announceAppReady();

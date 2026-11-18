@@ -49,7 +49,7 @@ impl Queued {
             .as_array()
             .into_iter()
             .flatten()
-            .map(|image| json!({"src":image["dataUrl"],"name":image["name"]}))
+            .map(|image| json!({"src":image.get("localPath").unwrap_or(&image["dataUrl"]),"name":image["name"]}))
             .collect();
         json!({"id":self.id,"clientUserMessageId":self.payload["clientUserMessageId"],
             "action":if self.compact {"compact"} else {"send"},

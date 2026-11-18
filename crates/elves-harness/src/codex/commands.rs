@@ -1000,6 +1000,18 @@ impl CodexHarness {
                         .cloned()
                         .collect();
                     images.extend(payload["images"].as_array().into_iter().flatten().cloned());
+                    // 未传保留列表时会保留旧图；按最终合并后的真实张数和内联大小拒绝超限。
+                    if images.len() > super::super::MAX_INPUT_IMAGE_COUNT {
+                        return Err(error(400, "每条消息最多保留或新增 8 张图片"));
+                    }
+                    let inline_bytes = images
+                        .iter()
+                        .filter(|image| image.get("localPath").is_none())
+                        .filter_map(|image| image["size"].as_u64())
+                        .fold(0, u64::saturating_add);
+                    if inline_bytes > super::super::MAX_INPUT_IMAGES_TOTAL_BYTES as u64 {
+                        return Err(error(413, "图片总大小不能超过 12 MiB"));
+                    }
                     message.payload["images"] = json!(images);
                     inputs(&message.payload)?;
                 } else {
@@ -1170,6 +1182,9 @@ pub(super) fn async_reply_message(
 }
 
 fn image_source(image: &Value) -> String {
+    if let Some(path) = image["localPath"].as_str() {
+        return path.to_owned();
+    }
     use sha2::{Digest, Sha256};
     image["dataUrl"]
         .as_str()
@@ -1186,7 +1201,18 @@ pub(super) fn inputs(payload: &Value) -> anyhow::Result<Vec<Value>> {
         input.push(json!({"type":"text","text":text,"text_elements":[]}));
     }
     for image in payload["images"].as_array().into_iter().flatten() {
-        input.push(json!({"type":"image","url":required(image,"dataUrl")?}));
+        // 本机 Codex 使用后端已确认的暂存原图路径；预览图与内联 Data URL 均不进入这个分支。
+        if let Some(path) = image["localPath"].as_str() {
+            if !super::super::input_files::staged_image_is_readable(
+                std::path::Path::new(path),
+                image["size"].as_u64(),
+            ) {
+                return Err(error(409, "本机原图已不可读，请重新添加"));
+            }
+            input.push(json!({"type":"localImage","path":path}));
+        } else {
+            input.push(json!({"type":"image","url":required(image,"dataUrl")?}));
+        }
     }
     for skill in payload["skills"].as_array().into_iter().flatten() {
         input.push(

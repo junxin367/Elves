@@ -224,8 +224,12 @@ export function updateComposer({ followEnd = false } = {}) {
   const queueOnly = !isClaude() && compacting && !goalMode && !editing && !compactionSendReason;
   const unsupportedFiles = composerLocalInputsPayload().length > 0
     && session?.capabilities?.localFileInput !== true;
-  const unsupportedImages = !editing && composerAttachmentsPayload().length > 0 && !backendCapability("imageInput")
-    || !!editingQueuedMessage?.imageEditing && composerAttachmentsPayload().length > 0
+  const inputImages = composerAttachmentsPayload();
+  const unsupportedStagedImages = inputImages.some(image => image.staged)
+    && (isClaude() || session?.capabilities?.desktopCodexImageInput !== true);
+  const unsupportedImages = unsupportedStagedImages
+    || !editing && inputImages.length > 0 && !backendCapability("imageInput")
+    || !!editingQueuedMessage?.imageEditing && inputImages.length > 0
       && !queueCapability("queuedImageEditing");
   const queueImageNote = editingQueuedMessage?.state === "editing"
     && queuedEditHasOriginalImages(editingQueuedMessage) && !editingQueuedMessage.imageEditing
@@ -244,6 +248,8 @@ export function updateComposer({ followEnd = false } = {}) {
   if (attachmentNote) {
     attachmentNote.textContent = unsupportedFiles
       ? "当前远程服务尚不支持文件和文件夹发送，请更新服务；附件已保留。"
+      : unsupportedStagedImages
+      ? "原图仅支持在具备此能力的 Elves 本机 Codex 会话发送，图片已保留。"
       : unsupportedImages
       ? editingQueuedMessage
         ? "当前运行的服务尚不支持编辑队列图片，修改已保留，请更新程序后再发送。"
@@ -298,7 +304,8 @@ export function updateComposer({ followEnd = false } = {}) {
   }
   send.setAttribute("aria-label", sendingLabel || (goalMode ? "创建目标" : action === "stop" ? stopLabel : queueOnly ? "发送到原生消息队列" : "发送消息"));
   send.title = sendingLabel || (editingQueuedMessage ? "发送消息" : editingMessage ? "请先完成消息编辑" : goalMode ? goalReason || "创建目标" : action === "stop" ? stopLabel : queueOnly ? "加入原生消息队列，压缩完成后执行" : compactionSendReason || (active ? "发送补充消息" : "发送消息"));
-  if (unsupportedImages) send.title = "当前服务版本尚不支持图片发送，请先更新程序";
+  if (unsupportedStagedImages) send.title = "原图仅支持在具备此能力的 Elves 本机 Codex 会话发送";
+  else if (unsupportedImages) send.title = "当前服务版本尚不支持图片发送，请先更新程序";
   if (unsupportedFiles) send.title = "请更新远程服务后发送文件和文件夹";
   if (unsupportedProjectless) send.title = "当前服务版本尚不支持无项目会话，请先更新程序或选择已有项目";
   send.setAttribute("aria-busy", String(busy || stopping));
@@ -516,6 +523,10 @@ export async function sendMessage() {
   const prompt = composerPrompt(draft.text, draft.skills, goalMode);
   const images = composerAttachmentsPayload();
   const files = composerLocalInputsPayload();
+  if (images.some(image => image.staged) && (isClaude() || session.capabilities?.desktopCodexImageInput !== true)) {
+    notice("草稿中的原图只能在支持原图发送的本机 Codex 会话使用，附件已保留。", true);
+    return;
+  }
   // 用户要求浏览器也能发送拖入/粘贴的文件；这里只检查服务能力，不再要求本机路径读取桥。
   if (files.length && session.capabilities?.localFileInput !== true) {
     notice("当前远程服务尚不支持文件和文件夹发送，请更新服务；附件已保留。", true);

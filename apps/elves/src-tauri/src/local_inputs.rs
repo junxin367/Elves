@@ -265,6 +265,7 @@ fn clipboard_image(input: &CapturedInput) -> bool {
 pub(crate) fn stage(
     inputs: Vec<CapturedInput>,
     classify_images: bool,
+    stage_images: bool,
     directory: &Path,
     device_id: &str,
 ) -> Result<serde_json::Value, String> {
@@ -275,7 +276,10 @@ pub(crate) fn stage(
     let mut result = Vec::with_capacity(inputs.len());
     let mut image_bytes = 0;
     for input in inputs {
-        if classify_images && clipboard_image(&input) {
+        // 本机 Codex 常用格式按原图落盘；WSL Claude、旧页面及需要兼容转码的格式保持原内联协议。
+        let native_image = stage_images && Path::new(&input.name).extension().and_then(|value| value.to_str())
+            .is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp"));
+        if classify_images && clipboard_image(&input) && !native_image {
             let available = LEGACY_MAX_BYTES - image_bytes;
             let reason = if available < MAX_IMAGE_BYTES {
                 "图片总大小不能超过 12 MiB"
@@ -651,6 +655,7 @@ mod tests {
         {
             let result = stage(
                 capture(vec![file]).unwrap(),
+                false,
                 false,
                 temporary.path(),
                 "isolated-desktop",

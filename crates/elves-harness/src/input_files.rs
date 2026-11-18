@@ -312,6 +312,37 @@ fn staged_path(directory: &Path, device: &str, input: &StagedInput) -> Result<Pa
     Ok(path)
 }
 
+pub(super) fn staged_image_file(
+    directory: &Path,
+    device: &str,
+    id: &str,
+    index: usize,
+) -> Result<(PathBuf, u64), ApiError> {
+    let (path, input) = staged_slot(directory, device, id, index)?;
+    if input.kind != "file" || input.staged.entries != 1 || checked_file(&path)?.len() != input.size {
+        return Err(invalid("本机图片已变化，请重新添加"));
+    }
+    Ok((path, input.size))
+}
+
+pub(super) fn staged_image_is_readable(path: &Path, size: Option<u64>) -> bool {
+    checked_file(path).is_ok_and(|metadata| size.is_none_or(|size| metadata.len() == size))
+        && std::fs::File::open(path).is_ok()
+}
+
+pub(super) fn staged_file_identity<'a>(
+    directory: &Path,
+    device: &str,
+    path: &'a Path,
+) -> Option<(&'a str, usize)> {
+    let root = directory.join(STAGED_ROOT).join(super::hash(device));
+    let mut parts = path.strip_prefix(root).ok()?.iter();
+    let id = parts.next()?.to_str()?;
+    let index = parts.next()?.to_str()?.parse().ok()?;
+    parts.next()?;
+    (valid_id(id) && index < MAX_ROOTS && parts.next().is_none()).then_some((id, index))
+}
+
 fn upload_io(error: std::io::Error) -> ApiError {
     if error.kind() == std::io::ErrorKind::StorageFull {
         ApiError::new(507, "本机磁盘空间不足，未添加附件")

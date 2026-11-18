@@ -38,8 +38,9 @@ export function goalComposerStorageRecord(record) {
   if (!goalComposerAction(record?.action, record?.payload) || !validGoalComposerDraft(record.draft)) return record;
   let imageIndex = 0;
   return { ...record, draft: { ...record.draft, attachments: record.draft.attachments.map(entry => {
-    if (entry.kind !== "inline") return entry;
+    if (!["inline", "staged-image"].includes(entry.kind)) return entry;
     const index = imageIndex++, image = record.payload.images?.[index];
+    if (entry.kind !== "inline") return entry;
     if (!image || image.dataUrl !== entry.dataUrl) return entry;
     const { dataUrl, ...metadata } = entry;
     return { ...metadata, goalImageIndex: index };

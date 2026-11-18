@@ -4,6 +4,7 @@ import {
   bindMessageVideos, loadAttachmentThumbnail, retryOriginalImage, safeInlineImageSource
 } from "../../attachments.js";
 import { prepareRemoteTunnelAccess } from "../../channels.js";
+import { desktopImagePattern } from "../../local-inputs.js";
 import {
   bindLocalFileReferences, markdown, prepareMessageImage, settleMessageImage,
   withStableMessageLayout
@@ -145,7 +146,9 @@ function bindMessageImages(node) {
 }
 export function messageImage(asset, label, inlineSource, previous) {
   const remoteUrl = /^\/api\/images\/[A-Za-z0-9_-]{20,128}$/.test(asset?.url || "") ? asset.url : null;
-  const source = remoteUrl || safeInlineImageSource(inlineSource);
+  const desktopUrl = typeof inlineSource === "string" && inlineSource.startsWith("/api/desktop/input-files/")
+    && desktopImagePattern.test(inlineSource) ? inlineSource : null;
+  const source = remoteUrl || desktopUrl || safeInlineImageSource(inlineSource);
   if (!source) return null;
   const caption = label || "图片附件";
   if (previous?.messageImageSource === source && previous.messageImageLabel === caption) return previous;
@@ -157,7 +160,10 @@ export function messageImage(asset, label, inlineSource, previous) {
   } else link.type = "button";
   image.alt = caption; image.loading = "lazy"; image.decoding = "async";
   loadAttachmentThumbnail(image, source);
-  link.append(image); bindMessageImages(link); return link;
+  link.append(image);
+  if (desktopUrl) link.onclick = () => openImagePreview(link, image);
+  else bindMessageImages(link);
+  return link;
 }
 export function setMarkdown(node, text, remoteImages = [], options) {
   node.markdownSource = { text, remoteImages, options };

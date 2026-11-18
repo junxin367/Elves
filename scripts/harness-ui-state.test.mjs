@@ -8,7 +8,7 @@ import { createSelectComponent } from "../assets/harness/ui/select.js";
 import { mountInstancePermissions, permissionLabel, permissionModeKnown, permissionOptions } from "../assets/harness/permissions.js";
 import { menuHorizontalLeft } from "../assets/harness/ui/position.js";
 import { localFileReference } from "../assets/harness/file-reference.js";
-import { copyLocalInput, isLocalInput, localInputBridge, validateLocalInputs } from "../assets/harness/local-inputs.js";
+import { copyLocalInput, desktopImagePattern, imageAttachmentPayload, isLocalInput, localInputBridge, stagedImageUrl, validateLocalInputs } from "../assets/harness/local-inputs.js";
 import { captureTransferInputs, hasTransferFiles, readTransferInputs, stageTransferredInputs } from "../assets/harness/transfer-inputs.js";
 import { marked, Renderer } from "../assets/harness/vendor/marked.esm.js";
 import { defaultSharedSettings } from "../assets/harness/features/settings/shared-state.js";
@@ -1326,7 +1326,7 @@ async function localAttachmentHarness() {
   };
   const context = vm.createContext({
     nativeConnectionVersion: 1, Blob, Uint8Array, TextEncoder, TextDecoder, atob,
-    isLocalInput, copyLocalInput, validateLocalInputs,
+    isLocalInput, copyLocalInput, validateLocalInputs, desktopImagePattern, imageAttachmentPayload, stagedImageUrl,
     AbortController, captureTransferInputs, hasTransferFiles, readTransferInputs, stageTransferredInputs,
     FileReader: class {
       readAsDataURL(blob) {
@@ -1431,6 +1431,55 @@ test("本机附件拖入 40 MiB 只暂存文件流，草稿及发送保留引用
   assert.throws(() => validateLocalInputs([entry, { ...entry, kind: "folder",
     staged: { ...entry.staged, entries: 510 } }], { allowStaged: true }), /512/);
   await assert.rejects(() => readTransferInputs([{ file }]), /12 MiB/);
+});
+
+test("本机 Codex 选择、拖放和截图粘贴保留大图字节与引用；其他端仍按原额度拒绝", async () => {
+  for (const source of ["picker", "drop", "paste", "side-panel-drop"]) {
+    const h = await localAttachmentHarness(), c = h.context;
+    const bytes = new Uint8Array(13 * 1024 * 1024);
+    bytes.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const file = attachmentTestFile("截图.png", bytes, "image/png");
+    file.arrayBuffer = () => assert.fail("本机大图不能整体转成 Base64");
+    const entry = { kind: "file", name: file.name, size: file.size,
+      staged: { id: "00000000-0000-4000-8000-000000000002", index: 0, entries: 1 } };
+    const calls = [];
+    if (source === "side-panel-drop") c.localInputBridge = () => null;
+    else h.bridge.pickStaged = () => [];
+    vm.runInContext("desktopImageInputAvailable = () => true", c);
+    c.stageTransferredInputs = async (manifest, blobs) => {
+      assert.equal(blobs[0], file);
+      assert.equal(manifest[0].size, file.size);
+      calls.push("stage");
+      return [entry];
+    };
+    c.fetch = async (url, options) => {
+      assert.equal(url, stagedImageUrl(entry));
+      assert.equal(options.method, "HEAD");
+      calls.push("verify");
+      return { ok: true, headers: new Headers({ "Content-Type": "image/png" }) };
+    };
+    if (source.endsWith("drop")) await c.addTransferredInputs([{ file }]);
+    else if (source === "paste") {
+      assert.equal(c.handleComposerImagePaste({ clipboardData: { files: [file] }, preventDefault() {} }), true);
+      while (c.composerAttachmentsLoading()) await new Promise(resolve => setImmediate(resolve));
+    } else await c.addFiles([file]);
+    assert.deepEqual(calls, ["stage", "verify"]);
+    assert.deepEqual(h.notices, []);
+    const draft = c.composerAttachmentSnapshot();
+    c.clearComposerAttachments();
+    c.setComposerAttachments(draft);
+    assert.deepEqual(JSON.parse(JSON.stringify(c.composerAttachmentsPayload())),
+      [{ name: entry.name, mime: "image/png", size: file.size, staged: entry.staged }]);
+    const thumbnail = {};
+    c.loadAttachmentThumbnail(thumbnail, stagedImageUrl(entry), "image/png");
+    assert.equal(thumbnail.src, `${stagedImageUrl(entry)}/thumbnail`);
+    assert.equal(thumbnail.originalImageSource, stagedImageUrl(entry));
+    c.clearComposerAttachments();
+    vm.runInContext("desktopImageInputAvailable = () => false", c);
+    await c.addFiles([file]);
+    assert.match(h.notices.at(-1), /12 MiB/);
+    assert.deepEqual(calls, ["stage", "verify"]);
+  }
 });
 
 test("现代目录 handle 同样保留目录，捕获拒绝不会降级为空文件", async () => {
@@ -4805,7 +4854,7 @@ test("Claude 队列编辑使用会话图片能力，桌面离线不禁用保存�
     editing: true, hasAttachments: true, editingQueuedMessage: { imageEditing: true },
     composerAttachmentsPayload: () => [{ name: "new.png" }],
   });
-  const unsupported = vm.runInContext(`() => {${sourceSection("  const unsupportedImages =", "  const queueImageNote =")}
+  const unsupported = vm.runInContext(`() => {${sourceSection("  const inputImages =", "  const queueImageNote =")}
     return unsupportedImages; }`, context);
   assert.equal(unsupported(), false);
   assert.equal(context.queueCapability("queueEditRecovery"), true);
@@ -7576,7 +7625,7 @@ function queuedEditFeedbackHarness() {
       : selector === "#send-status" ? status : h.prompt,
     session: { device: { id: "device-a" }, capabilities: {} },
     sending: null, compacting: false, goalMode: false, editing: true, editingMessage: null, active: false, hasAttachments: false,
-    unsupportedImages: false, unsupportedProjectless: false, goalReason: "", queueOnly: false,
+    unsupportedImages: false, unsupportedStagedImages: false, unsupportedProjectless: false, goalReason: "", queueOnly: false,
     sessionTypeEnabled: true,
     compactionSendReason: "", compaction: { state: "idle" }, deleting: false, prompt: h.prompt.value,
     pageLeaving: false, stream: null, composerDiagnosticState: "", creating: false,

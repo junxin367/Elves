@@ -1,6 +1,6 @@
 import { remoteMediaCandidates, remoteMediaUrl } from "./channels.js";
 import { sha256Hex } from "./sha256.js";
-import { copyLocalInput, isLocalInput, localInputBridge, validateLocalInputs } from "./local-inputs.js";
+import { copyLocalInput, desktopImagePattern, imageAttachmentPayload, isLocalInput, localInputBridge, stagedImageUrl, validateLocalInputs } from "./local-inputs.js";
 import { captureTransferInputs, hasTransferFiles, readTransferInputs, stageTransferredInputs } from "./transfer-inputs.js";
 import { icon } from "./ui/icons.js";
 
@@ -522,6 +522,14 @@ export function retryOriginalImage(image) {
 
 export function loadAttachmentThumbnail(image, source, mime = "") {
   image.originalImageSource = source;
+  if (typeof source === "string" && source.startsWith("/api/desktop/input-files/")
+      && desktopImagePattern.test(source)) {
+    // 本机小图不借用远程授权或线路；点击查看仍使用完整原图地址。
+    image.attachmentRecovery = { source, candidates: [`${source}/thumbnail`], attempted: new Set() };
+    image.onerror = null;
+    retryOriginalImage(image);
+    return;
+  }
   const thumbnail = remoteImagePattern.test(source) && mime !== "image/gif" ? `${source}/thumbnail` : source;
   if (remoteImagePattern.test(source)) {
     // 第二线路仍由服务端校验 Origin 和媒体凭证；无 CORS 的图片会被 CORP 拦截。
@@ -549,6 +557,7 @@ let composerPrompt = null;
 let changeListener = () => {};
 let showNotice = () => {};
 let previewImage = () => {};
+let desktopImageInputAvailable = () => false;
 let disabled = false;
 let locked = false;
 let remoteRemovalAllowed = false;
@@ -563,6 +572,7 @@ function attachmentName(value, fallback = "图片") {
 
 function copyAttachment(entry) {
   if (isLocalInput(entry)) return copyLocalInput(entry);
+  if (entry.kind === "staged-image") return { ...imageAttachmentPayload(entry), kind: entry.kind };
   return entry.kind === "inline"
     ? {
         kind: "inline",
@@ -776,6 +786,43 @@ async function readImageFile(file) {
   };
 }
 
+const desktopRasterExtensions = { "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp" };
+
+function canStageDesktopImages() {
+  // 侧边会话不注入原生桥；浏览器已提供 Blob 时，只需要本机服务确认原图能力。
+  return desktopImageInputAvailable();
+}
+
+async function readComposerImage(file, staged, signal) {
+  if (!staged || !(file instanceof Blob) || !file.size) return readImageFile(file);
+  const mime = detectImageMime(new Uint8Array(await file.slice(0, 256).arrayBuffer()));
+  if (!supportedMimes.has(mime)) return readImageFile(file);
+  const declared = canonicalImageMime(file.type);
+  if ((supportedMimes.has(declared) || convertibleMimes.has(declared)) && declared !== mime)
+    throw new Error("图片扩展类型与实际内容不一致");
+  // 参考 Codex App：保留原始 PNG/JPEG/GIF/WebP 字节，不在添加时压图或把原图转成 Base64。
+  const ext = desktopRasterExtensions[mime];
+  let name = attachmentName(file.name, `图片.${ext}`);
+  if (!new RegExp(`\\.${ext === "jpg" ? "(?:jpe?g)" : ext}$`, "iu").test(name))
+    name = `${name.replace(/\.[^.]+$/u, "")}.${ext}`;
+  const [reference] = await stageTransferredInputs(
+    [{ kind: "file", name, size: file.size, files: [{ path: name, size: file.size }], directories: [] }],
+    [file], signal
+  );
+  return previewStagedImage(reference, mime, signal);
+}
+
+async function previewStagedImage(reference, mime, signal) {
+  const entry = { kind: "staged-image", name: reference.name, size: reference.size, mime, staged: reference.staged };
+  const url = stagedImageUrl(entry);
+  if (!url) throw new Error("本机图片暂存回执不完整，请重新添加");
+  // HEAD 核验归属、格式和尺寸，不为添加图片下载整份原图。
+  const response = await fetch(url, { method: "HEAD", signal, cache: "no-store", redirect: "error", credentials: "same-origin" });
+  if (!response.ok || response.headers.get("Content-Type") !== mime)
+    throw new Error("本机图片无法读取、格式不一致或尺寸过大");
+  return entry;
+}
+
 function renderComposerAttachments() {
   if (!attachmentRoot) return;
   attachmentRoot.replaceChildren();
@@ -796,7 +843,8 @@ function renderComposerAttachments() {
     } else {
       const image = document.createElement("img");
       image.className = "composer-attachment-image";
-      loadAttachmentThumbnail(image, entry.kind === "inline" ? entry.dataUrl : entry.url, entry.mime);
+      loadAttachmentThumbnail(image, entry.kind === "inline" ? entry.dataUrl
+        : entry.kind === "staged-image" ? stagedImageUrl(entry) : entry.url, entry.mime);
       image.alt = entry.name;
       image.title = entry.name;
       image.decoding = "async";
@@ -850,9 +898,10 @@ async function addFiles(files) {
     showNotice(`每条消息最多添加 ${MAX_IMAGE_COUNT} 张图片`, true);
     return true;
   }
+  const staged = canStageDesktopImages();
   const currentBytes = attachments.reduce((total, entry) =>
     total + (entry.kind === "inline" ? entry.size : 0), 0);
-  if (currentBytes + candidates.reduce((total, file) => total + file.size, 0) > MAX_TOTAL_BYTES) {
+  if (!staged && currentBytes + candidates.reduce((total, file) => total + file.size, 0) > MAX_TOTAL_BYTES) {
     showNotice("图片总大小不能超过 12 MiB", true);
     return true;
   }
@@ -861,9 +910,11 @@ async function addFiles(files) {
   changeListener();
   const version = attachmentVersion;
   try {
+    if (staged) localInputUpload = new AbortController();
+    const signal = localInputUpload?.signal;
     const next = [], errors = [];
     for (const file of candidates) {
-      try { next.push(await readImageFile(file)); }
+      try { next.push(await readComposerImage(file, staged, signal)); }
       catch (error) { errors.push(`${attachmentName(file?.name)}：${error?.message || "无法添加图片"}`); }
       if (version !== attachmentVersion) return true;
     }
@@ -876,6 +927,7 @@ async function addFiles(files) {
     showNotice(error?.message || "无法添加图片", true);
   } finally {
     if (version === attachmentVersion) {
+      localInputUpload = null;
       readingFiles = false;
       if (attachmentInput) attachmentInput.value = "";
       renderComposerAttachments();
@@ -885,13 +937,14 @@ async function addFiles(files) {
   return true;
 }
 
-export function mountComposerAttachments({ form, prompt, onChange, notice, onPreview } = {}) {
+export function mountComposerAttachments({ form, prompt, onChange, notice, onPreview, allowDesktopImages } = {}) {
   if (!(form instanceof HTMLElement) || !(prompt instanceof HTMLElement))
     throw new Error("图片附件组件缺少编辑框");
   composerPrompt = prompt;
   changeListener = typeof onChange === "function" ? onChange : () => {};
   showNotice = typeof notice === "function" ? notice : () => {};
   previewImage = typeof onPreview === "function" ? onPreview : () => {};
+  desktopImageInputAvailable = typeof allowDesktopImages === "function" ? allowDesktopImages : () => false;
   attachmentRoot = document.createElement("div");
   attachmentRoot.id = "composer-attachments";
   attachmentRoot.className = "composer-attachments";
@@ -947,20 +1000,29 @@ export function composerCanAddLocalInputs() {
 async function addLocalInputs(read, fallback = null, classifyImages = false) {
   if (!composerCanAddLocalInputs()) { showNotice("当前不能添加文件和文件夹", true); return; }
   const version = attachmentVersion;
+  const staged = canStageDesktopImages();
   readingFiles = true; renderComposerAttachments(); changeListener();
   try {
     const next = await read();
     if (version !== attachmentVersion) return;
     if (next.length) {
       const checked = validateLocalInputs(next, { allowStaged: desktopStagedInputsSupported() }), images = [], inputs = [];
+      const converted = [];
+      if (staged && classifyImages) localInputUpload = new AbortController();
+      const signal = localInputUpload?.signal;
       for (const entry of checked) {
-        if (classifyImages && !entry.staged && entry.kind === "file" && imageFileExtensions.test(entry.name)) {
+        const mime = classifyImages && staged && entry.kind === "file" && entry.staged
+          ? ({ png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp" })[entry.name.split(".").at(-1).toLowerCase()]
+          : null;
+        if (mime) {
+          converted.push(await previewStagedImage(entry, mime, signal));
+          if (version !== attachmentVersion) return;
+        } else if (classifyImages && !entry.staged && entry.kind === "file" && imageFileExtensions.test(entry.name)) {
           const bytes = Uint8Array.from(atob(entry.files[0].data), character => character.charCodeAt(0));
           images.push(Object.assign(new Blob([bytes]), { name: entry.name }));
         } else inputs.push(entry);
       }
-      validateAttachmentBatch(inputs, images.map(file => ({ kind: "inline", size: file.size })));
-      const converted = [];
+      validateAttachmentBatch(inputs, [...converted, ...images.map(file => ({ kind: "inline", size: file.size }))]);
       for (const file of images) {
         converted.push(await readImageFile(file));
         if (version !== attachmentVersion) return;
@@ -977,6 +1039,7 @@ async function addLocalInputs(read, fallback = null, classifyImages = false) {
     if (version === attachmentVersion) showNotice(error?.message || String(error) || "无法添加附件", true);
   } finally {
     if (version === attachmentVersion) {
+      localInputUpload = null;
       readingFiles = false; renderComposerAttachments(); changeListener();
       composerPrompt?.focus({ preventScroll: true });
     }
@@ -999,6 +1062,7 @@ async function addTransferredInputs(captured) {
   readingFiles = true; renderComposerAttachments(); changeListener();
   try {
     const forDesktop = desktopStagedInputsSupported();
+    const stageImages = canStageDesktopImages();
     const batch = await readTransferInputs(captured, { isImageFile: imageInputFile,
       isCurrent: () => version === attachmentVersion, forDesktop });
     if (version !== attachmentVersion) return;
@@ -1012,12 +1076,12 @@ async function addTransferredInputs(captured) {
       if ([...existing, ...batch.inputs].reduce((count, entry) => count + entries(entry), 0) > 512)
         throw new Error("每条消息最多包含 512 个文件和目录项");
     }
-    validateAttachmentBatch(checkInputs, batch.images.map(file => ({ kind: "inline", size: file.size })));
-    if (forDesktop && batch.inputs.length) localInputUpload = new AbortController();
+    validateAttachmentBatch(checkInputs, batch.images.map(file => ({ kind: stageImages ? "staged-image" : "inline", size: file.size })));
+    if (stageImages || forDesktop && batch.inputs.length) localInputUpload = new AbortController();
     const signal = localInputUpload?.signal;
     const images = [];
     for (const file of batch.images) {
-      images.push(await readImageFile(file));
+      images.push(await readComposerImage(file, stageImages, signal));
       if (version !== attachmentVersion) return;
       validateAttachmentBatch(checkInputs, images);
     }
@@ -1057,7 +1121,7 @@ export function chooseComposerLocalInputs() {
 
 function pasteLocalInputs() {
   const bridge = localInputBridge();
-  return typeof bridge?.pasteStaged === "function" ? bridge.pasteStaged() : bridge?.paste() || [];
+  return typeof bridge?.pasteStaged === "function" ? bridge.pasteStaged(canStageDesktopImages()) : bridge?.paste() || [];
 }
 
 export function handleComposerLocalPaste(event) {
@@ -1125,7 +1189,7 @@ export function composerAttachmentSnapshot() {
 export function composerAttachmentsPayload() {
   return attachments.flatMap(entry => entry.kind === "inline"
     ? [{ name: entry.name, mime: entry.mime, dataUrl: entry.dataUrl, size: entry.size }]
-    : []);
+    : entry.kind === "staged-image" ? [imageAttachmentPayload(entry)] : []);
 }
 
 export function composerRemoteAttachmentSources() {
@@ -1145,6 +1209,9 @@ export function setComposerAttachments(value = [], { readOnly = false, removable
     }
     if (entry?.kind === "inline" && supportedMimes.has(entry.mime)
         && typeof entry.dataUrl === "string" && Number.isFinite(entry.size) && imageCount++ < MAX_IMAGE_COUNT)
+      return [copyAttachment(entry)];
+    if (entry?.kind === "staged-image" && supportedMimes.has(entry.mime) && stagedImageUrl(entry)
+        && typeof entry.name === "string" && Number.isSafeInteger(entry.size) && entry.size > 0 && imageCount++ < MAX_IMAGE_COUNT)
       return [copyAttachment(entry)];
     if (entry?.kind === "remote" && (remoteImagePattern.test(entry.url) || safeInlineImageSource(entry.url))
         && imageCount++ < MAX_IMAGE_COUNT)

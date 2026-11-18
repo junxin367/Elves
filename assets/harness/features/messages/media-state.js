@@ -5,6 +5,7 @@ import {
   safeInlineImageSource
 } from "../../attachments.js";
 import { remoteMediaUrl } from "../../channels.js";
+import { desktopImagePattern } from "../../local-inputs.js";
 import { renderMermaidBlocks, withStableMessageLayout } from "../../markdown.js";
 import { $, button, element } from "../../ui/dom.js";
 import { icon } from "../../ui/icons.js";
@@ -115,9 +116,10 @@ function enableImagePreviewZoom(viewport, image) {
 export function openImagePreview(link, image) {
   const source = link.getAttribute("href") || image.originalImageSource || image.getAttribute("src") || "";
   const remoteSource = /^\/api\/images\/[A-Za-z0-9_-]{20,128}$/.test(source);
+  const desktopSource = source.startsWith("/api/desktop/input-files/") && desktopImagePattern.test(source);
   const inlineSource = safeInlineImageSource(source, { allowSvg: true });
-  if (!remoteSource && !inlineSource) return;
-  if (requestWorkspaceMediaPreview({ kind: "image", source: remoteSource ? source : inlineSource, name: image.alt || "图片" })) return;
+  if (!remoteSource && !desktopSource && !inlineSource) return;
+  if (!desktopSource && requestWorkspaceMediaPreview({ kind: "image", source: remoteSource ? source : inlineSource, name: image.alt || "图片" })) return;
   $("#image-preview-dialog")?.close();
   rememberTransientHistory();
   const trigger = link;
@@ -176,7 +178,7 @@ export function openImagePreview(link, image) {
   };
   preview.onload = present;
   if (remoteSource) preview.crossOrigin = "anonymous";
-  preview.alt = image.alt || "图片预览"; preview.src = remoteMediaUrl(remoteSource ? source : inlineSource);
+  preview.alt = image.alt || "图片预览"; preview.src = desktopSource ? source : remoteMediaUrl(remoteSource ? source : inlineSource);
   preview.onerror = () => {
     disposeZoom?.();
     viewport.textContent = "图片不可用，请关闭后重试";
