@@ -4,7 +4,7 @@ import { exportAndroidDiagnostics, sendAndroidDiagnostics } from "../../diagnost
 import { mountInstancePermissions } from "../../permissions.js";
 import {
   getAndroidAppInfo, getAndroidNotificationSettings, isAndroidContainer,
-  openAndroidNotificationSystemSettings, postPlatformMessage, requestAndroidNotificationPermission,
+  openAndroidNotificationSystemSettings, requestAndroidNotificationPermission,
   subscribeAndroidNotificationSettings
 } from "../../platform.js";
 import { getPwaCacheState, retryPwaCache } from "../../pwa.js";
@@ -347,9 +347,7 @@ export function mountSettingsPage(screen, { onBack, fromLogin = false }) {
     <div class="appearance-field appearance-thread-limit-field"><span>每个项目显示会话数</span><div id="appearance-project-thread-limit-slot"></div></div>
     <div id="appearance-cache-state" class="appearance-field" role="status"></div>
     </div></section>
-    ${androidContainer ? `<section id="appearance-app-section" class="appearance-section" hidden><h4>应用</h4><div class="appearance-card">
-    <div class="appearance-field"><span>应用版本</span><button type="button" class="text-button appearance-version" id="appearance-app-version" disabled></button></div>
-    </div></section>` : ""}
+    <!-- 用户要求设置页不再提供“应用”及“应用信息”；Android 专属工具仅保留通知与诊断。 -->
     </section>
     ${instanceSettingPages.map(page => `<section id="appearance-${page.id}-page" class="appearance-body appearance-settings-page" hidden>
     <h3 class="appearance-panel-title">${page.label}</h3>
@@ -823,20 +821,6 @@ export function mountSettingsPage(screen, { onBack, fromLogin = false }) {
   if (androidContainer) {
     // 原生返回先于隐藏会话的返回处理；有真正的弹窗时交还它自己的处理器。
     window.addEventListener("codex-elves-native-back", onNativeBack, true);
-    const versionButton = find("#appearance-app-version");
-    void getAndroidAppInfo().then(info => {
-      if (!isOpen() || !info?.versionName) return;
-      versionButton.textContent = `v${info.versionName}`;
-      versionButton.disabled = !info.updateSupported;
-      versionButton.title = info.updateSupported ? "点击检查更新" : "当前应用暂不支持在线更新";
-      versionButton.setAttribute("aria-label", info.updateSupported
-        ? `当前应用版本 v${info.versionName}，点击检查更新`
-        : `当前应用版本 v${info.versionName}，暂不支持在线更新`);
-      find("#appearance-app-section").hidden = false;
-    }).catch(() => {});
-    versionButton.onclick = () => {
-      if (isOpen() && !versionButton.disabled) postPlatformMessage("check-app-update");
-    };
   }
   window.addEventListener("keydown", onAppearanceEscape, true);
   const modeButtons = new Map();
