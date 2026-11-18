@@ -2922,8 +2922,8 @@ impl Claude {
                     || job_id.len() == 8 && job_id.bytes().all(|byte| byte.is_ascii_hexdigit())),
             "Claude 原生会话身份无效"
         );
-        let (thread, turns, turn_ids, session_plan, completed, usage_changed, changed, reverted) =
-            self.change(|saved| {
+        let update = self
+            .change(|saved| {
                 let c = saved
                     .conversations
                     .get_mut(id)
@@ -3054,6 +3054,14 @@ impl Claude {
                 if !generation.starts_with("native-history-") {
                     c.discovered = false;
                 }
+                // 用户要求标题只按本次压缩后的新轮次更新；只接收实时原生快照的增量，不因读取旧历史开新一轮。
+                let naming_activity = if history_changed && !initial_import && !reverted
+                    && !generation.starts_with("native-history-")
+                {
+                    super::conversation_naming::claude_refresh_activity(&c.turns, &projected)
+                } else {
+                    Vec::new()
+                };
                 c.turns = projected;
                 // 用户要求正文不反复出现/隐藏：元数据快照沿用同一预览，正式正文或轮次变化时一次性退役。
                 if c.live_preview.as_ref().is_some_and(|preview| {
@@ -3089,9 +3097,19 @@ impl Claude {
                     usage_changed,
                     changed,
                     reverted,
+                    naming_activity,
                 ))
             })
             .await?;
+        let (
+            thread, turns, turn_ids, session_plan, completed, usage_changed, changed, reverted,
+            naming_activity,
+        ) = update;
+        if !naming_activity.is_empty()
+            && let Some(controller) = self.controller.get().and_then(Weak::upgrade)
+        {
+            controller.conversation_naming.observe_refresh(id, naming_activity);
+        }
         self.observed
             .lock()
             .await

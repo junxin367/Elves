@@ -74,8 +74,9 @@ export function mountConversationNaming(page) {
   const lengthBox = element("span", "appearance-number"); lengthBox.append(length);
   const intervalBox = element("span", "appearance-number"); intervalBox.append(interval);
   row(namingLabels.maxTitleChars, "默认 36 个字符，可设置为 10～120 个字符。", lengthBox);
-  row(namingLabels.refresh, "仅在自动命名开启后生效；按标题更新间隔检查主题，主题未变时保留原标题。手动重命名后停止更新。", refresh);
-  row(namingLabels.refreshEveryTurns, "标题生成后，默认每完成 5 个成功轮次检查一次；失败、中断和重复事件不计数。", intervalBox);
+  row(namingLabels.refresh, "仅在自动命名开启后生效；每次成功压缩后最多检查一次，主题未变时保留原标题。手动重命名后停止更新。", refresh);
+  // 标题更新间隔只累计最新一次成功压缩之后的成功对话，压缩所在轮不计入默认的 5 轮。
+  row(namingLabels.refreshEveryTurns, "从最近一次成功压缩后开始计数，默认满 5 个成功轮次检查标题。压缩所在轮、失败、中断和重复轮次不计。", intervalBox);
   const promptSettings = button("设置", `设置${namingLabels.systemPrompt}`, openNamingPrompt);
   promptSettings.setAttribute("aria-haspopup", "dialog");
   row(namingLabels.systemPrompt, "", promptSettings, "div");

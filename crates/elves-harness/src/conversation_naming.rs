@@ -106,10 +106,37 @@ struct Record {
     manual: bool,
     attempted: bool,
     generated_title: Option<String>,
-    completed: u64,
-    last_attempt: u64,
+    // 旧版的 completed/lastAttempt 不参与迁移：没有已确认的压缩边界，就没有更新计数。
+    refresh_window: Option<RefreshWindow>,
+    seen_compactions: VecDeque<String>,
     seen_turns: VecDeque<String>,
     updated_at: u64,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RefreshWindow {
+    compaction_id: String,
+    completed: u64,
+    checked: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum RefreshActivity {
+    Compacted { id: String, turn: String },
+    FinishedTurn(String),
+    CompletedTurn(String),
+}
+
+fn remember_id(ids: &mut VecDeque<String>, id: String) -> bool {
+    if id.is_empty() || ids.contains(&id) {
+        return false;
+    }
+    ids.push_back(id);
+    while ids.len() > 128 {
+        ids.pop_front();
+    }
+    true
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -122,9 +149,8 @@ struct Saved {
 #[derive(Default)]
 struct Runtime {
     saved: Saved,
-    pending: HashSet<String>,
-    // 完成事件可能先于发送回执；短暂保留真实轮次 ID，登记会话后补齐计数。
-    early: HashMap<String, VecDeque<String>>,
+    // 同会话只运行一项命名；在途时收到新的轮次完成，只合并为一次后续核对。
+    pending: HashMap<String, bool>,
 }
 
 pub(super) struct ConversationNaming {
@@ -187,59 +213,126 @@ impl ConversationNaming {
         let mut state = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
         let record = state.saved.records.entry(id.to_owned()).or_default();
         record.manual = true;
+        record.refresh_window = None;
         record.updated_at = super::now_ms();
         self.persist(&state)
     }
 
     pub fn observe(self: &Arc<Self>, event: &Value) {
-        if event["method"] != "turn/completed"
-            || event["params"]["turn"]["status"] != "completed"
-            || !event["params"]["turn"]["error"].is_null()
-        {
+        if !matches!(
+            event["method"].as_str(),
+            Some("item/completed" | "turn/completed")
+        ) {
             return;
         }
-        let Some(id) = event["params"]["threadId"].as_str() else {
+        let params = &event["params"];
+        let Some(id) = params["threadId"].as_str().filter(|id| !id.is_empty()) else {
             return;
         };
-        let Some(turn) = event["params"]["turn"]["id"].as_str() else {
+        let Some(turn) = params["turn"]["id"]
+            .as_str()
+            .or_else(|| params["turnId"].as_str())
+            .filter(|turn| !turn.is_empty())
+        else {
             return;
         };
+        let activity = if event["method"] == "item/completed" {
+            let item = &params["item"];
+            if item["type"] != "contextCompaction" {
+                return;
+            }
+            // Codex 原生 item/completed 的 contextCompaction 可能没有 status；
+            // 受理、开始、显式失败、中断及无需压缩都不是计数起点。
+            if let Some(item_id) = item["id"].as_str().filter(|id| !id.is_empty())
+                && (item["status"].is_null() || item["status"] == "completed")
+                && item["error"].is_null()
+                && item["completed"] != false
+                && item["outcome"] != "noop"
+            {
+                RefreshActivity::Compacted {
+                    id: item_id.to_owned(),
+                    turn: turn.to_owned(),
+                }
+            } else {
+                RefreshActivity::FinishedTurn(turn.to_owned())
+            }
+        } else {
+            let outcome = &params["turn"];
+            let ordinary = outcome["status"] == "completed"
+                && outcome["error"].is_null()
+                && outcome["_nativeEndedWithoutReply"] != true
+                && !outcome["items"].as_array().is_some_and(|items| {
+                    !items.is_empty()
+                        && items.iter().all(|item| item["type"] == "contextCompaction")
+                });
+            if ordinary {
+                RefreshActivity::CompletedTurn(turn.to_owned())
+            } else {
+                RefreshActivity::FinishedTurn(turn.to_owned())
+            }
+        };
+        self.observe_refresh(id, [activity]);
+    }
+
+    pub(super) fn observe_refresh(
+        self: &Arc<Self>,
+        id: &str,
+        activities: impl IntoIterator<Item = RefreshActivity>,
+    ) {
         let should_refresh = {
             let mut state = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(record) = state.saved.records.get_mut(id) {
-                if record.manual || record.seen_turns.iter().any(|seen| seen == turn) {
-                    return;
-                }
-                record.seen_turns.push_back(turn.into());
-                if record.seen_turns.len() > 128 {
-                    record.seen_turns.pop_front();
-                }
-                record.completed = record.completed.saturating_add(1);
-                record.updated_at = super::now_ms();
-                let named = record.generated_title.is_some();
-                if let Err(error) = self.persist(&state) {
-                    drop(state);
-                    if let Some(controller) = self.controller.get().and_then(Weak::upgrade) {
-                        self.failed(&controller, id, &error);
-                    } else {
-                        self.log_failure(id, &error);
+            let Some(record) = state.saved.records.get_mut(id).filter(|r| !r.manual) else {
+                return;
+            };
+            let mut changed = false;
+            let mut counted = false;
+            for activity in activities {
+                match activity {
+                    RefreshActivity::Compacted { id, turn } => {
+                        if !remember_id(&mut record.seen_compactions, id.clone()) {
+                            continue;
+                        }
+                        // 用户要求只从最新一次成功压缩之后计数。压缩所在轮（包括独立 /compact）不计。
+                        remember_id(&mut record.seen_turns, turn);
+                        record.refresh_window = Some(RefreshWindow {
+                            compaction_id: id,
+                            completed: 0,
+                            checked: false,
+                        });
+                        changed = true;
+                        counted = false;
                     }
-                    return;
+                    RefreshActivity::FinishedTurn(turn) => {
+                        changed |= remember_id(&mut record.seen_turns, turn);
+                    }
+                    RefreshActivity::CompletedTurn(turn) => {
+                        if !remember_id(&mut record.seen_turns, turn) {
+                            continue;
+                        }
+                        changed = true;
+                        if let Some(window) = record.refresh_window.as_mut().filter(|w| !w.checked)
+                        {
+                            window.completed = window.completed.saturating_add(1);
+                            counted = true;
+                        }
+                    }
                 }
-                named
-            } else {
-                if state.early.len() >= 512 {
-                    state.early.clear();
-                }
-                let turns = state.early.entry(id.to_owned()).or_default();
-                if !turns.iter().any(|seen| seen == turn) {
-                    turns.push_back(turn.into());
-                }
-                if turns.len() > 128 {
-                    turns.pop_front();
-                }
-                false
             }
+            if !changed {
+                return;
+            }
+            record.updated_at = super::now_ms();
+            let due = counted && record.generated_title.is_some();
+            if let Err(error) = self.persist(&state) {
+                drop(state);
+                if let Some(controller) = self.controller.get().and_then(Weak::upgrade) {
+                    self.failed(&controller, id, &error);
+                } else {
+                    self.log_failure(id, &error);
+                }
+                return;
+            }
+            due
         };
         if should_refresh {
             self.schedule(id.to_owned(), None);
@@ -292,17 +385,11 @@ impl ConversationNaming {
                     return Ok(());
                 }
                 let mut state = service.runtime.lock().unwrap_or_else(|e| e.into_inner());
-                let early = state.early.remove(&id).unwrap_or_default();
                 let record = state.saved.records.entry(id.clone()).or_default();
                 record.owner = owner;
-                for turn in early {
-                    if !record.seen_turns.contains(&turn) {
-                        record.completed = record.completed.saturating_add(1);
-                        record.seen_turns.push_back(turn);
-                    }
-                }
                 record.updated_at = super::now_ms();
-                let initial = !record.manual;
+                let initial =
+                    !record.manual && !record.attempted && record.generated_title.is_none();
                 service.persist(&state)?;
                 drop(state);
                 if initial {
@@ -325,23 +412,27 @@ impl ConversationNaming {
     fn schedule(self: &Arc<Self>, id: String, initial_prompt: Option<String>) {
         {
             let mut state = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
-            if !state.pending.insert(id.clone()) {
+            if let Some(again) = state.pending.get_mut(&id) {
+                *again |= initial_prompt.is_none();
                 return;
             }
+            state.pending.insert(id.clone(), false);
         }
         let service = self.clone();
         super::execution::spawn_inherited(async move {
-            if let Some(controller) = service.controller.get().and_then(Weak::upgrade) {
-                if let Err(error) = service.run(&controller, &id, initial_prompt).await {
-                    service.failed(&controller, &id, &error);
+            let mut initial_prompt = initial_prompt;
+            loop {
+                if let Some(controller) = service.controller.get().and_then(Weak::upgrade) {
+                    if let Err(error) = service.run(&controller, &id, initial_prompt.take()).await {
+                        service.failed(&controller, &id, &error);
+                    }
+                }
+                let mut state = service.runtime.lock().unwrap_or_else(|e| e.into_inner());
+                if !state.pending.get_mut(&id).is_some_and(std::mem::take) {
+                    state.pending.remove(&id);
+                    break;
                 }
             }
-            service
-                .runtime
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .pending
-                .remove(&id);
         });
     }
 
@@ -356,23 +447,34 @@ impl ConversationNaming {
         if !settings.enabled {
             return Ok(());
         }
-        let record = {
-            let state = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(record) = state.saved.records.get(id).filter(|r| !r.manual) else {
+        let (record, refresh_compaction) = {
+            let mut state = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(record) = state.saved.records.get_mut(id).filter(|r| !r.manual) else {
                 return Ok(());
             };
             // 首次任务已经启动后，不因收到同一回执、首轮完成或下一条消息再发起首次命名。
-            let due = if record.generated_title.is_none() {
-                !record.attempted && initial_prompt.is_some()
+            let refresh_compaction = if record.generated_title.is_none() {
+                if record.attempted || initial_prompt.is_none() {
+                    return Ok(());
+                }
+                None
             } else {
-                settings.refresh_enabled
-                    && record.completed.saturating_sub(record.last_attempt)
-                        >= settings.refresh_every_turns
+                let Some(window) = record.refresh_window.as_mut().filter(|window| {
+                    settings.refresh_enabled
+                        && !window.checked
+                        && window.completed >= settings.refresh_every_turns
+                }) else {
+                    return Ok(());
+                };
+                // 一次压缩最多检查一次。主题未变、失败或结果未知都不自动重发，等下次确认压缩。
+                window.checked = true;
+                Some(window.compaction_id.clone())
             };
-            if !due {
-                return Ok(());
+            let record = record.clone();
+            if refresh_compaction.is_some() {
+                self.persist(&state)?;
             }
-            record.clone()
+            (record, refresh_compaction)
         };
         let device = controller
             .resolve_device(&record.owner, None)
@@ -420,11 +522,10 @@ impl ConversationNaming {
         {
             let mut state = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
             let current = state.saved.records.get_mut(id).context("命名记录已失效")?;
-            if current.manual {
+            if !naming_attempt_current(current, refresh_compaction.as_deref()) {
                 return Ok(());
             }
             current.attempted = true;
-            current.last_attempt = current.completed;
             self.persist(&state)?;
         }
         let text = self
@@ -435,7 +536,7 @@ impl ConversationNaming {
         let _rename = lock.lock().await;
         let _configuration = self.configuration.read().await;
         authorization.check().await?;
-        // 用户手动改名、停用功能或改换执行模型后，迟到生成结果必须丢弃；写回仍在原会话所属引擎内完成。
+        // 手动改名、命名设置变化或新压缩发生后，迟到结果不能覆盖现有标题。
         if self.settings(controller).await? != settings
             || self
                 .runtime
@@ -444,7 +545,9 @@ impl ConversationNaming {
                 .saved
                 .records
                 .get(id)
-                .is_none_or(|current| current.manual)
+                .is_none_or(|current| {
+                    !naming_attempt_current(current, refresh_compaction.as_deref())
+                })
         {
             return Ok(());
         }
@@ -465,7 +568,14 @@ impl ConversationNaming {
             let mut state = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
             let current = state.saved.records.get_mut(id).context("命名记录已失效")?;
             current.generated_title = Some(generated);
-            current.last_attempt = current.completed;
+            let refresh_due = initial
+                && settings.refresh_enabled
+                && current.refresh_window.as_ref().is_some_and(|window| {
+                    !window.checked && window.completed >= settings.refresh_every_turns
+                });
+            if refresh_due && let Some(again) = state.pending.get_mut(id) {
+                *again = true;
+            }
             state.saved.status = status.clone();
             self.persist(&state)?;
         }
@@ -548,6 +658,83 @@ impl ConversationNaming {
             json!({"threadId":id,"error":error.to_string()}),
         );
     }
+}
+
+fn naming_attempt_current(record: &Record, compaction_id: Option<&str>) -> bool {
+    !record.manual
+        && compaction_id.is_none_or(|id| {
+            record
+                .refresh_window
+                .as_ref()
+                .is_some_and(|window| window.compaction_id == id)
+        })
+}
+
+pub(super) fn claude_refresh_activity(
+    previous: &[Value],
+    current: &[Value],
+) -> Vec<RefreshActivity> {
+    fn compaction_id(item: &Value) -> Option<&str> {
+        // Claude 的 /compact 无需压缩也可返回 completed；只以 JSONL compact_boundary 的原生 ID 为准。
+        if item["type"] == "contextCompaction"
+            && item["status"] == "completed"
+            && item["outcome"] != "noop"
+        {
+            item["nativeId"].as_str().filter(|id| !id.is_empty())
+        } else {
+            None
+        }
+    }
+
+    fn items(turn: &Value) -> impl Iterator<Item = &Value> {
+        turn["items"].as_array().into_iter().flatten()
+    }
+
+    fn turn_id(turn: &Value) -> Option<&str> {
+        turn["_nativeUserId"].as_str().filter(|id| !id.is_empty())
+    }
+
+    fn native_turn_ended(turn: &Value) -> bool {
+        turn["_nativeDone"] == true
+            || matches!(turn["status"].as_str(), Some("failed" | "interrupted"))
+    }
+
+    let old_compactions: HashSet<_> = previous
+        .iter()
+        .flat_map(items)
+        .filter_map(compaction_id)
+        .collect();
+    let old_finished: HashSet<_> = previous
+        .iter()
+        .filter(|turn| native_turn_ended(turn))
+        .filter_map(turn_id)
+        .collect();
+    let mut activity = Vec::new();
+    // 同一个快照可能同时含压缩边界和多条完成回执；按原生历史顺序一次交给计数器。
+    for turn in current {
+        let Some(id) = turn_id(turn) else { continue };
+        for boundary in items(turn)
+            .filter_map(compaction_id)
+            .filter(|id| !old_compactions.contains(id))
+        {
+            activity.push(RefreshActivity::Compacted {
+                id: boundary.to_owned(),
+                turn: id.to_owned(),
+            });
+        }
+        if native_turn_ended(turn) && !old_finished.contains(id) {
+            let successful = turn["status"] == "completed"
+                && turn["error"].is_null()
+                && turn["_nativeEndedWithoutReply"] != true
+                && items(turn).any(|item| item["type"] == "userMessage");
+            activity.push(if successful {
+                RefreshActivity::CompletedTurn(id.to_owned())
+            } else {
+                RefreshActivity::FinishedTurn(id.to_owned())
+            });
+        }
+    }
+    activity
 }
 
 fn checked_title(text: &str, max: usize) -> anyhow::Result<String> {
@@ -727,32 +914,112 @@ mod tests {
     #[tokio::test]
     async fn conversation_naming_completed_turns_deduplicate_and_persist() {
         let directory = tempfile::tempdir().unwrap();
+        // 旧版的周期计数即使已超过阈值，也不能充当本次压缩后的计数。
+        std::fs::write(
+            directory.path().join("remote-conversation-naming.json"),
+            json!({
+                "records":{"fixture":{"generatedTitle":"原名","completed":50,"lastAttempt":0}}
+            })
+            .to_string(),
+        )
+        .unwrap();
         let service = ConversationNaming::new(directory.path()).unwrap();
-        service
-            .runtime
-            .lock()
-            .unwrap()
-            .saved
-            .records
-            .insert("fixture".into(), Record::default());
+        let id = "fixture";
+        service.observe(&completed_turn(id, "old-turn"));
+        let mut noop = compaction(id, "noop-item", "noop-turn");
+        noop["params"]["item"]["outcome"] = json!("noop");
+        service.observe(&noop);
+        assert!(
+            service.runtime.lock().unwrap().saved.records[id]
+                .refresh_window
+                .is_none()
+        );
+
+        service.observe(&compaction(id, "first-boundary", "compaction-turn"));
+        service.observe(&completed_turn(id, "old-turn"));
+        service.observe(&completed_turn(id, "compaction-turn"));
+        service.observe(&completed_turn(id, "after-first"));
+        service.observe(&compaction(id, "second-boundary", "second-compaction-turn"));
+        service.observe(&compaction(id, "first-boundary", "compaction-turn"));
+        service.observe(&completed_turn(id, "second-compaction-turn"));
+        service.observe(&completed_turn(id, "after-first"));
         for index in 0..5 {
-            let event = json!({"method":"turn/completed","params":{"threadId":"fixture","turn":{"id":format!("t{index}"),"status":"completed"}}});
+            let event = completed_turn(id, &format!("t{index}"));
             service.observe(&event);
             service.observe(&event);
         }
         for status in ["failed", "interrupted"] {
-            service.observe(&json!({"method":"turn/completed","params":{"threadId":"fixture","turn":{"id":status,"status":status}}}));
+            let mut failed = completed_turn(id, status);
+            failed["params"]["turn"]["status"] = json!(status);
+            service.observe(&failed);
         }
-        service.observe(&json!({"method":"turn/completed","params":{"threadId":"fixture","turn":{"id":"error","status":"completed","error":{"message":"failure"}}}}));
-        assert_eq!(
-            service.runtime.lock().unwrap().saved.records["fixture"].completed,
-            5
-        );
+        let mut failed = completed_turn(id, "error");
+        failed["params"]["turn"]["error"] = json!({"message":"failure"});
+        service.observe(&failed);
+        for status in ["failed", "interrupted", "unknown"] {
+            let mut failed_compaction =
+                compaction(id, &format!("item-{status}"), &format!("turn-{status}"));
+            failed_compaction["params"]["item"]["status"] = json!(status);
+            service.observe(&failed_compaction);
+        }
+        service.observe(&noop);
         let reopened = ConversationNaming::new(directory.path()).unwrap();
+        reopened.observe(&compaction(id, "second-boundary", "second-compaction-turn"));
+        reopened.observe(&completed_turn(id, "t4"));
+        let state = reopened.runtime.lock().unwrap();
+        let window = state.saved.records[id].refresh_window.as_ref().unwrap();
+        assert_eq!(window.compaction_id, "second-boundary");
+        assert_eq!(window.completed, 5);
+        assert!(!window.checked);
+    }
+
+    fn completed_turn(id: &str, turn: &str) -> Value {
+        json!({"method":"turn/completed","params":{"threadId":id,"turn":{"id":turn,"status":"completed"}}})
+    }
+
+    fn compaction(id: &str, item: &str, turn: &str) -> Value {
+        json!({"method":"item/completed","params":{"threadId":id,"turnId":turn,
+            "item":{"id":item,"type":"contextCompaction"}}})
+    }
+
+    #[test]
+    fn conversation_naming_claude_counts_only_new_native_boundaries_and_completed_user_turns() {
+        let turn = |id: &str| {
+            json!({"id":format!("client-{id}"),"_nativeUserId":id,
+            "status":"completed","_nativeDone":true,
+            "items":[{"type":"userMessage"},{"type":"agentMessage"}]})
+        };
+        let boundary =
+            |id: &str| json!({"type":"contextCompaction","status":"completed","nativeId":id});
+        let mut old = turn("old");
+        old["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(boundary("historical"));
+        let mut compacted_turn = turn("with-auto-compaction");
+        compacted_turn["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(boundary("new-boundary"));
+        let mut noop = turn("local-command");
+        noop["items"] = json!([{"type":"contextCompaction","status":"completed","outcome":"noop"}]);
+        let mut withdrawn = turn("withdrawn");
+        withdrawn["_nativeEndedWithoutReply"] = json!(true);
+        let fresh = vec![old.clone(), compacted_turn, noop, withdrawn, turn("next")];
         assert_eq!(
-            reopened.runtime.lock().unwrap().saved.records["fixture"].completed,
-            5
+            claude_refresh_activity(&[old], &fresh),
+            vec![
+                RefreshActivity::Compacted {
+                    id: "new-boundary".into(),
+                    turn: "with-auto-compaction".into()
+                },
+                RefreshActivity::CompletedTurn("with-auto-compaction".into()),
+                RefreshActivity::FinishedTurn("local-command".into()),
+                RefreshActivity::FinishedTurn("withdrawn".into()),
+                RefreshActivity::CompletedTurn("next".into()),
+            ]
         );
+        assert!(claude_refresh_activity(&fresh, &fresh).is_empty());
     }
 
     #[tokio::test]
@@ -761,10 +1028,11 @@ mod tests {
         let service = ConversationNaming::new(directory.path()).unwrap();
         service.manual("fixture").unwrap();
         let reopened = ConversationNaming::new(directory.path()).unwrap();
-        reopened.observe(&json!({"method":"turn/completed","params":{"threadId":"fixture","turn":{"id":"t","status":"completed"}}}));
+        reopened.observe(&compaction("fixture", "boundary", "compact-turn"));
+        reopened.observe(&completed_turn("fixture", "t"));
         let state = reopened.runtime.lock().unwrap();
         assert!(state.saved.records["fixture"].manual);
-        assert_eq!(state.saved.records["fixture"].completed, 0);
+        assert!(state.saved.records["fixture"].refresh_window.is_none());
     }
 
     async fn naming_fixture(
@@ -854,7 +1122,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conversation_naming_first_message_before_completion_then_every_five_turns() {
+    async fn conversation_naming_first_message_before_completion_then_once_per_compaction() {
         let (_directory, authorization, id, generation) = naming_fixture(false, false).await;
         let controller = &authorization.controller;
         let service = &controller.conversation_naming;
@@ -866,26 +1134,39 @@ mod tests {
                 json!({"mode":"initial","maxTitleChars":36,"firstUserMessage":"wait 验证首条自动命名"})
             ]
         );
-        assert_eq!(
-            service.runtime.lock().unwrap().saved.records[&id].completed,
-            0
+        assert!(
+            service.runtime.lock().unwrap().saved.records[&id]
+                .refresh_window
+                .is_none()
         );
         let inputs = generation.inputs.clone();
         *service.test_generation.lock().unwrap() = Some(TestGeneration {
             text: r#"{"title":"主题变化后的标题","description":"更新"}"#.into(),
             ..generation
         });
-        for index in 0..4 {
-            controller.publish_event(
-                json!({"method":"turn/completed","params":{"threadId":id,"turn":{
-                    "id":format!("completed-{index}"),"status":"completed"
-                }}}),
-            );
+        for index in 0..6 {
+            controller.publish_event(completed_turn(&id, &format!("before-{index}")));
         }
+        assert_eq!(inputs.lock().unwrap().len(), 1);
+        let first = compaction(&id, "first-boundary", "compact-1");
+        let mut started = first.clone();
+        started["method"] = json!("item/started");
+        controller.publish_event(started);
+        assert!(
+            service.runtime.lock().unwrap().saved.records[&id]
+                .refresh_window
+                .is_none()
+        );
+        controller.publish_event(first.clone());
+        controller.publish_event(completed_turn(&id, "compact-1"));
+        for index in 0..4 {
+            controller.publish_event(completed_turn(&id, &format!("after-{index}")));
+        }
+        controller.publish_event(first);
         wait_idle(service).await;
         assert_eq!(native_title(&authorization, &id).await, "首条自动标题");
         assert_eq!(inputs.lock().unwrap().len(), 1);
-        controller.publish_event(json!({"method":"turn/completed","params":{"threadId":id,"turn":{"id":"completed-4","status":"completed"}}}));
+        controller.publish_event(completed_turn(&id, "after-4"));
         wait_idle(service).await;
         assert_eq!(native_title(&authorization, &id).await, "主题变化后的标题");
         {
@@ -894,6 +1175,55 @@ mod tests {
             assert_eq!(inputs[1]["mode"], "refresh");
             assert!(inputs[1].get("firstUserMessage").is_none());
         }
+        for index in 0..6 {
+            controller.publish_event(completed_turn(&id, &format!("after-check-{index}")));
+        }
+        wait_idle(service).await;
+        assert_eq!(inputs.lock().unwrap().len(), 2);
+
+        controller.publish_event(compaction(&id, "next-boundary", "compact-2"));
+        for index in 0..6 {
+            controller.publish_event(completed_turn(&id, &format!("next-{index}")));
+        }
+        wait_idle(service).await;
+        assert_eq!(inputs.lock().unwrap().len(), 3, "未改名也只检查一次");
+        assert!(
+            service.runtime.lock().unwrap().saved.records[&id]
+                .refresh_window
+                .as_ref()
+                .unwrap()
+                .checked
+        );
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let next_fixture = TestGeneration {
+            text: r#"{"title":"新压缩边界后的标题","description":"更新"}"#.into(),
+            started: started.clone(),
+            release: None,
+            inputs: inputs.clone(),
+        };
+        *service.test_generation.lock().unwrap() = Some(TestGeneration {
+            text: r#"{"title":"旧压缩边界的迟到标题","description":"不应写回"}"#.into(),
+            release: Some(release.clone()),
+            ..next_fixture.clone()
+        });
+        controller.publish_event(compaction(&id, "in-flight", "compact-3"));
+        for index in 0..5 {
+            controller.publish_event(completed_turn(&id, &format!("in-flight-{index}")));
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        *service.test_generation.lock().unwrap() = Some(next_fixture);
+        controller.publish_event(compaction(&id, "while-in-flight", "compact-4"));
+        for index in 0..5 {
+            controller.publish_event(completed_turn(&id, &format!("while-in-flight-{index}")));
+        }
+        release.notify_one();
+        wait_idle(service).await;
+        assert_eq!(inputs.lock().unwrap().len(), 5);
+        assert_eq!(native_title(&authorization, &id).await, "新压缩边界后的标题");
         release_engine(&authorization).await;
     }
 
