@@ -176,73 +176,243 @@ pub(crate) fn read(paths: Vec<PathBuf>) -> Result<Vec<LocalInput>, String> {
 }
 
 #[cfg(windows)]
-pub(crate) fn choose(parent: isize, folders: bool) -> Result<Vec<PathBuf>, String> {
-    choose_with_options(parent, folders, true)
+pub(crate) fn choose(parent: isize, folders: Option<bool>) -> Result<Vec<PathBuf>, String> {
+    // 旧网页缓存仍传布尔值；新版“文件和文件夹”不传模式，直接打开可混选的一个窗口。
+    let mode = match folders {
+        Some(false) => picker::Mode::Files,
+        Some(true) => picker::Mode::Folders,
+        None => picker::Mode::Mixed,
+    };
+    picker::choose(parent, mode)
 }
 
 #[cfg(windows)]
 pub(crate) fn choose_project_folder(parent: isize) -> Result<Option<PathBuf>, String> {
-    Ok(choose_with_options(parent, true, false)?.into_iter().next())
+    Ok(picker::choose(parent, picker::Mode::Project)?
+        .into_iter()
+        .next())
 }
 
 #[cfg(windows)]
-fn choose_with_options(
-    parent: isize,
-    folders: bool,
-    multiple: bool,
-) -> Result<Vec<PathBuf>, String> {
-    use windows::Win32::Foundation::HWND;
+mod picker {
+    use std::cell::RefCell;
+
+    use super::{MAX_ROOTS, PathBuf};
+    use windows::Win32::Foundation::{HWND, S_OK};
     use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
     use windows::Win32::UI::Shell::{
-        FOS_ALLOWMULTISELECT, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST,
-        FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog, SIGDN_FILESYSPATH,
+        CDCS_ENABLEDVISIBLE, CDCS_VISIBLE, FDE_OVERWRITE_RESPONSE, FDE_SHAREVIOLATION_RESPONSE,
+        FDEOR_DEFAULT, FDESVR_DEFAULT, FOS_ALLOWMULTISELECT, FOS_FILEMUSTEXIST,
+        FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, FileOpenDialog, IFileDialog,
+        IFileDialogControlEvents, IFileDialogControlEvents_Impl, IFileDialogCustomize,
+        IFileDialogEvents, IFileDialogEvents_Impl, IFileOpenDialog, IShellItem, IShellItemArray,
+        SIGDN_FILESYSPATH,
     };
-    unsafe {
-        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)
-            .map_err(|error| format!("无法打开文件选择器：{error}"))?;
-        let mut options = dialog.GetOptions().map_err(|error| error.to_string())?
-            | FOS_FORCEFILESYSTEM
-            | FOS_PATHMUSTEXIST
-            | FOS_FILEMUSTEXIST;
-        if multiple {
-            options |= FOS_ALLOWMULTISELECT;
+    use windows::core::{BOOL, ComObject, Interface, Ref, Result as WinResult, implement, w};
+
+    pub(super) enum Mode {
+        Files,
+        Folders,
+        Mixed,
+        Project,
+    }
+
+    // 此 ID 仅用于当前系统对话框自定义控件及其事件。
+    const ADD_SELECTED: u32 = 1001;
+    type Selection = Result<Vec<PathBuf>, String>;
+
+    #[implement(IFileDialogEvents, IFileDialogControlEvents)]
+    struct MixedSelection {
+        result: RefCell<Option<Selection>>,
+    }
+
+    impl IFileDialogEvents_Impl for MixedSelection_Impl {
+        fn OnFileOk(&self, _: Ref<'_, IFileDialog>) -> WinResult<()> {
+            Ok(())
         }
-        if folders {
-            options |= FOS_PICKFOLDERS;
+        fn OnFolderChanging(
+            &self,
+            _: Ref<'_, IFileDialog>,
+            _: Ref<'_, IShellItem>,
+        ) -> WinResult<()> {
+            Ok(())
         }
-        if !multiple {
-            dialog
-                .SetTitle(windows::core::w!("添加文件夹"))
-                .map_err(|error| error.to_string())?;
-            dialog
-                .SetOkButtonLabel(windows::core::w!("添加文件夹"))
-                .map_err(|error| error.to_string())?;
+        fn OnFolderChange(&self, dialog: Ref<'_, IFileDialog>) -> WinResult<()> {
+            let controls: IFileDialogCustomize = dialog.ok()?.cast()?;
+            unsafe { controls.SetControlState(ADD_SELECTED, CDCS_VISIBLE) }
         }
-        dialog
-            .SetOptions(options)
-            .map_err(|error| error.to_string())?;
-        if let Err(error) = dialog.Show(Some(HWND(parent as _))) {
-            if error.code().0 as u32 == 0x800704c7 {
-                return Ok(Vec::new());
+        fn OnSelectionChange(&self, dialog: Ref<'_, IFileDialog>) -> WinResult<()> {
+            let dialog: IFileOpenDialog = dialog.ok()?.cast()?;
+            let controls: IFileDialogCustomize = dialog.cast()?;
+            let enabled = unsafe { dialog.GetSelectedItems().and_then(|items| items.GetCount()) }
+                .is_ok_and(|count| count > 0);
+            unsafe {
+                controls.SetControlState(
+                    ADD_SELECTED,
+                    if enabled {
+                        CDCS_ENABLEDVISIBLE
+                    } else {
+                        CDCS_VISIBLE
+                    },
+                )
             }
-            return Err(format!("文件选择失败：{error}"));
         }
-        let items = dialog.GetResults().map_err(|error| error.to_string())?;
-        let count = items.GetCount().map_err(|error| error.to_string())?;
-        if count as usize > MAX_ROOTS {
-            return Err("一次最多选择 16 个文件或文件夹。".into());
+        fn OnShareViolation(
+            &self,
+            _: Ref<'_, IFileDialog>,
+            _: Ref<'_, IShellItem>,
+        ) -> WinResult<FDE_SHAREVIOLATION_RESPONSE> {
+            Ok(FDESVR_DEFAULT)
         }
-        let mut paths = Vec::new();
-        for index in 0..count {
-            let item = items.GetItemAt(index).map_err(|error| error.to_string())?;
-            let name = item
-                .GetDisplayName(SIGDN_FILESYSPATH)
+        fn OnTypeChange(&self, _: Ref<'_, IFileDialog>) -> WinResult<()> {
+            Ok(())
+        }
+        fn OnOverwrite(
+            &self,
+            _: Ref<'_, IFileDialog>,
+            _: Ref<'_, IShellItem>,
+        ) -> WinResult<FDE_OVERWRITE_RESPONSE> {
+            Ok(FDEOR_DEFAULT)
+        }
+    }
+
+    impl IFileDialogControlEvents_Impl for MixedSelection_Impl {
+        fn OnItemSelected(
+            &self,
+            _: Ref<'_, IFileDialogCustomize>,
+            _: u32,
+            _: u32,
+        ) -> WinResult<()> {
+            Ok(())
+        }
+        fn OnButtonClicked(
+            &self,
+            controls: Ref<'_, IFileDialogCustomize>,
+            id: u32,
+        ) -> WinResult<()> {
+            if id != ADD_SELECTED {
+                return Ok(());
+            }
+            let dialog: IFileOpenDialog = controls.ok()?.cast()?;
+            let paths = unsafe { dialog.GetSelectedItems() }
+                .map_err(|error| format!("无法取得所选文件和文件夹：{error}"))
+                .and_then(|items| selected_paths(&items));
+            // 用户需要在一个窗口混选；“打开”仍用于进入文件夹，只在点击“添加所选项”时确认列表中的选取。
+            // Close 后系统不提供 GetResults，先保存本次选择；不把未选中的当前目录作为附件。
+            if matches!(&paths, Ok(paths) if paths.is_empty()) {
+                return Ok(());
+            }
+            *self.result.borrow_mut() = Some(paths);
+            let closed = unsafe { dialog.Close(S_OK) };
+            if closed.is_err() {
+                self.result.borrow_mut().take();
+            }
+            closed
+        }
+        fn OnCheckButtonToggled(
+            &self,
+            _: Ref<'_, IFileDialogCustomize>,
+            _: u32,
+            _: BOOL,
+        ) -> WinResult<()> {
+            Ok(())
+        }
+        fn OnControlActivating(&self, _: Ref<'_, IFileDialogCustomize>, _: u32) -> WinResult<()> {
+            Ok(())
+        }
+    }
+
+    pub(super) fn choose(parent: isize, mode: Mode) -> Selection {
+        // 与项目选择器共用现有主线程 STA；只为输入区混选安装自定义确认，不改变项目选择和旧缓存。
+        unsafe {
+            let dialog: IFileOpenDialog =
+                CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)
+                    .map_err(|error| format!("无法打开文件选择器：{error}"))?;
+            let mut options = dialog.GetOptions().map_err(|error| error.to_string())?
+                | FOS_FORCEFILESYSTEM
+                | FOS_PATHMUSTEXIST
+                | FOS_FILEMUSTEXIST;
+            if !matches!(mode, Mode::Project) {
+                options |= FOS_ALLOWMULTISELECT;
+            }
+            if matches!(mode, Mode::Folders | Mode::Project) {
+                options |= FOS_PICKFOLDERS;
+            }
+            if matches!(mode, Mode::Project) {
+                dialog
+                    .SetTitle(w!("添加文件夹"))
+                    .map_err(|error| error.to_string())?;
+                dialog
+                    .SetOkButtonLabel(w!("添加文件夹"))
+                    .map_err(|error| error.to_string())?;
+            }
+            dialog
+                .SetOptions(options)
                 .map_err(|error| error.to_string())?;
-            let path = name.to_string().map_err(|error| error.to_string());
-            CoTaskMemFree(Some(name.0 as _));
-            paths.push(PathBuf::from(path?));
+
+            let mixed = if matches!(mode, Mode::Mixed) {
+                dialog
+                    .SetTitle(w!("添加文件和文件夹"))
+                    .map_err(|error| error.to_string())?;
+                let controls: IFileDialogCustomize =
+                    dialog.cast().map_err(|error| error.to_string())?;
+                controls
+                    .AddPushButton(ADD_SELECTED, w!("添加所选项"))
+                    .map_err(|error| error.to_string())?;
+                controls
+                    .MakeProminent(ADD_SELECTED)
+                    .map_err(|error| error.to_string())?;
+                controls
+                    .SetControlState(ADD_SELECTED, CDCS_VISIBLE)
+                    .map_err(|error| error.to_string())?;
+                let events = ComObject::new(MixedSelection {
+                    result: RefCell::new(None),
+                });
+                let cookie = dialog
+                    .Advise(&events.to_interface::<IFileDialogEvents>())
+                    .map_err(|error| error.to_string())?;
+                Some((events, cookie))
+            } else {
+                None
+            };
+            let shown = dialog.Show(Some(HWND(parent as _)));
+            let result = mixed.and_then(|(events, cookie)| {
+                let _ = dialog.Unadvise(cookie);
+                events.result.borrow_mut().take()
+            });
+            if let Err(error) = shown {
+                if error.code().0 as u32 == 0x800704c7 {
+                    return Ok(Vec::new());
+                }
+                return Err(format!("文件选择失败：{error}"));
+            }
+            result.unwrap_or_else(|| {
+                let items = dialog.GetResults().map_err(|error| error.to_string())?;
+                selected_paths(&items)
+            })
         }
-        Ok(paths)
+    }
+
+    fn selected_paths(items: &IShellItemArray) -> Selection {
+        unsafe {
+            let count = items.GetCount().map_err(|error| error.to_string())? as usize;
+            if count > MAX_ROOTS {
+                return Err(format!("一次最多选择 {MAX_ROOTS} 个文件或文件夹。"));
+            }
+            let mut paths = Vec::with_capacity(count);
+            for index in 0..count {
+                let item = items
+                    .GetItemAt(index as u32)
+                    .map_err(|error| error.to_string())?;
+                let name = item
+                    .GetDisplayName(SIGDN_FILESYSPATH)
+                    .map_err(|error| format!("所选项不是可读取的本机文件或文件夹：{error}"))?;
+                let path = name.to_string().map_err(|error| error.to_string());
+                CoTaskMemFree(Some(name.0 as _));
+                paths.push(PathBuf::from(path?));
+            }
+            Ok(paths)
+        }
     }
 }
 

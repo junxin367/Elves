@@ -1018,8 +1018,18 @@ async function addTransferredInputs(captured) {
   }
 }
 
-export function chooseComposerLocalInputs(folders = false) {
-  if (composerCanAddLocalInputs()) return addLocalInputs(() => localInputBridge().pick(folders));
+export function chooseComposerLocalInputs() {
+  const bridge = localInputBridge();
+  if (!bridge || !composerCanAddLocalInputs()) return;
+  if (typeof bridge.pickAny === "function") return addLocalInputs(() => bridge.pickAny());
+  // 网页资源可能比客户端更新；旧版仍一键选文件，说明文件夹的替代入口，不恢复二级菜单。
+  const version = attachmentVersion;
+  return addLocalInputs(async () => {
+    const inputs = await bridge.pick(false);
+    if (version === attachmentVersion)
+      showNotice("此客户端版本只能在窗口中选文件。可拖放或粘贴文件夹，更新 Elves 后可在同一窗口选择。");
+    return inputs;
+  });
 }
 
 export function handleComposerLocalPaste(event) {

@@ -425,12 +425,19 @@ async fn client_cache_activity(
 // 用户要求文件/文件夹仅在独立客户端输入区开放；只允许当前会话页选择或粘贴，
 // 不接受网页提供路径，也不向预览页、连接页及后台窗口开放剪贴板文件读取。
 fn trusted_input_page(webview: &tauri::Webview, state: &ClientState) -> Result<(), String> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+
     let url = trusted_service_page(webview, state)?;
+    let window = webview.window();
+    // 会话输入区的键盘焦点在子 WebView，Tao 的 is_focused() 不能代表顶层窗口是否在前台。
+    // 选择和粘贴都只认发起操作的原生会话窗口，不接受其他 Elves 窗口或系统弹窗的句柄。
     if settings::is_startup_page(&url)
-        || !allows_service_url(state, webview.window().label(), &url)
+        || !allows_service_url(state, window.label(), &url)
         || !matches!(url.path(), "/" | "/side-thread")
         || !matches!(url.scheme(), "http" | "https")
-        || !webview.window().is_focused().unwrap_or(false)
+        || !window
+            .hwnd()
+            .is_ok_and(|hwnd| unsafe { GetForegroundWindow() == hwnd.0 })
     {
         return Err("请在当前独立客户端的会话输入区添加文件和文件夹。".into());
     }
@@ -441,7 +448,7 @@ fn trusted_input_page(webview: &tauri::Webview, state: &ClientState) -> Result<(
 async fn client_choose_inputs(
     webview: tauri::Webview,
     state: tauri::State<'_, ClientState>,
-    folders: bool,
+    folders: Option<bool>,
 ) -> Result<Vec<crate::local_inputs::LocalInput>, String> {
     trusted_input_page(&webview, &state)?;
     let source = webview.url().map_err(|error| error.to_string())?;

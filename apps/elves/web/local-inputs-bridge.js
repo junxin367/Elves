@@ -5,6 +5,8 @@
   Object.defineProperty(window, "__CODEX_ELVES_LOCAL_INPUTS__", {
     value: Object.freeze({
       pick: folders => window.__TAURI__.core.invoke("client_choose_inputs", { folders: folders === true }),
+      // 新版直接打开同一个选择窗口；旧网页的文件/文件夹独立调用仍通过 pick 兼容。
+      pickAny: () => window.__TAURI__.core.invoke("client_choose_inputs", {}),
       paste: () => window.__TAURI__.core.invoke("client_paste_inputs")
     })
   });

@@ -1264,7 +1264,12 @@ test("普通浏览器没有本机文件入口，同源客户端侧边页可复�
 
 async function localAttachmentHarness() {
   const source = await readFile(new URL("../assets/harness/attachments.js", import.meta.url), "utf8");
-  const h = { notices: [], changes: 0, pasted: 0, picked: [], next: localInputFixtures(), timers: [] };
+  const h = { notices: [], changes: 0, pasted: 0, picked: [], mixedPicks: 0, next: localInputFixtures(), timers: [] };
+  h.bridge = {
+    pickAny: async () => { ++h.mixedPicks; return h.next; },
+    pick: async folders => { h.picked.push(folders); return h.next; },
+    paste: async () => { ++h.pasted; return h.next; },
+  };
   const context = vm.createContext({
     nativeConnectionVersion: 1, Blob, Uint8Array, TextEncoder, TextDecoder, atob,
     isLocalInput, copyLocalInput, validateLocalInputs,
@@ -1279,10 +1284,7 @@ async function localAttachmentHarness() {
     },
     createImageBitmap: async () => ({ width: 1, height: 1, close() {} }),
     setTimeout: callback => h.timers.push(callback), icon: () => ({}),
-    localInputBridge: () => ({
-      pick: async folders => { h.picked.push(folders); return h.next; },
-      paste: async () => { ++h.pasted; return h.next; },
-    }),
+    localInputBridge: () => h.bridge,
   });
   vm.runInContext(source.replace(/^import .*;\r?\n/gm, "").replace(/^export /gm, ""), context);
   context.report = message => h.notices.push(message);
@@ -1494,22 +1496,40 @@ test("本机文件及文件夹预览显示两种图标和下方名称，移除�
   assert.match(css, /\.composer-local-attachment>figcaption\{[^}]*display:block[^}]*text-overflow:ellipsis/);
 });
 
-test("本机文件选取及恢复保留全部内容，纯附件草稿可移除且迟到结果不串会话", async () => {
+test("本机文件和文件夹直开混选，取消或迟到结果不改变其他会话的附件", async () => {
   const h = await localAttachmentHarness(), c = h.context;
-  await vm.runInContext("chooseComposerLocalInputs(true)", c);
-  assert.deepEqual(h.picked, [true]);
+  await c.chooseComposerLocalInputs();
+  assert.equal(h.mixedPicks, 1);
+  assert.deepEqual(h.picked, []);
   assert.deepEqual(JSON.parse(JSON.stringify(vm.runInContext("composerLocalInputsPayload()", c))), h.next);
+  h.next = [];
+  await c.chooseComposerLocalInputs();
+  assert.deepEqual(JSON.parse(JSON.stringify(c.composerLocalInputsPayload())), localInputFixtures(), "取消保留已有附件");
   vm.runInContext("setComposerAttachments(composerAttachmentSnapshot())", c);
   assert.equal(vm.runInContext("composerHasAttachments()", c), true);
   assert.equal(vm.runInContext("composerAttachmentsPayload().length", c), 0);
   let finish;
-  c.delayed = () => new Promise(resolve => { finish = resolve; });
-  const reading = vm.runInContext("addLocalInputs(delayed)", c);
+  h.bridge.pickAny = () => new Promise(resolve => { finish = resolve; });
+  const reading = c.chooseComposerLocalInputs();
   assert.equal(vm.runInContext("composerAttachmentsLoading()", c), true);
   vm.runInContext("setComposerAttachments([])", c);
-  finish(h.next); await reading;
+  finish(localInputFixtures()); await reading;
   assert.equal(vm.runInContext("composerHasAttachments()", c), false);
   assert.deepEqual(h.notices, []);
+});
+
+test("新版网页配合旧本机选择器直接选文件，提示文件夹替代方式且不覆盖读取错误", async () => {
+  const h = await localAttachmentHarness(), c = h.context;
+  delete h.bridge.pickAny;
+  h.next = [localInputFixtures()[0]];
+  await c.chooseComposerLocalInputs();
+  assert.deepEqual(h.picked, [false]);
+  assert.equal(c.composerLocalInputsPayload().length, 1);
+  assert.match(h.notices.at(-1), /拖放或粘贴文件夹/);
+  h.bridge.pick = async () => { throw new Error("读取附件失败"); };
+  await c.chooseComposerLocalInputs();
+  assert.equal(h.notices.at(-1), "读取附件失败");
+  assert.equal(c.composerLocalInputsPayload().length, 1);
 });
 
 test("Ctrl+V 粘贴本机文件及目录只添加一次，纯文字和图片继续走原有粘贴", async () => {
@@ -8878,24 +8898,25 @@ function independentPromptOptimizationHarness(backend = "claude") {
   return h;
 }
 
-test("输入区菜单严格按文件和文件夹、图片、目标、压缩排序，旧客户端和浏览器隐藏本机入口", async () => {
+test("输入区菜单按压缩、目标、文件和文件夹、图片排序，附件入口直接调用选择窗口", async () => {
   const h = independentPromptOptimizationHarness("codex"), c = h.context, selected = [];
   c.session.capabilities.localFileInput = true;
   c.composerLocalInputsSupported = () => true;
   c.composerCanAddLocalInputs = () => true;
-  c.chooseComposerLocalInputs = folders => selected.push(folders);
+  c.chooseComposerLocalInputs = (...args) => selected.push(args);
   c.updateComposer();
-  assert.deepEqual(Array.from(h.add.menuOptions, option => option.label), ["文件和文件夹", "图片", "目标", "压缩"]);
-  assert.equal(h.add.menuOptions[0].disabled, false);
-  h.add.menuOptions[0].submenu[0].action();
-  h.add.menuOptions[0].submenu[1].action();
-  assert.deepEqual(selected, [false, true]);
+  assert.deepEqual(Array.from(h.add.menuOptions, option => option.label), ["压缩", "目标", "文件和文件夹", "图片"]);
+  const files = h.add.menuOptions.find(option => option.value === "files");
+  assert.equal(files.disabled, false);
+  assert.equal(files.submenu, undefined);
+  files.action();
+  assert.deepEqual(selected, [[]]);
   c.session.capabilities.localFileInput = false;
   c.updateComposer();
-  assert.equal(h.add.menuOptions[0].disabled, true, "旧服务不能把附件静默丢弃");
+  assert.equal(h.add.menuOptions.find(option => option.value === "files").disabled, true, "旧服务不能把附件静默丢弃");
   c.composerLocalInputsSupported = () => false;
   c.updateComposer();
-  assert.deepEqual(Array.from(h.add.menuOptions, option => option.label), ["图片", "目标", "压缩"]);
+  assert.deepEqual(Array.from(h.add.menuOptions, option => option.label), ["压缩", "目标", "图片"]);
 });
 
 test("Claude 与 Codex 均显示独立提示词优化，不依赖原生连接并保留恢复、附件和写入限制", async () => {
@@ -8905,7 +8926,7 @@ test("Claude 与 Codex 均显示独立提示词优化，不依赖原生连接并
     assert.equal(control.hidden, false);
     assert.equal(control.disabled, false, "未连接原生服务也可以使用独立优化");
     assert.deepEqual(Array.from(h.add.menuOptions, option => option.value || option.label),
-      backend === "claude" ? ["images"] : ["images", "goal", "compact"]);
+      backend === "claude" ? ["images"] : ["compact", "goal", "images"]);
     await context.activatePromptOptimization();
     assert.equal(prompt.value, "优化后的需求");
     assert.equal(control.dataset.state, "optimized");

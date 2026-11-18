@@ -220,23 +220,21 @@ export function updateComposer({ followEnd = false } = {}) {
     || !!editingMessage || editing && !!pending || editingQueuedMessage?.state === "starting" || (!creating && !selectedId));
   const add = $("#composer-add");
   const usage = contextUsage(currentThreadDisplay()?.tokenUsage);
-  // 用户指定顺序：文件和文件夹、图片、目标、压缩；本机文件入口只出现在已安装原生能力的独立客户端。
+  // 用户指定左侧“+”菜单从上到下为压缩、目标、文件和文件夹、图片；本机文件入口仍仅在支持原生选择器的独立客户端显示。
   add.menuOptions = [
-    ...(composerLocalInputsSupported() ? [{
-      value: "files", label: "文件和文件夹", icon: "folderClosed",
-      disabled: deleting || !composerCanAddLocalInputs() || session?.capabilities?.localFileInput !== true,
-      submenu: [
-        { label: "选择文件", icon: "document", action: () => chooseComposerLocalInputs(false) },
-        { label: "选择文件夹", icon: "folderClosed", action: () => chooseComposerLocalInputs(true) }
-      ]
-    }] : []),
-    { value: "images", label: "图片", icon: "image", disabled: deleting || !composerCanAddImages(), action: chooseComposerImages },
+    { value: "compact", label: "压缩", icon: "compactContext",
+      description: compactUsageDescription(usage),
+      disabled: !compactCommandAvailable(), action: compactContext },
     { value: "goal", label: "目标", icon: "target",
       description: goalComposerReason() || "设置要持续追求的目标",
       disabled: !!goalComposerReason(), action: () => selectGoalCommand(null) },
-    { value: "compact", label: "压缩", icon: "compactContext",
-      description: compactUsageDescription(usage),
-      disabled: !compactCommandAvailable(), action: compactContext }
+    ...(composerLocalInputsSupported() ? [{
+      value: "files", label: "文件和文件夹", icon: "folderClosed",
+      disabled: deleting || !composerCanAddLocalInputs() || session?.capabilities?.localFileInput !== true,
+      // 用户要求点击一级菜单直接打开系统选择窗口，文件和文件夹无需先选类型。
+      action: chooseComposerLocalInputs
+    }] : []),
+    { value: "images", label: "图片", icon: "image", disabled: deleting || !composerCanAddImages(), action: chooseComposerImages }
   // 用户要求临时侧边直接移除“目标”按钮，/ 菜单需同步隐藏，不能仅保留禁用项。
   ].filter(option => (option.value !== "goal" || !temporarySideThread())
     && (!isClaude() || !["compact", "goal"].includes(option.value) || claudeCommandSupported(option.value)));
