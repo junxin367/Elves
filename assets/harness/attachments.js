@@ -94,7 +94,7 @@ function videoPreviewIcon(name) {
   return icon;
 }
 
-export function fitMediaPreview(dialog, panel, media, dimensions, { fillAvailable = false } = {}) {
+export function fitMediaPreview(dialog, panel, media, dimensions, { fillAvailable = false, alignedControls = null } = {}) {
   const pixels = (style, property) => Number.parseFloat(style.getPropertyValue(property)) || 0;
   const resize = () => {
     if (!dialog.open) return;
@@ -123,21 +123,37 @@ export function fitMediaPreview(dialog, panel, media, dimensions, { fillAvailabl
     media.style.width = "0px";
     media.style.height = "0px";
     dialog.style.width = `${maxWidth}px`;
-    if (fillAvailable) {
-      media.style.width = `${Math.max(1, maxWidth - frameWidth)}px`;
-      media.style.height = `${Math.max(1, maxHeight - frameHeight())}px`;
+    const availableWidth = Math.max(1, maxWidth - frameWidth);
+    const availableHeight = () => Math.max(1, maxHeight - frameHeight());
+    if (!width || !height) {
+      media.style.width = `${availableWidth}px`;
+      media.style.height = `${availableHeight()}px`;
       return;
     }
-    let scale = Math.min(1, Math.max(1, maxWidth - frameWidth) / width,
-      Math.max(1, maxHeight - frameHeight()) / height);
-    dialog.style.width = `${Math.min(maxWidth, Math.max(pixels(dialogStyle, "--preview-min-width"), width * scale + frameWidth))}px`;
-    // 最终宽度下文案可能换行；只收缩媒体区域，窗口宽度不再随换行来回变化。
-    scale = Math.min(scale, Math.max(1, maxHeight - frameHeight()) / height);
+    if (alignedControls) alignedControls.style.width = `${availableWidth}px`;
+    let scale = Math.min(fillAvailable ? Infinity : 1, availableWidth / width, availableHeight() / height);
+    if (!fillAvailable) {
+      dialog.style.width = `${Math.min(maxWidth, Math.max(pixels(dialogStyle, "--preview-min-width"), width * scale + frameWidth))}px`;
+      // 最终宽度下文案可能换行；只收缩媒体区域，窗口宽度不再随换行来回变化。
+      scale = Math.min(scale, availableHeight() / height);
+    }
+    if (alignedControls) {
+      // 确认稿要求控件与实际视频同宽；控件依次换行时先扣除新增行高，避免越过预览高度上限。
+      for (let pass = 0; pass < alignedControls.childElementCount; pass++) {
+        alignedControls.style.width = `${width * scale}px`;
+        const nextScale = Math.min(scale, availableHeight() / height);
+        if (nextScale === scale) break;
+        scale = nextScale;
+      }
+      alignedControls.style.width = `${width * scale}px`;
+    }
     media.style.width = `${width * scale}px`;
     media.style.height = `${height * scale}px`;
   };
   const observer = new ResizeObserver(resize);
   observer.observe(panel);
+  // 时长文本变化可能让控件换行，即使面板已达最大高度，也要重新给控件预留空间。
+  if (alignedControls) observer.observe(alignedControls);
   window.addEventListener("resize", resize);
   return {
     resize,
@@ -249,11 +265,18 @@ export function openVideoPreview(trigger, source, poster, name, prepareAccess = 
   title.textContent = name;
   const cover = new Image();
   const thumbnail = trigger?.querySelector(".message-video-poster");
-  // 预留完整播放区域，封面和不同宽高比的视频都在其中适配，不改变窗口尺寸。
-  const layout = fitMediaPreview(dialog, panel, video, null, { fillAvailable: true });
+  let playbackDimensions = null;
+  // 确认稿保留整页居中的预览壳，画面和控件单独等比适配。先用封面比例（未知时 16:9），不为测量提前加载视频。
+  const layout = fitMediaPreview(dialog, panel, video, () => {
+    if (playbackDimensions) return playbackDimensions;
+    const image = cover.naturalWidth && cover.naturalHeight ? cover : thumbnail;
+    return image?.naturalWidth && image.naturalHeight
+      ? { width: image.naturalWidth, height: image.naturalHeight } : { width: 16, height: 9 };
+  }, { fillAvailable: true, alignedControls: controls });
   loadVideoPoster(cover, poster, source => {
     video.poster = source;
     if (thumbnail?.hidden) thumbnail.src = source;
+    if (!playbackDimensions) layout.resize();
   });
   let closed = false, seeking = false, failed = false, pendingSeek = null;
   let wantsPlayback = false, recoveryTimer = null, attempt = 0, playRequest = 0;
@@ -264,6 +287,16 @@ export function openVideoPreview(trigger, source, poster, name, prepareAccess = 
     const source = video.getAttribute("src");
     return source && (!video.currentSrc || video.currentSrc === new URL(source, location.href).href);
   };
+  const resizeToVideo = () => {
+    if (closed || !dialog.open || !currentSource() || !video.videoWidth || !video.videoHeight) return;
+    const { videoWidth: width, videoHeight: height } = video;
+    if (width === playbackDimensions?.width && height === playbackDimensions?.height) return;
+    // 播放器的实际尺寸优先于封面；暂停、切换线路或封面迟到时不退回占位比例。
+    playbackDimensions = { width, height };
+    layout.resize();
+  };
+  video.addEventListener("loadedmetadata", resizeToVideo);
+  video.addEventListener("resize", resizeToVideo);
   const sync = () => {
     const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
     if (duration && video.readyState >= 1 && currentSource() && pendingSeek !== null) {

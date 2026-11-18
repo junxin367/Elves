@@ -977,9 +977,9 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .image-preview-close:hover{background:#fff2}
 /* 透明预览始终叠在深色遮罩上，说明与关闭按钮使用浅色，浅色外观下同样保持可读。 */
 .image-preview-caption{max-width:100%;margin:10px 0 0;color:#ddd;text-shadow:0 1px 4px #000;font-size:.78571rem;overflow-wrap:anywhere;text-align:center}
-/* 用户确认图片预览按整个页面居中；固定视口的 inset:0 配合上方 margin:auto，
- * 不能按 PC 聊天栏或侧边文件面板偏移，放大仅改变框内图片，不改变弹窗尺寸与中心。 */
-#image-preview-dialog{position:fixed;inset:0}
+/* 图片和视频预览按整个页面居中；固定视口的 inset:0 配合上方 margin:auto，
+ * 不能按 PC 聊天栏或侧边文件面板偏移，放大仅改变框内图片，不改变图片弹窗尺寸与中心。 */
+#image-preview-dialog,#video-preview-dialog{position:fixed;inset:0}
 .image-preview-unavailable{color:#ddd}
 .message-video-preview{display:inline-flex;flex-direction:column;width:160px;max-width:100%;margin:8px 4px 4px 0;padding:0;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--side);color:var(--text);text-align:left;vertical-align:top;cursor:pointer}
 .message-video-cover{position:relative;display:grid;place-items:center;width:100%;aspect-ratio:16/9;background:#252830}
@@ -988,14 +988,16 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .message-video-name{display:block;max-width:100%;padding:6px 8px;font-size:.78571rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .video-preview-dialog{--preview-min-width:280px}
 .video-preview-panel{position:relative;display:flex;flex-direction:column;align-items:center;padding:44px 16px 12px;min-width:0;max-height:var(--popup-max-height);overflow:auto}
-.video-preview-media{display:block;flex-shrink:0;max-width:100%;width:320px;height:180px;object-fit:contain;background:#111;border-radius:6px}
-.video-preview-controls{display:flex;align-self:stretch;align-items:center;gap:12px;min-width:0;margin-top:12px}
-.video-preview-play{flex:0 0 auto;border-radius:50%}
-.video-preview-play>.ui-icon{width:24px;height:24px}
-.video-preview-progress{flex:1 1 0;min-width:0;width:0;margin:0;padding:0;border:0;border-radius:0;background:transparent;accent-color:var(--accent-solid)}
-.video-preview-time{flex:0 0 auto;font-size:.78571rem;font-variant-numeric:tabular-nums;white-space:nowrap;color:inherit}
+/* 用户确认留白只透出图片预览的同一遮罩，不再铺独立底板。控件由 fitMediaPreview 随画面同宽；
+ * 窄画面可换行，进度条预留 48px 供拖动，画面更窄时不超过画面的实际宽度。 */
+.video-preview-media{display:block;flex-shrink:0;max-width:100%;width:320px;height:180px;object-fit:contain;background:transparent;border-radius:6px}
+.video-preview-controls{display:flex;flex-shrink:0;flex-wrap:wrap;align-items:center;gap:4px 12px;width:320px;max-width:100%;min-width:0;margin-top:12px}
+.video-preview-play{flex:0 0 auto;max-width:100%;border-radius:50%}
+.video-preview-play>.ui-icon{width:24px;max-width:100%;height:24px}
+.video-preview-progress{flex:1 1 0;min-width:min(48px,100%);width:0;margin:0;padding:0;border:0;border-radius:0;background:transparent;accent-color:var(--accent-solid)}
+.video-preview-time{flex:0 0 auto;max-width:100%;margin-left:auto;font-size:.78571rem;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;text-align:right;color:inherit}
 .video-preview-status{min-height:1.5em;margin:8px 0 0;font-size:.78571rem;color:inherit;text-align:center}
-@media(max-width:760px){.message-video-preview{width:140px}.video-preview-panel{padding:40px 8px 8px}.video-preview-controls{gap:8px}}
+@media(max-width:760px){.message-video-preview{width:140px}.video-preview-panel{padding:40px 8px 8px}.video-preview-controls{column-gap:8px}}
 .image-view-item,.image-view-item[open]{border-color:transparent;background:transparent}
 .image-view-summary{width:fit-content;max-width:100%;min-width:0}
 .image-view-summary::-webkit-details-marker{display:none}
