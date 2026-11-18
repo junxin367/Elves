@@ -87,16 +87,83 @@ function appearanceFontOptions(current = "") {
   return [{ value: "", label: "系统" },
     ...[...fonts].sort((left, right) => left.localeCompare(right)).map(family => ({ value: family, label: family }))];
 }
+
+function installSettingsSelectWidths(host) {
+  const measure = document.createElement("canvas").getContext("2d");
+  if (!measure) return () => {};
+  // DESIGN.md：默认 120px；指定宽度由调用方通过类名覆盖，其他 Select 按最长选项选择标准档。
+  const sizes = [80, 100, 120, 160, 200, 240];
+  let cache = new WeakMap();
+  let frame = null;
+  const update = () => {
+    frame = null;
+    for (const control of host.querySelectorAll(".select-trigger")) {
+      const label = control.querySelector(".select-label"), options = control.selectOptions;
+      if (!label || !options?.length) continue;
+      const style = getComputedStyle(control), font = getComputedStyle(label);
+      const size = value => parseFloat(value) || 0;
+      const textFont = `${font.fontStyle} ${font.fontWeight} ${font.fontSize} ${font.fontFamily}`;
+      const icons = [...control.children].filter(child => child.classList.contains("ui-icon"));
+      const arrowWidth = icons.length ? size(getComputedStyle(icons.at(-1)).width) : 0;
+      const gap = size(style.columnGap);
+      const frameWidth = size(style.paddingInlineStart) + size(style.paddingInlineEnd)
+        + size(style.borderInlineStartWidth) + size(style.borderInlineEndWidth);
+      const brandWidth = control.renderSelectValue && icons.length > 1
+        ? size(getComputedStyle(icons[0]).width) : size(font.fontSize);
+      const signature = [textFont, arrowWidth, brandWidth, gap, frameWidth].join("|");
+      const previous = cache.get(control);
+      if (previous?.options === options && previous.signature === signature) continue;
+      cache.set(control, { options, signature });
+      measure.font = textFont;
+      const required = options.reduce((maximum, option) => {
+        const brand = icons.length > 1 && control.renderSelectValue || ["codex", "claude"].includes(option.icon);
+        return Math.max(maximum, frameWidth + measure.measureText(option.label || "").width
+          + (arrowWidth ? arrowWidth + gap : 0) + (brand ? brandWidth + gap : 0));
+      }, 0);
+      const next = sizes.find(width => width >= 120 && width >= required) ?? sizes.at(-1);
+      control.style.setProperty("--settings-select-width", `${next}px`);
+    }
+    if (activePopup?.trigger && host.contains(activePopup.trigger)) fitPopup();
+  };
+  const schedule = () => { if (frame === null) frame = requestAnimationFrame(update); };
+  const fontsChanged = () => { cache = new WeakMap(); schedule(); };
+  const observer = new MutationObserver(schedule);
+  observer.observe(host, { childList: true, subtree: true });
+  window.addEventListener("resize", schedule);
+  document.fonts?.addEventListener("loadingdone", fontsChanged);
+  update();
+  return () => {
+    observer.disconnect();
+    window.removeEventListener("resize", schedule);
+    document.fonts?.removeEventListener("loadingdone", fontsChanged);
+    if (frame !== null) cancelAnimationFrame(frame);
+  };
+}
+
+function appearanceInputFeedback(input, host, message) {
+  // 按 DESIGN.md，错误不仅靠描边颜色；保留原有说明的读屏关联，校验恢复时一起清除错误。
+  const hint = element("small", "settings-input-error");
+  hint.id = `${input.id}-error`; hint.hidden = true;
+  hint.setAttribute("aria-live", "polite");
+  input.setAttribute("aria-describedby", [input.getAttribute("aria-describedby"), hint.id].filter(Boolean).join(" "));
+  host.append(hint);
+  return invalid => {
+    hint.hidden = !invalid;
+    hint.textContent = invalid ? message : "";
+  };
+}
+
 // 用户要求恢复之前的预设颜色，保留原有 12 个值，放在取色器的色相条下方。
 const appearanceColorPresets = ["#171717", "#3f3f46", "#71717a", "#d4d4d8", "#f4f4f5", "#ffffff",
   "#2563eb", "#7c3aed", "#db2777", "#dc2626", "#ea580c", "#16a34a"];
-function bindAppearanceColorValue(input, getColor, onChange) {
+function bindAppearanceColorValue(input, getColor, onChange, showError = () => {}) {
   // 用户要求 HEX 可直接修改、只有色块打开取色器；不保存输入到一半或非法的颜色，失焦时恢复实际色值。
   input.setAttribute("data-appearance-escape", "restore");
-  const reset = () => { input.value = getColor().toUpperCase(); input.setAttribute("aria-invalid", "false"); };
+  const validate = invalid => { input.setAttribute("aria-invalid", String(invalid)); showError(invalid); };
+  const reset = () => { input.value = getColor().toUpperCase(); validate(false); };
   input.oninput = () => {
     const value = input.value.trim(), valid = /^#[0-9a-f]{6}$/i.test(value);
-    input.setAttribute("aria-invalid", String(!valid));
+    validate(!valid);
     if (valid) onChange(value.toLowerCase());
   };
   input.onblur = reset;
@@ -108,22 +175,23 @@ function bindAppearanceColorValue(input, getColor, onChange) {
   };
   return () => { if (document.activeElement !== input) reset(); };
 }
-function bindAppearanceFontSize(input, min, max, getValue, onChange) {
+function bindAppearanceFontSize(input, min, max, getValue, onChange, showError) {
   // 用户要求所有字号统一为数字输入框；保留原滑条/输入框的范围，Enter 或失焦才应用，不能把空值或小数写入设置。
-  bindAppearanceNumberValue(input, min, max, getValue, onChange, "px");
+  bindAppearanceNumberValue(input, min, max, getValue, onChange, "px", showError);
 }
-function bindAppearanceNumberValue(input, min, max, getValue, onChange, unit) {
+function bindAppearanceNumberValue(input, min, max, getValue, onChange, unit, showError = () => {}) {
   // 背景透明度与字号共用数值确认交互，避免空值变成零；输入阶段只标记错误，不改已保存的外观。
   input.setAttribute("data-appearance-escape", "restore");
   input.setAttribute("aria-description", `输入 ${min}～${max}${unit}，按 Enter 或离开输入框应用`);
   const valid = () => input.value.trim() !== "" && Number.isInteger(Number(input.value))
     && Number(input.value) >= min && Number(input.value) <= max;
-  const reset = () => { input.value = String(getValue()); input.setAttribute("aria-invalid", "false"); };
+  const validate = invalid => { input.setAttribute("aria-invalid", String(invalid)); showError(invalid); };
+  const reset = () => { input.value = String(getValue()); validate(false); };
   const commit = () => {
     if (!input.disabled && valid() && Number(input.value) !== getValue()) onChange(Number(input.value));
     reset();
   };
-  input.oninput = () => input.setAttribute("aria-invalid", String(!valid()));
+  input.oninput = () => validate(!valid());
   input.onchange = commit;
   input.onblur = commit;
   input.onkeydown = event => {
@@ -169,6 +237,7 @@ function openAppearanceColorPicker(trigger, label, color, onChange) {
   const presets = element("div", "appearance-color-presets");
   presets.setAttribute("role", "group"); presets.setAttribute("aria-label", `${label}预设颜色`);
   footer.append(swatch, hex); node.append(plane, hue, presets, footer);
+  const showHexError = appearanceInputFeedback(hex, node, "请输入 # 加六位十六进制字符。");
   let hsv = appearanceHexToHsv(color), currentColor = color.toLowerCase();
   const presetButtons = appearanceColorPresets.map(value => {
     const preset = button("", `${label} ${value.toUpperCase()}`, () => {
@@ -187,7 +256,9 @@ function openAppearanceColorPicker(trigger, label, color, onChange) {
     plane.setAttribute("aria-valuetext", `饱和度 ${Math.round(hsv.s * 100)}%，亮度 ${Math.round(hsv.v * 100)}%`);
     hue.value = String(hsv.h);
     for (const preset of presetButtons) preset.setAttribute("aria-pressed", String(preset.dataset.color === currentColor));
-    if (document.activeElement !== hex) { hex.value = currentColor.toUpperCase(); hex.setAttribute("aria-invalid", "false"); }
+    if (document.activeElement !== hex) {
+      hex.value = currentColor.toUpperCase(); hex.setAttribute("aria-invalid", "false"); showHexError(false);
+    }
   };
   const commit = () => {
     currentColor = appearanceHsvToHex(hsv); onChange(currentColor); render();
@@ -219,7 +290,7 @@ function openAppearanceColorPicker(trigger, label, color, onChange) {
   hue.oninput = () => { hsv.h = Number(hue.value); commit(); };
   hex.oninput = () => {
     const value = appearanceHexToHsv(hex.value);
-    hex.setAttribute("aria-invalid", String(!value));
+    hex.setAttribute("aria-invalid", String(!value)); showHexError(!value);
     if (value) { hsv = { ...value, h: value.s ? value.h : hsv.h }; commit(); }
   };
   trigger.popupWidth = 240; trigger.popupMaxHeight = 360;
@@ -240,7 +311,7 @@ function openAppearanceColorPicker(trigger, label, color, onChange) {
 export function mountSettingsPage(screen, { onBack, fromLogin = false }) {
   closeComposerMenus(); closePopup(); sessionMenu?.close();
   const androidContainer = isAndroidContainer();
-  let disposed = false;
+  let disposed = false, stopSelectSizing = () => {};
   const isOpen = () => !disposed && screen.isConnected && !screen.hidden;
   const ownsPopup = () => !!activePopup && screen.contains(activePopup.trigger);
   const find = selector => $(selector, screen);
@@ -786,8 +857,11 @@ export function mountSettingsPage(screen, { onBack, fromLogin = false }) {
     projectThreadLimits.map(value => ({ value: String(value), label: `${value}个` })), String(appearance.projectThreadLimit)));
   const backgroundAction = find("#appearance-background-action");
   const backgroundOpacityInput = find("#appearance-background-opacity");
+  const backgroundOpacityCopy = backgroundOpacityInput.closest(".appearance-field").firstElementChild;
   const syncBackgroundOpacity = bindAppearanceNumberValue(backgroundOpacityInput, backgroundOpacityMin, backgroundOpacityMax,
-    () => appearance.backgroundOpacity, value => { appearance.backgroundOpacity = value; applyAppearance(true); }, "%");
+    () => appearance.backgroundOpacity, value => { appearance.backgroundOpacity = value; applyAppearance(true); }, "%",
+    appearanceInputFeedback(backgroundOpacityInput, backgroundOpacityCopy,
+      `请输入 ${backgroundOpacityMin}～${backgroundOpacityMax}% 的整数。`));
   find("#appearance-background-fit-slot").append(selectControl("appearance-background-fit", "图片铺法", [
     { value: "cover", label: "铺满裁切" }, { value: "contain", label: "完整不裁" }
   ], appearance.backgroundFit));
@@ -811,9 +885,11 @@ export function mountSettingsPage(screen, { onBack, fromLogin = false }) {
     hex.id = `appearance-${name}-hex`; hex.type = "text"; hex.maxLength = 7;
     hex.spellcheck = false; hex.autocomplete = "off";
     hex.setAttribute("aria-label", name === "button" ? "按钮色值" : `${label}色值`);
-    const syncValue = bindAppearanceColorValue(hex, () => getColor(name), color => setColor(name, color));
+    const copy = element("span", "appearance-field-copy", label);
+    const syncValue = bindAppearanceColorValue(hex, () => getColor(name), color => setColor(name, color),
+      appearanceInputFeedback(hex, copy, "请输入 # 加六位十六进制字符。"));
     control.append(swatch, hex);
-    row.append(element("span", "", label), control); colorHost.append(row);
+    row.append(copy, control); colorHost.append(row);
     return { name, swatch, syncValue };
   });
   const contrastInput = find("#appearance-contrast"), contrastOutput = find("#appearance-contrast-value");
@@ -936,13 +1012,25 @@ export function mountSettingsPage(screen, { onBack, fromLogin = false }) {
     applyAppearance(true); syncThemePreviews();
   };
   // 用户要求普通设置改动即保存；输入校验和原有共享设置回执不依赖页面返回或“完成”按钮。
-  find("#appearance-conversation-width").onchange = event => {
-    const value = Number(event.target.value);
-    if (!Number.isInteger(value) || value < conversationWidthMin || value > conversationWidthMax) {
-      event.target.value = appearance.conversationWidth;
-      notice(`会话正文宽度上限请填写 ${conversationWidthMin}～${conversationWidthMax}px。`, true); return;
+  const conversationWidth = find("#appearance-conversation-width");
+  const conversationWidthCopy = conversationWidth.closest(".appearance-field").firstElementChild;
+  const showConversationWidthError = appearanceInputFeedback(
+    conversationWidth, conversationWidthCopy, `请输入 ${conversationWidthMin}～${conversationWidthMax}px 的整数。`);
+  const validateConversationWidth = () => {
+    const value = Number(conversationWidth.value);
+    const valid = Number.isInteger(value) && value >= conversationWidthMin && value <= conversationWidthMax;
+    conversationWidth.setAttribute("aria-invalid", String(!valid)); showConversationWidthError(!valid);
+    return valid;
+  };
+  conversationWidth.oninput = validateConversationWidth;
+  conversationWidth.onchange = () => {
+    if (!validateConversationWidth()) {
+      conversationWidth.value = appearance.conversationWidth;
+      validateConversationWidth();
+      return;
     }
-    void saveSharedSettings({ conversationWidth: value }).catch(error => { if (isOpen()) sync(); notice(error.message, true); });
+    void saveSharedSettings({ conversationWidth: Number(conversationWidth.value) })
+      .catch(error => { if (isOpen()) sync(); notice(error.message, true); });
   };
   find("#appearance-preset").onchange = event => {
     appearance.themePreset = event.target.value;
@@ -1015,9 +1103,12 @@ export function mountSettingsPage(screen, { onBack, fromLogin = false }) {
   };
   for (const [id, key, min, max] of [["font", "fontSize", 10, 20], ["code-font-size", "codeFontSize", 8, 24],
     ["file-reading-font", "fileReadingFontSize", fileReadingFontMin, fileReadingFontMax]]) {
-    bindAppearanceFontSize(find(`#appearance-${id}`), min, max,
+    const input = find(`#appearance-${id}`);
+    const copy = input.closest(".appearance-field").firstElementChild;
+    bindAppearanceFontSize(input, min, max,
       () => key === "fileReadingFontSize" ? currentFileReadingFontSize() : appearance[key],
-      value => { appearance[key] = value; applyAppearance(true); sync(); });
+      value => { appearance[key] = value; applyAppearance(true); sync(); },
+      appearanceInputFeedback(input, copy, `请输入 ${min}～${max}px 的整数。`));
   }
   find("#appearance-file-reading-font-reset").onclick = () => {
     appearance.fileReadingFontSize = fileReadingFontDefault; applyAppearance(true); sync();
@@ -1065,12 +1156,14 @@ export function mountSettingsPage(screen, { onBack, fromLogin = false }) {
         remoteSettings.refreshInstance(change.instanceId);
     }
   });
+  stopSelectSizing = installSettingsSelectWidths(screen);
   // 用户要求可行时提前准备实例设置；只预读本次当前实例，点击实例页时复用缓存或同一请求，不扫描其他 CLI。
   if (session && connected) void instancePages.get("types").show();
   find("#appearance-title").focus({ preventScroll: true });
   return () => {
     if (disposed) return;
     disposed = true;
+    stopSelectSizing();
     clearTimeout(leaving);
     screen.inert = false;
     delete screen.dataset.settingsLeaving;

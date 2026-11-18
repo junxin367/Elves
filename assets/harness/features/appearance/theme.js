@@ -373,6 +373,16 @@ function appearanceAccessibleColor(color, background, minimum = 4.5) {
   }
   return mixColor(color, target, high);
 }
+function appearanceSettingsStroke(color, backgrounds, minimum) {
+  const ratio = (stroke, surface) => appearanceContrastRatio(stroke, surface);
+  const clears = stroke => backgrounds.every(surface => ratio(stroke, surface) >= minimum);
+  if (clears(color)) return color;
+  const closest = backgrounds.reduce((left, right) => ratio(color, left) <= ratio(color, right) ? left : right);
+  const adjusted = appearanceAccessibleColor(color, closest, minimum);
+  if (clears(adjusted)) return adjusted;
+  const score = stroke => Math.min(...backgrounds.map(surface => ratio(stroke, surface)));
+  return score("#ffffff") > score("#000000") ? "#ffffff" : "#000000";
+}
 export function appearanceButtonColor(palette) {
   // Elver 自带默认按钮色；没有按钮色的其他主题继续沿用前景色派生。
   return /^#[0-9a-f]{6}$/i.test(palette.button) ? palette.button : null;
@@ -431,6 +441,11 @@ export function appearanceThemeColors(theme, palette) {
   const customButton = appearanceButtonColor(palette);
   // 设置和管理卡片共用 68% 输入框表面 + 32% 页面背景；背景和按钮引用同一份舍入后的实色。
   const card = mixColor(background, surfaces["composer-bg"], .68);
+  const danger = dark ? "#ff9c97" : "#b42318";
+  const focus = appearanceAccessibleColor(dark
+    ? mixColor(background, accentText, .7 + .1 * contrast) : accent, background, 3);
+  // 设置内描边同时邻接控件填充与卡片；独立校验实际表面，保留其他区域既有焦点和错误颜色。
+  const settingsSurfaces = [background, card, surfaces["composer-bg"], surfaces["composer-hover"], surfaces["control-bg"]];
   const buttons = {};
   // 与 style.css 的审批/设置卡片及管理页的 card/popover 表面对齐；不改变发送、危险、强调按钮和无自定义色主题。
   for (const [prefix, surface] of Object.entries({ button: background, "button-side": side,
@@ -456,8 +471,10 @@ export function appearanceThemeColors(theme, palette) {
       : mixColor(background, accent, .12 + .045 * contrast),
     "accent-soft-active": selection,
     "accent-indicator": appearanceAccessibleColor(accent, background, 3),
-    "focus-ring": appearanceAccessibleColor(dark
-      ? mixColor(background, accentText, .7 + .1 * contrast) : accent, background, 3),
+    "focus-ring": focus,
+    "settings-field-focus": appearanceSettingsStroke(focus, settingsSurfaces, 3),
+    "settings-field-error": appearanceSettingsStroke(danger, settingsSurfaces, 3),
+    "settings-error-text": appearanceSettingsStroke(danger, [card, surfaces["control-bg"]], 4.5),
     "selection-bg": selection, "selection-text": appearanceReadableForeground(selection, foreground),
     // 当前外观通过 HEX 独立配置，不借用 Codex 账号强调色来源；按原生自定义配色路径保留中性发送按钮和用户气泡。
     "primary-bg": foreground, "primary-text": primaryText,
@@ -465,7 +482,7 @@ export function appearanceThemeColors(theme, palette) {
     ...buttons,
     "user-message-bg": appearanceAlphaColor(foreground, .05), "user-message-text": foreground,
     "notice-bg": surfaces["control-bg"], "notice-text": foreground,
-    danger: dark ? "#ff9c97" : "#b42318", "on-danger": dark ? "#171717" : "#ffffff",
+    danger, "on-danger": dark ? "#171717" : "#ffffff",
     green: dark ? "#77c7a0" : "#168350",
   };
 }

@@ -1972,3 +1972,89 @@ body{font-weight:var(--ui-font-weight,400)}
  .appearance-card .appearance-font input{min-width:48px;width:80px}
  .appearance-field-copy>small{font-size:.78571rem}
 }
+
+/* 用户要求设置页遵循 DESIGN.md：普通控件统一 36px 外框、8px 圆角；
+ * 输入默认 100px，Select 默认 120px，指定的字体、主题、模型、思考深度和实例选择器使用固定档位。
+ * 导航、开关、滑块、主题缩略图和菜单选项保留专用样式。 */
+:is(.appearance-screen,.prompt-optimization-settings){
+  --settings-control-height:36px;
+  --settings-control-radius:8px;
+  --settings-control-padding:10px;
+  --settings-control-min-width:80px;
+  --settings-select-gap:8px;
+  --settings-model-width:140px;
+  --settings-effort-width:100px;
+  --settings-instance-width:200px
+}
+.appearance-screen :is(input:not([type=range],[type=checkbox],[type=radio],[type=file],[type=color],[type=hidden],.popup-search),.select-trigger){
+  box-sizing:border-box;
+  height:var(--settings-control-height);min-height:var(--settings-control-height);
+  min-width:var(--settings-control-min-width);max-width:100%;
+  padding:0 var(--settings-control-padding);
+  border:1px solid var(--line);border-radius:var(--settings-control-radius);
+  line-height:1.4;background:var(--settings-control-bg,var(--composer-bg))
+}
+.appearance-screen input:not([type=range],[type=checkbox],[type=radio],[type=file],[type=color],[type=hidden],.popup-search){
+  width:var(--settings-input-width,100px)
+}
+.appearance-screen input[type=number][placeholder]{--settings-input-width:160px}
+.appearance-screen .select-trigger{
+  display:inline-flex;justify-content:space-between;gap:var(--settings-select-gap);
+  width:var(--settings-select-width,120px);flex-shrink:1
+}
+.appearance-screen .select-trigger>.select-label{
+  flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap
+}
+.appearance-screen .select-trigger>.ui-icon{flex-shrink:0}
+.appearance-screen .select-trigger[aria-expanded=true]:not(:disabled){--settings-control-bg:var(--composer-hover)}
+.appearance-screen .select-trigger:active:not(:disabled){--settings-control-bg:var(--settings-control-active)}
+.appearance-screen .appearance-font-family{width:120px}
+.appearance-screen .select-trigger:where(#appearance-preset){width:140px}
+.appearance-screen .select-trigger:where(#conversation-naming-model),
+.appearance-screen .instance-model-defaults-selectors>.select-trigger:not(.instance-model-default-effort){
+  width:var(--settings-model-width)
+}
+.appearance-screen .instance-model-default-effort{width:var(--settings-effort-width)}
+.appearance-screen .instance-settings-target .select-trigger,
+.appearance-screen .select-trigger:where(#permission-instance,#instruction-instance,#conversation-naming-instance,#claude-recap-instance){
+  width:var(--settings-instance-width)
+}
+.prompt-optimization-settings .select-trigger:where(#prompt-optimization-model){width:var(--settings-model-width)}
+.prompt-optimization-settings .select-trigger:where(#prompt-optimization-effort){width:var(--settings-effort-width)}
+.prompt-optimization-settings .select-trigger:where(#prompt-optimization-model,#prompt-optimization-effort){max-width:100%}
+:is(.appearance-screen,.settings-prompt-dialog) button:not(.select-trigger,.appearance-nav-item,.icon-button,.color-swatch,.appearance-mode-option,.appearance-color-preset,.appearance-version,.appearance-theme-button,.appearance-page-entry,.popup-option,.popup-submenu-back){
+  display:inline-flex;align-items:center;justify-content:center;gap:5px;
+  width:max-content;max-width:100%;height:var(--settings-control-height);min-height:var(--settings-control-height);
+  padding:0 var(--settings-control-padding);border-radius:var(--settings-control-radius);line-height:1.4;white-space:nowrap
+}
+.appearance-screen .color-swatch{flex-basis:var(--settings-control-height);width:var(--settings-control-height);height:var(--settings-control-height)}
+.appearance-screen :is(.select-trigger,input:not([type=range],[type=checkbox],[type=radio],[type=file],[type=color],[type=hidden])):disabled{
+  opacity:.45;cursor:not-allowed
+}
+/* 焦点和错误只保留一圈内描边，最外缘不改变，避免设置页控件尺寸跳动。 */
+:is(.appearance-screen,.settings-prompt-dialog) :is(input:not([type=range],[type=checkbox],[type=radio],[type=file],[type=color],[type=hidden]),textarea,select):focus,
+:is(.appearance-screen,.settings-prompt-dialog) button:not(.popup-option,.popup-submenu-back):focus-visible,
+.appearance-screen .select-trigger[aria-expanded=true]:not(:disabled){
+  outline:1px solid var(--settings-outline,var(--settings-field-focus,var(--focus-ring)));
+  outline-offset:-1px;border-color:transparent;transition-property:background-color,opacity
+}
+:is(.appearance-screen,.settings-prompt-dialog) :is(input:not([type=range],[type=checkbox],[type=radio],[type=file],[type=color],[type=hidden]),textarea,select)[aria-invalid=true]{
+  border-color:var(--settings-field-error,var(--danger))
+}
+:is(.appearance-screen,.settings-prompt-dialog) [aria-invalid=true]{--settings-outline:var(--settings-field-error,var(--danger))}
+.appearance-screen .appearance-field-copy>.settings-input-error{
+  color:var(--settings-error-text,var(--danger));font-size:.85714rem;overflow-wrap:anywhere
+}
+@media(hover:hover) and (pointer:fine){
+  .appearance-screen :is(.select-trigger,input:not([type=range],[type=checkbox],[type=radio],[type=file],[type=color],[type=hidden])):hover:not(:disabled,:active){
+    --settings-control-bg:var(--composer-hover)
+  }
+}
+@media(max-width:760px){
+  :is(.appearance-screen,.prompt-optimization-settings){
+    --settings-control-min-width:60px;--settings-control-padding:5px;--settings-select-gap:4px
+  }
+  .appearance-screen input[type=number]:not([placeholder]){--settings-input-width:80px}
+  .appearance-screen input[type=number][placeholder]{--settings-input-width:120px}
+}
+.appearance-screen{--settings-control-active:color-mix(in srgb,var(--composer-hover),var(--text) 6%)}
