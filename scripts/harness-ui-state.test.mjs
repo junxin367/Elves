@@ -7881,7 +7881,7 @@ function toolRenderer() {
   return context.renderItem;
 }
 
-function compactionRenderer() {
+function compactionRenderer(composerTooltips = null) {
   function element(tag, className = "", text = "") {
     return { tagName: tag, className, ownText: text, children: [], attributes: {},
       classList: { add() {} }, append(...nodes) { this.children.push(...nodes); },
@@ -7890,7 +7890,13 @@ function compactionRenderer() {
       get textContent() { return this.ownText + this.children.map(node => node.textContent || "").join(""); },
     };
   }
-  const context = { element, icon: () => element("svg"), button: () => element("button"),
+  const context = { element, icon: () => element("svg"), composerTooltips,
+    button: (text, label, action, className) => {
+      const control = element("button", className, text);
+      control.setAttribute("title", label);
+      control.click = action;
+      return control;
+    },
     compactionQueueSendReason: () => "", models: [],
     effortLabels: { high: "高", xhigh: "极高", max: "Max" } };
   vm.createContext(context);
@@ -7924,11 +7930,21 @@ test("Claude 压缩沿用同一正文行，状态和说明不写死执行器且�
 });
 
 test("压缩提示分行保留同次实际模型和统计，缺失字段不借用当前模型", () => {
-  const render = compactionRenderer();
+  const opened = [], render = compactionRenderer({ toggleCompaction: trigger => opened.push(trigger) });
   const node = render({ id: "compact", type: "contextCompaction", completed: true,
     compactionModel: "actual-compression-model", preTokens: 283393, postTokens: 9878, durationMs: 198244 });
   assert.match(node.attributes["aria-label"], /\n压缩模型：actual-compression-model\n/);
   assert.match(node.attributes["aria-label"], /\n压缩前：283,393 Token\n压缩后：9,878 Token\n缩减：96.5%\n用时：3 分 18.244 秒/);
+  const info = node.children[2], click = { currentTarget: info, stopPropagation() { this.stopped = true; } };
+  assert.equal(info.attributes["aria-expanded"], "false");
+  assert.match(info.attributes.title, /\n压缩模型：actual-compression-model\n/);
+  info.click(click);
+  assert.equal(click.stopped, true);
+  assert.deepEqual(opened, [info]);
+  const modelInfo = render({ type: "modelChanged", fromModel: "a", toModel: "b" }).children[2];
+  modelInfo.click({ ...click, currentTarget: modelInfo });
+  assert.equal(modelInfo.attributes["aria-expanded"], undefined);
+  assert.deepEqual(opened, [info], "普通模型变更事件不展开压缩详情");
   const missing = render({ id: "missing", type: "contextCompaction", completed: true, postTokens: 0, durationMs: 0 });
   assert.match(missing.attributes["aria-label"], /压缩模型：原生未提供/);
   assert.match(missing.attributes["aria-label"], /压缩后：0 Token/);
@@ -15613,7 +15629,7 @@ test("编辑区主题提示接管并恢复 title，保留无障碍说明，触�
   }
   const document = { documentElement: { dataset: { inputModality: "pointer" } },
     body: { append: node => nodes.push(node) },
-    addEventListener: (name, handler) => listeners.set(name, handler) };
+    addEventListener: (name, handler, capture) => listeners.set(capture ? `${name}:capture` : name, handler) };
   const context = nodeVm.createContext({ nativeConnectionVersion: 1, document, element,
     window: { innerWidth: 800, innerHeight: 600, addEventListener() {} },
     setTimeout: fn => { timers.set(++timerId, fn); return timerId; }, clearTimeout: id => timers.delete(id),
@@ -15661,10 +15677,45 @@ test("编辑区主题提示接管并恢复 title，保留无障碍说明，触�
   assert.equal(nodes[0].className, "composer-tooltip composer-metrics-tooltip");
   listeners.get("pointerout")({ target: metrics, relatedTarget: null });
   const compaction = element("button");
-  compaction.isCompaction = true; compaction.setAttribute("title", "压缩模型：actual-model\n压缩前：1,000 Token");
+  const details = "压缩模型：actual-model\n压缩前：1,000 Token";
+  compaction.isCompaction = true; compaction.setAttribute("title", details);
+  compaction.setAttribute("aria-expanded", "false");
   listeners.get("pointerover")({ target: compaction, pointerType: "mouse" }); flush();
   assert.equal(nodes[0].className, "composer-tooltip compaction-tooltip");
-  assert.match(nodes[0].textContent, /\n压缩前：/);
+  assert.equal(nodes[0].textContent, details);
+  const hover = nodes[0], press = target => listeners.get("pointerdown:capture")({ target });
+  const leave = target => listeners.get("pointerout")({ target, relatedTarget: null });
+  press(compaction); tooltip.toggleCompaction(compaction);
+  leave(compaction);
+  assert.deepEqual(nodes, [hover], "点击悬停中的图标固定同一提示，移出后保留");
+  assert.equal(compaction.getAttribute("aria-expanded"), "true");
+  listeners.get("pointerover")({ target: trigger, pointerType: "mouse" }); flush();
+  assert.deepEqual(nodes, [hover], "展开详情后经过其他提示不抢占");
+  press(compaction); tooltip.toggleCompaction(compaction);
+  assert.equal(nodes.length, 0);
+  assert.equal(compaction.getAttribute("aria-expanded"), "false");
+  assert.equal(compaction.getAttribute("title"), details);
+
+  listeners.get("pointerover")({ target: compaction, pointerType: "touch" });
+  assert.equal(timers.size, 0);
+  press(compaction); tooltip.toggleCompaction(compaction);
+  assert.equal(nodes[0].textContent, details, "触屏点击不等待 200ms");
+  press(trigger);
+  assert.equal(nodes.length, 0);
+
+  listeners.get("pointerover")({ target: compaction, pointerType: "mouse" });
+  assert.equal(timers.size, 1);
+  press(compaction); tooltip.toggleCompaction(compaction);
+  assert.equal(timers.size, 0, "点击取消尚未执行的悬停计时");
+  const escape = { key: "Escape", preventDefault() { this.prevented = true; }, stopPropagation() { this.stopped = true; } };
+  listeners.get("keydown:capture")(escape);
+  assert.equal(escape.prevented, true);
+  assert.equal(escape.stopped, true);
+  assert.equal(nodes.length, 0);
+  tooltip.toggleCompaction(compaction);
+  compaction.isConnected = false; observers.at(-1).callback();
+  assert.equal(nodes.length, 0);
+  assert.equal(compaction.getAttribute("aria-expanded"), "false");
 });
 
 function composerMetricsHarness({ animate = false, reducedMotion = false } = {}) {

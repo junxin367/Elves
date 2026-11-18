@@ -2,6 +2,7 @@
 
 import { button, element } from "../../ui/dom.js";
 import { icon } from "../../ui/icons.js";
+import { composerTooltips } from "../../ui/tooltip.js";
 import { models } from "../composer/options-state.js";
 import { effortLabels } from "../composer/prompt-editor.js";
 import { compactionQueueSendReason } from "../conversation/compaction.js";
@@ -116,7 +117,13 @@ export function renderTranscriptEvent(item, previous) {
       : `模型切换可能触发上下文压缩。${item.reason ? ` 原因：${item.reason}` : ""}`;
   }
   const text = element("span", `transcript-event-label${compacting && item.status !== "failed" ? " working-label" : ""}`, label);
-  const info = button("", description, event => event.stopPropagation(), "transcript-event-info");
+  // 用户要求压缩信息图标可点击查看原悬停内容，触屏与键盘也能展开；其他事件保持原交互。
+  const compaction = item.type === "contextCompaction";
+  const info = button("", description, event => {
+    event.stopPropagation();
+    if (compaction) composerTooltips?.toggleCompaction(event.currentTarget);
+  }, "transcript-event-info");
+  if (compaction) info.setAttribute("aria-expanded", "false");
   info.append(icon("info"));
   node.replaceChildren(symbol, text, info);
   node.setAttribute("role", compacting && item.status !== "failed" ? "status" : "note");
