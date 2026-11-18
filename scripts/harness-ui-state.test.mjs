@@ -4236,6 +4236,9 @@ test("Open in 前端接受独立服务的全部目标，IDEA、WSL 和 PowerShel
   const accepted = Array.from(context.normalizeTargets(context.input, { wslInstance: true }).targets, target => target.target);
   assert.deepEqual(accepted, targets.map(target => target.target));
   for (const target of ["intellij", "wsl", "powershell"]) assert.ok(accepted.includes(target));
+  context.input.targets = [...targets, { target: "defaultApp", label: "Default app", available: true }];
+  assert.equal(context.normalizeTargets(context.input, { wslInstance: true }).targets
+    .some(target => target.target === "defaultApp"), false, "工作区和会话行不得接收正文专属项");
   assert.equal(context.normalizeTargets(context.input, { wslInstance: false }).targets
     .some(target => target.target === "wsl"), false, "本机实例不能被旧后台的 WSL 项误启用");
 });
@@ -4447,7 +4450,7 @@ test("会话右键打开方式在异步准备后复核授权、入口身份、�
   }
 });
 
-test("正文文件打开方式携带所点相对路径，保留图标列表且不改写工作区首选程序", async () => {
+test("正文文件打开方式在 VS Code 后显示 Default app，携带所点路径且不改写首选程序", async () => {
   const requests = [], disk = storage(), preferences = storage();
   disk.removeItem = key => disk.records.delete(key);
   preferences.setItem("existing-workspace-preference", "vscode");
@@ -4455,30 +4458,32 @@ test("正文文件打开方式携带所点相对路径，保留图标列表且�
   const context = rawVm.createContext({ nativeConnectionVersion: 1, pageLeaving: false,
     session: { transport: "desktop", device: { id: "device" }, capabilities: { workspaceOpenIn: true } },
     privateInputScope: value => value.device.id, threadReadOnly: () => false,
+    element: (_tag, className) => ({ className, setAttribute() {} }),
     AbortController, setTimeout, clearTimeout, notice() {}, sessionStorage: disk, localStorage: preferences,
     randomId: () => "file-request", validateRemoteReceipt: value => value,
     api: async (path, payload, requestId) => {
       requests.push({ path, payload: JSON.parse(JSON.stringify(payload)), requestId });
       return path.endsWith("targets") ? { ok: true, root: item.cwd, path: payload.path, targets: [
         { target: "vscode", label: "VS Code", available: true },
+        { target: "defaultApp", label: "Default app", available: true },
         { target: "fileManager", label: "File Explorer", available: true }
       ] } : { state: "completed", result: { target: payload.target, root: item.cwd, path: payload.path } };
     } });
   rawVm.runInContext(workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("const applicationIds ="),
-    workspaceOpenInSource.indexOf("const applicationPaths ="))
-    + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function normalizeTargets("),
+    workspaceOpenInSource.indexOf("export function clientOpenInContext("))
+    + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function applicationIcon("),
       workspaceOpenInSource.indexOf("export function mountWorkspaceOpenIn("))
-    + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function workspaceOpenInAvailable("),
-      workspaceOpenInSource.indexOf("export function clientOpenInContext("))
     + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function sidebarOpenInContext("))
       .replace(/^export /gm, ""), context);
   const menu = context.fileOpenInMenu("src/app.ts", { getItem: () => item });
   const targets = await menu.submenu({});
-  assert.deepEqual(Array.from(targets, target => target.value), ["vscode", "fileManager"]);
-  await targets[0].action();
+  assert.deepEqual(Array.from(targets, target => target.value), ["vscode", "defaultApp", "fileManager"]);
+  assert.equal(targets[1].label, "Default app");
+  assert.match(targets[1].renderIcon().innerHTML, /<rect[^>]+rx="5"/);
+  await targets[1].action();
   assert.equal(requests.length, 3);
   assert.ok(requests.every(request => request.payload.threadId === item.id && request.payload.path === "src/app.ts"));
-  assert.equal(requests[2].payload.target, "vscode");
+  assert.equal(requests[2].payload.target, "defaultApp");
   assert.equal(preferences.records.size, 1); assert.equal(disk.records.size, 0);
   context.api = async () => ({ ok: true, root: item.cwd, path: "other/file.ts", targets: [] });
   await assert.rejects(menu.submenu({}), /所选文件不一致/);

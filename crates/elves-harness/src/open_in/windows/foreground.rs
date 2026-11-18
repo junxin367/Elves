@@ -161,13 +161,16 @@ fn candidate_rank(fresh: bool, matching: bool, terminal: bool) -> Option<u8> {
 
 pub(super) fn activate(
     before: &Snapshot,
-    application: &Application,
+    application: Option<&Application>,
     terminal: Option<&Path>,
     child: Option<u32>,
     root: &Path,
 ) -> bool {
-    let expected = application.executable.to_string_lossy().to_lowercase();
-    let title = if terminal.is_some() {
+    let expected = application.map(|app| app.executable.to_string_lossy().to_lowercase());
+    if expected.is_none() && child.is_none() {
+        return false;
+    }
+    let title = if let (Some(application), Some(_)) = (application, terminal) {
         super::window_title(application, root).to_lowercase()
     } else {
         root.file_name()
@@ -180,18 +183,20 @@ pub(super) fn activate(
     loop {
         // 用户要求激活新窗口和被单实例应用复用的旧窗口；仅匹配所选程序的安装路径或其 Windows Terminal 宿主。
         // 不访问 Codex App 的连接、页面或内部对象，也不靠标题全局抢占其他软件的窗口。
-        let mut owners: HashSet<u32> = crate::windows_integration::enumerate_processes()
-            .into_iter()
-            .filter(|process| {
-                process
-                    .executable_path
-                    .as_ref()
-                    .is_some_and(|path| path.to_string_lossy().to_lowercase() == expected)
-                    || terminal.is_some()
-                        && process.exe_file.eq_ignore_ascii_case("WindowsTerminal.exe")
-            })
-            .map(|process| process.process_id)
-            .collect();
+        let mut owners: HashSet<u32> = expected.as_ref().map_or_else(HashSet::new, |expected| {
+            crate::windows_integration::enumerate_processes()
+                .into_iter()
+                .filter(|process| {
+                    process
+                        .executable_path
+                        .as_ref()
+                        .is_some_and(|path| path.to_string_lossy().to_lowercase() == *expected)
+                        || terminal.is_some()
+                            && process.exe_file.eq_ignore_ascii_case("WindowsTerminal.exe")
+                })
+                .map(|process| process.process_id)
+                .collect()
+        });
         owners.extend(child);
         let foreground = unsafe { GetForegroundWindow() };
         let mut foreground_owner = 0;

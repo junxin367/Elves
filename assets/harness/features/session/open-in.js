@@ -16,6 +16,8 @@ const applicationIds = new Set(["vscode", "visualStudio", "sublimeText", "github
   "fileManager", "gitBash", "cmder", "rider", "intellij", "powershell", "wsl"]);
 const applicationPaths = {
   vscode: '<path d="M17.25 2.8 7.57 11.6 3.4 8.43 1.5 9.5v5l1.9 1.08 4.17-3.18 9.68 8.8L22.5 19V5l-5.25-2.2Zm-.2 5.08v8.24L11.75 12l5.3-4.12Z"/>',
+  // 用户要求参考 Codex App 的浅色圆角底和蓝黄色文件夹，沿用其他应用图标的 16px 菜单尺寸。
+  defaultApp: '<rect x="2" y="2" width="20" height="20" rx="5" fill="#f5f5f5"/><path d="M6 9a1.5 1.5 0 0 1 1.5-1.5h3L12 9h4.5a1.5 1.5 0 0 1 1.5 1.5v5A1.5 1.5 0 0 1 16.5 17h-9A1.5 1.5 0 0 1 6 15.5Z" fill="#eeb23e"/><path d="M8 11h8v4H8z" fill="#287acb"/><path d="M6 13.5h4l1 1.5h2l1-1.5h4v2a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 6 15.5Z" fill="#f7c454"/>',
   visualStudio: '<path d="m17.34 2.5-8.8 6.7-4.42-3.42L1.5 7.1v9.8l2.62 1.32 4.42-3.42 8.8 6.7 5.16-2.06V4.56L17.34 2.5ZM4.65 9.35 7.7 12l-3.05 2.65v-5.3Zm12.5-1.82v8.94L11.28 12l5.87-4.47Z"/>',
   githubDesktop: '<path d="M12 2a10 10 0 0 0-3.16 19.49c.5.09.68-.22.68-.48v-1.86c-2.78.6-3.37-1.18-3.37-1.18-.45-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.61.07-.61 1 .07 1.53 1.03 1.53 1.03.9 1.52 2.34 1.08 2.91.83.09-.64.35-1.08.64-1.33-2.22-.25-4.55-1.11-4.55-4.94 0-1.09.39-1.98 1.03-2.68-.1-.26-.45-1.27.1-2.64 0 0 .84-.27 2.75 1.02A9.6 9.6 0 0 1 12 6.84c.85 0 1.71.11 2.51.34 1.91-1.29 2.75-1.02 2.75-1.02.55 1.37.2 2.38.1 2.64.64.7 1.03 1.59 1.03 2.68 0 3.84-2.34 4.69-4.57 4.94.36.31.68.92.68 1.85v2.74c0 .27.18.58.69.48A10 10 0 0 0 12 2Z"/>',
   fileManager: '<path d="M2 6a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2Z"/>'
@@ -70,7 +72,9 @@ function normalizeTargets(result, context) {
   if (context?.path && result.path !== context.path)
     throw new Error("应用列表与所选文件不一致，请重新打开文件菜单。");
   const seen = new Set();
-  const targets = result.targets.filter(target => target && applicationIds.has(target.target)
+  // Default app 只属于正文文件的打开方式；即使目录应用列表误返回该项，顶部和会话行也不能显示或选中。
+  const targets = result.targets.filter(target => target
+      && (target.target === "defaultApp" ? !!context?.path : applicationIds.has(target.target))
       && (target.target !== "wsl" || context?.wslInstance === true)
       && target.available === true && typeof target.label === "string" && target.label.length <= 80
       && target.label.trim() && !seen.has(target.target) && seen.add(target.target))

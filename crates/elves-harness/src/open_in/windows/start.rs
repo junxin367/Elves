@@ -1,16 +1,18 @@
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::process::Command;
 
-use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::Foundation::{CloseHandle, ERROR_NO_ASSOCIATION};
+use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Threading::GetProcessId;
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
-    SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
-    SHOpenFolderAndSelectItems, SHParseDisplayName, ShellExecuteExW,
+    AssocIsDangerous, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS,
+    SHELLEXECUTEINFOW, SHGFI_EXETYPE, SHGetFileInfoW, SHOpenFolderAndSelectItems,
+    SHParseDisplayName, ShellExecuteExW,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::PCWSTR;
@@ -50,6 +52,70 @@ pub(super) fn reveal_file(path: &Path) -> io::Result<()> {
     // 解析或定位失败必须报错，不另开工作区根目录或自动重试。
     unsafe { SHOpenFolderAndSelectItems(item.0, None, 0) }
         .map_err(|error| io::Error::other(error.to_string()))
+}
+
+pub(super) fn open_with_default_app(path: &Path) -> io::Result<Option<u32>> {
+    let _apartment = crate::windows_integration::ComApartment::init()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let extension = path
+        .extension()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| io::Error::other("该文件没有可用的 Windows 默认应用"))?;
+    let extension = extension.to_ascii_lowercase();
+    let mut association = OsString::from(".");
+    association.push(&extension);
+    let association = wide(&association);
+    let file = wide(OsStr::new(&super::display_path(path).replace('/', r"\")));
+    // 正文的 Default app 只打开关联文档；应用、脚本和快捷方式不能经文件菜单直接执行。
+    // 补充 Windows 风险分类未覆盖的安装包、Shell 搜索和常见脚本类型，再检查实际可执行文件格式。
+    if matches!(
+        extension.to_str().unwrap_or_default(),
+        "application"
+            | "appinstaller"
+            | "appx"
+            | "appxbundle"
+            | "msix"
+            | "msixbundle"
+            | "search-ms"
+            | "searchconnector-ms"
+            | "diagcab"
+            | "xll"
+            | "jar"
+            | "py"
+            | "pyw"
+            | "rb"
+            | "sh"
+            | "psm1"
+    ) || unsafe { AssocIsDangerous(PCWSTR(association.as_ptr())).as_bool() }
+        || unsafe {
+            SHGetFileInfoW(
+                PCWSTR(file.as_ptr()),
+                FILE_FLAGS_AND_ATTRIBUTES::default(),
+                None,
+                0,
+                SHGFI_EXETYPE,
+            ) != 0
+        }
+    {
+        return Err(io::Error::other(
+            "此文件可能执行程序或脚本，请在 File Explorer 中确认后打开",
+        ));
+    }
+    // 将原文件作为 Shell 的文件参数，不拼接命令或改用浏览器；空 verb 使用系统当前默认关联。
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+        lpFile: PCWSTR(file.as_ptr()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    execute(&mut info).map_err(|error| {
+        if error.code() == windows::core::HRESULT::from_win32(ERROR_NO_ASSOCIATION.0) {
+            io::Error::other("Windows 未为此类型设置默认应用")
+        } else {
+            io::Error::other(error.to_string())
+        }
+    })
 }
 
 // ShellExecute 只接受参数字符串；按 Windows argv 规则转义每个独立参数，路径中的引号和尾部反斜杠不能变成额外命令。
@@ -136,7 +202,11 @@ pub(super) fn launch(command: &mut Command) -> io::Result<Option<u32>> {
         nShow: SW_SHOWNORMAL.0,
         ..Default::default()
     };
-    unsafe { ShellExecuteExW(&mut info) }.map_err(|error| io::Error::other(error.to_string()))?;
+    execute(&mut info).map_err(|error| io::Error::other(error.to_string()))
+}
+
+fn execute(info: &mut SHELLEXECUTEINFOW) -> windows::core::Result<Option<u32>> {
+    unsafe { ShellExecuteExW(info) }?;
     if info.hProcess.is_invalid() {
         return Ok(None);
     }
@@ -160,6 +230,24 @@ mod tests {
             assert_eq!(
                 String::from_utf16(&quoted(OsStr::new(input))).unwrap(),
                 expected
+            );
+        }
+    }
+
+    #[test]
+    fn default_app_refuses_windows_execution_and_installation_targets() {
+        for file in [
+            "package.EXE",
+            "example.lnk",
+            "run.ps1",
+            "run.py",
+            "setup.msix",
+            "test.search-ms",
+        ] {
+            let error = open_with_default_app(Path::new(file)).unwrap_err();
+            assert!(
+                error.to_string().contains("File Explorer"),
+                "{file}: {error}"
             );
         }
     }

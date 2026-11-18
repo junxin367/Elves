@@ -17,7 +17,7 @@ use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO};
 use windows::core::PCWSTR;
 
-use super::{ApiError, Application, LaunchOutcome, display_path};
+use super::{ApiError, Application, FileTarget, LaunchOutcome, display_path};
 
 mod foreground;
 mod start;
@@ -507,16 +507,20 @@ fn command(
     command
 }
 
-pub(super) fn launch(application: &Application, root: &Path) -> Result<LaunchOutcome, ApiError> {
-    if application.target == "wsl" && application.wsl_session.is_none() {
-        return Err(ApiError::new(409, "当前对话没有可恢复的 WSL 会话"));
-    }
-    // canonicalize 会产生 \\?\ 前缀，交给 Windows Shell/编辑器前恢复普通盘符或 UNC 形式。
+fn validate_workspace_root(root: &Path) -> Result<(), ApiError> {
     let root_now = std::fs::canonicalize(root)
         .map_err(|_| ApiError::new(404, "会话工作目录不存在或无法读取"))?;
     if root_now != root || !root_now.is_dir() {
         return Err(ApiError::new(409, "会话工作目录已变化，请重新打开会话"));
     }
+    Ok(())
+}
+
+pub(super) fn launch(application: &Application, root: &Path) -> Result<LaunchOutcome, ApiError> {
+    if application.target == "wsl" && application.wsl_session.is_none() {
+        return Err(ApiError::new(409, "当前对话没有可恢复的 WSL 会话"));
+    }
+    validate_workspace_root(root)?;
     let terminal = matches!(application.target, "powershell" | "wsl")
         .then(windows_terminal)
         .flatten();
@@ -539,7 +543,7 @@ pub(super) fn launch(application: &Application, root: &Path) -> Result<LaunchOut
     .map_err(|error| ApiError::new(422, &format!("无法启动 {}：{error}", application.label)))?;
     let focus = foreground::activate(
         &snapshot,
-        application,
+        Some(application),
         terminal.as_deref(),
         process_id,
         if application.target == "wsl" || application.target == "githubDesktop" {
@@ -560,6 +564,24 @@ pub(super) fn launch(application: &Application, root: &Path) -> Result<LaunchOut
                 application.label
             )
         }),
+    })
+}
+
+pub(super) fn launch_default_file(
+    root: &Path,
+    file: &FileTarget,
+) -> Result<LaunchOutcome, ApiError> {
+    validate_workspace_root(root)?;
+    let file = super::super::workspace::open_in_file_path(&file.root, &file.relative)?;
+    let snapshot = foreground::Snapshot::capture();
+    let process_id = start::open_with_default_app(&file)
+        .map_err(|error| ApiError::new(422, format!("无法用 Default app 打开文件：{error}")))?;
+    // Windows 可能复用已打开的应用而不返回进程；这种情况不猜测前台窗口或重复启动。
+    let foreground = foreground::activate(&snapshot, None, None, process_id, &file);
+    Ok(LaunchOutcome {
+        foreground,
+        warning: (!foreground)
+            .then(|| "已交由系统默认应用打开，未能确认窗口已切到前台，请在任务栏查看。".into()),
     })
 }
 

@@ -13,6 +13,7 @@ use super::{ApiError, WebState};
 mod windows;
 
 const DESKTOP_ONLY: &str = "仅 Elves 本机客户端支持打开工作区应用";
+const DEFAULT_FILE_APP: &str = "defaultApp";
 
 pub(super) fn available(state: &WebState, device: &super::Device) -> bool {
     // 用户要求远程 PC 和手机屏蔽宿主机应用入口；必须同时核对真实本机监听与本机授权，不能相信客户端标记。
@@ -93,6 +94,10 @@ fn requested_file(payload: &Value) -> Result<Option<&str>, ApiError> {
             .map(Some)
             .ok_or_else(|| ApiError::new(400, "文件路径无效")),
     }
+}
+
+fn default_app_requires_file() -> ApiError {
+    ApiError::new(400, "Default app 仅支持打开会话正文引用的文件")
 }
 
 fn file_reference_path(cwd: &Path, requested: &str) -> String {
@@ -236,9 +241,10 @@ pub(super) async fn targets(
     let identity = identity(&payload, false)?;
     let (root, metadata) = super::workspace_file_context(&state, &identity, &authorization).await?;
     let file = resolve_file(&root, &metadata, &payload, &authorization).await?;
+    let include_default_app = cfg!(windows) && identity["threadId"].is_string() && file.is_some();
     let wsl_session = wsl_session(&state, &identity, &metadata).await?;
     let result = tokio::task::spawn_blocking(move || {
-        let targets: Vec<_> = applications(&root, wsl_session.as_ref())
+        let mut targets: Vec<_> = applications(&root, wsl_session.as_ref())
             .into_iter()
             .map(|app| {
                 let mut value =
@@ -249,6 +255,17 @@ pub(super) async fn targets(
                 value
             })
             .collect();
+        if include_default_app {
+            // 用户要求仅在正文文件的打开方式添加此项；按 Codex App 放在 VS Code 之后，缺少 VS Code 时置于首项。
+            let index = targets
+                .iter()
+                .position(|item| item["target"] == "vscode")
+                .map_or(0, |index| index + 1);
+            targets.insert(
+                index,
+                json!({"target": DEFAULT_FILE_APP, "label": "Default app", "available": true}),
+            );
+        }
         // 只公开应用 ID、名称、程序图标 PNG 和原生确认的目录，不向网页暴露安装路径。
         let mut value = json!({"ok": true, "root": display_path(&root), "targets": targets});
         if let Some(file) = file {
@@ -301,11 +318,14 @@ pub(super) async fn open(
 
 fn validate_open(payload: &Value) -> Result<Value, ApiError> {
     let identity = identity(payload, true)?;
-    if !payload["target"]
-        .as_str()
-        .is_some_and(|target| TARGETS.iter().any(|(id, _)| *id == target))
-    {
-        return Err(ApiError::new(400, "请选择可用的工作区应用"));
+    match payload["target"].as_str() {
+        Some(DEFAULT_FILE_APP) => {
+            if !identity["threadId"].is_string() || requested_file(payload)?.is_none() {
+                return Err(default_app_requires_file());
+            }
+        }
+        Some(target) if TARGETS.iter().any(|(id, _)| *id == target) => {}
+        _ => return Err(ApiError::new(400, "请选择可用的工作区应用")),
     }
     Ok(identity)
 }
@@ -325,35 +345,47 @@ pub(super) async fn dispatch(
         controller: authorization.controller.clone(),
         settings: Default::default(),
     };
-    let target = payload["target"]
-        .as_str()
-        .filter(|target| TARGETS.iter().any(|(id, _)| id == target))
-        .ok_or_else(|| ApiError::new(400, "请选择可用的工作区应用"))?
-        .to_owned();
+    let target = payload["target"].as_str().expect("validated target");
     let (root, metadata) = super::workspace_file_context(&state, &identity, authorization).await?;
     let file = resolve_file(&root, &metadata, &payload, authorization).await?;
-    let wsl_session = wsl_session(&state, &identity, &metadata).await?;
-    let (root, application) = tokio::task::spawn_blocking(move || {
-        let mut application = applications(&root, wsl_session.as_ref())
-            .into_iter()
-            .find(|app| app.target == target)
-            .ok_or_else(|| ApiError::new(409, "该应用已不可用，请重新选择打开方式"))?;
-        application.file = file;
-        Ok::<_, ApiError>((root, application))
-    })
-    .await
-    .map_err(|_| ApiError::new(503, "无法确认工作区应用"))??;
-    let mut result = json!({"ok": true, "root": display_path(&root), "target": application.target});
-    if let Some(file) = &application.file {
+    let mut result = json!({"ok": true, "root": display_path(&root), "target": target});
+    if let Some(file) = &file {
         result["path"] = json!(file.requested);
     }
+    let (root, application) = if target == DEFAULT_FILE_APP {
+        // 文件关联由 Windows 在打开原文件时决定，不探测其他应用，也不涉及 WSL 会话恢复。
+        (root, None)
+    } else {
+        let wsl_session = wsl_session(&state, &identity, &metadata).await?;
+        let target = target.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let application = applications(&root, wsl_session.as_ref())
+                .into_iter()
+                .find(|app| app.target == target)
+                .ok_or_else(|| ApiError::new(409, "该应用已不可用，请重新选择打开方式"))?;
+            Ok::<_, ApiError>((root, Some(application)))
+        })
+        .await
+        .map_err(|_| ApiError::new(503, "无法确认工作区应用"))??
+    };
     let permit = authorization
         .prepare_dispatch()
         .await
         .map_err(super::authorization_error)?;
     // 启动前重新检测应用、复核授权；只在本机启动一次，不复用 Codex App。
     let outcome = tokio::task::spawn_blocking(move || {
-        permit.commit(|| launch(&application, &root).map_err(anyhow::Error::from))
+        permit.commit(|| {
+            match application {
+                Some(mut application) => {
+                    application.file = file;
+                    launch(&application, &root)
+                }
+                None => {
+                    launch_default_file(&root, file.as_ref().ok_or_else(default_app_requires_file)?)
+                }
+            }
+            .map_err(anyhow::Error::from)
+        })
     })
     .await
     .map_err(|_| ApiError::new(503, "无法启动工作区应用"))?
@@ -385,6 +417,19 @@ fn launch(_: &Application, _: &Path) -> Result<LaunchOutcome, ApiError> {
     Err(ApiError::new(422, "当前服务系统不支持打开工作区应用"))
 }
 
+#[cfg(windows)]
+fn launch_default_file(root: &Path, file: &FileTarget) -> Result<LaunchOutcome, ApiError> {
+    windows::launch_default_file(root, file)
+}
+
+#[cfg(not(windows))]
+fn launch_default_file(_: &Path, _: &FileTarget) -> Result<LaunchOutcome, ApiError> {
+    Err(ApiError::new(
+        422,
+        "仅 Windows 支持使用系统默认应用打开文件",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,18 +437,20 @@ mod tests {
     #[tokio::test]
     async fn remote_open_workspace_action_is_rejected_before_engine_lookup() {
         let (_directory, authorization) = crate::tests::service_dispatch_fixture().await;
-        let error = authorization
-            .controller
-            .call_authorized(
-                "openWorkspace",
-                json!({"threadId":"unknown-session","path":"src/app.ts","target":"fileManager"}),
-                &authorization,
-            )
-            .await
-            .unwrap_err();
-        let error = error.downcast_ref::<ApiError>().unwrap();
-        assert_eq!(error.code, 403);
-        assert_eq!(error.message, DESKTOP_ONLY);
+        for target in ["fileManager", DEFAULT_FILE_APP] {
+            let error = authorization
+                .controller
+                .call_authorized(
+                    "openWorkspace",
+                    json!({"threadId":"unknown-session","path":"src/app.ts","target":target}),
+                    &authorization,
+                )
+                .await
+                .unwrap_err();
+            let error = error.downcast_ref::<ApiError>().unwrap();
+            assert_eq!(error.code, 403);
+            assert_eq!(error.message, DESKTOP_ONLY);
+        }
     }
 
     #[test]
@@ -421,6 +468,19 @@ mod tests {
             assert!(validate_open(&payload).is_err(), "{payload}");
         }
         assert!(validate_open(&json!({"threadId":"main","target":"vscode"})).is_ok());
+        assert!(
+            validate_open(
+                &json!({"threadId":"main","path":"./README.md","target":DEFAULT_FILE_APP})
+            )
+            .is_ok()
+        );
+        for payload in [
+            json!({"threadId":"main","target":DEFAULT_FILE_APP}),
+            json!({"threadId":"main","path":"","target":DEFAULT_FILE_APP}),
+            json!({"projectId":"fixture","path":"./README.md","target":DEFAULT_FILE_APP}),
+        ] {
+            assert!(validate_open(&payload).is_err(), "{payload}");
+        }
     }
 
     #[test]
