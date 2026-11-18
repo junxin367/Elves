@@ -7277,8 +7277,26 @@ body {
 input[type="checkbox"],input[type="radio"]{accent-color:hsl(var(--control-accent))}
 :is(.context-enabled-switch,.codex-update-toggle,.session-sync-toggle-control).active .context-switch-track{background:hsl(var(--control-accent))}
 :is(.context-enabled-switch,.codex-update-toggle,.session-sync-toggle-control).active .context-switch-thumb{background:hsl(var(--control-accent-foreground))}
-/* 用户要求按钮颜色只影响普通操作；不改 primary 语义变量，避免同时染色徽标、导航、开关及危险操作。
-   仅在明确自定义时覆盖三个状态，沿用 Harness 的 Codex 状态派生值；未设置和旧缓存保持原样。 */
-:root[data-custom-button-color="true"] .normal-button{background:hsl(var(--managed-button));color:hsl(var(--managed-button-text))}
-:root[data-custom-button-color="true"] .normal-button:hover:not(:disabled){background:hsl(var(--managed-button-hover))}
-:root[data-custom-button-color="true"] .normal-button:active:not(:disabled){background:hsl(var(--managed-button-active))}
+/* 用户要求普通按钮按实际表面配色；卡片和弹窗沿用各自的背景，描边不改变原按钮尺寸和键盘焦点环。 */
+:where(.bg-card,.panel){
+  --normal-button-bg:var(--managed-button-card,var(--managed-button,var(--primary)));
+  --normal-button-text:var(--managed-button-card-text,var(--managed-button-text,var(--primary-foreground)));
+  --normal-button-hover:var(--managed-button-card-hover,var(--managed-button-hover,var(--primary)));
+  --normal-button-active:var(--managed-button-card-active,var(--managed-button-active,var(--primary)));
+  --normal-button-outline:var(--managed-button-card-outline,var(--managed-button-outline,transparent))
+}
+:where(.modal-card){
+  --normal-button-bg:var(--managed-button-modal,var(--managed-button,var(--primary)));
+  --normal-button-text:var(--managed-button-modal-text,var(--managed-button-text,var(--primary-foreground)));
+  --normal-button-hover:var(--managed-button-modal-hover,var(--managed-button-hover,var(--primary)));
+  --normal-button-active:var(--managed-button-modal-active,var(--managed-button-active,var(--primary)));
+  --normal-button-outline:var(--managed-button-modal-outline,var(--managed-button-outline,transparent))
+}
+:root[data-custom-button-color="true"] .normal-button{
+  background:hsl(var(--normal-button-bg,var(--managed-button,var(--primary))));
+  color:hsl(var(--normal-button-text,var(--managed-button-text,var(--primary-foreground))));
+  outline:1px solid var(--normal-button-outline,var(--managed-button-outline,transparent));outline-offset:-1px;
+  transition-property:transform,opacity
+}
+:root[data-custom-button-color="true"] .normal-button:hover:not(:disabled){background:hsl(var(--normal-button-hover,var(--managed-button-hover,var(--primary))))}
+:root[data-custom-button-color="true"] .normal-button:active:not(:disabled){background:hsl(var(--normal-button-active,var(--managed-button-active,var(--primary))))}

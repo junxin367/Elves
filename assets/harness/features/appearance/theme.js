@@ -379,6 +379,32 @@ export function appearanceButtonColor(palette) {
   // Elver 自带默认按钮色；没有按钮色的其他主题继续沿用前景色派生。
   return /^#[0-9a-f]{6}$/i.test(palette.button) ? palette.button : null;
 }
+function appearanceButtonColors(color, surface, preferredText, dark, contrast) {
+  const white = "#ffffff", black = "#000000";
+  const textMinimum = 4.5, edgeMinimum = 3, textGoal = 5;
+  let bg = color, text = appearanceReadableForeground(color, preferredText);
+  // 用户要求参考实际面板而不是深浅模式标签。白字亮于按钮、按钮亮于面板时，
+  // 两段 WCAG 对比度相乘等于白字对面板的对比度；5:1 是期望值，4.5:1 和 3:1 分别是文字和边界下限。
+  // 最多向黑色混入 25%，足以覆盖 Elver 示例，又不会为了白字把用户选的亮色大幅压暗；不改写原始 HEX。
+  const target = Math.min(textGoal, appearanceContrastRatio(white, surface) / edgeMinimum,
+    appearanceContrastRatio(white, mixColor(color, black, .25)));
+  if (target >= textMinimum) {
+    const matchesSurface = fill => appearanceLuminance(fill) > appearanceLuminance(surface)
+      && appearanceContrastRatio(fill, surface) >= edgeMinimum;
+    let fill = appearanceAccessibleColor(color, white, target);
+    // 动态目标恰好贴边时，8 位 RGB 取整可能越过边界。允许重试文字下限，不得向下取整放宽任何下限。
+    if (!matchesSurface(fill)) fill = appearanceAccessibleColor(color, white, textMinimum);
+    if (matchesSurface(fill)) { bg = fill; text = white; }
+  }
+  // 延续 Codex 的状态叠色比例，混入所在面板，三个状态使用同一字色并分别检查文字对比度。
+  const state = weight => appearanceAccessibleColor(mixColor(bg, surface, weight), text, textMinimum);
+  const hover = state(dark ? .04 + .03 * contrast : .05 + .06 * contrast);
+  const active = state(dark ? .07 + .05 * contrast : .1 + .12 * contrast);
+  // 当任一状态的填充与面板分不清时，使用同一条达标的描边；描边不参与文字对比度计算。
+  const outline = [bg, hover, active].some(fill => appearanceContrastRatio(fill, surface) < edgeMinimum)
+    ? appearanceAccessibleColor(bg, surface, edgeMinimum) : "transparent";
+  return { bg, text, hover, active, outline };
+}
 export function appearanceThemeColors(theme, palette) {
   const { background, foreground, contrast: setting } = palette;
   const accent = /^#[0-9a-f]{6}$/i.test(palette.accent) ? palette.accent : foreground;
@@ -404,20 +430,21 @@ export function appearanceThemeColors(theme, palette) {
   const primaryText = appearanceReadableForeground(foreground, surfaces["control-bg"]);
   const primaryHover = appearanceAccessibleColor(mixColor(foreground, background, .08), primaryText);
   const primaryActive = appearanceAccessibleColor(mixColor(foreground, background, .14), primaryText);
-  const customButton = appearanceButtonColor(palette), buttonColor = customButton ?? foreground;
-  const buttonText = customButton ? appearanceReadableForeground(buttonColor, surfaces["control-bg"]) : primaryText;
-  // 用户要求按钮颜色只控制确认、保存等普通主操作，不改变发送/停止、强调及危险操作。
-  // 状态叠加比例参考 Codex 26.1111.2228：浅色 hover=.05+.06c、active=.1+.12c，
-  // 深色 hover=.04+.03c、active=.07+.05c；c 复用同一对比度曲线，并保证三个状态文字均至少 4.5:1。
-  // 未设置按钮颜色时保留现有状态值；只修正派生色，不回写用户填写的 HEX。
-  const buttonHover = customButton ? appearanceAccessibleColor(mixColor(buttonColor, background,
-    dark ? .04 + .03 * contrast : .05 + .06 * contrast), buttonText) : primaryHover;
-  const buttonActive = customButton ? appearanceAccessibleColor(mixColor(buttonColor, background,
-    dark ? .07 + .05 * contrast : .1 + .12 * contrast), buttonText) : primaryActive;
+  const customButton = appearanceButtonColor(palette);
+  // 设置卡片沿用 68% 输入框表面 + 32% 页面背景；背景和按钮引用同一份舍入后的实色。
+  const card = mixColor(background, surfaces["composer-bg"], .68);
+  const buttons = {};
+  // 与 style.css 的审批/设置卡片及管理页的 card/popover 表面对齐；不改变发送、危险、强调按钮和无自定义色主题。
+  for (const [prefix, surface] of Object.entries({ button: background, "button-side": side,
+    "button-card": card, "button-composer": surfaces["composer-bg"], "button-control": surfaces["control-bg"] })) {
+    const colors = customButton ? appearanceButtonColors(customButton, surface, surfaces["control-bg"], dark, contrast)
+      : { bg: foreground, text: primaryText, hover: primaryHover, active: primaryActive, outline: "transparent" };
+    for (const [part, value] of Object.entries(colors)) buttons[`${prefix}-${part}`] = value;
+  }
   return {
     bg: background, text: foreground, accent, "on-accent": onAccent,
     ...appearanceTextColors(theme, palette), ...surfaces,
-    side, code: mixColor(background, dark ? foreground : "#ffffff", dark ? .07 : .12),
+    side, "appearance-card-bg": card, code: mixColor(background, dark ? foreground : "#ffffff", dark ? .07 : .12),
     hover: appearanceAlphaColor(foreground, dark ? .06 + .03 * contrast : .04 + .03 * contrast),
     line: appearanceAlphaColor(foreground, .06 + .04 * contrast),
     "line-heavy": appearanceAlphaColor(foreground, dark ? .12 + .06 * contrast : .09 + .06 * contrast),
@@ -437,8 +464,7 @@ export function appearanceThemeColors(theme, palette) {
     // 当前外观通过 HEX 独立配置，不借用 Codex 账号强调色来源；按原生自定义配色路径保留中性发送按钮和用户气泡。
     "primary-bg": foreground, "primary-text": primaryText,
     "primary-hover": primaryHover, "primary-active": primaryActive,
-    "button-bg": buttonColor, "button-text": buttonText,
-    "button-hover": buttonHover, "button-active": buttonActive,
+    ...buttons,
     "user-message-bg": appearanceAlphaColor(foreground, .05), "user-message-text": foreground,
     "notice-bg": surfaces["control-bg"], "notice-text": foreground,
     danger: dark ? "#ff9c97" : "#b42318", "on-danger": dark ? "#171717" : "#ffffff",

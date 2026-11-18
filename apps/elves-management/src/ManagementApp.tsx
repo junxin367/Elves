@@ -338,10 +338,6 @@ export function App() {
           background: ["bg"], foreground: ["text"], card: ["composer-bg", "bg"], "card-foreground": ["text"],
           popover: ["control-bg", "side"], "popover-foreground": ["text"],
           primary: ["primary-bg", "text"], "primary-foreground": ["primary-text", "bg"],
-          "managed-button": ["button-bg", "primary-bg", "text"],
-          "managed-button-text": ["button-text", "primary-text", "bg"],
-          "managed-button-hover": ["button-hover", "primary-bg", "text"],
-          "managed-button-active": ["button-active", "primary-bg", "text"],
           secondary: ["side"], "secondary-foreground": ["text"], muted: ["hover"],
           "muted-foreground": ["text-secondary", "muted"], accent: ["hover"], "accent-foreground": ["text"],
           border: ["line"], input: ["line"], ring: ["focus-ring", "accent"], destructive: ["danger"],
@@ -355,6 +351,23 @@ export function App() {
           if (value) document.documentElement.style.setProperty(`--${token}`, value);
         }
         const root = document.documentElement;
+        // 普通按钮的各表面令牌由同源父页派生；旧缓存未提供某一整组时回退到页面组，不能保留上一主题的值。
+        for (const [target, source] of [["managed-button", "button"], ["managed-button-card", "button-composer"],
+          ["managed-button-modal", "button-control"]]) {
+          const variants = ["bg", "text", "hover", "active"].map(part =>
+            [part, hslColor(event.data.colors?.[`${source}-${part}`])] as const);
+          const complete = variants.every(([, value]) => value !== null);
+          for (const [part, value] of variants) {
+            const name = part === "bg" ? `--${target}` : `--${target}-${part}`;
+            if (complete && value) root.style.setProperty(name, value);
+            else root.style.removeProperty(name);
+          }
+          const outline = event.data.colors?.[`${source}-outline`];
+          if (complete && typeof outline === "string" && /^#[0-9a-f]{6}$/i.test(outline))
+            root.style.setProperty(`--${target}-outline`, outline);
+          else if (complete) root.style.setProperty(`--${target}-outline`, "transparent");
+          else root.style.removeProperty(`--${target}-outline`);
+        }
         if (typeof event.data.font === "string" && event.data.font.length <= 500) root.style.setProperty("--managed-font", event.data.font);
         if (typeof event.data.codeFont === "string" && event.data.codeFont.length <= 500) root.style.setProperty("--font-mono", event.data.codeFont);
         if (Number.isFinite(event.data.fontSize) && event.data.fontSize >= 10 && event.data.fontSize <= 32)

@@ -15237,6 +15237,61 @@ test("主会话保留背景透明度与铺法，侧边页不重绘图片或叠�
 const appearanceColorModelSource = sourceSection("const appearanceContrastMin =", "const backgroundOpacityMin =")
   + sourceSection("function mix");
 
+test("自定义普通主按钮按实际页面、卡片和弹窗背景派生白字或保留原色", () => {
+  const context = nodeVm.createContext();
+  nodeVm.runInContext(appearanceColorModelSource, context);
+  const palette = { background: "#1e1e1e", foreground: "#cccccc", accent: "#16a34a", button: "#16a34a", contrast: 60 };
+  const saved = { ...palette };
+  const colors = context.appearanceThemeColors("dark", palette);
+  assert.equal(colors["button-bg"], "#11803a"); assert.equal(colors["button-text"], "#ffffff");
+  assert.equal(colors["button-side-text"], "#ffffff", "审批卡片按自身深色表面取色");
+  assert.equal(colors["appearance-card-bg"], "#2d2d2d");
+  assert.equal(colors["button-card-bg"], "#12883e"); assert.equal(colors["button-card-text"], "#ffffff");
+  assert.equal(colors["button-composer-bg"], "#16a34a");
+  assert.equal(colors["button-composer-text"], "#000000", "更亮的管理页卡片不能借用页脚的白字方案");
+  assert.equal(colors["button-control-bg"], "#16a34a", "8 位颜色不能满足两项下限时保留原色");
+  assert.deepEqual(palette, saved);
+  const light = context.appearanceThemeColors("light", { ...palette, background: "#ffffff", foreground: "#3b3b3b", contrast: 45 });
+  assert.equal(light["button-bg"], "#16a34a"); assert.equal(light["button-text"], "#000000");
+  const inverseMode = context.appearanceThemeColors("light", palette);
+  assert.equal(inverseMode["button-bg"], "#11803a", "实际背景而非深浅模式决定白字方案");
+  const withoutButton = context.appearanceThemeColors("dark", { ...palette, button: undefined });
+  for (const key of ["primary-bg", "primary-text", "primary-hover", "primary-active", "accent-solid", "danger", "user-message-bg"])
+    assert.equal(colors[key], withoutButton[key], `独立按钮配色不得影响 ${key}`);
+  for (const part of ["bg", "text", "hover", "active"])
+    assert.equal(withoutButton[`button-${part}`], withoutButton[`primary-${part}`], "未配置颜色保留中性配色");
+});
+
+test("自定义普通主按钮三个状态保留同一字色，分别校验文字和面板边界且不大幅改写亮色", () => {
+  const context = nodeVm.createContext();
+  nodeVm.runInContext(appearanceColorModelSource, context);
+  const surfaces = { button: "bg", "button-side": "side", "button-card": "appearance-card-bg",
+    "button-composer": "composer-bg", "button-control": "control-bg" };
+  for (const theme of ["light", "dark"]) {
+    for (const background of ["#000000", "#1e1e1e", "#2d2d2d", "#2e2e2e", "#333333", "#776633", "#ffffff"]) {
+      for (const button of ["#000000", "#171717", "#16a34a", "#767676", "#339cff", "#fff500", "#ffffff"]) {
+        for (const contrast of [0, 45, 60, 100]) {
+          const colors = context.appearanceThemeColors(theme, { background, foreground: "#cccccc", button, contrast });
+          for (const [prefix, surface] of Object.entries(surfaces)) {
+            const { appearanceContrastRatio: ratio } = context;
+            const outline = colors[`${prefix}-outline`];
+            for (const state of ["bg", "hover", "active"]) {
+              const fill = colors[`${prefix}-${state}`], label = `${theme} ${background} ${button} ${contrast} ${prefix} ${state}`;
+              assert.ok(ratio(fill, colors[`${prefix}-text`]) >= 4.5, `文字 ${label}`);
+              assert.ok(ratio(outline === "transparent" ? fill : outline, colors[surface]) >= 3, `边界 ${label}`);
+            }
+          }
+        }
+      }
+    }
+  }
+  const lightButton = context.appearanceButtonColors("#ffffff", "#1e1e1e", "#2e2e2e", true, .6);
+  assert.equal(lightButton.bg, "#ffffff", "不能为了强制白字把纯白变成深灰");
+  const lowEdge = context.appearanceButtonColors("#1e1e1e", "#1e1e1e", "#2e2e2e", true, .6);
+  assert.equal(lowEdge.bg, "#1e1e1e"); assert.equal(lowEdge.text, "#ffffff");
+  assert.notEqual(lowEdge.outline, "transparent");
+});
+
 test("外观表面与原生 Codex 默认调色一致，并区分输入框、控件及浅色普通提示", () => {
   const context = nodeVm.createContext();
   nodeVm.runInContext(appearanceColorModelSource, context);
