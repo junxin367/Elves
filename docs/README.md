@@ -7,19 +7,19 @@
 | 文档 | 内容 |
 | --- | --- |
 | [项目首页](../README.md) | 产品能力、安装、快速开始与源码构建 |
-| [Windows 客户端](windows-remote-client.md) | 本机启动、窗口、托盘及客户端数据 |
-| [手机连接](remote-access-mobile.md) | 电脑端准备、网页/PWA/Android 接入及连接恢复 |
-| [远程会话](remote-access.md) | 网页服务、设备授权、会话能力及接口边界 |
+| [Windows 本机工作区](product-standards/clients/windows-workspace.md) | 本机启动、窗口、托盘及客户端数据 |
+| [手机连接](product-standards/clients/mobile-web-pwa-android.md) | 电脑端准备、网页/PWA/Android 接入及连接恢复 |
+| [远程会话接入与操作](product-standards/sessions/remote-access-guide.md) | 网页服务、设备授权及会话操作 |
 | [公网入口](remote-public-access.md) | zrok / FRP 主入口、ngrok 第二线路及地址切换 |
-| [会话工具](remote-session-tools.md) | 文件、变更、子智能体、侧边会话与平台差异 |
-| [缓存与恢复](remote-cache.md) | 正文缓存、草稿、分页及断线恢复 |
+| [工作区工具与关联会话](product-standards/sessions/workspace-tools-and-side-sessions.md) | 文件、变更、子智能体、侧边会话与平台差异 |
+| [会话展示缓存与恢复](product-standards/sessions/display-cache-and-recovery.md) | 正文缓存、阅读位置及缓存失效 |
 | [Windows 更新](remote-service-update.md) | Elves 与内置 Harness 的升级、验证和回退 |
 
 ## 产品与架构
 
-- [产品规范](product-standards.md)：已确认的功能、交互和跨端约束。
+- [产品规范索引](product-standards/README.md)：按主规范、会话、客户端与前端实现查阅；通用 UI 规则在根目录 [DESIGN.md](../DESIGN.md)。
 - [Elves 与 Harness 架构](harness-architecture.md)：代码边界、启动、本地代理和本机/远程隔离。
-- [工作区网页架构](harness-web-architecture.md)：模块分层、共享管理前端及网页资源构建。
+- [工作区前端架构与公共组件](product-standards/frontend/workspace-architecture-and-components.md)：模块分层、Select 与弹层、共享管理前端及网页资源构建。
 - [构建性能](build-performance.md)：日常与正式编译配置、前端内容缓存及实测方法。
 - [Harness Codex 执行](remote-service-mode.md)：独立 app-server、权限、回执及原生执行边界。
 - [功能需求条目](harness-product-features.md)：按用户任务组织的功能与交互条目。

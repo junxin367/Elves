@@ -57,7 +57,7 @@ Elves 是 Windows 桌面客户端，打开后自动启动本机 Harness 并进�
 
 本机工作区默认使用 `127.0.0.1:45223`，远程网页默认端口为 `45222`。本机授权与远程设备授权分开保存；关闭远程会话、调整远程只读策略或撤销远程设备，都不会使 Elves 本机退出。远程使用期间，运行 Harness 的电脑需要保持开机。
 
-详细步骤见[手机连接指南](docs/remote-access-mobile.md)；公网线路与授权规则见[远程会话说明](docs/remote-access.md)。
+详细步骤见[手机连接指南](docs/product-standards/clients/mobile-web-pwa-android.md)；公网线路与授权规则见[远程会话接入指南](docs/product-standards/sessions/remote-access-guide.md)。
 
 ## 数据与升级
 
@@ -104,4 +104,4 @@ cargo check --workspace --locked
 
 ## 文档
 
-从[文档索引](docs/README.md)选择使用指南、架构说明和构建发布流程。产品行为以[产品规范](docs/product-standards.md)为准；执行边界见[Elves 与 Harness 架构](docs/harness-architecture.md)。
+从[文档索引](docs/README.md)选择使用指南、架构说明和构建发布流程。产品行为通过[产品规范索引](docs/product-standards/README.md)查阅；执行边界见[Elves 与 Harness 架构](docs/harness-architecture.md)。

@@ -37,7 +37,7 @@ Android 容器不注册网页 Service Worker，以免原生快照和网页缓存
 
 ## 普通网页与 PWA
 
-普通浏览器和已安装 PWA 继续使用当前服务 Origin。登录仍输入访问密钥；Service Worker 的离线资源缓存不保存访问密钥、API 响应、会话消息或附件。经授权的正文展示与草稿由独立客户端存储处理，见 [会话缓存](remote-cache.md)。
+普通浏览器和已安装 PWA 继续使用当前服务 Origin。登录仍输入访问密钥；Service Worker 的离线资源缓存不保存访问密钥、API 响应、会话消息或附件。经授权的正文展示与草稿由独立客户端存储处理，见 [会话展示缓存与恢复](product-standards/sessions/display-cache-and-recovery.md)。
 
 `pwa.js` 只在安全上下文且不处于 Android 容器时注册 Service Worker。Service Worker 使用资源清单中的整体版本创建缓存，校验同源静态文件后再提供离线读取；资源清单不支持、完整性校验失败或缓存未就绪时，不把未验证缓存当成可用版本。
 

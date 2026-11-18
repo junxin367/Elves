@@ -48,7 +48,7 @@
 
 13 个 suite 均可单独选择。单独执行不会自动创建前置对象或扩大授权。顺序见导出的 `REMOTE_ACCESS_E2E_CASES`：关闭在已读/草稿案例后，control 永久删除在全部依赖案例后。
 
-覆盖边界：当前矩阵没有子智能体列表/只读详情或变更/文件页面的专用处理器，不能用侧边案例或菜单入口存在替代。`session.model` 也不替代 UF-09 的“侧边成功发送新模型后往返、刷新及不重选续发”。已有目标的暂停/开始/删除按 UF-03 另核，不能从 `scenario.goal` 等待完成推导已验。浏览器入口需要 FRP 线路及受支持的 Android 原生能力，普通 Chrome 页面不提供该原生能力；App 缓存是客户端恢复机制，不是单独的工具菜单页。现行功能与权限边界见 [远程会话工具](remote-session-tools.md) 和 [远程访问](remote-access.md)，本段不增加执行或通过状态。
+覆盖边界：当前矩阵没有子智能体列表/只读详情或变更/文件页面的专用处理器，不能用侧边案例或菜单入口存在替代。`session.model` 也不替代 UF-09 的“侧边成功发送新模型后往返、刷新及不重选续发”。已有目标的暂停/开始/删除按 UF-03 另核，不能从 `scenario.goal` 等待完成推导已验。浏览器入口需要 FRP 线路及受支持的 Android 原生能力，普通 Chrome 页面不提供该原生能力；App 缓存是客户端恢复机制，不是单独的工具菜单页。现行功能与权限边界见 [工作区工具](product-standards/sessions/workspace-tools-and-side-sessions.md) 和 [远程接入指南](product-standards/sessions/remote-access-guide.md)，本段不增加执行或通过状态。
 
 服务侧边由独立执行引擎管理，不与桌面侧边标签同步。依赖桌面 `tab.title` 的六项旧验收案例已移除；创建、发送、历史、已读及关闭仍核对服务回执与准确的父子会话 ID。
 

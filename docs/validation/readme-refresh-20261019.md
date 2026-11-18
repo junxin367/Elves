@@ -5,7 +5,7 @@
 ## 本次交付
 
 - 重写 `README.md` 的介绍、主要功能、首次使用和效果展示；移除旧版改名过程、早期痛点截图和过时页面名称。
-- 新增 [远程会话移动端指南](../remote-access-mobile.md)，说明电脑端配置、手机连接、会话操作、浏览器/PWA/Android 区别和连接问题处理。
+- 新增远程会话移动端指南，说明电脑端配置、手机连接、会话操作、浏览器/PWA/Android 区别和连接问题处理。现行指南见[手机网页、PWA 与 Android](../product-standards/clients/mobile-web-pwa-android.md)。
 - 在 `docs/images/showcase/` 提供 13 张新 PNG 和 1 个 GIF：5 张管理器截图和 3 张 Codex 控件演示统一为 1200 × 810，5 张手机截图为 390 × 844；GIF 为 390 × 844、11 帧、14.8 秒，474,706 字节。
 - [素材说明（历史版本）](https://github.com/junxin367/Elves/blob/9d0ec52542feef0832366b8c815727158a49039e/docs/images/showcase/README.md) 记录截图来源和演示范围。所有界面均使用演示数据，API Key 遮挡，不包含真实密钥、私人路径或会话内容。
 

@@ -57,4 +57,4 @@ ngrok 区块始终保留标题及独立开关；关闭时隐藏 Token 及操作�
 - [`frp_tunnel.rs`](../crates/elves-harness/src/frp_tunnel.rs)：配置、受管进程、回源及重试。
 - [`channels.js`](../assets/harness/channels.js)：网页选路和单次写入。
 
-使用步骤、授权和线路规则见[远程会话](remote-access.md)。[主入口开发验收](validation/remote-primary-switch-20261023/README.md)与 [HTTP 验收报告](validation/frp-http-20261023/README.md)保留当时的实现和验证结果，不替代当前版本运行验证。
+使用步骤、授权和线路规则见[远程会话接入指南](product-standards/sessions/remote-access-guide.md)。[主入口开发验收](validation/remote-primary-switch-20261023/README.md)与 [HTTP 验收报告](validation/frp-http-20261023/README.md)保留当时的实现和验证结果，不替代当前版本运行验证。

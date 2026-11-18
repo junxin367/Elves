@@ -1,6 +1,6 @@
 # 参与 Elves 开发
 
-Elves 是唯一的 Windows 桌面程序，Harness 是独立执行与管理产品，远程会话只是网页和 Android 的接入能力。开始修改前阅读 `AGENTS.md`、`docs/product-standards.md` 和 `docs/harness-architecture.md`。
+Elves 是唯一的 Windows 桌面程序，Harness 是独立执行与管理产品，远程会话只是网页和 Android 的接入能力。开始修改前阅读 [AGENTS.md](AGENTS.md)，按 [产品规范索引](docs/product-standards/README.md) 查阅对应章节，并核对 [Elves 与 Harness 架构](docs/harness-architecture.md)。
 
 ## 开发准备
 

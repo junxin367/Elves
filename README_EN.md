@@ -51,7 +51,7 @@ Enable web access in **Remote sessions**, save an access key, and configure an a
 
 The local workspace defaults to `127.0.0.1:45223`; remote web access defaults to port `45222`. Desktop authorization is independent of remote devices and policies. Disabling remote access, changing its read-only policy, or revoking a remote device does not sign out the local desktop client. Keep the Harness computer running while using remote access.
 
-See the [mobile guide](docs/remote-access-mobile.md) and [remote-session reference](docs/remote-access.md).
+See the [mobile guide](docs/product-standards/clients/mobile-web-pwa-android.md) and [remote-session access guide](docs/product-standards/sessions/remote-access-guide.md).
 
 ## Data and upgrades
 
@@ -81,4 +81,4 @@ npm --prefix apps/elves-management run vite:build
 
 `apps/elves/` contains the only Windows application; `crates/elves-harness/` contains Harness execution and management. `elves-core` and `elves-data` provide configuration, protocol proxying, and session data access. Workspace assets live in `assets/harness/`. Commit `assets/harness/management/` alongside changes to `apps/elves-management/`. Android lives in `apps/elves-android/`, with independent versions and signing.
 
-See the [documentation index](docs/README.md), [product standards](docs/product-standards.md), and [Elves / Harness architecture](docs/harness-architecture.md).
+See the [documentation index](docs/README.md), [product standards index](docs/product-standards/README.md), and [Elves / Harness architecture](docs/harness-architecture.md).

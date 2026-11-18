@@ -2,7 +2,7 @@
 
 日期：2026-10-20。结果：源码开发、集成和隔离环境验收完成。
 
-本报告记录 2026-10-20 的交付和撤回过程，文末“浏览器功能移除”仅是该阶段结论；后续已重新提供受 FRP 与 Android 原生能力限制的浏览器入口。当前工具及缓存规则见 [远程会话工具](../remote-session-tools.md) 和 [远程访问](../remote-access.md)，不能用本文旧方案或旧验收结果推定今天的实现与运行状态。
+本报告记录 2026-10-20 的交付和撤回过程，文末“浏览器功能移除”仅是该阶段结论；后续已重新提供受 FRP 与 Android 原生能力限制的浏览器入口。当前工具及缓存规则见 [工作区工具](../product-standards/sessions/workspace-tools-and-side-sessions.md) 和 [远程接入指南](../product-standards/sessions/remote-access-guide.md)，不能用本文旧方案或旧验收结果推定今天的实现与运行状态。
 
 ## 验收环境与边界
 
