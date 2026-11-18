@@ -14,18 +14,23 @@ export function createManagementPages() {
       frame.contentWindow?.postMessage(value, location.origin);
   };
   const syncTheme = () => {
-    const style = getComputedStyle(document.documentElement);
+    const root = document.documentElement;
+    const style = getComputedStyle(root);
     // 用户要求普通按钮按所在面板计算；管理页复用父页算法，接收页面、卡片和弹窗三套已核对颜色。
     const buttonColors = ["button", "button-composer", "button-control"]
       .flatMap(prefix => ["bg", "text", "hover", "active", "outline"].map(part => `${prefix}-${part}`));
     send({ type: "management-theme", theme: style.colorScheme === "dark" ? "dark" : "light",
-      customButtonColor: document.documentElement.dataset.customButtonColor === "true",
+      customButtonColor: root.dataset.customButtonColor === "true",
       // 用户要求管理页沿用同一套外观语义：主按钮、强调色与焦点分开传递，不能再把所有主操作染成原始 HEX。
       colors: Object.fromEntries(["bg", "text", "text-secondary", "side", "hover", "line", "muted", "accent",
         "accent-text", "accent-solid", "accent-soft", "on-accent", "focus-ring", "primary-bg", "primary-text",
         ...buttonColors,
         "composer-bg", "control-bg", "code", "danger", "on-danger", "selection-bg", "selection-text"]
-        .map(name => [name, style.getPropertyValue(`--${name}`).trim()])),
+        .map(name => {
+          const property = `--${name}`;
+          // 三个管理页继承 applyAppearance 写入的最终配色，不采样会话页动画中间色。尚未写入时才读取默认样式。
+          return [name, root.style.getPropertyValue(property).trim() || style.getPropertyValue(property).trim()];
+        })),
       font: style.getPropertyValue("--ui-font-family").trim(), fontSize: parseFloat(style.fontSize),
       codeFont: style.getPropertyValue("--code-font-family").trim() });
   };
