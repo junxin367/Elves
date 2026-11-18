@@ -350,9 +350,13 @@ export function renderSidebar() {
     mark.title = backend === "claude" ? "Claude" : "Codex";
     titleLine.prepend(mark);
     container.append(title);
-    if (active || attention === "unread" || attention === "waiting") {
-      const state = element("span", `thread-state${active ? " active" : " unread"}`);
-      state.title = attention === "waiting" ? "等待你的回复" : active ? "正在运行" : "有未读消息";
+    if (active || ["unread", "waiting", "error"].includes(attention)) {
+      const state = attention === "error" ? icon("warning")
+        : element("span", `thread-state${active ? " active" : " unread"}`);
+      state.classList.add("thread-state", attention);
+      state.title = attention === "waiting" ? "等待你的回复"
+        : attention === "error" ? item.lastTurnOutcome?.kind === "rateLimit" ? "触发流量限制" : "执行失败"
+        : active ? "正在运行" : "有未读消息";
       state.setAttribute("role", "img"); state.setAttribute("aria-label", state.title);
       container.append(state);
     }

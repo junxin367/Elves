@@ -545,6 +545,10 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .thread-state{width:10px;height:10px;flex-shrink:0;margin-right:4px;border-radius:50%}
 .thread-state.active{border:1.5px solid var(--muted);border-top-color:transparent;animation:thread-spin 1s linear infinite}
 .thread-state.unread{width:6px;height:6px;background:#3076df}
+.thread-state.error{width:14px;height:14px;color:var(--danger);border-radius:0}
+.thread-state.error>svg{width:14px;height:14px}
+.thread-state-header{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;flex:0 0 16px;color:var(--danger)}
+.thread-state-header::before{content:"!";display:grid;place-items:center;width:14px;height:14px;border:1.5px solid currentColor;border-radius:50%;font-size:10px;font-weight:700;line-height:1}
 .thread-row>.ui-icon,.project-header>.ui-icon{width:12px;height:12px;color:var(--muted);margin-right:4px}
 .project-header{margin-top:0;border-radius:var(--radius-control)}
 .project-title{display:flex;gap:8px;align-items:center;min-height:32px;padding:6px 8px;font-weight:400;line-height:20px}

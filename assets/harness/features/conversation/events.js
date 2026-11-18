@@ -50,10 +50,13 @@ import { refreshConnectedSession, setConnection } from "../session/connection.js
 import { relatedMenuTimer, relatedSessionView, setRelatedMenuTimer } from "../session/related-state.js";
 import { retireNativeSideThreads } from "../session/related.js";
 import { currentThreadDisplay, readScope, threadDisplayKey, threadDisplays } from "../session/thread-cache.js";
-import { rememberBackgroundThreadDisplay, rememberThreadDisplay } from "../session/thread-display.js";
+import {
+  applySidebarThreadOutcome, applySidebarThreadReadState, applySidebarThreadTitle,
+  sidebarReadRefreshSuppressions
+} from "../sidebar/list-state.js";
+import { rememberBackgroundThreadDisplay, rememberThreadDisplay, renderOutcomeMarker } from "../session/thread-display.js";
 import { sessionMenu } from "../shell-state.js";
 import { threadDeleted } from "../sidebar/deletion-state.js";
-import { sidebarReadRefreshSuppressions } from "../sidebar/list-state.js";
 import { applyThreadDeletion } from "../sidebar/thread-deletion.js";
 
 function receiveClaudeHistory(params) {
@@ -209,6 +212,43 @@ export function receive(event) {
     return;
   }
   if (typeof eventThreadId === "string" && threadDeleted(eventThreadId)) return;
+  let sidebarChanged = false;
+  if (event.method === "thread/name/updated" && typeof eventThreadId === "string"
+      && typeof params.name === "string") {
+    sidebarChanged = applySidebarThreadTitle(eventThreadId, params.name) || sidebarChanged;
+    if (eventThreadId === selectedId && thread) {
+      thread.title = params.name;
+      const title = typeof document === "undefined" ? null : document.getElementById("thread-title");
+      if (title) title.textContent = thread.viewKind === "subagent"
+        ? thread.agentName || params.name : params.name;
+      rememberThreadDisplay({ id: eventThreadId, title: params.name });
+    }
+  }
+  if (["thread/readState/updated", "thread/readState/changed"].includes(event.method)
+      && typeof eventThreadId === "string") {
+    sidebarChanged = applySidebarThreadReadState(eventThreadId, params.readState) || sidebarChanged;
+    if (eventThreadId === selectedId && thread) {
+      thread.readState = params.readState;
+      thread.hasUnreadTurn = params.readState?.firstUnread != null;
+    }
+  }
+  if (event.method === "turn/completed" && typeof eventThreadId === "string") {
+    const unread = eventThreadId !== selectedId
+      || typeof document !== "undefined" && (document.hidden
+        || document.documentElement?.dataset?.workspaceSidePanelVisible === "false");
+    sidebarChanged = (typeof applySidebarThreadOutcome === "function"
+      && applySidebarThreadOutcome(eventThreadId, params.turn, { unread })) || sidebarChanged;
+    if (eventThreadId === selectedId && thread) {
+      thread.lastTurnOutcome = params.turn?.error != null || params.turn?.status === "failed"
+        ? { turnId: params.turn?.id, status: "failed", kind: params.turn?.error?.statusCode === 429 ? "rateLimit" : "failed",
+          error: params.turn?.error || null }
+        : { turnId: params.turn?.id, status: params.turn?.status || "completed", kind: "completed", error: null };
+      if (typeof renderOutcomeMarker === "function") renderOutcomeMarker(thread);
+      if (typeof rememberThreadDisplay === "function")
+        rememberThreadDisplay({ id: eventThreadId, lastTurnOutcome: thread.lastTurnOutcome });
+    }
+  }
+  if (sidebarChanged) renderSidebar();
   if (event.method === "thread/settings/updated" && typeof params.fastMode === "boolean") {
     rememberRemoteFastPreference(params.threadId, params.fastMode);
     if (params.threadId === selectedId) updateComposer();
@@ -415,7 +455,7 @@ export function receive(event) {
     void refreshSkillCatalog().catch(() => {});
   }
   if (!suppressSidebarRefresh && ["thread/started", "turn/started", "turn/completed", "remote/sidebarChanged", "thread/name/updated", "thread/status/changed",
-    "project/changed", "thread/project/updated", "thread/readState/updated",
+    "project/changed", "thread/project/updated", "thread/readState/updated", "thread/readState/changed",
     "remote/requestsChanged", "serverRequest/resolved"].includes(event.method)) {
     scheduleSidebarRefresh();
   }

@@ -41,6 +41,19 @@ export function syncRelatedModelDisplay(value = currentThreadDisplay()) {
     + `${effortLabel ? ` · 推理等级：${effortLabel}` : ""}`;
   node.title = description; node.setAttribute("aria-label", description);
 }
+export function renderOutcomeMarker(value = thread) {
+  if (typeof document === "undefined") return;
+  const node = $("#thread-state");
+  if (!node) return;
+  const outcome = value?.lastTurnOutcome;
+  const failed = outcome?.status === "failed" || ["failed", "rateLimit"].includes(outcome?.kind);
+  node.hidden = !failed;
+  if (!failed) {
+    node.removeAttribute("title"); node.removeAttribute("aria-label"); return;
+  }
+  const label = outcome?.kind === "rateLimit" ? "会话触发流量限制" : "会话执行失败";
+  node.title = label; node.setAttribute("aria-label", label);
+}
 export function rememberThreadDisplay(value = thread, { persist = true } = {}) {
   if (!session || !validRelatedThreadId(value?.id) || threadDeleted(value.id) || value.sideThreadClosed
       || value.model != null && typeof value.model !== "string"
@@ -68,6 +81,7 @@ export function rememberThreadDisplay(value = thread, { persist = true } = {}) {
             triggerPercent: value.tokenUsage.compaction.triggerPercent } } : {}),
         last: { totalTokens: value.tokenUsage.last.totalTokens } } : null,
     ...(Object.hasOwn(value, "goal") ? { goal: value.goal } : {}),
+    ...(Object.hasOwn(value, "lastTurnOutcome") ? { lastTurnOutcome: value.lastTurnOutcome } : {}),
     ...(Array.isArray(value.queuedMessages) ? { queuedMessages: value.queuedMessages } : {}),
     ...(Object.hasOwn(value, "queueSnapshotVersion") ? { queueSnapshotVersion: value.queueSnapshotVersion } : {}),
     ...(typeof ephemeral === "boolean" ? { ephemeral } : {}),

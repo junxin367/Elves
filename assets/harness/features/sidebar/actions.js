@@ -6,12 +6,11 @@ import { $, button, element } from "../../ui/dom.js";
 import { icon } from "../../ui/icons.js";
 import { notice } from "../../ui/notice.js";
 import { closePopup, openPopup, togglePopup } from "../../ui/popup.js";
-import { closeComposerMenus, loadSidebar, mutate, renderSidebar, saveSharedSettings } from "../../core/actions.js";
-import { connected, selectedId, session, sidebar, thread } from "../../core/state.js";
+import { closeComposerMenus, loadSidebar, mutate, reloadThread, renderSidebar, saveSharedSettings } from "../../core/actions.js";
+import { connected, selectedId, session, sidebar } from "../../core/state.js";
 import { recoveryGeneration } from "../composer/drafts.js";
 import { normalizeRelatedView, privateInputScope, validRelatedThreadId } from "../session/capabilities.js";
 import { relatedThreadViews } from "../session/related-state.js";
-import { cacheDisplayData, sidebarSnapshot } from "../session/thread-cache.js";
 import { threadDeleted, threadDeletionLocked } from "./deletion-state.js";
 import { sharedSettingsState, subscribeSharedSettings } from "../settings/shared-state.js";
 
@@ -255,19 +254,16 @@ export function renameSidebarThread(item) {
       const result = await mutate("rename", { threadId: item.id, title });
       if (!currentAuthorization()) { dialog.close("cancel"); return; }
       if (result?.ok !== true) throw new Error("会话名称尚未确认保存，请刷新后核对。");
-      const rows = [...(sidebar?.recent || []), ...(sidebar?.pinnedThreads || []),
-        ...(sidebar?.projects || []).flatMap(project => project.threads || [])];
-      for (const row of rows) if (row.id === item.id) row.title = title;
-      if (thread?.id === item.id) thread.title = title;
-      if (selectedId === item.id) {
-        const heading = $("#thread-title");
-        if (heading) heading.textContent = title;
-      }
-      if (sidebar) cacheDisplayData("sidebar", "main", sidebarSnapshot(sidebar));
-      renderSidebar(); dialog.close("saved");
+      // 成功回执只结束编辑；列表和顶部标题统一由 thread/name/updated 事件归并，
+      // 事件迟到或断线时再用一次当前会话读取补齐，避免两个界面各自写入不同状态。
+      dialog.close("saved");
       void loadSidebar(null, { fresh: true }).catch(failure => {
         if (currentAuthorization()) notice(`名称已保存，列表刷新失败：${failure.message}`, true);
       });
+      if (selectedId === item.id)
+        void reloadThread().catch(failure => {
+          if (currentAuthorization()) notice(`名称已保存，顶部标题刷新失败：${failure.message}`, true);
+        });
     } catch (failure) {
       if (currentAuthorization() && dialog.open) showError(failure.message || "重命名失败，请重试。");
     } finally {
