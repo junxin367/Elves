@@ -7,14 +7,20 @@ export function installComposerTooltips() {
   // 压缩信息沿用同一提示层并支持点击固定；其他提示和已有独立上下文提示的触屏交互不变。
   const scope = ".composer-area,.composer-popover,.composer-add-popup,.queued-message-popup,.context-compaction";
   let pending = null, timer = null, node = null, observer = null;
+  const available = trigger => trigger.isConnected && !trigger.closest("[hidden],[inert]")
+    && document.documentElement.dataset.workspaceSidePanelVisible !== "false";
   function position() {
     if (!pending || !node) return;
     const view = window.visualViewport, left = view?.offsetLeft || 0, top = view?.offsetTop || 0;
     const width = view?.width || window.innerWidth, height = view?.height || window.innerHeight;
-    const anchor = pending.trigger.getBoundingClientRect(), box = node.getBoundingClientRect();
-    node.style.left = `${Math.max(left + 8, Math.min(anchor.left + (anchor.width - box.width) / 2, left + width - box.width - 8))}px`;
-    const above = anchor.top - box.height - 6;
-    node.style.top = `${Math.max(top + 8, Math.min(above >= top + 8 ? above : anchor.bottom + 6, top + height - box.height - 8))}px`;
+    const { trigger, point } = pending;
+    const anchor = trigger.getBoundingClientRect(), box = node.getBoundingClientRect();
+    // 用户要求侧边 hover 以悬停点为锚；沿用 6px 上下间距和 8px 视口留白，键盘及固定详情仍按控件定位。
+    const x = point?.x ?? anchor.left + anchor.width / 2;
+    const above = (point?.y ?? anchor.top) - box.height - 6;
+    const below = (point?.y ?? anchor.bottom) + 6;
+    node.style.left = `${Math.max(left + 8, Math.min(x - box.width / 2, left + width - box.width - 8))}px`;
+    node.style.top = `${Math.max(top + 8, Math.min(above >= top + 8 ? above : below, top + height - box.height - 8))}px`;
   }
   function update(trigger, title) {
     if (pending?.trigger !== trigger) return;
@@ -51,7 +57,7 @@ export function installComposerTooltips() {
     close();
     const title = trigger.getAttribute("title")?.trim();
     if (!title) return false;
-    pending = { trigger, title, pinned: false };
+    pending = { trigger, title, pinned: false, point: null };
     trigger.removeAttribute("title");
     return true;
   }
@@ -59,8 +65,8 @@ export function installComposerTooltips() {
     clearTimeout(timer); timer = null;
     if (!pending || node) return;
     const { trigger, title } = pending;
-    if (!trigger.isConnected || trigger.closest("[hidden],[inert]")) { close(); return; }
-    // Token 统计仍为单行；用户要求压缩提示按模型、前后 Token、缩减及耗时分行，不能再显示成长条原生 title。
+    if (!available(trigger)) { close(); return; }
+    // Token 统计宽度不足时自然换行；压缩正文提示仍按模型、前后 Token、缩减及耗时分行。
     const className = trigger.id === "session-metrics" ? "composer-tooltip composer-metrics-tooltip"
       : trigger.closest(".context-compaction") ? "composer-tooltip compaction-tooltip" : "composer-tooltip";
     node = element("div", className, title);
@@ -72,27 +78,39 @@ export function installComposerTooltips() {
     if (node.hasAttribute("popover")) node.showPopover();
     position();
     observer = new MutationObserver(() => {
-      if (!trigger.isConnected || trigger.closest("[hidden],[inert]")) close();
+      if (!available(trigger)) close();
     });
     observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["hidden", "inert"] });
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ["data-workspace-side-panel-visible"] });
   }
-  function schedule(trigger) {
+  function schedule(trigger, point = null) {
     if (pending?.trigger === trigger || pending?.pinned || !prepare(trigger)) return;
+    pending.point = point;
     // 原生 Codex 普通提示默认延迟 200ms，避免移动鼠标经过工具栏时连续闪烁。
     timer = setTimeout(show, 200);
   }
   function toggleCompaction(trigger) {
+    togglePinned(trigger);
+  }
+  function togglePinned(trigger) {
     if (pending?.trigger === trigger && pending.pinned) { close(); return; }
     if (!prepare(trigger)) return;
     // 点击或轻触立即显示同一提示；已经悬停时固定原浮层，不另建一份。
     pending.pinned = true;
-    show();
+    pending.point = null;
+    if (node) position();
+    else show();
     if (node) trigger.setAttribute("aria-expanded", "true");
   }
   document.addEventListener("pointerover", event => {
     if (event.pointerType !== "mouse") return;
     const trigger = target(event);
-    if (trigger) schedule(trigger);
+    if (trigger) schedule(trigger, sideTooltipPoint(event, trigger));
+  });
+  document.addEventListener("pointermove", event => {
+    // 200ms 等待期间采用最后的悬停点；弹出后保留位置，避免小幅移动造成气泡抖动。
+    if (pending?.point && !node && pending.trigger.contains(event.target))
+      pending.point = sideTooltipPoint(event, pending.trigger) ?? pending.point;
   });
   document.addEventListener("pointerout", event => {
     if (pending && !pending.pinned && pending.trigger.contains(event.target) && !pending.trigger.contains(event.relatedTarget)) close();
@@ -105,7 +123,14 @@ export function installComposerTooltips() {
   document.addEventListener("focusout", event => {
     if (pending?.trigger.contains(event.target) && !pending.trigger.contains(event.relatedTarget)) close();
   });
+  document.addEventListener("click", event => {
+    const trigger = event.target?.closest?.("#session-metrics");
+    if (!trigger || !trigger.closest(scope)) return;
+    // Token 统计没有自身业务点击动作；点击时固定当前 hover，再次点击收起，手机端也可查看同一份详情。
+    togglePinned(trigger);
+  });
   document.addEventListener("pointerdown", event => {
+    if (event.target?.closest?.("#session-metrics")) return;
     if (pending?.trigger.closest(".context-compaction") && pending.trigger.contains(event.target)) return;
     close();
   }, true);
@@ -121,7 +146,15 @@ export function installComposerTooltips() {
   window.addEventListener("blur", close);
   window.visualViewport?.addEventListener("resize", close);
   window.visualViewport?.addEventListener("scroll", close);
-  return { close, update, toggleCompaction };
+  return { close, update, toggleCompaction, togglePinned };
+}
+
+export function sideTooltipPoint(event, trigger) {
+  if (event.pointerType !== "mouse" || !Number.isFinite(event.clientX) || !Number.isFinite(event.clientY)) return null;
+  if (document.documentElement.dataset.workspaceSidePanel !== "true"
+      && !trigger.closest(".workspace.related-session-view:not(.related-session-readonly)")) return null;
+  // 取当前页面视口坐标；右侧 iframe 已自带坐标原点，不叠加父页偏移或屏幕坐标。
+  return { x: event.clientX, y: event.clientY };
 }
 export let composerTooltips = null;
 export function setComposerTooltips(value) { return composerTooltips = value; }

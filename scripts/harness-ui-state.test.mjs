@@ -15912,7 +15912,9 @@ test("编辑区主题提示接管并恢复 title，保留无障碍说明，触�
       contains(other) { return other === this; },
       closest(selector) { return selector === "[title]" ? attrs.has("title") ? this : null
         : selector === "[hidden],[inert]" ? this.hidden ? this : null
-          : selector === ".context-compaction" ? this.isCompaction ? this : null : this.inScope ? this : null; },
+          : selector === ".context-compaction" ? this.isCompaction ? this : null
+            : selector === "#session-metrics" ? this.id === "session-metrics" ? this : null
+              : this.inScope ? this : null; },
       getBoundingClientRect: () => ({ left: 100, top: 200, bottom: 228, width: 120, height: 28 }),
       showPopover() {}, remove() { const index = nodes.indexOf(this); if (index >= 0) nodes.splice(index, 1); },
     };
@@ -15964,6 +15966,12 @@ test("编辑区主题提示接管并恢复 title，保留无障碍说明，触�
   assert.equal(trigger.getAttribute("title"), "本会话 Fast 已开启，点击关闭");
   const metrics = element("span");
   metrics.id = "session-metrics"; metrics.setAttribute("title", "首 Token 时间 1.24 秒 · 缓存命中率 96.8%");
+  listeners.get("click")({ target: metrics });
+  assert.equal(nodes.length, 1, "点击 Token 统计立即显示提示");
+  assert.equal(metrics.getAttribute("aria-expanded"), "true");
+  listeners.get("click")({ target: metrics });
+  assert.equal(nodes.length, 0, "再次点击收起固定提示");
+  assert.equal(metrics.getAttribute("aria-expanded"), "false");
   listeners.get("pointerover")({ target: metrics, pointerType: "mouse" }); flush();
   assert.equal(nodes[0].className, "composer-tooltip composer-metrics-tooltip");
   listeners.get("pointerout")({ target: metrics, relatedTarget: null });
@@ -15976,6 +15984,12 @@ test("编辑区主题提示接管并恢复 title，保留无障碍说明，触�
   assert.equal(nodes[0].style.top, "192px", "鼠标上方 6px，不使用控件上边缘");
   listeners.get("pointermove")({ target: metrics, pointerType: "mouse", clientX: 130, clientY: 220 });
   assert.equal(nodes[0].style.left, "144px", "气泡显示后不随鼠标抖动");
+  listeners.get("pointerdown:capture")({ target: metrics });
+  listeners.get("click")({ target: metrics });
+  assert.equal(nodes.length, 1, "侧边 Token 提示点击后固定");
+  listeners.get("pointerdown:capture")({ target: metrics });
+  listeners.get("click")({ target: metrics });
+  assert.equal(nodes.length, 0, "侧边 Token 提示点击后可再次收起");
   side.workspaceSidePanelVisible = "false"; observers.at(-1).callback();
   assert.equal(nodes.length, 0, "隐藏侧边标签时收起原气泡");
   side.workspaceSidePanelVisible = "true";

@@ -276,6 +276,9 @@ mod tests {
         for index in 0..96 {
             let item = if index == 0 {
                 json!({"id":"item-0","type":"userMessage","content":[{"type":"text","text":"首条侧边输入"}]})
+            } else if index == 95 {
+                json!({"id":"item-95","type":"commandExecution","status":"completed",
+                    "startedAtMs":1000,"hoverObservedStartedAtMs":1050,"hoverObservedCompletedAtMs":2050})
             } else {
                 json!({"id":format!("item-{index}"),"type":"agentMessage","text":format!("输出 {index}")})
             };
@@ -287,10 +290,15 @@ mod tests {
         assert_eq!(active["data"][0]["items"].as_array().unwrap().len(), 96);
         side.observe(&json!({"method":"turn/completed","params":{"turn":{
             "id":"turn","status":"completed","itemsView":"summary",
-            "items":[{"id":"item-95","type":"agentMessage","text":"最后输出"}]}}}));
+            "items":[{"id":"item-95","type":"commandExecution","completedAtMs":2000}]}}}));
         let first = side.history(&json!({"threadId":"side"})).unwrap();
         assert_eq!(first["data"][0]["items"][0]["id"], "item-0");
         assert_eq!(first["data"][0]["items"][0]["remoteHistoryContext"], true);
+        let timings = &side.turns[0]["items"][95];
+        assert_eq!(timings["startedAtMs"], 1000);
+        assert_eq!(timings["completedAtMs"], 2000);
+        assert_eq!(timings["hoverObservedStartedAtMs"], 1050);
+        assert_eq!(timings["hoverObservedCompletedAtMs"], 2050);
         let second = side
             .history(&json!({"threadId":"side","turnId":"turn",
             "itemCursor":first["data"][0]["itemsNextCursor"]}))
@@ -479,7 +487,7 @@ impl SideThread {
         }
     }
 
-    fn upsert_item(&mut self, turn_id: &str, item: Value) {
+    fn upsert_item(&mut self, turn_id: &str, mut item: Value) {
         if self.incomplete {
             return;
         }
@@ -494,7 +502,20 @@ impl SideThread {
             .iter()
             .position(|previous| previous["id"] == item["id"]);
         match index {
-            Some(index) => items[index] = item,
+            Some(index) => {
+                // 条目终态和轮次摘要可能不重发起止字段；保留同一侧边条目已有的实测依据。
+                for key in [
+                    "startedAtMs",
+                    "completedAtMs",
+                    "hoverObservedStartedAtMs",
+                    "hoverObservedCompletedAtMs",
+                ] {
+                    if item[key].is_null() && !items[index][key].is_null() {
+                        item[key] = items[index][key].clone();
+                    }
+                }
+                items[index] = item;
+            }
             None => items.push(item),
         }
     }

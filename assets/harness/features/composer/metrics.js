@@ -1,7 +1,7 @@
 // 输入区统计：会话 Token 统计与上下文用量提示。
 
 import { $, element } from "../../ui/dom.js";
-import { composerTooltips } from "../../ui/tooltip.js";
+import { composerTooltips, sideTooltipPoint } from "../../ui/tooltip.js";
 import { closePopup } from "../../ui/popup.js";
 import { closeComposerMenus } from "../../core/actions.js";
 import { formatDuration } from "../../core/util.js";
@@ -198,6 +198,62 @@ export function composerMetricsLatestTurn(state) {
   }
   return state.latestTurn;
 }
+function composerMetricsTurnTimings(turn, source) {
+  const intervals = [], compactions = new Map();
+  if (!Array.isArray(turn?.items) || turn.itemsComplete === false || turn.itemsNextCursor)
+    return { tool: null, compaction: null };
+  const milliseconds = value => Number.isSafeInteger(value) && value > 0;
+  const bound = (exact, legacy, end = false) => milliseconds(exact) ? exact
+    // Codex 旧轮次字段是秒级时间戳，结束边界包含最后一秒内的毫秒；新版毫秒边界直接使用。
+    : !milliseconds(legacy) ? null : legacy >= 100_000_000_000 ? legacy : legacy * 1000 + (end ? 999 : 0);
+  const lower = bound(turn.turnStartedAtMs, turn.startedAt);
+  const upper = bound(turn.turnCompletedAtMs, turn.completedAt, true);
+  const inTurn = value => milliseconds(value) && (lower == null || value >= lower) && (upper == null || value <= upper);
+  const pair = (start, end, valid = inTurn) => valid(start) && valid(end) && end >= start ? [start, end] : null;
+  const claude = source === "claude-native";
+  let toolObserved = false;
+  for (const item of turn.items) {
+    if (!item || typeof item.id !== "string" || !item.id) continue;
+    const status = item.status?.type ?? item.status;
+    if (["inProgress", "pending", "running", "unknown", "declined", "denied"].includes(status)) continue;
+    // 原生时间和服务收帧时间分别成对；收帧可能晚于原生轮次结束，只按同一轮次/条目的身份归属。
+    const observed = claude ? null : pair(item.hoverObservedStartedAtMs, item.hoverObservedCompletedAtMs, milliseconds);
+    if (item.type === "contextCompaction") {
+      // 用户要求只统计本轮压缩；附在正文末尾供阅读的手动压缩和未执行的压缩不计入。
+      if (item.source === "manual" || item.outcome === "noop"
+          || item.completed !== true && status !== "completed" && !observed && !inTurn(item.completedAtMs)) continue;
+      if (milliseconds(item.startedAtMs) && !inTurn(item.startedAtMs)
+          || milliseconds(item.completedAtMs) && !inTurn(item.completedAtMs)) continue;
+      const duration = Number.isSafeInteger(item.durationMs) && item.durationMs >= 0 ? item.durationMs : null;
+      const native = pair(item.startedAtMs, item.completedAtMs), interval = native ?? observed;
+      const elapsed = duration ?? (interval ? interval[1] - interval[0] : null);
+      const key = item.nativeId || item.id, evidence = duration != null ? 2 : native ? 1 : 0;
+      if (elapsed != null && (!milliseconds(item.completedAtMs) || lower == null || item.completedAtMs - elapsed >= lower)
+          && evidence > (compactions.get(key)?.evidence ?? -1))
+        compactions.set(key, { elapsed, evidence });
+      continue;
+    }
+    if (["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch",
+      "imageView", "imageGeneration", "collabAgentToolCall", "collabToolCall", "sleep"].includes(item.type)
+        && !["AskUserQuestion", "ExitPlanMode", "request_user_input", "request_user_input_async",
+          "request_permissions"].includes(item.tool)) {
+      const native = claude ? pair(item.toolCallAtMs, item.toolResultAtMs) : pair(item.startedAtMs, item.completedAtMs);
+      if (native || observed) intervals.push(native ?? observed);
+      if (!native && observed) toolObserved = true;
+    }
+  }
+  // 同轮并行工具计算墙钟区间的并集，重叠部分不重复计时；缺少起止的调用不推算。
+  intervals.sort((a, b) => a[0] - b[0]);
+  let tool = 0, through = 0;
+  for (const [start, end] of intervals) {
+    tool += Math.max(0, end - Math.max(start, through));
+    through = Math.max(through, end);
+  }
+  const compaction = [...compactions.values()].reduce((sum, entry) => sum + entry.elapsed, 0);
+  return { tool: intervals.length ? tool : null, toolObserved,
+    compaction: compactions.size && Number.isSafeInteger(compaction) ? compaction : null,
+    compactionObserved: [...compactions.values()].some(entry => entry.evidence === 0) };
+}
 export function renderComposerMetrics() {
   const node = $("#session-metrics"), state = composerMetricsState;
   if (state) { clearTimeout(state.cacheTimer); state.cacheTimer = null; }
@@ -255,11 +311,26 @@ export function renderComposerMetrics() {
     }
     node.replaceChildren(...groups);
   }
-  // 用户确认 hover 只保留当前轮次的一行实测摘要；未返回字段整项省略，三项均缺失或等待新轮次统计时不显示。
+  // 用户要求工具和压缩耗时只进入当前轮的 Token hover，不改底栏及其他页面；未返回字段整项省略。
   const details = [];
   if (sameTurn && composerMetricsNumber(metrics?.firstTokenMs)) details.push(`首 Token 时间 ${composerMetricsDuration(metrics.firstTokenMs)}`);
   if (sameTurn && composerMetricsNumber(metrics?.durationMs)) details.push(`本轮耗时 ${formatDuration(metrics.durationMs / 1000)}`);
   if (sameTurn && composerMetricsNumber(metrics?.cacheHitRate)) details.push(`缓存命中率 ${Number((metrics.cacheHitRate * 100).toFixed(1))}%`);
+  if (latest && latest.id === value.turnId) {
+    const turn = turns.get(latest.id);
+    if (state.timingTurn !== turn || state.timingMessageVersion !== messageVersion) {
+      state.timingTurn = turn;
+      state.timingMessageVersion = messageVersion;
+      state.timings = composerMetricsTurnTimings(turn, value.source);
+    }
+    const display = ms => ms < 1000 ? composerMetricsDuration(ms) : formatDuration(ms / 1000);
+    if (state.timings?.tool != null) {
+      const basis = value.source === "claude-native" ? "（调用至结果）" : state.timings.toolObserved ? "（按事件计时）" : "";
+      details.push(`工具耗时 ${display(state.timings.tool)}${basis}`);
+    }
+    if (state.timings?.compaction != null)
+      details.push(`上下文压缩耗时 ${display(state.timings.compaction)}${state.timings.compactionObserved ? "（按事件计时）" : ""}`);
+  }
   const description = details.join(" · ");
   // 复用编辑区现有主题提示组件，不再创建一套 hover 配色或监听器。
   node.title = description;
@@ -313,8 +384,10 @@ export function closeContextUsageTip() {
 }
 export function fitContextUsageTip() {
   if (!contextUsageTip) return;
-  const { node, trigger } = contextUsageTip;
-  if (!trigger.isConnected || trigger.hidden) { closeContextUsageTip(); return; }
+  const { node, trigger, point } = contextUsageTip;
+  if (!trigger.isConnected || trigger.hidden || document.documentElement.dataset.workspaceSidePanelVisible === "false") {
+    closeContextUsageTip(); return;
+  }
   const viewport = window.visualViewport, gap = 4, padding = 8;
   const top = viewport?.offsetTop || 0, left = viewport?.offsetLeft || 0;
   const width = viewport?.width || window.innerWidth, height = viewport?.height || window.innerHeight;
@@ -322,8 +395,9 @@ export function fitContextUsageTip() {
   if (box.bottom <= top || box.top >= top + height || box.right <= left || box.left >= left + width) {
     closeContextUsageTip(); return;
   }
-  const above = Math.max(0, box.top - top - gap - padding);
-  const below = Math.max(0, top + height - box.bottom - gap - padding);
+  const anchorTop = point?.y ?? box.top, anchorBottom = point?.y ?? box.bottom;
+  const above = Math.max(0, anchorTop - top - gap - padding);
+  const below = Math.max(0, top + height - anchorBottom - gap - padding);
   const availableWidth = Math.max(0, width - padding * 2), maxWidth = Math.min(300, availableWidth);
   node.style.width = "max-content";
   node.style.minWidth = `${Math.min(140, maxWidth)}px`;
@@ -332,8 +406,10 @@ export function fitContextUsageTip() {
   const upwards = below < node.getBoundingClientRect().height && above > below;
   node.style.maxHeight = `${Math.min(height * .8, upwards ? above : below)}px`;
   const actual = node.getBoundingClientRect();
-  node.style.left = `${Math.max(left + padding, Math.min(box.left, left + width - actual.width - padding))}px`;
-  node.style.top = `${Math.max(top + padding, Math.min(upwards ? box.top - gap - actual.height : box.bottom + gap,
+  // 侧边鼠标提示使用悬停点；点击固定、触屏及键盘仍使用用量环的位置。
+  const preferredLeft = point ? point.x - actual.width / 2 : box.left;
+  node.style.left = `${Math.max(left + padding, Math.min(preferredLeft, left + width - actual.width - padding))}px`;
+  node.style.top = `${Math.max(top + padding, Math.min(upwards ? anchorTop - gap - actual.height : anchorBottom + gap,
     top + height - actual.height - padding))}px`;
   node.dataset.direction = upwards ? "up" : "down";
 }
@@ -355,12 +431,13 @@ export function updateContextUsage() {
     fitContextUsageTip();
   }
 }
-function showContextUsageTip(pinned = false) {
+function showContextUsageTip(pinned = false, point = null) {
   const trigger = $("#context-info");
   if (!trigger?.isConnected) return;
   if (contextUsageTip?.trigger === trigger) {
     clearTimeout(contextUsageTip.closeTimer);
     contextUsageTip.pinned ||= pinned;
+    contextUsageTip.point = contextUsageTip.pinned ? null : point;
     fitContextUsageTip(); return;
   }
   closePopup(); closeComposerMenus();
@@ -369,7 +446,7 @@ function showContextUsageTip(pinned = false) {
   // 用户要求与 Codex 一致，只显示用量、百分比和容量，不再增加 Claude 或压缩配置说明行。
   // 用户要求用量文字颜色对齐 Codex 正文，不能沿用 muted 提示色；仍只显示原有单行用量。
   node.append(element("div", "context-usage-value"));
-  contextUsageTip = { node, trigger, pinned, closeTimer: null };
+  contextUsageTip = { node, trigger, pinned, point, closeTimer: null };
   trigger.setAttribute("aria-expanded", "true");
   trigger.setAttribute("aria-describedby", node.id);
   if (typeof node.showPopover === "function") node.setAttribute("popover", "manual");
@@ -394,7 +471,9 @@ export function mountContextUsage() {
     if (contextUsageTip?.pinned) closeContextUsageTip();
     else showContextUsageTip(true);
   };
-  trigger.onpointerenter = event => { if (event.pointerType === "mouse") showContextUsageTip(); };
+  trigger.onpointerenter = event => {
+    if (event.pointerType === "mouse") showContextUsageTip(false, sideTooltipPoint(event, trigger));
+  };
   trigger.onpointerleave = scheduleContextUsageTipClose;
   trigger.onfocus = () => {
     if (document.documentElement.dataset.inputModality === "keyboard") showContextUsageTip();

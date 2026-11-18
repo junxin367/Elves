@@ -4842,8 +4842,19 @@ fn project_frame(turn: &mut Value, frame: &Value) -> Vec<Value> {
             if item["type"] == "agentMessage" && frame["timestampMs"].is_number() {
                 item["sentAtMs"] = frame["timestampMs"].clone();
             }
+            // Claude 只提供同一工具调用和结果的原生记录时间，不当作纯执行时间。
+            if block["type"] == "tool_use"
+                && let Some(at) = frame["timestampMs"].as_u64().filter(|at| *at > 0)
+            {
+                item["toolCallAtMs"] = json!(at);
+            }
             // stream_event 的部分内容与最终 assistant 使用同一个原生消息 ID，避免回复重复。
             if let Some(old) = items.iter_mut().find(|i| i["id"] == item["id"]) {
+                for key in ["toolCallAtMs", "toolResultAtMs"] {
+                    if !old[key].is_null() {
+                        item[key] = old[key].clone();
+                    }
+                }
                 *old = item.clone();
             } else {
                 items.push(item.clone());
@@ -4860,7 +4871,18 @@ fn project_frame(turn: &mut Value, frame: &Value) -> Vec<Value> {
             }
             let items = turn["items"].as_array_mut().unwrap();
             if let Some(item) = items.iter_mut().find(|i| i["id"] == block["tool_use_id"]) {
+                let call = item["toolCallAtMs"].as_u64();
+                let result = item["toolResultAtMs"]
+                    .as_u64()
+                    .or_else(|| frame["timestampMs"].as_u64().filter(|at| *at > 0));
                 tools::apply_result(item, block, frame);
+                if let Some(at) = call {
+                    item["toolCallAtMs"] = json!(at);
+                }
+                // 后台工具这里只统计到原生返回“已启动”，后续任务通知不能延长原轮次。
+                if let Some(at) = result.filter(|at| call.is_some_and(|call| *at >= call)) {
+                    item["toolResultAtMs"] = json!(at);
+                }
                 changes.push(item.clone());
             } else if let Some(item) = tools::observe_plan_result(turn, block, frame) {
                 // 失败的任务清单调用不改变计划，单独显示通用失败卡片保留原生报错。
@@ -5788,6 +5810,30 @@ mod tests {
         assert_eq!(turn["items"].as_array().unwrap().len(), 2);
         assert_eq!(turn["items"][0]["text"], "你好 Claude");
         assert_eq!(turn["items"][1]["text"], "第二个独立正文块");
+    }
+
+    #[test]
+    fn claude_frames_measure_tool_call_and_first_native_result_by_id() {
+        let mut turn = json!({"items":[]});
+        project_frame(
+            &mut turn,
+            &json!({"type":"assistant","timestampMs":1000,"message":{"id":"msg-1","content":[
+                {"id":"tool-a","type":"tool_use","name":"Bash","input":{"command":"echo ok"}},
+                {"id":"tool-b","type":"tool_use","name":"Bash","input":{"command":"echo later"}}
+            ]}}),
+        );
+        for time in [1500, 4000] {
+            project_frame(
+                &mut turn,
+                &json!({"type":"user","timestampMs":time,"message":{"content":[
+                    {"type":"tool_result","tool_use_id":"tool-a","content":"ok"}
+                ]}}),
+            );
+        }
+        assert_eq!(turn["items"][0]["toolCallAtMs"], 1000);
+        assert_eq!(turn["items"][0]["toolResultAtMs"], 1500);
+        assert_eq!(turn["items"][1]["toolCallAtMs"], 1000);
+        assert!(turn["items"][1]["toolResultAtMs"].is_null());
     }
 
     #[test]

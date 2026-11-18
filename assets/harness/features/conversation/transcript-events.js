@@ -173,11 +173,16 @@ export function mergeItemProjection(previous, item) {
   for (const field of ["messageMetadata", "sentAtMs", "startedAtMs", "completedAtMs", "completed",
     "remoteImages", "remoteVideos", "clientId", "remoteCompactionInput", "remoteHistoryContext", "remoteItemCompleted"])
     if (!Object.hasOwn(item, field) && Object.hasOwn(previous || {}, field)) projection[field] = previous[field];
+  // Token hover 的观测时间只随同一原生条目合并，历史快照缺失时不能撤回已记录的时间边界。
+  const hoverTiming = {};
+  if (previous?.id === item.id)
+    for (const field of ["hoverObservedStartedAtMs", "hoverObservedCompletedAtMs", "toolCallAtMs", "toolResultAtMs"])
+      if (item[field] == null && Number.isSafeInteger(previous?.[field])) hoverTiming[field] = previous[field];
   // 用户要求压缩模型对应同一条原生记录；较旧历史缺字段时保留已确认型号，不能跨条目或跨会话补模型。
   const compaction = {};
   if (previous?.id === item.id && previous.type === "contextCompaction" && item.type === "contextCompaction")
     for (const field of ["compactionModel", "model"])
       if (item[field] == null && typeof previous[field] === "string") compaction[field] = previous[field];
-  const merged = mergeRemoteImageProjection(previous, null, { ...projection, ...item, ...compaction });
+  const merged = mergeRemoteImageProjection(previous, null, { ...projection, ...item, ...hoverTiming, ...compaction });
   return previous && JSON.stringify(previous) === JSON.stringify(merged) ? previous : merged;
 }

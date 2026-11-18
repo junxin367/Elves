@@ -13,6 +13,7 @@ struct CompactionRecord {
     thread_id: String,
     turn_id: String,
     item: Value,
+    position_at_ms: u64,
     sequence: u64,
 }
 
@@ -387,10 +388,12 @@ impl Projection {
         if id.is_empty() || turn_id.is_empty() || item["id"].as_str().is_none_or(str::is_empty) {
             return;
         }
+        let mut position_at_ms = None;
         if let Some(index) = self.compaction_records.iter().position(|record| {
             record.thread_id == id && record.turn_id == turn_id && record.item["id"] == item["id"]
         }) {
             let previous = self.compaction_records.remove(index).unwrap();
+            position_at_ms = Some(previous.position_at_ms);
             let mut merged = previous.item.clone();
             for (key, value) in item.as_object().into_iter().flatten() {
                 merged[key] = value.clone();
@@ -402,13 +405,17 @@ impl Projection {
             }
         }
         item["completed"] = json!(completed || item["completed"] == true);
-        if item["startedAtMs"].as_u64().is_none() {
-            item["startedAtMs"] = json!(now_ms());
-        }
+        // 缺少原生开始时间时只用收帧时间给正文定位，不能把定位回退传成 Token hover 的实测起点。
+        let position_at_ms = item["startedAtMs"]
+            .as_u64()
+            .or_else(|| item["hoverObservedStartedAtMs"].as_u64())
+            .or(position_at_ms)
+            .unwrap_or_else(now_ms);
         self.compaction_records.push_back(CompactionRecord {
             thread_id: id.to_owned(),
             turn_id: turn_id.to_owned(),
             item,
+            position_at_ms,
             sequence: self.sequence + 1,
         });
         // 与实时事件队列同上限；只淘汰已结束记录，进行中的压缩不能因其它会话活动而丢失。
@@ -455,7 +462,7 @@ impl Projection {
                 *turn_id == record.turn_id
             } else {
                 let exists = turns.iter().any(|turn| turn["id"] == record.turn_id);
-                let started = record.item["startedAtMs"].as_u64().unwrap_or(0);
+                let started = record.position_at_ms;
                 // 用户要求切回会话立即显示压缩；历史尚未落盘该轮时，以已收到的真实生命周期补齐。
                 if !exists && latest && (record.item["completed"] != true || started >= oldest) {
                     let status = if record.item["completed"] != true {
@@ -565,6 +572,39 @@ impl Projection {
                 .contains(&(id.clone(), turn_id.to_owned()))
         {
             return;
+        }
+        if frame.get("id").is_none()
+            && matches!(method.as_str(), "item/started" | "item/completed")
+            && matches!(
+                frame["params"]["item"]["type"].as_str(),
+                Some(
+                    "commandExecution"
+                        | "fileChange"
+                        | "mcpToolCall"
+                        | "dynamicToolCall"
+                        | "webSearch"
+                        | "imageView"
+                        | "imageGeneration"
+                        | "collabAgentToolCall"
+                        | "collabToolCall"
+                        | "sleep"
+                        | "contextCompaction"
+                )
+            )
+        {
+            // 旧原生版本仅通知开始与结束；为 Token hover 记录服务接收时间，不补造原生时间。
+            // 侧边历史和网页合并须保留这一对独立字段；轮次结束不能替代条目结束。
+            let (native, observed) = if method == "item/started" {
+                ("startedAtMs", "hoverObservedStartedAtMs")
+            } else {
+                ("completedAtMs", "hoverObservedCompletedAtMs")
+            };
+            if frame["params"]["item"][native].as_u64().is_none()
+                && let Some(at) = frame["params"][native].as_u64()
+            {
+                frame["params"]["item"][native] = json!(at);
+            }
+            frame["params"]["item"][observed] = json!(now_ms());
         }
         if method == "turn/plan/updated" {
             let Some(turn_id) = frame["params"]["turnId"]
@@ -1213,6 +1253,12 @@ mod tests {
             "threadId":"main","turnId":"compact-turn","item":item}}));
         let completed = projection.history("main", history, true);
         assert_eq!(completed["transcriptEvents"][0]["item"]["completed"], true);
+        let measured = &completed["transcriptEvents"][0]["item"];
+        assert_eq!(measured["startedAtMs"], 2000);
+        assert!(
+            measured["hoverObservedStartedAtMs"].as_u64().unwrap()
+                <= measured["hoverObservedCompletedAtMs"].as_u64().unwrap()
+        );
         assert_eq!(projection.compaction("main")["state"], "idle");
         // 迟到的开始事件不能把完成记录重新锁定，且不依赖发送新消息来恢复显示。
         projection.ingest(json!({"method":"item/started","params":{
@@ -1222,6 +1268,14 @@ mod tests {
             projection.thread("main", json!({}))["transcriptEvents"][0]["item"]["completed"],
             true
         );
+        projection.ingest(json!({"method":"item/completed","params":{
+            "threadId":"other","turnId":"other-turn","completedAtMs":3000,
+            "item":{"type":"contextCompaction","id":"finish-only"}}}));
+        let other = projection.thread("other", json!({}));
+        let finish_only = &other["transcriptEvents"][0]["item"];
+        assert_eq!(finish_only["completedAtMs"], 3000);
+        assert!(finish_only["startedAtMs"].is_null());
+        assert!(finish_only["hoverObservedStartedAtMs"].is_null());
     }
 
     #[test]
