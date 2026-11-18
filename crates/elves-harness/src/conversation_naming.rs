@@ -78,7 +78,7 @@ pub(super) fn validate(value: &Value) -> Result<Settings, ApiError> {
     {
         return Err(ApiError::new(
             400,
-            "请核对命名实例、命名模型、命名系统提示词、标题长度上限和标题更新间隔",
+            "请核对命名实例、命名模型、会话命名提示词、标题长度上限和标题更新间隔",
         ));
     }
     Ok(settings)

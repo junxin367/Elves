@@ -663,6 +663,25 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .confirmation-content>div{min-width:0}
 .confirmation-actions{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:8px}
 .confirmation-actions button{min-height:40px}
+/* 两处提示词共享弹窗：留出桌面阅读宽度，手机或软键盘缩小视口时只滚动正文，操作按钮仍可见。 */
+.confirmation-dialog.settings-prompt-dialog{
+  position:fixed;inset:calc(var(--settings-prompt-viewport-top,0px) + var(--settings-prompt-viewport-height,100dvh)/2) 0 auto;
+  width:min(700px,calc(100% - 24px));max-height:min(var(--popup-max-height),calc(var(--settings-prompt-viewport-height,100dvh) - 24px));
+  margin:0 auto;padding:0;overflow:hidden;transform:translateY(-50%)
+}
+.settings-prompt-dialog[open]{display:flex;flex-direction:column}
+.settings-prompt-heading,.settings-prompt-actions{display:flex;align-items:center;flex-shrink:0;gap:8px;padding:10px 16px}
+.settings-prompt-heading{justify-content:space-between;border-bottom:1px solid var(--line)}
+.settings-prompt-heading h2{font-size:1.14286rem;overflow-wrap:anywhere}
+.settings-prompt-heading>button{flex-shrink:0}
+.settings-prompt-body{min-height:0;overflow:auto;overscroll-behavior:contain;padding:12px 16px}
+.settings-prompt-dialog .instruction-content{height:clamp(140px,40dvh,360px);min-height:0;resize:none;background:var(--composer-bg,var(--side));overscroll-behavior:contain}
+.settings-prompt-default{margin-top:8px;font-size:.85714rem}
+.settings-prompt-default summary{cursor:pointer}
+.settings-prompt-default pre{max-height:160px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-family:var(--code-font-family,monospace);line-height:1.6}
+.settings-prompt-dialog .settings-prompt-status{margin:8px 0 0;color:var(--text-secondary);overflow-wrap:anywhere}
+.settings-prompt-actions{border-top:1px solid var(--line)}
+.settings-prompt-actions>button:first-child{margin-right:auto}
 /* 用户要求左侧会话菜单使用重命名弹窗；输入框沿用会话编辑框配色，PC 与手机共用现有确认框宽度。 */
 .thread-rename-dialog form{display:grid;gap:18px}
 .thread-rename-field{display:flex;flex-direction:column;gap:8px;font-size:.92857rem}

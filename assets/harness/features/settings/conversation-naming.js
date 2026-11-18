@@ -3,7 +3,7 @@ import { button, element } from "../../ui/dom.js";
 import { icon } from "../../ui/icons.js";
 import { selectControl, setSelectOptions } from "../../ui/select.js";
 import { notice } from "../../ui/notice.js";
-import { confirmAction } from "../../ui/dialog.js";
+import { confirmAction, openSettingsPrompt } from "../../ui/dialog.js";
 import { saveSharedSettings } from "../../core/actions.js";
 import { connected, session } from "../../core/state.js";
 import { privateInputScope } from "../session/capabilities.js";
@@ -14,10 +14,10 @@ import { settingsEnvironments, settingsPageCache } from "./instance-settings-cac
 const namingListeners = new Set();
 const namingModelCache = settingsPageCache("naming-models"), namingInfoCache = settingsPageCache("naming-info");
 let latestNamingStatus = null;
-// 用户要求同一功能只有一套口径；可见名称与无障碍名称共用，自动更新标题是自动命名的子设置。
+// 用户要求可见名称与无障碍名称共用，提示词统一称为“会话命名提示词”；自动更新标题仍是自动命名的子设置。
 const namingLabels = {
   enabled: "自动命名", refresh: "自动更新标题", instance: "命名实例", model: "命名模型",
-  maxTitleChars: "标题长度上限", refreshEveryTurns: "标题更新间隔", systemPrompt: "命名系统提示词"
+  maxTitleChars: "标题长度上限", refreshEveryTurns: "标题更新间隔", systemPrompt: "会话命名提示词"
 };
 export function receiveConversationNaming(value) {
   latestNamingStatus = { owner: namingInfoCache.identity(""), value };
@@ -29,6 +29,7 @@ export function mountConversationNaming(page) {
   page.classList.add("instance-settings-content");
   const scope = privateInputScope(session);
   let disposed = false, loading = false, saving = false, defaults = null, base = null, draft = null;
+  let defaultsOwner = "", promptEditor = null;
   let revision = -1, epoch = "", generation = 0, loadedModels = [], catalogOwner = "", showing = null, modelReading = null;
   const alive = () => !disposed && page.isConnected && privateInputScope(session) === scope;
   const supported = () => session?.capabilities?.conversationNaming === true && sharedSettingsState.ready;
@@ -59,7 +60,8 @@ export function mountConversationNaming(page) {
   const interval = numberControl(namingLabels.refreshEveryTurns, 1, 50);
   const row = (label, description, control, tag = "label") => {
     const field = element(tag, "appearance-field"), copy = element("span", "appearance-field-copy");
-    copy.append(element("span", "", label), element("small", "", description));
+    copy.append(element("span", "", label));
+    if (description) copy.append(element("small", "", description));
     field.append(copy, control); card.append(field);
     return field;
   };
@@ -74,17 +76,9 @@ export function mountConversationNaming(page) {
   row(namingLabels.maxTitleChars, "默认 36 个字符，可设置为 10～120 个字符。", lengthBox);
   row(namingLabels.refresh, "仅在自动命名开启后生效；按标题更新间隔检查主题，主题未变时保留原标题。手动重命名后停止更新。", refresh);
   row(namingLabels.refreshEveryTurns, "标题生成后，默认每完成 5 个成功轮次检查一次；失败、中断和重复事件不计数。", intervalBox);
-  const promptSection = element("section", "appearance-section");
-  promptSection.append(element("h4", "", namingLabels.systemPrompt));
-  const prompt = element("textarea", "instruction-content");
-  prompt.id = "conversation-naming-prompt"; prompt.rows = 13; prompt.maxLength = 20000;
-  prompt.setAttribute("aria-label", namingLabels.systemPrompt); prompt.spellcheck = false;
-  const promptHint = element("p", "appearance-hint", "默认命名系统提示词参考 Codex App：使用用户语言概括任务，并保留工单及代码名称。最多 10000 字符。");
-  const reset = button("恢复默认提示词", "恢复默认命名系统提示词", () => {
-    if (!writable() || !defaults) return;
-    draft.systemPrompt = defaults.systemPrompt; prompt.value = draft.systemPrompt; sync();
-  }, "text-button");
-  promptSection.append(promptHint, prompt, reset);
+  const promptSettings = button("设置", `设置${namingLabels.systemPrompt}`, openNamingPrompt);
+  promptSettings.setAttribute("aria-haspopup", "dialog");
+  row(namingLabels.systemPrompt, "", promptSettings, "div");
   const status = element("p", "appearance-hint");
   status.setAttribute("role", "status"); status.setAttribute("aria-live", "polite");
   const recent = element("p", "appearance-hint");
@@ -93,29 +87,67 @@ export function mountConversationNaming(page) {
   const save = button("保存", "保存会话命名设置", () => void persist(), "primary");
   actions.append(reload, save);
   // 命名说明只保留共享范围、标题作用及失败时保留原标题。
-  page.append(card, promptSection, element("p", "appearance-hint",
+  page.append(card, element("p", "appearance-hint",
     "同一 Harness 的各客户端共用设置；仅更新标题，失败时保留原标题。"),
   status, recent, actions);
 
   function sync() {
     const canWrite = writable();
-    for (const control of [enabled, instances, models, length, refresh, interval, prompt, reset])
+    for (const control of [enabled, instances, models, length, refresh, interval])
       control.disabled = !canWrite || !draft;
     models.disabled ||= !catalogReady();
-    reset.disabled ||= !defaults;
+    promptSettings.disabled = !alive() || !connected || !supported() || !defaults?.systemPrompt
+      || defaultsOwner !== namingInfoCache.identity("") || saving;
     // 主开关关闭时子设置不生效，禁用控件并保留原选择，避免呈现为两个互相独立的命名开关。
     refresh.disabled ||= !draft?.enabled;
     interval.disabled ||= !draft?.enabled || !draft?.refreshEnabled;
     save.disabled = !canWrite || draft?.enabled && !catalogReady() || !dirty();
     reload.disabled = saving || loading || !alive();
+    if (promptEditor) alive() ? promptEditor.sync() : promptEditor.close();
   }
   function restore() {
     base = structuredClone(sharedSettingsState.settings); draft = structuredClone(base.conversationNaming);
     revision = sharedSettingsState.revision; epoch = sharedSettingsState.epoch;
     enabled.checked = draft.enabled; refresh.checked = draft.refreshEnabled;
     length.value = String(draft.maxTitleChars); interval.value = String(draft.refreshEveryTurns);
-    prompt.value = draft.systemPrompt;
     renderInstances(); renderModels(); sync();
+  }
+  function openNamingPrompt() {
+    if (promptSettings.disabled || !alive() || !supported() || !defaults?.systemPrompt || promptEditor) return;
+    const editBase = structuredClone(sharedSettingsState.settings);
+    const editRevision = sharedSettingsState.revision, editEpoch = sharedSettingsState.epoch;
+    const initial = editBase.conversationNaming.systemPrompt, defaultValue = defaults.systemPrompt;
+    const getBlock = () => {
+      if (!alive() || editEpoch !== sharedSettingsState.epoch)
+        return "服务或授权已变化，请重新打开设置。";
+      if (sharedSettingsState.settings.conversationNaming.systemPrompt !== initial)
+        return "会话命名提示词已在其他客户端更新，请关闭后重新打开核对。";
+      return writable() ? "" : "当前无法修改，请核对连接和写入权限。";
+    };
+    // 用户要求弹窗独立保存提示词：沿用打开时的版本，只提交 systemPrompt，不带上页面其他未保存的字段。
+    promptEditor = openSettingsPrompt({ title: namingLabels.systemPrompt,
+      value: !initial || initial === defaultValue ? null : initial, defaultValue, max: 10000, getBlock,
+      returnFocus: () => promptSettings,
+      onClose() { promptEditor = null; },
+      async onSave(value) {
+        const blocked = getBlock();
+        if (blocked) throw new Error(blocked);
+        const systemPrompt = value ?? defaultValue, hadDraft = dirty();
+        saving = true; sync();
+        try {
+          const snapshot = await saveSharedSettings({ conversationNaming: { systemPrompt } },
+            { base: editBase, expectedRevision: editRevision });
+          if (!alive() || editEpoch !== sharedSettingsState.epoch
+              || snapshot?.settings?.conversationNaming?.systemPrompt !== systemPrompt)
+            throw new Error("会话命名提示词保存结果未确认，请重新读取核对。");
+          if (hadDraft) {
+            // 保留其他字段的草稿和基线；不能借此吸收另一个客户端的改动。
+            base.conversationNaming.systemPrompt = draft.systemPrompt = systemPrompt;
+          } else restore();
+          status.textContent = "会话命名提示词已保存。";
+        } finally { saving = false; if (alive()) sync(); }
+      }
+    });
   }
   function renderInstances() {
     const choices = availableSessionInstances().map(instance => ({ value: instance.id,
@@ -193,12 +225,16 @@ export function mountConversationNaming(page) {
       try {
         const preloaded = availableSessionInstances().some(instance => instance.id === draft.instanceId && instance.ready && !instance.error)
           ? readNamingModels(force) : null;
-        const [data] = await Promise.all([namingInfoCache.read("", { force, background: !!defaults }),
-          settingsEnvironments(force), preloaded]);
+        const infoOwner = namingInfoCache.identity("");
+        const readInfo = namingInfoCache.read("", { force, background: !!defaults }).then(data => {
+          if (!alive() || infoOwner !== namingInfoCache.identity("")) return;
+          defaults = data.defaults; defaultsOwner = infoOwner;
+          const latest = latestNamingStatus?.owner === infoOwner ? latestNamingStatus.value : null;
+          renderRecent(latest && (!data.status?.updatedAt || latest.updatedAt >= data.status.updatedAt) ? latest : data.status);
+          sync();
+        });
+        await Promise.all([readInfo, settingsEnvironments(force), preloaded]);
         if (!alive()) return;
-        defaults = data.defaults;
-        const latest = latestNamingStatus?.owner === namingInfoCache.identity("") ? latestNamingStatus.value : null;
-        renderRecent(latest && (!data.status?.updatedAt || latest.updatedAt >= data.status.updatedAt) ? latest : data.status);
         renderInstances();
         if (!preloaded) await readNamingModels(force);
         sync();
@@ -218,7 +254,7 @@ export function mountConversationNaming(page) {
     if (!Number.isInteger(draft.maxTitleChars) || draft.maxTitleChars < 10 || draft.maxTitleChars > 120
         || !Number.isInteger(draft.refreshEveryTurns) || draft.refreshEveryTurns < 1 || draft.refreshEveryTurns > 50
         || !draft.systemPrompt.trim() || Array.from(draft.systemPrompt).length > 10000) {
-      status.textContent = "请核对标题长度上限、标题更新间隔和命名系统提示词。"; return;
+      status.textContent = `请核对标题长度上限、标题更新间隔和${namingLabels.systemPrompt}。`; return;
     }
     const patch = Object.fromEntries(Object.entries(draft).filter(([key, value]) => value !== base.conversationNaming[key]));
     saving = true; status.textContent = "正在同步到所有客户端…"; sync();
@@ -238,7 +274,6 @@ export function mountConversationNaming(page) {
   models.onchange = () => { draft.model = models.value; sync(); };
   length.oninput = () => { draft.maxTitleChars = Number(length.value); sync(); };
   interval.oninput = () => { draft.refreshEveryTurns = Number(interval.value); sync(); };
-  prompt.oninput = () => { draft.systemPrompt = prompt.value; sync(); };
   const unsubscribe = subscribeSharedSettings(change => {
     if (!alive() || !supported()) { sync(); return; }
     if (draft && !saving) {
@@ -252,5 +287,7 @@ export function mountConversationNaming(page) {
   });
   const receive = value => { if (alive()) renderRecent(value); };
   namingListeners.add(receive); sync();
-  return { show, dispose() { disposed = true; generation++; unsubscribe(); namingListeners.delete(receive); } };
+  return { show, dispose() {
+    disposed = true; promptEditor?.close(); generation++; unsubscribe(); namingListeners.delete(receive);
+  } };
 }

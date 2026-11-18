@@ -1,5 +1,6 @@
 // 用户确认的实例设置：共享的显示开关与原生常规配置分开；模型、思考和扩展页面共用实例选择及请求隔离。
 import { button, element } from "../../ui/dom.js";
+import { openSettingsPrompt } from "../../ui/dialog.js";
 import { icon } from "../../ui/icons.js";
 import { selectControl, setSelectOptions } from "../../ui/select.js";
 import { connected, session } from "../../core/state.js";
@@ -94,7 +95,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
   setSelectedInstance = () => {} }) {
   const scope = privateInputScope(session);
   let disposed = false, selected = "", record = null, detecting = false, loading = false, saving = false, needsRead = false;
-  let pendingModelFocus = null, recordIdentity = "";
+  let pendingModelFocus = null, recordIdentity = "", promptEditor = null;
   let generation = 0, message = "", externalRefresh = false;
   const alive = () => !disposed && page.isConnected && scope === privateInputScope(session);
   // 过期缓存后台核对时可继续编辑；已知跨端变化或服务、CLI 身份变化后，旧记录只供查看。
@@ -103,6 +104,8 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     && recordIdentity === instanceSettingsIdentity(selected, name) && !cachedInstanceSettings(selected, name)?.blocked
     && !!currentInstance() && !currentInstance().error && record.backend === currentInstance().backend;
   const currentInstance = () => availableSessionInstances().find(instance => instance.id === selected);
+  const promptReadable = () => alive() && connected && !!record
+    && recordIdentity === instanceSettingsIdentity(selected, name);
   function retireRead() {
     generation++; loading = false;
     return generation;
@@ -128,8 +131,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
   const actions = element("div", "appearance-action-buttons instance-settings-actions");
   actions.append(reload);
   page.append(head, detect, content, status, actions);
-  const controls = new Set();
-  const textDrafts = new Map();
+  const controls = new Set(), promptControls = new Set();
   function sync() {
     instances.disabled = !alive() || detecting || saving || !availableSessionInstances().length;
     detect.disabled = !alive() || detecting || saving || !session || !connected;
@@ -143,6 +145,9 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     status.textContent = detecting ? "正在检测会话实例…" : loading && !record ? "正在读取实例设置…" : saving ? "正在保存…" : message;
     const canWrite = writable();
     for (const control of controls) control.disabled = !canWrite || control.settingsUnsupported === true;
+    const canReadPrompt = promptReadable() && !detecting && !saving;
+    for (const control of promptControls) control.disabled = !canReadPrompt;
+    if (promptEditor) alive() ? promptEditor.sync() : promptEditor.close();
   }
   function addSwitch(card, key, label, description, value, unsupported = false) {
     const row = element("label", "appearance-field");
@@ -341,6 +346,39 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
       card.append(row);
     }
   }
+  function addPromptSetting(card, option, value) {
+    const row = element("div", "appearance-field");
+    const owner = record, ownerId = selected;
+    const control = button("设置", `设置${option.label}`, () => {
+      if (control.disabled || !control.isConnected || record !== owner || selected !== ownerId || promptEditor) return;
+      const identity = recordIdentity;
+      const expected = { revision: record.revision, preferenceRevision: record.preferenceRevision };
+      const getBlock = () => {
+        if (!promptReadable() || selected !== ownerId || recordIdentity !== identity)
+          return "实例、服务或授权已变化，请重新打开设置。";
+        if (record.revision !== expected.revision || record.preferenceRevision !== expected.preferenceRevision
+            || record.settings[option.id] !== value)
+          return "实例设置已更新，请关闭后重新打开核对。";
+        return writable() ? "" : "当前无法修改，请核对连接和写入权限，必要时重新读取。";
+      };
+      // 用户要求按实例在弹窗设置压缩提示词。恢复默认待保存后才移除覆盖，写入使用打开时的两个版本。
+      const defaultValue = option.defaultValue || (owner.backend === "claude" ? null : undefined);
+      promptEditor = openSettingsPrompt({ title: option.label, value, defaultValue, max: option.max, getBlock,
+        returnFocus: () => selected === ownerId ? [...promptControls].find(item => item.id === control.id) : null,
+        onClose() { promptEditor = null; },
+        async onSave(value) {
+          const blocked = getBlock();
+          if (blocked) throw new Error(blocked);
+          const error = await save({ [option.id]: value }, expected);
+          if (error) throw new Error(error);
+        }
+      });
+    });
+    control.id = `settings-${name}-${option.id}-prompt`;
+    control.setAttribute("aria-haspopup", "dialog");
+    row.append(fieldCopy(option.label, option.description), control);
+    promptControls.add(control); card.append(row);
+  }
   function renderExtraSettings() {
     const rows = record.extraSettings || [];
     if (!rows.length) return;
@@ -368,36 +406,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
         addSelect(card, option.id, option.label, option.description,
           [inherit, ...option.options], value || "", value => value || null);
       } else if (option.kind === "text") {
-        const box = element("div", "appearance-instructions-card");
-        const input = element("textarea", "instruction-content");
-        const owner = record, ownerId = selected, draftKey = JSON.stringify([ownerId, option.id]);
-        const draft = textDrafts.get(draftKey), fallback = option.defaultValue || "";
-        input.setAttribute("aria-label", option.label); input.maxLength = option.max;
-        input.placeholder = fallback ? "使用默认压缩提示词" : "使用原生默认";
-        input.value = draft?.value ?? value ?? fallback;
-        // 提示词草稿按实例保留；保存沿用开始编辑时的原生/偏好版本，迟到输入不能借用其他实例或新配置版本。
-        input.oninput = () => {
-          if (record === owner && selected === ownerId && input.isConnected)
-            textDrafts.set(draftKey, { value: input.value, revision: owner.revision,
-              preferenceRevision: owner.preferenceRevision });
-        };
-        const savePrompt = button("保存提示词", `保存${option.label}`, () => {
-          if (record !== owner || selected !== ownerId || !input.isConnected) return;
-          const current = textDrafts.get(draftKey) || { ...owner, value: input.value };
-          if (!current.value.trim() || current.value.length > option.max) {
-            message = `${option.label}需填写 1～${option.max} 个字符，或恢复默认。`; sync(); return;
-          }
-          void save({ [option.id]: current.value }, current);
-        }, "text-button");
-        const resetPrompt = button("恢复默认", `恢复默认${option.label}`, () => {
-          if (record === owner && selected === ownerId && input.isConnected)
-            void save({ [option.id]: null });
-        }, "text-button");
-        const actions = element("div", "appearance-action-buttons");
-        actions.append(resetPrompt, savePrompt);
-        box.append(fieldCopy(option.label, option.description), input, actions);
-        for (const control of [input, savePrompt, resetPrompt]) controls.add(control);
-        card.append(box);
+        addPromptSetting(card, option, value);
       } else if (option.kind === "integer") {
         const row = element("label", "appearance-field");
         const input = element("input");
@@ -428,7 +437,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     }
   }
   function render() {
-    content.replaceChildren(); controls.clear();
+    content.replaceChildren(); controls.clear(); promptControls.clear();
     if (record) {
       if (name === "general") {
         // 合并页面只读取当前实例的一份设置；旧服务未返回模型目录时仍可显示已有常规配置。
@@ -573,7 +582,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     }
   }
   async function save(settings, expected = record) {
-    if (!writable()) { render(); return; }
+    if (!writable()) { render(); return "当前无法保存，请重新读取核对。"; }
     const id = selected, before = record, identity = instanceSettingsIdentity(selected, name);
     // 保存先撤销同一实例旧读取；旧快照不能在成功回执之后回填，也不能带着旧版本继续写入其他分类。
     retireRead(); invalidateInstanceSettings(id);
@@ -582,7 +591,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
       const result = await api("/api/settings/instance", { instanceId: id, section: name,
         operation: "save", settings, expectedRevision: expected.revision,
         expectedPreferenceRevision: expected.preferenceRevision });
-      if (scope !== privateInputScope(session) || selected !== id) return;
+      if (scope !== privateInputScope(session) || selected !== id) return "保存结果不属于当前实例或授权。";
       if (identity !== instanceSettingsIdentity(id, name))
         throw new Error("实例或服务已变化，请重新读取核对保存结果。");
       record = checkedResult(result, id);
@@ -593,8 +602,6 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
         if (key === "hiddenModelIds" ? JSON.stringify(actual) !== JSON.stringify(value)
           : actual !== (["skill", "server"].includes(key) ? value.enabled : value))
           throw new Error("保存结果与所选设置不一致，请重新读取核对。");
-        const draftKey = JSON.stringify([id, key]), draft = textDrafts.get(draftKey);
-        if (value === null || draft?.value === value) textDrafts.delete(draftKey);
       }
       record = storeInstanceSettings(id, name, record);
       if (cachedInstanceSettings(id, name)?.blocked) {
@@ -622,11 +629,14 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
       if (alive()) message = Object.hasOwn(settings, "hiddenModelIds")
         ? "模型显示设置已保存，已有会话继续使用当前模型。"
         : "已保存，新会话或重新加载后生效。";
+      return "";
     } catch (error) {
+      const failure = `${error.message} 未自动重复保存，请重新读取核对。`;
       if (alive() && selected === id) {
         record = before; needsRead = true;
-        message = `${error.message} 未自动重复保存，请重新读取核对。`;
+        message = failure;
       }
+      return failure;
     } finally {
       if (alive() && selected === id) {
         saving = false; render();
@@ -694,7 +704,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     }
   });
   render();
-  return { show, dispose() { disposed = true; retireRead(); unsubscribe(); } };
+  return { show, dispose() { disposed = true; promptEditor?.close(); retireRead(); unsubscribe(); } };
 }
 
 export function mountShortcuts(page) {
