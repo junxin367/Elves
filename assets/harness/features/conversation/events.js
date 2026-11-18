@@ -130,6 +130,10 @@ export function receive(event) {
     window.dispatchEvent(new CustomEvent("codex-elves-management-updated"));
     return;
   }
+  if (event.method === "remote/scheduledTasksChanged") {
+    window.dispatchEvent(new Event("codex-elves-scheduled-tasks-changed"));
+    return;
+  }
   if (event.method === "remote/conversationNaming") {
     receiveConversationNaming(rawParams);
     if (rawParams.state === "completed") {
