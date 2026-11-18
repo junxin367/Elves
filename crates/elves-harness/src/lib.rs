@@ -1362,6 +1362,9 @@ impl HarnessController {
                 .await
                 .map_err(Into::into);
         }
+        if action == "harnessDiagnostics" {
+            return self.harness_diagnostics(&payload, authorization).await;
+        }
         if action == "clearRecentPriority" {
             let invalid = || ApiError::new(400, "待清除的优先事项标识无效");
             let ids = payload["threadIds"]
@@ -1652,6 +1655,122 @@ impl HarnessController {
             return Ok(value);
         }
         Ok(value)
+    }
+
+    async fn harness_diagnostics(
+        &self,
+        payload: &Value,
+        authorization: &HarnessAuthorization,
+    ) -> anyhow::Result<Value> {
+        let thread_id = payload["threadId"]
+            .as_str()
+            .filter(|id| notification_thread_id(&json!(id)).is_some())
+            .map(str::to_owned);
+        let mut enabled_instance_ids = vec!["codex:local".to_owned()];
+        // 目标是 Claude 会话时只补查该会话所属实例，避免诊断入口默认扫描所有 WSL。
+        if let Some(id) = thread_id
+            .as_deref()
+            .filter(|id| claude::Claude::owns_id(id))
+            && let Ok(instance_id) = self.claude.instance_id(id).await
+        {
+            enabled_instance_ids.push(instance_id);
+        }
+        let sidebar = self
+            .call_backend(
+                "sidebar",
+                json!({"enabledInstanceIds":enabled_instance_ids}),
+                authorization,
+            )
+            .await?;
+        let mut target = Value::Null;
+        let mut detail = Value::Null;
+        let mut related = Value::Null;
+        let mut thread_read_error = Value::Null;
+        let mut related_threads_error = Value::Null;
+        let mut related_for_id = Value::Null;
+        if let Some(id) = thread_id.as_deref() {
+            target = ["recent", "pinnedThreads"]
+                .into_iter()
+                .flat_map(|key| sidebar[key].as_array().into_iter().flatten())
+                .find(|row| row["id"].as_str() == Some(id))
+                .cloned()
+                .unwrap_or(Value::Null);
+            match self
+                .call_backend("thread", json!({"threadId":id}), authorization)
+                .await
+            {
+                Ok(value) => {
+                    detail = value;
+                    related_for_id = detail["thread"]["parentThreadId"]
+                        .as_str()
+                        .or_else(|| detail["thread"]["attachedToThreadId"].as_str())
+                        .unwrap_or(id)
+                        .into();
+                }
+                Err(error) => {
+                    thread_read_error = json!(format!("{error:#}"));
+                    related_for_id = json!(id);
+                }
+            }
+            let related_id = related_for_id.as_str().unwrap_or(id);
+            match self
+                .call_backend(
+                    "relatedThreads",
+                    json!({"threadId":related_id}),
+                    authorization,
+                )
+                .await
+            {
+                Ok(value) => related = value,
+                Err(error) => related_threads_error = json!(format!("{error:#}")),
+            }
+        }
+        let unknown_unread_ids = ["recent", "pinnedThreads"]
+            .into_iter()
+            .flat_map(|key| sidebar[key].as_array().into_iter().flatten())
+            .filter_map(|row| {
+                row["hasUnreadTurn"]
+                    .is_null()
+                    .then(|| row["id"].as_str())
+                    .flatten()
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "ok":true,
+            "capturedAtMs":now_ms(),
+            "buildId":crate::assets::DIAGNOSTIC_BUILD_ID,
+            "version":crate::version::VERSION,
+            "runtime":{
+                "desktop":true,
+                "desktopRunning":self.desktop_running.load(Ordering::Acquire),
+                "serviceConnected":self.harness_connected.load(Ordering::Acquire),
+                "codexHarnessEnabled":self.harness.enabled.load(Ordering::Acquire),
+                "closing":self.closing.load(Ordering::Acquire),
+                "desktopPort":self.desktop_port.load(Ordering::Acquire)
+            },
+            "priority":{
+                "ids":sidebar["recentPriorityIds"],
+                "clearableIds":sidebar["recentPriorityClearableIds"],
+                "unknownUnreadIds":unknown_unread_ids,
+                "sideThreadsComplete":sidebar["sideThreadsComplete"],
+                "sideThreadsError":sidebar["sideThreadsError"]
+            },
+            "persistentSides":{
+                "ids":sidebar["sideThreadIds"],
+                "unread":sidebar["unreadSideThreads"]
+            },
+            "target":{
+                "requestedId":thread_id,
+                "foundInSidebar":!target.is_null(),
+                "relatedForId":related_for_id,
+                "sidebar":target,
+                "threadRead":detail["thread"],
+                "threadReadError":thread_read_error,
+                "relatedThreads":related,
+                "relatedThreadsError":related_threads_error
+            }
+        }))
     }
 
     async fn call_backend(
@@ -4020,8 +4139,18 @@ async fn read(
             | "notifications"
             | "relatedThreads"
             | "sidePresence"
+            | "harnessDiagnostics"
     ) {
         return Err(ApiError::new(404, "不支持的读取操作"));
+    }
+    if action == "harnessDiagnostics" && !state.desktop {
+        return Err(ApiError::new(403, "Harness 诊断仅可在 Elves 独立客户端使用"));
+    }
+    if action == "harnessDiagnostics"
+        && payload.get("threadId").is_some()
+        && notification_thread_id(&payload["threadId"]).is_none()
+    {
+        return Err(ApiError::new(400, "诊断目标会话 ID 无效"));
     }
     if action == "sessionMetrics" && notification_thread_id(&payload["threadId"]).is_none() {
         return Err(ApiError::new(400, "会话统计标识无效"));
@@ -6276,6 +6405,122 @@ mod tests {
         assert!(log.contains("\"resolvedCount\":1"));
         assert!(log.contains("\"event\":\"remote_access.priority_clear\""));
         assert!(log.contains("\"removed\":1"));
+    }
+
+    #[tokio::test]
+    async fn harness_diagnostics_collects_local_runtime_priority_and_side_relationships() {
+        struct DiagnosticsCatalog;
+        #[async_trait]
+        impl TestRemoteBackend for DiagnosticsCatalog {
+            async fn call(&self, action: &str, payload: Value) -> anyhow::Result<Value> {
+                match action {
+                    "sidebar" => Ok(json!({
+                        "ok":true,
+                        "nativeBridge":"harness",
+                        "complete":true,
+                        "sideThreadsComplete":false,
+                        "sideThreadsError":"持久侧边读取失败",
+                        "sideThreadIds":["persistent-side"],
+                        "unreadSideThreads":[{"id":"persistent-side","parentThreadId":"target-parent"}],
+                        "projects":[],
+                        "pinnedThreads":[],
+                        "recent":[{
+                            "id":"target",
+                            "backend":"codex",
+                            "instanceId":"codex:local",
+                            "status":{"type":"idle"},
+                            "hasUnreadTurn":null,
+                            "requestsKnown":true,
+                            "requests":[],
+                            "parentThreadId":null,
+                            "attachedToThreadId":null,
+                            "ephemeral":false,
+                            "serviceSide":false
+                        }]
+                    })),
+                    "thread" if payload["threadId"] == "target" => Ok(json!({
+                        "ok":true,
+                        "thread":{
+                            "id":"target",
+                            "parentThreadId":"target-parent",
+                            "attachedToThreadId":"target-parent",
+                            "status":{"type":"idle"},
+                            "hasUnreadTurn":false
+                        }
+                    })),
+                    "relatedThreads" if payload["threadId"] == "target-parent" => Ok(json!({
+                        "ok":true,
+                        "threadId":"target-parent",
+                        "sideThreads":[{"id":"persistent-side","parentThreadId":"target-parent"}],
+                        "sideThreadsComplete":false,
+                        "sideThreadsError":"持久侧边读取失败"
+                    })),
+                    _ => anyhow::bail!("unexpected diagnostics action: {action}"),
+                }
+            }
+        }
+
+        let (_directory, authorization) = harness_fixture_with_store(None).await;
+        let authorization = desktop_authorization(authorization).await;
+        let controller = &authorization.controller;
+        assert!(controller
+            .test_backend
+            .set(Arc::new(DiagnosticsCatalog))
+            .is_ok());
+
+        let snapshot = controller
+            .call_authorized(
+                "harnessDiagnostics",
+                json!({"threadId":"target"}),
+                &authorization,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot["ok"], true);
+        assert_eq!(snapshot["runtime"]["desktop"], true);
+        assert_eq!(snapshot["runtime"]["desktopRunning"], true);
+        assert_eq!(snapshot["target"]["requestedId"], "target");
+        assert_eq!(snapshot["target"]["foundInSidebar"], true);
+        assert_eq!(snapshot["target"]["relatedForId"], "target-parent");
+        assert_eq!(snapshot["target"]["threadRead"]["id"], "target");
+        assert_eq!(
+            snapshot["target"]["relatedThreads"]["sideThreads"][0]["id"],
+            "persistent-side"
+        );
+        assert_eq!(snapshot["priority"]["unknownUnreadIds"], json!(["target"]));
+        assert_eq!(snapshot["persistentSides"]["ids"], json!(["persistent-side"]));
+        assert_eq!(
+            snapshot["priority"]["sideThreadsError"],
+            "持久侧边读取失败"
+        );
+    }
+
+    #[tokio::test]
+    async fn harness_diagnostics_is_rejected_for_remote_read_entry() {
+        let (_directory, authorization) = harness_authorization_fixture(None).await;
+        let controller = authorization.controller.clone();
+        let state = WebState {
+            desktop: false,
+            controller,
+            settings: RemoteAccessSettings::default(),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("codex_elves_device=isolated-service-dispatch-token"),
+        );
+
+        let error = read(
+            State(state),
+            Path("harnessDiagnostics".into()),
+            headers,
+            Json(json!({})),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, 403);
+        assert_eq!(error.message, "Harness 诊断仅可在 Elves 独立客户端使用");
     }
 
     #[test]

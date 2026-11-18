@@ -1039,10 +1039,47 @@ pub(crate) fn popup_app_menu(
             !state.checking_update.load(Ordering::Acquire),
             None::<&str>,
         )?;
+        let devtools = MenuItem::with_id(app, "help_devtools", "打开 DevTools", true, None::<&str>)?;
+        let diagnostics =
+            MenuItem::with_id(app, "help_diagnostics", "Harness 诊断快照", true, None::<&str>)?;
         let about = MenuItem::with_id(app, "help_about", "关于 Elves", true, None::<&str>)?;
-        Menu::with_items(app, &[&project, &update, &about])?
+        Menu::with_items(app, &[&project, &update, &devtools, &diagnostics, &about])?
     };
     window.popup_menu_at(&menu, PhysicalPosition::new(x, y))
+}
+
+fn open_devtools(app: &tauri::AppHandle) -> tauri::Result<()> {
+    show_window(app);
+    let content = app
+        .get_webview(CONTENT_LABEL)
+        .ok_or(tauri::Error::WebviewNotFound)?;
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    content
+        .with_webview(move |view| {
+            let result = unsafe {
+                view.controller()
+                    .CoreWebView2()
+                    .and_then(|core| core.OpenDevToolsWindow())
+            };
+            let _ = sender.send(result.map_err(|error| error.to_string()));
+        })
+        .map_err(|error| tauri::Error::Anyhow(anyhow::anyhow!(error.to_string())))?;
+    receiver
+        .recv()
+        .map_err(|_| tauri::Error::Anyhow(anyhow::anyhow!("DevTools 调用未返回结果")))?
+        .map_err(|error| tauri::Error::Anyhow(anyhow::anyhow!(error)))?;
+    Ok(())
+}
+
+fn open_harness_diagnostics(app: &tauri::AppHandle) -> tauri::Result<()> {
+    open_devtools(app)?;
+    if let Some(content) = app.get_webview(CONTENT_LABEL) {
+        // 诊断快照只在本机独立客户端的当前工作区执行；不连接 Codex App、不注入页面状态。
+        content.eval(
+            "Promise.resolve(window.__ELVES_HARNESS_DIAGNOSTICS__?.({log:true})).catch(error => console.error('[Elves] Harness 诊断快照失败', error));",
+        )?;
+    }
+    Ok(())
 }
 
 pub(crate) fn report_native_error(window: &tauri::Window, message: &str) {
@@ -1374,6 +1411,20 @@ fn handle_menu_event(app: &tauri::AppHandle, event: MenuEvent) {
         "file_add_folder" => add_folder(app),
         "help_project" => open_external(Url::parse(crate::updates::PROJECT_URL).unwrap()),
         "help_update" => check_update(app),
+        "help_devtools" => {
+            if let Err(error) = open_devtools(app)
+                && let Some(window) = app.get_window(WINDOW_LABEL)
+            {
+                report_native_error(&window, &format!("无法打开开发者工具：{error}"));
+            }
+        }
+        "help_diagnostics" => {
+            if let Err(error) = open_harness_diagnostics(app)
+                && let Some(window) = app.get_window(WINDOW_LABEL)
+            {
+                report_native_error(&window, &format!("无法打开 Harness 诊断：{error}"));
+            }
+        }
         "help_about" => {
             if let Err(error) = open_about(app)
                 && let Some(window) = app.get_window(WINDOW_LABEL)
@@ -1563,6 +1614,7 @@ fn create_client_window(
     .data_directory(directory.join("webview"))
     .initialization_script(include_str!("../../web/theme-bridge.js"))
     .initialization_script(include_str!("../../web/local-inputs-bridge.js"))
+    .initialization_script(include_str!("../../web/diagnostics-bridge.js"))
     // 用户要求编辑框接收图片、文件和目录拖入；保留 HTML 拖放，不能让窗口级处理抢走 DOM 目录入口。
     .disable_drag_drop_handler()
     .on_navigation(move |url| {
