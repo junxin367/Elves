@@ -58,7 +58,7 @@ function updateSidebarThread(id, callback) {
   });
   return changed;
 }
-function turnOutcome(turn) {
+export function normalizeTurnOutcome(turn) {
   const status = turn?.error != null ? "failed" : typeof turn?.status === "string" ? turn.status : "completed";
   const errorText = JSON.stringify(turn?.error ?? "").toLowerCase();
   const kind = status === "failed"
@@ -73,13 +73,30 @@ function turnOutcome(turn) {
 }
 export function applySidebarThreadOutcome(id, turn, { unread = false } = {}) {
   return updateSidebarThread(id, item => {
-    const next = turnOutcome(turn);
+    const next = normalizeTurnOutcome(turn);
     const previous = item.lastTurnOutcome;
     item.lastTurnOutcome = next;
     item.status = turn?.status || item.status;
     const unreadChanged = unread && ["completed", "failed"].includes(next.status) && item.hasUnreadTurn !== true;
     if (unreadChanged) item.hasUnreadTurn = true;
     return unreadChanged || JSON.stringify(previous) !== JSON.stringify(next);
+  });
+}
+export function applySidebarThreadStarted(id, turn) {
+  return updateSidebarThread(id, item => {
+    const previous = item.lastTurnOutcome;
+    const status = turn?.status || { type: "active" };
+    const changed = previous != null || item.priority?.active !== true
+      || JSON.stringify(item.status) !== JSON.stringify(status);
+    item.lastTurnOutcome = null;
+    item.status = status;
+    item.priority = {
+      ...(item.priority || {}),
+      status: item.status,
+      active: true,
+      attentionState: "active"
+    };
+    return changed;
   });
 }
 export function applySidebarThreadReadState(id, readState) {

@@ -87,6 +87,7 @@ export function mountScheduledTasksPage(root) {
   let disposed = false;
   let tasks = [];
   let editingId = "";
+  let editingEnabled = true;
   let instancesReady = false;
   let modelRows = [];
 
@@ -266,6 +267,7 @@ export function mountScheduledTasksPage(root) {
 
   function openEditor(task = null) {
     editingId = task?.id || "";
+    editingEnabled = task?.enabled !== false;
     editorTitle.textContent = task ? "编辑任务" : "新建任务";
     nameInput.value = task?.name || "";
     promptInput.value = task?.prompt || "";
@@ -300,6 +302,7 @@ export function mountScheduledTasksPage(root) {
     editor.hidden = true;
     add.disabled = false;
     editingId = "";
+    editingEnabled = true;
     setEditorStatus("");
   }
 
@@ -329,7 +332,8 @@ export function mountScheduledTasksPage(root) {
       model: modelSelect.value,
       reasoningEffort: effortSelect.value || "",
       schedule: schedulePayload(),
-      enabled: true
+      // 编辑任务必须保留原有暂停状态，启停由单独的任务开关控制。
+      enabled: editingId ? editingEnabled : true
     };
     if (!task.name || !task.prompt.trim() || !task.instanceId || !task.model) {
       setEditorStatus("请填写名称、提示，先选择实例，再选择模型。", true);
@@ -337,8 +341,8 @@ export function mountScheduledTasksPage(root) {
     }
     save.disabled = true;
     try {
-      const action = editingId ? "updateScheduledTask" : "createScheduledTask";
-      await action(`/api/action/${action}`, editingId ? { taskId: editingId, task } : { task });
+      const operation = editingId ? "updateScheduledTask" : "createScheduledTask";
+      await action(`/api/action/${operation}`, editingId ? { taskId: editingId, task } : { task });
       closeEditorPanel();
       await refreshTasks();
     } catch (error) {

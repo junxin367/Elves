@@ -51,7 +51,8 @@ import { relatedMenuTimer, relatedSessionView, setRelatedMenuTimer } from "../se
 import { retireNativeSideThreads } from "../session/related.js";
 import { currentThreadDisplay, readScope, threadDisplayKey, threadDisplays } from "../session/thread-cache.js";
 import {
-  applySidebarThreadOutcome, applySidebarThreadReadState, applySidebarThreadTitle,
+  applySidebarThreadOutcome, applySidebarThreadReadState, applySidebarThreadStarted, applySidebarThreadTitle,
+  normalizeTurnOutcome,
   sidebarReadRefreshSuppressions
 } from "../sidebar/list-state.js";
 import { rememberBackgroundThreadDisplay, rememberThreadDisplay, renderOutcomeMarker } from "../session/thread-display.js";
@@ -243,14 +244,14 @@ export function receive(event) {
     sidebarChanged = (typeof applySidebarThreadOutcome === "function"
       && applySidebarThreadOutcome(eventThreadId, params.turn, { unread })) || sidebarChanged;
     if (eventThreadId === selectedId && thread) {
-      thread.lastTurnOutcome = params.turn?.error != null || params.turn?.status === "failed"
-        ? { turnId: params.turn?.id, status: "failed", kind: params.turn?.error?.statusCode === 429 ? "rateLimit" : "failed",
-          error: params.turn?.error || null }
-        : { turnId: params.turn?.id, status: params.turn?.status || "completed", kind: "completed", error: null };
+      thread.lastTurnOutcome = normalizeTurnOutcome(params.turn);
       if (typeof renderOutcomeMarker === "function") renderOutcomeMarker(thread);
       if (typeof rememberThreadDisplay === "function")
         rememberThreadDisplay({ id: eventThreadId, lastTurnOutcome: thread.lastTurnOutcome });
     }
+  }
+  if (event.method === "turn/started" && typeof eventThreadId === "string") {
+    sidebarChanged = applySidebarThreadStarted(eventThreadId, params.turn) || sidebarChanged;
   }
   if (sidebarChanged) renderSidebar();
   if (event.method === "thread/settings/updated" && typeof params.fastMode === "boolean") {

@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use chrono::{Datelike, TimeZone, Timelike, Utc};
+use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -210,15 +211,27 @@ impl ScheduledTasks {
             }
             "runScheduledTask" => {
                 let task_id = task_id(payload)?;
-                let task = self.get(&task_id).await?;
-                let result = self
+                let task = self.begin_manual(&task_id, super::now_ms()).await?;
+                match self
                     .run_one(controller, task, authorization, "manual")
-                    .await?;
-                controller.publish_event(json!({
-                    "method":"remote/scheduledTasksChanged",
-                    "params":{"taskId":task_id,"reason":"run"}
-                }));
-                Ok(json!({"ok":true,"taskId":task_id,"result":result}))
+                    .await
+                {
+                    Ok(result) => {
+                        controller.publish_event(json!({
+                            "method":"remote/scheduledTasksChanged",
+                            "params":{"taskId":task_id,"reason":"run"}
+                        }));
+                        Ok(json!({"ok":true,"taskId":task_id,"result":result}))
+                    }
+                    Err(error) => {
+                        self.finish_error(&task_id, &error.to_string()).await;
+                        controller.publish_event(json!({
+                            "method":"remote/scheduledTasksChanged",
+                            "params":{"taskId":task_id,"reason":"failed"}
+                        }));
+                        Err(error)
+                    }
+                }
             }
             _ => Err(ApiError::new(404, "不支持的定时任务操作").into()),
         }
@@ -349,21 +362,37 @@ impl ScheduledTasks {
         })
     }
 
-    async fn get(&self, id: &str) -> Result<ScheduledTask, ApiError> {
-        let state = self.state.lock().await;
+    async fn begin_manual(&self, id: &str, now: u64) -> Result<ScheduledTask, ApiError> {
+        let mut state = self.state.lock().await;
         if state.load_failed {
             return Err(ApiError::new(
                 503,
                 "定时任务存储暂不可用，请重启 Harness 后重试",
             ));
         }
-        state
+        let mut task = state
             .stored
             .tasks
             .iter()
             .find(|task| task.id == id)
             .cloned()
-            .ok_or_else(|| ApiError::new(404, "定时任务不存在"))
+            .ok_or_else(|| ApiError::new(404, "定时任务不存在"))?;
+        if task.status == "running" {
+            return Err(ApiError::new(409, "定时任务正在执行，请等待本次运行结束"));
+        }
+        // 手动运行也先持久化 running，避免连续点击或调度线程并发创建多个会话。
+        task.status = "running".into();
+        task.updated_at_ms = now;
+        save_locked(&self.path, &mut state, |stored| {
+            let current = stored
+                .tasks
+                .iter_mut()
+                .find(|current| current.id == id)
+                .context("定时任务不存在")?;
+            *current = task.clone();
+            Ok(())
+        })?;
+        Ok(task)
     }
 
     async fn toggle(&self, id: &str, enabled: bool, now: u64) -> Result<ScheduledTask, ApiError> {
@@ -636,9 +665,12 @@ fn task_from_payload(
     if name.is_empty() || name.len() > MAX_NAME_BYTES || name.chars().any(char::is_control) {
         return Err(ApiError::new(400, "任务名称需为 1–160 字节"));
     }
+    // 定时任务提示是用户可编辑的多行文本；保留换行、回车和制表符，只拦截其他控制字符。
     if prompt.trim().is_empty()
         || prompt.len() > MAX_PROMPT_BYTES
-        || prompt.chars().any(char::is_control)
+        || prompt
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
     {
         return Err(ApiError::new(400, "执行提示需为 1–128 KiB"));
     }
@@ -781,7 +813,9 @@ fn parse_schedule(value: &Value, now: u64) -> Result<Schedule, ApiError> {
         }
         "cron" => {
             let expression = schedule.cron.as_deref().unwrap_or("");
-            if expression.len() > MAX_CRON_BYTES || next_cron_after(expression, now).is_none() {
+            if expression.len() > MAX_CRON_BYTES
+                || next_cron_after(expression, schedule.timezone.as_deref(), now).is_none()
+            {
                 return Err(ApiError::new(
                     400,
                     "Cron 表达式无效或一年内没有下一次执行时间",
@@ -812,37 +846,68 @@ fn next_run_at(schedule: &Schedule, now: u64) -> anyhow::Result<Option<u64>> {
             let jumps = elapsed / step + 1;
             Ok(Some(start.saturating_add(jumps.saturating_mul(step))))
         }
-        "cron" => Ok(next_cron_after(schedule.cron.as_deref().unwrap_or(""), now)),
+        "cron" => Ok(next_cron_after(
+            schedule.cron.as_deref().unwrap_or(""),
+            schedule.timezone.as_deref(),
+            now,
+        )),
         _ => anyhow::bail!("执行计划类型无效"),
     }
 }
 
-fn next_cron_after(expression: &str, now: u64) -> Option<u64> {
+fn parse_timezone(value: Option<&str>) -> anyhow::Result<Tz> {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("UTC")
+        .parse::<Tz>()
+        .map_err(|_| anyhow::anyhow!("时区标识无效"))
+}
+
+fn next_cron_after(expression: &str, timezone: Option<&str>, now: u64) -> Option<u64> {
     let fields = expression.split_whitespace().collect::<Vec<_>>();
     if fields.len() != 5 {
         return None;
     }
+    let timezone = parse_timezone(timezone).ok()?;
     let minute = parse_cron_field(fields[0], 0, 59).ok()?;
     let hour = parse_cron_field(fields[1], 0, 23).ok()?;
     let day = parse_cron_field(fields[2], 1, 31).ok()?;
     let month = parse_cron_field(fields[3], 1, 12).ok()?;
     let weekday = parse_cron_field(fields[4], 0, 6).ok()?;
+    let day_restricted = !cron_field_is_wildcard(fields[2]);
+    let weekday_restricted = !cron_field_is_wildcard(fields[4]);
+    // 按保存的 IANA 时区解释 Cron 字段，再在 UTC 分钟上扫描，覆盖夏令时跳变和重复时刻。
     let mut cursor = (now / 60_000 + 1).saturating_mul(60_000);
     for _ in 0..MAX_SCHEDULE_MINUTES {
         let timestamp = Utc
             .timestamp_millis_opt(i64::try_from(cursor).ok()?)
             .single()?;
-        if minute.contains(&timestamp.minute())
-            && hour.contains(&timestamp.hour())
-            && day.contains(&timestamp.day())
-            && month.contains(&timestamp.month())
-            && weekday.contains(&timestamp.weekday().num_days_from_sunday())
+        let local = timestamp.with_timezone(&timezone);
+        let day_matches = day.contains(&local.day());
+        let weekday_matches = weekday.contains(&local.weekday().num_days_from_sunday());
+        // 标准五段 Cron 在日期和星期都受限时采用 OR；其中一项为 * 时只看另一项。
+        let calendar_matches = match (day_restricted, weekday_restricted) {
+            (false, false) => true,
+            (true, false) => day_matches,
+            (false, true) => weekday_matches,
+            (true, true) => day_matches || weekday_matches,
+        };
+        if minute.contains(&local.minute())
+            && hour.contains(&local.hour())
+            && month.contains(&local.month())
+            && calendar_matches
         {
             return Some(cursor);
         }
         cursor = cursor.saturating_add(60_000);
     }
     None
+}
+
+fn cron_field_is_wildcard(value: &str) -> bool {
+    value
+        .split(',')
+        .all(|part| part == "*" || part.starts_with("*/"))
 }
 
 fn parse_cron_field(value: &str, min: u32, max: u32) -> anyhow::Result<HashSet<u32>> {
@@ -878,4 +943,104 @@ fn parse_cron_field(value: &str, min: u32, max: u32) -> anyhow::Result<HashSet<u
     }
     anyhow::ensure!(!values.is_empty(), "Cron 字段为空");
     Ok(values)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono_tz::Asia::Shanghai;
+
+    #[test]
+    fn multiline_prompt_is_valid_but_other_controls_are_rejected() {
+        let now = 1_800_000_000_000;
+        let task = task_from_payload(
+            &json!({
+                "name":"多行任务",
+                "prompt":"第一行\n第二行\t继续",
+                "instanceId":"codex:local",
+                "model":"gpt-6.1-sol",
+                "schedule":{"kind":"once","startAtMs":now + 60_000}
+            }),
+            None,
+            now,
+        )
+        .unwrap();
+        assert_eq!(task.prompt, "第一行\n第二行\t继续");
+
+        let error = task_from_payload(
+            &json!({
+                "name":"非法任务",
+                "prompt":"包含\u{0000}控制字符",
+                "instanceId":"codex:local",
+                "model":"gpt-6.1-sol",
+                "schedule":{"kind":"once","startAtMs":now + 60_000}
+            }),
+            None,
+            now,
+        )
+        .unwrap_err();
+        assert_eq!(error.message, "执行提示需为 1–128 KiB");
+    }
+
+    #[test]
+    fn cron_uses_saved_timezone_and_standard_day_or_weekday_matching() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 11, 18, 0, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis() as u64;
+        let expected_local = Shanghai
+            .with_ymd_and_hms(2026, 11, 18, 9, 0, 0)
+            .single()
+            .unwrap()
+            .with_timezone(&Utc)
+            .timestamp_millis() as u64;
+        assert_eq!(
+            next_cron_after("0 9 * * *", Some("Asia/Shanghai"), now),
+            Some(expected_local)
+        );
+
+        let expected_day_or_weekday = Utc
+            .with_ymd_and_hms(2026, 11, 20, 9, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis() as u64;
+        assert_eq!(
+            next_cron_after("0 9 20 * 1", Some("UTC"), now),
+            Some(expected_day_or_weekday)
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_run_claim_is_serialized_per_task() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = ScheduledTasks::new(directory.path()).unwrap();
+        let now = 1_800_000_000_000;
+        let task = task_from_payload(
+            &json!({
+                "name":"手动运行",
+                "prompt":"测试",
+                "instanceId":"codex:local",
+                "model":"gpt-6.1-sol",
+                "schedule":{"kind":"once","startAtMs":now + 60_000}
+            }),
+            None,
+            now,
+        )
+        .unwrap();
+        let inserted = service.insert(task).await.unwrap();
+        assert_eq!(
+            service
+                .begin_manual(&inserted.id, now + 1)
+                .await
+                .unwrap()
+                .status,
+            "running"
+        );
+        let error = service
+            .begin_manual(&inserted.id, now + 2)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, 409);
+    }
 }
