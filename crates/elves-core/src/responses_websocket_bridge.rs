@@ -502,7 +502,7 @@ async fn bridge_responses_websockets(
                         break;
                     };
                     let message = message.context("读取本地 Responses WebSocket 消息失败")?;
-                    let payload = match validate_downstream_message(&message, &relay) {
+                    let payload = match validate_downstream_message(&message, &relay, &request_context) {
                         Ok(payload) => payload,
                         Err(error) => {
                             if let Ok(state) = request_logger.state.lock() {
@@ -3429,6 +3429,7 @@ fn is_expected_websocket_close_error(error: &WebSocketError) -> bool {
 fn validate_downstream_message(
     message: &Message,
     relay: &crate::settings::RelayProfile,
+    request_context: &crate::request_headers::RequestContext,
 ) -> anyhow::Result<Option<(Value, crate::settings::BackendSettings, bool)>> {
     let Message::Text(text) = message else {
         return Ok(None);
@@ -3452,14 +3453,11 @@ fn validate_downstream_message(
     if current_relay.resolve_protocol_for_model(&model)? != RelayProtocol::Responses {
         return Err(ResponsesWebSocketProtocolMismatch.into());
     }
-    let rewritten_payload = crate::protocol_proxy::apply_codex_system_prompt_to_responses_request(
+    let rewritten_payload = crate::protocol_proxy::prepare_codex_responses_request(
         &payload,
         &current_relay,
         &crate::codex_home::codex_home_dir_for_settings(&settings),
-    );
-    let rewritten_payload = crate::protocol_proxy::rewrite_catalog_model_to_request_model(
-        &rewritten_payload,
-        &current_relay,
+        request_context,
     );
     let payload_rewritten = rewritten_payload != payload;
     let _ = crate::diagnostic_log::append_diagnostic_log(

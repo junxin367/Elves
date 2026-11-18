@@ -216,6 +216,12 @@ fn effective(values: &Value) -> Result<Value, ApiError> {
             put(&mut result, &path, value);
         }
     }
+    if result["conversationNaming"]["systemPrompt"]
+        == super::conversation_naming::PREVIOUS_DEFAULT_PROMPT
+    {
+        result["conversationNaming"]["systemPrompt"] =
+            json!(super::conversation_naming::DEFAULT_PROMPT);
+    }
     validate(&result)?;
     Ok(result)
 }

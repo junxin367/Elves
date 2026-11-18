@@ -1439,17 +1439,9 @@ impl Claude {
     pub async fn naming_context(&self, id: &str, initial: bool) -> anyhow::Result<Value> {
         anyhow::ensure!(!Self::is_subagent_id(id), "子智能体会话不参与自动命名");
         let c = self.conversation(id).await?;
-        let turns = if initial {
-            &c.turns[..c.turns.len().min(1)]
-        } else {
-            &c.turns[c.turns.len().saturating_sub(8)..]
-        };
-        let messages = super::conversation_naming::messages(turns);
-        let first = super::conversation_naming::messages(&c.turns[..c.turns.len().min(1)]);
+        let first = super::conversation_naming::first_user_message(&c.turns);
         let fallback = first
-            .iter()
-            .find(|message| message["role"] == "user")
-            .and_then(|message| message["text"].as_str())
+            .as_deref()
             .unwrap_or("")
             .split_whitespace()
             .collect::<Vec<_>>()
@@ -1458,8 +1450,11 @@ impl Claude {
             .take(30)
             .collect::<String>();
         Ok(json!({"title":c.title,"expectedName":c.title,
-            "eligible":c.native_title.is_empty() && (c.title.is_empty() || c.title == fallback),
-            "messages":messages}))
+        "eligible":c.native_title.is_empty() && (c.title.is_empty() || c.title == fallback),
+        "firstUserMessage":if initial { first } else { None },
+        "messages":if initial { Vec::new() } else {
+            super::conversation_naming::messages(&c.turns[c.turns.len().saturating_sub(8)..])
+        }}))
     }
 
     #[cfg(test)]

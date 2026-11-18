@@ -380,7 +380,7 @@ pub(crate) fn normalize_thread(thread: &Value) -> anyhow::Result<Value> {
     {
         bail!("Codex CLI service 只提供主会话元数据");
     }
-    normalize_thread_metadata(thread)
+    normalize_thread_metadata_with_preview(thread, true)
 }
 
 pub(crate) fn attached_parent_id(thread: &Value) -> Option<&str> {
@@ -473,6 +473,13 @@ fn thread_timestamp_ms(value: Option<&Value>) -> Value {
 }
 
 pub(crate) fn normalize_thread_metadata(thread: &Value) -> anyhow::Result<Value> {
+    normalize_thread_metadata_with_preview(thread, false)
+}
+
+fn normalize_thread_metadata_with_preview(
+    thread: &Value,
+    short_preview: bool,
+) -> anyhow::Result<Value> {
     let id = thread["id"]
         .as_str()
         .filter(|id| !id.trim().is_empty())
@@ -493,13 +500,22 @@ pub(crate) fn normalize_thread_metadata(thread: &Value) -> anyhow::Result<Value>
                 .and_then(Value::as_str)
                 .filter(|s| !s.trim().is_empty())
         })
+        .map(std::borrow::Cow::Borrowed)
         .or_else(|| {
             thread
                 .get("preview")
                 .and_then(Value::as_str)
                 .filter(|s| !s.trim().is_empty())
+                .map(|preview| {
+                    if short_preview {
+                        std::borrow::Cow::Owned(provisional_title(preview))
+                    } else {
+                        std::borrow::Cow::Borrowed(preview)
+                    }
+                })
+                .filter(|value| !value.is_empty())
         })
-        .unwrap_or("新会话");
+        .unwrap_or(std::borrow::Cow::Borrowed("新会话"));
     let status = thread.get("status").cloned().unwrap_or(Value::Null);
     let status_type = status.as_str().or_else(|| status["type"].as_str());
     let active = match status_type {
@@ -539,6 +555,34 @@ pub(crate) fn normalize_thread_metadata(thread: &Value) -> anyhow::Result<Value>
     }))
 }
 
+fn provisional_title(preview: &str) -> String {
+    use pulldown_cmark::{Event, Parser, TagEnd};
+
+    // 用户要求对齐 Codex App 的临时标题：正文转单行纯文本，60 字符含省略号。
+    // 只处理未命名的 Codex 主会话预览；正式标题、侧边会话和原消息内容不变。
+    const MAX_PREVIEW_CHARS: usize = 60;
+    let mut plain = String::new();
+    for event in Parser::new(preview) {
+        match event {
+            Event::Text(text) | Event::Code(text) => plain.push_str(&text),
+            Event::SoftBreak
+            | Event::HardBreak
+            | Event::End(
+                TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::Item | TagEnd::CodeBlock,
+            ) => plain.push(' '),
+            _ => {}
+        }
+    }
+    let one_line = plain.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = one_line.char_indices();
+    if let Some((end, _)) = chars.nth(MAX_PREVIEW_CHARS - 1)
+        && chars.next().is_some()
+    {
+        return format!("{}…", one_line[..end].trim_end());
+    }
+    one_line
+}
+
 fn truncate_error(value: &str) -> String {
     const MAX_ERROR_CHARS: usize = 1_000;
     value.chars().take(MAX_ERROR_CHARS).collect()
@@ -561,6 +605,27 @@ mod tests {
         assert_eq!(normalized["priority"]["active"], true);
         assert_eq!(normalized["hasUnreadTurn"], true);
         assert_eq!(normalized["readState"], raw["readState"]);
+        let mut long = raw.clone();
+        let text = format!(
+            "# **统计** [数字人功能](https://example.com/tasks/1)\n\n{}",
+            "字".repeat(70)
+        );
+        long["thread"]["preview"] = json!(text);
+        let short = normalize_thread_response(&long).unwrap();
+        let short = short["title"].as_str().unwrap();
+        assert!(short.starts_with("统计 数字人功能 "));
+        assert!(short.ends_with('…'));
+        assert_eq!(short.chars().count(), 60);
+        assert!(!short.contains("https"));
+        assert_eq!(
+            normalize_thread_metadata(&long["thread"]).unwrap()["title"],
+            long["thread"]["preview"]
+        );
+        long["thread"]["name"] = json!("已保存".repeat(30));
+        assert_eq!(
+            normalize_thread_response(&long).unwrap()["title"],
+            long["thread"]["name"]
+        );
         let mut unloaded = raw;
         unloaded["thread"]["status"]["type"] = json!("notLoaded");
         unloaded.as_object_mut().unwrap().remove("readState");

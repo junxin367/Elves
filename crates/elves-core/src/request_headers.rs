@@ -144,6 +144,23 @@ impl RequestContext {
             .map(ToString::to_string)
     }
 
+    pub(crate) fn is_conversation_naming(&self, request: &serde_json::Value) -> bool {
+        self.headers
+            .get("originator")
+            .and_then(|value| value.to_str().ok())
+            == Some(crate::protocol_proxy::CONVERSATION_NAMING_CLIENT)
+            && request
+                .pointer("/client_metadata/x-codex-turn-metadata")
+                .map(serde_json::Value::as_str)
+                .unwrap_or_else(|| {
+                    self.headers
+                        .get("x-codex-turn-metadata")
+                        .and_then(|value| value.to_str().ok())
+                })
+                .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+                .is_some_and(|metadata| metadata["thread_source"] == "thread_title")
+    }
+
     pub(crate) fn is_primary_agent_request(&self, request: &serde_json::Value) -> bool {
         // 每个请求的元数据优先于连接头，WebSocket 连接头可能属于更早的请求。
         let metadata =

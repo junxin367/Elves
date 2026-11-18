@@ -92,13 +92,13 @@ async fn codex_with_service(
     authorization: &HarnessAuthorization,
 ) -> anyhow::Result<String> {
     let outcome = tokio::time::timeout(TIMEOUT, async {
-        rpc(&mut service, 1, "initialize", json!({"clientInfo":{"name":"elves-naming",
+        rpc(&mut service, 1, "initialize", json!({"clientInfo":{"name":crate::protocol_proxy::CONVERSATION_NAMING_CLIENT,
             "version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}), authorization, None).await?;
         write(&service, json!({"method":"initialized","params":{}}), authorization).await?;
         let saved = rpc(&mut service, 2, "config/read", json!({"includeLayers":false}), authorization, None).await?;
         let disabled_mcp = saved["config"]["mcp_servers"].as_object().into_iter().flatten()
             .map(|(name,_)| (name.clone(),json!({"enabled":false}))).collect::<serde_json::Map<_,_>>();
-        // 参考 App 的临时元数据请求隔离配置：不加载项目指令、记忆、Hooks、MCP 或可执行工具，不污染原会话。
+        // 用户要求只生成元数据；禁用原生可配置工具，代理开启时另行移除原生仍声明的内置工具。
         let mut config = json!({"project_doc_max_bytes":0,"include_environment_context":false,
             "include_permissions_instructions":false,"include_apps_instructions":false,
             "mcp_servers":disabled_mcp,"apps":{"_default":{"enabled":false}},
@@ -107,22 +107,30 @@ async fn codex_with_service(
             "features.hooks":false,"features.apps":false,"features.plugins":false,
             "features.shell_tool":false,"features.unified_exec":false,"features.apply_patch_freeform":false,
             "features.js_repl":false,"features.code_mode":false,"features.multi_agent":false,
-            "features.multi_agent_v2":false,"features.memories":false,"features.image_generation":false});
+            "features.multi_agent_v2":false,"features.memories":false,"features.image_generation":false,
+            "features.goals":false,"features.view_image":false,"features.sleep_tool":false,
+            "features.default_mode_request_user_input":false,"features.tool_suggest":false});
         if let Some(effort) = effort { config["model_reasoning_effort"] = json!(effort); }
         let thread = rpc(&mut service, 3, "thread/start", json!({
             "model":settings.model,"ephemeral":true,"threadSource":"thread_title",
-            "baseInstructions":settings.system_prompt,"developerInstructions":"","config":config,
+            "baseInstructions":format!("{}{}",crate::protocol_proxy::CONVERSATION_NAMING_INSTRUCTIONS_PREFIX,
+                settings.system_prompt),"developerInstructions":"",
+            "dynamicTools":[],"config":config,
             "approvalPolicy":"never","sandbox":"read-only","cwd":std::env::temp_dir()
         }), authorization, None).await?;
         let id = thread["thread"]["id"].as_str().context("命名引擎未返回临时会话 ID")?.to_owned();
         let mut early = std::collections::VecDeque::new();
         let started = rpc(&mut service, 4, "turn/start", json!({
             "threadId":id,"model":settings.model,"effort":effort,"outputSchema":schema(),
-            "input":[{"type":"text","text":input.to_string(),"text_elements":[]}]
+            "input":[{"type":"text","text":format!("{}{}",crate::protocol_proxy::CONVERSATION_NAMING_INPUT_PREFIX,input),
+                "text_elements":[]}]
         }), authorization, Some(&mut early)).await?;
         let mut text = String::new();
         if let Some(items) = started["turn"]["items"].as_array() {
-            for item in items { if item["type"] == "agentMessage" { text = item["text"].as_str().unwrap_or("").into(); } }
+            for item in items {
+                ensure_naming_item(item)?;
+                if item["type"] == "agentMessage" { text = item["text"].as_str().unwrap_or("").into(); }
+            }
         }
         loop {
             // 原生完成事件可先于 turn/start 回执；必须按接收顺序处理，不能漏掉已完成的标题结果。
@@ -131,8 +139,15 @@ async fn codex_with_service(
                 bail!("命名模型请求了交互或工具，已停止本次命名");
             }
             if frame["params"]["threadId"] != id { continue; }
-            if frame["method"] == "item/completed" && frame["params"]["item"]["type"] == "agentMessage" {
-                text = frame["params"]["item"]["text"].as_str().unwrap_or("").into();
+            if matches!(frame["method"].as_str(), Some("item/started" | "item/completed")) {
+                let item = &frame["params"]["item"];
+                ensure_naming_item(item)?;
+                if frame["method"] == "item/completed" && item["type"] == "agentMessage" {
+                    text = item["text"].as_str().unwrap_or("").into();
+                }
+            }
+            if frame["method"] == "turn/plan/updated" {
+                bail!("命名模型试图执行原任务，已停止本次命名");
             }
             if frame["method"] == "turn/completed" {
                 anyhow::ensure!(frame["params"]["turn"]["status"] == "completed", "命名模型未成功完成");
@@ -144,6 +159,18 @@ async fn codex_with_service(
     let _ = service.child.start_kill();
     let _ = tokio::time::timeout(Duration::from_secs(2), service.child.wait()).await;
     outcome
+}
+
+fn ensure_naming_item(item: &Value) -> anyhow::Result<()> {
+    // 直连或上游未遵守工具限制时，不接收包含工具或其他操作的命名结果。
+    anyhow::ensure!(
+        matches!(
+            item["type"].as_str(),
+            Some("userMessage" | "agentMessage" | "reasoning")
+        ),
+        "命名模型返回了工具或非文本操作，已停止本次命名"
+    );
+    Ok(())
 }
 
 pub(super) async fn claude(

@@ -16,6 +16,10 @@ use crate::request_headers::{RequestContext, ResponsesRequestOperation, Upstream
 use crate::settings::SettingsStore;
 
 pub const DEFAULT_PROTOCOL_PROXY_PORT: u16 = 45221;
+pub const CONVERSATION_NAMING_CLIENT: &str = "elves-naming";
+pub const CONVERSATION_NAMING_INSTRUCTIONS_PREFIX: &str =
+    "Conversation naming instructions (metadata only):\n";
+pub const CONVERSATION_NAMING_INPUT_PREFIX: &str = "Conversation naming input (JSON):\n";
 
 /// 只读同一原生会话最新的缓存证据，不因统计轮询刷新时长。
 pub fn session_cache_expiry(
@@ -480,7 +484,66 @@ pub fn local_models_proxy_response() -> anyhow::Result<Option<ProxyHttpResponse>
     }))
 }
 
-pub(crate) fn apply_codex_system_prompt_to_responses_request(
+pub(crate) fn prepare_codex_responses_request(
+    request: &Value,
+    relay: &crate::settings::RelayProfile,
+    codex_home: &std::path::Path,
+    context: &RequestContext,
+) -> Value {
+    if !context.is_conversation_naming(request) {
+        let request = apply_codex_system_prompt_to_responses_request(request, relay, codex_home);
+        return rewrite_catalog_model_to_request_model(&request, relay);
+    }
+
+    // 用户要求命名独立于普通编码：HTTP 和 WS 只保留专用指令，不套供应商提示词，也不发送任何工具定义。
+    // 仅识别 Elves 独立命名客户端的原生 thread_title；不改变 Codex App 及普通会话的代理行为。
+    let mut request = request.clone();
+    if let Some(object) = request.as_object_mut() {
+        if let Some(model) = object.get("model").and_then(Value::as_str) {
+            let model = relay.request_model_for_catalog_model(model);
+            object.insert("model".into(), json!(model));
+        }
+        for field in ["tools", "tool_choice", "parallel_tool_calls"] {
+            object.remove(field);
+        }
+        let mut native_prompt = object
+            .get("instructions")
+            .and_then(Value::as_str)
+            .and_then(|text| text.strip_prefix(CONVERSATION_NAMING_INSTRUCTIONS_PREFIX))
+            .map(str::to_owned);
+        if let Some(items) = object.get_mut("input").and_then(Value::as_array_mut) {
+            items.retain(|item| item["type"] != "additional_tools");
+            for item in items.iter() {
+                if native_prompt.is_none()
+                    && matches!(item["role"].as_str(), Some("system" | "developer"))
+                    && let Some(text) = codex_base_prompt_text(&item["content"])
+                    && let Some(prompt) = text.strip_prefix(CONVERSATION_NAMING_INSTRUCTIONS_PREFIX)
+                {
+                    // 新旧原生运行时的 baseInstructions 消息 ID 不同，识别专用前缀而非猜测 ID。
+                    native_prompt = Some(prompt.to_owned());
+                }
+            }
+            if native_prompt.is_some()
+                && let Some(task) = items.iter().rfind(|item| {
+                    item["role"] == "user"
+                        && codex_base_prompt_text(&item["content"])
+                            .is_some_and(|text| text.starts_with(CONVERSATION_NAMING_INPUT_PREFIX))
+                })
+            {
+                // 原生仍会附入用户级 AGENTS.md 等内容；只传 Harness 标记的命名输入。
+                let task = task.clone();
+                items.clear();
+                items.push(task);
+            }
+        }
+        if let Some(prompt) = native_prompt {
+            object.insert("instructions".into(), json!(prompt));
+        }
+    }
+    request
+}
+
+fn apply_codex_system_prompt_to_responses_request(
     request: &Value,
     relay: &crate::settings::RelayProfile,
     codex_home: &std::path::Path,
@@ -561,6 +624,20 @@ fn codex_base_prompt_id(message: &Value) -> bool {
         .and_then(|id| id.strip_prefix("msg_"))
         .and_then(|id| uuid::Uuid::parse_str(id.strip_suffix(".msg").unwrap_or(id)).ok())
         .is_some_and(|id| id.get_version_num() == 5)
+}
+
+fn codex_base_prompt_text(content: &Value) -> Option<String> {
+    if let Some(text) = content.as_str().filter(|text| !text.is_empty()) {
+        return Some(text.to_owned());
+    }
+    let mut text = String::new();
+    for part in content.as_array()? {
+        text.push_str(part.as_str().or_else(|| match part["type"].as_str() {
+            Some("input_text" | "text") => part["text"].as_str(),
+            _ => None,
+        })?);
+    }
+    (!text.is_empty()).then_some(text)
 }
 
 pub(crate) fn apply_system_prompt_override_to_responses_request(
@@ -2941,12 +3018,12 @@ async fn execute_validated_compaction(
     }
 
     let options = CompactionOptions::from_settings(&settings);
-    let source = apply_codex_system_prompt_to_responses_request(
+    let source = prepare_codex_responses_request(
         original,
         &relay,
         &crate::codex_home::codex_home_dir_for_settings(&settings),
+        request_context,
     );
-    let source = rewrite_catalog_model_to_request_model(&source, &relay);
     let source_model = source["model"]
         .as_str()
         .unwrap_or_default()
@@ -3540,13 +3617,12 @@ async fn open_responses_proxy_request_once(
     let mut audit = crate::proxy_log::ProxyRequestAudit::default();
     'relay_attempts: for (attempt, relay) in relays.into_iter().enumerate() {
         validate_upstream(&relay)?;
-        let source_request_json = apply_codex_system_prompt_to_responses_request(
+        let source_request_json = prepare_codex_responses_request(
             &original_request_json,
             &relay,
             &crate::codex_home::codex_home_dir_for_settings(&settings),
+            request_context,
         );
-        let source_request_json =
-            rewrite_catalog_model_to_request_model(&source_request_json, &relay);
         // 按会话模型和协议确定本地压缩或原生 V2 路径。
         let source_response_protocol =
             responses_proxy_target_protocol(&relay, &source_request_json)?;
@@ -14522,6 +14598,63 @@ mod system_prompt_override_tests {
                 home.path()
             ),
             request
+        );
+    }
+
+    #[test]
+    fn isolated_conversation_naming_keeps_native_prompt_without_tools() {
+        let home = tempfile::tempdir().unwrap();
+        // 原生 HTTP/WS 请求的 baseInstructions 都可能在 input；普通会话算法会删掉这个开发者消息。
+        let mut request = json!({
+            "model": "gpt-test",
+            "prompt_cache_key": "01a14406-e520-7391-89a4-a7e998f862c4",
+            "input": [
+                {"type":"additional_tools","role":"developer","tools":[{"name":"update_plan"}]},
+                {"id":"msg_00000000-0000-5000-8000-000000000002","type":"message","role":"developer",
+                 "content":[{"type":"input_text","text":format!("{}只生成原任务的短标题", super::CONVERSATION_NAMING_INSTRUCTIONS_PREFIX)}]},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"用户级 AGENTS.md"}]},
+                {"type":"message","role":"user","content":[{"type":"input_text",
+                    "text":format!("{}{{\"firstUserMessage\":\"统计功能改动\"}}", super::CONVERSATION_NAMING_INPUT_PREFIX)}]}
+            ],
+            "tools": [{"type":"function","name":"view_image"}], "tool_choice":"auto",
+            "parallel_tool_calls":true,"text":{"format":{"type":"json_schema"}}
+        });
+        let metadata = json!({"thread_source":"thread_title"}).to_string();
+        let context = |originator: &str| {
+            crate::request_headers::RequestContext::from_http_request(format!(
+                "POST /v1/responses HTTP/1.1\r\noriginator: {originator}\r\nx-codex-turn-metadata: {metadata}\r\n\r\n"
+            ).as_bytes())
+        };
+        let prepare = |request: &serde_json::Value, context| {
+            super::prepare_codex_responses_request(request, &relay(), home.path(), &context)
+        };
+        let untouched = prepare(&request, context("codex_app"));
+        assert_eq!(untouched["instructions"], "custom prompt");
+        assert_eq!(untouched["tools"], request["tools"]);
+
+        let isolated = prepare(&request, context(super::CONVERSATION_NAMING_CLIENT));
+        assert_eq!(isolated["instructions"], "只生成原任务的短标题");
+        assert_eq!(isolated["input"], json!([request["input"][3]]));
+        for key in ["tools", "tool_choice", "parallel_tool_calls"] {
+            assert!(isolated.get(key).is_none());
+        }
+        assert_eq!(isolated["text"], request["text"]);
+
+        // 复用连接时，以本条请求元数据为准，不拿旧连接头隔离一条普通会话。
+        request["client_metadata"] = json!({"x-codex-turn-metadata":r#"{"thread_source":"user"}"#});
+        assert_eq!(
+            prepare(&request, context(super::CONVERSATION_NAMING_CLIENT))["instructions"],
+            "custom prompt"
+        );
+        request["client_metadata"]["x-codex-turn-metadata"] = json!(metadata);
+        request["input"] = isolated["input"].clone();
+        request["instructions"] = json!(format!(
+            "{}You are GPT-6. Only write this title.",
+            super::CONVERSATION_NAMING_INSTRUCTIONS_PREFIX
+        ));
+        assert_eq!(
+            prepare(&request, context(super::CONVERSATION_NAMING_CLIENT))["instructions"],
+            "You are GPT-6. Only write this title."
         );
     }
 

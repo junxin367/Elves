@@ -18,7 +18,8 @@ impl CodexHarness {
                 if !initial { turns.reverse(); }
                 let name = raw["thread"]["name"].as_str().unwrap_or("");
                 Ok(json!({"title":thread["title"],"expectedName":name,"eligible":name.trim().is_empty(),
-                    "messages":super::super::conversation_naming::messages(&turns)}))
+                    "firstUserMessage":if initial { super::super::conversation_naming::first_user_message(&turns) } else { None },
+                    "messages":if initial { Vec::new() } else { super::super::conversation_naming::messages(&turns) }}))
             }).await
     }
 }

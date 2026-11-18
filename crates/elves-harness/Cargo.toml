@@ -25,6 +25,7 @@ fs2.workspace = true
 if-addrs.workspace = true
 image.workspace = true
 pdf-extract = "0.12"
+pulldown-cmark = { version = "0.13", default-features = false }
 reqwest.workspace = true
 ring = "0.17"
 roxmltree = "0.21"
