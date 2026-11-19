@@ -60,6 +60,8 @@ import { sessionMenu } from "../shell-state.js";
 import { threadDeleted } from "../sidebar/deletion-state.js";
 import { applyThreadDeletion } from "../sidebar/thread-deletion.js";
 
+const reconnectMessagePattern = /^Reconnecting(?:\.{3}|…)?\s+\d+\s*\/\s*\d+$/iu;
+
 function receiveClaudeHistory(params) {
   const id = params.threadId;
   // 临时正文不改变其他会话的标题、未读或队列；只让正式快照触发侧栏读取，避免流式片段反复刷新列表。
@@ -194,7 +196,7 @@ export function receive(event) {
         : typeof error.turnId === "string" ? error.turnId : "";
     const willRetry = params.willRetry === true || params.will_retry === true
       || error.willRetry === true || error.will_retry === true
-      || /^Reconnecting(?:\.{3}|…)?\s+\d+\s*\/\s*\d+$/iu.test(message);
+      || reconnectMessagePattern.test(message);
     if (!threadId || !turnId || !message) return null;
     const statusCandidates = [
       error.statusCode, error.status_code, error.httpStatusCode,
@@ -207,9 +209,6 @@ export function receive(event) {
     const details = typeof error.additionalDetails === "string" ? error.additionalDetails.trim()
       : typeof params.additionalDetails === "string" ? params.additionalDetails.trim()
         : typeof error.detail === "string" ? error.detail.trim() : "";
-    const identity = `${turnId}|${message}|${details}`;
-    let hash = 0;
-    for (const character of identity) hash = (hash * 31 + character.codePointAt(0)) >>> 0;
     const turnError = {
       ...(typeof error === "object" ? error : {}),
       message,
@@ -221,7 +220,8 @@ export function receive(event) {
       terminal: !willRetry,
       turnError,
       item: willRetry ? {
-        id: `native-retry-${hash.toString(36)}`,
+        // 用户要求同一轮重连只显示一个状态条；次数变化是原位更新，不能按文案生成多条消息。
+        id: `native-retry-${turnId}`,
         type: "error",
         message,
         status: "inProgress",
@@ -476,6 +476,9 @@ export function receive(event) {
               && previous.completedAtMs > item.completedAtMs)
             item = mergeItemProjection(item, previous);
           if (index < 0) turn.items.push(item); else turn.items[index] = item;
+          // 兼容升级前已经按文案生成的旧重连条目，收到新状态时合并回同一轮次。
+          if (item.type === "error" && typeof item.id === "string" && item.id.startsWith("native-retry-"))
+            turn.items = normalizeDisplayedTurnItems(turn.items);
           itemVersions.set(`${turnId}:${item.id}`, version); partialItems.delete(`${turnId}:${item.id}`);
         }
       }

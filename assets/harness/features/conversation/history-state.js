@@ -166,10 +166,24 @@ export function normalizeDisplayedUserMessage(item) {
     content
   };
 }
+const reconnectMessagePattern = /^Reconnecting(?:\.{3}|…)?\s+\d+\s*\/\s*\d+$/iu;
+function reconnectTurnId(item) {
+  return item?.type === "error" && typeof item.message === "string"
+    && typeof item.turnId === "string" && item.turnId
+    && reconnectMessagePattern.test(item.message.trim()) ? item.turnId : null;
+}
 export function normalizeDisplayedTurnItems(items) {
-  const byId = new Map();
+  const byId = new Map(), reconnectIds = new Map();
   for (const source of items) {
-    const item = normalizeDisplayedUserMessage(source);
+    let item = normalizeDisplayedUserMessage(source);
+    const reconnectId = reconnectTurnId(item);
+    if (reconnectId) {
+      // 用户要求重连次数在同一条状态里更新；兼容旧缓存中按每次文案生成的多个哈希条目。
+      const stableId = `native-retry-${reconnectId}`, previousId = reconnectIds.get(reconnectId);
+      if (previousId && previousId !== stableId) byId.delete(previousId);
+      reconnectIds.set(reconnectId, stableId);
+      if (item.id !== stableId) item = { ...item, id: stableId };
+    }
     // 原生正文和 steered 确认共用消息 ID；分页、实时轮次与重进缓存必须一致保留一份正文。
     if (byId.get(item.id)?.type === "userMessage" && item.type === "steered") continue;
     byId.set(item.id, item);

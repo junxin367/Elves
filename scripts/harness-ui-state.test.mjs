@@ -14518,6 +14518,14 @@ test("Codex turn/completed 通过真实事件入口纠正引导位置", () => {
   } });
   assert.equal(context.turns.get("turn-3").status, "failed", "终态429错误必须结束当前轮次");
   assert.equal(context.turns.get("turn-3").error.statusCode, 429, "终态错误保留状态码");
+  for (const attempt of [1, 2, 3]) context.receive({ method: "error", params: {
+    threadId: "main", turnId: "turn-reconnect", willRetry: true,
+    error: { message: `Reconnecting... ${attempt}/5` }
+  } });
+  const retryTurn = context.turns.get("turn-reconnect");
+  assert.equal(retryTurn.items.length, 1, "同一轮重连次数不能生成多个正文条目");
+  assert.equal(retryTurn.items[0].id, "native-retry-turn-reconnect");
+  assert.equal(retryTurn.items[0].message, "Reconnecting... 3/5", "重连条目应原位更新到最新次数");
 });
 
 test("侧边 turn/completed 与主会话共用可见跟随未读规则", () => {
