@@ -16958,6 +16958,8 @@ test("编辑区加号保持正常前景色和交互背景，提示词优化始�
   const css = await readFile(new URL("../assets/harness/style.css", import.meta.url), "utf8");
   assert.match(css, /\.composer-add-button\{[^}]*color:var\(--text\)/);
   assert.match(css, /\.prompt-optimize-button\{[^}]*color:var\(--text\)/);
+  assert.match(css, /\.slash-command-option \.slash-command-icon\{[^}]*color:var\(--text\)/,
+    "未选中的 / 命令图标应使用正文前景色");
   assert.ok(css.includes(".composer-toolbar .composer-add-button:is(:focus-visible,:active,[aria-expanded=true]){background:var(--composer-hover,var(--hover))}"));
   assert.ok(css.includes(".composer-toolbar .composer-add-button:hover:not(:disabled){background:var(--composer-hover,var(--hover))}"));
   assert.match(css, /\.composer-add-button:active:not\(:disabled\)\{opacity:1\}/);
