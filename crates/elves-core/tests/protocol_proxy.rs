@@ -9890,11 +9890,13 @@ fn upstream_chat_error_is_regularized_as_responses_error_envelope() {
     assert_eq!(json_error["error"]["type"], "invalid_request_error");
     assert_eq!(json_error["error"]["code"], "bad_model");
     assert_eq!(json_error["error"]["param"], "model");
+    assert_eq!(json_error["error"]["statusCode"], 400);
 
     let text_error = responses_error_from_upstream(502, "text/html", b"<html>bad gateway</html>");
     assert_eq!(text_error["error"]["message"], "<html>bad gateway</html>");
     assert_eq!(text_error["error"]["type"], "upstream_error");
     assert_eq!(text_error["error"]["code"], "502");
+    assert_eq!(text_error["error"]["statusCode"], 502);
 }
 
 #[test]

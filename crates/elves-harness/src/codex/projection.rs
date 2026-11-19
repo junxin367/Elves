@@ -1048,8 +1048,7 @@ fn turn_outcome_kind(turn: &Value) -> &'static str {
         return "completed";
     }
     let error = turn["error"].to_string().to_ascii_lowercase();
-    if turn["error"]["statusCode"].as_u64() == Some(429)
-        || turn["error"]["code"].as_u64() == Some(429)
+    if error_status_code(&turn["error"]) == Some(429)
         || error.contains("rate limit")
         || error.contains("ratelimit")
         || error.contains("too many requests")
@@ -1061,6 +1060,26 @@ fn turn_outcome_kind(turn: &Value) -> &'static str {
     }
 }
 
+fn error_status_code(error: &Value) -> Option<u16> {
+    [
+        "/statusCode",
+        "/status_code",
+        "/httpStatusCode",
+        "/http_status_code",
+        "/code",
+        "/error/statusCode",
+        "/error/status_code",
+        "/codex_error_info/response_too_many_failed_attempts/http_status_code",
+    ]
+    .iter()
+    .filter_map(|pointer| error.pointer(pointer))
+    .find_map(|value| {
+        value
+            .as_u64()
+            .and_then(|value| u16::try_from(value).ok())
+            .or_else(|| value.as_str()?.trim().parse::<u16>().ok())
+    })
+}
 #[cfg(test)]
 #[test]
 fn recent_priority_uses_native_activity_without_replaying_completed_rounds() {
@@ -1414,6 +1433,17 @@ mod tests {
         assert_eq!(failed["hasUnreadTurn"], true);
         assert_eq!(failed["priority"]["attentionState"], "error");
         assert_eq!(failed["priority"]["error"], true);
+
+        projection.ingest(json!({"method":"turn/completed","params":{
+            "threadId":"main","turn":{"id":"turn-c","status":"failed",
+                "error":{"code":"429","codex_error_info":{
+                    "response_too_many_failed_attempts":{"http_status_code":429}
+                }}}
+        }}));
+        assert_eq!(
+            projection.thread("main", json!({"id":"main"}))["lastTurnOutcome"]["kind"],
+            "rateLimit"
+        );
     }
 
     #[test]

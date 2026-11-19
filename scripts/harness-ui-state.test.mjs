@@ -14493,6 +14493,12 @@ test("Codex turn/completed 通过真实事件入口纠正引导位置", () => {
     threadId: "main", turn: { id: "turn-2", status: "completed", items: [] }
   } });
   assert.equal(outcomes[1][2].unread, true, "阅读旧历史时新回复保留未读");
+  context.receive({ method: "error", params: {
+    threadId: "main", turnId: "turn-3", willRetry: false,
+    error: { statusCode: 429, message: "upstream rate limit" }
+  } });
+  assert.equal(context.turns.get("turn-3").status, "failed", "终态429错误必须结束当前轮次");
+  assert.equal(context.turns.get("turn-3").error.statusCode, 429, "终态错误保留状态码");
 });
 
 test("Claude 恢复后单独压缩的状态行始终位于已经完成的回复之后", () => {

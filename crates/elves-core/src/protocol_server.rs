@@ -1003,11 +1003,24 @@ async fn handle_protocol_proxy_connection_inner(
             let retry_after = (status_code == 429)
                 .then(|| crate::protocol_proxy::rate_limit_retry_after_seconds(&upstream_body))
                 .flatten();
+            let body = if status_code == 429 {
+                let mut error = crate::protocol_proxy::responses_error_from_upstream(
+                    status_code,
+                    &content_type,
+                    &upstream_body,
+                );
+                if let Some(seconds) = retry_after {
+                    error["error"]["retryAfterSeconds"] = serde_json::json!(seconds);
+                }
+                serde_json::to_vec(&error)?
+            } else {
+                upstream_body
+            };
             write_http_response_with_retry_after(
                 stream,
                 &status,
                 &content_type,
-                &upstream_body,
+                &body,
                 retry_after,
             )
             .await?;
@@ -1033,8 +1046,8 @@ async fn handle_protocol_proxy_connection_inner(
                 status_code,
                 false,
                 request_body,
-                &upstream_body,
-                upstream_body.len(),
+                &body,
+                body.len(),
                 false,
                 Some(format!("上游返回 HTTP {status_code}")),
             );

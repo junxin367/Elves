@@ -192,28 +192,47 @@ export function receive(event) {
     const turnId = typeof params.turnId === "string" ? params.turnId
       : typeof params.turn?.id === "string" ? params.turn.id
         : typeof error.turnId === "string" ? error.turnId : "";
-    // 原生重试提示属于当前轮次的过程记录；只投影明确会继续重试的错误，
-    // 最终 429 终态由 turn.error 渲染，避免同一错误在正文重复两次。
     const willRetry = params.willRetry === true || params.will_retry === true
+      || error.willRetry === true || error.will_retry === true
       || /^Reconnecting(?:\.{3}|…)?\s+\d+\s*\/\s*\d+$/iu.test(message);
-    if (!threadId || !turnId || !message || !willRetry) return null;
+    if (!threadId || !turnId || !message) return null;
+    const statusCandidates = [
+      error.statusCode, error.status_code, error.httpStatusCode,
+      typeof error.code === "number" || typeof error.code === "string" ? error.code : null,
+      error.codex_error_info?.response_too_many_failed_attempts?.http_status_code,
+      error.error?.statusCode, error.error?.status_code
+    ];
+    const statusCode = statusCandidates.map(value => Number(value))
+      .find(value => Number.isInteger(value) && value >= 100 && value <= 599) || null;
     const details = typeof error.additionalDetails === "string" ? error.additionalDetails.trim()
       : typeof params.additionalDetails === "string" ? params.additionalDetails.trim()
         : typeof error.detail === "string" ? error.detail.trim() : "";
     const identity = `${turnId}|${message}|${details}`;
     let hash = 0;
     for (const character of identity) hash = (hash * 31 + character.codePointAt(0)) >>> 0;
-    return {
-      id: `native-retry-${hash.toString(36)}`,
-      type: "error",
+    const turnError = {
+      ...(typeof error === "object" ? error : {}),
       message,
-      status: "inProgress",
-      ...(details ? { additionalDetails: details } : {}),
+      ...(statusCode ? { statusCode } : {})
+    };
+    return {
       threadId,
-      turnId
+      turnId,
+      terminal: !willRetry,
+      turnError,
+      item: willRetry ? {
+        id: `native-retry-${hash.toString(36)}`,
+        type: "error",
+        message,
+        status: "inProgress",
+        ...(details ? { additionalDetails: details } : {}),
+        threadId,
+        turnId,
+        ...(statusCode ? { statusCode } : {})
+      } : null
     };
   })();
-  if (nativeError) params.item = nativeError;
+  if (nativeError?.item) params.item = nativeError.item;
   const displayItem = normalizeDisplayedUserMessage(params.item);
   const displayTurnItems = Array.isArray(params.turn?.items)
     ? normalizeDisplayedTurnItems(params.turn.items) : null;
@@ -250,6 +269,21 @@ export function receive(event) {
   }
   if (typeof eventThreadId === "string" && threadDeleted(eventThreadId)) return;
   let sidebarChanged = false;
+  if (nativeError?.terminal && typeof eventThreadId === "string") {
+    const failedTurn = {
+      id: nativeError.turnId,
+      status: "failed",
+      error: nativeError.turnError
+    };
+    sidebarChanged = (typeof applySidebarThreadOutcome === "function"
+      && applySidebarThreadOutcome(eventThreadId, failedTurn, { unread: true })) || sidebarChanged;
+    if (eventThreadId === selectedId && thread) {
+      thread.lastTurnOutcome = normalizeTurnOutcome(failedTurn);
+      if (typeof renderOutcomeMarker === "function") renderOutcomeMarker(thread);
+      if (typeof rememberThreadDisplay === "function")
+        rememberThreadDisplay({ id: eventThreadId, lastTurnOutcome: thread.lastTurnOutcome });
+    }
+  }
   if (event.method === "thread/name/updated" && typeof eventThreadId === "string"
       && typeof params.name === "string") {
     sidebarChanged = applySidebarThreadTitle(eventThreadId, params.name) || sidebarChanged;
@@ -485,6 +519,15 @@ export function receive(event) {
         } else if (event.method === "item/fileChange/patchUpdated") item.changes = params.changes;
         else item.text = (item.text || "") + params.delta;
         turn.items[index] = item; itemVersions.set(`${turnId}:${item.id}`, version);
+      }
+      if (nativeError?.terminal && nativeError.turnId === turnId) {
+        turn.status = "failed";
+        turn.error = nativeError.turnError;
+        turn.turnCompletedAtMs = Date.now();
+        turnVersions.set(turnId, version);
+        setNotifiedStatus({ type: "idle" }); setStatusVersion(statusVersion + 1);
+        if (thread) thread.status = notifiedStatus;
+        updateComposer();
       }
       turns.set(turnId, enrichTurnTranscriptEvents(turn));
       scheduleMessages();

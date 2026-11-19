@@ -8085,6 +8085,7 @@ pub fn responses_error_from_upstream(status_code: u16, content_type: &str, body:
     let mut error = json!({
         "message": message,
         "type": error_type.unwrap_or_else(|| "upstream_error".to_string()),
+        "statusCode": status_code,
     });
     if let Some(code) = code {
         error["code"] = json!(code);
