@@ -15953,15 +15953,26 @@ test("自定义普通主按钮按实际页面、卡片和弹窗背景派生白�
   assert.equal(colors["button-bg"], "#11803a"); assert.equal(colors["button-text"], "#ffffff");
   assert.equal(colors["button-side-text"], "#ffffff", "审批卡片按自身深色表面取色");
   assert.equal(colors["appearance-card-bg"], "#2d2d2d");
-  assert.equal(colors["button-card-bg"], "#12883e"); assert.equal(colors["button-card-text"], "#ffffff");
-  assert.equal(colors["button-composer-bg"], "#16a34a");
-  assert.equal(colors["button-composer-text"], "#000000", "更亮的输入框表面不能借用页脚的白字方案");
-  assert.equal(colors["button-control-bg"], "#16a34a", "8 位颜色不能满足两项下限时保留原色");
+  assert.equal(colors["button-card-bg"], "#11803a"); assert.equal(colors["button-card-text"], "#ffffff");
+  assert.equal(colors["button-composer-bg"], "#11803a");
+  assert.equal(colors["button-composer-text"], "#ffffff", "深色输入框表面优先保证白字可读");
+  assert.equal(colors["button-control-bg"], "#11803a", "深色控件表面优先保证白字可读");
   assert.deepEqual(palette, saved);
   const light = context.appearanceThemeColors("light", { ...palette, background: "#ffffff", foreground: "#3b3b3b", contrast: 45 });
   assert.equal(light["button-bg"], "#16a34a"); assert.equal(light["button-text"], "#000000");
   const inverseMode = context.appearanceThemeColors("light", palette);
   assert.equal(inverseMode["button-bg"], "#11803a", "实际背景而非深浅模式决定白字方案");
+  const screenshotPalette = context.appearanceThemeColors("dark", {
+    background: "#2c2a2a", foreground: "#cccccc", accent: "#0078d4", button: "#16a34a", contrast: 60
+  });
+  assert.equal(screenshotPalette["button-card-text"], "#ffffff",
+    "较亮的深色自定义背景仍优先保证设置卡片按钮白字");
+  assert.ok(context.appearanceContrastRatio(screenshotPalette["button-card-bg"], screenshotPalette["button-card-text"]) >= 4.5);
+  assert.ok(context.appearanceContrastRatio(
+    screenshotPalette["button-card-outline"] === "transparent"
+      ? screenshotPalette["button-card-bg"] : screenshotPalette["button-card-outline"],
+    screenshotPalette["appearance-card-bg"]) >= 3,
+  "面板边界不足时使用独立描边");
   const withoutButton = context.appearanceThemeColors("dark", { ...palette, button: undefined });
   for (const key of ["primary-bg", "primary-text", "primary-hover", "primary-active", "accent-solid", "danger", "user-message-bg"])
     assert.equal(colors[key], withoutButton[key], `独立按钮配色不得影响 ${key}`);

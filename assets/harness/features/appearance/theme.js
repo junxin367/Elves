@@ -391,14 +391,18 @@ function appearanceButtonColors(color, surface, preferredText, dark, contrast) {
   const white = "#ffffff", black = "#000000";
   const textMinimum = 4.5, edgeMinimum = 3, textGoal = 5;
   let bg = color, text = appearanceReadableForeground(color, preferredText);
-  // 用户要求参考实际面板而不是深浅模式标签。白字亮于按钮、按钮亮于面板时，
-  // 两段 WCAG 对比度相乘等于白字对面板的对比度；5:1 是期望值，4.5:1 和 3:1 分别是文字和边界下限。
+  // 用户要求参考实际面板而不是深浅模式标签。浅色沿用 Codex 的白字/面板联动上限；
+  // 深色优先保证按钮文字 4.5:1，面板边界不足时由独立描边补足，避免较亮的深色自定义背景把绿色按钮错误回退为黑字。
   // 最多向黑色混入 25%，足以覆盖 Elver 示例，又不会为了白字把用户选的亮色大幅压暗；不改写原始 HEX。
-  const target = Math.min(textGoal, appearanceContrastRatio(white, surface) / edgeMinimum,
-    appearanceContrastRatio(white, mixColor(color, black, .25)));
+  const target = dark
+    ? Math.min(textGoal, appearanceContrastRatio(white, mixColor(color, black, .25)))
+    : Math.min(textGoal, appearanceContrastRatio(white, surface) / edgeMinimum,
+      appearanceContrastRatio(white, mixColor(color, black, .25)));
   if (target >= textMinimum) {
-    const matchesSurface = fill => appearanceLuminance(fill) > appearanceLuminance(surface)
-      && appearanceContrastRatio(fill, surface) >= edgeMinimum;
+    const matchesSurface = fill => dark
+      ? appearanceContrastRatio(fill, white) >= textMinimum
+      : appearanceLuminance(fill) > appearanceLuminance(surface)
+        && appearanceContrastRatio(fill, surface) >= edgeMinimum;
     let fill = appearanceAccessibleColor(color, white, target);
     // 动态目标恰好贴边时，8 位 RGB 取整可能越过边界。允许重试文字下限，不得向下取整放宽任何下限。
     if (!matchesSurface(fill)) fill = appearanceAccessibleColor(color, white, textMinimum);
