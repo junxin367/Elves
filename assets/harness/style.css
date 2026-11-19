@@ -1488,6 +1488,9 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 html[data-workspace-side-panel=true] .workspace{grid-template-columns:minmax(0,1fr)}
 html[data-workspace-side-panel=true] .workspace>.sidebar,html[data-workspace-side-panel=true] .sidebar-backdrop,html[data-workspace-side-panel=true] :is(#open-sidebar,#related-session-back){display:none!important}
 html[data-workspace-side-panel=true] .workspace>.conversation{animation:none}
+/* 用户要求 PC 侧边 iframe 不显示重复的左侧主导航；初始化期间不能等待 related-session-view，避免短暂闪出 52px 导航。 */
+html[data-workspace-side-panel=true] .remote-shell{--main-nav-width:0px;grid-template-columns:minmax(0,1fr)}
+html[data-workspace-side-panel=true] .remote-shell>.main-navigation{display:none!important}
 /* 仅 PC 侧边 iframe 穿透到父页面同一背景；手机关联整页仍保留原有不透明过渡底色。 */
 html[data-workspace-side-panel=true],html[data-workspace-side-panel=true] body,html[data-workspace-side-panel=true] .workspace.related-session-view>.conversation{background:transparent}
 html[data-workspace-side-panel=true] .conversation-header{display:none}
