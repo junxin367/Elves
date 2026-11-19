@@ -34,7 +34,7 @@ import {
   projectVisibleThreadCounts, recentLimit, search,
   setClientUnreadBadgeRequest, setClientUnreadBadgeTimer, setRecentLimit, setSidebarFilterDeviceId, setSidebarRequest,
   setSidebarVersion, sidebarAttentionState, sidebarFilterDeviceId, sidebarReadRefreshSuppressions,
-  sidebarRecentDateGroups, sidebarRequest, sidebarThreadActive, sidebarTimestamp, sidebarUpdatedAt, sidebarVersion
+  sidebarRecentDateGroups, sidebarRequest, sidebarTimestamp, sidebarUpdatedAt, sidebarVersion
 } from "./list-state.js";
 import { checkThreadDeletion, deleteSidebarThread, threadDeletionConflict } from "./thread-deletion.js";
 
@@ -337,7 +337,6 @@ export function renderSidebar() {
     } else title.replaceChildren(element("span", "thread-label", item.title));
     if (selectedId === item.id) title.setAttribute("aria-current", "page");
     const attention = attentionFor(item);
-    const active = attention !== "waiting" && sidebarThreadActive(item);
     // 用户要求 Codex 与 Claude 列表均显示对应品牌，置顶不再用通用聊天图标；
     // 最近列表仅在标题行放图标，与项目/置顶列表共用 1em 尺寸、3px 间距和文字居中对齐规则。
     const backend = item.backend === "claude" || claudeThreadId(item.id) ? "claude" : "codex";
@@ -346,7 +345,8 @@ export function renderSidebar() {
     mark.title = backend === "claude" ? "Claude" : "Codex";
     titleLine.prepend(mark);
     container.append(title);
-    if (active || ["unread", "waiting", "error"].includes(attention)) {
+    if (attention !== "idle") {
+      const active = attention === "active";
       const state = attention === "error" ? icon("warning")
         : element("span", `thread-state${active ? " active" : " unread"}`);
       state.classList.add("thread-state", attention);

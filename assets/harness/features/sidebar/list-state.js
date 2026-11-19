@@ -75,15 +75,36 @@ export function applySidebarThreadOutcome(id, turn, { unread = false } = {}) {
   return updateSidebarThread(id, item => {
     const next = normalizeTurnOutcome(turn);
     const previous = item.lastTurnOutcome;
+    const previousPriority = item.priority;
+    const previousUnread = item.hasUnreadTurn === true;
+    const previousStatus = item.status;
     item.lastTurnOutcome = next;
     item.status = turn?.status || item.status;
-    const unreadChanged = unread && ["completed", "failed"].includes(next.status) && item.hasUnreadTurn !== true;
-    if (unreadChanged) item.hasUnreadTurn = true;
-    return unreadChanged || JSON.stringify(previous) !== JSON.stringify(next);
+    // 用户要求完成事件先结束执行态，再按阅读位置决定未读态；展示层只能得到一个互斥状态，
+    // 避免旧的 priority.active 与本次完成产生的蓝点同时落到同一个会话节点。
+    const nextUnread = unread && ["completed", "failed", "interrupted"].includes(next.status)
+      ? true : item.hasUnreadTurn === true;
+    item.hasUnreadTurn = nextUnread;
+    const failed = next.status === "failed" || ["failed", "rateLimit"].includes(next.kind);
+    item.priority = {
+      ...(item.priority || {}),
+      status: item.status,
+      active: false,
+      attentionState: failed ? "error" : nextUnread ? "unread" : "idle"
+    };
+    return previousUnread !== nextUnread
+      || JSON.stringify(previousStatus) !== JSON.stringify(item.status)
+      || previousPriority?.active !== item.priority.active
+      || previousPriority?.attentionState !== item.priority.attentionState
+      || JSON.stringify(previous) !== JSON.stringify(next);
   });
 }
 export function applySidebarThreadStarted(id, turn) {
   return updateSidebarThread(id, item => {
+    const turnId = typeof turn?.id === "string" ? turn.id : null;
+    // Codex App 的终态投影不能被迟到的同一轮 turn/started 复活；原生事件重放时保留完成结果。
+    if (turnId && item.lastTurnOutcome?.turnId === turnId
+        && ["completed", "failed", "interrupted"].includes(item.lastTurnOutcome.status)) return false;
     const previous = item.lastTurnOutcome;
     const status = turn?.status || { type: "active" };
     const changed = previous != null || item.priority?.active !== true
@@ -103,14 +124,15 @@ export function applySidebarThreadReadState(id, readState) {
   if (!readState || typeof readState !== "object" || !Object.hasOwn(readState, "firstUnread")) return false;
   const unread = readState.firstUnread !== null;
   return updateSidebarThread(id, item => {
+    const previousPriority = item.priority;
     const changed = item.hasUnreadTurn !== unread || JSON.stringify(item.readState) !== JSON.stringify(readState);
     item.readState = readState;
     item.hasUnreadTurn = unread;
-    if (!unread && item.priority?.attentionState === "unread")
-      item.priority = { ...item.priority, attentionState: "idle" };
-    else if (unread && item.priority?.attentionState === "idle")
-      item.priority = { ...item.priority, attentionState: "unread" };
-    return changed;
+    if (item.priority && ["idle", "unread"].includes(item.priority.attentionState)) {
+      item.priority = { ...item.priority,
+        attentionState: item.priority.active === true ? "active" : unread ? "unread" : "idle" };
+    }
+    return changed || JSON.stringify(previousPriority) !== JSON.stringify(item.priority);
   });
 }
 export function applySidebarThreadTitle(id, title) {
@@ -143,7 +165,7 @@ export function clientUnreadThreadCount(value) {
     const attention = sidebarAttentionState(item);
     // 明确的 hasUnreadTurn=false 是已读抑制，不能被尚未同步的旧 priority 未读标记重新计入。
     const hasUnread = typeof item.hasUnreadTurn === "boolean" ? item.hasUnreadTurn : attention === "unread";
-    if (hasUnread && ["unread", "error"].includes(attention) && !sidebarThreadActive(item)) unread.add(item.id);
+    if (hasUnread && ["unread", "error"].includes(attention)) unread.add(item.id);
   }
   return unread.size;
 }
@@ -217,8 +239,12 @@ export function sidebarAttentionState(item) {
   const type = typeof status === "string" ? status : status?.type;
   if (requests || side?.waiting || own === "waiting" || !own && (type === "waiting" || (status?.activeFlags || []).some(flag =>
     flag === "waitingOnApproval" || flag === "waitingOnUserInput"))) return "waiting";
+  // 用户要求参考 Codex App 的侧栏投影：等待、运行、异常、未读、空闲按优先级互斥展示；
+  // 执行态优先于旧阅读快照，直到完成事件清除 active 后才允许显示蓝色未读点。
+  if (side?.active || own === "active" || item.priority?.active === true
+      || !own && (type === "active" || type === "inProgress")) return "active";
   if (item.lastTurnOutcome?.status === "failed"
       || ["failed", "rateLimit"].includes(item.lastTurnOutcome?.kind)) return "error";
   if (side?.unread || own === "unread" || item.hasUnreadTurn) return "unread";
-  return side?.active || own === "active" || !own && (type === "active" || type === "inProgress") ? "active" : "idle";
+  return "idle";
 }

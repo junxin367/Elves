@@ -8824,6 +8824,47 @@ test("当前主会话收到问答立即显示未读提醒，处理完成后恢�
   assert.deepEqual(h.selected, []);
 });
 
+test("完成会话的侧栏状态互斥，不同时显示执行圈和未读蓝点", () => {
+  const h = recentSidebarHarness();
+  h.unread.priority = { attentionState: "unread", active: true };
+  h.unread.hasUnreadTurn = true;
+  h.context.renderSidebar();
+  const row = h.root.querySelectorAll(".thread-row").find(node => node.dataset.threadId === h.unread.id);
+  const state = row.querySelector(".thread-state");
+  assert.equal(state.classList.contains("active"), true, "执行态优先于旧未读快照");
+  assert.equal(state.classList.contains("unread"), false, "同一节点不得叠加 active 和 unread");
+  assert.equal(state.title, "正在运行");
+});
+
+test("完成事件先清除旧运行态，迟到的同轮 started 不得复活会话", () => {
+  const item = { id: "thread", status: { type: "active" }, hasUnreadTurn: false,
+    priority: { active: true, attentionState: "active" } };
+  const context = nodeVm.createContext({
+    sidebar: { recent: [item], pinnedThreads: [], projects: [] }
+  });
+  nodeVm.runInContext([
+    sourceSection("function forEachSidebarThread(", "function normalizeTurnOutcome("),
+    sourceSection("function normalizeTurnOutcome(", "function applySidebarThreadOutcome("),
+    sourceSection("function applySidebarThreadOutcome(", "function applySidebarThreadStarted("),
+    sourceSection("function applySidebarThreadStarted(", "function applySidebarThreadReadState("),
+    sourceSection("function applySidebarThreadReadState(", "function applySidebarThreadTitle("),
+    sourceSection("function sidebarAttentionState(")
+  ].join("\n"), context);
+  assert.equal(context.applySidebarThreadOutcome("thread",
+    { id: "turn", status: "completed" }, { unread: true }), true);
+  assert.equal(item.priority.active, false);
+  assert.equal(item.priority.attentionState, "unread");
+  assert.equal(context.sidebarAttentionState(item), "unread");
+  assert.equal(context.applySidebarThreadStarted("thread",
+    { id: "turn", status: { type: "active" } }), false);
+  assert.equal(item.priority.active, false);
+  assert.equal(item.lastTurnOutcome.status, "completed");
+  assert.equal(context.applySidebarThreadReadState("thread",
+    { firstUnread: null, revision: "read" }), true);
+  assert.equal(item.hasUnreadTurn, false);
+  assert.equal(context.sidebarAttentionState(item), "idle");
+});
+
 test("最近会话更名优先事项，双滑杆固定为最后一个操作，清除已读位于其左侧", async () => {
   const h = recentSidebarHarness();
   assert.equal(h.sections()[0].label, "优先事项");

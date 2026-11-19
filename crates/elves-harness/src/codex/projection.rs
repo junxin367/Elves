@@ -788,9 +788,13 @@ impl Projection {
                     if observation.0 != turn_id {
                         *observation = (turn_id.to_owned(), None);
                     }
+                    let already_completed =
+                        self.completed.contains(&format!("{id}:{turn_id}"));
                     self.started(&id, turn_id);
-                    self.threads.entry(id.clone()).or_insert_with(|| json!({}))
-                        ["lastTurnOutcome"] = Value::Null;
+                    if !already_completed {
+                        self.threads.entry(id.clone()).or_insert_with(|| json!({}))
+                            ["lastTurnOutcome"] = Value::Null;
+                    }
                 }
             }
             "turn/completed" => {
@@ -815,6 +819,15 @@ impl Projection {
                 // 清除它，其他端则直接从同一投影得到未读，避免等到点击会话才补出蓝点。
                 self.threads.entry(id.clone()).or_insert_with(|| json!({}))
                     ["hasUnreadTurn"] = json!(true);
+                if self
+                    .active
+                    .get(&id)
+                    .is_some_and(|turn| frame["params"]["turn"]["id"] == *turn)
+                {
+                    // 用户要求完成事件的服务端投影原子地结束运行态，再通知优先事项刷新；
+                    // 这样同一份侧栏快照不会在 active 和 unread 之间产生短暂叠加。
+                    self.active.remove(&id);
+                }
                 if let Some(turn_id) = frame["params"]["turn"]["id"].as_str() {
                     let key = format!("{id}:{turn_id}");
                     if self.completed.contains(&key) {
@@ -838,13 +851,6 @@ impl Projection {
                         "recoveryCheck":frame["_queueRecoveryCheck"] == true
                     }),
                 );
-                if self
-                    .active
-                    .get(&id)
-                    .is_some_and(|turn| frame["params"]["turn"]["id"] == *turn)
-                {
-                    self.active.remove(&id);
-                }
                 if self
                     .compactions
                     .get(&id)
@@ -1460,10 +1466,16 @@ mod tests {
             "params":{"threadId":"thread-a","turn":{"id":"turn-a","status":"completed"}}}));
         projection.started("thread-a", "turn-a");
         assert!(projection.active.is_empty());
+        assert_eq!(
+            projection.thread("thread-a", json!({}))["lastTurnOutcome"]["status"],
+            "completed"
+        );
+        projection.active.insert("thread-a".to_owned(), "turn-a".to_owned());
         let sequence = projection.sequence;
         projection.ingest(json!({"method":"turn/completed","_generation":"new",
             "params":{"threadId":"thread-a","turn":{"id":"turn-a","status":"completed"}}}));
         assert_eq!(projection.sequence, sequence);
+        assert!(projection.active.is_empty());
     }
 
     #[test]
