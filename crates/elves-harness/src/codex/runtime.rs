@@ -419,6 +419,14 @@ impl Runtime {
         connection.alive.load(Ordering::Acquire) && connection.pending.lock().await.is_empty()
     }
 
+    pub async fn has_live_connection(&self) -> bool {
+        self.connection
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|connection| connection.alive.load(Ordering::Acquire))
+    }
+
     pub async fn check_health(&self) -> anyhow::Result<()> {
         let connection = self.connection().await?;
         let mut health = self.health.lock().await;

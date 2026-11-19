@@ -2684,6 +2684,10 @@ async fn prepare_controller_shutdown() -> Value {
         .enabled
         .swap(false, Ordering::AcqRel);
     if !controller.harness.idle().await {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "harness.shutdown_blocked",
+            json!({"reason":"codex_active_or_unknown"}),
+        );
         controller
             .harness
             .enabled
@@ -2696,6 +2700,10 @@ async fn prepare_controller_shutdown() -> Value {
             "cleanup":{"complete":false,"pendingStartupCheck":false}
         });
     }
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "harness.shutdown_confirmed",
+        json!({"reason":"safe_idle"}),
+    );
 
     controller.stop_desktop().await;
     controller.publish_access_policy(&RemoteAccessSettings::default());

@@ -24,7 +24,7 @@ mod sides;
 mod store;
 mod subagents;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -359,7 +359,21 @@ impl CodexHarness {
             .values()
             .all(|deletion| deletion.state == "deleted");
         drop(store);
+        let live_connection = self.runtime.has_live_connection().await;
+        if !live_connection && codex_child_running() {
+            // 原生连接已断开但当前 Harness 仍持有 Codex 子进程时，执行状态未知，不能关闭后台。
+            return false;
+        }
         let projection = self.projection.lock().await;
+        if !live_connection
+            && (!projection.threads.is_empty()
+                || !projection.active.is_empty()
+                || !projection.requests.is_empty()
+                || !projection.compactions.is_empty())
+        {
+            // 已有会话但原生连接已断开时，状态未知，不能让安装流程强制结束后台。
+            return false;
+        }
         let threads_safe = projection.threads.values().all(|thread| {
             let status = thread["status"]
                 .as_str()
@@ -369,15 +383,80 @@ impl CodexHarness {
                 Some("active" | "inProgress" | "running" | "waiting" | "unknown")
             ) && thread["requests"].as_array().is_none_or(Vec::is_empty)
         });
+        let projection_safe = projection.active.is_empty()
+            && projection.requests.is_empty()
+            && projection.compactions.is_empty()
+            && threads_safe
+            && projection.sides.threads.values().all(|side| side.closed);
+        drop(projection);
         queues_empty
             && edits_empty
             && queue_gates_empty
             && deletions_confirmed
-            && projection.active.is_empty()
-            && projection.requests.is_empty()
-            && projection.compactions.is_empty()
-            && threads_safe
-            && projection.sides.threads.values().all(|side| side.closed)
+            && projection_safe
+            && (!live_connection || self.native_threads_idle().await)
+    }
+
+    async fn native_threads_idle(&self) -> bool {
+        for (method, base_params) in [
+            ("thread/list", json!({"limit":100,"archived":false})),
+            ("thread/loaded/list", json!({"limit":100})),
+        ] {
+            let mut params = base_params;
+            let mut cursors = HashSet::new();
+            loop {
+                let page = match self.runtime.request(method, params.clone(), None).await {
+                    Ok(page) => page,
+                    Err(_) => return false,
+                };
+                let Some(rows) = page["data"].as_array() else {
+                    return false;
+                };
+                for row in rows {
+                    if row["status"].is_object()
+                        || row["status"].is_string()
+                        || row["nativeStatus"].is_object()
+                        || row["nativeStatus"].is_string()
+                    {
+                        if native_thread_is_busy(row) {
+                            return false;
+                        }
+                        continue;
+                    }
+                    let Some(id) = row
+                        .as_str()
+                        .or_else(|| row["id"].as_str())
+                        .filter(|id| !id.is_empty())
+                    else {
+                        return false;
+                    };
+                    let thread = match self
+                        .runtime
+                        .request(
+                            "thread/read",
+                            json!({"threadId":id,"includeTurns":false}),
+                            None,
+                        )
+                        .await
+                    {
+                        Ok(thread) => thread,
+                        Err(_) => return false,
+                    };
+                    if native_thread_is_busy(&thread["thread"]) {
+                        return false;
+                    }
+                }
+                let Some(cursor) = page["nextCursor"].as_str().filter(|cursor| !cursor.is_empty())
+                else {
+                    break;
+                };
+                if !cursors.insert(cursor.to_owned()) {
+                    return false;
+                }
+                params["cursor"] = json!(cursor);
+            }
+        }
+        true
     }
 
     pub async fn release(&self) {
@@ -877,6 +956,51 @@ impl CodexHarness {
     }
 }
 
+fn native_thread_is_busy(thread: &Value) -> bool {
+    let status = thread
+        .get("status")
+        .or_else(|| thread.get("nativeStatus"))
+        .and_then(|status| status.as_str().or_else(|| status["type"].as_str()));
+    if !matches!(
+        status,
+        Some("idle" | "notLoaded" | "completed" | "failed" | "interrupted" | "stopped")
+    ) {
+        return true;
+    }
+    thread["requests"]
+        .as_array()
+        .is_some_and(|requests| !requests.is_empty())
+}
+
+fn codex_child_running() -> bool {
+    #[cfg(windows)]
+    {
+        let current_process_id = std::process::id();
+        let processes = elves_core::windows_integration::enumerate_processes();
+        let mut parents = HashSet::from([current_process_id]);
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for process in &processes {
+                if !parents.contains(&process.parent_process_id) {
+                    continue;
+                }
+                if process.exe_file.eq_ignore_ascii_case("codex.exe") {
+                    return true;
+                }
+                if parents.insert(process.process_id) {
+                    changed = true;
+                }
+            }
+        }
+        false
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 fn error(code: u16, message: &str) -> anyhow::Error {
     ApiError::new(code, message).into()
 }
@@ -896,6 +1020,16 @@ fn sent_key(id: &str, payload: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_thread_idle_check_fails_closed_for_missing_or_active_state() {
+        assert!(!native_thread_is_busy(&json!({"status":{"type":"idle"}})));
+        assert!(!native_thread_is_busy(&json!({"status":{"type":"notLoaded"}})));
+        assert!(native_thread_is_busy(&json!({"status":{"type":"active"}})));
+        assert!(native_thread_is_busy(&json!({"status":{"type":"waiting"}})));
+        assert!(native_thread_is_busy(&json!({"status":{"type":"idle"},"requests":[{"id":1}]})));
+        assert!(native_thread_is_busy(&json!({})));
+    }
 
     #[tokio::test]
     #[ignore = "只读验证已安装引擎，需显式指定会话和轮次"]

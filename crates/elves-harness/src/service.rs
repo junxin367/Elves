@@ -52,6 +52,30 @@ fn shutdown_response_is_safe(value: &Value) -> bool {
     )
 }
 
+fn client_process_running() -> bool {
+    #[cfg(windows)]
+    {
+        let current_process_id = std::process::id();
+        return elves_core::windows_integration::enumerate_processes()
+            .into_iter()
+            .any(|process| {
+                process.process_id != current_process_id
+                    && matches!(
+                        process.exe_file.to_ascii_lowercase().as_str(),
+                        "elves.exe"
+                            | "codex-elves.exe"
+                            | "codex-elves-manager.exe"
+                            | "codex-elves-task-board.exe"
+                            | "codex-elves-remote.exe"
+                    )
+            });
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Endpoint {
@@ -311,9 +335,17 @@ pub async fn prepare_shutdown(reason: &str) -> anyhow::Result<Value> {
     let directory = crate::paths::default_app_state_dir();
     super::claude::remember_shutdown(&directory, reason)?;
     let Some(endpoint) = load_endpoint_any(&directory)? else {
+        if client_process_running() {
+            // 端点缺失但仍有客户端进程时，状态无法确认；禁止安装器继续强制结束进程。
+            anyhow::bail!("Elves 后台端点不可用且仍有客户端进程运行，请先退出 Elves 后重试");
+        }
         return Ok(json!({"status":"not_running","cleanup":"pending_startup_check"}));
     };
     if !endpoint_is_active(&endpoint).await? {
+        if client_process_running() {
+            // 端点失效但仍有客户端进程时，不能把未知状态当作“未运行”。
+            anyhow::bail!("Elves 后台端点已失效且仍有客户端进程运行，请先退出 Elves 后重试");
+        }
         return Ok(json!({"status":"not_running","cleanup":"pending_startup_check"}));
     }
     if endpoint.protocol_version < 9 {
