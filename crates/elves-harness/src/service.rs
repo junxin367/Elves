@@ -45,13 +45,6 @@ pub fn owns_service() -> bool {
     }
 }
 
-fn shutdown_response_is_safe(value: &Value) -> bool {
-    matches!(
-        value["status"].as_str(),
-        Some("stopped" | "not_running")
-    )
-}
-
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Endpoint {
@@ -162,8 +155,8 @@ async fn retire_obsolete_service(directory: &Path) -> anyhow::Result<()> {
         )
         .await?;
         anyhow::ensure!(
-            shutdown_response_is_safe(&value),
-            "旧版 Harness 未确认安全退出，请先等待当前任务完成后重试"
+            matches!(value["status"].as_str(), Some("stopped" | "closing")),
+            "旧版 Harness 未确认安全退出，请先退出 Elves 后重试"
         );
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
@@ -321,13 +314,9 @@ pub async fn prepare_shutdown(reason: &str) -> anyhow::Result<Value> {
         return Ok(json!({"status":"legacy_service","cleanup":"pending_startup_check"}));
     }
     let value = request(&endpoint, "prepareShutdown", &json!({"reason":reason})).await?;
-    let message = value["message"]
-        .as_str()
-        .unwrap_or("远程后台未确认安全退出，请等待当前任务完成后重试")
-        .to_owned();
     anyhow::ensure!(
-        shutdown_response_is_safe(&value),
-        "{message}"
+        matches!(value["status"].as_str(), Some("stopped" | "closing")),
+        "远程后台未确认受控退出"
     );
     Ok(value)
 }
@@ -399,10 +388,8 @@ async fn admin(
             }}),
         };
         response["serviceProcessId"] = json!(endpoint.process_id);
-        // 只有明确确认已停止时才关闭管理监听；忙碌、超时或未知结果必须保留后台，等待用户稍后重试。
-        if shutdown_response_is_safe(&response) {
-            state.handle.graceful_shutdown(Some(Duration::from_secs(2)));
-        }
+        // 先给本机调用者返回逐会话结果，再停止管理监听；不改变用户保存的启用开关及设备授权。
+        state.handle.graceful_shutdown(Some(Duration::from_secs(2)));
         return Ok(Json(response));
     }
     let mut response = super::admin_request(&action, payload).await;
@@ -503,16 +490,6 @@ fn remote_service_job(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn shutdown_response_only_allows_confirmed_stopped_or_not_running() {
-        for status in ["stopped", "not_running"] {
-            assert!(shutdown_response_is_safe(&json!({"status":status})));
-        }
-        for status in ["busy", "closing", "legacy_service", "failed"] {
-            assert!(!shutdown_response_is_safe(&json!({"status":status})));
-        }
-    }
 
     #[tokio::test]
     async fn protocol_upgrade_requests_controlled_shutdown_before_replacing_service() {

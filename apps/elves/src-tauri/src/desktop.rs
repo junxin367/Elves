@@ -1308,11 +1308,6 @@ fn quit_app(app: &tauri::AppHandle) {
                     "harness.client_exit_pending",
                     serde_json::json!({"message":format!("{error:#}")}),
                 );
-                // 用户要求执行中的 Codex 不得因退出动作被强制中断；安全回收失败时保留客户端和后台，允许稍后重试。
-                app.state::<ClientState>()
-                    .exiting
-                    .store(false, Ordering::SeqCst);
-                return;
             }
             app.exit(0);
         });

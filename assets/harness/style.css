@@ -545,7 +545,14 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .sidebar-search-toggle[aria-pressed=true]{color:#3076df}
 .sidebar-action{display:flex;flex-shrink:0;margin-bottom:0}
 .sidebar-action>.new-chat{width:100%;margin-bottom:0}
-.sidebar-action>.search{height:40px}
+.sidebar-search-control{position:relative;display:flex;width:100%;min-width:0;height:40px}
+.sidebar-search-control>.search{width:100%;height:40px;padding-right:40px}
+/* 会话搜索使用自有清除按钮，避免 Chromium 原生搜索 × 只在焦点状态显示。 */
+.sidebar-search-control>.search::-webkit-search-cancel-button{appearance:none;-webkit-appearance:none}
+.sidebar-search-control>.search::-ms-clear{display:none}
+.sidebar-search-clear{position:absolute;top:50%;right:4px;width:28px;height:28px;transform:translateY(-50%);color:var(--muted);border-radius:var(--radius-control)}
+.sidebar-search-clear:hover{background:var(--hover);color:var(--text)}
+.sidebar-search-clear .ui-icon{width:16px;height:16px}
 .new-chat{min-height:40px;padding:8px}
 .select-trigger{display:inline-flex;align-items:center;justify-content:space-between;gap:8px;min-height:32px;border-radius:var(--radius-control);text-align:left}
 .select-trigger[aria-expanded=true]{background:var(--hover);color:var(--text)}

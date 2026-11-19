@@ -113,7 +113,7 @@ export function shell() {
     <div class="sidebar-backdrop"></div>
     <aside id="session-sidebar" class="sidebar" aria-label="会话侧边栏">
       <div class="sidebar-header"><strong class="sidebar-brand"><img src="/icons/elves-logo.svg" alt="" aria-hidden="true"><span>Elves</span></strong><div class="sidebar-header-actions"><button id="sidebar-type-filter" class="icon-button sidebar-type-filter" type="button" title="筛选会话实例" aria-label="筛选会话实例" aria-haspopup="menu"></button><button id="sidebar-view-toggle" class="icon-button sidebar-view-toggle" type="button" aria-label="切换会话视图" disabled></button><button id="sidebar-search-toggle" class="icon-button sidebar-search-toggle" type="button" title="搜索会话与项目" aria-label="搜索会话与项目" aria-controls="sidebar-search" aria-expanded="false" aria-pressed="false"></button></div></div>
-      <div class="sidebar-action"><button id="new-chat" class="new-chat" type="button">＋ 新建会话</button><input id="sidebar-search" class="search" type="search" placeholder="搜索会话与项目" aria-label="搜索会话与项目" autocomplete="off" hidden></div>
+      <div class="sidebar-action"><button id="new-chat" class="new-chat" type="button">＋ 新建会话</button><div id="sidebar-search-control" class="sidebar-search-control" hidden><input id="sidebar-search" class="search" type="search" placeholder="搜索会话与项目" aria-label="搜索会话与项目" autocomplete="off"><button id="sidebar-search-clear" class="icon-button sidebar-search-clear" type="button" aria-label="清除搜索" title="清除搜索" hidden></button></div></div>
       <div id="sidebar-content" class="sidebar-content"></div>
     </aside>
     <main class="conversation">
@@ -364,7 +364,11 @@ export function shell() {
         || !press?.released || (event.pointerId != null && event.pointerId !== press.pointerId)) return;
     closeSidebar();
   };
-  const searchInput = $("#sidebar-search"), searchToggle = $("#sidebar-search-toggle");
+  const searchInput = $("#sidebar-search"), searchControl = $("#sidebar-search-control");
+  const searchClear = $("#sidebar-search-clear"), searchToggle = $("#sidebar-search-toggle");
+  searchClear.append(icon("close"));
+  // 用户要求会话搜索有内容时始终显示右侧清除按钮，不能依赖浏览器只在输入框聚焦时显示原生 ×。
+  const updateSidebarSearchClear = () => { searchClear.hidden = searchInput.value.length === 0; };
   const typeFilter = $("#sidebar-type-filter");
   typeFilter.popupClassName = "sidebar-type-popup";
   typeFilter.onclick = () => {
@@ -377,18 +381,24 @@ export function shell() {
   };
   const setSidebarSearchOpen = open => {
     closePopup();
-    searchInput.hidden = !open;
+    searchControl.hidden = !open;
     $("#new-chat").hidden = open;
     searchToggle.setAttribute("aria-expanded", String(open));
     searchToggle.setAttribute("aria-pressed", String(open));
-    if (open) searchInput.focus({ preventScroll: true });
+    if (open) { updateSidebarSearchClear(); searchInput.focus({ preventScroll: true }); }
     else {
-      searchInput.value = ""; setSearch(""); renderSidebar();
+      searchInput.value = ""; updateSidebarSearchClear(); setSearch(""); renderSidebar();
       searchToggle.focus({ preventScroll: true });
     }
   };
-  searchToggle.onclick = () => setSidebarSearchOpen(searchInput.hidden);
-  searchInput.oninput = event => { setSearch(event.target.value.trim().toLowerCase()); renderSidebar(); };
+  searchToggle.onclick = () => setSidebarSearchOpen(searchControl.hidden);
+  searchInput.oninput = event => {
+    updateSidebarSearchClear(); setSearch(event.target.value.trim().toLowerCase()); renderSidebar();
+  };
+  searchClear.onclick = () => {
+    searchInput.value = ""; updateSidebarSearchClear(); setSearch(""); renderSidebar();
+    searchInput.focus({ preventScroll: true });
+  };
   searchInput.onkeydown = event => {
     if (event.key !== "Escape" || event.isComposing) return;
     event.preventDefault(); event.stopPropagation(); setSidebarSearchOpen(false);

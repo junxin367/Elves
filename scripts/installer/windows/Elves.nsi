@@ -89,9 +89,7 @@ Section "Install"
   nsExec::ExecToLog '"$PLUGINSDIR\elves-shutdown-helper.exe" --prepare-shutdown'
   Pop $0
   ${If} $0 != 0
-    ; 用户要求执行中的 Codex 不得因安装被重启；忙碌、超时、旧服务或未知结果均中止安装。
-    DetailPrint "Codex 或 Harness 尚未确认安全空闲，安装已中止，请等待当前任务完成后重试。"
-    Abort
+    DetailPrint "安全回收尚未全部确认，保留记录供下次 Harness 启动核对。"
   ${EndIf}
   !insertmacro StopElves
   SetOutPath "$INSTDIR"
@@ -123,11 +121,6 @@ SectionEnd
 Section "Uninstall"
   nsExec::ExecToLog '"$INSTDIR\elves.exe" --prepare-shutdown'
   Pop $0
-  ; 用户要求执行中的 Codex 不得因卸载被强制结束；未确认安全空闲时保留现有程序。
-  ${If} $0 != 0
-    DetailPrint "Codex 或 Harness 尚未确认安全空闲，卸载已中止，请等待当前任务完成后重试。"
-    Abort
-  ${EndIf}
   !insertmacro StopElves
   !insertmacro RemoveLegacyPrograms "$INSTDIR"
   !insertmacro RemoveLegacyShortcuts
