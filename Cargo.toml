@@ -43,7 +43,13 @@ uuid = { version = "1", features = ["v4"] }
 winresource = "0.1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
-# 用户要求缩短日常编译等待：只降低自身 crate 的优化等级，正式安装包仍使用 release 完整优化。
+# 正式安装包仍保持 opt-level=3；开启增量并行代码生成，缩短本机和持续集成中的重复 release 编译。
+# codegen-units 从 Cargo 默认值提高到 64，会略微减少跨单元优化机会，但不改变 release 的优化级别。
+[profile.release]
+incremental = true
+codegen-units = 64
+
+# 用户要求缩短日常编译等待：release-fast 进一步降低自身 crate 的优化等级，正式安装包仍使用 release。
 # 不使用 package."*"，否则会覆盖 build-override 并让第三方构建脚本与过程宏也按高优化重新编译。
 [profile.release-fast]
 inherits = "release"
