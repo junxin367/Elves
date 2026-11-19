@@ -336,8 +336,14 @@ async function loadPopupSubmenu(popup, submenu) {
     renderPopupSubmenu(popup, submenu, choices);
   } catch (error) {
     if (activePopup !== popup || popup.submenu !== submenu || controller.signal.aborted) return;
+    // 文件已不存在时直接显示简短状态，不再把“重新加载打开方式”与删除提示叠加在同一行。
+    const message = error?.message || "";
+    if (/文件不存在或已(?:被)?删除/u.test(message)) {
+      renderPopupSubmenu(popup, submenu, [{ label: "文件不存在或已删除", disabled: true }]);
+      return;
+    }
     renderPopupSubmenu(popup, submenu, [{ label: "重新加载打开方式",
-      description: error.message || "读取失败，请重试", keepOpen: true,
+      description: message || "读取失败，请重试", keepOpen: true,
       action: () => loadPopupSubmenu(popup, submenu) }]);
   } finally {
     if (submenu.controller === controller) submenu.node.removeAttribute("aria-busy");

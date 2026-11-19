@@ -1024,7 +1024,9 @@ pub(crate) fn popup_app_menu(
             && !state.exiting.load(Ordering::Acquire)
             && !state.adding_folder.load(Ordering::Acquire)
             && state.home.lock().unwrap().is_some();
-        let add = MenuItem::with_id(app, "file_add_folder", "添加文件夹", ready, None::<&str>)?;
+        // 用户要求文件菜单使用“打开文件夹”作为入口名称；内部命令仍沿用既有 ID，
+        // 以保持原生目录选择、项目登记和后续会话跳转行为不变。
+        let add = MenuItem::with_id(app, "file_add_folder", "打开文件夹", ready, None::<&str>)?;
         Menu::with_items(app, &[&add])?
     } else {
         let devtools =

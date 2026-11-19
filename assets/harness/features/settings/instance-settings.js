@@ -123,19 +123,19 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     row.append(fieldCopy("显示此实例", "所有客户端共用此开关，不会停止正在执行的任务。"), display);
     head.append(row);
   }
-  const detect = button("重新检测实例", "重新检测会话实例", () => void show(true), "text-button");
   const content = element("div", "instance-settings-content");
   const status = element("p", "appearance-hint instance-settings-status");
   status.setAttribute("role", "status"); status.setAttribute("aria-live", "polite");
   const reload = button("重新读取", "重新读取当前实例设置", () => void refresh(true), "text-button");
   const actions = element("div", "appearance-action-buttons instance-settings-actions");
   actions.append(reload);
-  page.append(head, detect, content, status, actions);
+  // 用户要求设置页移除“重新检测实例”按钮；实例目录仍由进入设置及服务状态变化自动检测，当前配置保留“重新读取”。
+  page.append(head, content, status, actions);
   const controls = new Set(), promptControls = new Set();
   function sync() {
     instances.disabled = !alive() || detecting || saving || !availableSessionInstances().length;
-    detect.disabled = !alive() || detecting || saving || !session || !connected;
-    reload.disabled = detect.disabled || loading || !currentInstance() || !!currentInstance().error;
+    reload.disabled = !alive() || detecting || saving || loading || !session || !connected
+      || !currentInstance() || !!currentInstance().error;
     display.checked = sessionInstanceEnabled(selected);
     display.indeterminate = !currentInstance();
     // 显示开关来自服务端共享偏好，不等待原生配置读取；实例检测或保存期间仍锁定目标。
@@ -541,7 +541,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     needsRead = false;
     if (!id || !currentInstance() || currentInstance().error) {
       record = null;
-      message = "所选实例暂不可用，请重新检测或明确选择其他实例。"; render(); return;
+      message = "所选实例暂不可用，请等待实例目录更新或明确选择其他实例。"; render(); return;
     }
     if (!session || !connected) {
       record = null;
@@ -672,7 +672,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
             icon: previous?.icon || preferred.split(":")[0], disabled: true });
         }
         selected = preferred; setSelectOptions(instances, choices, selected);
-        record = null; message = "所选实例暂不可用，请重新检测或明确选择其他实例。"; render(); return;
+        record = null; message = "所选实例暂不可用，请等待实例目录更新或明确选择其他实例。"; render(); return;
       }
       selected = preferred || choices.find(option => !option.disabled)?.value || "";
       setSelectedInstance(selected);
