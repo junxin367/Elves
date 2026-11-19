@@ -21,6 +21,31 @@ if ($BinaryDirectory -and !$SkipBuild) {
     throw "-BinaryDirectory is only supported with -SkipBuild."
 }
 
+function Remove-StaleClientBackups {
+    param(
+        [string]$Directory,
+        [string]$Destination
+    )
+
+    $directoryRoot = [System.IO.Path]::GetFullPath($Directory).TrimEnd('\') + '\'
+    $destinationPath = [System.IO.Path]::GetFullPath($Destination)
+    if (!$destinationPath.StartsWith($directoryRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "客户端备份目标不在构建产物目录内：$destinationPath"
+    }
+    $pattern = "$([System.IO.Path]::GetFileName($destinationPath)).previous-*"
+    $backups = @(Get-ChildItem -LiteralPath $Directory -Filter $pattern -File -ErrorAction SilentlyContinue)
+    foreach ($backup in $backups) {
+        try {
+            Remove-Item -LiteralPath $backup.FullName -Force -ErrorAction Stop
+            Write-Output "[INFO] Removed stale client backup: $($backup.Name)"
+        }
+        catch {
+            # 用户可能仍在运行旧版便携客户端；保留被占用的备份，下一次构建继续重试清理。
+            Write-Output "[INFO] Preserved in-use client backup: $($backup.Name)"
+        }
+    }
+}
+
 # 用户要求只提供一个 Elves Windows 程序；此入口只构建客户端，不启动管理器、不构建 Android。
 if (!$SkipBuild) {
     $cargo = Get-Command "cargo.exe" -CommandType Application -ErrorAction Stop | Select-Object -First 1
@@ -77,6 +102,8 @@ if ([BitConverter]::ToUInt32($image, $peOffset) -ne 0x4550 -or
 $DistDirectory = Join-Path $RepoRoot "dist\windows"
 New-Item -ItemType Directory -Path $DistDirectory -Force | Out-Null
 $Destination = Join-Path $DistDirectory "Elves-$ResolvedVersion-windows-x64.exe"
+# 用户要求构建不长期积累 previous 备份；未被占用的历史文件在替换前先清理。
+Remove-StaleClientBackups -Directory $DistDirectory -Destination $Destination
 $sourceHasher = [Security.Cryptography.SHA256]::Create()
 try { $sourceDigest = [BitConverter]::ToString($sourceHasher.ComputeHash($image)).Replace("-", "").ToLowerInvariant() }
 finally { $sourceHasher.Dispose() }
@@ -102,6 +129,8 @@ if (!(Test-Path -LiteralPath $Destination -PathType Leaf) -or
     }
     finally { Remove-Item -LiteralPath $temporaryArtifact -Force -ErrorAction SilentlyContinue }
 }
+# 替换完成后再次清理；如果旧客户端仍占用文件，保留它直到后续构建重试。
+Remove-StaleClientBackups -Directory $DistDirectory -Destination $Destination
 $digest = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($digest -ne $sourceDigest) { throw "Staged Elves client does not match the validated executable." }
 $info = [ordered]@{
