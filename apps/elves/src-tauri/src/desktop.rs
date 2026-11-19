@@ -1027,6 +1027,15 @@ pub(crate) fn popup_app_menu(
         let add = MenuItem::with_id(app, "file_add_folder", "添加文件夹", ready, None::<&str>)?;
         Menu::with_items(app, &[&add])?
     } else {
+        let devtools =
+            MenuItem::with_id(app, "help_devtools", "打开 DevTools", true, None::<&str>)?;
+        let diagnostics = MenuItem::with_id(
+            app,
+            "help_diagnostics",
+            "Harness 诊断快照",
+            true,
+            None::<&str>,
+        )?;
         let project = MenuItem::with_id(app, "help_project", "打开项目地址", true, None::<&str>)?;
         let update = MenuItem::with_id(
             app,
@@ -1039,11 +1048,20 @@ pub(crate) fn popup_app_menu(
             !state.checking_update.load(Ordering::Acquire),
             None::<&str>,
         )?;
-        let devtools = MenuItem::with_id(app, "help_devtools", "打开 DevTools", true, None::<&str>)?;
-        let diagnostics =
-            MenuItem::with_id(app, "help_diagnostics", "Harness 诊断快照", true, None::<&str>)?;
         let about = MenuItem::with_id(app, "help_about", "关于 Elves", true, None::<&str>)?;
-        Menu::with_items(app, &[&project, &update, &devtools, &diagnostics, &about])?
+        // 帮助菜单按用户要求将诊断工具置于上方，并把项目、更新和关于合并到最下方一组。
+        let group_separator = PredefinedMenuItem::separator(app)?;
+        Menu::with_items(
+            app,
+            &[
+                &devtools,
+                &diagnostics,
+                &group_separator,
+                &project,
+                &update,
+                &about,
+            ],
+        )?
     };
     window.popup_menu_at(&menu, PhysicalPosition::new(x, y))
 }
