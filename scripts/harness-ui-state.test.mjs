@@ -3966,8 +3966,54 @@ function sessionFilterPopupHarness({ enabled = ["codex:local", "claude:wsl:a", "
     checked: () => options().filter(node => node.getAttribute("aria-checked") === "true").map(node => node.dataset.value),
     outside: () => listeners.get("pointerdown")({ target: element("button") }),
     focusOutside: () => listeners.get("focusin")({ target: element("input") }),
+    keydown: event => listeners.get("keydown")?.(event),
   };
 }
+
+test("主会话执行中按 Escape 复用停止逻辑，侧边面板仍优先隐藏而不停止", () => {
+  const h = sessionFilterPopupHarness(), stops = [], panelCloses = [];
+  h.context.document.querySelector = () => null;
+  h.context.handleSideThreadShortcut = () => false;
+  h.context.queueDrag = null;
+  h.context.claudeUsageState = null;
+  h.context.closeContextUsageTip = () => {};
+  h.context.closeClaudeUsageTip = () => {};
+  h.context.closePopup = () => {};
+  h.context.closeMobileSidebar = () => {};
+  h.context.returnToParentSession = async () => {};
+  h.context.requestSideCreationBack = () => {};
+  h.context.notice = () => {};
+  h.context.relatedSessionView = null;
+  h.context.sideCreationView = null;
+  h.context.connected = true;
+  h.context.selectedId = "thread-a";
+  h.context.threadReadOnly = () => false;
+  h.context.isActiveThread = () => true;
+  h.context.stopGeneration = () => { stops.push(true); return Promise.resolve(); };
+  h.context.workspaceSidePanel = false;
+  h.context.requestSidePanelClose = () => false;
+  h.context.checkModelMenuFocus = () => {};
+  h.context.window.addEventListener = () => {};
+  nodeVm.runInContext(sourceSection("function installGlobalInputHandlers() {", "function checkModelMenuFocus"), h.context);
+  h.context.installGlobalInputHandlers();
+  assert.equal(h.context.connected, true);
+  assert.equal(h.context.selectedId, "thread-a");
+  assert.equal(h.context.threadReadOnly(), false);
+  assert.equal(h.context.isActiveThread(), true);
+  const escape = () => ({ key: "Escape", isComposing: false, defaultPrevented: false,
+    preventDefault() { this.defaultPrevented = true; } });
+  const mainEvent = escape();
+  h.keydown(mainEvent);
+  assert.equal(mainEvent.defaultPrevented, true);
+  assert.equal(stops.length, 1);
+  h.context.workspaceSidePanel = true;
+  h.context.requestSidePanelClose = () => { panelCloses.push(true); return true; };
+  const sideEvent = escape();
+  h.keydown(sideEvent);
+  assert.equal(sideEvent.defaultPrevented, true);
+  assert.equal(panelCloses.length, 1);
+  assert.equal(stops.length, 1, "侧边面板 Escape 不能停止侧边 iframe 当前任务");
+});
 
 test("二级菜单支持键盘进入返回，父菜单刷新保留子弹层且旧父项不能再触发", () => {
   const h = sessionFilterPopupHarness(), copied = [];

@@ -4,8 +4,9 @@ import { $ } from "../ui/dom.js";
 import { notice } from "../ui/notice.js";
 import { activePopup, closePopup } from "../ui/popup.js";
 import { closeComposerMenus } from "../core/actions.js";
-import { selectedId, selectionToken } from "../core/state.js";
+import { connected, selectedId, selectionToken } from "../core/state.js";
 import { claudeUsageState, closeClaudeUsageTip } from "./composer/claude-usage.js";
+import { stopGeneration } from "./composer/composer.js";
 import { closeModelMenu } from "./composer/composer-menus.js";
 import { closeContextUsageTip, contextUsageTip } from "./composer/metrics.js";
 import { finishQueueDrag } from "./queue/queue.js";
@@ -18,6 +19,7 @@ import {
   dismissSideCreation, handleSideThreadShortcut, handleTransientHistoryPop, ownsRelatedOperation,
   requestSideCreationBack, returnToParentSession, showSideCreation, updateSideCreationStatus
 } from "./session/related.js";
+import { isActiveThread, threadReadOnly } from "./session/capabilities.js";
 import { closeMobileSidebar } from "./shell-state.js";
 import { requestSidePanelClose, workspaceSidePanel } from "./session/side-panel.js";
 
@@ -61,6 +63,13 @@ export function installGlobalInputHandlers() {
       }
       if (workspaceSidePanel && requestSidePanelClose()) {
         event.preventDefault();
+        return;
+      }
+      if (!event.defaultPrevented && !relatedSessionView && connected && selectedId
+          && !threadReadOnly() && isActiveThread() && !document.querySelector("dialog[open]")) {
+        // 用户要求 Codex 执行 computer use 等当前轮次时按 Escape 可停止执行；沿用停止按钮的服务端回执和防重复逻辑。
+        event.preventDefault();
+        void stopGeneration().catch(error => notice(error.message, true));
         return;
       }
       if (!event.defaultPrevented && relatedSessionView && !document.querySelector("dialog[open]")) {
