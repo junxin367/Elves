@@ -93,7 +93,8 @@ export function applyThreadDeletion(id, deviceId = session?.device.id) {
   renderSidebar(); updateComposer(); renderApprovals();
 }
 export function threadDeletionConflict(id) {
-  return busy || stopping || sidebarBusy || pending?.payload?.threadId === id
+  // busy/stopping 只属于当前选中的会话；删除其它空闲会话不能被另一会话的执行状态误禁用。
+  return selectedId === id && (busy || stopping) || sidebarBusy || pending?.payload?.threadId === id
     || compactionLocked(id) || queuedEdits.has(id)
     || goalEditPending?.deviceId === session?.device.id && goalEditPending.payload.threadId === id
     || [...queuedActionBusy].some(key => key.startsWith(`${id}:`))

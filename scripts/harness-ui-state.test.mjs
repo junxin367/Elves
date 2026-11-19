@@ -10783,6 +10783,21 @@ test("删除主会话的确认文案明确包含侧边关闭和执行中限制",
   await deletion;
 });
 
+test("删除空闲目标不受另一会话 busy/stopping 状态误阻止", () => {
+  const context = nodeVm.createContext({
+    selectedId: "running", busy: true, stopping: false, sidebarBusy: false, pending: null,
+    session: { device: { id: "device" } }, goalEditPending: null, queuedActionBusy: new Set(),
+    queuedEdits: new Map(), approvalReplies: new Map(), questionReplyReceipts: new Map(),
+    compactionLocked: () => false,
+  });
+  nodeVm.runInContext(sourceSection("function threadDeletionConflict(", "function deletionMessage("), context);
+  assert.equal(context.threadDeletionConflict("idle"), false);
+  assert.equal(context.threadDeletionConflict("running"), true);
+  context.busy = false; context.stopping = true;
+  assert.equal(context.threadDeletionConflict("idle"), false);
+  assert.equal(context.threadDeletionConflict("running"), true);
+});
+
 test("删除成功回执后迟到详情409只保留成功提示，不恢复会话或重发删除", async () => {
   const h = sidebarDeletionHarness(), { context } = h;
   const read = deferred(), timers = [], sidebarReads = [], locations = [];
