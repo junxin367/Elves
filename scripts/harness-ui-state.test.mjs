@@ -13081,6 +13081,7 @@ test("主会话和侧边的完整请求快照同步审批与异步问答，旧�
   const context = nodeVm.createContext({
     workspaceSidePanel: true, window: { parent }, location: { origin: "http://127.0.0.1:45222" },
     workspaceSidePanelStateSignature: "", creating: false, selectedId: row.id, connected: true, pageLeaving: false,
+    document: { hidden: false, documentElement: { dataset: { workspaceSidePanelVisible: "true" } } }, followMessages: true,
     session: { device: { id: "device" } }, thread: { ...row, status: { type: "active" }, requests: [] },
     sidebar: { recent: [row, other], pinnedThreads: [{ ...row }], projects: [{ threads: [{ ...row }] }] },
     blockingRequestStates: states, approvalReplies: new Map(), questionVersion: 0, notifiedQuestions: null,
@@ -13092,6 +13093,7 @@ test("主会话和侧边的完整请求快照同步审批与异步问答，旧�
     sourceSection("function replaceAsyncQuestions(", "function setQuestionReceipt("),
     sourceSection("function replaceRequestSnapshot(", "async function submitBlockingRequest("),
     sourceSection("function sidebarAttentionState("),
+    sourceSection("function sidePanelUnread(", "function sideComposerEditor("),
     sourceSection("function sideComposerEditor(", "function installSidePanelMessageListener("),
   ].join("\n"), context);
   const snapshot = requestsRevision => ({ requestsEpoch: "native-epoch", requestsRevision });
@@ -13158,10 +13160,12 @@ test("侧边标签执行状态沿用原生状态并去重，排队占位和等�
   const context = nodeVm.createContext({ nativeConnectionVersion: 1,
     workspaceSidePanel: true, window: { parent }, location: { origin: "http://127.0.0.1:45222" },
     workspaceSidePanelStateSignature: "", creating: false, selectedId: "side-a", connected: true, pageLeaving: false,
+    document: { hidden: false, documentElement: { dataset: { workspaceSidePanelVisible: "true" } } }, followMessages: true,
     session: { device: { id: "fixture-device" } },
     thread: { id: "side-a", status: { type: "active" } },
   });
   nodeVm.runInContext(sourceSection("function sidebarAttentionState(")
+    + sourceSection("function sidePanelUnread(", "function sideComposerEditor(")
     + sourceSection("function sideComposerEditor(", "function installSidePanelMessageListener("), context);
   context.syncWorkspaceSidePanelState();
   assert.equal(sent.at(-1).running, true);
@@ -14499,6 +14503,57 @@ test("Codex turn/completed 通过真实事件入口纠正引导位置", () => {
   } });
   assert.equal(context.turns.get("turn-3").status, "failed", "终态429错误必须结束当前轮次");
   assert.equal(context.turns.get("turn-3").error.statusCode, 429, "终态错误保留状态码");
+});
+
+test("侧边 turn/completed 与主会话共用可见跟随未读规则", () => {
+  const outcomes = [], markReads = [], renders = [];
+  const context = nodeVm.createContext({ nativeConnectionVersion: 1,
+    session: { device: { id: "device" } }, selectedId: "side", privateInputScope: () => "scope",
+    sessionMenu: { invalidate: () => null }, relatedSessionView: { kind: "side" }, relatedMenuTimer: null,
+    connected: true, document: { hidden: false, documentElement: { dataset: { workspaceSidePanelVisible: "true" } } },
+    thread: { id: "side", viewKind: "side", hasUnreadTurn: false, status: { type: "active" } },
+    turns: new Map(), pending: null, sending: false, followMessages: true,
+    messageVersion: 0, statusVersion: 0, itemVersions: new Map(), turnVersions: new Map(), turnFieldVersions: new Map(),
+    partialItems: new Set(), transcriptEventTypes: new Set(), sidebarReadRefreshSuppressions: new Set(),
+    recentPrioritySelectionSuppressions: new Set(), threadDeleted: () => false,
+    handleRemoteChannelEvent: () => false, scheduleRelatedMenuRefresh() {}, rememberBackgroundThreadDisplay() {},
+    receiveCompactionLifecycle() {}, mergeTranscriptEvents() {},
+    mergeItemProjection: (previous, incoming) => ({ ...previous, ...incoming }), enrichTurnTranscriptEvents: value => value,
+    reconcileConfirmedInputOrder() {},
+    applySidebarThreadOutcome: (...args) => { outcomes.push(args); return false; },
+    normalizeTurnOutcome: turn => ({ turnId: turn?.id || null, status: turn?.status || "completed",
+      kind: "completed", error: null }),
+    renderOutcomeMarker() {}, rememberThreadDisplay() {}, updateComposer() {}, scheduleReload() {},
+    markVisibleThreadRead: async (...args) => markReads.push(args), scheduleMessages() {},
+    rememberTranscript() {}, scheduleSidebarRefresh() {}, renderSidebar: () => renders.push(true),
+  });
+  nodeVm.runInContext(sourceSection("function normalizeDi") + "\n" + sourceSection("function receive(event) {"), context);
+  context.receive({ method: "turn/completed", params: {
+    threadId: "side", turn: { id: "side-turn", status: "completed", items: [] }
+  } });
+  assert.equal(outcomes[0][2].unread, false, "可见且跟随最新消息的侧边完成轮次不产生未读");
+  assert.equal(markReads.length, 1, "侧边完成后沿用主会话已读回执");
+  assert.equal(context.thread.hasUnreadTurn, false);
+  assert.equal(renders.length, 1, "侧边状态立即同步到外层标签");
+
+  context.followMessages = false;
+  context.receive({ method: "turn/completed", params: {
+    threadId: "side", turn: { id: "side-turn-2", status: "completed", items: [] }
+  } });
+  assert.equal(outcomes[1][2].unread, true, "侧边滚离底部后保留未读");
+  assert.equal(context.thread.hasUnreadTurn, true);
+});
+
+test("侧边标签未读状态尊重正文已读和审批优先级", () => {
+  const context = nodeVm.createContext({
+    document: { hidden: false, documentElement: { dataset: { workspaceSidePanelVisible: "true" } } },
+    thread: { hasUnreadTurn: false }
+  });
+  nodeVm.runInContext(sourceSection("function sidePanelUnread(", "function sideComposerEditor("), context);
+  assert.equal(context.sidePanelUnread("unread"), false, "明确的正文已读不显示蓝点");
+  context.thread.hasUnreadTurn = true;
+  assert.equal(context.sidePanelUnread("unread"), true, "正文未读保留蓝点");
+  assert.equal(context.sidePanelUnread("waiting"), true, "待处理请求优先于正文已读");
 });
 
 test("Claude 恢复后单独压缩的状态行始终位于已经完成的回复之后", () => {

@@ -1193,12 +1193,16 @@ impl CodexHarness {
                 if side.closed {
                     return Err(error(410, "侧边会话已关闭，内容已释放"));
                 }
+                let parent = side.parent.clone();
                 // 已读只修改当前保留正文的标记，不依赖已过期的引擎连接，也不恢复临时会话。
                 return permit.commit(|| {
                     let side = projection.sides.threads.get_mut(id).unwrap();
                     if side.unread {
                         side.unread = false;
                         projection.side_changed(id);
+                        // 与主会话 markRead 一样通知父会话刷新未读聚合，避免只在下一次菜单操作时清除。
+                        projection.push(json!({"method":"remote/sidebarChanged",
+                            "params":{"threadId":parent,"reason":"sideRead"}}));
                     }
                     Ok(json!({"ok":true,"threadId":id}))
                 });

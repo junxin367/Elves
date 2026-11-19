@@ -59,6 +59,11 @@ export function installSessionWindowTitleSync() {
   bind();
 }
 let workspaceSidePanelStateSignature = "";
+function sidePanelUnread(attention) {
+  const hasUnreadTurn = typeof thread.hasUnreadTurn === "boolean"
+    ? thread.hasUnreadTurn : attention === "unread";
+  return attention === "waiting" || hasUnreadTurn;
+}
 function sideComposerEditor(id) {
   if (!session || !id || id !== selectedId || thread?.id !== id || thread.viewKind !== "side"
       || creating || pageLeaving || document.hidden || threadReadOnly(id)
@@ -105,8 +110,7 @@ export function syncWorkspaceSidePanelState(force = false) {
   const type = typeof status === "string" ? status : status?.type;
   const attention = sidebarAttentionState(thread);
   // 用户要求侧边有审批或问答时显示未读蓝点；待处理请求不能因查看正文的已读回执而消失。
-  const unread = attention === "waiting"
-    || (typeof thread.hasUnreadTurn === "boolean" ? thread.hasUnreadTurn : attention === "unread");
+  const unread = sidePanelUnread(attention);
   // 用户要求侧边标签显示真实执行状态：沿用原生状态及等待判断，不把发送中、排队或待确认占位当成执行中。
   const running = connected && !pageLeaving && ["active", "inProgress", "running"].includes(type)
     && attention !== "waiting";
@@ -124,6 +128,12 @@ export function installSidePanelMessageListener() {
   document.addEventListener("visibilitychange", () => syncSideThreadPresence());
   window.addEventListener("pagehide", () => syncSideThreadPresence(true));
   window.addEventListener("pageshow", () => syncSideThreadPresence());
+  window.addEventListener("codex-elves-thread-read", event => {
+    if (event.detail?.threadId !== selectedId) return;
+    syncWorkspaceSidePanelState(true);
+    if (window.parent !== window)
+      window.parent.postMessage({ type: "codex-elves-side-thread-read", threadId: selectedId }, location.origin);
+  });
   window.addEventListener("message", event => {
     if (!workspaceSidePanel || window.parent === window || event.source !== window.parent || event.origin !== location.origin) return;
     if (event.data?.type === "codex-elves-side-panel-focus") {

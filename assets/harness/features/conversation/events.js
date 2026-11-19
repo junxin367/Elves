@@ -314,10 +314,14 @@ export function receive(event) {
     sidebarChanged = (typeof applySidebarThreadOutcome === "function"
       && applySidebarThreadOutcome(eventThreadId, params.turn, { unread })) || sidebarChanged;
     if (eventThreadId === selectedId && thread) {
+      if (thread.viewKind === "side") thread.hasUnreadTurn = unread;
       thread.lastTurnOutcome = normalizeTurnOutcome(params.turn);
       if (typeof renderOutcomeMarker === "function") renderOutcomeMarker(thread);
       if (typeof rememberThreadDisplay === "function")
         rememberThreadDisplay({ id: eventThreadId, lastTurnOutcome: thread.lastTurnOutcome });
+      // 侧边页面没有主会话侧栏，仍需立即把“可见/跟随”判定同步到外层标签；
+      // 已读回执成功后会再次强制发送 false，隐藏或滚离底部则发送 true。
+      if (thread.viewKind === "side") sidebarChanged = true;
     }
   }
   if (event.method === "turn/started" && typeof eventThreadId === "string") {

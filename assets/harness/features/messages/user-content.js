@@ -187,6 +187,12 @@ export async function markVisibleThreadRead(id = selectedId, { opened = false } 
     markSidebarThreadReadLocally(id);
     syncSideThreadUnread();
     renderSidebar();
+    // 侧边正文与外层标签分属独立页面；已读回执成功后强制通知 iframe 状态，
+    // 让外层标签和父会话菜单立即清除蓝点，不等待下一次列表刷新。
+    if (document.documentElement?.dataset?.workspaceSidePanel === "true"
+        && typeof window !== "undefined" && typeof window.dispatchEvent === "function"
+        && typeof CustomEvent === "function")
+      window.dispatchEvent(new CustomEvent("codex-elves-thread-read", { detail: { threadId: id } }));
   })();
   readMarkRequests.set(id, request);
   try { await request; }

@@ -585,6 +585,9 @@ function mountWorkspaceSideThread(workspace, item, createSideThread, updateThrea
       transferFocus();
     }
     // 路径最多 32768 字符，与本模块其他文件路径字段的上限一致；行号只接受正整数。
+    else if (event.data?.type === "codex-elves-side-thread-read"
+        && item.kind === "side" && event.data.threadId === item.threadId)
+      options.onSideThreadRead?.(item.threadId);
     else if (visible && event.data?.type === "codex-elves-workspace-open-file"
         && event.data.threadId === item.threadId && typeof event.data.path === "string"
         && event.data.path.trim() && event.data.path.length <= 32768 && !event.data.path.includes("\0")

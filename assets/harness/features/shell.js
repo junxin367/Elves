@@ -74,7 +74,9 @@ import { activeInstanceId, newChatBackendOptions } from "./session/instances.js"
 import { mountWorkspaceOpenIn } from "./session/open-in.js";
 import { disconnect, refreshConnectionFromIndicator } from "./session/lifecycle.js";
 import { showLogin } from "./session/login.js";
-import { relatedSessionView, relatedThreadOperations, stopRelatedSessionTimers } from "./session/related-state.js";
+import {
+  relatedSessionView, relatedThreadOperations, stopRelatedSessionTimers, syncSideThreadUnread
+} from "./session/related-state.js";
 import {
   adoptRelatedMenu, createDesktopSideThread, loadRelatedThreads, openRelatedThread,
   ownsRelatedOperation, rememberTransientHistory, restoreRelatedOperations, returnToParentSession,
@@ -90,7 +92,7 @@ import {
 } from "./shell-state.js";
 import { changeSidebar, openWorkspaceFileContextMenu, sidebarFilters } from "./sidebar/actions.js";
 import { renderSessionFilter } from "./sidebar/filters.js";
-import { setSearch } from "./sidebar/list-state.js";
+import { markSidebarThreadReadLocally, setSearch } from "./sidebar/list-state.js";
 
 export function shell() {
   disposeMainNavigation();
@@ -432,6 +434,12 @@ export function shell() {
     },
     beforeOpen: () => { sessionMenu?.close(); closePopup(); closeComposerMenus(); closeMobileSidebar({ focus: false }); },
     onUnauthorized: requireAuthentication,
+    onSideThreadRead: threadId => {
+      // 外层标签收到侧边正文的成功已读回执后，立即同步父会话菜单和侧栏投影。
+      markSidebarThreadReadLocally(threadId);
+      syncSideThreadUnread();
+      renderSidebar();
+    },
     openImagePreview,
     openVideoPreview: (trigger, source, poster, name) => openVideoPreview(trigger, source, poster, name, prepareRemoteTunnelAccess),
     copyText
