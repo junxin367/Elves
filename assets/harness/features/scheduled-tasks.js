@@ -283,10 +283,10 @@ export function mountScheduledTasksPage(root) {
     scheduleMode.dispatchEvent(new Event("change"));
     editor.hidden = false;
     add.disabled = true;
-    void prepareEditor(task);
+    void loadEditorState(task);
   }
 
-  async function prepareEditor(task) {
+  async function loadEditorState(task) {
     if (!instancesReady) {
       await loadSessionInstances(true).catch(error => setEditorStatus(error.message, true));
       if (disposed) return;
@@ -377,7 +377,7 @@ export function mountScheduledTasksPage(root) {
       const controls = element("div", "scheduled-row-actions");
       const run = button("", "立即运行", () => void runTask(task), "icon-button");
       run.append(icon("play"));
-      const toggle = button("", task.enabled ? "暂停任务" : "启用任务", () => void toggleTask(task), "icon-button");
+      const toggle = button("", task.enabled ? "暂停任务" : "启用任务", () => void setTaskEnabled(task), "icon-button");
       toggle.append(icon(task.enabled ? "pause" : "play"));
       const edit = button("", "编辑任务", () => openEditor(task), "icon-button");
       edit.append(icon("edit"));
@@ -415,7 +415,7 @@ export function mountScheduledTasksPage(root) {
     }
   }
 
-  async function toggleTask(task) {
+  async function setTaskEnabled(task) {
     try {
       await action("/api/action/toggleScheduledTask", { taskId: task.id, enabled: !task.enabled });
       await refreshTasks();

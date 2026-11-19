@@ -93,13 +93,14 @@ async function navigationFixture(native = false, transport = native ? "desktop" 
 
 test("统一主导航固定排序，切换后保留当前会话草稿、节点与阅读位置", async () => {
   const fixture = await navigationFixture(true);
-  assert.deepEqual(Array.from(fixture.buttons, button => button.label), ["会话", "代理设置", "会话管理", "远程会话"]);
+  assert.deepEqual(Array.from(fixture.buttons, button => button.label), ["会话", "定时任务", "代理设置", "会话管理", "远程会话"]);
   fixture.buttons[1].action();
   assert.equal(fixture.workspace.hidden, true);
   assert.equal(fixture.workspace.inert, true);
   fixture.buttons[2].action();
+  fixture.buttons[3].action();
   assert.deepEqual(fixture.opened, ["proxy", "sessions"]);
-  assert.equal(fixture.buttons[2].attributes["aria-current"], "page");
+  assert.equal(fixture.buttons[3].attributes["aria-current"], "page");
   fixture.messages.scrollTop = 0;
   fixture.buttons[0].action();
   fixture.animation.forEach(callback => callback());
@@ -108,7 +109,7 @@ test("统一主导航固定排序，切换后保留当前会话草稿、节点�
   assert.equal(fixture.workspace.draft, "保留当前输入");
   assert.equal(fixture.messages.scrollTop, 320);
   assert.equal(fixture.context.navigation.shell.children[1], fixture.workspace);
-  assert.deepEqual(fixture.visibility, [true, true, false]);
+  assert.deepEqual(fixture.visibility, [false, true, true, false]);
   rawVm.runInContext("disposeMainNavigation(); disposeMainNavigation();", fixture.context);
   assert.equal(fixture.callbacks.disposed, 1);
 });
@@ -221,7 +222,7 @@ test("Windows 窄窗口仍保留 PC 主导航与直接设置入口，不出现�
   const fixture = await navigationFixture(true, "desktop", { mobile: true });
   assert.equal(fixture.context.navigation.shell.dataset.mobileNavigation, "false");
   assert.equal(fixture.footer, undefined);
-  assert.equal(fixture.buttons.length, 4);
+  assert.equal(fixture.buttons.length, 5);
   fixture.settings.action();
   assert.equal(fixture.callbacks.settings, 1);
   assert.equal(fixture.settingsPage.dataset.settingsMobile, "false");
@@ -14118,7 +14119,7 @@ test("模型目录统一保存 Fast 档位、实例限制和缓存身份，Ultra
   };
   vm.createContext(context);
   context.nativeConnectionVersion ??= 1;
-  vm.runInContext(sourceSection("async function loadM", "async functi"), context);
+  vm.runInContext(sourceSection("async function loadModels(", "async functi"), context);
   const models = await context.loadModels(true);
   assert.deepEqual(Array.from(models[0].supportedReasoningEfforts, effort => effort.reasoningEffort), ["xhigh", "max"]);
   assert.equal(writes[0][2].version, currentModelCatalogCacheVersion);
@@ -14186,7 +14187,7 @@ test("Fast 环境暂不可读时复用目录重试，不清空模型；普通目
   };
   vm.createContext(context);
   context.nativeConnectionVersion ??= 1;
-  vm.runInContext(sourceSection("async function loadM", "async functi")
+  vm.runInContext(sourceSection("async function loadModels(", "async functi")
     + sourceSection("function scheduleCatalogRefresh(", "function refreshCachedCatalogs("), context);
   await context.loadModels(true);
   assert.equal(context.models.length, 1);
@@ -14284,7 +14285,7 @@ test("服务连接变化后，旧模型读取晚到不能覆盖新目录", async
   };
   vm.createContext(context);
   context.nativeConnectionVersion ??= 1;
-  vm.runInContext(sourceSection("async function loadM", "async functi"), context);
+  vm.runInContext(sourceSection("async function loadModels(", "async functi"), context);
   const oldRead = context.loadModels(true);
   ++context.nativeConnectionVersion;
   context.modelsPromise = null;
@@ -14996,7 +14997,7 @@ test("新建类型切换后，迟到 Codex 模型不覆盖 Claude，项目 ID �
   };
   vm.createContext(context);
   context.nativeConnectionVersion ??= 1;
-  vm.runInContext(sourceSection("async function loadM", "async functi"), context);
+  vm.runInContext(sourceSection("async function loadModels(", "async functi"), context);
   const codex = context.loadModels(true);
   context.creationBackend = "claude";
   context.creationInstanceId = "claude:wsl:test";
@@ -15053,7 +15054,7 @@ function claudeHistoryModelMenuHarness({ cached = false, stale = false } = {}) {
       menu.replaceChildren(...Array.from(context.models, model => element("button", "", model.model)));
     },
   });
-  vm.runInContext(sourceSection("async function loadM", "async functi"), context);
+  vm.runInContext(sourceSection("async function loadModels(", "async functi"), context);
   vm.runInContext(sourceSection('  $("#model-button").onclick = async () => {', '  $("#model-settings").onkeydown ='), context);
   return { context, reads, cacheWrites, menu, trigger, catalog, settle: () => new Promise(resolve => setImmediate(resolve)) };
 }
