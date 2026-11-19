@@ -2672,29 +2672,49 @@ async fn prepare_controller_shutdown() -> Value {
     let Some(controller) = CONTROLLER.get() else {
         return json!({"status":"stopped","cleanup":{"complete":true}});
     };
+    let _serial = controller.shutdown_serial.lock().await;
+    if controller.shutdown_complete.load(Ordering::Acquire) {
+        return json!({"status":"stopped","cleanup":controller.claude.cleanup_report()});
+    }
+
+    // 用户要求安装或退出时不能中断执行中的 Codex；先锁住新派发，再核对当前轮次、队列、审批、压缩和未知状态。
     controller.closing.store(true, Ordering::Release);
+    let was_harness_enabled = controller
+        .harness
+        .enabled
+        .swap(false, Ordering::AcqRel);
+    if !controller.harness.idle().await {
+        controller
+            .harness
+            .enabled
+            .store(was_harness_enabled, Ordering::Release);
+        controller.closing.store(false, Ordering::Release);
+        return json!({
+            "status":"busy",
+            "reason":"codex_active",
+            "message":"Codex 仍在执行或状态尚未确认，未停止 Elves；请等待任务完成后再重试。",
+            "cleanup":{"complete":false,"pendingStartupCheck":false}
+        });
+    }
+
     controller.stop_desktop().await;
     controller.publish_access_policy(&RemoteAccessSettings::default());
     controller.claude.set_reconnect_enabled(false);
-    controller.harness.enabled.store(false, Ordering::Release);
-    let _serial = controller.shutdown_serial.lock().await;
-    if !controller.shutdown_complete.load(Ordering::Acquire) {
-        let settings = controller
-            .live
-            .lock()
-            .await
-            .settings
-            .clone()
-            .unwrap_or_default();
-        controller.reconcile(settings).await;
-        if controller.claude.record_clean_exit().is_err() {
-            let _ = crate::diagnostic_log::append_diagnostic_log(
-                "claude.cleanup_exit_journal_failed",
-                json!({"pendingStartupCheck":true}),
-            );
-        }
-        controller.shutdown_complete.store(true, Ordering::Release);
+    let settings = controller
+        .live
+        .lock()
+        .await
+        .settings
+        .clone()
+        .unwrap_or_default();
+    controller.reconcile(settings).await;
+    if controller.claude.record_clean_exit().is_err() {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "claude.cleanup_exit_journal_failed",
+            json!({"pendingStartupCheck":true}),
+        );
     }
+    controller.shutdown_complete.store(true, Ordering::Release);
     json!({"status":"stopped","cleanup":controller.claude.cleanup_report()})
 }
 
