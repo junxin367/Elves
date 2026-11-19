@@ -79,6 +79,8 @@ html.theme-transition{
 .management-workspace{min-width:0;min-height:0;overflow:hidden;background:var(--bg)}
 .management-frame{display:block;width:100%;height:100%;border:0;background:var(--bg)}
 .management-unavailable{padding:24px;color:var(--muted);line-height:1.7}
+/* 用户要求会话、定时任务、管理页和设置页共享主导航右侧内容列；固定到第 1 行第 2 列，避免页面落入被外层裁剪的隐式网格行。手机隐藏主导航后改回第 1 列。 */
+.remote-shell>:is(.scheduled-workspace,.management-workspace,.appearance-screen){grid-column:2;grid-row:1}
 .scheduled-workspace{display:flex;flex-direction:column;min-width:0;min-height:0;overflow:auto;padding:28px clamp(20px,4vw,56px) 40px;background:var(--bg);color:var(--text)}
 .scheduled-heading{display:flex;align-items:center;justify-content:space-between;gap:16px;width:min(100%,1000px);margin:0 auto 24px}
 .scheduled-title{display:flex;align-items:center;gap:10px;min-width:0}
@@ -131,6 +133,7 @@ html.theme-transition{
 /* 用户要求手机不出现主导航：会话区用满宽度，抽屉和遮罩从屏幕左缘开始；窄 PC 客户端仍保留原生主导航。 */
 .remote-shell[data-mobile-navigation=true]{--main-nav-width:0px;grid-template-columns:minmax(0,1fr)}
 .remote-shell[data-mobile-navigation=true]>.main-navigation{display:none}
+.remote-shell[data-mobile-navigation=true]>:is(.scheduled-workspace,.management-workspace,.appearance-screen){grid-column:1}
 .remote-shell[data-mobile-navigation=true]>.workspace>.sidebar,.remote-shell[data-mobile-navigation=true]>.workspace>.sidebar-backdrop{left:0}
 .workspace.related-session-view{--sidebar-layout-width:0px;grid-template-columns:minmax(0,1fr)}
 .workspace.related-session-view>.sidebar,.workspace.related-session-view>.sidebar-backdrop{display:none!important}
