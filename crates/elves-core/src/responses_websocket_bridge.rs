@@ -965,6 +965,21 @@ async fn bridge_responses_websockets(
                                         return Ok(());
                                     }
                                     Err(reconnect_error) => {
+                                        if is_suppressible_upstream_reconnect_error(
+                                            &reconnect_error,
+                                        )
+                                            && request_logger
+                                                .can_suppress_upstream_transport_failure()
+                                        {
+                                            // Codex 客户端对未产生任何响应事件的上游断链会自行重连；
+                                            // 不把代理内部的 reset/重连堆栈写成当前轮次错误，避免 Harness
+                                            // 把一次可恢复的上游传输故障展示成执行失败。
+                                            request_logger.record_transport_failure(&format!(
+                                                "{error_message}; 最后一次重连失败：{reconnect_error:#}"
+                                            ));
+                                            downstream_closed = true;
+                                            return Ok(());
+                                        }
                                         let _ = send_downstream_terminal_failure(
                                             &mut downstream,
                                             &request_logger,
@@ -979,6 +994,13 @@ async fn bridge_responses_websockets(
                                         );
                                     }
                                 }
+                            }
+                            if request_logger.can_suppress_upstream_transport_failure() {
+                                // 已达到内部重连上限但仍未收到任何响应事件时，不把代理
+                                // 的传输细节写给 Harness；让 Codex 看到异常断线并自行恢复。
+                                request_logger.record_transport_failure(&error_message);
+                                downstream_closed = true;
+                                return Ok(());
                             }
                             let _ = send_downstream_terminal_failure(
                                 &mut downstream,
@@ -1019,6 +1041,15 @@ async fn bridge_responses_websockets(
                                     break;
                                 }
                                 continue;
+                            }
+                            if request_logger.can_suppress_upstream_transport_failure() {
+                                // 首个响应事件尚未送达时，异常 EOF 只结束本地桥接；
+                                // 让 Codex 按异常断线恢复，不发送含内部原因的 Close 帧。
+                                request_logger.record_transport_failure(
+                                    "Responses WebSocket 上游在首个响应事件前结束连接",
+                                );
+                                downstream_closed = true;
+                                return Ok(());
                             }
                             let _ = send_downstream_terminal_failure(
                                 &mut downstream,
@@ -1354,6 +1385,25 @@ async fn send_downstream_terminal_failure(
     )
     .await?;
     Ok(())
+}
+
+fn is_suppressible_upstream_reconnect_error(error: &anyhow::Error) -> bool {
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::responses_websocket::ResponsesWebsocketRateLimitError>()
+            .is_some()
+    }) {
+        return false;
+    }
+    let message = format!("{error:#}");
+    if message.contains("Responses WebSocket 上游返回 HTTP ") {
+        return false;
+    }
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<WebSocketError>().is_some())
+        || message.contains("Responses WebSocket 连接失败")
+        || message.contains("Responses WebSocket 上游连接超时")
 }
 
 async fn reconnect_upstream_with_replay(
@@ -2580,6 +2630,17 @@ impl WebSocketRequestLogger {
         self.state
             .lock()
             .map_or(true, |state| !state.requests.is_empty())
+    }
+
+    fn can_suppress_upstream_transport_failure(&self) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        !state.requests.is_empty()
+            && state
+                .requests
+                .values()
+                .all(|tracked| tracked.record.first_token_ms.is_none())
     }
 
     fn rate_limit_cooldown_remaining(&self, model: &str) -> Option<u64> {
@@ -4553,8 +4614,8 @@ mod tests {
         should_temporarily_fallback_early_disconnect_responses_websocket_to_http,
         should_temporarily_fallback_oversized_responses_websocket_to_http,
         should_temporarily_fallback_upstream_failure_responses_websocket_to_http,
-        websocket_application_event_payload, websocket_failure_close_frame,
-        websocket_idle_timeout_elapsed,
+        is_suppressible_upstream_reconnect_error, websocket_application_event_payload,
+        websocket_failure_close_frame, websocket_idle_timeout_elapsed,
     };
     use crate::settings::{
         BackendSettings, LayeredCompactionModelUsage, LayeredCompactionModels, RelayModelMapping,
@@ -5858,9 +5919,11 @@ mod tests {
             .record_request(&request, &request.to_string())
             .unwrap();
         assert_eq!(logger.upstream_replay_block_reason(), None);
+        assert!(logger.can_suppress_upstream_transport_failure());
         logger.record_first_response_event(&Message::Text(
             r#"{"type":"response.created","response":{"id":"resp_first"}}"#.into(),
         ));
+        assert!(!logger.can_suppress_upstream_transport_failure());
         assert_eq!(
             logger.upstream_replay_block_reason(),
             Some("application_response_already_received")
@@ -5893,6 +5956,19 @@ mod tests {
         );
         logger.finish_pending("upstream failed on a later request", 502);
         assert!(logger.interrupted_before_response());
+    }
+
+    #[test]
+    fn upstream_reconnect_suppression_only_accepts_transport_failures() {
+        assert!(is_suppressible_upstream_reconnect_error(&anyhow::anyhow!(
+            "Responses WebSocket 连接失败。"
+        )));
+        assert!(is_suppressible_upstream_reconnect_error(&anyhow::anyhow!(
+            "Responses WebSocket 上游连接超时"
+        )));
+        assert!(!is_suppressible_upstream_reconnect_error(&anyhow::anyhow!(
+            "Responses WebSocket 上游返回 HTTP 401"
+        )));
     }
 
     #[tokio::test]

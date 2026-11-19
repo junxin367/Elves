@@ -1351,16 +1351,26 @@ async fn local_proxy_closes_downstream_promptly_when_upstream_ends_without_close
         .await
         .unwrap();
 
-    let close = tokio::time::timeout(Duration::from_secs(3), client.next())
+    let downstream = tokio::time::timeout(Duration::from_secs(3), client.next())
         .await
-        .expect("upstream EOF should close the downstream websocket promptly")
-        .expect("downstream websocket should yield a close frame")
-        .expect("downstream websocket close should be readable");
-    let Message::Close(Some(close)) = close else {
-        panic!("expected websocket failure close after upstream EOF");
-    };
-    assert_eq!(close.code, CloseCode::Restart);
-    assert_eq!(close.reason, "upstream websocket reconnect required");
+        .expect("upstream EOF should end the downstream websocket promptly");
+    match downstream {
+        Some(Ok(Message::Close(frame))) => {
+            panic!("proxy must not expose an internal transport failure close frame: {frame:?}");
+        }
+        Some(Ok(message)) => {
+            panic!("unexpected downstream message after upstream EOF: {message:?}")
+        }
+        Some(Err(error)) => {
+            assert!(
+                !error
+                    .to_string()
+                    .contains("upstream websocket reconnect required"),
+                "proxy must not expose its internal reconnect reason: {error}"
+            );
+        }
+        None => {}
+    }
 
     upstream.await.unwrap();
     assert!(
