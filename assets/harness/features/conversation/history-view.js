@@ -269,11 +269,15 @@ export function renderMessages(keepScroll = true) {
       }
       items.push(note);
     }
-    // 任务只显示在所属轮次底部。Claude 旧服务若缺少轮次 plan，仅把会话快照兼容到最新轮次，
-    // 不把第一轮任务复制到整个会话末尾；明确的 turn.plan（包括空数组）始终优先。
-    const plan = Array.isArray(turn.plan) ? turn.plan
-      : claudeSession && turn === lastRealTurn && Array.isArray(sessionPlan) ? sessionPlan : null;
-    const turnPlan = renderTurnPlan(plan, turn.id);
+    // Codex 每轮显示自己的快照；Claude 只在最新轮次底部显示会话级最新清单，
+    // 旧轮次的 plan 仍保留在数据中用于恢复，但不重复渲染为多份用户界面清单。
+    const latestClaudeTurn = claudeSession && turn === lastRealTurn;
+    const plan = claudeSession
+      ? latestClaudeTurn
+        ? Array.isArray(sessionPlan) ? sessionPlan : Array.isArray(turn.plan) ? turn.plan : null
+        : null
+      : turn.plan;
+    const turnPlan = renderTurnPlan(plan, turn.id, claudeSession ? "claude-session" : turn.id);
     if (turnPlan) items.push(turnPlan);
     for (const item of trailingManualCompactions) items.push(renderMessage(item));
     reconcileChildren(group, items);

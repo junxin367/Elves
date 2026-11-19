@@ -71,14 +71,14 @@ export function renderTurnPlanTitle(plan) {
     `${plan.length} 个任务（${count("completed")} 个已完成，${count("inProgress")} 个进行中，${count("pending")} 个待办）`);
 }
 // 用户要求恢复原有的轮次尾部布局；折叠只改变当前轮次任务明细的可见性，不改变任务快照归属。
-export function renderTurnPlan(plan, turnId) {
+export function renderTurnPlan(plan, turnId, expansionId = turnId) {
   if (!Array.isArray(plan) || !plan.length) return null;
-  const key = `${selectedId || ""}:${turnId || ""}`;
+  const key = `${selectedId || ""}:${expansionId || turnId || ""}`;
   const block = element("details", "turn-plan-block");
   block.open = turnPlanExpansion.get(key) !== false;
   const title = element("summary", "turn-plan-title",
     renderTurnPlanTitle(plan).textContent);
-  title.title = "展开或收起当前轮次任务";
+  title.title = "展开或收起任务清单";
   const chevron = icon("chevron");
   chevron.classList.add("turn-plan-chevron");
   title.append(chevron);

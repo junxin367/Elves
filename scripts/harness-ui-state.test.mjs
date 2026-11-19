@@ -14394,13 +14394,13 @@ function claudeExecutionFeedbackHarness(turn) {
     editingMessage: null, editingQueuedMessage: null, pending: null, busy: false, stopping: false, connected: true,
     historyError: "", historyCursor: null, historyInitialized: true, historyScrollTop: 0, markdownRenderVersion: 0,
     textContent: item => item.text || "", $: selector => selector === "#messages" ? root : null,
-    renderTurnPlan: (plan, turnId) => {
+    renderTurnPlan: (plan, turnId, expansionId) => {
       if (!Array.isArray(plan) || !plan.length) return null;
       const node = makeNode();
       node.dataset.planScope = "turn";
       node.dataset.turnId = turnId;
       node.plan = plan;
-      taskPlans.push({ plan, turnId, node });
+      taskPlans.push({ plan, turnId, expansionId, node });
       return node;
     },
     element: (_tag, _className, text = "") => makeNode(text), icon: () => makeNode(),
@@ -14654,7 +14654,7 @@ test("Claude 手动压缩仍在正文末尾，任务清单保留在对应轮次�
   assert.deepEqual(plan.plan, turn.plan);
 });
 
-test("Claude 每个轮次保留自己的最终任务快照，不把第一轮重复追加到会话末尾", () => {
+test("Claude 只显示最新会话级任务清单，不把第一轮快照重复渲染", () => {
   const first = { id: "plan-first", _nativeUserId: "native-plan-first", status: "completed",
     plan: [{ step: "旧任务", status: "completed" }],
     items: [{ id: "input", type: "userMessage" }, { id: "reply", type: "agentMessage", text: "第一轮" }] };
@@ -14664,8 +14664,8 @@ test("Claude 每个轮次保留自己的最终任务快照，不把第一轮重�
   const h = claudeExecutionFeedbackHarness([first, second]);
   h.render();
   assert.deepEqual(Array.from(h.root.children, node => node.dataset.planScope || "turn"), ["turn", "turn"]);
-  assert.deepEqual(h.taskPlans.map(item => [item.turnId, item.plan]), [
-    [first.id, first.plan], [second.id, second.plan]
+  assert.deepEqual(h.taskPlans.map(item => [item.turnId, item.plan, item.expansionId]), [
+    [second.id, second.plan, "claude-session"]
   ]);
   assert.equal(h.root.children[0].children.some(node => node.dataset.planScope === "claude-session"), false,
     "旧全局任务清单不能继续追加到会话末尾");
@@ -14675,14 +14675,14 @@ test("Claude 每个轮次保留自己的最终任务快照，不把第一轮重�
     { step: "收尾", status: "pending" },
   ];
   h.render();
-  assert.deepEqual(h.taskPlans.map(item => [item.turnId, item.plan]), [
-    [first.id, first.plan], [second.id, second.plan]
+  assert.deepEqual(h.taskPlans.map(item => [item.turnId, item.plan, item.expansionId]), [
+    [second.id, second.plan, "claude-session"]
   ]);
 
   second.plan = [];
   h.render();
-  assert.deepEqual(h.taskPlans.map(item => item.turnId), [first.id],
-    "当前轮次明确清空后不能继续显示旧快照，但第一轮最终快照仍保留");
+  assert.deepEqual(h.taskPlans.map(item => item.turnId), [],
+    "当前轮次明确清空后不能继续显示旧快照");
 });
 
 test("Claude 会话级快照只兼容到最新轮次，补齐旧页后各轮次快照分别显示", () => {
@@ -14693,18 +14693,18 @@ test("Claude 会话级快照只兼容到最新轮次，补齐旧页后各轮次�
   const h = claudeExecutionFeedbackHarness(turns.slice(-10));
   h.context.sessionPlan = [{ step: "会话最新任务", status: "inProgress" }];
   h.render();
-  assert.deepEqual(h.taskPlans.map(item => [item.turnId, item.plan]), [
-    ["turn-11", h.context.sessionPlan]
+  assert.deepEqual(h.taskPlans.map(item => [item.turnId, item.plan, item.expansionId]), [
+    ["turn-11", h.context.sessionPlan, "claude-session"]
   ]);
   h.context.turns = new Map(turns.map(turn => [turn.id, turn]));
   h.render();
-  assert.deepEqual(h.taskPlans.map(item => item.turnId), ["turn-0", "turn-11"],
-    "加载旧页后旧轮次和最新轮次各自保留任务快照");
+  assert.deepEqual(h.taskPlans.map(item => item.turnId), ["turn-11"],
+    "加载旧页后仍只显示最新轮次的会话任务清单");
   assert.deepEqual(h.taskPlans.find(item => item.turnId === "turn-11").plan, h.context.sessionPlan);
   h.context.sessionPlan = [];
   h.render();
-  assert.deepEqual(h.taskPlans.map(item => item.turnId), ["turn-0"],
-    "最新会话快照明确为空时不能伪造最新轮次任务，但不能抹掉旧轮次最终快照");
+  assert.deepEqual(h.taskPlans.map(item => item.turnId), [],
+    "最新会话快照明确为空时不能伪造任务清单");
   h.context.sessionPlan = null;
   h.context.turns = new Map([["codex-turn", { id: "codex-turn", status: "inProgress",
     plan: [{ step: "Codex 任务", status: "pending" }], items: [{ id: "input", type: "userMessage" }] }]]);
@@ -14729,11 +14729,13 @@ test("任务列表折叠状态按轮次保留，默认展开不改变原有显�
   });
   vm.runInContext(sourceSection("function renderTurnPlanTitle(", "function legacySentDisplayTurn("), context);
   const plan = [{ step: "任务", status: "inProgress" }];
-  const first = context.renderTurnPlan(plan, "turn-a");
+  const first = context.renderTurnPlan(plan, "turn-a", "claude-session");
   assert.equal(first.open, true);
   first.open = false; first.listeners.toggle();
-  assert.equal(context.renderTurnPlan(plan, "turn-a").open, false);
-  assert.equal(context.renderTurnPlan(plan, "turn-b").open, true);
+  assert.equal(context.renderTurnPlan(plan, "turn-b", "claude-session").open, false,
+    "Claude 会话级清单在新轮次继续沿用用户折叠状态");
+  assert.equal(context.renderTurnPlan(plan, "turn-b", "turn-b").open, true,
+    "Codex 轮次清单按各自轮次保存折叠状态");
 });
 
 test("Codex 任务计划实时更新与重进历史共用快照，较旧版本和迟到读取不撤回新状态", () => {
