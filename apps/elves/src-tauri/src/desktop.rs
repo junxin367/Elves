@@ -1282,8 +1282,8 @@ fn open_about(app: &tauri::AppHandle) -> tauri::Result<()> {
     let mut builder =
         tauri::WebviewWindowBuilder::new(app, "elves-about", WebviewUrl::External(address))
             .title("关于 Elves")
-            // 360×420 为逻辑像素：原有信息区下方增加固定操作区，确认按钮不挤占或遮挡内容。
-            .inner_size(360.0, 420.0)
+            // 按效果图使用紧凑两栏布局；500×300 为逻辑像素，保证信息列和右下确认区不互相挤压。
+            .inner_size(500.0, 300.0)
             .resizable(false)
             // 用户要求关于弹窗标题栏只保留关闭，不提供最小化、最大化或拖边缩放。
             .minimizable(false)

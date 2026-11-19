@@ -1,9 +1,26 @@
-/* 关于页单独保留底部操作区，确认按钮固定右下，不改变启动页的布局。 */
-body.about-page{display:flex;flex-direction:column;gap:16px;padding:28px 24px 18px}
-.about-page main{width:100%;flex:1;min-height:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
-.about-page h1{margin:18px 0 14px}
-.about-page main p{margin:0 0 14px}
-.about-page footer{margin-top:12px}
+/* 按效果图保持宽屏两栏：左侧品牌图、中央分隔线、右侧信息，确认按钮固定在右下角。 */
+body.about-page{display:flex;flex-direction:column;gap:20px;padding:32px 32px 28px;background:#17191b;color:#f5f5f7}
+.about-page main{width:100%;flex:1;min-height:0;display:grid;grid-template-columns:250px 1px minmax(0,1fr);column-gap:32px;align-items:center}
+.about-brand{display:flex;align-items:center;justify-content:center}
+.about-page .brand-icon{width:155px;height:155px;object-fit:contain}
+.about-divider{width:1px;height:206px;background:#4a4c50}
+.about-details{min-width:0;align-self:center}
+.about-page h1{margin:0 0 12px;font-size:40px;line-height:1.15;font-weight:500;letter-spacing:0}
+.about-page main p{margin:0 0 14px;font-size:20px;line-height:1.4;color:#c6c7ca}
+.about-page main p:last-of-type{margin-bottom:14px}
+.about-page a{color:#8673ff;text-decoration:underline;text-underline-offset:4px}
+.about-page footer{margin-top:0;font-size:20px;line-height:1.4;color:#c6c7ca}
 .about-actions{display:flex;align-items:center;justify-content:flex-end;gap:12px;flex-shrink:0;width:100%}
-.about-actions button{padding:8px 22px;flex-shrink:0}
-#about-error{margin:0;font-size:12px;overflow-wrap:anywhere}
+.about-actions button{min-width:116px;height:48px;padding:8px 22px;border-radius:12px;font-size:20px;font-weight:600;background:#f4f4f5;color:#17191b}
+#about-error{margin:0;font-size:12px;overflow-wrap:anywhere;color:#f29b91}
+
+@media (max-width:700px){
+  body.about-page{padding:24px 20px 20px}
+  .about-page main{grid-template-columns:120px 1px minmax(0,1fr);column-gap:20px}
+  .about-page .brand-icon{width:96px;height:96px}
+  .about-divider{height:160px}
+  .about-page h1{margin-bottom:8px;font-size:28px}
+  .about-page main p,.about-page footer{font-size:14px;line-height:1.35}
+  .about-page main p{margin-bottom:8px}
+  .about-actions button{min-width:96px;height:40px;padding:6px 18px;border-radius:10px;font-size:16px}
+}
