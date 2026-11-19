@@ -2825,7 +2825,11 @@ fn build_app_resources_manifest(
 ) -> AppResourcesManifest {
     let mut files: Vec<_> = assets
         .iter()
-        .filter(|(path, _)| desktop || !desktop_only_web_page(path))
+        .filter(|(path, _)| {
+            // 管理页由本机客户端通过独立 iframe 直接加载，不属于 Service Worker 版本壳；
+            // 即使桌面端保留管理页路由，也必须从资源清单排除，否则任一管理页文件都会使清单校验失败。
+            !management_page_path(path) && (desktop || !desktop_only_web_page(path))
+        })
         .map(|(path, asset)| AppResourceFile {
             path: (*path).to_string(),
             content_type: asset.content_type.to_string(),
@@ -18512,8 +18516,20 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
         assert!(!paths.contains(&PREVIEW_WINDOW_PATH));
         assert!(paths.iter().all(|path| !path.starts_with("/api/")));
         assert!(paths.contains(&"/session-files.js"));
-        assert!(build_app_resources_manifest(web_assets(), true).files.iter()
-            .any(|file| file.path == PREVIEW_WINDOW_PATH));
+        let desktop_manifest = build_app_resources_manifest(web_assets(), true);
+        assert!(web_assets().contains_key("/management/index.html"));
+        assert!(
+            desktop_manifest
+                .files
+                .iter()
+                .all(|file| !management_page_path(&file.path))
+        );
+        assert!(
+            desktop_manifest
+                .files
+                .iter()
+                .any(|file| file.path == PREVIEW_WINDOW_PATH)
+        );
         let legacy_preview = client
             .get(format!("{base_url}{PREVIEW_WINDOW_PATH}"))
             .header(reqwest::header::IF_NONE_MATCH, "*")
