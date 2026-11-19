@@ -859,6 +859,18 @@ impl CodexHarness {
         Ok(json!({"ok":true,"thread":thread,"nativeBridge":"harness"}))
     }
 
+    pub(super) async fn naming_turns(&self, id: &str) -> anyhow::Result<Vec<Value>> {
+        let projection = self.projection.lock().await;
+        let side = projection
+            .sides
+            .threads
+            .get(id)
+            .ok_or_else(|| error(409, "此会话不是服务创建的侧边会话"))?;
+        // 临时侧边不支持原生 thread/turns/list；命名只读取 Harness 已接收的自身轮次，
+        // 不使用父会话历史，也不把内部边界消息写入正文或命名输入。
+        Ok(side.turns.iter().take(8).cloned().collect())
+    }
+
     pub(super) async fn side_history(&self, payload: &Value) -> anyhow::Result<Value> {
         let id = required(payload, "threadId")?;
         let projection = self.projection.lock().await;

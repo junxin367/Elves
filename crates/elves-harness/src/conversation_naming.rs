@@ -1307,10 +1307,15 @@ mod tests {
 
     #[tokio::test]
     async fn conversation_naming_names_side_once_without_compaction_refresh() {
-        let (_directory, authorization, parent, _generation) = naming_fixture(false, false).await;
+        let (directory, authorization, parent, _generation) = naming_fixture(false, false).await;
         let controller = &authorization.controller;
         let service = &controller.conversation_naming;
         wait_idle(service).await;
+        std::fs::write(
+            directory.path().join("side-policy.json"),
+            serde_json::to_vec(&json!({"ephemeralHistoryUnavailable":true})).unwrap(),
+        )
+        .unwrap();
         let side_generation = TestGeneration {
             text: r#"{"title":"侧边自动标题","description":"侧边命名"}"#.into(),
             started: Arc::new(tokio::sync::Notify::new()),
