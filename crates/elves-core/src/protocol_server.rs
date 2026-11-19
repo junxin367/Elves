@@ -1000,7 +1000,17 @@ async fn handle_protocol_proxy_connection_inner(
             } else {
                 upstream_content_type
             };
-            write_http_response(stream, &status, &content_type, &upstream_body).await?;
+            let retry_after = (status_code == 429)
+                .then(|| crate::protocol_proxy::rate_limit_retry_after_seconds(&upstream_body))
+                .flatten();
+            write_http_response_with_retry_after(
+                stream,
+                &status,
+                &content_type,
+                &upstream_body,
+                retry_after,
+            )
+            .await?;
             log_helper_response(
                 "helper.protocol_proxy_upstream_error",
                 method,
@@ -1037,7 +1047,17 @@ async fn handle_protocol_proxy_connection_inner(
             &upstream_body,
         );
         let body = serde_json::to_vec(&error)?;
-        write_http_response(stream, &status, "application/json; charset=utf-8", &body).await?;
+        let retry_after = (status_code == 429)
+            .then(|| crate::protocol_proxy::rate_limit_retry_after_seconds(&upstream_body))
+            .flatten();
+        write_http_response_with_retry_after(
+            stream,
+            &status,
+            "application/json; charset=utf-8",
+            &body,
+            retry_after,
+        )
+        .await?;
         log_helper_response(
             "helper.protocol_proxy_upstream_error",
             method,
@@ -2919,7 +2939,17 @@ async fn handle_chat_completions_proxy_connection(
             observed_upstream_model(&body, response_protocol, false),
         );
     }
-    write_http_response(stream, &status, &content_type, &body).await?;
+    let retry_after = (status_code == 429)
+        .then(|| crate::protocol_proxy::rate_limit_retry_after_seconds(&body))
+        .flatten();
+    write_http_response_with_retry_after(
+        stream,
+        &status,
+        &content_type,
+        &body,
+        retry_after,
+    )
+    .await?;
     log_helper_response(
         if is_success {
             "helper.chat_completions_proxy_ok"
@@ -3309,9 +3339,22 @@ async fn write_http_response(
     content_type: &str,
     body: &[u8],
 ) -> anyhow::Result<()> {
+    write_http_response_with_retry_after(stream, status, content_type, body, None).await
+}
+
+async fn write_http_response_with_retry_after(
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+    retry_after_seconds: Option<u64>,
+) -> anyhow::Result<()> {
+    let retry_after = retry_after_seconds
+        .map(|seconds| format!("Retry-After: {seconds}\r\n"))
+        .unwrap_or_default();
     let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n{retry_after}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len(),
     );
     stream.write_all(response.as_bytes()).await?;
     stream.write_all(body).await?;

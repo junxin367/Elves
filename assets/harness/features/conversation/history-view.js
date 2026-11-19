@@ -54,6 +54,31 @@ import { syncRelatedSessionLayout } from "../session/related.js";
 import { currentThreadDisplay, readScope } from "../session/thread-cache.js";
 import { composerScroll } from "../shell-state.js";
 
+function isRateLimitTurnError(error) {
+  const text = JSON.stringify(error ?? "").toLowerCase();
+  return error?.statusCode === 429 || error?.code === 429
+    || /usage_limit|rate\s*limit|ratelimit|too many requests|quota/u.test(text);
+}
+
+function renderTurnError(error) {
+  const rateLimited = isRateLimitTurnError(error);
+  const node = element("div", `turn-error${rateLimited ? " rate-limit-error" : ""}`);
+  node.setAttribute("role", "alert");
+  if (!rateLimited) {
+    node.textContent = error?.message || "此轮执行失败";
+    return node;
+  }
+  // 用户要求 Harness 对齐 Codex：429 终态明确告诉用户已达到上游使用上限，
+  // 不把原始 JSON 当作唯一可读反馈；详细错误仍可展开查看，便于诊断。
+  node.append(element("strong", "turn-error-title", "已达到上游使用上限"));
+  node.append(element("p", "turn-error-message", "你已达到使用上限，请稍后再试。"));
+  const detail = typeof error?.message === "string" && error.message.trim()
+    || typeof error?.additionalDetails === "string" && error.additionalDetails.trim();
+  if (detail && !/usage limit|rate limit|quota/iu.test(detail))
+    node.append(element("small", "turn-error-detail", detail));
+  return node;
+}
+
 export function scheduleMessages() {
   if (messageFrame != null) return;
   setMessageFrame(requestAnimationFrame(() => { setMessageFrame(null); renderMessages(); }));
@@ -229,7 +254,7 @@ export function renderMessages(keepScroll = true) {
       const editedFiles = renderEditedFiles(turn, group.querySelector(":scope > .edited-files-card"));
       if (editedFiles) items.push(editedFiles);
     }
-    if (turn.error) items.push(element("div", "turn-error", turn.error.message || "此轮执行失败"));
+    if (turn.error) items.push(renderTurnError(turn.error));
     // 原生已结束但没有回复时保留已接收消息，结束等待提示；不把未知的结束原因说成用户主动停止。
     // 出字前停止由连接端按终端输入框确认为原生撤回（Rust _nativeWithdrawn）：原文回到原版终端输入框，不进入对话。
     if (turn._nativeEndedWithoutReply === true)

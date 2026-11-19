@@ -2,8 +2,7 @@
 //!
 //! Codex Chat 与 Responses 协议之间的转换实现。
 
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -75,9 +74,331 @@ const ANTHROPIC_DEEPSEEK_V4_MAX_OUTPUT_TOKENS: u64 = 384_000;
 const ANTHROPIC_CLAUDE_LEGACY_MAX_OUTPUT_TOKENS: u64 = 8_192;
 const ANTHROPIC_CLAUDE_OPUS_4_MAX_OUTPUT_TOKENS: u64 = 32_000;
 const ANTHROPIC_CLAUDE_4_5_MAX_OUTPUT_TOKENS: u64 = 64_000;
+// 用户要求：上游返回 429 后停止向同一线路重复打请求；只在冷却窗口内拦截，
+// 仍把 429 交给原生客户端，让它保留自己的重连/终态交互。
+const RATE_LIMIT_DEFAULT_COOLDOWN: Duration = Duration::from_secs(30);
+const RATE_LIMIT_MAX_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
 const REASONING_EFFORT_ORDER: &[&str] =
     &["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 static PROTOCOL_PROXY_DIAGNOSTIC_COUNTER: AtomicU64 = AtomicU64::new(1);
+static RATE_LIMIT_COOLDOWNS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RateLimitScope {
+    Model,
+    Credential,
+}
+
+fn rate_limit_cooldowns() -> &'static Mutex<HashMap<String, u64>> {
+    RATE_LIMIT_COOLDOWNS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn rate_limit_now_ms() -> u64 {
+    crate::proxy_log::current_timestamp_ms()
+}
+
+fn rate_limit_model(request: &Value) -> String {
+    request
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+fn rate_limit_key(relay_id: &str, endpoint: &str, model: &str, scope: RateLimitScope) -> String {
+    match scope {
+        RateLimitScope::Credential => format!("credential|{relay_id}|{endpoint}"),
+        RateLimitScope::Model => format!("model|{relay_id}|{endpoint}|{model}"),
+    }
+}
+
+fn rate_limit_cooldown_until(
+    relay_id: &str,
+    endpoint: &str,
+    model: &str,
+) -> Option<u64> {
+    let now = rate_limit_now_ms();
+    let keys = [
+        rate_limit_key(relay_id, endpoint, model, RateLimitScope::Credential),
+        rate_limit_key(relay_id, endpoint, model, RateLimitScope::Model),
+    ];
+    let mut guard = rate_limit_cooldowns()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.retain(|_, until| *until > now);
+    keys.into_iter()
+        .filter_map(|key| guard.get(&key).copied())
+        .max()
+}
+
+fn parse_retry_after_seconds(value: Option<&str>) -> Option<u64> {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+}
+
+fn rate_limit_delay_ms(retry_after_seconds: Option<u64>, reset_at_ms: Option<u64>) -> u64 {
+    let now = rate_limit_now_ms();
+    let requested = retry_after_seconds
+        .map(|seconds| seconds.saturating_mul(1000))
+        .or_else(|| reset_at_ms.map(|at| at.saturating_sub(now)))
+        .unwrap_or_else(|| RATE_LIMIT_DEFAULT_COOLDOWN.as_millis() as u64);
+    requested
+        .max(1_000)
+        .min(RATE_LIMIT_MAX_COOLDOWN.as_millis() as u64)
+}
+
+fn find_numeric_field(value: &Value, keys: &[&str]) -> Option<u64> {
+    match value {
+        Value::Object(object) => {
+            for key in keys {
+                if let Some(number) = object.get(*key).and_then(Value::as_u64) {
+                    return Some(number);
+                }
+            }
+            object.values().find_map(|value| find_numeric_field(value, keys))
+        }
+        Value::Array(values) => values.iter().find_map(|value| find_numeric_field(value, keys)),
+        _ => None,
+    }
+}
+
+fn rate_limit_reset_at_ms(body: &[u8]) -> Option<u64> {
+    let value = serde_json::from_slice::<Value>(body).ok()?;
+    let raw = find_numeric_field(&value, &["resets_at", "resetsAt"])?;
+    Some(if raw < 100_000_000_000 {
+        raw.saturating_mul(1000)
+    } else {
+        raw
+    })
+}
+
+fn rate_limit_scope(body: &[u8]) -> RateLimitScope {
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    if text.contains("usage_limit_reached")
+        || text.contains("usage limit")
+        || text.contains("quota")
+        || text.contains("billing_hard_limit")
+        || text.contains("plan_type")
+        || text.contains("resets_at")
+        || text.contains("resetsat")
+    {
+        RateLimitScope::Credential
+    } else {
+        RateLimitScope::Model
+    }
+}
+
+pub(crate) fn is_rate_limit_response(status_code: Option<u16>, body: &[u8]) -> bool {
+    if status_code == Some(429) {
+        return true;
+    }
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    text.contains("usage_limit_reached")
+        || text.contains("rate_limit_error")
+        || text.contains("rate_limit_exceeded")
+        || text.contains("rate limit")
+        || text.contains("too many requests")
+        || text.contains("quota")
+        || text.contains("\"status_code\":429")
+        || text.contains("\"statuscode\":429")
+}
+
+fn record_rate_limit_cooldown(
+    relay_id: &str,
+    endpoint: &str,
+    model: &str,
+    scope: RateLimitScope,
+    retry_after_seconds: Option<u64>,
+    reset_at_ms: Option<u64>,
+) -> u64 {
+    let until = rate_limit_now_ms().saturating_add(rate_limit_delay_ms(
+        retry_after_seconds,
+        reset_at_ms,
+    ));
+    let key = rate_limit_key(relay_id, endpoint, model, scope);
+    let mut guard = rate_limit_cooldowns()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entry = guard.entry(key).or_insert(0);
+    *entry = (*entry).max(until);
+    *entry
+}
+
+pub(crate) fn record_rate_limit_from_upstream(
+    relay_id: &str,
+    endpoint: &str,
+    model: &str,
+    status_code: Option<u16>,
+    retry_after: Option<&str>,
+    body: &[u8],
+) -> Option<u64> {
+    if !is_rate_limit_response(status_code, body) {
+        return None;
+    }
+    let model = model.trim();
+    // WebSocket 握手尚未收到 response.create，模型名为空时只能按凭据级冷却，
+    // 否则同一线路会在每次握手重试时再次命中上游 429。
+    let scope = if model.is_empty() {
+        RateLimitScope::Credential
+    } else {
+        rate_limit_scope(body)
+    };
+    Some(record_rate_limit_cooldown(
+        relay_id,
+        endpoint,
+        model,
+        scope,
+        parse_retry_after_seconds(retry_after),
+        rate_limit_reset_at_ms(body),
+    ))
+}
+
+pub(crate) fn rate_limit_cooldown_remaining_for_relay(
+    relay_id: &str,
+    endpoint: &str,
+) -> Option<u64> {
+    let now = rate_limit_now_ms();
+    let key = rate_limit_key(relay_id, endpoint, "", RateLimitScope::Credential);
+    let mut guard = rate_limit_cooldowns()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.retain(|_, until| *until > now);
+    guard
+        .get(&key)
+        .copied()
+        .map(|until| until.saturating_sub(now))
+        .filter(|remaining| *remaining > 0)
+}
+
+pub(crate) fn rate_limit_cooldown_remaining_for_model(
+    relay_id: &str,
+    endpoint: &str,
+    model: &str,
+) -> Option<u64> {
+    rate_limit_cooldown_until(relay_id, endpoint, model)
+        .map(|until| until.saturating_sub(rate_limit_now_ms()))
+        .filter(|remaining| *remaining > 0)
+}
+
+fn arm_rate_limit_from_headers(
+    relay_id: &str,
+    endpoint: &str,
+    request: &Value,
+    headers: &reqwest::header::HeaderMap,
+) {
+    let Some(retry_after) = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+    else {
+        // 没有 Retry-After 时先建立短暂的模型级闸门；读取正文后若确认是账号级额度，
+        // record_rate_limit_body 会把同一线路提升为凭据级冷却。
+        let model = rate_limit_model(request);
+        record_rate_limit_cooldown(
+            relay_id,
+            endpoint,
+            &model,
+            RateLimitScope::Model,
+            None,
+            None,
+        );
+        return;
+    };
+    let model = rate_limit_model(request);
+    record_rate_limit_cooldown(
+        relay_id,
+        endpoint,
+        &model,
+        RateLimitScope::Model,
+        parse_retry_after_seconds(Some(retry_after)),
+        None,
+    );
+}
+
+fn record_rate_limit_body(
+    relay_id: Option<&str>,
+    endpoint: Option<&str>,
+    request_body: &str,
+    body: &[u8],
+) {
+    let (Some(relay_id), Some(endpoint)) = (relay_id, endpoint) else {
+        return;
+    };
+    let Ok(request) = serde_json::from_str::<Value>(request_body) else {
+        return;
+    };
+    let model = rate_limit_model(&request);
+    let _ = record_rate_limit_from_upstream(
+        relay_id,
+        endpoint,
+        &model,
+        Some(429),
+        None,
+        body,
+    );
+}
+
+/// 返回 429 正文中可安全转发给客户端的等待秒数。
+pub fn rate_limit_retry_after_seconds(body: &[u8]) -> Option<u64> {
+    let now = rate_limit_now_ms();
+    let value = body_value(body)?;
+    if let Some(seconds) = find_numeric_field(&value, &["retry_after_seconds", "retryAfterSeconds"]) {
+        return Some(seconds.max(1));
+    }
+    rate_limit_reset_at_ms(body)
+        .filter(|reset_at| *reset_at > now)
+        .map(|reset_at| (reset_at - now).div_ceil(1000).max(1))
+}
+
+fn body_value(body: &[u8]) -> Option<Value> {
+    serde_json::from_slice(body).ok()
+}
+
+fn rate_limit_cooldown_response(
+    audit: crate::proxy_log::ProxyRequestAudit,
+    diagnostic_id: String,
+    relay_id: String,
+    relay_name: String,
+    endpoint: String,
+    request_body: String,
+    response_protocol: UpstreamResponseProtocol,
+    remaining_ms: u64,
+) -> UpstreamProxyResponse {
+    let seconds = remaining_ms.div_ceil(1000).max(1);
+    UpstreamProxyResponse {
+        audit,
+        status_code: 429,
+        content_type: "application/json; charset=utf-8".to_string(),
+        is_stream: false,
+        response_protocol,
+        diagnostic_id,
+        relay_id: Some(relay_id),
+        relay_name: Some(relay_name),
+        endpoint: Some(endpoint),
+        request_body,
+        anthropic_replay_origin: None,
+        response: None,
+        body_override: Some(
+            json!({
+                "error": {
+                    "type": "rate_limit_error",
+                    "code": "local_proxy_rate_limit_cooldown",
+                    "message": format!("上游刚返回 429，本地代理已暂停向该线路发送请求，请在 {seconds} 秒后重试。"),
+                    "retry_after_seconds": seconds
+                }
+            })
+            .to_string()
+            .into_bytes(),
+        ),
+        upstream_response_model: None,
+        layered_compaction_options: LayeredCompactionOptions::default(),
+        independent_compaction_model: None,
+        independent_compaction_usage: None,
+        bridge_remote_compaction_v2: false,
+        cache_observer: None,
+    }
+}
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct AnthropicThinkingReplayOrigin {
@@ -2236,6 +2557,16 @@ impl UpstreamProxyResponse {
     }
 
     pub async fn into_body_bytes(mut self) -> anyhow::Result<Vec<u8>> {
+        let retry_after = self
+            .response
+            .as_ref()
+            .and_then(|response| {
+                response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| parse_retry_after_seconds(Some(value)))
+            });
         let body = if let Some(body) = self.body_override.take() {
             body
         } else {
@@ -2244,6 +2575,30 @@ impl UpstreamProxyResponse {
             };
             response.bytes().await?.to_vec()
         };
+        if self.status_code == 429 {
+            if let Some(seconds) = retry_after {
+                if let (Some(relay_id), Some(endpoint)) =
+                    (self.relay_id.as_deref(), self.endpoint.as_deref())
+                {
+                    if let Ok(request) = serde_json::from_str::<Value>(&self.request_body) {
+                        record_rate_limit_cooldown(
+                            relay_id,
+                            endpoint,
+                            &rate_limit_model(&request),
+                            RateLimitScope::Model,
+                            Some(seconds),
+                            None,
+                        );
+                    }
+                }
+            }
+            record_rate_limit_body(
+                self.relay_id.as_deref(),
+                self.endpoint.as_deref(),
+                &self.request_body,
+                &body,
+            );
+        }
         if self.is_success()
             && let Some(mut observer) = self.cache_observer.take()
         {
@@ -2257,6 +2612,16 @@ impl UpstreamProxyResponse {
         mut self,
         idle_timeout: Duration,
     ) -> anyhow::Result<Vec<u8>> {
+        let retry_after = self
+            .response
+            .as_ref()
+            .and_then(|response| {
+                response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| parse_retry_after_seconds(Some(value)))
+            });
         let body = if let Some(body) = self.body_override.take() {
             body
         } else {
@@ -2265,6 +2630,30 @@ impl UpstreamProxyResponse {
             };
             read_upstream_response_body_with_idle_timeout(response, idle_timeout).await?
         };
+        if self.status_code == 429 {
+            if let Some(seconds) = retry_after {
+                if let (Some(relay_id), Some(endpoint)) =
+                    (self.relay_id.as_deref(), self.endpoint.as_deref())
+                {
+                    if let Ok(request) = serde_json::from_str::<Value>(&self.request_body) {
+                        record_rate_limit_cooldown(
+                            relay_id,
+                            endpoint,
+                            &rate_limit_model(&request),
+                            RateLimitScope::Model,
+                            Some(seconds),
+                            None,
+                        );
+                    }
+                }
+            }
+            record_rate_limit_body(
+                self.relay_id.as_deref(),
+                self.endpoint.as_deref(),
+                &self.request_body,
+                &body,
+            );
+        }
         if self.is_success()
             && let Some(mut observer) = self.cache_observer.take()
         {
@@ -3708,6 +4097,49 @@ async fn open_responses_proxy_request_once(
         } else {
             upstream_endpoint_for_protocol(&relay, response_protocol)
         };
+        let has_more_candidates = attempt + 1 < relay_count;
+        if let Some(until) = rate_limit_cooldown_until(
+            &relay.id,
+            &endpoint,
+            &rate_limit_model(&request_json),
+        ) {
+            let remaining_ms = until.saturating_sub(rate_limit_now_ms());
+            let model = rate_limit_model(&request_json);
+            audit.record_attempt(
+                &model,
+                Some(429),
+                Some(format!(
+                    "本地代理 429 冷却中，剩余 {} 秒",
+                    remaining_ms.div_ceil(1000)
+                )),
+            );
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "protocol_proxy.rate_limit_cooldown_blocked",
+                json!({
+                    "diagnosticId": diagnostic_id.as_str(),
+                    "relayId": relay.id,
+                    "relayName": relay.name,
+                    "endpoint": endpoint,
+                    "model": model,
+                    "remainingMs": remaining_ms,
+                    "attempt": attempt + 1,
+                    "candidateCount": relay_count
+                }),
+            );
+            if has_more_candidates {
+                continue;
+            }
+            return Ok(rate_limit_cooldown_response(
+                audit,
+                diagnostic_id,
+                relay.id.clone(),
+                relay.name.clone(),
+                endpoint,
+                serialized_proxy_request_body(&request_json),
+                response_protocol,
+                remaining_ms,
+            ));
+        }
         let can_recover_ws = is_stream
             && !native_compact
             && compaction_execution_mode == CompactionExecutionMode::None
@@ -3722,7 +4154,6 @@ async fn open_responses_proxy_request_once(
             // requests are auxiliary and must not reset the conversation's timer.
             crate::session_transport::forget_thread(request_context);
         }
-        let has_more_candidates = attempt + 1 < relay_count;
         let upstream_is_stream = is_stream;
         let header_timeout = Some(
             stream_header_timeout_override
@@ -3832,6 +4263,14 @@ async fn open_responses_proxy_request_once(
                     .context(failure_context);
             }
         };
+        if upstream.status().as_u16() == 429 && !used_ws {
+            arm_rate_limit_from_headers(
+                &relay.id,
+                &endpoint,
+                &request_json,
+                upstream.headers(),
+            );
+        }
         let mut cache_wire_request = upstream_request_json.clone();
         if used_ws {
             endpoint = crate::responses_websocket::responses_websocket_url(
@@ -4608,6 +5047,35 @@ pub async fn open_chat_completions_proxy_request(
         validate_upstream(&relay)?;
         let request_json = apply_system_prompt_override_to_chat_request(&original, &relay);
         let request_json = rewrite_catalog_model_to_request_model(&request_json, &relay);
+        let endpoint = chat_completions_url(&relay.base_url);
+        let has_more_candidates = attempt + 1 < relay_count;
+        if let Some(until) =
+            rate_limit_cooldown_until(&relay.id, &endpoint, &rate_limit_model(&request_json))
+        {
+            let remaining_ms = until.saturating_sub(rate_limit_now_ms());
+            let model = rate_limit_model(&request_json);
+            audit.record_attempt(
+                &model,
+                Some(429),
+                Some(format!(
+                    "本地代理 429 冷却中，剩余 {} 秒",
+                    remaining_ms.div_ceil(1000)
+                )),
+            );
+            if has_more_candidates {
+                continue;
+            }
+            return Ok(rate_limit_cooldown_response(
+                audit,
+                diagnostic_id,
+                relay.id.clone(),
+                relay.name.clone(),
+                endpoint,
+                serialized_proxy_request_body(&request_json),
+                UpstreamResponseProtocol::ChatCompletions,
+                remaining_ms,
+            ));
+        }
         let client = crate::http_client::proxied_client(&effective_user_agent(
             &relay.user_agent,
             original_user_agent,
@@ -4650,6 +5118,9 @@ pub async fn open_chat_completions_proxy_request(
             }
         };
         let status_code = upstream.status().as_u16();
+        if status_code == 429 {
+            arm_rate_limit_from_headers(&relay.id, &endpoint, &request_json, upstream.headers());
+        }
         audit.record_attempt(
             request_json
                 .get("model")
@@ -4666,7 +5137,7 @@ pub async fn open_chat_completions_proxy_request(
                 RotationEvent::Failure
             },
         );
-        if !upstream.status().is_success() && attempt + 1 < relay_count {
+        if !upstream.status().is_success() && has_more_candidates {
             continue;
         }
         let content_type = upstream
@@ -4685,7 +5156,7 @@ pub async fn open_chat_completions_proxy_request(
             diagnostic_id,
             relay_id: Some(relay.id.clone()),
             relay_name: Some(relay.name.clone()),
-            endpoint: Some(chat_completions_url(&relay.base_url)),
+            endpoint: Some(endpoint),
             request_body: serialized_proxy_request_body(&request_json),
             anthropic_replay_origin: None,
             response: Some(upstream),
@@ -16559,5 +17030,71 @@ data: {"type":"response.completed","response":{"status":"completed","output":[{"
 
 "#;
         assert!(!responses_body_has_retryable_model_capacity_error(body));
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_cooldown_tests {
+    use super::*;
+
+    #[test]
+    fn usage_limit_body_exposes_reset_wait_and_uses_credential_scope() {
+        let seconds = (rate_limit_now_ms() / 1000).saturating_add(90);
+        let body = serde_json::to_vec(&json!({
+            "error": {
+                "type": "usage_limit_reached",
+                "message": "The usage limit has been reached",
+                "resets_at": seconds,
+                "plan_type": "pro"
+            }
+        }))
+        .unwrap();
+        let retry_after = rate_limit_retry_after_seconds(&body).unwrap();
+        assert!((89..=90).contains(&retry_after));
+        assert_eq!(rate_limit_scope(&body), RateLimitScope::Credential);
+
+        let relay = "rate-limit-credential-test";
+        let endpoint = "https://example.test/v1/responses";
+        record_rate_limit_body(Some(relay), Some(endpoint), r#"{"model":"gpt-a"}"#, &body);
+        assert!(rate_limit_cooldown_until(relay, endpoint, "gpt-a").is_some());
+        assert!(rate_limit_cooldown_until(relay, endpoint, "gpt-b").is_some());
+        rate_limit_cooldowns()
+            .lock()
+            .unwrap()
+            .retain(|key, _| !key.contains(relay));
+    }
+
+    #[test]
+    fn ordinary_rate_limit_body_only_blocks_the_same_model() {
+        let relay = "rate-limit-model-test";
+        let endpoint = "https://example.test/v1/responses";
+        let body = br#"{"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"too many requests"}}"#;
+        assert_eq!(rate_limit_scope(body), RateLimitScope::Model);
+        record_rate_limit_body(Some(relay), Some(endpoint), r#"{"model":"gpt-a"}"#, body);
+        assert!(rate_limit_cooldown_until(relay, endpoint, "gpt-a").is_some());
+        assert!(rate_limit_cooldown_until(relay, endpoint, "gpt-b").is_none());
+        rate_limit_cooldowns()
+            .lock()
+            .unwrap()
+            .retain(|key, _| !key.contains(relay));
+    }
+
+    #[tokio::test]
+    async fn cooldown_response_keeps_429_and_retry_after_in_body() {
+        let response = rate_limit_cooldown_response(
+            Default::default(),
+            "ppx-rate-limit-test".into(),
+            "relay".into(),
+            "Relay".into(),
+            "https://example.test/v1/responses".into(),
+            r#"{"model":"gpt-a"}"#.into(),
+            UpstreamResponseProtocol::Responses,
+            2_500,
+        );
+        assert_eq!(response.status_code, 429);
+        let body = response.into_body_bytes().await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "local_proxy_rate_limit_cooldown");
+        assert_eq!(value["error"]["retry_after_seconds"], 3);
     }
 }

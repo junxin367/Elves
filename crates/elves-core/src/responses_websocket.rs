@@ -19,6 +19,23 @@ pub(crate) const RESPONSES_UPSTREAM_WEBSOCKET_SAFE_MAX_BYTES: usize = 16 * 1024 
 pub type UpstreamResponsesWebsocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+#[derive(Debug)]
+pub(crate) struct ResponsesWebsocketRateLimitError {
+    pub(crate) status_code: u16,
+}
+
+impl std::fmt::Display for ResponsesWebsocketRateLimitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Responses WebSocket 上游返回 HTTP {} 限流",
+            self.status_code
+        )
+    }
+}
+
+impl std::error::Error for ResponsesWebsocketRateLimitError {}
+
 pub(crate) fn responses_websocket_config() -> WebSocketConfig {
     WebSocketConfig::default()
         .max_frame_size(Some(RESPONSES_TRANSPORT_MAX_BYTES))
@@ -119,6 +136,22 @@ pub async fn probe_responses_websocket(profile: &RelayProfile) -> ResponsesWebso
             classify_probe_http_status(endpoint, response.status())
         }
         Ok(Err(WebsocketError::Http(response))) => {
+            let status_code = response.status().as_u16();
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok());
+            let body = response.body().as_deref().unwrap_or_default();
+            if crate::protocol_proxy::is_rate_limit_response(Some(status_code), body) {
+                let _ = crate::protocol_proxy::record_rate_limit_from_upstream(
+                    &profile.id,
+                    &endpoint,
+                    "",
+                    Some(status_code),
+                    retry_after,
+                    body,
+                );
+            }
             classify_probe_http_status(endpoint, response.status())
         }
         Ok(Err(error)) => unknown_probe_result(endpoint, websocket_error_message(&error)),
@@ -138,6 +171,8 @@ pub async fn open_responses_websocket_upstream_with_request_context(
     request_context: &RequestContext,
 ) -> anyhow::Result<UpstreamResponsesWebsocket> {
     let request = responses_websocket_request(profile, Some(request_context))?;
+    let endpoint = responses_websocket_url(relay_responses_base_url(profile))
+        .unwrap_or_else(|| "responses-websocket".to_string());
     let result = tokio::time::timeout(
         PROBE_TIMEOUT,
         tokio_tungstenite::connect_async_with_config(
@@ -148,20 +183,35 @@ pub async fn open_responses_websocket_upstream_with_request_context(
     )
     .await
     .context("Responses WebSocket 上游连接超时")?;
-    let (socket, response) = result.map_err(|error| {
-        anyhow::anyhow!(
-            "{}",
-            match error {
-                WebsocketError::Http(ref response) => {
-                    format!(
-                        "Responses WebSocket 上游返回 HTTP {}",
-                        response.status().as_u16()
-                    )
-                }
-                _ => websocket_error_message(&error).to_string(),
+    let (socket, response) = match result {
+        Ok(pair) => pair,
+        Err(WebsocketError::Http(response)) => {
+            let status_code = response.status().as_u16();
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok());
+            let body = response.body().as_deref().unwrap_or_default();
+            if crate::protocol_proxy::is_rate_limit_response(Some(status_code), body) {
+                let _ = crate::protocol_proxy::record_rate_limit_from_upstream(
+                    &profile.id,
+                    &endpoint,
+                    "",
+                    Some(status_code),
+                    retry_after,
+                    body,
+                );
+                return Err(anyhow::Error::new(ResponsesWebsocketRateLimitError {
+                    status_code,
+                }));
             }
-        )
-    })?;
+            return Err(anyhow::anyhow!(
+                "Responses WebSocket 上游返回 HTTP {}",
+                status_code
+            ));
+        }
+        Err(error) => return Err(anyhow::anyhow!("{}", websocket_error_message(&error))),
+    };
     if response.status() != StatusCode::SWITCHING_PROTOCOLS {
         anyhow::bail!(
             "Responses WebSocket 上游返回 HTTP {}",

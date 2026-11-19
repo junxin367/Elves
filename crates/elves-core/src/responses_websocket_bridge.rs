@@ -291,6 +291,33 @@ pub async fn handle_responses_websocket_connection(
         reject_upgrade(&mut stream, StatusCode::UPGRADE_REQUIRED, message).await?;
         return Ok(());
     }
+    let websocket_endpoint = crate::responses_websocket::responses_websocket_url(
+        crate::responses_websocket::relay_responses_base_url(&relay),
+    );
+    if let Some(endpoint) = websocket_endpoint.as_deref()
+        && let Some(remaining_ms) =
+            crate::protocol_proxy::rate_limit_cooldown_remaining_for_relay(&relay.id, endpoint)
+    {
+        let seconds = remaining_ms.div_ceil(1000).max(1);
+        let message = format!(
+            "上游刚返回 429，本地代理已暂停 Responses WebSocket 建连，请在 {seconds} 秒后重试。"
+        );
+        log_websocket_event(
+            "helper.responses_websocket_rate_limit_cooldown",
+            &relay,
+            remote_addr.as_deref(),
+            &connection_context,
+            Some(&message),
+        );
+        reject_upgrade_with_retry_after(
+            &mut stream,
+            StatusCode::TOO_MANY_REQUESTS,
+            &message,
+            seconds,
+        )
+        .await?;
+        return Ok(());
+    }
 
     let upstream = match open_responses_websocket_upstream_with_initial_retries(
         &relay,
@@ -299,6 +326,38 @@ pub async fn handle_responses_websocket_connection(
     .await
     {
         Ok(upstream) => upstream,
+        Err(error)
+            if error
+                .downcast_ref::<crate::responses_websocket::ResponsesWebsocketRateLimitError>()
+                .is_some() =>
+        {
+            let seconds = websocket_endpoint
+                .as_deref()
+                .and_then(|endpoint| {
+                    crate::protocol_proxy::rate_limit_cooldown_remaining_for_relay(
+                        &relay.id, endpoint,
+                    )
+                })
+                .map(|remaining_ms| remaining_ms.div_ceil(1000).max(1))
+                .unwrap_or(1);
+            let message =
+                format!("上游返回 429，本地代理已停止重复建连，请在 {seconds} 秒后重试。");
+            log_websocket_event(
+                "helper.responses_websocket_rate_limited",
+                &relay,
+                remote_addr.as_deref(),
+                &connection_context,
+                Some(&message),
+            );
+            reject_upgrade_with_retry_after(
+                &mut stream,
+                StatusCode::TOO_MANY_REQUESTS,
+                &message,
+                seconds,
+            )
+            .await?;
+            return Ok(());
+        }
         Err(error) => {
             ensure_websocket_relay_still_current(&relay)?;
             // 用户要求：内部安全重试耗尽只计一个建连失败周期，达到会话阈值才强制 HTTP。
@@ -651,6 +710,41 @@ async fn bridge_responses_websockets(
                     if let (Some(request_payload), Message::Text(text)) =
                         (request_payload.as_ref(), &message)
                     {
+                        if let Some(remaining_ms) = request_payload
+                            .get("model")
+                            .and_then(Value::as_str)
+                            .and_then(|model| request_logger.rate_limit_cooldown_remaining(model))
+                        {
+                            // 用户要求：同一 WS 连接也必须尊重 HTTP/WS 共享的 429 冷却，
+                            // 在本地生成终态而不是把下一条 response.create 再送到已限流线路。
+                            crate::session_transport::observe_native_request(
+                                &relay,
+                                &request_context,
+                                request_payload,
+                                text.len(),
+                            );
+                            let log_id = request_logger.record_request(request_payload, text.as_str());
+                            let seconds = remaining_ms.div_ceil(1000).max(1);
+                            let failure = websocket_rate_limit_failure_message(
+                                request_payload
+                                    .get("model")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default(),
+                                seconds,
+                            );
+                            if forward_downstream_response(
+                                &mut downstream,
+                                failure,
+                                &request_logger,
+                                log_id.as_deref(),
+                            )
+                            .await?
+                            {
+                                downstream_closed = true;
+                                break 'bridge;
+                            }
+                            continue;
+                        }
                         crate::session_transport::observe_native_request(
                             &relay, &request_context, request_payload, text.len(),
                         );
@@ -1214,6 +1308,15 @@ async fn open_responses_websocket_upstream_with_initial_retries(
         .await
         {
             Ok(upstream) => return Ok(upstream),
+            Err(error)
+                if error
+                    .downcast_ref::<
+                        crate::responses_websocket::ResponsesWebsocketRateLimitError,
+                    >()
+                    .is_some() =>
+            {
+                return Err(error);
+            }
             Err(error) => last_error = Some(error),
         }
     }
@@ -1337,6 +1440,14 @@ async fn recover_upstream_connection(
                         *attempts,
                         Some(&format!("{error:#}")),
                     );
+                    if error
+                        .downcast_ref::<
+                            crate::responses_websocket::ResponsesWebsocketRateLimitError,
+                        >()
+                        .is_some()
+                    {
+                        return Err(error);
+                    }
                     last_error = Some(error);
                 }
             }
@@ -1872,6 +1983,10 @@ fn handle_validated_compaction_websocket_message(
         .and_then(|payload| payload.get("type"))
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let rate_limited = payload.as_ref().is_some_and(|payload| {
+        let body = payload.to_string();
+        crate::protocol_proxy::is_rate_limit_response(None, body.as_bytes())
+    });
     let transport_failure =
         malformed || closed || matches!(event_type, "response.failed" | "error");
     log_compaction_attempt(
@@ -1929,7 +2044,8 @@ fn handle_validated_compaction_websocket_message(
             .error
             .or_else(|| Some(failure.as_str().to_string()));
     }
-    if verdict.is_err() && active.round == 0 {
+    // 429/usage_limit_reached 不允许像普通压缩校验失败一样重试同一条上游线路。
+    if verdict.is_err() && active.round == 0 && !rate_limited {
         let plan = active
             .compaction_plan
             .as_mut()
@@ -2466,6 +2582,18 @@ impl WebSocketRequestLogger {
             .map_or(true, |state| !state.requests.is_empty())
     }
 
+    fn rate_limit_cooldown_remaining(&self, model: &str) -> Option<u64> {
+        let Ok(state) = self.state.lock() else {
+            return None;
+        };
+        let endpoint = state.endpoint.as_deref()?;
+        crate::protocol_proxy::rate_limit_cooldown_remaining_for_model(
+            &state.relay_id,
+            endpoint,
+            model,
+        )
+    }
+
     fn upstream_replay_block_reason(&self) -> Option<&'static str> {
         let Ok(state) = self.state.lock() else {
             return Some("request_state_unavailable");
@@ -2850,6 +2978,8 @@ impl WebSocketRequestLogger {
         let response_id = websocket_response_id(&payload);
         let terminal = is_terminal_websocket_response_event(event_type);
         let failed = matches!(event_type, "response.failed" | "error");
+        let rate_limited = failed
+            && crate::protocol_proxy::is_rate_limit_response(None, text.as_bytes());
         let mut update = None;
         let mut completed_cache_observer = None;
         let Ok(mut state) = self.state.lock() else {
@@ -2862,6 +2992,8 @@ impl WebSocketRequestLogger {
         let Some(log_id) = log_id else {
             return;
         };
+        let relay_id = state.relay_id.clone();
+        let endpoint = state.endpoint.clone();
         if let Some(response_id) = response_id.as_deref() {
             state.has_received_application_response = true;
             state
@@ -2901,7 +3033,13 @@ impl WebSocketRequestLogger {
             tracked.record.audit.error_code = observer.error_code.clone();
             tracked.record.audit.observe_response(&observer);
             tracked.record.state = crate::proxy_log::ProxyRequestState::Completed;
-            tracked.record.status_code = Some(if failed { 500 } else { 200 });
+            tracked.record.status_code = Some(if rate_limited {
+                429
+            } else if failed {
+                500
+            } else {
+                200
+            });
             tracked.record.duration_ms = Some(tracked.started_at.elapsed().as_millis() as u64);
             tracked.record.response_bytes = Some(tracked.response_bytes);
             tracked.record.response_captured_bytes = Some(tracked.response_capture.len());
@@ -2917,6 +3055,18 @@ impl WebSocketRequestLogger {
             }
             tracked.record.error = websocket_response_error(&payload, event_type);
             tracked.log_after_transport_timeout("terminal_response", Some(event_type));
+            if rate_limited {
+                if let Some(endpoint) = endpoint.as_deref() {
+                    let _ = crate::protocol_proxy::record_rate_limit_from_upstream(
+                        &relay_id,
+                        endpoint,
+                        tracked.record.model.as_deref().unwrap_or_default(),
+                        Some(429),
+                        None,
+                        text.as_bytes(),
+                    );
+                }
+            }
             update = Some(tracked.record.clone());
             let observer = tracked.cache_observer.take();
             if !failed {
@@ -3308,6 +3458,31 @@ fn websocket_response_error(payload: &Value, event_type: &str) -> Option<String>
         .or_else(|| payload.get("message").and_then(Value::as_str))
         .map(ToString::to_string)
         .or_else(|| Some(format!("Responses WebSocket 返回 {event_type}")))
+}
+
+fn websocket_rate_limit_failure_message(model: &str, retry_after_seconds: u64) -> Message {
+    Message::Text(
+        serde_json::json!({
+            "type": "response.failed",
+            "response": {
+                "id": format!("resp_codex_elves_rate_limit_{}", uuid::Uuid::new_v4()),
+                "object": "response",
+                "status": "failed",
+                "model": model,
+                "error": {
+                    "type": "rate_limit_error",
+                    "code": "local_proxy_rate_limit_cooldown",
+                    "status_code": 429,
+                    "message": format!(
+                        "上游刚返回 429，本地代理已暂停向该线路发送请求，请在 {retry_after_seconds} 秒后重试。"
+                    ),
+                    "retry_after_seconds": retry_after_seconds
+                }
+            }
+        })
+        .to_string()
+        .into(),
+    )
 }
 
 fn append_websocket_proxy_log_record(record: &crate::proxy_log::ProxyRequestRecord) {
@@ -3991,12 +4166,24 @@ async fn reject_upgrade(
     status: StatusCode,
     message: &str,
 ) -> anyhow::Result<()> {
+    reject_upgrade_with_retry_after(stream, status, message, 0).await
+}
+
+async fn reject_upgrade_with_retry_after(
+    stream: &mut TcpStream,
+    status: StatusCode,
+    message: &str,
+    retry_after_seconds: u64,
+) -> anyhow::Result<()> {
     let body = serde_json::to_vec(&serde_json::json!({
         "status": "failed",
         "message": message,
     }))?;
+    let retry_after = (retry_after_seconds > 0)
+        .then(|| format!("Retry-After: {retry_after_seconds}\r\n"))
+        .unwrap_or_default();
     let response = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json; charset=utf-8\r\n{retry_after}Content-Length: {}\r\nConnection: close\r\n\r\n",
         status.as_u16(),
         status.canonical_reason().unwrap_or("Error"),
         body.len(),

@@ -182,6 +182,38 @@ export function receive(event) {
     return;
   }
   const params = { ...event.params || {} };
+  const nativeError = (() => {
+    if (event.method !== "error") return null;
+    const error = params.error && typeof params.error === "object" ? params.error : params;
+    const message = typeof error.message === "string" ? error.message.trim()
+      : typeof params.message === "string" ? params.message.trim() : "";
+    const threadId = typeof params.threadId === "string" ? params.threadId
+      : typeof error.threadId === "string" ? error.threadId : "";
+    const turnId = typeof params.turnId === "string" ? params.turnId
+      : typeof params.turn?.id === "string" ? params.turn.id
+        : typeof error.turnId === "string" ? error.turnId : "";
+    // 原生重试提示属于当前轮次的过程记录；只投影明确会继续重试的错误，
+    // 最终 429 终态由 turn.error 渲染，避免同一错误在正文重复两次。
+    const willRetry = params.willRetry === true || params.will_retry === true
+      || /^Reconnecting(?:\.{3}|…)?\s+\d+\s*\/\s*\d+$/iu.test(message);
+    if (!threadId || !turnId || !message || !willRetry) return null;
+    const details = typeof error.additionalDetails === "string" ? error.additionalDetails.trim()
+      : typeof params.additionalDetails === "string" ? params.additionalDetails.trim()
+        : typeof error.detail === "string" ? error.detail.trim() : "";
+    const identity = `${turnId}|${message}|${details}`;
+    let hash = 0;
+    for (const character of identity) hash = (hash * 31 + character.codePointAt(0)) >>> 0;
+    return {
+      id: `native-retry-${hash.toString(36)}`,
+      type: "error",
+      message,
+      status: "inProgress",
+      ...(details ? { additionalDetails: details } : {}),
+      threadId,
+      turnId
+    };
+  })();
+  if (nativeError) params.item = nativeError;
   const displayItem = normalizeDisplayedUserMessage(params.item);
   const displayTurnItems = Array.isArray(params.turn?.items)
     ? normalizeDisplayedTurnItems(params.turn.items) : null;

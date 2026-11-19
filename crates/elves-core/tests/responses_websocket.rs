@@ -309,6 +309,183 @@ async fn authentication_and_temporary_http_failures_remain_unknown() {
 }
 
 #[tokio::test]
+async fn local_websocket_handshake_429_cools_down_without_repeating_upstream_connection() {
+    let _settings_lock = websocket_settings_test_lock().lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let _settings_path = SettingsPathGuard::new(temp.path().join("settings.json"));
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_address = upstream_listener.local_addr().unwrap();
+    let upstream_connections = Arc::new(AtomicUsize::new(0));
+    let upstream_count = Arc::clone(&upstream_connections);
+    let upstream = tokio::spawn(async move {
+        let (mut stream, _) = upstream_listener.accept().await.unwrap();
+        upstream_count.fetch_add(1, Ordering::SeqCst);
+        let mut request = vec![0_u8; 4096];
+        let _ = stream.read(&mut request).await.unwrap();
+        let body =
+            br#"{"error":{"type":"usage_limit_reached","message":"usage limit reached"}}"#;
+        let response = format!(
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 17\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+        stream.shutdown().await.unwrap();
+    });
+
+    save_supported_websocket_settings(upstream_address, "gpt-websocket-429");
+    let mut settings = SettingsStore::default().load().unwrap();
+    settings.relay_profiles[0].id = "relay-websocket-429".to_string();
+    settings.active_relay_id = "relay-websocket-429".to_string();
+    SettingsStore::default().save(&settings).unwrap();
+
+    let first_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let first_address = first_listener.local_addr().unwrap();
+    let first_server = tokio::spawn(async move {
+        let (mut stream, remote_addr) = first_listener.accept().await.unwrap();
+        let request_bytes = read_upgrade_request(&mut stream).await;
+        handle_responses_websocket_connection(stream, request_bytes, Some(remote_addr))
+            .await
+            .unwrap();
+    });
+    let first_result = connect_async(format!("ws://{first_address}/v1/responses")).await;
+    let Err(WebSocketError::Http(response)) = first_result else {
+        panic!("the first upstream 429 must be returned as a local HTTP 429");
+    };
+    assert_eq!(response.status().as_u16(), 429);
+    assert_eq!(
+        response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("17")
+    );
+    first_server.await.unwrap();
+
+    let second_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let second_address = second_listener.local_addr().unwrap();
+    let second_server = tokio::spawn(async move {
+        let (mut stream, remote_addr) = second_listener.accept().await.unwrap();
+        let request_bytes = read_upgrade_request(&mut stream).await;
+        handle_responses_websocket_connection(stream, request_bytes, Some(remote_addr))
+            .await
+            .unwrap();
+    });
+    let second_result = connect_async(format!("ws://{second_address}/v1/responses")).await;
+    let Err(WebSocketError::Http(response)) = second_result else {
+        panic!("the cooldown must reject the next local websocket without dialing upstream");
+    };
+    assert_eq!(response.status().as_u16(), 429);
+    second_server.await.unwrap();
+
+    assert_eq!(upstream_connections.load(Ordering::SeqCst), 1);
+    upstream.await.unwrap();
+}
+
+#[tokio::test]
+async fn local_websocket_terminal_429_blocks_the_next_same_model_request() {
+    let _settings_lock = websocket_settings_test_lock().lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let _settings_path = SettingsPathGuard::new(temp.path().join("settings.json"));
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_address = upstream_listener.local_addr().unwrap();
+    let upstream = tokio::spawn(async move {
+        let (stream, _) = upstream_listener.accept().await.unwrap();
+        let mut socket = accept_hdr_async(stream, |_request: &Request, response: Response| {
+            Ok(response)
+        })
+        .await
+        .unwrap();
+        let first = socket.next().await.unwrap().unwrap();
+        assert!(matches!(first, Message::Text(_)));
+        socket
+            .send(Message::Text(
+                serde_json::json!({
+                    "type": "response.failed",
+                    "response": {
+                        "id": "resp-terminal-rate-limit",
+                        "status": "failed",
+                        "error": {
+                            "type": "rate_limit_error",
+                            "code": "rate_limit_exceeded",
+                            "status_code": 429,
+                            "message": "rate limit reached"
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let next = tokio::time::timeout(Duration::from_millis(300), socket.next()).await;
+        assert!(
+            next.is_err() || matches!(next.unwrap(), Some(Ok(Message::Close(_))) | None),
+            "the second same-model request must not reach the rate-limited upstream"
+        );
+    });
+
+    save_supported_websocket_settings(upstream_address, "gpt-websocket-terminal-429");
+    let mut settings = SettingsStore::default().load().unwrap();
+    settings.relay_profiles[0].id = "relay-websocket-terminal-429".to_string();
+    settings.active_relay_id = "relay-websocket-terminal-429".to_string();
+    SettingsStore::default().save(&settings).unwrap();
+
+    let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_address = local_listener.local_addr().unwrap();
+    let local_server = tokio::spawn(async move {
+        let (mut stream, remote_addr) = local_listener.accept().await.unwrap();
+        let request_bytes = read_upgrade_request(&mut stream).await;
+        handle_responses_websocket_connection(stream, request_bytes, Some(remote_addr))
+            .await
+            .unwrap();
+    });
+
+    let (mut client, _) = connect_async(format!("ws://{local_address}/v1/responses"))
+        .await
+        .unwrap();
+    let request = serde_json::json!({
+        "type": "response.create",
+        "model": "gpt-websocket-terminal-429",
+        "input": [{"role": "user", "content": "first"}],
+        "stream": true
+    });
+    client
+        .send(Message::Text(request.to_string().into()))
+        .await
+        .unwrap();
+    let first = client.next().await.unwrap().unwrap();
+    let Message::Text(first) = first else {
+        panic!("expected upstream response.failed");
+    };
+    let first: serde_json::Value = serde_json::from_str(first.as_str()).unwrap();
+    assert_eq!(first["type"], "response.failed");
+    assert_eq!(first["response"]["error"]["status_code"], 429);
+
+    let mut second_request = request;
+    second_request["input"][0]["content"] = serde_json::json!("second");
+    client
+        .send(Message::Text(second_request.to_string().into()))
+        .await
+        .unwrap();
+    let second = client.next().await.unwrap().unwrap();
+    let Message::Text(second) = second else {
+        panic!("expected local cooldown response.failed");
+    };
+    let second: serde_json::Value = serde_json::from_str(second.as_str()).unwrap();
+    assert_eq!(second["type"], "response.failed");
+    assert_eq!(
+        second["response"]["error"]["code"],
+        "local_proxy_rate_limit_cooldown"
+    );
+    assert_eq!(second["response"]["error"]["status_code"], 429);
+
+    client.close(None).await.unwrap();
+    local_server.await.unwrap();
+    upstream.await.unwrap();
+}
+
+#[tokio::test]
 async fn matching_explicit_cache_skips_network_connection() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
