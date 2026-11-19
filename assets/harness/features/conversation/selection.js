@@ -301,6 +301,10 @@ export async function selectThread(id, { closeSidebar = true, force = false, rel
     syncEditableMessageMetadata();
     updateComposer(); renderApprovals();
     if (historyInitialized) scheduleMessages();
+    // 用户要求点击进入后立即清除侧栏未读；会话详情已确认后即可提交，
+    // 不等待最新历史读取结束，避免必须切换到其他会话才触发蓝点重绘。
+    if (!isActiveThread())
+      void markVisibleThreadRead(id, { opened: true }).catch(error => notice(error.message, true));
   } catch (error) {
     if (!controller.signal.aborted && version === selectionVersion && selectedId === id
         && isMissingThreadError(error, id)) {
@@ -317,9 +321,6 @@ export async function selectThread(id, { closeSidebar = true, force = false, rel
     if (selectionController === controller) setSelectionController(null);
   }
   await latest;
-  // 用户要求进入会话后立即消除正文未读；正文初始化完成即确认已读，不受恢复的历史滚动位置影响。
-  if (version === selectionVersion && !isActiveThread())
-    void markVisibleThreadRead(id, { opened: true }).catch(error => notice(error.message, true));
 }
 export function showWelcome({ startNew = true, clearHash = false } = {}) {
   setRelatedSelectionVersion(relatedSelectionVersion + 1);
