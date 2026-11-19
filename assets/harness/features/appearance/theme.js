@@ -452,6 +452,13 @@ export function appearanceThemeColors(theme, palette) {
   // 设置和管理卡片共用 68% 输入框表面 + 32% 页面背景；背景和按钮引用同一份舍入后的实色。
   const card = mixColor(background, surfaces["composer-bg"], .68);
   const danger = dark ? "#ff9c97" : "#b42318";
+  // 顶部提醒和输入区状态提示使用独立语义层，不复用普通控件底色；深色背景提高强调色混合比例。
+  const noticeBg = mixColor(background, accent, dark ? .22 : .12);
+  const noticeText = appearanceReadableForeground(noticeBg, foreground);
+  const noticeBorder = appearanceAccessibleColor(accent, noticeBg, 3);
+  const noticeErrorBg = mixColor(background, danger, dark ? .22 : .12);
+  const noticeErrorText = appearanceReadableForeground(noticeErrorBg, foreground);
+  const noticeErrorBorder = appearanceAccessibleColor(danger, noticeErrorBg, 3);
   const focus = appearanceAccessibleColor(dark
     ? mixColor(background, accentText, .7 + .1 * contrast) : accent, background, 3);
   // 设置内描边同时邻接控件填充与卡片；独立校验实际表面，保留其他区域既有焦点和错误颜色。
@@ -491,7 +498,8 @@ export function appearanceThemeColors(theme, palette) {
     "primary-hover": primaryHover, "primary-active": primaryActive,
     ...buttons,
     "user-message-bg": appearanceAlphaColor(foreground, .05), "user-message-text": foreground,
-    "notice-bg": surfaces["control-bg"], "notice-text": foreground,
+    "notice-bg": noticeBg, "notice-text": noticeText, "notice-border": noticeBorder, "notice-accent": accent,
+    "notice-error-bg": noticeErrorBg, "notice-error-text": noticeErrorText, "notice-error-border": noticeErrorBorder,
     danger, "on-danger": dark ? "#171717" : "#ffffff",
     green: dark ? "#77c7a0" : "#168350",
   };

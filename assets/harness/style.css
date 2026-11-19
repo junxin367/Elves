@@ -41,6 +41,11 @@
 @property --user-message-text{syntax:"<color>";inherits:true;initial-value:#1f1f1f}
 @property --notice-bg{syntax:"<color>";inherits:true;initial-value:#ffffff}
 @property --notice-text{syntax:"<color>";inherits:true;initial-value:#1f1f1f}
+@property --notice-border{syntax:"<color>";inherits:true;initial-value:#e8e8e8}
+@property --notice-accent{syntax:"<color>";inherits:true;initial-value:#171717}
+@property --notice-error-bg{syntax:"<color>";inherits:true;initial-value:#912018}
+@property --notice-error-text{syntax:"<color>";inherits:true;initial-value:#ffffff}
+@property --notice-error-border{syntax:"<color>";inherits:true;initial-value:#912018}
 @property --danger{syntax:"<color>";inherits:true;initial-value:#b42318}
 @property --green{syntax:"<color>";inherits:true;initial-value:#168350}
 /* 用户要求卡片、页面、侧栏和控件同帧过渡。300ms 是原有整页时长，JS 等实际过渡结束；期间不叠加控件自己的颜色动效。 */
@@ -50,7 +55,8 @@ html.theme-transition{
     --side,--text,--text-secondary,--muted,--line,--hover,--sidebar-row-highlight,--code,--accent,--on-accent,
     --accent-text,--accent-text-hover,--accent-solid,--accent-solid-hover,--accent-solid-active,--accent-soft,--accent-soft-hover,
     --accent-soft-active,--accent-indicator,--focus-ring,--selection-bg,--selection-text,--primary-bg,--primary-text,--primary-hover,
-    --primary-active,--user-message-bg,--user-message-text,--notice-bg,--notice-text,--danger,--green;
+    --primary-active,--user-message-bg,--user-message-text,--notice-bg,--notice-text,--notice-border,--notice-accent,
+    --notice-error-bg,--notice-error-text,--notice-error-border,--danger,--green;
   transition-duration:300ms;
   transition-timing-function:linear
 }
@@ -2137,3 +2143,19 @@ body{font-weight:var(--ui-font-weight,400)}
   .appearance-screen input[type=number][placeholder]{--settings-input-width:120px}
 }
 .appearance-screen{--settings-control-active:color-mix(in srgb,var(--composer-hover),var(--text) 6%)}
+
+/* 顶部 Toast 与输入区状态提示使用独立语义层，避免深色主题下与普通控件表面混在一起。 */
+.pending-banner{
+  margin-bottom:9px;padding:9px 12px;border:1px solid var(--notice-border);
+  border-left:3px solid var(--notice-accent);border-radius:8px;
+  background:var(--notice-bg);color:var(--notice-text);font-size:.78571rem;line-height:1.8
+}
+.pending-banner .text-button{color:var(--notice-accent)}
+#notice{
+  border:1px solid var(--notice-border);border-left:3px solid var(--notice-accent);
+  box-shadow:0 8px 28px #0004;line-height:1.5
+}
+#notice.error{
+  background:var(--notice-error-bg);color:var(--notice-error-text);
+  border-color:var(--notice-error-border);border-left-color:var(--danger)
+}
