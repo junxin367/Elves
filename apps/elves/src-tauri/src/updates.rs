@@ -1,4 +1,4 @@
-//! 用户点击“更新”后才查询公开发行版；经确认、大小和 SHA-256 校验后才交给原生安装流程。
+//! 公开发行版查询与安装包校验逻辑；当前桌面帮助菜单不提供更新入口。
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;

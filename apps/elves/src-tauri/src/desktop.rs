@@ -70,7 +70,6 @@ struct ClientState {
     window_sequence: AtomicU64,
     cache: Arc<ResourceCache>,
     adding_folder: AtomicBool,
-    checking_update: AtomicBool,
     project_navigation: Mutex<Option<ProjectNavigation>>,
     // 本机凭据仅留在原生内存，串行恢复并复用仍有效的令牌，避免多个窗口互相撤销授权。
     desktop_identity: tokio::sync::Mutex<Option<DesktopIdentity>>,
@@ -1039,30 +1038,12 @@ pub(crate) fn popup_app_menu(
             None::<&str>,
         )?;
         let project = MenuItem::with_id(app, "help_project", "打开项目地址", true, None::<&str>)?;
-        let update = MenuItem::with_id(
-            app,
-            "help_update",
-            if state.checking_update.load(Ordering::Acquire) {
-                "正在更新…"
-            } else {
-                "更新"
-            },
-            !state.checking_update.load(Ordering::Acquire),
-            None::<&str>,
-        )?;
         let about = MenuItem::with_id(app, "help_about", "关于 Elves", true, None::<&str>)?;
-        // 帮助菜单按用户要求将诊断工具置于上方，并把项目、更新和关于合并到最下方一组。
+        // 用户要求帮助菜单不再提供更新入口；保留诊断工具在上方、项目地址和关于在底部一组。
         let group_separator = PredefinedMenuItem::separator(app)?;
         Menu::with_items(
             app,
-            &[
-                &devtools,
-                &diagnostics,
-                &group_separator,
-                &project,
-                &update,
-                &about,
-            ],
+            &[&devtools, &diagnostics, &group_separator, &project, &about],
         )?
     };
     window.popup_menu_at(&menu, PhysicalPosition::new(x, y))
@@ -1304,102 +1285,6 @@ fn open_about(app: &tauri::AppHandle) -> tauri::Result<()> {
     window.set_focus()
 }
 
-fn check_update(app: &tauri::AppHandle) {
-    let state = app.state::<ClientState>();
-    if state.exiting.load(Ordering::Acquire) || state.checking_update.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    show_window(app);
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let result = async {
-            let Some(release) = crate::updates::check().await? else {
-                native_message(&app, "项目当前尚无公开发行版。".into(), false).await?;
-                return Ok::<(), anyhow::Error>(());
-            };
-            if !release.newer_than(env!("CARGO_PKG_VERSION"))? {
-                native_message(
-                    &app,
-                    format!(
-                        "当前版本：{}\n最新公开版本：{}\n\n无需更新。",
-                        env!("CARGO_PKG_VERSION"),
-                        release.version
-                    ),
-                    false,
-                )
-                .await?;
-                return Ok(());
-            }
-            let Some(installer) = release
-                .installer
-                .filter(|installer| installer.sha256.is_some())
-            else {
-                if native_message(
-                    &app,
-                    format!(
-                        "发现新版本 {}。\n此版本需从项目发布页下载，是否打开？",
-                        release.version
-                    ),
-                    true,
-                )
-                .await?
-                {
-                    open_external(release.page);
-                }
-                return Ok(());
-            };
-            if !native_message(
-                &app,
-                format!("发现新版本 {}。\n是否下载安装包？", release.version),
-                true,
-            )
-            .await?
-            {
-                return Ok(());
-            }
-            let directory = app.state::<ClientState>().directory.join("updates");
-            let path = crate::updates::download(&installer, &directory).await?;
-            if native_message(
-                &app,
-                format!(
-                    "{} 安装包已下载并校验。\n是否退出 Elves 并开始安装？",
-                    release.version
-                ),
-                true,
-            )
-            .await?
-            {
-                let file: Vec<u16> = path
-                    .as_os_str()
-                    .to_string_lossy()
-                    .encode_utf16()
-                    .chain(Some(0))
-                    .collect();
-                let status = unsafe {
-                    windows_sys::Win32::UI::Shell::ShellExecuteW(
-                        std::ptr::null_mut(),
-                        windows_sys::core::w!("open"),
-                        file.as_ptr(),
-                        std::ptr::null(),
-                        std::ptr::null(),
-                        windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
-                    )
-                } as isize;
-                anyhow::ensure!(status > 32, "无法启动安装程序（{status}）");
-                quit_app(&app);
-            }
-            Ok(())
-        }
-        .await;
-        app.state::<ClientState>()
-            .checking_update
-            .store(false, Ordering::Release);
-        if let Err(error) = result {
-            let _ = native_message(&app, format!("更新未完成：{error:#}"), false).await;
-        }
-    });
-}
-
 fn quit_app(app: &tauri::AppHandle) {
     let state = app.state::<ClientState>();
     if state.exiting.swap(true, Ordering::SeqCst) {
@@ -1430,7 +1315,6 @@ fn handle_menu_event(app: &tauri::AppHandle, event: MenuEvent) {
     match event.id.as_ref() {
         "file_add_folder" => add_folder(app),
         "help_project" => open_external(Url::parse(crate::updates::PROJECT_URL).unwrap()),
-        "help_update" => check_update(app),
         "help_devtools" => {
             if let Err(error) = open_devtools(app)
                 && let Some(window) = app.get_window(WINDOW_LABEL)
@@ -1802,7 +1686,6 @@ pub fn run() -> anyhow::Result<()> {
                 window_sequence: AtomicU64::new(1),
                 cache: cache.clone(),
                 adding_folder: AtomicBool::new(false),
-                checking_update: AtomicBool::new(false),
                 project_navigation: Mutex::new(None),
                 desktop_identity: tokio::sync::Mutex::new(None),
             });
