@@ -1259,7 +1259,12 @@ fn open_about(app: &tauri::AppHandle) -> tauri::Result<()> {
     let mut address = Url::parse("http://tauri.localhost/about.html").unwrap();
     address
         .query_pairs_mut()
-        .append_pair("version", env!("CARGO_PKG_VERSION"));
+        .append_pair("version", env!("CARGO_PKG_VERSION"))
+        // 用户要求独立程序可直接对比安装内容；程序版本不变时，用内嵌网页资源版本识别实际构建。
+        .append_pair(
+            "resourceRevision",
+            &elves_assets::resource_revision().to_string(),
+        );
     let mut builder =
         tauri::WebviewWindowBuilder::new(app, "elves-about", WebviewUrl::External(address))
             .title("关于 Elves")

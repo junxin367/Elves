@@ -8,6 +8,7 @@ body.about-page{display:flex;flex-direction:column;gap:20px;padding:32px 32px 28
 .about-page h1{margin:0 0 12px;font-size:40px;line-height:1.15;font-weight:500;letter-spacing:0}
 .about-page main p{margin:0 0 14px;font-size:20px;line-height:1.4;color:#c6c7ca}
 .about-page main p:last-of-type{margin-bottom:14px}
+.about-page #about-resource-revision{font-family:Consolas,"SFMono-Regular",monospace;font-size:16px;color:#aeb0b5}
 .about-page a{color:#8673ff;text-decoration:underline;text-underline-offset:4px}
 .about-page footer{margin-top:0;font-size:20px;line-height:1.4;color:#c6c7ca}
 .about-actions{display:flex;align-items:center;justify-content:flex-end;gap:12px;flex-shrink:0;width:100%}
@@ -21,6 +22,7 @@ body.about-page{display:flex;flex-direction:column;gap:20px;padding:32px 32px 28
   .about-divider{height:160px}
   .about-page h1{margin-bottom:8px;font-size:28px}
   .about-page main p,.about-page footer{font-size:14px;line-height:1.35}
+  .about-page #about-resource-revision{font-size:12px}
   .about-page main p{margin-bottom:8px}
   .about-actions button{min-width:96px;height:40px;padding:6px 18px;border-radius:10px;font-size:16px}
 }
