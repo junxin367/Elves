@@ -11466,7 +11466,9 @@ test("纯文件和文件夹输入经过原可靠发送，成功前不显示正�
   await sending;
   const confirmed = displayedUserMessages(c);
   assert.equal(confirmed.length, 1);
-  assert.match(confirmed[0].content[0].text, /需求说明\.txt.*素材（文件夹）/);
+  assert.deepEqual(Array.from(confirmed[0].content, part => part.type), ["mention", "mention", "mention"]);
+  assert.deepEqual(Array.from(confirmed[0].content, part => part.name), ["需求说明.txt", "素材", "空文件夹"]);
+  assert.equal(confirmed[0].content.some(part => part.type === "text"), false);
   assert.equal(h.notices.length, 0);
   const old = sendRecoveryHarness();
   old.prompt.value = "";

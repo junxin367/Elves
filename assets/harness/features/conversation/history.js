@@ -418,7 +418,15 @@ function mergeHistoryTurn(snapshot, readVersion, { older = false, beforeId = nul
   if (contextItems.length) {
     const contextIds = new Set(contextItems.map(item => item.id));
     const loaded = new Map(items.map(item => [item.id, item]));
-    items = [...contextItems.map(item => loaded.get(item.id) || item), ...items.filter(item => !contextIds.has(item.id))];
+    // 早期历史页可能已有旧缓存副本；合并时保留服务端刚补齐的附件字段，
+    // 不能因为上下文条目先被移出分页而退回没有文件芯片的旧对象。
+    items = [...contextItems.map(item => {
+      const merged = loaded.has(item.id) ? mergeItemProjection(loaded.get(item.id), item) : item;
+      // 上下文条目即使已有旧缓存副本，也必须以本次历史返回的附件清单为准。
+      return Array.isArray(item.fileAttachments) && item.fileAttachments.length
+        ? { ...merged, fileAttachments: item.fileAttachments } : merged;
+    }),
+    ...items.filter(item => !contextIds.has(item.id))];
   }
   const merged = enrichTurnTranscriptEvents(withImages({
     ...current, ...snapshot, ...pagination, ...timing, ...liveFields, items,

@@ -1207,6 +1207,21 @@ pub(super) fn inputs(payload: &Value) -> anyhow::Result<Vec<Value>> {
     if let Some(text) = payload["prompt"].as_str().filter(|s| !s.trim().is_empty()) {
         input.push(json!({"type":"text","text":text,"text_elements":[]}));
     }
+    for file in payload["files"].as_array().into_iter().flatten() {
+        let kind = required(file, "kind")?;
+        let name = required(file, "name")?;
+        let path = required(file, "path")?;
+        if !super::super::input_files::staged_attachment_is_readable(
+            std::path::Path::new(path),
+            kind,
+            file["size"].as_u64(),
+        ) {
+            return Err(error(409, "本机文件或文件夹已不可读，请重新添加"));
+        }
+        // 文件和文件夹沿用 Codex app-server 的结构化 mention；路径不再写入用户正文。
+        // app-server 原生 mention 只接受 name/path；附件类型仅用于 Harness 的校验和界面显示。
+        input.push(json!({"type":"mention","name":name,"path":path}));
+    }
     for image in payload["images"].as_array().into_iter().flatten() {
         // 本机 Codex 使用后端已确认的暂存原图路径；预览图与内联 Data URL 均不进入这个分支。
         if let Some(path) = image["localPath"].as_str() {

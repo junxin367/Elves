@@ -331,7 +331,9 @@ function renderQueuedMessages(messages, previous = null) {
         performAndroidHapticFeedback("drag-tick");
       void reorderQueuedMessages(threadId, ids, next, messageId);
     };
-    const attachmentSignature = JSON.stringify([message.remoteImages, message.context?.imageAttachments]);
+    const attachmentSignature = JSON.stringify([
+      message.remoteImages, message.context?.imageAttachments, message.context?.fileAttachments
+    ]);
     const previousAttachment = previousAttachments.get(messageId);
     const thumbnail = previousAttachment?.querySelector("img");
     const attachments = previousAttachment?.remoteAttachmentSignature === attachmentSignature
@@ -497,6 +499,7 @@ async function steerQueuedMessage(threadId, messageId) {
   const sendDisplay = compact ? null : rememberSendDisplay({
     threadId, clientUserMessageId: preview.clientId || messageId, prompt: preview.text,
     images: queuedMessage?.context?.imageAttachments || queuedMessage?.images || [],
+    files: queuedMessage?.context?.fileAttachments || queuedMessage?.files || [],
     skills: queuedMessage?.context?.skills || queuedMessage?.skills || []
   });
   if (sendDisplay) sendDisplay.messageId = messageId;

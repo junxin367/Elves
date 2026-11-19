@@ -660,6 +660,7 @@ impl HarnessController {
 
     fn attach_item_images(&self, item: &mut Value) {
         video::attach_item(self, item);
+        self.attach_item_files(item);
         let sources = canonical_item_image_sources(item);
         if let Some(object) = item.as_object_mut() {
             object.remove("remoteImages");
@@ -687,6 +688,39 @@ impl HarnessController {
         if !images.is_empty() {
             replace_item_inline_image_sources(item, &replacements);
             item["remoteImages"] = Value::Array(images);
+        }
+    }
+
+    fn attach_item_files(&self, item: &mut Value) {
+        if item["type"] != "userMessage" {
+            return;
+        }
+        let historical = item["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|content| content["type"] == "text")
+            .filter_map(|content| content["text"].as_str())
+            .flat_map(input_files::mentioned_file_attachments)
+            .collect::<Vec<_>>();
+        if !historical.is_empty() {
+            // Codex App 历史消息把附件写在用户正文的兼容块中；保留原正文供模型和编辑使用，
+            // 另提供独立附件列表供各端按文件芯片显示，不能再把路径当普通正文渲染。
+            item["fileAttachments"] = Value::Array(historical);
+        }
+        for content in item["content"].as_array_mut().into_iter().flatten() {
+            if content["type"] != "mention" || content["kind"].is_string() {
+                continue;
+            }
+            let Some(path) = content["path"].as_str() else {
+                continue;
+            };
+            let kind = std::fs::symlink_metadata(path)
+                .ok()
+                .map(|metadata| if metadata.is_dir() { "folder" } else { "file" });
+            if let Some(kind) = kind {
+                content["kind"] = json!(kind);
+            }
         }
     }
 
@@ -1863,7 +1897,7 @@ impl HarnessController {
                 return Err(ApiError::new(400, "当前操作不接受文件和文件夹附件").into());
             }
             let paths = input_files::stage(self.state_dir.clone(), &payload, authorization).await?;
-            let paths = if claude_thread || requested == Some("claude") {
+            if claude_thread || requested == Some("claude") {
                 let config = if !claude_thread {
                     match &instance_id {
                         Some(id) => Some(self.claude_instance_config(id).await?),
@@ -1872,7 +1906,7 @@ impl HarnessController {
                 } else {
                     None
                 };
-                self.claude
+                let target_paths = self.claude
                     .local_input_paths(thread_id, config, paths)
                     .await
                     .map_err(|error| {
@@ -1881,13 +1915,12 @@ impl HarnessController {
                             format!("附件无法映射到目标 WSL，消息尚未发送：{error}"),
                         )
                     })?
+                    ;
+                // Claude 原生 CLI 当前仍通过正文接收目标 WSL 路径；Codex 走下方结构化 mention。
+                input_files::append_paths(&mut payload, target_paths);
             } else {
-                paths
-                    .into_iter()
-                    .map(|path| path.to_string_lossy().into_owned())
-                    .collect()
-            };
-            input_files::append_paths(&mut payload, paths);
+                input_files::replace_paths(&mut payload, paths)?;
+            }
         }
         if action == "sessionMetrics" {
             let id = thread_id.ok_or_else(|| ApiError::new(400, "缺少会话 ID"))?;

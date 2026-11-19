@@ -1042,6 +1042,9 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .user-attachments button.message-image-link{padding:0;border:0;background:transparent;border-radius:8px}
 .user-attachments .message-image{width:var(--thumbnail-size);height:var(--thumbnail-size);max-width:var(--thumbnail-size);max-height:var(--thumbnail-size);object-fit:cover}
 .user-attachments .message-video-preview{flex:0 0 140px;margin:0}
+.message-file-attachment{display:inline-flex;align-items:center;gap:6px;max-width:min(100%,360px);min-height:32px;margin:0;padding:5px 10px;border:1px solid var(--line);border-radius:16px;background:color-mix(in srgb,var(--text) 6%,var(--side));color:var(--text);font-size:.85714rem;line-height:20px}
+.message-file-attachment>.ui-icon{width:16px;height:16px;flex:0 0 16px;color:var(--muted)}
+.message-file-attachment-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 /* 用户确认 PC/手机资源预览框内外共用一层 #000b 遮罩，不铺灰底、不重复叠加。
  * 图片和视频均保留最大宽度 90vw、最大高度 --popup-max-height（80dvh），不能因透明效果或图片放大取消上限。
  * fitMediaPreview 须扣除关闭区、说明和内边距；手机断点调整内边距与安全边距，仍共用上述视口比例。 */
@@ -1265,6 +1268,8 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .queued-message[data-reorderable=true]{cursor:grab}
 .queued-message-attachments{display:flex;align-items:center;flex:0 0 20px;width:20px;height:20px;overflow:hidden}
 .queued-message-attachment{display:block;width:20px;height:20px;flex:0 0 20px;object-fit:cover;border:1px solid var(--line);border-radius:4px}
+.queued-message-file-attachment{display:grid;width:20px;height:20px;place-items:center;flex:0 0 20px;border:1px solid var(--line);border-radius:4px;color:var(--muted)}
+.queued-message-file-attachment>.ui-icon{width:14px;height:14px}
 .composer-attachments{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 10px;padding:4px 4px 0 0}
 .attachment-support-note{display:block;margin:0 0 8px;color:var(--muted);font-size:.78571rem;line-height:1.5}
 .composer-attachment{position:relative;flex:0 0 40px;width:40px;height:40px;margin:0}

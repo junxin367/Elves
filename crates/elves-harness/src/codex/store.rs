@@ -51,6 +51,20 @@ impl Queued {
             .flatten()
             .map(|image| json!({"src":image.get("localPath").unwrap_or(&image["dataUrl"]),"name":image["name"]}))
             .collect();
+        let files: Vec<_> = self.payload["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|file| {
+                Some(json!({
+                    "kind": file["kind"].as_str()?,
+                    "name": file["name"].as_str()?,
+                    "size": file["size"],
+                    "path": file["path"],
+                    "staged": file.get("staged"),
+                }))
+            })
+            .collect();
         json!({"id":self.id,"clientUserMessageId":self.payload["clientUserMessageId"],
             "action":if self.compact {"compact"} else {"send"},
             "text":if self.compact {json!("压缩上下文")} else {self.payload["prompt"].clone()},
@@ -59,7 +73,7 @@ impl Queued {
                 "unknown" => json!("消息送达状态待核对"), "paused" => json!("消息已暂停"), _ => Value::Null },
             "remoteDeliveryState":if self.state=="unknown" {"outcome-unknown"} else {"queued"},
             "submission":{"status":match self.state.as_str(){"unknown"=>"outcome-unknown","sending"=>"sending",_=>"queued"}},
-            "context":{"prompt":self.payload["prompt"],"imageAttachments":images},
+            "context":{"prompt":self.payload["prompt"],"imageAttachments":images,"fileAttachments":files},
             "submissionOptions":{"clientUserMessageId":self.payload["clientUserMessageId"],
                 "model":self.payload["model"],"reasoningEffort":self.payload["reasoningEffort"]}})
     }

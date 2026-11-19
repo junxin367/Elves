@@ -1241,8 +1241,14 @@ export function attachmentsFromRemoteImages(value) {
 export async function attachmentsFromQueuedMessage(message) {
   const registeredImages = safeRemoteImages(message?.remoteImages);
   const images = message?.context?.imageAttachments;
-  if (!Array.isArray(images)) return registeredImages;
-  const attachments = [];
+  const files = Array.isArray(message?.context?.fileAttachments) ? message.context.fileAttachments : [];
+  const attachments = files
+    .filter(file => file?.staged && ["file", "folder"].includes(file.kind))
+    .map(file => ({
+      kind: file.kind, name: file.name, size: Number.isSafeInteger(file.size) ? file.size : 0,
+      staged: { ...file.staged }
+    }));
+  if (!Array.isArray(images)) return [...attachments, ...registeredImages];
   for (const image of images) {
     const registered = registeredImages.find(entry => entry.source === image?.src);
     if (registered) {
@@ -1278,19 +1284,48 @@ export function renderQueuedMessageAttachments(message) {
   }
   for (const image of registeredImages)
     if (!images.some(entry => entry.url === image.url)) images.push(image);
-  if (!images.length) return null;
+  const files = Array.isArray(message?.context?.fileAttachments) ? message.context.fileAttachments : [];
+  if (!images.length && !files.length) return null;
   const root = document.createElement("div");
   root.className = "queued-message-attachments";
-  root.setAttribute("aria-label", `${images.length} 张图片附件，仅显示第一张`);
-  const image = images[0];
-  const thumbnail = document.createElement("img");
-  thumbnail.className = "queued-message-attachment";
-  loadAttachmentThumbnail(thumbnail, image.url, image.mime);
-  thumbnail.alt = image.name;
-  thumbnail.title = image.name;
-  thumbnail.loading = "lazy";
-  thumbnail.decoding = "async";
-  thumbnail.draggable = false;
-  root.append(thumbnail);
+  root.setAttribute("aria-label", `${images.length + files.length} 个附件`);
+  if (images.length) {
+    const image = images[0];
+    const thumbnail = document.createElement("img");
+    thumbnail.className = "queued-message-attachment";
+    loadAttachmentThumbnail(thumbnail, image.url, image.mime);
+    thumbnail.alt = image.name;
+    thumbnail.title = image.name;
+    thumbnail.loading = "lazy";
+    thumbnail.decoding = "async";
+    thumbnail.draggable = false;
+    root.append(thumbnail);
+  } else {
+    const file = files[0];
+    const badge = document.createElement("span");
+    badge.className = "queued-message-file-attachment";
+    badge.title = `${file.kind === "folder" ? "文件夹" : "文件"}：${file.name}`;
+    badge.setAttribute("aria-label", badge.title);
+    badge.append(icon(file.kind === "folder" ? "folderClosed" : "document"));
+    root.append(badge);
+  }
+  return root;
+}
+
+export function renderMessageFileAttachment(content, previous = null) {
+  if (content?.type !== "mention" || typeof content.name !== "string" || !content.name) return null;
+  const kind = content.kind === "folder" ? "folder" : "file";
+  if (previous?.messageFileName === content.name && previous.messageFileKind === kind) return previous;
+  const root = document.createElement("span");
+  root.className = "message-file-attachment";
+  root.messageFileName = content.name;
+  root.messageFileKind = kind;
+  root.title = `${kind === "folder" ? "文件夹" : "文件"}：${content.name}`;
+  root.setAttribute("aria-label", root.title);
+  root.append(icon(kind === "folder" ? "folderClosed" : "document"));
+  const name = document.createElement("span");
+  name.className = "message-file-attachment-name";
+  name.textContent = content.name;
+  root.append(name);
   return root;
 }

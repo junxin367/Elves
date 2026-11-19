@@ -171,7 +171,8 @@ export function mergeItemProjection(previous, item) {
   if (previous?.id === item.id && previous.type === "userMessage" && item.type === "steered") return previous;
   const projection = {};
   for (const field of ["messageMetadata", "sentAtMs", "startedAtMs", "completedAtMs", "completed",
-    "remoteImages", "remoteVideos", "clientId", "remoteCompactionInput", "remoteHistoryContext", "remoteItemCompleted"])
+    "remoteImages", "remoteVideos", "fileAttachments", "clientId", "remoteCompactionInput",
+    "remoteHistoryContext", "remoteItemCompleted"])
     if (!Object.hasOwn(item, field) && Object.hasOwn(previous || {}, field)) projection[field] = previous[field];
   // Token hover 的观测时间只随同一原生条目合并，历史快照缺失时不能撤回已记录的时间边界。
   const hoverTiming = {};

@@ -1,6 +1,6 @@
 // 会话条目渲染：按条目类型渲染单条消息；工具名称、Claude 事件文案与过程事件渲染在 item-presentation.js。
 
-import { bindMessageVideos, videoPreviewMarkup } from "../../attachments.js";
+import { bindMessageVideos, renderMessageFileAttachment, videoPreviewMarkup } from "../../attachments.js";
 import { prepareRemoteTunnelAccess } from "../../channels.js";
 import { $, element } from "../../ui/dom.js";
 import { icon } from "../../ui/icons.js";
@@ -41,6 +41,18 @@ export function renderItem(item, previous, inActivity = false, running = false) 
     }
     const attachments = $(".user-attachments", node) || element("div", "user-attachments");
     const previousImages = [...attachments.children], images = [];
+    const fileContents = [
+      ...(Array.isArray(item.fileAttachments) ? item.fileAttachments.map(file => ({ type: "mention", ...file })) : []),
+      ...(item.content || []).filter(content => content.type === "mention")
+    ];
+    const seenFiles = new Set();
+    for (const content of fileContents) if (content.type === "mention") {
+      const key = `${content.path || ""}\u0000${content.name || ""}`;
+      if (seenFiles.has(key)) continue;
+      seenFiles.add(key);
+      const file = renderMessageFileAttachment(content, previousImages[images.length]);
+      if (file) images.push(file);
+    }
     for (const content of item.content || []) if (["image", "localImage"].includes(content.type)) {
       const source = content.path || content.url;
       // Claude 图片沿用现有附件预览；内联资源 ID 不作为面向用户的文件名。
