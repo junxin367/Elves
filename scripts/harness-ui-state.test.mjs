@@ -8824,6 +8824,21 @@ test("当前主会话收到问答立即显示未读提醒，处理完成后恢�
   assert.deepEqual(h.selected, []);
 });
 
+test("异常会话使用 warning 图标并保持危险红色，不被通用 muted 规则覆盖", async () => {
+  const h = recentSidebarHarness();
+  h.regular.lastTurnOutcome = { status: "failed", kind: "failed" };
+  h.context.renderSidebar();
+  const row = h.root.querySelectorAll(".thread-row").find(node => node.dataset.threadId === h.regular.id);
+  const state = row.querySelector(".thread-state");
+  assert.equal(state.classList.contains("error"), true);
+  assert.equal(state.dataset.icon, "warning");
+  assert.equal(state.title, "执行失败");
+  const css = await readFile(new URL("../assets/harness/style.css", import.meta.url), "utf8");
+  const mutedRule = css.indexOf(".thread-row>.ui-icon,.project-header>.ui-icon");
+  const errorRule = css.indexOf(".thread-row>.thread-state.error{color:var(--danger)}");
+  assert.ok(errorRule > mutedRule, "错误色覆盖必须位于通用 muted 规则之后");
+});
+
 test("完成会话的侧栏状态互斥，不同时显示执行圈和未读蓝点", () => {
   const h = recentSidebarHarness();
   h.unread.priority = { attentionState: "unread", active: true };
