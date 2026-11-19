@@ -3,6 +3,7 @@ import { sha256Hex } from "./sha256.js";
 import { copyLocalInput, desktopImagePattern, imageAttachmentPayload, isLocalInput, localInputBridge, stagedImageUrl, validateLocalInputs } from "./local-inputs.js";
 import { captureTransferInputs, hasTransferFiles, readTransferInputs, stageTransferredInputs } from "./transfer-inputs.js";
 import { icon } from "./ui/icons.js";
+import { bindImageContextMenu } from "./ui/media-menu.js";
 
 // 用户要求 Codex/Claude 单条固定最多 8 张；添加、粘贴、拖拽与草稿/队列恢复共用此值，并与 Rust MAX_INPUT_IMAGE_COUNT 同步。
 const MAX_IMAGE_COUNT = 8;
@@ -855,6 +856,7 @@ function renderComposerAttachments() {
       preview.setAttribute("aria-haspopup", "dialog");
       preview.title = `查看图片 ${entry.name}`;
       preview.onclick = () => previewImage(preview, image);
+      bindImageContextMenu(preview, image);
       preview.append(image);
       const caption = document.createElement("figcaption");
       caption.textContent = entry.name;

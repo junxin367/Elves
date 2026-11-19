@@ -31,7 +31,9 @@ export function togglePopup(trigger) {
   if (activePopup?.trigger === trigger) closePopup(true);
   else openPopup(trigger);
 }
-export function openPopup(trigger, { query = "", edge = null, focus = true, focusSearch = true, position = null } = {}) {
+export function openPopup(trigger, {
+  query = "", edge = null, focus = true, focusSearch = true, position = null, host = null
+} = {}) {
   if (trigger.disabled || !trigger.isConnected) return;
   closePopup(); closeAppMenus();
   const node = element("div", `ui-popup${trigger.popupClassName ? ` ${trigger.popupClassName}` : ""}`);
@@ -67,7 +69,7 @@ export function openPopup(trigger, { query = "", edge = null, focus = true, focu
   const choices = selecting ? trigger.selectOptions : trigger.menuOptions;
   activePopup = { node, trigger, list, input, query, position, index: Math.max(0, choices.findIndex(option => option.value === trigger.value)), choices: [] };
   trigger.setAttribute("aria-expanded", "true"); trigger.setAttribute("aria-controls", node.id);
-  const host = trigger.closest("dialog,[data-popup-host]") || document.body;
+  const popupHost = host || trigger.closest("dialog,[data-popup-host]") || document.body;
   if (trigger.popupDismissLayer) {
     const dismiss = element("div", "session-tools-menu-dismiss");
     dismiss.onpointerdown = event => { event.preventDefault(); event.stopPropagation(); };
@@ -75,10 +77,10 @@ export function openPopup(trigger, { query = "", edge = null, focus = true, focu
       event.preventDefault(); event.stopPropagation(); closePopup(true);
     };
     activePopup.dismiss = dismiss;
-    host.append(dismiss);
+    popupHost.append(dismiss);
   }
   if (typeof node.showPopover === "function") node.setAttribute("popover", "manual");
-  host.append(node);
+  popupHost.append(node);
   renderPopup();
   if (activePopup?.node !== node) return;
   if (node.hasAttribute("popover")) node.showPopover();

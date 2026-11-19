@@ -12,6 +12,7 @@ import {
 import { copyText } from "../../ui/clipboard.js";
 import { $, element } from "../../ui/dom.js";
 import { icon } from "../../ui/icons.js";
+import { bindImageContextMenu } from "../../ui/media-menu.js";
 import { renderMessages } from "../../core/actions.js";
 import { turns } from "../../core/state.js";
 import { api } from "../api.js";
@@ -136,6 +137,7 @@ function bindMessageImages(node) {
     };
     if (link && (/^\/api\/images\/[A-Za-z0-9_-]{20,128}$/.test(link.getAttribute("href") || "")
         || safeInlineImageSource(image.getAttribute("src")))) {
+      bindImageContextMenu(link, image);
       link.title = image.alt ? `预览图片：${image.alt}` : "预览图片";
       link.onclick = event => {
         if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;

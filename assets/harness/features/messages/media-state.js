@@ -9,6 +9,7 @@ import { desktopImagePattern } from "../../local-inputs.js";
 import { renderMermaidBlocks, withStableMessageLayout } from "../../markdown.js";
 import { $, button, element } from "../../ui/dom.js";
 import { icon } from "../../ui/icons.js";
+import { bindImageContextMenu } from "../../ui/media-menu.js";
 import { pageLeaving, selectedId, selectionVersion, session, turns } from "../../core/state.js";
 import { followMessages, renderedItems } from "../conversation/history-state.js";
 import { privateInputScope } from "../session/capabilities.js";
@@ -178,7 +179,9 @@ export function openImagePreview(link, image) {
   };
   preview.onload = present;
   if (remoteSource) preview.crossOrigin = "anonymous";
+  preview.originalImageSource = source;
   preview.alt = image.alt || "图片预览"; preview.src = desktopSource ? source : remoteMediaUrl(remoteSource ? source : inlineSource);
+  bindImageContextMenu(preview, preview, { host: document.body });
   preview.onerror = () => {
     disposeZoom?.();
     viewport.textContent = "图片不可用，请关闭后重试";
