@@ -19,72 +19,7 @@ export const renderedItems = new Map(), renderedTurns = new Map();
 // Claude 的会话清单独立于已加载的正文页；null 表示旧服务未提供，[] 表示明确没有任务。
 export let sessionPlan = null;
 export function setSessionPlan(value) { return sessionPlan = value; }
-const taskPanelExpansion = new Map();
-function taskStatusCount(plan, status) {
-  return plan.filter(step => step.status === status).length;
-}
-export function taskPlanSummary(plan) {
-  const total = plan.length, completed = taskStatusCount(plan, "completed"),
-    inProgress = taskStatusCount(plan, "inProgress"), pending = taskStatusCount(plan, "pending");
-  if (completed === total) return `任务 ${total}/${total} · 已完成`;
-  const parts = [`任务 ${total} 项`];
-  if (completed) parts.push(`${completed} 个已完成`);
-  if (inProgress) parts.push(`${inProgress} 个进行中`);
-  if (pending) parts.push(`${pending} 个待办`);
-  return parts.join(" · ");
-}
-function taskStepText(step) {
-  return String(step?.step ?? step?.subject ?? "").trim();
-}
-function taskStepMark(status) {
-  return status === "completed" ? "✓" : status === "inProgress" ? "◌" : "○";
-}
-// 用户要求任务清单脱离聊天正文，固定在输入框上方；空清单只隐藏面板，不丢失会话任务数据。
-export function clearTaskPanel() {
-  const root = $("#task-area");
-  if (!root) return;
-  root.hidden = true;
-  root.replaceChildren();
-  delete root.dataset.taskKey;
-}
-// Claude 使用跨轮次清单，Codex 只把当前执行轮次暂时放入状态栏；展开状态按会话和轮次分别保留。
-export function renderTaskPanel(plan, { scope = "claude-session", threadId = selectedId } = {}) {
-  const root = $("#task-area");
-  if (!root) return;
-  const items = Array.isArray(plan) ? plan.filter(step => taskStepText(step)) : [];
-  if (!items.length) {
-    clearTaskPanel();
-    return;
-  }
-  const key = `${scope}:${threadId || ""}`;
-  let expanded = taskPanelExpansion.get(key);
-  if (typeof expanded !== "boolean")
-    expanded = items.some(step => ["pending", "inProgress"].includes(step.status));
-  root.hidden = false;
-  root.dataset.taskKey = key;
-  root.replaceChildren();
-  const panel = element("details", "task-panel");
-  panel.open = expanded;
-  const summary = element("summary", "task-panel-summary");
-  summary.title = "展开或收起任务清单";
-  summary.append(icon("queue"), element("span", "task-panel-title", taskPlanSummary(items)));
-  const toggle = element("span", "task-panel-toggle", expanded ? "收起" : "查看全部");
-  const chevron = icon("chevron");
-  chevron.classList.add("task-panel-chevron");
-  summary.append(toggle, chevron);
-  const list = element("ul", "task-panel-list");
-  for (const step of items) {
-    const item = element("li", `task-panel-item ${step.status || "pending"}`,
-      `${taskStepMark(step.status)} ${taskStepText(step)}`);
-    list.append(item);
-  }
-  panel.append(summary, list);
-  panel.addEventListener("toggle", () => {
-    taskPanelExpansion.set(key, panel.open);
-    toggle.textContent = panel.open ? "收起" : "查看全部";
-  });
-  root.append(panel);
-}
+const turnPlanExpansion = new Map();
 export function updateScrollControl() {
   const messages = $("#messages"), control = $("#scroll-to-bottom");
   if (!messages || !control) return;
@@ -134,6 +69,26 @@ export function renderTurnPlanTitle(plan) {
   const count = status => plan.filter(step => step.status === status).length;
   return element("div", "turn-plan-title",
     `${plan.length} 个任务（${count("completed")} 个已完成，${count("inProgress")} 个进行中，${count("pending")} 个待办）`);
+}
+// 用户要求恢复原有的轮次尾部布局；折叠只改变当前轮次任务明细的可见性，不改变任务快照归属。
+export function renderTurnPlan(plan, turnId) {
+  if (!Array.isArray(plan) || !plan.length) return null;
+  const key = `${selectedId || ""}:${turnId || ""}`;
+  const block = element("details", "turn-plan-block");
+  block.open = turnPlanExpansion.get(key) !== false;
+  const title = element("summary", "turn-plan-title",
+    renderTurnPlanTitle(plan).textContent);
+  title.title = "展开或收起当前轮次任务";
+  const chevron = icon("chevron");
+  chevron.classList.add("turn-plan-chevron");
+  title.append(chevron);
+  const list = element("ul", "turn-plan");
+  for (const step of plan)
+    list.append(element("li", step.status,
+      `${step.status === "completed" ? "✓" : step.status === "inProgress" ? "◌" : "○"} ${step.step}`));
+  block.append(title, list);
+  block.addEventListener("toggle", () => turnPlanExpansion.set(key, block.open));
+  return block;
 }
 export function legacySentDisplayTurn(turn) {
   // 旧版本曾把补插出的已接替提问写成只有 id/status/items 的完成轮次，用户升级后旧缓存仍会把旧消息插到执行中轮次前后。

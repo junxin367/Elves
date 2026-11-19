@@ -18,10 +18,10 @@ import { compactionLocked } from "./compaction.js";
 import { forkAvailable, forkThread } from "./fork.js";
 import {
   followMessages, historyCursor, historyError, historyInitialized, historyLoadButton,
-  legacySentDisplayTurn, messageFrame, renderTurnPlanTitle, renderedItems, renderedTurns,
+  legacySentDisplayTurn, messageFrame, renderTurnPlan, renderedItems, renderedTurns,
   setFollowMessages, setHistoryCursor, setHistoryInitialized, setHistoryScrollTop, setMessageFrame,
   sessionPlan, setRecentHistoryPage, setSessionPlan, setTranscriptChecking, syncHistoryButtons,
-  renderTaskPanel, turnFieldVersions, updateScrollControl, visibleMessageAnchor
+  turnFieldVersions, updateScrollControl, visibleMessageAnchor
 } from "./history-state.js";
 import { historyPlaceholder, loadHistory, scheduleHistoryLoad } from "./history.js";
 import { pending } from "./pending-state.js";
@@ -114,11 +114,8 @@ export function renderMessages(keepScroll = true) {
     children.push(source);
   }
   const lastRealTurn = [...sorted].reverse().find(turn => turns.has(turn.id));
-  // 用户要求 Claude 原生任务清单属于整个会话：完整清单或原生轮次标记识别 Claude，
-  // 统一放到正文所有轮次之后，旧服务才从已加载轮次寻找最新快照。
+  // Claude 通过原生轮次标记或会话级快照识别；任务展示仍以各轮次自己的 plan 快照为准。
   const claudeSession = sorted.some(turn => turn?._nativeUserId) || Array.isArray(sessionPlan);
-  // 用户要求新页面不等待下一次任务更新；新服务提供完整会话快照，旧服务才从已加载轮次兼容读取。
-  let claudePlan = Array.isArray(sessionPlan) ? sessionPlan : null;
   loadMessageSkillChoices(sorted.flatMap(turn => turn.items || []));
   if (historyError && sorted.length)
     children.push(historyLoadButton("最新记录加载失败，重试", () => void loadHistory()));
@@ -272,27 +269,16 @@ export function renderMessages(keepScroll = true) {
       }
       items.push(note);
     }
-    // Codex 当前执行轮次的任务移到输入框上方状态栏；轮次结束后再留在对应回复末尾，保留历史归属。
-    const liveCodexPlan = !claudeSession && turn === lastRealTurn && turn.status === "inProgress";
-    if (!claudeSession && turn.plan?.length && !liveCodexPlan) {
-      const plan = element("ul", "turn-plan");
-      for (const step of turn.plan) plan.append(element("li", step.status, `${step.status === "completed" ? "✓" : step.status === "inProgress" ? "◌" : "○"} ${step.step}`));
-      items.push(renderTurnPlanTitle(turn.plan), plan);
-    }
-    // 用户要求手动压缩位于本轮所有收尾内容之后；“已编辑文件”和任务清单由这里追加，
-    // 必须先渲染这些结果再放压缩提示，避免提示出现在文件卡片和任务统计之前。
+    // 任务只显示在所属轮次底部。Claude 旧服务若缺少轮次 plan，仅把会话快照兼容到最新轮次，
+    // 不把第一轮任务复制到整个会话末尾；明确的 turn.plan（包括空数组）始终优先。
+    const plan = Array.isArray(turn.plan) ? turn.plan
+      : claudeSession && turn === lastRealTurn && Array.isArray(sessionPlan) ? sessionPlan : null;
+    const turnPlan = renderTurnPlan(plan, turn.id);
+    if (turnPlan) items.push(turnPlan);
     for (const item of trailingManualCompactions) items.push(renderMessage(item));
     reconcileChildren(group, items);
     if (items.length) children.push(group);
-    if (claudeSession && !Array.isArray(sessionPlan) && Array.isArray(turn.plan)) claudePlan = turn.plan;
   }
-  // Claude 的任务清单是跨轮次的单一状态板，Codex 只在当前执行轮次暂时显示状态栏；
-  // 两者都不再把任务状态作为聊天正文之外的重复尾部节点追加到 #messages。
-  renderTaskPanel(claudeSession ? claudePlan
-    : lastRealTurn?.status === "inProgress" ? lastRealTurn.plan : null, {
-    scope: claudeSession ? "claude-session" : "codex-turn",
-    threadId: claudeSession ? selectedId : lastRealTurn?.id || selectedId
-  });
   if (!sorted.length) children.push(creating ? welcomeNode()
     : selectedId && (!historyInitialized || historyError) ? historyPlaceholder()
     : element("div", "empty-conversation", "此会话暂无消息。"));
