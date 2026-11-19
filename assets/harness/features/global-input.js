@@ -6,6 +6,7 @@ import { activePopup, closePopup } from "../ui/popup.js";
 import { closeComposerMenus } from "../core/actions.js";
 import { selectedId, selectionToken } from "../core/state.js";
 import { claudeUsageState, closeClaudeUsageTip } from "./composer/claude-usage.js";
+import { stopGeneration } from "./composer/composer.js";
 import { closeModelMenu } from "./composer/composer-menus.js";
 import { closeContextUsageTip, contextUsageTip } from "./composer/metrics.js";
 import { finishQueueDrag } from "./queue/queue.js";
@@ -18,6 +19,7 @@ import {
   dismissSideCreation, handleSideThreadShortcut, handleTransientHistoryPop, ownsRelatedOperation,
   requestSideCreationBack, returnToParentSession, showSideCreation, updateSideCreationStatus
 } from "./session/related.js";
+import { isComputerUseActive } from "./session/capabilities.js";
 import { closeMobileSidebar } from "./shell-state.js";
 import { requestSidePanelClose, workspaceSidePanel } from "./session/side-panel.js";
 
@@ -61,6 +63,14 @@ export function installGlobalInputHandlers() {
       }
       if (workspaceSidePanel && requestSidePanelClose()) {
         event.preventDefault();
+        return;
+      }
+      if (!event.defaultPrevented && !relatedSessionView && isComputerUseActive()
+          && !document.querySelector("dialog[open]")) {
+        // Codex App 的 Escape 会中断当前 computer-use 轮次；已有 stop action 会发送 turn/interrupt，
+        // 由 bundled computer-use 的 Interrupt/Stop hook 结束其控制层，不停止普通会话轮次。
+        event.preventDefault();
+        void stopGeneration().catch(error => notice(error.message, true));
         return;
       }
       if (!event.defaultPrevented && relatedSessionView && !document.querySelector("dialog[open]")) {

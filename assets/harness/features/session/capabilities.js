@@ -1,6 +1,6 @@
 // 会话能力与访问限制：后端类型与实例能力、授权范围键、关联视图校验，以及只读/侧边/子代理等访问限制的统一查询；依赖模型目录与关联视图的动作能力在 action-capabilities.js。
 
-import { creating, selectedId, session, thread } from "../../core/state.js";
+import { creating, selectedId, session, thread, turns } from "../../core/state.js";
 import { creationBackend } from "../composer/creation-state.js";
 import { relatedNavigationOwner, relatedSessionView, relatedThreadViews } from "./related-state.js";
 
@@ -104,4 +104,37 @@ export function isActiveThread() {
   const status = thread?.status?.status || thread?.status;
   const statusType = typeof status === "string" ? status : status?.type;
   return ["active", "inProgress", "running", "pending"].includes(statusType);
+}
+
+function computerUseTool(item) {
+  const surfaces = [
+    item?.toolSurface,
+    item?._meta?.["codex/toolSurface"],
+    item?.result?._meta?.["codex/toolSurface"]
+  ];
+  if (surfaces.some(surface => surface?.kind === "browserUse")
+      || item?.pluginId === "unified-computer-use@openai-bundled") return true;
+  const names = [
+    item?.tool, item?.name, item?.server, item?.pluginId, item?.type,
+    item?.arguments?.name, item?.arguments?.tool, item?.result?.name
+  ]
+    .filter(value => typeof value === "string").join(" ");
+  return /(?:computer|browser)[\s_-]*use/i.test(names);
+}
+
+export function isComputerUseActive() {
+  // Codex App 的 Escape 只中断当前 computer-use 控制层；普通执行轮次不能被这个快捷键误停止。
+  for (const turn of [...turns.values()].reverse()) {
+    const turnStatus = turn?.status?.status || turn?.status;
+    if (!["active", "inProgress", "running", "pending"].includes(turnStatus)) continue;
+    const items = Array.isArray(turn.items) ? turn.items : [];
+    for (let index = items.length - 1; index >= 0; index--) {
+      const item = items[index];
+      if (!computerUseTool(item)) continue;
+      const itemStatus = item?.status?.status || item?.status;
+      if (["active", "inProgress", "running", "pending"].includes(itemStatus)
+          || !itemStatus && index === items.length - 1) return true;
+    }
+  }
+  return false;
 }

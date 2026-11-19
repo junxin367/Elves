@@ -3233,6 +3233,67 @@ test("服务子智能体按独立能力启用，旧后台保持禁用且子会�
   assert.equal(context.subagentsEnabled(), false);
 });
 
+test("只把活跃 computer-use 工具识别为 Escape 关闭目标，不误判普通工具", () => {
+  const context = { turns: new Map() };
+  vm.createContext(context);
+  vm.runInContext(sourceSection("function computerUseTool("), context);
+  const active = item => ({ id: "tool", status: "inProgress", ...item });
+  context.turns.set("ordinary", { status: "inProgress", items: [
+    { id: "shell", type: "commandExecution", status: "inProgress" }
+  ] });
+  assert.equal(context.isComputerUseActive(), false);
+  context.turns.set("browser", { status: "inProgress", items: [
+    active({ pluginId: "unified-computer-use@openai-bundled" })
+  ] });
+  assert.equal(context.isComputerUseActive(), true);
+  context.turns.set("completed", { status: "completed", items: [
+    { id: "tool", pluginId: "unified-computer-use@openai-bundled", status: "completed" }
+  ] });
+  assert.equal(context.isComputerUseActive(), true, "旧完成轮次不能覆盖仍活跃的 computer-use 轮次");
+  context.turns.delete("browser");
+  assert.equal(context.isComputerUseActive(), false);
+});
+
+test("全局 Escape 只在 computer-use 活跃时发送 turn interrupt", () => {
+  const listeners = new Map(), stops = [];
+  const workspace = { classList: { contains: () => false } };
+  const document = {
+    documentElement: { dataset: {} },
+    addEventListener: (name, handler) => listeners.set(name, handler),
+    querySelector: () => null
+  };
+  const context = nodeVm.createContext({
+    document,
+    window: { addEventListener() {} },
+    $: selector => selector === ".workspace[hidden]" ? null
+      : selector === ".workspace" ? workspace
+      : ["#model-settings", "#skill-menu"].includes(selector) ? { hidden: true }
+      : null,
+    activePopup: null, contextUsageTip: null, claudeUsageState: null, queueDrag: null,
+    closeComposerMenus() {}, closeContextUsageTip() {}, closeClaudeUsageTip() {},
+    closePopup() {}, closeMobileSidebar() {}, handleSideThreadShortcut: () => false,
+    workspaceSidePanel: false, requestSidePanelClose: () => false,
+    relatedSessionView: null, sideCreationView: null,
+    isComputerUseActive: () => context.computerUse,
+    stopGeneration: () => { stops.push(true); return Promise.resolve(); },
+    notice() {}, selectedId: "thread-a", selectionToken: "token",
+    computerUse: true
+  });
+  vm.runInContext(sourceSection("function installGlobalInputHandlers()"), context);
+  context.installGlobalInputHandlers();
+  const pressEscape = () => {
+    const event = { key: "Escape", isComposing: false, defaultPrevented: false,
+      preventDefault() { this.defaultPrevented = true; } };
+    listeners.get("keydown")(event);
+    return event;
+  };
+  assert.equal(pressEscape().defaultPrevented, true);
+  assert.equal(stops.length, 1);
+  context.computerUse = false;
+  assert.equal(pressEscape().defaultPrevented, false);
+  assert.equal(stops.length, 1);
+});
+
 test("会话菜单分离子智能体读取和侧边写入，并按连接代次退役旧请求", () => {
   let current = { deviceId: "device", cacheScope: "scope", threadId: "parent", connected: true,
     subagentsEnabled: true, sideThreadsEnabled: false, relatedScope: "service:1" };
