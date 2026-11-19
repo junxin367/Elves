@@ -347,7 +347,8 @@ impl ConversationNaming {
     }
 
     pub fn accepted(self: &Arc<Self>, action: &str, payload: &Value, result: &Value, owner: &str) {
-        // 只使用明确成功且已接收的普通主会话输入；入队、未知结果、编辑和侧边任务均不产生首次命名。
+        // 只使用明确成功且已接收的输入；入队、未知结果和编辑不产生首次命名，
+        // 执行中的侧边消息待真正派发成功后由队列路径补回此入口。
         if !matches!(action, "create" | "send")
             || result["ok"] != true
             || result["queued"] == true
