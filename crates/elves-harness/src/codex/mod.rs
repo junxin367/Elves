@@ -861,6 +861,20 @@ impl CodexHarness {
         self.queue_changed(id).await;
         result.map(|_| ())
     }
+
+    fn accept_queued_conversation_naming(
+        &self,
+        payload: &Value,
+        result: &Value,
+        authorization: &HarnessAuthorization,
+    ) {
+        let Some(controller) = self.controller.get().and_then(Weak::upgrade) else {
+            return;
+        };
+        controller
+            .conversation_naming
+            .accepted("send", payload, result, &authorization.device.id);
+    }
 }
 
 fn error(code: u16, message: &str) -> anyhow::Error {
@@ -1180,5 +1194,100 @@ mod tests {
             assert!(turns["data"].is_array());
         }
         service.release().await;
+    }
+
+    #[tokio::test]
+    async fn queued_ephemeral_side_message_triggers_conversation_naming_after_delivery() {
+        let (directory, authorization) = super::super::tests::harness_fixture().await;
+        let controller = &authorization.controller;
+        let parent = controller
+            .call_authorized(
+                "create",
+                json!({"projectId":"project-a","prompt":"wait 侧边父会话"}),
+                &authorization,
+            )
+            .await
+            .unwrap();
+        let side = controller
+            .call_authorized(
+                "createSideThread",
+                json!({"threadId":parent["threadId"]}),
+                &authorization,
+            )
+            .await
+            .unwrap();
+        let side_id = side["threadId"].as_str().unwrap().to_owned();
+        crate::settings::atomic_write(
+            &directory.path().join("remote-shared-settings.json"),
+            &serde_json::to_vec(&json!({
+                "revision":1,
+                "values":{"conversationNaming":{
+                    "enabled":true,"instanceId":"codex:local","model":"fixture-model",
+                    "systemPrompt":crate::conversation_naming::DEFAULT_PROMPT,
+                    "maxTitleChars":36,"refreshEnabled":true,"refreshEveryTurns":5
+                }}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        {
+            let mut projection = controller.harness.projection.lock().await;
+            projection
+                .active
+                .insert(side_id.clone(), "blocking-turn".into());
+            let side = projection.sides.threads.get_mut(&side_id).unwrap();
+            side.queue.queue_gates.insert(
+                side_id.clone(),
+                store::QueueGate {
+                    turn_id: Some("blocking-turn".into()),
+                    kind: "turn".into(),
+                    phase: "waiting".into(),
+                    reason: String::new(),
+                },
+            );
+        }
+        let queued = controller
+            .call_authorized(
+                "send",
+                json!({"threadId":side_id,"prompt":"排队后仍需自动命名",
+                    "clientUserMessageId":"queued-side-naming"}),
+                &authorization,
+            )
+            .await
+            .unwrap();
+        assert_eq!(queued["deliveryState"], "queued");
+
+        let message = {
+            let mut projection = controller.harness.projection.lock().await;
+            projection.active.remove(&side_id);
+            let side = projection.sides.threads.get_mut(&side_id).unwrap();
+            side.queue.queue_gates.get_mut(&side_id).unwrap().phase = "ready".into();
+            side.queue.queues[&side_id][0].clone()
+        };
+        controller
+            .harness
+            .dispatch_side_queued(&side_id, &message, &authorization, false)
+            .await
+            .unwrap();
+
+        let naming_path = directory.path().join("remote-conversation-naming.json");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(bytes) = std::fs::read(&naming_path)
+                    && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+                    && value["records"][&side_id]["side"] == true
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let saved: Value = serde_json::from_slice(&std::fs::read(naming_path).unwrap()).unwrap();
+        assert_eq!(saved["records"][&side_id]["side"], true);
+        controller.harness.enabled.store(false, Ordering::Release);
+        controller.harness.release().await;
     }
 }

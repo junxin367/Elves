@@ -1712,6 +1712,14 @@ impl CodexHarness {
             self.deliver_side(id, &message.payload, authorization, active)
                 .await
         };
+        if !message.compact
+            && let Ok(response) = &result
+            && response["ok"] == true
+            && response["deliveryState"] != "queued"
+        {
+            // 用户要求执行中的侧边首条消息排队后仍触发自动命名；入队回执只表示等待，实际送达成功时补发命名受理。
+            self.accept_queued_conversation_naming(&message.payload, response, authorization);
+        }
         let mut projection = self.projection.lock().await;
         if let Some(side) = projection
             .sides
