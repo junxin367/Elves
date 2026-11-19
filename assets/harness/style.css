@@ -485,7 +485,8 @@ html[data-workspace-side-panel=true] .composer-anchor>.composer-metrics,
 .skill-option strong{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500}
 .skill-option small{display:block;max-width:100%;font-size:calc(var(--font-size)*.75);line-height:1.6;white-space:nowrap;text-overflow:ellipsis;overflow:hidden}
 .slash-command-option{display:grid;grid-template-columns:20px minmax(0,1fr);align-items:center;gap:9px;min-height:36px;padding:5px 10px}
-.slash-command-option .slash-command-icon{width:18px;height:18px;display:grid;place-items:center;color:var(--muted)}
+/* 用户要求未选中的 / 命令图标与命令标题保持正文前景色；仅说明文字使用 muted，彩色提示词优化图标继续由 Emoji 自己着色。 */
+.slash-command-option .slash-command-icon{width:18px;height:18px;display:grid;place-items:center;color:var(--text)}
 .slash-command-icon svg{width:18px;height:18px}
 .slash-command-copy{display:flex;align-items:baseline;gap:7px;min-width:0}
 .slash-command-copy strong{flex-shrink:0}
