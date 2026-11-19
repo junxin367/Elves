@@ -387,31 +387,41 @@ export function appearanceButtonColor(palette) {
   // Elver 自带默认按钮色；没有按钮色的其他主题继续沿用前景色派生。
   return /^#[0-9a-f]{6}$/i.test(palette.button) ? palette.button : null;
 }
-function appearanceButtonColors(color, surface, preferredText, dark, contrast) {
+function appearanceButtonTextMinimum(programBackground) {
+  const luminance = appearanceLuminance(programBackground);
+  // 程序背景暗时允许按钮文字采用接近非文本控件的 3:1 下限；背景变亮后逐步恢复正文 4.5:1。
+  const progress = Math.min(1, Math.max(0, (luminance - .08) / .42));
+  return 3 + 1.5 * progress;
+}
+function appearanceButtonColors(color, programBackground) {
   const white = "#ffffff", black = "#000000";
-  const textMinimum = 4.5, edgeMinimum = 3, textGoal = 5;
-  let bg = color, text = appearanceReadableForeground(color, preferredText);
-  // 用户要求参考实际面板而不是深浅模式标签。白字亮于按钮、按钮亮于面板时，
-  // 两段 WCAG 对比度相乘等于白字对面板的对比度；5:1 是期望值，4.5:1 和 3:1 分别是文字和边界下限。
-  // 最多向黑色混入 25%，足以覆盖 Elver 示例，又不会为了白字把用户选的亮色大幅压暗；不改写原始 HEX。
-  const target = Math.min(textGoal, appearanceContrastRatio(white, surface) / edgeMinimum,
-    appearanceContrastRatio(white, mixColor(color, black, .25)));
-  if (target >= textMinimum) {
-    const matchesSurface = fill => appearanceLuminance(fill) > appearanceLuminance(surface)
-      && appearanceContrastRatio(fill, surface) >= edgeMinimum;
-    let fill = appearanceAccessibleColor(color, white, target);
-    // 动态目标恰好贴边时，8 位 RGB 取整可能越过边界。允许重试文字下限，不得向下取整放宽任何下限。
-    if (!matchesSurface(fill)) fill = appearanceAccessibleColor(color, white, textMinimum);
-    if (matchesSurface(fill)) { bg = fill; text = white; }
-  }
-  // 延续 Codex 的状态叠色比例，混入所在面板，三个状态使用同一字色并分别检查文字对比度。
-  const state = weight => appearanceAccessibleColor(mixColor(bg, surface, weight), text, textMinimum);
-  const hover = state(dark ? .04 + .03 * contrast : .05 + .06 * contrast);
-  const active = state(dark ? .07 + .05 * contrast : .1 + .12 * contrast);
-  // 当任一状态的填充与面板分不清时，使用同一条达标的描边；描边不参与文字对比度计算。
-  const outline = [bg, hover, active].some(fill => appearanceContrastRatio(fill, surface) < edgeMinimum)
-    ? appearanceAccessibleColor(bg, surface, edgeMinimum) : "transparent";
-  return { bg, text, hover, active, outline };
+  const textMinimum = appearanceButtonTextMinimum(programBackground);
+  const preferredText = appearanceLuminance(programBackground) <= .18 ? white : black;
+  const fallbackText = preferredText === white ? black : white;
+  const text = appearanceContrastRatio(color, preferredText) >= textMinimum
+    ? preferredText
+    : appearanceContrastRatio(color, fallbackText) >= textMinimum
+      ? fallbackText
+      : appearanceContrastRatio(color, black) >= appearanceContrastRatio(color, white) ? black : white;
+  // 用户要求按钮底色保留用户设置或设计默认值；文字根据程序背景明暗优先选择黑/白，
+  // 再用按钮填充与文字的对比度核对当前背景门槛。按钮周围的卡片或输入框表面不参与基础判断。
+  const bg = color;
+  // 使用固定状态层：Hover 8%、Active 12%；若状态层使文字低于当前门槛，只收小状态层透明度。
+  const state = requestedWeight => {
+    const max = Math.min(1, Math.max(0, requestedWeight));
+    const value = weight => mixColor(bg, text, weight);
+    if (appearanceContrastRatio(value(max), text) >= textMinimum) return value(max);
+    let low = 0, high = max;
+    for (let index = 0; index < 16; index++) {
+      const middle = (low + high) / 2;
+      if (appearanceContrastRatio(value(middle), text) >= textMinimum) low = middle;
+      else high = middle;
+    }
+    return value(low);
+  };
+  const hover = state(.08);
+  const active = state(.12);
+  return { bg, text, hover, active, outline: "transparent" };
 }
 export function appearanceThemeColors(theme, palette) {
   const { background, foreground, contrast: setting } = palette;
@@ -450,7 +460,7 @@ export function appearanceThemeColors(theme, palette) {
   // 与 style.css 的审批/设置卡片及管理页的 card/popover 表面对齐；不改变发送、危险、强调按钮和无自定义色主题。
   for (const [prefix, surface] of Object.entries({ button: background, "button-side": side,
     "button-card": card, "button-composer": surfaces["composer-bg"], "button-control": surfaces["control-bg"] })) {
-    const colors = customButton ? appearanceButtonColors(customButton, surface, surfaces["control-bg"], dark, contrast)
+    const colors = customButton ? appearanceButtonColors(customButton, background)
       : { bg: foreground, text: primaryText, hover: primaryHover, active: primaryActive, outline: "transparent" };
     for (const [part, value] of Object.entries(colors)) buttons[`${prefix}-${part}`] = value;
   }
