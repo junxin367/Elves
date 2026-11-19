@@ -10596,7 +10596,7 @@ test("过期侧边阅读后提交已读，清除父会话蓝点并保留其它�
   await assert.rejects(context.mutate("markRead", { threadId: "side" }), error => error.code === 403);
 });
 
-test("显式打开主会话即使阅读位置不在底部也提交已读", async () => {
+test("显式打开主会话即使历史仍在读取且阅读位置不在底部也提交已读", async () => {
   const acknowledgements = [], timers = [];
   const transport = transportClient(({ path, options }) => {
     acknowledgements.push({ action: path.split("/").at(-1), payload: JSON.parse(options.body) });
@@ -10605,8 +10605,8 @@ test("显式打开主会话即使阅读位置不在底部也提交已读", async
   });
   const context = Object.assign(transport.context, {
     session: { device: { id: "device" }, readOnly: false }, selectedId: "main",
-    thread: { id: "main", hasUnreadTurn: true }, connected: true, historyInitialized: true,
-    historyError: "", transcriptChecking: false, followMessages: false, document: { hidden: false },
+    thread: { id: "main", hasUnreadTurn: true }, connected: true, historyInitialized: false,
+    historyError: "最新历史仍在读取", transcriptChecking: true, followMessages: false, document: { hidden: false },
     normalizeRelatedView: value => value, relatedThreadViews: new Map(), relatedSessionView: null,
     threadDeletionLocked: () => false, threadDeleted: () => false,
     readMarkRequests: new Map(), recentPrioritySelectionSuppressions: new Set(),

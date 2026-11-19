@@ -164,11 +164,12 @@ export function loadMessageSkillChoices(items) {
 export async function markVisibleThreadRead(id = selectedId, { opened = false } = {}) {
   // 用户要求显式进入会话后立即提交已读；opened 只由正文初始化完成的导航路径传入，
   // 绕过 followMessages，避免恢复旧阅读位置时点击会话仍残留蓝点。
+  const explicitOpen = opened === true;
   if (!id || id !== selectedId || thread?.id !== id || threadActionReadOnly("markRead", id) || !connected
-      || !historyInitialized || historyError || transcriptChecking
+      || !explicitOpen && (!historyInitialized || historyError || transcriptChecking)
       || threadDeletionLocked(id) || threadDeleted(id) || document.hidden
       || document.documentElement?.dataset?.workspaceSidePanelVisible === "false"
-      || !opened && !followMessages) return;
+      || !explicitOpen && !followMessages) return;
   if (readMarkRequests.has(id)) return readMarkRequests.get(id);
   const deviceId = session.device.id, readVersion = messageVersion;
   sidebarReadRefreshSuppressions.add(id);
