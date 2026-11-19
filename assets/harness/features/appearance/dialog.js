@@ -393,7 +393,6 @@ export function mountSettingsPage(screen, { onBack, fromLogin = false }) {
       <div id="appearance-colors"></div>
       <!-- 用户要求对比度使用滑块，拖动时实时应用，只更新当前主题的明暗模式。 -->
       <label class="appearance-field"><span>对比度</span><span class="appearance-font"><input id="appearance-contrast" type="range" min="${appearanceContrastMin}" max="${appearanceContrastMax}" step="1" aria-label="外观对比度"><output id="appearance-contrast-value" for="appearance-contrast" aria-hidden="true"></output></span></label>
-      <div class="appearance-field"><span>界面字体</span><div id="appearance-ui-font-slot"></div></div>
     </div></section>
     <section class="appearance-section"><h4>背景图片</h4><div class="appearance-card">
     <div class="appearance-field appearance-background-field"><span>图片</span><div class="appearance-background-actions"><input id="appearance-background-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden><button type="button" id="appearance-background-action"></button></div></div>
@@ -405,6 +404,8 @@ export function mountSettingsPage(screen, { onBack, fromLogin = false }) {
     </div></section>
     <details class="appearance-advanced"><summary>高级<span aria-hidden="true">›</span></summary>
     <section class="appearance-section"><h4>字体与排版</h4><div class="appearance-card">
+    <!-- 用户要求界面字体位于界面字号上方；两者同属字体与排版分组。 -->
+    <div class="appearance-field"><span>界面字体</span><div id="appearance-ui-font-slot"></div></div>
     <!-- 用户要求字号均改为数值输入；界面 10～20、代码 8～24、阅读 6～14 的原有范围与校验同步保留。 -->
     <label class="appearance-field"><span>界面字号</span><span class="appearance-number"><input id="appearance-font" type="number" inputmode="numeric" min="10" max="20" step="1" aria-label="界面字号"><span>px</span></span></label>
     <div class="appearance-field"><span>界面字重</span><div id="appearance-ui-font-weight-slot"></div></div>
