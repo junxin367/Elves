@@ -317,8 +317,9 @@ export async function selectThread(id, { closeSidebar = true, force = false, rel
     if (selectionController === controller) setSelectionController(null);
   }
   await latest;
+  // 用户要求进入会话后立即消除正文未读；正文初始化完成即确认已读，不受恢复的历史滚动位置影响。
   if (version === selectionVersion && !isActiveThread())
-    void markVisibleThreadRead(id).catch(error => notice(error.message, true));
+    void markVisibleThreadRead(id, { opened: true }).catch(error => notice(error.message, true));
 }
 export function showWelcome({ startNew = true, clearHash = false } = {}) {
   setRelatedSelectionVersion(relatedSelectionVersion + 1);

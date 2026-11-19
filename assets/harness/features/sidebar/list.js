@@ -317,10 +317,6 @@ export function renderSidebar() {
 
   const openThread = async item => {
     await selectThread(item.id);
-    if (!item.hasUnreadTurn || threadReadOnly(item.id) || !connected || selectedId !== item.id || thread?.id !== item.id) return;
-    try {
-      await markVisibleThreadRead(item.id);
-    } catch (error) { notice(error.message, true); }
   };
   const threadProjectName = item => projectNames.get(item.projectId)
     || String(item.cwd || "").replace(/[\\/]+$/, "").split(/[\\/]/).pop()

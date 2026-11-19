@@ -30,7 +30,7 @@ import {
 import {
   claudeHistoryCursor, completedItem, itemVersions, messageVersion, normalizeDisplayedTurnItems,
   normalizeDisplayedUserMessage, orderClaudeHistoryTurns, partialItems, setHistoryCursor,
-  setMessageVersion, setSessionPlan, turnFieldVersions, turnVersions
+  followMessages, setMessageVersion, setSessionPlan, turnFieldVersions, turnVersions
 } from "./history-state.js";
 import { retireClaudeHistoryTurns } from "./history.js";
 import { acceptedSendItem, pending } from "./pending-state.js";
@@ -238,7 +238,11 @@ export function receive(event) {
     }
   }
   if (event.method === "turn/completed" && typeof eventThreadId === "string") {
+    // 对齐 Codex App：当前会话且仍跟随最新消息时不计未读；
+    // 用户正在查看旧历史、切换到其他会话、页面隐藏或面板不可见时保留未读，
+    // 回到底部或重新进入会话后再提交 markRead。
     const unread = eventThreadId !== selectedId
+      || !followMessages
       || typeof document !== "undefined" && (document.hidden
         || document.documentElement?.dataset?.workspaceSidePanelVisible === "false");
     sidebarChanged = (typeof applySidebarThreadOutcome === "function"

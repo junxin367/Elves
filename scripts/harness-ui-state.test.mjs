@@ -10464,6 +10464,39 @@ test("过期侧边阅读后提交已读，清除父会话蓝点并保留其它�
   await assert.rejects(context.mutate("markRead", { threadId: "side" }), error => error.code === 403);
 });
 
+test("显式打开主会话即使阅读位置不在底部也提交已读", async () => {
+  const acknowledgements = [], timers = [];
+  const transport = transportClient(({ path, options }) => {
+    acknowledgements.push({ action: path.split("/").at(-1), payload: JSON.parse(options.body) });
+    return jsonResponse({ requestId: options.headers.get("Idempotency-Key"),
+      state: "completed", result: { ok: true } });
+  });
+  const context = Object.assign(transport.context, {
+    session: { device: { id: "device" }, readOnly: false }, selectedId: "main",
+    thread: { id: "main", hasUnreadTurn: true }, connected: true, historyInitialized: true,
+    historyError: "", transcriptChecking: false, followMessages: false, document: { hidden: false },
+    normalizeRelatedView: value => value, relatedThreadViews: new Map(), relatedSessionView: null,
+    threadDeletionLocked: () => false, threadDeleted: () => false,
+    readMarkRequests: new Map(), recentPrioritySelectionSuppressions: new Set(),
+    sidebarReadRefreshSuppressions: new Set(), setTimeout: callback => timers.push(callback),
+    selectionVersion: 1, messageVersion: 0, recoveryGeneration: 0, randomId: () => "read-receipt",
+    privateInputScope: value => value.device.id, goalComposerAction: () => false,
+    sidebar: { recent: [{ id: "main", hasUnreadTurn: true }], pinnedThreads: [], projects: [],
+      unreadSideThreads: [] },
+    sessionMenu: { markSideThreadRead() {} }, syncSideThreadUnread() {}, renderSidebar() {}
+  });
+  vm.runInContext([
+    sourceSection("function threadReadOnly(", "function threadReadOnlyMessage("),
+    sourceSection("async function mutat", "async functi"),
+    sourceSection("function markSidebarThreadReadLocally(", "function sidebarAttentionState("),
+    sourceSection("async function markVisibleThreadRead(")
+  ].join("\n"), context);
+  await context.markVisibleThreadRead("main", { opened: true });
+  assert.equal(acknowledgements.length, 1);
+  assert.equal(acknowledgements[0].action, "markRead");
+  assert.equal(context.thread.hasUnreadTurn, false);
+});
+
 test("侧边过期且从未读到正文时显示读取失败，不伪装成空会话或提交已读", async () => {
   const h = sideExpiryHarness(() => jsonResponse({
     ok: false, message: `thread not loaded: ${expiredSideProbe.threadId}`
@@ -14342,17 +14375,22 @@ test("Codex 历史合并实际执行确认输入的原生顺序纠正", () => {
 });
 
 test("Codex turn/completed 通过真实事件入口纠正引导位置", () => {
+  const outcomes = [], markReads = [];
   const context = nodeVm.createContext({ nativeConnectionVersion: 1,
     session: { device: { id: "device" } }, selectedId: "main", privateInputScope: () => "scope",
     sessionMenu: { invalidate: () => null }, relatedSessionView: null, relatedMenuTimer: null, connected: true,
     thread: { id: "main", status: { type: "active" } }, turns: new Map(), pending: null, sending: false,
+    followMessages: true,
     messageVersion: 0, statusVersion: 0, itemVersions: new Map(), turnVersions: new Map(), turnFieldVersions: new Map(),
     partialItems: new Set(), transcriptEventTypes: new Set(), sidebarReadRefreshSuppressions: new Set(),
     recentPrioritySelectionSuppressions: new Set(), threadDeleted: () => false,
     handleRemoteChannelEvent: () => false, scheduleRelatedMenuRefresh() {}, rememberBackgroundThreadDisplay() {},
     receiveCompactionLifecycle() {}, mergeTranscriptEvents() {},
     mergeItemProjection: (previous, incoming) => ({ ...previous, ...incoming }), enrichTurnTranscriptEvents: value => value,
-    updateComposer() {}, scheduleReload() {}, markVisibleThreadRead: async () => {},
+    applySidebarThreadOutcome: (...args) => { outcomes.push(args); return false; },
+    normalizeTurnOutcome: turn => ({ turnId: turn?.id || null, status: turn?.status || "completed",
+      kind: "completed", error: null }),
+    updateComposer() {}, scheduleReload() {}, markVisibleThreadRead: async (...args) => markReads.push(args),
     scheduleMessages() {}, rememberTranscript() {}, scheduleSidebarRefresh() {},
   });
   installSentMessageDisplayHarness(context);
@@ -14368,6 +14406,13 @@ test("Codex turn/completed 通过真实事件入口纠正引导位置", () => {
   context.receive({ method: "turn/completed", params: { threadId: "main",
     turn: { id: turn.id, status: "completed", items: [native, reply] } } });
   assert.deepEqual(Array.from(context.withSentMessageDisplays()[0].items, item => item.id), ["native", "reply"]);
+  assert.equal(outcomes[0][2].unread, false, "当前会话跟随最新消息时不产生未读");
+  assert.equal(markReads.length, 1, "当前会话完成后提交已读");
+  context.followMessages = false;
+  context.receive({ method: "turn/completed", params: {
+    threadId: "main", turn: { id: "turn-2", status: "completed", items: [] }
+  } });
+  assert.equal(outcomes[1][2].unread, true, "阅读旧历史时新回复保留未读");
 });
 
 test("Claude 恢复后单独压缩的状态行始终位于已经完成的回复之后", () => {

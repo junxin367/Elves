@@ -162,6 +162,8 @@ export function loadMessageSkillChoices(items) {
   void loadSkillChoices(scope, { threadId: selectedId }).catch(() => {});
 }
 export async function markVisibleThreadRead(id = selectedId, { opened = false } = {}) {
+  // 用户要求显式进入会话后立即提交已读；opened 只由正文初始化完成的导航路径传入，
+  // 绕过 followMessages，避免恢复旧阅读位置时点击会话仍残留蓝点。
   if (!id || id !== selectedId || thread?.id !== id || threadActionReadOnly("markRead", id) || !connected
       || !historyInitialized || historyError || transcriptChecking
       || threadDeletionLocked(id) || threadDeleted(id) || document.hidden
