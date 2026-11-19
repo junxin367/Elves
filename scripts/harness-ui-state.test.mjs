@@ -4035,6 +4035,19 @@ test("异步子菜单读取失败原地重试，父项失效后释放子菜单",
   assert.equal(popup.submenu, null);
 });
 
+test("文件不存在时打开方式只显示简短删除提示，不提供重新加载按钮", async () => {
+  const h = sessionFilterPopupHarness();
+  h.trigger.menuOptions = [{ value: "openIn", label: "打开方式", submenuKey: "missing",
+    submenu: async () => { throw new Error("文件不存在或已被删除"); } }];
+  h.context.openPopup(h.trigger); h.context.activePopup.list.querySelector("button").click();
+  await new Promise(setImmediate);
+  const submenu = h.context.activePopup.submenu;
+  const option = submenu.list.querySelector("button");
+  assert.equal(option.children[0].children[0].textContent, "文件不存在或已删除");
+  assert.equal(option.disabled, true);
+  assert.equal(option.title, "文件不存在或已删除");
+});
+
 test("二级菜单按实际视口向右或向左避让，窄屏提供返回并保留八像素边距", () => {
   const h = sessionFilterPopupHarness();
   h.trigger.menuOptions = [{ value: "copy", label: "复制", submenuWidth: 200,
