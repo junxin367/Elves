@@ -11,7 +11,8 @@ import {
   setHistoryAutoFailed, setHistoryController, setHistoryError, setHistoryLoadFrame,
   setHistoryLoadVisibleItems, setHistoryLoading, setHistoryLoadingOlder, setHistoryLoadingTurnId,
   setHistoryLoadingVersion, setHistoryRequest, setHistoryScrollTop, setLatestHistoryReadFailed,
-  sessionPlan, setMessageFrame, setRecentHistoryPage, setSessionPlan, setThreadRequest, setTranscriptChecking, threadRequest,
+  clearTaskPanel, sessionPlan, setMessageFrame, setRecentHistoryPage, setSessionPlan, setThreadRequest,
+  setTranscriptChecking, threadRequest,
   turnFieldVersions, turnVersions
 } from "./history-state.js";
 import {
@@ -59,6 +60,7 @@ export function resetMessages() {
   renderedItems.clear(); renderedTurns.clear(); renderedActivities.clear(); itemVersions.clear(); turnVersions.clear(); turnFieldVersions.clear();
   partialItems.clear();
   setSessionPlan(null);
+  clearTaskPanel();
   setFollowMessages(true);
   setTranscriptChecking(false);
   setRecentHistoryPage(null);

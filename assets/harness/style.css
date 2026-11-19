@@ -911,9 +911,22 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .turn-plan{list-style:none;margin:10px 0;padding:0;font-size:.85714rem;color:var(--muted);line-height:1.8}
 .turn-plan>.inProgress{color:var(--text)}
 .turn-plan>.completed{text-decoration:line-through}
-/* Claude 清单属于整个会话，固定在正文所有轮次之后；新消息会在它上方继续出现。 */
-.claude-session-plan{margin:10px 0 20px}
-.claude-session-plan>.turn-plan-title{margin-top:0}
+/* 任务状态栏固定在输入框上方；完整清单展开时只在本区域滚动，不挤压聊天正文。 */
+.task-area{min-width:0;flex-shrink:0}
+.task-panel{min-width:0;margin:0}
+.task-panel>summary{display:flex;align-items:center;gap:7px;min-width:0;min-height:var(--composer-context-row-height);padding:4px 10px;color:var(--muted);cursor:pointer;list-style:none}
+.task-panel>summary::-webkit-details-marker{display:none}
+.task-panel>summary:focus-visible{outline:1px solid var(--focus-ring);outline-offset:-2px}
+.task-panel>summary:hover{color:var(--text)}
+.task-panel>summary>.ui-icon{width:15px;height:15px;flex:0 0 15px}
+.task-panel-title{min-width:0;overflow:hidden;color:inherit;font-size:1rem;line-height:1.4;text-overflow:ellipsis;white-space:nowrap}
+.task-panel-toggle{margin-left:auto;flex-shrink:0;font-size:.78571rem;white-space:nowrap}
+.task-panel-chevron{transition:transform var(--duration-control)}
+.task-panel[open] .task-panel-chevron{transform:rotate(180deg)}
+.task-panel-list{display:flex;flex-direction:column;gap:2px;max-height:min(30dvh,240px);margin:0;padding:4px 12px 10px 32px;overflow:auto;overscroll-behavior:contain;border-top:1px solid var(--line);list-style:none}
+.task-panel-item{min-width:0;color:var(--muted);font-size:.85714rem;line-height:1.6;overflow-wrap:anywhere}
+.task-panel-item.inProgress{color:var(--text)}
+.task-panel-item.completed{text-decoration:line-through}
 .send-button[data-action=stop] .ui-icon{width:18px;height:18px}
 /* 240% 背景从 150% 移至 -50%，亮带仍从左向右扫过，重置时两端都是 muted 底色。 */
 @keyframes working-shimmer{from{background-position:150% 0}to{background-position:-50% 0}}
@@ -1192,8 +1205,9 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .subagent-item[data-status=closed] .subagent-state,.subagent-item[data-status=interrupted] .subagent-state,.subagent-item[data-status=unknown] .subagent-state,.subagent-item[data-status=updated] .subagent-state{color:var(--muted)}
 .subagent-item[data-status=failed] .subagent-state{color:var(--danger)}
 .activity-body>.subagent-item{margin:0 0 4px;padding:2px 0}
-.composer-context:has(>#queued-area:not([hidden]),>#goal-area:not([hidden])){margin:0 12px -1px;border:1px solid var(--line);border-bottom:0;border-radius:14px 14px 0 0;background:var(--control-bg,var(--side));overflow:auto}
+.composer-context:has(>#queued-area:not([hidden]),>#goal-area:not([hidden]),>#task-area:not([hidden])){margin:0 12px -1px;border:1px solid var(--line);border-bottom:0;border-radius:14px 14px 0 0;background:var(--control-bg,var(--side));overflow:auto}
 #queued-area:not([hidden])+#goal-area:not([hidden]){border-top:1px solid var(--line)}
+#goal-area:not([hidden])+#task-area:not([hidden]),#queued-area:not([hidden])+#task-area:not([hidden]){border-top:1px solid var(--line)}
 #queued-area{display:flex;flex-direction:column;min-height:0}
 #goal-area{min-width:0;flex-shrink:0}
 .goal-card-shell{display:grid;grid-template-columns:minmax(0,1fr) 34px;align-items:start;min-width:0}
@@ -1242,7 +1256,7 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .goal-edit-primary-actions{display:grid;grid-template-columns:repeat(3,76px);align-items:center;gap:8px;margin-left:auto}
 .goal-edit-actions button{min-height:40px;padding:7px 14px;font-size:.85714rem}
 .goal-edit-primary-actions button{width:100%;height:40px;padding:7px 10px}
-@media(max-width:760px){.composer-context:has(>#queued-area:not([hidden]),>#goal-area:not([hidden])){margin-inline:8px}.goal-body{padding-left:12px;padding-right:12px}.goal-edit-dialog{position:fixed;inset:calc(var(--goal-edit-viewport-height,100lvh)*.06) 0 auto;width:calc(100% - 16px);height:calc(var(--goal-edit-viewport-height,100lvh)*.48);max-height:none;margin:0 auto}.goal-edit-heading{min-height:52px;padding:10px 12px}.goal-edit-scroll{padding:12px}.goal-edit-field{min-height:0}.goal-edit-input{height:100%;min-height:0}.goal-edit-actions{flex-direction:column;align-items:stretch;padding:10px 12px}.goal-edit-receipt-actions{width:100%}.goal-edit-primary-actions{grid-template-columns:repeat(3,minmax(0,1fr));width:100%;margin-left:0}}
+@media(max-width:760px){.composer-context:has(>#queued-area:not([hidden]),>#goal-area:not([hidden]),>#task-area:not([hidden])){margin-inline:8px}.goal-body{padding-left:12px;padding-right:12px}.goal-edit-dialog{position:fixed;inset:calc(var(--goal-edit-viewport-height,100lvh)*.06) 0 auto;width:calc(100% - 16px);height:calc(var(--goal-edit-viewport-height,100lvh)*.48);max-height:none;margin:0 auto}.goal-edit-heading{min-height:52px;padding:10px 12px}.goal-edit-scroll{padding:12px}.goal-edit-field{min-height:0}.goal-edit-input{height:100%;min-height:0}.goal-edit-actions{flex-direction:column;align-items:stretch;padding:10px 12px}.goal-edit-receipt-actions{width:100%}.goal-edit-primary-actions{grid-template-columns:repeat(3,minmax(0,1fr));width:100%;margin-left:0}}
 @media(max-width:390px){.goal-metrics{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:7px 10px}}
 @media(hover:none),(max-width:760px){.composer-context{--composer-context-row-height:max(36px,calc(1.4rem + 8px))}}
 .queued-messages{display:block;min-height:0;max-height:calc(4 * var(--composer-context-row-height));margin:0;padding:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;border:0;border-radius:0;background:transparent}

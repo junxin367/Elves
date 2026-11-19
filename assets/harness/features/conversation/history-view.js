@@ -20,8 +20,8 @@ import {
   followMessages, historyCursor, historyError, historyInitialized, historyLoadButton,
   legacySentDisplayTurn, messageFrame, renderTurnPlanTitle, renderedItems, renderedTurns,
   setFollowMessages, setHistoryCursor, setHistoryInitialized, setHistoryScrollTop, setMessageFrame,
-  sessionPlan, setRecentHistoryPage, setSessionPlan, setTranscriptChecking, syncHistoryButtons, turnFieldVersions,
-  updateScrollControl, visibleMessageAnchor
+  sessionPlan, setRecentHistoryPage, setSessionPlan, setTranscriptChecking, syncHistoryButtons,
+  renderTaskPanel, turnFieldVersions, updateScrollControl, visibleMessageAnchor
 } from "./history-state.js";
 import { historyPlaceholder, loadHistory, scheduleHistoryLoad } from "./history.js";
 import { pending } from "./pending-state.js";
@@ -272,7 +272,9 @@ export function renderMessages(keepScroll = true) {
       }
       items.push(note);
     }
-    if (!claudeSession && turn.plan?.length) {
+    // Codex 当前执行轮次的任务移到输入框上方状态栏；轮次结束后再留在对应回复末尾，保留历史归属。
+    const liveCodexPlan = !claudeSession && turn === lastRealTurn && turn.status === "inProgress";
+    if (!claudeSession && turn.plan?.length && !liveCodexPlan) {
       const plan = element("ul", "turn-plan");
       for (const step of turn.plan) plan.append(element("li", step.status, `${step.status === "completed" ? "✓" : step.status === "inProgress" ? "◌" : "○"} ${step.step}`));
       items.push(renderTurnPlanTitle(turn.plan), plan);
@@ -284,17 +286,13 @@ export function renderMessages(keepScroll = true) {
     if (items.length) children.push(group);
     if (claudeSession && !Array.isArray(sessionPlan) && Array.isArray(turn.plan)) claudePlan = turn.plan;
   }
-  if (claudeSession && claudePlan?.length) {
-    const plan = element("section", "claude-session-plan");
-    plan.dataset.planScope = "claude-session";
-    const title = renderTurnPlanTitle(claudePlan);
-    const list = element("ul", "turn-plan");
-    for (const step of claudePlan)
-      list.append(element("li", step.status,
-        `${step.status === "completed" ? "✓" : step.status === "inProgress" ? "◌" : "○"} ${step.step}`));
-    plan.append(title, list);
-    children.push(plan);
-  }
+  // Claude 的任务清单是跨轮次的单一状态板，Codex 只在当前执行轮次暂时显示状态栏；
+  // 两者都不再把任务状态作为聊天正文之外的重复尾部节点追加到 #messages。
+  renderTaskPanel(claudeSession ? claudePlan
+    : lastRealTurn?.status === "inProgress" ? lastRealTurn.plan : null, {
+    scope: claudeSession ? "claude-session" : "codex-turn",
+    threadId: claudeSession ? selectedId : lastRealTurn?.id || selectedId
+  });
   if (!sorted.length) children.push(creating ? welcomeNode()
     : selectedId && (!historyInitialized || historyError) ? historyPlaceholder()
     : element("div", "empty-conversation", "此会话暂无消息。"));

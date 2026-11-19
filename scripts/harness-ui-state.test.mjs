@@ -9538,6 +9538,7 @@ function installMessageResetHarness(context) {
   Object.assign(context, {
     messageImageRefreshes: new Map(), composerScroll: null, clearPendingFeedbackTimer() {},
     stopActivityTimer() {}, finishQueueDrag() {}, cancelAnimationFrame() {},
+    clearTaskPanel() {},
     historyController: new AbortController(), historyRequest: {},
     selectionController: new AbortController(), historyLoadFrame: null, messageFrame: null,
     renderedItems: new Map(), renderedTurns: new Map(), renderedActivities: new Map(),
@@ -11739,6 +11740,7 @@ test("真实渲染入口过滤未确认占位，已确认正文在后续渲染�
   Object.assign(context, {
     messageFrame: null, followMessages: true, composerScroll: null,
     cancelAnimationFrame() {}, scheduleMermaidBlocks() {},
+    renderTaskPanel() {},
     $: (selector, root) => !root && selector === "#messages" ? messagesRoot : originalQuery(selector, root),
   });
   vm.runInContext(sourceSection("function renderMessages(", "  loadMessageSkillChoices(sorted.flatMap")
@@ -14382,7 +14384,7 @@ function claudeExecutionFeedbackHarness(turn) {
   const initialTurns = Array.isArray(turn) ? turn : [turn];
   const makeNode = (textContent = "") => ({ dataset: {}, children: [], textContent,
     scrollTop: 0, scrollHeight: 0, querySelector: () => null, append(...children) { this.children.push(...children); } });
-  const root = makeNode(), activities = [];
+  const root = makeNode(), activities = [], taskPanels = [];
   const context = nodeVm.createContext({ nativeConnectionVersion: 1,
     selectedId: "claude-fixture", thread: { id: "claude-fixture", status: { type: "idle" } },
     turns: new Map(initialTurns.map(value => [value.id, value])), renderedItems: new Map(), renderedTurns: new Map(), renderedActivities: new Map(),
@@ -14390,6 +14392,7 @@ function claudeExecutionFeedbackHarness(turn) {
     editingMessage: null, editingQueuedMessage: null, pending: null, busy: false, stopping: false, connected: true,
     historyError: "", historyCursor: null, historyInitialized: true, historyScrollTop: 0, markdownRenderVersion: 0,
     textContent: item => item.text || "", $: selector => selector === "#messages" ? root : null,
+    renderTaskPanel: (plan, options) => taskPanels.push({ plan, options }),
     element: (_tag, _className, text = "") => makeNode(text), icon: () => makeNode(),
     cancelAnimationFrame() {}, scheduleMermaidBlocks() {}, reconcileSentMessageDisplays: () => false,
     currentThreadDisplay: () => context.thread, withSentMessageDisplays: () => [...context.turns.values()],
@@ -14416,7 +14419,9 @@ function claudeExecutionFeedbackHarness(turn) {
   nodeVm.runInContext(sourceSection("function completedManualCompactionAfterReply(", "function enrichTurnTranscriptEvents(")
     + sourceSection("function finalMessageIndex(", "function updateActivitySummary(")
     + sourceSection("function renderMessa", "function res"), context);
-  return { context, activities, root, render() { activities.length = 0; context.renderMessages(); return activities; } };
+  return { context, activities, taskPanels, root, render() {
+    activities.length = 0; taskPanels.length = 0; context.renderMessages(); return activities;
+  } };
 }
 
 test("Codex 引导按有序原生快照纠正位置，无原生锚点时保持现状", () => {
@@ -14614,7 +14619,7 @@ test("Claude 正文渲染兜底把迟到的手动完成压缩放到最终回复�
     ["render-fallback:input", "render-fallback:reply", "render-fallback:compact"]);
 });
 
-test("Claude 手动压缩位于已编辑文件之后，任务清单固定在正文末尾", () => {
+test("Claude 手动压缩仍在正文末尾，任务清单移到输入框上方状态栏", () => {
   const turn = { id: "render-tail", _nativeUserId: "native-render-tail",
     status: "failed", plan: [{ step: "保留任务清单", status: "completed" }], items: [
       { id: "input", type: "userMessage" },
@@ -14625,9 +14630,7 @@ test("Claude 手动压缩位于已编辑文件之后，任务清单固定在正�
     ] };
   const h = claudeExecutionFeedbackHarness(turn);
   const editedFiles = { dataset: { key: "edited-files" } };
-  const planTitle = { dataset: { key: "plan-title" } };
   h.context.renderEditedFiles = () => editedFiles;
-  h.context.renderTurnPlanTitle = () => planTitle;
   h.context.transcriptEventTypes.add("contextCompaction");
   h.render();
   const children = h.root.children[0].children;
@@ -14635,14 +14638,13 @@ test("Claude 手动压缩位于已编辑文件之后，任务清单固定在正�
   assert.ok(compact, "手动压缩节点必须被渲染");
   assert.ok(children.indexOf(editedFiles) < children.indexOf(compact),
     "压缩提示必须位于已编辑文件卡片之后");
-  const plan = h.root.children.at(-1);
-  assert.equal(plan.dataset.planScope, "claude-session");
-  assert.equal(plan.children[0], planTitle);
-  assert.ok(h.root.children.indexOf(plan) > 0 && h.root.children.indexOf(plan) > h.root.children.indexOf(h.root.children[0]),
-    "Claude 任务清单必须位于所有轮次之后");
+  assert.equal(h.root.children.some(node => node.dataset.planScope), false,
+    "Claude 任务清单不能重复追加到聊天正文");
+  assert.deepEqual(h.taskPanels.at(-1).plan, turn.plan);
+  assert.equal(h.taskPanels.at(-1).options.scope, "claude-session");
 });
 
-test("Claude 任务清单只显示最新快照并随正文刷新保持在最下方", () => {
+test("Claude 任务栏只显示最新快照并随正文刷新保持在输入框上方", () => {
   const first = { id: "plan-first", _nativeUserId: "native-plan-first", status: "completed",
     plan: [{ step: "旧任务", status: "completed" }],
     items: [{ id: "input", type: "userMessage" }, { id: "reply", type: "agentMessage", text: "第一轮" }] };
@@ -14650,12 +14652,10 @@ test("Claude 任务清单只显示最新快照并随正文刷新保持在最下�
     plan: [{ step: "新任务", status: "inProgress" }],
     items: [{ id: "input", type: "userMessage" }, { id: "reply", type: "agentMessage", text: "第二轮" }] };
   const h = claudeExecutionFeedbackHarness([first, second]);
-  h.context.renderTurnPlanTitle = plan => h.context.element("div", "turn-plan-title", `${plan.length} 个任务`);
   h.render();
-  let plan = h.root.children.at(-1);
-  assert.equal(plan.dataset.planScope, "claude-session");
-  assert.deepEqual(Array.from(h.root.children, node => node.dataset.planScope || "turn"), ["turn", "turn", "claude-session"]);
-  assert.equal(plan.children[1].children[0].textContent, "◌ 新任务");
+  let taskPanel = h.taskPanels.at(-1);
+  assert.deepEqual(Array.from(h.root.children, node => node.dataset.planScope || "turn"), ["turn", "turn"]);
+  assert.deepEqual(taskPanel.plan, second.plan);
   assert.equal(h.root.children[0].children.some(node => node.dataset.planScope), false,
     "旧轮次不能继续显示过期清单");
 
@@ -14664,13 +14664,12 @@ test("Claude 任务清单只显示最新快照并随正文刷新保持在最下�
     { step: "收尾", status: "pending" },
   ];
   h.render();
-  plan = h.root.children.at(-1);
-  assert.equal(plan.children[0].textContent, "2 个任务");
-  assert.deepEqual(Array.from(plan.children[1].children, node => node.textContent), ["✓ 新任务", "○ 收尾"]);
+  taskPanel = h.taskPanels.at(-1);
+  assert.deepEqual(taskPanel.plan, second.plan);
 
   second.plan = [];
   h.render();
-  assert.equal(h.root.children.at(-1).dataset.planScope, undefined,
+  assert.deepEqual(h.taskPanels.at(-1).plan, [],
     "最新清单为空时不能继续显示旧快照");
 });
 
@@ -14680,25 +14679,24 @@ test("Claude 新页面任务清单独立于正文分页，空快照优先于旧�
     items: [{ id: `input-${index}`, type: "userMessage" }] }));
   turns[0].plan = [{ step: "较早轮次中的任务", status: "pending" }];
   const h = claudeExecutionFeedbackHarness(turns.slice(-10));
-  h.context.renderTurnPlanTitle = plan => h.context.element("div", "turn-plan-title", `${plan.length} 个任务`);
   h.context.sessionPlan = [{ step: "会话最新任务", status: "inProgress" }];
   h.render();
-  assert.equal(h.root.children.at(-1).dataset.planScope, "claude-session");
-  assert.equal(h.root.children.at(-1).children[1].children[0].textContent, "◌ 会话最新任务");
+  assert.deepEqual(h.taskPanels.at(-1).plan, h.context.sessionPlan);
   h.context.turns = new Map(turns.map(turn => [turn.id, turn]));
   h.render();
-  assert.equal(h.root.children.at(-1).children[1].children[0].textContent, "◌ 会话最新任务",
+  assert.deepEqual(h.taskPanels.at(-1).plan, h.context.sessionPlan,
     "加载旧页不能改变完整会话的最新任务");
   h.context.sessionPlan = [];
   h.render();
-  assert.equal(h.root.children.some(node => node.dataset.planScope), false,
+  assert.deepEqual(h.taskPanels.at(-1).plan, [],
     "明确空清单必须覆盖仍在历史中的旧任务");
   h.context.sessionPlan = null;
   h.context.turns = new Map([["codex-turn", { id: "codex-turn", status: "inProgress",
     plan: [{ step: "Codex 任务", status: "pending" }], items: [{ id: "input", type: "userMessage" }] }]]);
   h.render();
-  assert.equal(h.root.children.some(node => node.dataset.planScope), false);
-  assert.equal(h.root.children[0].children.at(-1).children[0].textContent, "○ Codex 任务");
+  assert.deepEqual(h.taskPanels.at(-1).plan, h.context.turns.get("codex-turn").plan);
+  assert.equal(h.root.children[0].children.some(node => node.dataset.planScope), false,
+    "Codex 执行中的任务不能同时重复显示在正文和状态栏");
 });
 
 test("Codex 任务计划实时更新与重进历史共用快照，较旧版本和迟到读取不撤回新状态", () => {
