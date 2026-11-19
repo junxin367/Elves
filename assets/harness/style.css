@@ -91,8 +91,9 @@ html.theme-transition{
 .scheduled-heading{display:flex;align-items:center;justify-content:space-between;gap:16px;width:min(100%,1000px);margin:0 auto 24px}
 .scheduled-title{display:flex;align-items:center;gap:10px;min-width:0}
 .scheduled-title h1{margin:0;font-size:1.5rem;line-height:1.3}
-.scheduled-primary-button,.scheduled-editor-actions .primary-button{display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:36px;padding:0 12px;border:1px solid var(--primary);border-radius:var(--radius-control);background:var(--primary);color:var(--primary-contrast,var(--bg));font-weight:600;cursor:pointer}
-.scheduled-primary-button:hover,.scheduled-primary-button:focus-visible,.scheduled-editor-actions .primary-button:hover,.scheduled-editor-actions .primary-button:focus-visible{filter:brightness(1.08)}
+/* 用户要求“新建任务”入口在深色主题中保持可见；沿用项目已有主按钮变量，不能使用未登记的 --primary / --primary-contrast，否则文字和边框会回退为页面背景色。 */
+.scheduled-primary-button,.scheduled-editor-actions .primary-button{display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:36px;padding:0 12px;border:1px solid var(--primary-bg);border-radius:var(--radius-control);background:var(--primary-bg);color:var(--primary-text);font-weight:600;cursor:pointer}
+.scheduled-primary-button:hover,.scheduled-primary-button:focus-visible,.scheduled-editor-actions .primary-button:hover,.scheduled-editor-actions .primary-button:focus-visible{background:var(--primary-hover);border-color:var(--primary-hover)}
 .scheduled-list,.scheduled-editor{width:min(100%,1000px);margin-inline:auto}
 .scheduled-list{display:flex;flex-direction:column;gap:8px}
 .scheduled-row{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:16px;border:1px solid var(--line);border-radius:10px;background:var(--side)}
@@ -101,7 +102,7 @@ html.theme-transition{
 .scheduled-row-title{display:flex;align-items:center;flex-wrap:wrap;gap:8px;min-width:0}
 .scheduled-row-title strong{overflow-wrap:anywhere;font-size:1rem}
 .scheduled-status{display:inline-flex;align-items:center;min-height:22px;padding:0 7px;border-radius:999px;background:var(--hover);color:var(--muted);font-size:.75rem;white-space:nowrap}
-.status-active{color:var(--success,#32855d)}.status-running{color:var(--primary)}.status-error{color:var(--danger,#c83b32)}.status-completed{color:var(--muted)}
+.status-active{color:var(--success,#32855d)}.status-running{color:var(--primary-bg)}.status-error{color:var(--danger,#c83b32)}.status-completed{color:var(--muted)}
 .scheduled-row-meta{display:flex;flex-wrap:wrap;gap:8px 16px;margin-top:5px;color:var(--muted);font-size:.8rem}
 .scheduled-row-prompt{margin:10px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.55;color:var(--text)}
 .scheduled-row-error{display:block;margin-top:8px;overflow-wrap:anywhere}
