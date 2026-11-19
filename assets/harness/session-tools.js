@@ -381,6 +381,8 @@ export function mountSessionTools(options) {
       // 用户要求侧边正文文件打开在外层同级标签，保留原 iframe、输入草稿和阅读位置。
       if (ownsTab() && desktop() && context.active === key)
         openTab({ kind: "file", path, line, sourceThreadId: item.threadId });
+    }, () => {
+      if (ownsTab() && desktop() && context.active === key) hidePanel();
     })
       : item.kind === "side-creation" ? mountWorkspaceSideCreation(view)
       : item.kind === "changes" || item.kind === "change"
@@ -546,7 +548,8 @@ function mountWorkspaceSideCreation(workspace) {
   };
 }
 
-function mountWorkspaceSideThread(workspace, item, createSideThread, updateThreadState, openMediaPreview, openFile) {
+function mountWorkspaceSideThread(workspace, item, createSideThread, updateThreadState, openMediaPreview, openFile,
+  requestHidePanel) {
   // 每个侧边会话/子智能体使用独立页面上下文，隔离输入、选中会话、滚动和实时连接，不能借用主聊天的全局发送状态。
   // 子智能体沿用原生读取返回的只读身份，不创建会话副本或开放发送。
   // 专用入口仅允许同源嵌入，不修改普通首页的禁止嵌入策略；关闭标签只卸载页面，不关闭服务端会话。
@@ -590,6 +593,8 @@ function mountWorkspaceSideThread(workspace, item, createSideThread, updateThrea
       openFile?.(event.data.path, event.data.line);
     }
     else if (visible && event.data?.type === "codex-elves-create-side-thread") createSideThread?.();
+    else if (visible && event.data?.type === "codex-elves-hide-side-panel"
+        && event.data.threadId === item.threadId) requestHidePanel?.();
     else if (visible && event.data?.type === "codex-elves-workspace-media-preview"
         && ["image", "video"].includes(event.data.kind) && typeof event.data.source === "string"
         && typeof event.data.name === "string"

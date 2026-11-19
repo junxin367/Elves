@@ -19,6 +19,7 @@ import {
   requestSideCreationBack, returnToParentSession, showSideCreation, updateSideCreationStatus
 } from "./session/related.js";
 import { closeMobileSidebar } from "./shell-state.js";
+import { requestSidePanelClose, workspaceSidePanel } from "./session/side-panel.js";
 
 // 点击、焦点切换与键盘输入时收起弹层和提示，并处理 Tab 输入模式与 Esc 分层关闭。
 export function installGlobalInputHandlers() {
@@ -56,6 +57,10 @@ export function installGlobalInputHandlers() {
       if (skillOpen) { event.preventDefault(); return; }
       if (!document.querySelector("dialog[open]") && $(".workspace")?.classList.contains("sidebar-open")) {
         event.preventDefault(); closeMobileSidebar();
+        return;
+      }
+      if (workspaceSidePanel && requestSidePanelClose()) {
+        event.preventDefault();
         return;
       }
       if (!event.defaultPrevented && relatedSessionView && !document.querySelector("dialog[open]")) {

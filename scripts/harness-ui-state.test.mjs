@@ -12901,7 +12901,8 @@ test("隐藏的侧边标签即使请求打开确认也不标记已读，显示�
 });
 
 test("侧边页面只接受同源父页面的显隐和聚焦请求，只聚焦可见且可编辑的侧边", async () => {
-  const parent = {}, handlers = new Map(), marked = [], focused = [], synced = [];
+  const messages = [], parent = { postMessage: (...args) => messages.push(args) };
+  const handlers = new Map(), marked = [], focused = [], synced = [];
   const document = { documentElement: { dataset: { workspaceSidePanelVisible: "false" } }, querySelector: () => null,
     addEventListener: (name, fn) => handlers.set(name, fn) };
   const prompt = { isConnected: true, isContentEditable: true, disabled: false,
@@ -12921,6 +12922,10 @@ test("侧边页面只接受同源父页面的显隐和聚焦请求，只聚焦�
   context.installSidePanelMessageListener();
   const listener = handlers.get("message"), data = { type: "codex-elves-side-panel-visibility", visible: true };
   const focus = { type: "codex-elves-side-panel-focus", threadId: "side-a" };
+  assert.equal(context.requestSidePanelClose(), true);
+  assert.equal(messages.at(-1)[0].type, "codex-elves-hide-side-panel");
+  assert.equal(messages.at(-1)[0].threadId, "side-a");
+  assert.equal(messages.at(-1)[1], context.location.origin);
   listener({ source: parent, origin: context.location.origin, data: focus });
   assert.equal(focused.length, 0, "不可见时不能索取输入焦点");
   listener({ source: {}, origin: context.location.origin, data });

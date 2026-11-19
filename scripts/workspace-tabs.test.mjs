@@ -477,6 +477,30 @@ test("侧边标签向独立页面同步显示状态，隐藏标签不会继续�
   assert.equal(frame.events.has("load"), false);
 });
 
+test("侧边 iframe 的 Escape 请求只隐藏外层面板，不在 iframe 内切回主会话", () => {
+  const h = harness();
+  h.api.openSideThread({ id: "side-a", title: "侧边 A" });
+  const frame = h.views.children[0].children[0];
+  frame.contentWindow = { postMessage() {} };
+  const event = {
+    source: frame.contentWindow,
+    origin: "http://127.0.0.1:45222",
+    data: { type: "codex-elves-hide-side-panel", threadId: "side-a" }
+  };
+  h.message({ ...event, source: {} });
+  h.message({ ...event, origin: "https://other.example" });
+  h.message({ ...event, data: { ...event.data, threadId: "side-b" } });
+  assert.equal(h.dock.hidden, false);
+  h.message(event);
+  assert.equal(h.dock.hidden, true);
+  assert.equal(h.state.threadId, "thread-a", "关闭侧边标签不能在 iframe 内切换到主会话");
+  assert.equal(frame.isConnected, true, "隐藏面板必须保留侧边 iframe 和草稿");
+  h.toggle.emit("click");
+  assert.equal(h.dock.hidden, false);
+  assert.equal(h.views.children[0].children[0], frame);
+  h.api.dispose();
+});
+
 test("侧边资源交给主页面预览，拒绝其他来源及隐藏标签，切换或释放时关闭所属预览", () => {
   const opened = [], closed = [];
   const record = kind => (trigger, ...args) => {

@@ -78,6 +78,12 @@ export function requestSideComposerFocus(id) {
   if (scope && !workspaceSidePanel && id === selectedId)
     requestedSideInput = { id, scope, version: selectionVersion };
 }
+export function requestSidePanelClose() {
+  // 用户要求 PC 侧边标签中的 Escape 隐藏外层面板；不能在 iframe 内返回主会话，避免主会话正文嵌入侧边标签。
+  if (!workspaceSidePanel || window.parent === window || !selectedId) return false;
+  window.parent.postMessage({ type: "codex-elves-hide-side-panel", threadId: selectedId }, location.origin);
+  return true;
+}
 export function syncRequestedSideInput() {
   const request = requestedSideInput;
   if (!request) return;
