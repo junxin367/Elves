@@ -2725,6 +2725,22 @@ async fn prepare_controller_shutdown(reason: &str) -> Value {
     }
 
     let preserve_execution = reason == "installer";
+    if preserve_execution {
+        let handoff = controller.harness.handoff_status().await;
+        if !handoff.allows_upgrade() {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "harness.shutdown_handoff_unavailable",
+                json!({"reason":"installer","transport":handoff.as_str()}),
+            );
+            return json!({
+                "status":"busy",
+                "reason":"handoff_unavailable",
+                "handoff":"unavailable",
+                "transport":handoff.as_str(),
+                "message":"当前 Codex 连接不能脱离 Harness 安全交接，未停止 Elves；请等待连接恢复后重试。"
+            });
+        }
+    }
     controller
         .preserve_execution_on_shutdown
         .store(preserve_execution, Ordering::Release);
@@ -2753,6 +2769,30 @@ async fn prepare_controller_shutdown(reason: &str) -> Value {
         });
     }
     if preserve_execution {
+        // 安装交接只允许已确认的 daemon proxy；在设置 closing 后再次核对，
+        // 防止连接在首次检查与 detach 之间断开而把未知状态当成安全交接。
+        let handoff = controller.harness.handoff_status().await;
+        if !handoff.allows_upgrade() {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "harness.shutdown_handoff_unavailable",
+                json!({"reason":"installer","transport":handoff.as_str()}),
+            );
+            controller
+                .harness
+                .enabled
+                .store(was_harness_enabled, Ordering::Release);
+            controller.closing.store(false, Ordering::Release);
+            controller
+                .preserve_execution_on_shutdown
+                .store(false, Ordering::Release);
+            return json!({
+                "status":"busy",
+                "reason":"handoff_unavailable",
+                "handoff":"unavailable",
+                "transport":handoff.as_str(),
+                "message":"Codex 连接在安装交接前变为未知状态，未停止 Elves；请等待连接恢复后重试。"
+            });
+        }
         controller.stop_desktop().await;
         controller.publish_access_policy(&RemoteAccessSettings::default());
         controller.claude.set_reconnect_enabled(false);

@@ -31,17 +31,44 @@ pub trait ServiceDispatchGuard: Send + Sync {
     async fn prepare_dispatch(&self) -> anyhow::Result<Box<dyn ServiceDispatchPermit>>;
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ServiceTransport {
+    DaemonProxy,
+    Stdio,
+}
+
+impl ServiceTransport {
+    pub(crate) fn execution_label(self) -> &'static str {
+        match self {
+            Self::DaemonProxy => "app-server-daemon-proxy",
+            Self::Stdio => "app-server-stdio",
+        }
+    }
+
+    pub(crate) fn supports_handoff(self) -> bool {
+        matches!(self, Self::DaemonProxy)
+    }
+}
+
 pub(crate) struct RunningService {
     pub(crate) child: Child,
     // 占用检查绑定实际启动的实例目录，不能借用后来切换的设置或其他 Codex Home。
     pub(crate) codex_home: Option<PathBuf>,
+    pub(crate) transport: ServiceTransport,
     pub(crate) stdin: mpsc::Sender<WriteFrame>,
     pub(crate) stdout: BufReader<ChildStdout>,
 }
 
 #[cfg(test)]
 impl RunningService {
-    pub(crate) fn for_test(mut child: Child) -> anyhow::Result<Self> {
+    pub(crate) fn for_test(child: Child) -> anyhow::Result<Self> {
+        Self::for_test_with_transport(child, ServiceTransport::Stdio)
+    }
+
+    pub(crate) fn for_test_with_transport(
+        mut child: Child,
+        transport: ServiceTransport,
+    ) -> anyhow::Result<Self> {
         let (stdin, _) = service_transport::spawn_writer(
             child.stdin.take().context("missing stdin")?,
             REQUEST_TIMEOUT,
@@ -50,6 +77,7 @@ impl RunningService {
         Ok(Self {
             child,
             codex_home: None,
+            transport,
             stdin,
             stdout,
         })
@@ -81,6 +109,7 @@ pub(crate) async fn spawn_service() -> anyhow::Result<RunningService> {
                         "shell": candidate.shell,
                         "processId": service.child.id(),
                         "codexHome": codex_home.to_string_lossy(),
+                        "transport": service.transport.execution_label(),
                         "hidden": true
                     }),
                 );
@@ -105,9 +134,11 @@ async fn spawn_candidate(
     candidate: &Candidate,
     codex_home: &Path,
 ) -> anyhow::Result<RunningService> {
-    let mut command = match ensure_daemon(candidate, codex_home).await {
+    let socket = daemon_socket_path(codex_home);
+    let socket_was_present = socket.is_file();
+    let (mut command, transport) = match ensure_daemon(candidate, codex_home).await {
         Ok(socket) if proxy_is_usable(candidate, codex_home, &socket).await => {
-            proxy_command(candidate, &socket)
+            (proxy_command(candidate, &socket), ServiceTransport::DaemonProxy)
         }
         Ok(socket) => {
             let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -115,15 +146,26 @@ async fn spawn_candidate(
                 json!({
                     "executable": candidate.path.to_string_lossy(),
                     "socket": socket,
-                    "fallback": "stdio",
                     "reason": "initialize_timeout_or_invalid_response",
                 }),
             );
-            // Codex App 的 managed daemon 可能仍占用默认套接字，但不一定接受 Elves 的 proxy
-            // 握手；降级到当前 CLI 自己的 stdio 服务，保持远程 Harness 与 Codex App 独立。
-            candidate_command(candidate)
+            // 用户要求安装升级不能因代理握手失败而误杀执行中的 Codex；已有 daemon
+            // 套接字无法完成 proxy 握手时必须硬失败，不能再启动受 Harness 生命周期控制的 stdio。
+            bail!("Codex 持久服务代理握手失败，拒绝降级到 stdio")
         }
         Err(error) => {
+            if socket_was_present || socket.is_file() {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "remote_access.codex_service.daemon_unavailable",
+                    json!({
+                        "executable": candidate.path.to_string_lossy(),
+                        "socket": socket,
+                        "reason": error.to_string(),
+                        "fallback": "blocked",
+                    }),
+                );
+                return Err(error);
+            }
             let _ = crate::diagnostic_log::append_diagnostic_log(
                 "remote_access.codex_service.daemon_unavailable",
                 json!({
@@ -132,7 +174,9 @@ async fn spawn_candidate(
                     "reason": error.to_string(),
                 }),
             );
-            candidate_command(candidate)
+            // 只有没有任何 daemon 套接字、无法启动持久服务时才保留 stdio 兜底；
+            // Runtime 会把它标为不可 handoff，安装升级不得把该连接报告为安全交接。
+            (candidate_command(candidate), ServiceTransport::Stdio)
         }
     };
     // 用户要求服务模式独立于 Codex App；为 app-server 及其命令子进程注入 Elves 自带工具，
@@ -189,6 +233,7 @@ async fn spawn_candidate(
     Ok(RunningService {
         child,
         codex_home: Some(codex_home.to_path_buf()),
+        transport,
         stdin,
         stdout: BufReader::new(stdout),
     })
@@ -319,8 +364,12 @@ fn write_daemon_manifest(
     Ok(())
 }
 
+fn daemon_socket_path(codex_home: &Path) -> PathBuf {
+    codex_home.join(DAEMON_SOCKET_DIR).join(DAEMON_SOCKET_FILE)
+}
+
 async fn ensure_daemon(candidate: &Candidate, codex_home: &Path) -> anyhow::Result<PathBuf> {
-    let socket = codex_home.join(DAEMON_SOCKET_DIR).join(DAEMON_SOCKET_FILE);
+    let socket = daemon_socket_path(codex_home);
     let manifest_path = codex_home.join(DAEMON_MANIFEST_FILE);
     let expected_version = candidate
         .version
@@ -329,22 +378,31 @@ async fn ensure_daemon(candidate: &Candidate, codex_home: &Path) -> anyhow::Resu
         .context("无法确认 Codex CLI 版本，拒绝接管持久服务")?;
     let expected_path = candidate.path.to_string_lossy().to_string();
     if socket.is_file() {
-        let manifest: Value = serde_json::from_slice(
-            &std::fs::read(&manifest_path).with_context(|| {
-                format!("无法读取 Codex 持久服务代次：{}", manifest_path.display())
-            })?,
-        )
-        .context("Codex 持久服务代次格式无效")?;
-        anyhow::ensure!(
-            manifest["cliPath"] == expected_path
-                && manifest["cliVersion"] == expected_version,
-            "Codex 持久服务版本或路径不匹配，拒绝复用旧服务"
-        );
-        return Ok(socket);
-    }
-    if socket.is_file() {
-        // 安装升级可能只留下原生守护进程和套接字，清单尚未写入；先用 CLI 只读核对，
-        // 仅确认同一套接字仍由运行中的 app-server 提供时补写清单，不能把未知套接字当作可接管服务。
+        // 清单完整且匹配时直接复用；如果清单明确属于其他 CLI，不能用一次
+        // version 探测覆盖它。只有缺失或损坏的清单才允许进入恢复分支。
+        let manifest = match std::fs::read(&manifest_path) {
+            Ok(bytes) => serde_json::from_slice::<Value>(&bytes).ok(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("无法读取 Codex 持久服务代次：{}", manifest_path.display())
+                });
+            }
+        };
+        if let Some(manifest) = manifest {
+            let has_identity = manifest["cliPath"].is_string()
+                && manifest["cliVersion"].is_string();
+            if has_identity {
+                anyhow::ensure!(
+                    manifest["cliPath"] == expected_path
+                        && manifest["cliVersion"] == expected_version,
+                    "Codex 持久服务版本或路径不匹配，拒绝复用旧服务"
+                );
+                return Ok(socket);
+            }
+        }
+        // 安装升级可能只留下原生守护进程和套接字，清单尚未写入或内容损坏；
+        // 先用 CLI 只读核对，确认同一套接字仍由运行中的 app-server 提供后再补写清单。
         if let Some(daemon_version) = probe_daemon_version(candidate, codex_home).await
             && daemon_version_confirms_socket(&daemon_version, &socket)
         {
@@ -1117,6 +1175,81 @@ mod tests {
             }),
             &socket
         ));
+    }
+
+    #[test]
+    fn service_transport_only_allows_daemon_proxy_handoff() {
+        assert!(ServiceTransport::DaemonProxy.supports_handoff());
+        assert!(!ServiceTransport::Stdio.supports_handoff());
+        assert_eq!(
+            ServiceTransport::DaemonProxy.execution_label(),
+            "app-server-daemon-proxy"
+        );
+        assert_eq!(
+            ServiceTransport::Stdio.execution_label(),
+            "app-server-stdio"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn missing_daemon_manifest_is_recovered_from_cli_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let codex_home = directory.path().join("codex-home");
+        let socket = daemon_socket_path(&codex_home);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        std::fs::write(&socket, b"socket-placeholder").unwrap();
+        let socket_path = socket.to_string_lossy().replace('\\', "/");
+        let version_json = format!(
+            r#"{{"status":"running","socketPath":"{socket_path}","managedCodexPath":"managed-codex","managedCodexVersion":"0.166.0","appServerVersion":"0.166.0"}}"#
+        );
+        let candidate_path = directory.path().join("codex-stub.cmd");
+        std::fs::write(
+            &candidate_path,
+            format!(
+                "@echo off\r\nif \"%1\"==\"app-server\" if \"%2\"==\"daemon\" if \"%3\"==\"version\" (echo {version_json}\r\n exit /b 0\r\n)\r\nexit /b 17\r\n"
+            ),
+        )
+        .unwrap();
+        let candidate = Candidate {
+            path: candidate_path,
+            shell: true,
+            version: crate::cli_wrapper::parse_codex_cli_version("codex-cli 0.166.0"),
+            ordinal: 0,
+        };
+
+        let resolved = ensure_daemon(&candidate, &codex_home).await.unwrap();
+        assert_eq!(resolved, socket);
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(codex_home.join(DAEMON_MANIFEST_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(manifest["cliPath"], candidate.path.to_string_lossy().as_ref());
+        assert_eq!(manifest["cliVersion"], "0.166.0");
+        assert_eq!(manifest["managedCodexVersion"], "0.166.0");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn existing_daemon_socket_failure_does_not_fallback_to_stdio() {
+        let directory = tempfile::tempdir().unwrap();
+        let codex_home = directory.path().join("codex-home");
+        let socket = daemon_socket_path(&codex_home);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        std::fs::write(&socket, b"socket-placeholder").unwrap();
+        let candidate_path = directory.path().join("codex-stub.cmd");
+        std::fs::write(&candidate_path, "@echo off\r\nexit /b 17\r\n").unwrap();
+        let candidate = Candidate {
+            path: candidate_path,
+            shell: true,
+            version: crate::cli_wrapper::parse_codex_cli_version("codex-cli 0.166.0"),
+            ordinal: 0,
+        };
+
+        let error = match spawn_candidate(&candidate, &codex_home).await {
+            Ok(_) => panic!("已有 daemon 套接字核验失败后不应降级到 stdio"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("运行中的套接字未通过 CLI 状态核对"));
     }
 
     #[cfg(windows)]

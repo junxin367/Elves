@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 
 use super::execution;
 use super::read_cache::ReadCache;
-use crate::codex_service::{ServiceDispatchGuard, spawn_service};
+use crate::codex_service::{ServiceDispatchGuard, ServiceTransport, spawn_service};
 use crate::service_transport::{WriteFrame, guarded_write};
 
 const TIMEOUT: Duration = Duration::from_secs(45);
@@ -83,6 +83,7 @@ pub(super) struct Connection {
     pub generation_index: u64,
     pub user_agent: OnceLock<String>,
     codex_home: Option<PathBuf>,
+    transport: ServiceTransport,
     alive: Arc<AtomicBool>,
     stdin: mpsc::Sender<WriteFrame>,
     write_gate: Mutex<()>,
@@ -158,6 +159,7 @@ impl Runtime {
         };
         let generation = uuid::Uuid::new_v4().to_string();
         let generation_index = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let transport = service.transport;
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(true));
         let reader_pending = pending.clone();
@@ -225,6 +227,7 @@ impl Runtime {
             generation_index,
             user_agent: OnceLock::new(),
             codex_home,
+            transport,
             alive,
             stdin: service.stdin,
             write_gate: Mutex::new(()),
@@ -267,18 +270,15 @@ impl Runtime {
         params: Value,
         guard: Option<&dyn ServiceDispatchGuard>,
     ) -> anyhow::Result<Value> {
-        execution::transport("app-server-stdio", method, guard.is_some());
+        let connection = self.connection().await?;
+        execution::transport(connection.transport.execution_label(), method, guard.is_some());
         if guard.is_some()
             && let Some(id) = params["threadId"].as_str()
         {
             self.reads.invalidate(id).await;
         }
         let thread_id = params["threadId"].as_str().map(str::to_owned);
-        let result = self
-            .connection()
-            .await?
-            .request(method, params, guard)
-            .await;
+        let result = connection.request(method, params, guard).await;
         if guard.is_some()
             && let Some(id) = thread_id
         {
@@ -288,8 +288,8 @@ impl Runtime {
     }
 
     pub async fn read(&self, method: &str, params: Value) -> anyhow::Result<Value> {
-        execution::transport("app-server-stdio", method, false);
         let connection = self.connection().await?;
+        execution::transport(connection.transport.execution_label(), method, false);
         let scope = params["threadId"].as_str().unwrap_or_else(|| {
             if method == "skills/list" {
                 "skills"
@@ -318,8 +318,8 @@ impl Runtime {
         params: Value,
         guard: &dyn ServiceDispatchGuard,
     ) -> anyhow::Result<Value> {
-        execution::transport("app-server-stdio", method, true);
         let connection = self.connection().await?;
+        execution::transport(connection.transport.execution_label(), method, true);
         // 临时侧边会话只属于创建它的引擎，断线后不能把旧写入交给新进程或自动 resume。
         if connection.generation != generation {
             return Err(super::error(410, "侧边会话所属的服务连接已结束"));
@@ -340,7 +340,7 @@ impl Runtime {
             .filter(|connection| connection.generation == generation && connection.alive.load(Ordering::Acquire));
         let Some(connection) = connection else { return Ok(None) };
         let method = if guard.is_some() { "thread/unsubscribe" } else { "thread/read" };
-        execution::transport("app-server-stdio", method, guard.is_some());
+        execution::transport(connection.transport.execution_label(), method, guard.is_some());
         let result = connection.request(method, json!({"threadId":id,"includeTurns":false}), guard).await;
         if guard.is_some() { self.reads.invalidate(id).await; }
         result.map(Some)
@@ -383,7 +383,6 @@ impl Runtime {
         result: Value,
         guard: &dyn ServiceDispatchGuard,
     ) -> anyhow::Result<()> {
-        execution::transport("app-server-stdio", "approval-response", true);
         let connection = self
             .connection
             .lock()
@@ -391,6 +390,11 @@ impl Runtime {
             .clone()
             .filter(|c| c.generation == generation && c.alive.load(Ordering::Acquire))
             .context("审批所属的执行引擎已断开，请刷新会话")?;
+        execution::transport(
+            connection.transport.execution_label(),
+            "approval-response",
+            true,
+        );
         connection
             .write(json!({"id":id,"result":result}), Some(guard))
             .await
@@ -425,6 +429,21 @@ impl Runtime {
             .await
             .as_ref()
             .is_some_and(|connection| connection.alive.load(Ordering::Acquire))
+    }
+
+    pub async fn handoff_status(&self) -> super::HandoffStatus {
+        let connection = self.connection.lock().await;
+        match connection.as_ref() {
+            Some(connection) if connection.alive.load(Ordering::Acquire) => {
+                if connection.transport.supports_handoff() {
+                    super::HandoffStatus::DaemonProxy
+                } else {
+                    super::HandoffStatus::Stdio
+                }
+            }
+            Some(_) => super::HandoffStatus::Unknown,
+            None => super::HandoffStatus::NoConnection,
+        }
     }
 
     pub async fn check_health(&self) -> anyhow::Result<()> {
@@ -573,5 +592,62 @@ impl Connection {
             threads.insert(id.to_owned(), Instant::now());
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codex::HandoffStatus;
+    use crate::codex_service::{RunningService, ServiceTransport};
+
+    const TEST_ENGINE_SCRIPT: &str = r#"
+const readline = require('readline');
+const input = readline.createInterface({input: process.stdin});
+input.on('line', line => {
+  const request = JSON.parse(line);
+  if (request.id !== undefined) {
+    process.stdout.write(JSON.stringify({id: request.id, result: {userAgent: 'test-engine'}}) + '\n');
+  }
+});
+"#;
+
+    async fn runtime_with_transport(transport: ServiceTransport) -> Runtime {
+        let (events, _receiver) = mpsc::channel(8);
+        let runtime = Runtime::new(events, Arc::new(execution::Audit::default()));
+        let mut command = tokio::process::Command::new("node");
+        command
+            .args(["-e", TEST_ENGINE_SCRIPT])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        command.creation_flags(crate::windows_create_hidden_process());
+        let process = RunningService::for_test_with_transport(
+            command.spawn().expect("启动隔离测试引擎失败"),
+            transport,
+        )
+        .expect("构造隔离测试服务失败");
+        runtime.install_test_process(process).await;
+        runtime.connection().await.expect("隔离测试引擎初始化失败");
+        runtime
+    }
+
+    #[tokio::test]
+    async fn handoff_status_distinguishes_stdio_and_daemon_proxy() {
+        let (events, _receiver) = mpsc::channel(8);
+        let empty = Runtime::new(events, Arc::new(execution::Audit::default()));
+        assert_eq!(empty.handoff_status().await, HandoffStatus::NoConnection);
+
+        let stdio = runtime_with_transport(ServiceTransport::Stdio).await;
+        assert_eq!(stdio.handoff_status().await, HandoffStatus::Stdio);
+        assert!(!stdio.handoff_status().await.allows_upgrade());
+        stdio.shutdown().await;
+
+        let daemon = runtime_with_transport(ServiceTransport::DaemonProxy).await;
+        assert_eq!(daemon.handoff_status().await, HandoffStatus::DaemonProxy);
+        assert!(daemon.handoff_status().await.allows_upgrade());
+        daemon.shutdown().await;
     }
 }

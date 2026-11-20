@@ -43,6 +43,30 @@ use projection::Projection;
 use runtime::Runtime;
 use store::{Queued, Store};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HandoffStatus {
+    // Runtime 尚未持有执行连接；它与“已有连接后断开”的 Unknown 必须分开处理。
+    NoConnection,
+    DaemonProxy,
+    Stdio,
+    Unknown,
+}
+
+impl HandoffStatus {
+    pub(crate) fn allows_upgrade(self) -> bool {
+        matches!(self, Self::NoConnection | Self::DaemonProxy)
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::NoConnection => "no_connection",
+            Self::DaemonProxy => "daemon_proxy",
+            Self::Stdio => "stdio",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 pub(super) struct CodexHarness {
     pub audit: Arc<execution::Audit>,
     pub recent_priority: Arc<RecentPriority>,
@@ -83,6 +107,11 @@ impl CodexHarness {
     pub async fn install_test_process(&self, process: crate::codex_service::RunningService) {
         self.runtime.install_test_process(process).await;
     }
+
+    pub(crate) async fn handoff_status(&self) -> HandoffStatus {
+        self.runtime.handoff_status().await
+    }
+
     #[cfg(test)]
     pub async fn seed_test_history(&self, payload: Value) -> anyhow::Result<()> {
         anyhow::ensure!(
