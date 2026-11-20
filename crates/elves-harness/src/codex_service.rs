@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::mpsc;
 
@@ -14,6 +14,7 @@ use crate::service_transport::{self, WriteFrame};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(20);
+const PROXY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const DAEMON_SOCKET_DIR: &str = "app-server-control";
 const DAEMON_SOCKET_FILE: &str = "app-server-control.sock";
 const DAEMON_MANIFEST_FILE: &str = "elves-codex-daemon.json";
@@ -104,8 +105,36 @@ async fn spawn_candidate(
     candidate: &Candidate,
     codex_home: &Path,
 ) -> anyhow::Result<RunningService> {
-    let socket = ensure_daemon(candidate, codex_home).await?;
-    let mut command = proxy_command(candidate, &socket);
+    let mut command = match ensure_daemon(candidate, codex_home).await {
+        Ok(socket) if proxy_is_usable(candidate, codex_home, &socket).await => {
+            proxy_command(candidate, &socket)
+        }
+        Ok(socket) => {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "remote_access.codex_service.proxy_unavailable",
+                json!({
+                    "executable": candidate.path.to_string_lossy(),
+                    "socket": socket,
+                    "fallback": "stdio",
+                    "reason": "initialize_timeout_or_invalid_response",
+                }),
+            );
+            // Codex App 的 managed daemon 可能仍占用默认套接字，但不一定接受 Elves 的 proxy
+            // 握手；降级到当前 CLI 自己的 stdio 服务，保持远程 Harness 与 Codex App 独立。
+            candidate_command(candidate)
+        }
+        Err(error) => {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "remote_access.codex_service.daemon_unavailable",
+                json!({
+                    "executable": candidate.path.to_string_lossy(),
+                    "fallback": "stdio",
+                    "reason": error.to_string(),
+                }),
+            );
+            candidate_command(candidate)
+        }
+    };
     // 用户要求服务模式独立于 Codex App；为 app-server 及其命令子进程注入 Elves 自带工具，
     // 只修改子进程环境，不写入用户或系统 PATH。
     let tool_runtime = crate::tool_runtime::apply_to_command(&mut command);
@@ -165,6 +194,131 @@ async fn spawn_candidate(
     })
 }
 
+async fn proxy_is_usable(candidate: &Candidate, codex_home: &Path, socket: &Path) -> bool {
+    let mut command = proxy_command(candidate, socket);
+    command
+        .env("CODEX_HOME", codex_home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return false;
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return false;
+    };
+    let mut stdout = BufReader::new(stdout).lines();
+    let mut request = match serde_json::to_vec(&json!({
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "clientInfo": {
+                "name": "elves-harness-probe",
+                "version": env!("CARGO_PKG_VERSION")
+            },
+            "capabilities": {"experimentalApi": true}
+        }
+    })) {
+        Ok(request) => request,
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return false;
+        }
+    };
+    request.push(b'\n');
+    let write_ok = matches!(
+        tokio::time::timeout(PROXY_PROBE_TIMEOUT, stdin.write_all(&request)).await,
+        Ok(Ok(()))
+    ) && matches!(
+        tokio::time::timeout(PROXY_PROBE_TIMEOUT, stdin.flush()).await,
+        Ok(Ok(()))
+    );
+    let usable = if write_ok {
+        match tokio::time::timeout(PROXY_PROBE_TIMEOUT, stdout.next_line()).await {
+            Ok(Ok(Some(line))) => serde_json::from_str::<Value>(&line)
+                .ok()
+                .is_some_and(|value| value["id"] == 1 && value["result"].is_object()),
+            _ => false,
+        }
+    } else {
+        false
+    };
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+    usable
+}
+
+fn same_path(left: &str, right: &Path) -> bool {
+    let normalize = |value: &str| {
+        value
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    };
+    normalize(left) == normalize(&right.to_string_lossy())
+}
+
+fn daemon_version_confirms_socket(value: &Value, socket: &Path) -> bool {
+    value["status"] == "running"
+        && value["socketPath"]
+            .as_str()
+            .is_some_and(|path| same_path(path, socket))
+}
+
+async fn probe_daemon_version(candidate: &Candidate, codex_home: &Path) -> Option<Value> {
+    let mut command = command_with_args(candidate, ["app-server", "daemon", "version"]);
+    command
+        .env("CODEX_HOME", codex_home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(DAEMON_START_TIMEOUT, command.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&output.stdout).ok()
+}
+
+fn write_daemon_manifest(
+    manifest_path: &Path,
+    candidate: &Candidate,
+    socket: &Path,
+    daemon_version: Option<&Value>,
+) -> anyhow::Result<()> {
+    let expected_version = candidate
+        .version
+        .as_ref()
+        .map(|version| version.raw.clone())
+        .context("无法确认 Codex CLI 版本，拒绝接管持久服务")?;
+    let expected_path = candidate.path.to_string_lossy().to_string();
+    crate::settings::atomic_write(
+        manifest_path,
+        &serde_json::to_vec(&json!({
+            "cliPath": expected_path,
+            "cliVersion": expected_version,
+            "socket": socket,
+            "managedCodexPath": daemon_version.and_then(|value| value["managedCodexPath"].as_str()),
+            "managedCodexVersion": daemon_version.and_then(|value| value["managedCodexVersion"].as_str()),
+            "appServerVersion": daemon_version.and_then(|value| value["appServerVersion"].as_str()),
+            "createdAtMs": crate::now_ms()
+        }))?,
+    )?;
+    Ok(())
+}
+
 async fn ensure_daemon(candidate: &Candidate, codex_home: &Path) -> anyhow::Result<PathBuf> {
     let socket = codex_home.join(DAEMON_SOCKET_DIR).join(DAEMON_SOCKET_FILE);
     let manifest_path = codex_home.join(DAEMON_MANIFEST_FILE);
@@ -187,6 +341,30 @@ async fn ensure_daemon(candidate: &Candidate, codex_home: &Path) -> anyhow::Resu
             "Codex 持久服务版本或路径不匹配，拒绝复用旧服务"
         );
         return Ok(socket);
+    }
+    if socket.is_file() {
+        // 安装升级可能只留下原生守护进程和套接字，清单尚未写入；先用 CLI 只读核对，
+        // 仅确认同一套接字仍由运行中的 app-server 提供时补写清单，不能把未知套接字当作可接管服务。
+        if let Some(daemon_version) = probe_daemon_version(candidate, codex_home).await
+            && daemon_version_confirms_socket(&daemon_version, &socket)
+        {
+            write_daemon_manifest(&manifest_path, candidate, &socket, Some(&daemon_version))?;
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "remote_access.codex_service.daemon_manifest_recovered",
+                json!({
+                    "executable": candidate.path.to_string_lossy(),
+                    "socket": socket,
+                    "managedCodexPath": daemon_version["managedCodexPath"],
+                    "managedCodexVersion": daemon_version["managedCodexVersion"],
+                    "appServerVersion": daemon_version["appServerVersion"],
+                }),
+            );
+            return Ok(socket);
+        }
+        bail!(
+            "无法读取 Codex 持久服务代次：{}；运行中的套接字未通过 CLI 状态核对",
+            manifest_path.display()
+        );
     }
     let mut command = command_with_args(candidate, ["app-server", "daemon", "start"]);
     #[cfg(windows)]
@@ -214,15 +392,7 @@ async fn ensure_daemon(candidate: &Candidate, codex_home: &Path) -> anyhow::Resu
     let deadline = tokio::time::Instant::now() + DAEMON_START_TIMEOUT;
     while tokio::time::Instant::now() < deadline {
         if socket.is_file() {
-            crate::settings::atomic_write(
-                &manifest_path,
-                &serde_json::to_vec(&json!({
-                    "cliPath": expected_path,
-                    "cliVersion": expected_version,
-                    "socket": socket,
-                    "createdAtMs": crate::now_ms()
-                }))?,
-            )?;
+            write_daemon_manifest(&manifest_path, candidate, &socket, None)?;
             return Ok(socket);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -269,7 +439,6 @@ fn command_with_args<const N: usize>(
     command
 }
 
-#[cfg(test)]
 fn candidate_command(candidate: &Candidate) -> Command {
     command_with_args(candidate, ["app-server", "--analytics-default-enabled"])
 }
@@ -921,6 +1090,33 @@ mod tests {
         ];
         candidates.sort_by(compare_candidates);
         assert_eq!(candidates[0].path, PathBuf::from("codex-current.exe"));
+    }
+
+    #[test]
+    fn daemon_version_confirms_the_expected_socket() {
+        let socket =
+            PathBuf::from(r"C:\Users\me\.codex\app-server-control\app-server-control.sock");
+        assert!(daemon_version_confirms_socket(
+            &json!({
+                "status": "running",
+                "socketPath": "c:/Users/me/.codex/app-server-control/app-server-control.sock"
+            }),
+            &socket
+        ));
+        assert!(!daemon_version_confirms_socket(
+            &json!({
+                "status": "stopped",
+                "socketPath": socket
+            }),
+            &socket
+        ));
+        assert!(!daemon_version_confirms_socket(
+            &json!({
+                "status": "running",
+                "socketPath": r"C:\Users\other\.codex\app-server-control\app-server-control.sock"
+            }),
+            &socket
+        ));
     }
 
     #[cfg(windows)]

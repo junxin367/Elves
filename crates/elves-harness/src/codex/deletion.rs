@@ -20,6 +20,23 @@ fn side_executing(projection: &super::projection::Projection, parent: &str, id: 
         )
 }
 
+fn terminal_failure_from_projection(projection: &super::projection::Projection, id: &str) -> bool {
+    let Some(thread) = projection.threads.get(id) else {
+        return false;
+    };
+    let failed = matches!(
+        thread["lastTurnOutcome"]["status"].as_str(),
+        Some("failed" | "rateLimit")
+    ) || matches!(
+        thread["lastTurnOutcome"]["kind"].as_str(),
+        Some("failed" | "rateLimit")
+    );
+    failed
+        && !projection.active.contains_key(id)
+        && !projection.compactions.contains_key(id)
+        && projection.requests_for(id).is_empty()
+}
+
 impl CodexHarness {
     async fn persistent_descendants(&self, parent: &str) -> anyhow::Result<Vec<(String, String)>> {
         let mut pending = vec![parent.to_owned()];
@@ -67,15 +84,29 @@ impl CodexHarness {
         }
         let status = &identity["thread"]["status"];
         let projection = self.projection.lock().await;
-        if matches!(status.as_str().or_else(|| status["type"].as_str()),
-            Some("active" | "inProgress" | "running" | "waiting" | "unknown"))
-            || projection.active.contains_key(id)
+        let terminal_failure = terminal_failure_from_projection(&projection, id);
+        let status_type = status
+            .as_str()
+            .or_else(|| status["type"].as_str())
+            .unwrap_or("");
+        let terminal_status = matches!(
+            status_type,
+            "idle" | "notLoaded" | "completed" | "failed" | "interrupted"
+        );
+        let terminal_failure_status = status_type == "unknown" && terminal_failure;
+        if matches!(
+            status_type,
+            "active" | "inProgress" | "running" | "waiting" | "unknown"
+        ) || projection.active.contains_key(id)
         {
-            return Err(error(409, "侧边会话执行中，无法删除"));
+            if terminal_failure_status {
+                // 上游服务已将最后一轮明确结束为失败时，旧引擎可能只把 thread/read 标为 unknown；
+                // 没有活动、压缩或待处理交互时，删除可以按终态失败继续，不能把失败轮次永久当成执行中。
+            } else {
+                return Err(error(409, "侧边会话执行中，无法删除"));
+            }
         }
-        if !matches!(status.as_str().or_else(|| status["type"].as_str()),
-            Some("idle" | "notLoaded" | "completed" | "failed" | "interrupted"))
-        {
+        if !terminal_status && !terminal_failure_status {
             return Err(error(409, "侧边会话执行状态未确认，无法删除"));
         }
         if projection.compactions.contains_key(id) || !projection.requests_for(id).is_empty() {
@@ -214,18 +245,31 @@ impl CodexHarness {
             return Err(error(409, "删除前原生会话身份不匹配，本次未删除"));
         }
         let status = &identity["thread"]["status"];
+        let terminal_failure = {
+            let projection = self.projection.lock().await;
+            terminal_failure_from_projection(&projection, id)
+        };
+        let status_type = status
+            .as_str()
+            .or_else(|| status["type"].as_str())
+            .unwrap_or("");
+        let terminal_status = matches!(
+            status_type,
+            "idle" | "notLoaded" | "completed" | "failed" | "interrupted"
+        );
+        let terminal_failure_status = status_type == "unknown" && terminal_failure;
         if matches!(
-            status.as_str().or_else(|| status["type"].as_str()),
-            Some("active" | "inProgress" | "running" | "waiting" | "unknown")
+            status_type,
+            "active" | "inProgress" | "running" | "waiting" | "unknown"
         ) {
-            return Err(error(
-                409,
-                "会话仍在执行或执行状态未确认，本次未删除。请先停止任务并确认结束。",
-            ));
+            if !terminal_failure_status {
+                return Err(error(
+                    409,
+                    "会话仍在执行或执行状态未确认，本次未删除。请先停止任务并确认结束。",
+                ));
+            }
         }
-        if !matches!(status.as_str().or_else(|| status["type"].as_str()),
-            Some("idle" | "notLoaded" | "completed" | "failed" | "interrupted"))
-        {
+        if !terminal_status && !terminal_failure_status {
             return Err(error(409, "会话执行状态未确认，本次未删除。请先重新读取并确认结束。"));
         }
         {
@@ -529,4 +573,35 @@ fn delete_failure(id: &str, failure: anyhow::Error) -> anyhow::Error {
         outcome_unknown: true,
     }
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_failed_projection_can_override_unknown_delete_status() {
+        let mut projection = super::super::projection::Projection::default();
+        projection.threads.insert(
+            "thread".into(),
+            json!({
+                "status":{"type":"unknown"},
+                "lastTurnOutcome":{"status":"failed","kind":"failed"}
+            }),
+        );
+        assert!(terminal_failure_from_projection(&projection, "thread"));
+
+        projection.active.insert("thread".into(), "turn".into());
+        assert!(!terminal_failure_from_projection(&projection, "thread"));
+    }
+
+    #[test]
+    fn completed_or_unknown_outcomes_do_not_override_unknown_delete_status() {
+        let mut projection = super::super::projection::Projection::default();
+        projection.threads.insert(
+            "thread".into(),
+            json!({"status":{"type":"unknown"},"lastTurnOutcome":{"status":"completed"}}),
+        );
+        assert!(!terminal_failure_from_projection(&projection, "thread"));
+    }
 }

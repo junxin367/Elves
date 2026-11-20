@@ -381,6 +381,25 @@ impl Conversation {
             .is_some_and(|t| t["status"] == "inProgress")
     }
 
+    fn terminal_upstream_failure_can_remove(&self) -> bool {
+        // 用户要求上游服务已返回终态失败后仍可移除会话：只接受明确失败轮次、
+        // 原生进程已确认不存在且没有等待交互；真正执行中或状态未知仍必须保留删除保护。
+        let settled_tempo = matches!(
+            self.native_status["tempo"].as_str(),
+            Some("idle" | "blocked")
+        );
+        let no_pending_interaction = self.native_status["sessionStatus"] != "waiting"
+            && self.native_status["needs"].is_null();
+        self.shared
+            && self.native_status["sessionAlive"] == false
+            && settled_tempo
+            && no_pending_interaction
+            && self
+                .turns
+                .last()
+                .is_some_and(|turn| turn["status"] == "failed" && turn["_nativeDone"] == true)
+    }
+
     fn view(&self) -> Value {
         // 用户要求实例显示名统一简化；wslUser、实例 ID 和实际运行用户保持原用途。
         // 子代理沿用原生身份和只读详情，侧边会话仍独立保持未适配；不能据此开放子代理写操作。
@@ -2473,15 +2492,23 @@ impl Claude {
                 authorization.check().await?;
                 if action == "deleteThread" && c.shared && c.resumed && !c.native_job_id.is_empty()
                 {
-                    let process = match self.processes.lock().await.get(id).cloned() {
-                        Some(process) => process,
-                        None => {
-                            let process = self.spawn(&c).await?;
-                            process
-                        }
-                    };
-                    let result = self.shutdown_process(&process).await?;
-                    confirm_native_stop_for_removal(&result)?;
+                    let live_process = self
+                        .processes
+                        .lock()
+                        .await
+                        .get(id)
+                        .is_some_and(|process| process.channel.live.load(Ordering::Acquire));
+                    if live_process || !c.terminal_upstream_failure_can_remove() {
+                        let process = match self.processes.lock().await.get(id).cloned() {
+                            Some(process) => process,
+                            None => {
+                                let process = self.spawn(&c).await?;
+                                process
+                            }
+                        };
+                        let result = self.shutdown_process(&process).await?;
+                        confirm_native_stop_for_removal(&result)?;
+                    }
                 }
                 self.change(|saved| {
                     let c = saved
@@ -4977,6 +5004,30 @@ mod tests {
         let failure =
             confirm_native_stop_for_removal(&json!({"reason":"native_draft"})).unwrap_err();
         assert_eq!(failure.downcast_ref::<ApiError>().unwrap().code, 503);
+    }
+
+    #[test]
+    fn terminal_upstream_failure_allows_removal_without_a_live_native_process() {
+        let (_directory, _service, mut conversation) = fixture();
+        conversation.shared = true;
+        conversation.native_job_id = "1234abcd".into();
+        conversation.native_status =
+            json!({"tempo":"blocked","sessionAlive":false,"sessionStatus":null});
+        conversation.turns[0]["status"] = json!("failed");
+        conversation.turns[0]["_nativeDone"] = json!(true);
+        assert!(conversation.terminal_upstream_failure_can_remove());
+
+        conversation.native_status["sessionAlive"] = json!(true);
+        assert!(!conversation.terminal_upstream_failure_can_remove());
+        conversation.native_status["sessionAlive"] = json!(false);
+        conversation.turns[0]["status"] = json!("inProgress");
+        assert!(!conversation.terminal_upstream_failure_can_remove());
+        conversation.turns[0]["status"] = json!("failed");
+        conversation.native_status["tempo"] = json!("unknown");
+        assert!(!conversation.terminal_upstream_failure_can_remove());
+        conversation.native_status["tempo"] = json!("blocked");
+        conversation.native_status["needs"] = json!({"kind":"clarification"});
+        assert!(!conversation.terminal_upstream_failure_can_remove());
     }
 
     #[test]

@@ -73,35 +73,6 @@ fn client_process_running() -> bool {
     }
 }
 
-fn descendant_process_running(parent_process_id: u32, executable: &str) -> bool {
-    #[cfg(windows)]
-    {
-        let processes = elves_core::windows_integration::enumerate_processes();
-        let mut parents = std::collections::HashSet::from([parent_process_id]);
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for process in &processes {
-                if !parents.contains(&process.parent_process_id) {
-                    continue;
-                }
-                if process.exe_file.eq_ignore_ascii_case(executable) {
-                    return true;
-                }
-                if parents.insert(process.process_id) {
-                    changed = true;
-                }
-            }
-        }
-        false
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (parent_process_id, executable);
-        false
-    }
-}
-
 fn claude_execution_active(directory: &Path) -> bool {
     let Ok(bytes) = std::fs::read(directory.join("remote-claude-sessions.json")) else {
         return false;
@@ -115,19 +86,18 @@ fn claude_execution_active(directory: &Path) -> bool {
         .flat_map(|conversations| conversations.values())
         .filter(|conversation| conversation["shared"] == true && conversation["deleted"] != true)
         .any(|conversation| {
-            matches!(
-                conversation["nativeStatus"]["tempo"].as_str(),
-                Some("active" | "blocked")
-            ) || conversation["nativeStatus"]["sessionStatus"] == "waiting"
-                || conversation["turns"]
-                    .as_array()
-                    .and_then(|turns| turns.last())
-                    .is_some_and(|turn| {
-                        matches!(
-                            turn["status"].as_str(),
-                            Some("pending" | "inProgress" | "unknown")
-                        )
-                    })
+            let native = &conversation["nativeStatus"];
+            let tempo = native["tempo"].as_str().unwrap_or_default();
+            let last_status = conversation["turns"]
+                .as_array()
+                .and_then(|turns| turns.last())
+                .and_then(|turn| turn["status"].as_str());
+            // 与 Claude 会话的 active() 规则一致：只把当前原生活动或明确等待交互视为执行中，
+            // 不能用历史 turn 的 unknown/pending 反推仍在执行，否则旧会话会永久阻塞安装。
+            if tempo == "active" || native["sessionStatus"] == "waiting" {
+                return true;
+            }
+            tempo == "blocked" && last_status == Some("inProgress")
         })
 }
 
@@ -219,6 +189,40 @@ async fn endpoint_health(endpoint: &Endpoint) -> anyhow::Result<Option<Value>> {
         return Ok(None);
     }
     Ok(response.json::<Value>().await.ok())
+}
+
+fn endpoint_process_running(process_id: u32) -> bool {
+    #[cfg(windows)]
+    {
+        elves_core::windows_integration::enumerate_processes()
+            .into_iter()
+            .any(|process| process.process_id == process_id)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = process_id;
+        false
+    }
+}
+
+async fn wait_for_endpoint_stop(endpoint: &Endpoint) -> anyhow::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        // 仅在健康端点消失且服务 PID 已退出时确认关闭，避免把短暂的健康检查失败当成可安装。
+        if !endpoint_is_active(endpoint).await? && !endpoint_process_running(endpoint.process_id) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    anyhow::bail!("Harness 正在安全退出但尚未完成，请稍后重试")
+}
+
+async fn request_and_wait_for_shutdown(endpoint: &Endpoint, reason: &str) -> anyhow::Result<Value> {
+    let value = request(endpoint, "prepareShutdown", &json!({"reason":reason})).await?;
+    if shutdown_response_is_safe(&value) {
+        wait_for_endpoint_stop(endpoint).await?;
+    }
+    Ok(value)
 }
 
 async fn active_endpoint(directory: &Path) -> anyhow::Result<Option<Endpoint>> {
@@ -410,25 +414,27 @@ pub async fn prepare_shutdown_status(reason: &str) -> anyhow::Result<Value> {
         }
         return Ok(json!({"status":"not_running","cleanup":"pending_startup_check"}));
     }
-    if reason == "installer"
-        && !endpoint_health(&endpoint)
-            .await?
-            .is_some_and(|value| value["buildId"] == crate::assets::DIAGNOSTIC_BUILD_ID)
-        && (descendant_process_running(endpoint.process_id, "codex.exe")
-            || claude_execution_active(&directory))
-    {
-        // 首次从旧直连 stdio 版本升级时不能伪造无损接管；检测到旧 Harness 仍持有 Codex 时必须中止。
-        return Ok(json!({
-            "status":"handoff_unavailable",
-            "message":"当前 Harness 版本不支持执行中无损升级交接，请等待任务完成后重试安装",
-            "cleanup":{"complete":false,"pendingStartupCheck":false}
-        }));
+    let build_matches = endpoint_health(&endpoint)
+        .await?
+        .is_some_and(|value| value["buildId"] == crate::assets::DIAGNOSTIC_BUILD_ID);
+    if reason == "installer" && !build_matches && endpoint.protocol_version >= 9 {
+        // 首次从旧版直连 stdio Harness 升级时，先调用旧版自己的安全退出检查。
+        // 不能把常驻的 codex.exe 进程当成“执行中”：空闲时旧版会返回 stopped，执行中或未知才返回 busy。
+        if claude_execution_active(&directory) {
+            return Ok(json!({
+                "status":"busy",
+                "reason":"claude_active",
+                "message":"Claude 仍在执行或状态尚未确认，等待任务完成后再安装",
+                "cleanup":{"complete":false,"pendingStartupCheck":false}
+            }));
+        }
+        return request_and_wait_for_shutdown(&endpoint, "installer").await;
     }
     if endpoint.protocol_version < 9 {
         // 安装包用新 helper 请求旧服务时不恢复旧桥接；旧版无法响应的清理保留到新服务启动。
         return Ok(json!({"status":"legacy_service","cleanup":"pending_startup_check"}));
     }
-    request(&endpoint, "prepareShutdown", &json!({"reason":reason})).await
+    request_and_wait_for_shutdown(&endpoint, reason).await
 }
 
 pub async fn prepare_shutdown(reason: &str) -> anyhow::Result<Value> {
@@ -626,33 +632,127 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn shutdown_waits_for_legacy_service_to_exit_after_stopped_response() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let endpoint = Endpoint {
+            protocol_version: PROTOCOL_VERSION - 1,
+            process_id: u32::MAX,
+            port: listener.local_addr().unwrap().port(),
+            token: "a".repeat(64),
+        };
+        let health_stopped = stopped.clone();
+        let health_endpoint = endpoint.clone();
+        let admin_stopped = stopped.clone();
+        let router = Router::new()
+            .route(
+                "/health",
+                get(move || {
+                    let stopped = health_stopped.clone();
+                    let endpoint = health_endpoint.clone();
+                    async move {
+                        if stopped.load(Ordering::Acquire) {
+                            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})))
+                        } else {
+                            (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "protocolVersion":endpoint.protocol_version,
+                                    "processId":endpoint.process_id
+                                })),
+                            )
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/admin/prepareShutdown",
+                post(move || {
+                    let stopped = admin_stopped.clone();
+                    async move {
+                        stopped.store(true, Ordering::Release);
+                        Json(json!({"status":"stopped"}))
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let value = request_and_wait_for_shutdown(&endpoint, "installer")
+            .await
+            .unwrap();
+        assert_eq!(value["status"], "stopped");
+        assert!(stopped.load(Ordering::Acquire));
+
+        server.abort();
+        let _ = server.await;
+    }
+
     #[test]
-    fn claude_execution_active_distinguishes_idle_and_running_sessions() {
+    fn claude_execution_active_uses_current_native_state_not_stale_history() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("remote-claude-sessions.json");
         std::fs::write(
             &path,
             serde_json::json!({
                 "conversations": {
-                    "idle": {"shared":true,"deleted":false,"nativeStatus":{"tempo":"idle"},"turns":[]},
-                    "running": {"shared":true,"deleted":false,"nativeStatus":{"tempo":"active"},"turns":[]}
-                }
-            })
-            .to_string(),
-        )
-        .unwrap();
-        assert!(claude_execution_active(directory.path()));
-        std::fs::write(
-            &path,
-            serde_json::json!({
-                "conversations": {
-                    "idle": {"shared":true,"deleted":false,"nativeStatus":{"tempo":"idle"},"turns":[]}
+                    "idle": {
+                        "shared":true,
+                        "deleted":false,
+                        "nativeStatus":{"tempo":"idle"},
+                        "turns":[{"status":"unknown"}]
+                    },
+                    "blocked": {
+                        "shared":true,
+                        "deleted":false,
+                        "nativeStatus":{"tempo":"blocked","sessionAlive":false},
+                        "turns":[{"status":"failed"}]
+                    }
                 }
             })
             .to_string(),
         )
         .unwrap();
         assert!(!claude_execution_active(directory.path()));
+
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "conversations": {
+                    "running": {
+                        "shared":true,
+                        "deleted":false,
+                        "nativeStatus":{"tempo":"active","sessionAlive":true},
+                        "turns":[{"status":"inProgress"}]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(claude_execution_active(directory.path()));
+
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "conversations": {
+                    "waiting": {
+                        "shared":true,
+                        "deleted":false,
+                        "nativeStatus":{"tempo":"blocked","sessionStatus":"waiting"},
+                        "turns":[{"status":"completed"}]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(claude_execution_active(directory.path()));
     }
 
     #[tokio::test]

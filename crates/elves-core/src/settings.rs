@@ -1617,7 +1617,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let temp_path = temp_path_for(path);
     fs::write(&temp_path, bytes)
         .with_context(|| format!("failed to write temp file {}", temp_path.display()))?;
-    fs::rename(&temp_path, path).with_context(|| {
+    replace_file(&temp_path, path).with_context(|| {
         format!(
             "failed to replace {} with {}",
             path.display(),
@@ -1625,6 +1625,41 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         )
     })?;
     Ok(())
+}
+
+fn replace_file(temp_path: &Path, path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        };
+        use windows::core::PCWSTR;
+
+        let source = temp_path
+            .as_os_str()
+            .encode_wide()
+            .chain([0])
+            .collect::<Vec<_>>();
+        let target = path
+            .as_os_str()
+            .encode_wide()
+            .chain([0])
+            .collect::<Vec<_>>();
+        // Windows 的 std::fs::rename 不覆盖已存在目标；用 MoveFileExW 保留临时写入后的替换语义。
+        unsafe {
+            MoveFileExW(
+                PCWSTR(source.as_ptr()),
+                PCWSTR(target.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+            .map_err(std::io::Error::other)
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(temp_path, path)
+    }
 }
 
 fn temp_path_for(path: &Path) -> PathBuf {
@@ -1704,6 +1739,19 @@ mod tests {
         assert_eq!(settings.cli_wrapper_api_key_env, "CUSTOM_OPENAI_API_KEY");
         assert_eq!(settings.relay_base_url, default_relay_base_url());
         assert_eq!(settings.layered_compaction_retain_tokens, 20_000);
+    }
+
+    #[test]
+    fn atomic_write_replaces_existing_file() {
+        let directory = temp_dir();
+        let path = directory.join("state.json");
+        std::fs::write(&path, b"old").unwrap();
+
+        atomic_write(&path, b"new").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert!(!path.with_extension("json.tmp").exists());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
