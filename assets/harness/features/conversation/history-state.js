@@ -88,12 +88,7 @@ export function renderTurnPlan(plan, turnId, expansionId = turnId) {
       `${step.status === "completed" ? "✓" : step.status === "inProgress" ? "◌" : "○"} ${step.step}`));
   block.append(title, list);
   block.addEventListener("toggle", () => turnPlanExpansion.set(key, block.open));
-  // 用户要求长任务列表只在明细区滚动；任务更新后把当前进行中的任务保持在可视区域。
-  if (block.open && typeof requestAnimationFrame === "function")
-    requestAnimationFrame(() => {
-      const active = list.querySelector?.(".inProgress");
-      active?.scrollIntoView?.({ block: "nearest" });
-    });
+  // 用户要求恢复原有阅读行为：任务更新或历史重绘不得自动改变会话消息区的滚动位置。
   return block;
 }
 export function legacySentDisplayTurn(turn) {
