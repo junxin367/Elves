@@ -146,12 +146,14 @@ async fn spawn_candidate(
                 json!({
                     "executable": candidate.path.to_string_lossy(),
                     "socket": socket,
+                    "fallback": "stdio",
                     "reason": "initialize_timeout_or_invalid_response",
                 }),
             );
-            // 用户要求安装升级不能因代理握手失败而误杀执行中的 Codex；已有 daemon
-            // 套接字无法完成 proxy 握手时必须硬失败，不能再启动受 Harness 生命周期控制的 stdio。
-            bail!("Codex 持久服务代理握手失败，拒绝降级到 stdio")
+            // 已通过 manifest/CLI 状态核验的 daemon 仍由独立进程持有；proxy 握手失败时
+            // 保留启动可用性，使用 stdio 作为当前连接的降级传输。Runtime 会记录 Stdio，
+            // 安装 handoff 仍会拒绝该连接，不能把它误报为 daemon 可交接。
+            (candidate_command(candidate), ServiceTransport::Stdio)
         }
         Err(error) => {
             if socket_was_present || socket.is_file() {
@@ -392,17 +394,16 @@ async fn ensure_daemon(candidate: &Candidate, codex_home: &Path) -> anyhow::Resu
         if let Some(manifest) = manifest {
             let has_identity = manifest["cliPath"].is_string()
                 && manifest["cliVersion"].is_string();
-            if has_identity {
-                anyhow::ensure!(
-                    manifest["cliPath"] == expected_path
-                        && manifest["cliVersion"] == expected_version,
-                    "Codex 持久服务版本或路径不匹配，拒绝复用旧服务"
-                );
+            if has_identity
+                && manifest["cliPath"] == expected_path
+                && manifest["cliVersion"] == expected_version
+            {
                 return Ok(socket);
             }
         }
-        // 安装升级可能只留下原生守护进程和套接字，清单尚未写入或内容损坏；
-        // 先用 CLI 只读核对，确认同一套接字仍由运行中的 app-server 提供后再补写清单。
+        // CLI 自更新后 manifest 可能仍记录旧版本；只要当前 CLI 的只读 daemon/version
+        // 核对确认同一套接字仍在运行，就刷新 manifest 并继续使用，不把版本漂移误判为
+        // 不可用。无法核验时仍拒绝接管，避免把未知套接字当成 Codex 服务。
         if let Some(daemon_version) = probe_daemon_version(candidate, codex_home).await
             && daemon_version_confirms_socket(&daemon_version, &socket)
         {
@@ -1250,6 +1251,38 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("运行中的套接字未通过 CLI 状态核对"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn confirmed_daemon_proxy_failure_falls_back_to_stdio_transport() {
+        let directory = tempfile::tempdir().unwrap();
+        let codex_home = directory.path().join("codex-home");
+        let socket = daemon_socket_path(&codex_home);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        std::fs::write(&socket, b"socket-placeholder").unwrap();
+        let socket_path = socket.to_string_lossy().replace('\\', "/");
+        let version_json = format!(
+            r#"{{"status":"running","socketPath":"{socket_path}","managedCodexVersion":"0.166.0","appServerVersion":"0.166.0"}}"#
+        );
+        let candidate_path = directory.path().join("codex-stub.cmd");
+        std::fs::write(
+            &candidate_path,
+            format!(
+                "@echo off\r\nif \"%1\"==\"app-server\" if \"%2\"==\"daemon\" if \"%3\"==\"version\" (echo {version_json}\r\n exit /b 0\r\n)\r\nif \"%1\"==\"app-server\" if \"%2\"==\"proxy\" exit /b 17\r\nif \"%1\"==\"app-server\" exit /b 0\r\nexit /b 17\r\n"
+            ),
+        )
+        .unwrap();
+        let candidate = Candidate {
+            path: candidate_path,
+            shell: true,
+            version: crate::cli_wrapper::parse_codex_cli_version("codex-cli 0.166.0"),
+            ordinal: 0,
+        };
+
+        let mut service = spawn_candidate(&candidate, &codex_home).await.unwrap();
+        assert_eq!(service.transport, ServiceTransport::Stdio);
+        let _ = service.child.start_kill();
     }
 
     #[cfg(windows)]
