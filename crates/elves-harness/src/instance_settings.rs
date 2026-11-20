@@ -338,6 +338,122 @@ fn native_document(backend: &str, text: &str) -> Result<Value, ApiError> {
     }
 }
 
+const CLAUDE_SKILL_OVERRIDE_STATES: &[&str] =
+    &["on", "name-only", "user-invocable-only", "off"];
+
+fn claude_skill_name(id: &str) -> Option<&str> {
+    let name = id.strip_prefix("claude-skill:")?;
+    (!name.is_empty()
+        && name.len() <= 256
+        && name
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || matches!(ch, '-' | '_' | ':' | '.')))
+    .then_some(name)
+}
+
+fn claude_skill_override_state<'a>(
+    document: &'a Value,
+    name: &str,
+) -> Result<&'a str, ApiError> {
+    let overrides = &document["skillOverrides"];
+    if overrides.is_null() {
+        return Ok("on");
+    }
+    let overrides = overrides.as_object().ok_or_else(|| {
+        ApiError::new(422, "Claude skillOverrides 配置格式无效，未覆盖原文件")
+    })?;
+    let Some(value) = overrides.get(name) else {
+        return Ok("on");
+    };
+    let state = value.as_str().filter(|state| {
+        CLAUDE_SKILL_OVERRIDE_STATES.contains(state)
+    });
+    state.ok_or_else(|| ApiError::new(422, "Claude Skill 覆盖状态无效，未覆盖原文件"))
+}
+
+fn decorate_claude_skill_inventory(
+    inventory: &mut Value,
+    document: &Value,
+) -> Result<(), ApiError> {
+    let Some(rows) = inventory["data"].as_array_mut() else {
+        return Err(ApiError::new(503, "Claude Skill 列表格式无效"));
+    };
+    for row in rows {
+        let Some(name) = row["name"].as_str() else {
+            continue;
+        };
+        let state = claude_skill_override_state(document, name)?;
+        let plugin = row["scope"] == "plugin";
+        row["override"] = json!(state);
+        row["enabled"] = json!(state != "off");
+        row["canToggle"] = json!(!plugin);
+        if plugin {
+            row["readOnlyReason"] = json!("插件 Skill 由插件管理");
+        }
+    }
+    Ok(())
+}
+
+fn json_output(original: &str, document: &Value) -> String {
+    let ending = if original.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let mut output = serde_json::to_string_pretty(document)
+        .expect("JSON 配置文档序列化不应失败")
+        .replace('\n', ending);
+    if original.starts_with('\u{feff}') {
+        output.insert(0, '\u{feff}');
+    }
+    output.push_str(ending);
+    output
+}
+
+fn updated_claude_skill_override(text: &str, change: &Value) -> Result<String, ApiError> {
+    let change = change
+        .as_object()
+        .filter(|change| change.len() == 2)
+        .ok_or_else(|| ApiError::new(400, "Claude Skill 开关参数无效"))?;
+    let id = change
+        .get("id")
+        .and_then(Value::as_str)
+        .and_then(claude_skill_name)
+        .ok_or_else(|| ApiError::new(400, "请选择当前实例的 Claude Skill"))?;
+    let enabled = change
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| ApiError::new(400, "Claude Skill 开关必须为布尔值"))?;
+    let mut document = native_document("claude", text)?;
+    let root = document
+        .as_object_mut()
+        .ok_or_else(|| ApiError::new(422, "Claude 配置必须为 JSON 对象"))?;
+    if enabled {
+        let remove_overrides = if let Some(overrides) = root.get_mut("skillOverrides") {
+            let overrides = overrides.as_object_mut().ok_or_else(|| {
+                ApiError::new(422, "Claude skillOverrides 配置格式无效，未覆盖原文件")
+            })?;
+            overrides.remove(id);
+            overrides.is_empty()
+        } else {
+            false
+        };
+        if remove_overrides {
+            root.remove("skillOverrides");
+        }
+    } else {
+        let overrides = root
+            .entry("skillOverrides")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| {
+                ApiError::new(422, "Claude skillOverrides 配置格式无效，未覆盖原文件")
+            })?;
+        overrides.insert(id.to_owned(), json!("off"));
+    }
+    Ok(json_output(text, &document))
+}
+
 fn optional_bool(value: &Value) -> Result<Value, ApiError> {
     if value.is_null() || value.is_boolean() {
         Ok(value.clone())
@@ -564,15 +680,7 @@ fn updated_native(
                 root.insert(key.clone(), value.clone());
             }
         }
-        let ending = if text.contains("\r\n") { "\r\n" } else { "\n" };
-        let mut output = serde_json::to_string_pretty(&document)
-            .unwrap()
-            .replace('\n', ending);
-        if text.starts_with('\u{feff}') {
-            output.insert(0, '\u{feff}');
-        }
-        output.push_str(ending);
-        Ok(output)
+        Ok(json_output(text, &document))
     }
 }
 
@@ -1086,6 +1194,45 @@ pub(super) async fn settings(
                 &authorization,
             )
             .await?;
+        } else if changes.contains_key("skill") && target.backend == "claude" {
+            if section != "skills" || changes.len() != 1 {
+                return Err(ApiError::new(400, "Claude Skill 开关需要单独保存"));
+            }
+            if payload["expectedRevision"] != revision {
+                return Err(ApiError::new(409, "实例配置已变化，请重新读取后再保存"));
+            }
+            let native = state
+                .controller
+                .call_authorized(
+                    "skills",
+                    json!({"instanceId":instance,"forceReload":true}),
+                    &authorization,
+                )
+                .await
+                .map_err(super::authorization_error)?;
+            let mut native = super::native_result(native)?;
+            decorate_claude_skill_inventory(&mut native, &document)?;
+            let change = &changes["skill"];
+            let row = native["data"]
+                .as_array()
+                .and_then(|rows| rows.iter().find(|row| row["id"] == change["id"]))
+                .ok_or_else(|| ApiError::new(409, "Claude Skill 已不在当前实例中，请重新读取"))?;
+            if row["canToggle"] != true {
+                return Err(ApiError::new(403, "该 Claude Skill 由插件或原生策略管理"));
+            }
+            let updated = updated_claude_skill_override(&text, change)?;
+            permissions::save_settings_file(
+                &target,
+                &updated,
+                &payload["settings"],
+                &revision,
+                &authorization,
+            )
+            .await?;
+            state
+                .controller
+                .shared_settings
+                .instance_settings_changed(&state.controller, instance, &payload["settings"]);
         } else if changes.contains_key("skill") {
             if section != "skills"
                 || target.backend != "codex"
@@ -1273,11 +1420,13 @@ pub(super) async fn settings(
                 .await
                 .map_err(super::authorization_error)?;
             let native = super::native_result(native)?;
+            let mut native = native;
+            decorate_claude_skill_inventory(&mut native, &document)?;
             inventory["data"] = native["data"].clone();
             inventory["message"] = json!(if state.settings.read_only {
                 "只读访问不会启动 Claude Skill 探测，请在该实例的原生 CLI 中查看。"
             } else {
-                "由所选实例的 Claude CLI 返回；单项启停仍由原生 CLI 管理。"
+                "由所选实例的 Claude CLI 返回；开关保存到该实例的 skillOverrides。"
             });
         } else if target.backend == "claude" && section == "mcp" {
             inventory = claude_mcp(
@@ -1369,6 +1518,52 @@ mod tests {
         assert!(validate_hidden_model_selection(&["retired".into()], &["retired".into()], None).is_ok());
         assert!(validate_hidden_model_selection(&[], &["retired".into()], None).is_ok());
         assert!(updated_native("claude", "general", "{}", &json!({"hiddenModelIds":["present"]})).is_err());
+    }
+
+    #[test]
+    fn claude_skill_overrides_preserve_states_and_disable_plugin_toggles() {
+        let before = "\u{feff}{\r\n  \"skillOverrides\": {\r\n    \"review\": \"name-only\"\r\n  },\r\n  \"model\": \"keep\"\r\n}\r\n";
+        let mut inventory = json!({"data":[
+            {"id":"claude-skill:review","name":"review","scope":"native"},
+            {"id":"claude-skill:plugin-check","name":"plugin-check","scope":"plugin"}
+        ]});
+        let document = native_document("claude", before).unwrap();
+        decorate_claude_skill_inventory(&mut inventory, &document).unwrap();
+        assert_eq!(inventory["data"][0]["override"], "name-only");
+        assert_eq!(inventory["data"][0]["enabled"], true);
+        assert_eq!(inventory["data"][0]["canToggle"], true);
+        assert_eq!(inventory["data"][1]["canToggle"], false);
+        assert_eq!(inventory["data"][1]["readOnlyReason"], "插件 Skill 由插件管理");
+
+        let disabled = updated_claude_skill_override(
+            before,
+            &json!({"id":"claude-skill:review","enabled":false}),
+        )
+        .unwrap();
+        let disabled_document = native_document("claude", &disabled).unwrap();
+        assert_eq!(disabled_document["skillOverrides"]["review"], "off");
+        assert_eq!(disabled_document["model"], "keep");
+        assert!(disabled.starts_with('\u{feff}'));
+        assert!(disabled.contains("\r\n"));
+
+        let restored = updated_claude_skill_override(
+            &disabled,
+            &json!({"id":"claude-skill:review","enabled":true}),
+        )
+        .unwrap();
+        let restored_document = native_document("claude", &restored).unwrap();
+        assert!(restored_document["skillOverrides"].is_null());
+        assert_eq!(restored_document["model"], "keep");
+        assert!(updated_claude_skill_override(
+            before,
+            &json!({"id":"claude-skill:unknown","enabled":false})
+        )
+        .is_ok());
+        assert!(updated_claude_skill_override(
+            before,
+            &json!({"id":"claude-skill:review","enabled":"off"})
+        )
+        .is_err());
     }
 
     #[test]

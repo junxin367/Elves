@@ -11,6 +11,23 @@ fn catalog_key(config: &WslConfig, cwd: &str) -> String {
     json!([config.instance_id(), cwd]).to_string()
 }
 
+fn skill_scope(skill: &Value) -> String {
+    if skill["scope"] == "plugin"
+        || skill["source"] == "plugin"
+        || skill["plugin"].is_object()
+    {
+        "plugin".into()
+    } else if skill["builtin"] == true {
+        "bundled".into()
+    } else {
+        skill["scope"]
+            .as_str()
+            .filter(|scope| !scope.is_empty() && scope.len() <= 32)
+            .unwrap_or("native")
+            .to_owned()
+    }
+}
+
 fn normalize_skills(response: &Value, initialization: &Value) -> anyhow::Result<Vec<Value>> {
     let reported = response["skills"]
         .as_array()
@@ -42,7 +59,7 @@ fn normalize_skills(response: &Value, initialization: &Value) -> anyhow::Result<
         // path 仅是菜单稳定标识，不是文件路径，也不作为 Codex Skill 参数发送。
         data.push(json!({
             "name":name,"command":name,"path":format!("claude-skill:{name}"),
-            "backend":"claude","scope":"native",
+            "backend":"claude","scope":skill_scope(skill),
             "description":skill["description"].as_str().unwrap_or(""),
             "argumentHint":skill["argumentHint"].as_str().unwrap_or("")
         }));
@@ -113,15 +130,17 @@ mod tests {
             {"name":"compact"},{"name":"goal"},{"name":"hidden"},{"name":"bad\nname"}]});
         let response = json!({"skills":[
             {"name":"review","builtin":true,"description":"Review code","argumentHint":"[path]"},
-            {"name":"plugin:check","description":"Plugin skill"},
+            {"name":"plugin:check","scope":"plugin","description":"Plugin skill"},
             {"name":"review"},{"name":"model-only"},{"name":"hidden","userInvocable":false},
             {"name":"compact"},{"name":"goal"},{"name":"bad\nname"}
         ]});
         let skills = normalize_skills(&response, &commands).unwrap();
         assert_eq!(skills.len(), 2);
         assert_eq!(skills[0]["command"], "review");
+        assert_eq!(skills[0]["scope"], "bundled");
         assert_eq!(skills[0]["argumentHint"], "[path]");
         assert_eq!(skills[1]["path"], "claude-skill:plugin:check");
+        assert_eq!(skills[1]["scope"], "plugin");
         assert!(normalize_skills(&json!({}), &commands).is_err());
     }
 

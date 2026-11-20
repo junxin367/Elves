@@ -63,12 +63,13 @@ export function openSettingsPrompt({
   body.append(input, preview, status);
 
   // 用户要求恢复默认只修改弹窗草稿；取消不写入，保存才提交当前文本或移除实例覆盖。
+  // 操作区沿用设置页层级：恢复默认、取消为文字按钮，保存为唯一主按钮。
   const actions = element("div", "confirmation-actions settings-prompt-actions");
   const restore = button("恢复默认", `恢复默认${title}`, () => {
     if (restore.disabled) return;
     input.value = fallback; input.scrollTop = 0; useDefault = true; errorMessage = ""; sync();
-  });
-  const cancelButton = button("取消", "取消编辑", cancel);
+  }, "text-button");
+  const cancelButton = button("取消", "取消编辑", cancel, "text-button");
   const save = button("保存", `保存${title}`, async () => {
     sync();
     if (!dialog.open || save.disabled) return;

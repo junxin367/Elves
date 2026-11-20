@@ -50,10 +50,12 @@ export function mountInstancePermissions({
   const scope = authorizationScope();
   const current = () => page.isConnected && scope === authorizationScope();
   const instanceSlot = element("div", "permission-instance-slot");
-  const heading = element("label", "appearance-field permission-instance-field");
-  heading.append(element("span", "", "会话实例"), instanceSlot);
+  const path = element("span", "appearance-hint instruction-path");
+  const target = element("div", "permission-instance-target");
+  const heading = element("div", "appearance-field permission-instance-field");
+  target.append(path, instanceSlot);
+  heading.append(element("span", "", "会话实例"), target);
   const card = element("div", "appearance-card instance-permissions-card");
-  const path = element("p", "appearance-hint instruction-path");
   const fields = element("div", "instance-permission-fields");
   const status = element("p", "appearance-hint permission-settings-status");
   status.setAttribute("role", "status");
@@ -62,7 +64,7 @@ export function mountInstancePermissions({
   const reload = element("button", "", "重新读取"), save = element("button", "primary", "保存权限");
   reload.type = save.type = "button";
   actions.append(reload, save);
-  card.append(heading, path, fields, status, actions);
+  card.append(heading, fields, status, actions);
   page.append(element("p", "appearance-hint",
     "修改所选实例的全局权限，与原生客户端设置共用。已有会话的单独权限选择保持不变。"), card);
   const instances = selectControl("permission-instance", "权限设置的会话实例", [], "");

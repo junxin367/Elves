@@ -121,6 +121,7 @@ html.theme-transition{
 .scheduled-input,.scheduled-textarea{width:100%;border:1px solid var(--line);border-radius:var(--radius-control);background:var(--composer-bg,var(--bg));color:var(--text);padding:8px 10px;line-height:1.4}
 .scheduled-input{height:36px}.scheduled-textarea{min-height:132px;resize:vertical}
 .scheduled-select{width:100%;height:36px;min-height:36px;border:1px solid var(--line);background:var(--composer-bg,var(--bg));padding:0 10px}
+#scheduled-model{width:240px;max-width:100%}
 .scheduled-select .select-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .scheduled-select:disabled{opacity:.55;cursor:not-allowed}
 .scheduled-editor-status{min-height:1.5em;margin:12px 0 0;color:var(--muted);font-size:.82rem;white-space:pre-wrap}
@@ -182,6 +183,11 @@ textarea{resize:none;line-height:1.7}.muted{color:var(--muted)}
 .primary{background:var(--surface-button-bg,var(--button-bg));color:var(--surface-button-text,var(--button-text));border-color:var(--surface-button-outline,var(--button-outline,transparent))}
 .primary:hover:not(:disabled){background:var(--surface-button-hover,var(--button-hover))}
 .primary:active:not(:disabled){background:var(--surface-button-active,var(--button-active))}
+.primary:disabled,.primary:disabled:hover,.primary:disabled:active{
+  background:var(--surface-button-bg,var(--button-bg));
+  color:var(--surface-button-text,var(--button-text));
+  border-color:var(--surface-button-outline,var(--button-outline,transparent))
+}
 :root[data-custom-button-color=true] .primary{transition-property:opacity}
 /* 卡片是实际相邻表面；没有令牌的旧资源沿用页面配色，普通页脚及独立弹窗仍使用页面实色。 */
 .approval-card{
@@ -782,8 +788,8 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
   margin:0 auto;padding:0;overflow:hidden;transform:translateY(-50%)
 }
 .settings-prompt-dialog[open]{display:flex;flex-direction:column}
-.settings-prompt-heading,.settings-prompt-actions{display:flex;align-items:center;flex-shrink:0;gap:8px;padding:10px 16px}
-.settings-prompt-heading{justify-content:space-between;border-bottom:1px solid var(--line)}
+.settings-prompt-heading,.settings-prompt-actions{display:flex;align-items:center;flex-shrink:0}
+.settings-prompt-heading{justify-content:space-between;gap:12px;padding:12px 16px;border-bottom:1px solid var(--line)}
 .settings-prompt-heading h2{font-size:1.14286rem;overflow-wrap:anywhere}
 .settings-prompt-heading>button{flex-shrink:0}
 .settings-prompt-body{min-height:0;overflow:auto;overscroll-behavior:contain;padding:12px 16px}
@@ -792,7 +798,7 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .settings-prompt-default summary{cursor:pointer}
 .settings-prompt-default pre{max-height:160px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-family:var(--code-font-family,monospace);line-height:1.6}
 .settings-prompt-dialog .settings-prompt-status{margin:8px 0 0;color:var(--text-secondary);overflow-wrap:anywhere}
-.settings-prompt-actions{border-top:1px solid var(--line)}
+.settings-prompt-actions{justify-content:flex-end;gap:12px;padding:12px 16px 16px;border-top:1px solid var(--line)}
 .settings-prompt-actions>button:first-child{margin-right:auto}
 /* 用户要求左侧会话菜单使用重命名弹窗；输入框沿用会话编辑框配色，PC 与手机共用现有确认框宽度。 */
 .thread-rename-dialog form{display:grid;gap:18px}
@@ -1981,14 +1987,20 @@ body{font-weight:var(--ui-font-weight,400)}
 .session-instance-group>.appearance-notification-row{margin:0;border-radius:0;padding:12px 16px}
 .instance-permissions-card{padding:0 16px 14px}
 .permission-instance-field{gap:14px}
-.permission-instance-slot{flex:0 1 65%;min-width:0}
+.permission-instance-target{display:flex;align-items:center;justify-content:flex-end;gap:12px;flex:0 1 65%;min-width:0}
+.permission-instance-slot{flex:0 0 200px;min-width:0}
 .permission-instance-slot>.select-trigger{width:100%;min-width:0}
 .instance-permission-field{gap:14px}
 .instance-permission-field>.select-trigger{max-width:65%;min-width:0}
+.permission-instance-target .instruction-path{flex:1 1 auto;min-width:0;margin:0;overflow:hidden;color:var(--text-secondary);font-size:.85714rem;line-height:1.4;text-align:right;text-overflow:ellipsis;white-space:nowrap}
+.permission-instance-target .instruction-path:empty{display:none}
 .permission-instance-slot .select-label,.instance-permission-field .select-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-/* 用户要求 PC 权限设置中的会话实例下拉框收窄：761px 起以 240px 为基准，仍受卡片 65% 上限约束并可收缩；
- * 长实例名沿用上方省略规则，760px 及以下保留原有 65% 布局；断点须与设置页的 PC/手机布局同步。 */
-@media(min-width:761px){.permission-instance-slot{flex-basis:240px}}
+/* 用户要求 PC 权限设置中的会话实例 Select 贴右侧、配置路径显示在其左侧；桌面保留单行省略，
+ * 窄屏改为独立一行，避免路径挤压实例选择器；选择器仍与右侧控件保持 200px 对齐。 */
+@media(max-width:760px){
+  .permission-instance-target{flex:1 1 100%;width:100%;max-width:100%;flex-wrap:wrap}
+  .permission-instance-target .instruction-path{flex:1 1 100%;text-align:left;white-space:normal}
+}
 .permission-settings-status{min-height:1.5em;white-space:pre-wrap}
 .permission-settings-actions{justify-content:flex-end;margin-top:14px}
 /* 用户确认的实例设置沿用 222px 单层导航、分组卡片和原有品牌 SVG；设备显示与原生配置分开，
@@ -2004,18 +2016,27 @@ body{font-weight:var(--ui-font-weight,400)}
 .instance-settings-content .appearance-notification-switch:indeterminate::after{transform:translateX(6px);opacity:.5}
 /* 用户要求 Codex MCP 明确显示开关状态；文字与开关同组，手机端也保持同排，长服务名沿用左侧说明换行。 */
 .instance-mcp-toggle-state{display:inline-flex;align-items:center;flex-shrink:0;gap:.5em;white-space:nowrap}
+/* 用户要求 Skills 与 MCP 搜索框统一为 240px；窄屏按剩余空间收缩，输入有内容时显示清除按钮。 */
+.appearance-screen .instance-settings-search-control{position:relative;display:block;width:240px;max-width:100%;margin:0 0 12px auto}
+.appearance-screen .instance-settings-search-control>.instance-settings-search{display:block;width:100%;padding-right:40px}
+.instance-settings-search-control>.instance-settings-search::-webkit-search-cancel-button{appearance:none;-webkit-appearance:none}
+.instance-settings-search-control>.instance-settings-search::-ms-clear{display:none}
+.instance-settings-search-clear{position:absolute;top:50%;right:4px;width:28px;height:28px;transform:translateY(-50%);padding:0;color:var(--muted);border-radius:var(--radius-control);cursor:pointer}
+.instance-settings-search-clear:hover{background:var(--hover);color:var(--text);cursor:pointer}
+.instance-settings-search-clear .ui-icon{width:16px;height:16px}
+.instance-settings-inventory-list{min-width:0}
+.instance-settings-inventory-empty{margin:0;padding:16px;border-top:1px solid var(--line);text-align:center}
 .instance-settings-status:empty{display:none}
 .instance-settings-actions{justify-content:flex-end;margin-top:12px}
 /* 用户要求 Codex、Claude 默认模型在前、思考深度在后并保持两个 Select 同排。
- * 组合沿用命名选择器的 480px / 65% 上限；760px 及以下说明上移。
- * 深度按当前选项内容适配宽度，最多占组合一半以保留模型空间；模型占剩余宽度，长名称省略。 */
-.instance-model-defaults-selectors{display:flex;flex-wrap:nowrap;gap:8px;flex:0 1 480px;min-width:0;max-width:65%}
-.instance-settings-content .instance-model-defaults-selectors>.select-trigger{flex:1 1 0;max-width:none;min-width:0}
+ * 模型 Select 固定 240px，思考深度按内容保留空间；组合沿用 480px / 65% 上限并靠卡片右侧对齐，760px 及以下说明上移。 */
+.instance-model-defaults-selectors{display:flex;align-items:center;justify-content:flex-end;flex-wrap:nowrap;gap:8px;flex:0 1 480px;min-width:0;max-width:65%}
+.instance-settings-content .instance-model-defaults-selectors>.select-trigger:not(.instance-model-default-effort){flex:0 1 var(--settings-model-width);max-width:100%;min-width:0}
 .instance-settings-content .instance-model-defaults-selectors>.instance-model-default-effort{flex:0 1 auto;width:max-content;max-width:50%}
 .instance-model-defaults-selectors .select-label{flex:1;text-align:left}
 /* 用户要求命名实例与模型保持同排，左侧实例、右侧关联模型；长名称省略，不把模型挤到下一行。
- * PC 的组合宽度最多占当前卡片 65%；760px 及以下说明移至上方，两个选择器共同使用整行宽度。 */
-.conversation-naming-target-selectors{display:flex;flex-wrap:nowrap;gap:8px;flex:0 1 480px;min-width:0;max-width:65%}
+ * PC 的组合宽度最多占当前卡片 65% 并靠右对齐；760px 及以下说明移至上方，两个选择器共同使用整行宽度。 */
+.conversation-naming-target-selectors{display:flex;align-items:center;justify-content:flex-end;flex-wrap:nowrap;gap:8px;flex:0 1 480px;min-width:0;max-width:65%}
 .instance-settings-content .conversation-naming-target-selectors>.select-trigger{flex:1 1 0;max-width:none;min-width:0}
 .conversation-naming-target-selectors .select-label{flex:1;text-align:left}
 .shortcut-setting-row>kbd{border:1px solid var(--line);border-radius:6px;padding:3px 8px;background:var(--side);font:inherit;font-size:.85714rem;white-space:normal;text-align:right}
@@ -2066,13 +2087,13 @@ body{font-weight:var(--ui-font-weight,400)}
 /* 用户要求设置页遵循 DESIGN.md：普通控件统一 36px 外框、8px 圆角；
  * 输入默认 100px，Select 默认 120px，指定的字体、主题、模型、思考深度和实例选择器使用固定档位。
  * 导航、开关、滑块、主题缩略图和菜单选项保留专用样式。 */
-:is(.appearance-screen,.prompt-optimization-settings){
+:is(.appearance-screen,.prompt-optimization-settings,.settings-prompt-dialog){
   --settings-control-height:36px;
   --settings-control-radius:8px;
   --settings-control-padding:10px;
   --settings-control-min-width:80px;
   --settings-select-gap:8px;
-  --settings-model-width:140px;
+  --settings-model-width:240px;
   --settings-effort-width:100px;
   --settings-instance-width:200px
 }
@@ -2103,6 +2124,12 @@ body{font-weight:var(--ui-font-weight,400)}
 .appearance-screen .select-trigger:where(#conversation-naming-model),
 .appearance-screen .instance-model-defaults-selectors>.select-trigger:not(.instance-model-default-effort){
   width:var(--settings-model-width)
+}
+.appearance-screen .conversation-naming-target-selectors>#conversation-naming-instance{
+  flex:0 1 var(--settings-instance-width);width:var(--settings-instance-width)
+}
+.appearance-screen .conversation-naming-target-selectors>#conversation-naming-model{
+  flex:0 1 var(--settings-model-width);width:var(--settings-model-width)
 }
 .appearance-screen .instance-model-default-effort{width:var(--settings-effort-width)}
 .appearance-screen .instance-settings-target .select-trigger,
@@ -2141,7 +2168,7 @@ body{font-weight:var(--ui-font-weight,400)}
   }
 }
 @media(max-width:760px){
-  :is(.appearance-screen,.prompt-optimization-settings){
+  :is(.appearance-screen,.prompt-optimization-settings,.settings-prompt-dialog){
     --settings-control-min-width:60px;--settings-control-padding:5px;--settings-select-gap:4px
   }
   .appearance-screen input[type=number]:not([placeholder]){--settings-input-width:80px}

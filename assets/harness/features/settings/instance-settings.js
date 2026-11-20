@@ -96,7 +96,8 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
   const scope = privateInputScope(session);
   let disposed = false, selected = "", record = null, detecting = false, loading = false, saving = false, needsRead = false;
   let pendingModelFocus = null, recordIdentity = "", promptEditor = null;
-  let generation = 0, message = "", externalRefresh = false;
+  let generation = 0, message = "", externalRefresh = false, inventoryQuery = "";
+  const inventoryControls = new Set();
   const alive = () => !disposed && page.isConnected && scope === privateInputScope(session);
   // 过期缓存后台核对时可继续编辑；已知跨端变化或服务、CLI 身份变化后，旧记录只供查看。
   const writable = () => alive() && connected && session && !session.readOnly && !record?.readOnly
@@ -309,11 +310,50 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     }
     if (inventory.message) content.append(element("p", "appearance-hint", inventory.message));
     const rows = Array.isArray(inventory.data) ? inventory.data : [];
+    if (name === "skills" || name === "mcp") {
+      // 用户要求参考 Codex App：Skills 和 MCP 列表提供本地搜索，按已读取的目录字段筛选，
+      // 不改变后端目录、实例配置或开关状态；搜索框统一 240px，清空后保留焦点。
+      const label = name === "mcp" ? "MCP 服务" : "Skill";
+      const searchControl = element("div", "instance-settings-search-control");
+      const search = element("input", "instance-settings-search");
+      search.type = "search"; search.placeholder = `搜索${label}`; search.autocomplete = "off";
+      search.setAttribute("aria-label", `搜索${label}`); search.value = inventoryQuery;
+      const clear = button("", `清除${label}搜索`, () => {
+        inventoryQuery = ""; search.value = ""; renderRows();
+        search.focus({ preventScroll: true });
+      }, "icon-button instance-settings-search-clear");
+      clear.append(icon("close")); clear.hidden = search.value.length === 0;
+      searchControl.append(search, clear); content.append(searchControl);
+      const card = section(content, `所选实例的 ${sections[name]}`);
+      const list = element("div", "instance-settings-inventory-list");
+      card.append(list);
+      const renderRows = () => {
+        for (const control of inventoryControls) controls.delete(control);
+        inventoryControls.clear(); list.replaceChildren();
+        const query = inventoryQuery.trim().toLocaleLowerCase();
+        const filtered = rows.filter(value => !query || [
+          value.name, value.id, value.path, value.transport, value.description
+        ].filter(Boolean).join(" ").toLocaleLowerCase().includes(query));
+        if (!filtered.length) {
+          list.append(element("p", "appearance-hint instance-settings-inventory-empty",
+            rows.length ? "没有匹配的结果。" : inventory.error || `所选实例尚未返回${sections[name]}。`));
+          return;
+        }
+        appendInventoryRows(list, filtered);
+      };
+      const updateClear = () => { clear.hidden = search.value.length === 0; };
+      search.oninput = () => { inventoryQuery = search.value; updateClear(); renderRows(); };
+      renderRows();
+      return;
+    }
     if (!rows.length) {
       content.append(element("p", "appearance-hint", inventory.error || `所选实例尚未返回${sections[name]}。`));
       return;
     }
     const card = section(content, `所选实例的 ${sections[name]}`);
+    appendInventoryRows(card, rows);
+  }
+  function appendInventoryRows(card, rows) {
     for (const value of rows) {
       const row = element("div", "appearance-field");
       const codexMcp = name === "mcp" && record.backend === "codex";
@@ -321,10 +361,9 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
       // 用户要求 Codex MCP 读取后显示开/关；原生缺省值只用于展示，不能在读取时写成显式配置或当作连接状态。
       const enabled = codexMcp && inherited ? value.defaultEnabled : value.enabled;
       const state = typeof enabled === "boolean" ? enabled ? "已开启" : "已关闭" : "使用原生默认";
-      const description = [value.description || value.transport,
-        inherited && value.canToggle === true
-          ? `使用原生默认${codexMcp && typeof enabled === "boolean" ? `（${state}）` : ""}；切换后保存所选状态。` : ""]
-        .filter(Boolean).join(" · ");
+      // 用户要求参考 Codex App：MCP 列表只保留传输类型等必要信息，状态统一放在右侧文字和开关中，
+      // 不在每行重复显示“使用原生默认（已开启）”或“切换后保存所选状态”。
+      const description = value.description || value.transport || "";
       row.append(fieldCopy(value.name || value.id || value.path, description));
       if (value.canToggle === true) {
         const control = switchControl(value.name || value.id, enabled);
@@ -333,11 +372,13 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
           if (record === owner && selected === ownerId && control.isConnected)
             void save({ [name === "skills" ? "skill" : "server"]: { id: value.id, enabled: control.checked } });
         };
-        controls.add(control);
+        controls.add(control); inventoryControls.add(control);
         if (codexMcp) {
           const group = element("span", "instance-mcp-toggle-state");
           group.append(element("span", "muted", state), control); row.append(group);
         } else row.append(control);
+      } else if (value.readOnlyReason) {
+        row.append(element("span", "muted", value.readOnlyReason));
       } else if (typeof value.enabled === "boolean") {
         row.append(element("span", "muted", value.enabled ? "已开启" : "已关闭"));
       } else if (inherited) {
@@ -437,7 +478,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     }
   }
   function render() {
-    content.replaceChildren(); controls.clear(); promptControls.clear();
+    content.replaceChildren(); controls.clear(); inventoryControls.clear(); promptControls.clear();
     if (record) {
       if (name === "general") {
         // 合并页面只读取当前实例的一份设置；旧服务未返回模型目录时仍可显示已有常规配置。
