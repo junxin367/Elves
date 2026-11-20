@@ -2,7 +2,7 @@
 use serde_json::{Value, json};
 
 use super::store::{Data, Deletion};
-use super::{ApiError, CodexHarness, error};
+use super::{ApiError, CodexHarness, error, terminal_failure_from_projection};
 use crate::{HarnessAuthorization, Receipt};
 
 fn side_executing(projection: &super::projection::Projection, parent: &str, id: &str) -> bool {
@@ -18,23 +18,6 @@ fn side_executing(projection: &super::projection::Projection, parent: &str, id: 
             status.as_str().or_else(|| status["type"].as_str()),
             Some("active" | "inProgress" | "running" | "waiting")
         )
-}
-
-fn terminal_failure_from_projection(projection: &super::projection::Projection, id: &str) -> bool {
-    let Some(thread) = projection.threads.get(id) else {
-        return false;
-    };
-    let failed = matches!(
-        thread["lastTurnOutcome"]["status"].as_str(),
-        Some("failed" | "rateLimit")
-    ) || matches!(
-        thread["lastTurnOutcome"]["kind"].as_str(),
-        Some("failed" | "rateLimit")
-    );
-    failed
-        && !projection.active.contains_key(id)
-        && !projection.compactions.contains_key(id)
-        && projection.requests_for(id).is_empty()
 }
 
 impl CodexHarness {

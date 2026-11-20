@@ -374,15 +374,10 @@ impl CodexHarness {
             // 已有会话但原生连接已断开时，状态未知，不能让安装流程强制结束后台。
             return false;
         }
-        let threads_safe = projection.threads.values().all(|thread| {
-            let status = thread["status"]
-                .as_str()
-                .or_else(|| thread["status"]["type"].as_str());
-            !matches!(
-                status,
-                Some("active" | "inProgress" | "running" | "waiting" | "unknown")
-            ) && thread["requests"].as_array().is_none_or(Vec::is_empty)
-        });
+        let threads_safe = projection
+            .threads
+            .values()
+            .all(|thread| !native_thread_is_busy(thread));
         let projection_safe = projection.active.is_empty()
             && projection.requests.is_empty()
             && projection.compactions.is_empty()
@@ -398,6 +393,17 @@ impl CodexHarness {
     }
 
     async fn native_threads_idle(&self) -> bool {
+        // 上游失败已通过事件投影确认终态时，原生列表偶尔仍返回 unknown；
+        // 只对同一会话且没有活动/压缩/待处理请求的失败轮次放行，其他 unknown 继续阻止退出。
+        let terminal_failure_ids = {
+            let projection = self.projection.lock().await;
+            projection
+                .threads
+                .keys()
+                .filter(|id| terminal_failure_from_projection(&projection, id))
+                .cloned()
+                .collect::<HashSet<_>>()
+        };
         for (method, base_params) in [
             ("thread/list", json!({"limit":100,"archived":false})),
             ("thread/loaded/list", json!({"limit":100})),
@@ -413,12 +419,18 @@ impl CodexHarness {
                     return false;
                 };
                 for row in rows {
+                    let row_id = row
+                        .as_str()
+                        .or_else(|| row["id"].as_str())
+                        .or_else(|| row["threadId"].as_str());
                     if row["status"].is_object()
                         || row["status"].is_string()
                         || row["nativeStatus"].is_object()
                         || row["nativeStatus"].is_string()
                     {
-                        if native_thread_is_busy(row) {
+                        if native_thread_is_busy(row)
+                            && !row_id.is_some_and(|id| terminal_failure_ids.contains(id))
+                        {
                             return false;
                         }
                         continue;
@@ -442,7 +454,9 @@ impl CodexHarness {
                         Ok(thread) => thread,
                         Err(_) => return false,
                     };
-                    if native_thread_is_busy(&thread["thread"]) {
+                    if native_thread_is_busy(&thread["thread"])
+                        && !terminal_failure_ids.contains(id)
+                    {
                         return false;
                     }
                 }
@@ -956,15 +970,38 @@ impl CodexHarness {
     }
 }
 
+pub(super) fn terminal_failure_outcome(thread: &Value) -> bool {
+    matches!(
+        thread["lastTurnOutcome"]["status"].as_str(),
+        Some("failed" | "rateLimit")
+    ) || matches!(
+        thread["lastTurnOutcome"]["kind"].as_str(),
+        Some("failed" | "rateLimit")
+    )
+}
+
+fn terminal_failure_from_projection(projection: &Projection, id: &str) -> bool {
+    let Some(thread) = projection.threads.get(id) else {
+        return false;
+    };
+    terminal_failure_outcome(thread)
+        && !projection.active.contains_key(id)
+        && !projection.compactions.contains_key(id)
+        && projection.requests_for(id).is_empty()
+}
+
 fn native_thread_is_busy(thread: &Value) -> bool {
     let status = thread
         .get("status")
         .or_else(|| thread.get("nativeStatus"))
         .and_then(|status| status.as_str().or_else(|| status["type"].as_str()));
-    if !matches!(
-        status,
-        Some("idle" | "notLoaded" | "completed" | "failed" | "interrupted" | "stopped")
-    ) {
+    let terminal_failure = status == Some("unknown") && terminal_failure_outcome(thread);
+    if !terminal_failure
+        && !matches!(
+            status,
+            Some("idle" | "notLoaded" | "completed" | "failed" | "interrupted" | "stopped")
+        )
+    {
         return true;
     }
     thread["requests"]
@@ -1028,6 +1065,19 @@ mod tests {
         assert!(native_thread_is_busy(&json!({"status":{"type":"active"}})));
         assert!(native_thread_is_busy(&json!({"status":{"type":"waiting"}})));
         assert!(native_thread_is_busy(&json!({"status":{"type":"idle"},"requests":[{"id":1}]})));
+        assert!(!native_thread_is_busy(&json!({
+            "status":{"type":"unknown"},
+            "lastTurnOutcome":{"status":"failed"}
+        })));
+        assert!(native_thread_is_busy(&json!({
+            "status":{"type":"unknown"},
+            "lastTurnOutcome":{"status":"completed"}
+        })));
+        assert!(native_thread_is_busy(&json!({
+            "status":{"type":"unknown"},
+            "lastTurnOutcome":{"status":"failed"},
+            "requests":[{"id":1}]
+        })));
         assert!(native_thread_is_busy(&json!({})));
     }
 

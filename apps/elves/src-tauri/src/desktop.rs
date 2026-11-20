@@ -1312,6 +1312,14 @@ fn quit_app(app: &tauri::AppHandle) {
                 app.state::<ClientState>()
                     .exiting
                     .store(false, Ordering::SeqCst);
+                // 退出失败不能静默回到托盘；把安全关停原因交给原生弹窗，用户可等待任务结束后重试。
+                let dialog_app = app.clone();
+                let message = format!("无法退出 Elves：{error:#}\n\n请等待当前任务完成后再从托盘退出。");
+                let _ = app.run_on_main_thread(move || {
+                    if let Some(window) = dialog_app.get_window(WINDOW_LABEL) {
+                        report_native_error(&window, &message);
+                    }
+                });
                 return;
             }
             app.exit(0);
