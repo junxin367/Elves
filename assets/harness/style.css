@@ -941,8 +941,10 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .turn-plan-block>summary::-webkit-details-marker{display:none}
 .turn-plan-block>summary:focus-visible{outline:1px solid var(--focus-ring);outline-offset:-2px}
 .turn-plan-block>summary:hover{color:var(--text)}
-.turn-plan-chevron{width:14px;height:14px;margin-left:auto;transition:transform var(--duration-control)}
+.turn-plan-chevron{width:14px;height:14px;transition:transform var(--duration-control)}
 .turn-plan-block[open] .turn-plan-chevron{transform:rotate(180deg)}
+/* 用户要求任务列表较长时限制明细区高度并内部滚动；短列表保持原有自然高度，标题行始终可见。 */
+.turn-plan-block>.turn-plan{max-height:min(30dvh,240px);overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin}
 .send-button[data-action=stop] .ui-icon{width:18px;height:18px}
 /* 240% 背景从 150% 移至 -50%，亮带仍从左向右扫过，重置时两端都是 muted 底色。 */
 @keyframes working-shimmer{from{background-position:150% 0}to{background-position:-50% 0}}
