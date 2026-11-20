@@ -12,10 +12,7 @@ fn catalog_key(config: &WslConfig, cwd: &str) -> String {
 }
 
 fn skill_scope(skill: &Value) -> String {
-    if skill["scope"] == "plugin"
-        || skill["source"] == "plugin"
-        || skill["plugin"].is_object()
-    {
+    if skill["scope"] == "plugin" || skill["source"] == "plugin" || skill["plugin"].is_object() {
         "plugin".into()
     } else if skill["builtin"] == true {
         "bundled".into()
