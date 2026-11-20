@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use std::fs::{self, File};
 use std::sync::OnceLock;
 use std::time::Duration;
+use tauri::Manager;
 
 static COMMAND_SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
@@ -204,15 +205,10 @@ pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![manager_command, ensure_proxy_service])
         .setup(|app| {
-            let window = tauri::WebviewWindowBuilder::new(
-                app,
-                "main",
-                tauri::WebviewUrl::App("index.html".into()),
-            )
-            .title("Elves 代理管理器")
-            .inner_size(1180.0, 820.0)
-            .min_inner_size(900.0, 640.0)
-            .build()?;
+            // Tauri 配置已声明 main 窗口；启动钩子只能复用它，不能再次创建同一 label。
+            let window = app
+                .get_webview_window("main")
+                .ok_or(tauri::Error::WindowNotFound)?;
             window.show()?;
             window.set_focus()?;
             Ok(())
