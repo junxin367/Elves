@@ -1726,6 +1726,16 @@ impl Claude {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if shared_catalog.is_some() {
+            // 共享 Claude 会话属于可交接的 native job：升级时不随 Harness 进程退出，
+            // 新版本通过已保存 nativeId/nativeJobId 重新 attach；普通 stdio 会话仍沿用原有回收语义。
+            command.kill_on_drop(false);
+            #[cfg(windows)]
+            command.creation_flags(
+                crate::windows_integration::CREATE_NO_WINDOW
+                    | crate::windows_integration::CREATE_BREAKAWAY_FROM_JOB,
+            );
+        }
         let mut child = command
             .spawn()
             .context("无法启动指定 WSL 中的 Claude CLI")?;

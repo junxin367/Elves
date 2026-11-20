@@ -73,6 +73,64 @@ fn client_process_running() -> bool {
     }
 }
 
+fn descendant_process_running(parent_process_id: u32, executable: &str) -> bool {
+    #[cfg(windows)]
+    {
+        let processes = elves_core::windows_integration::enumerate_processes();
+        let mut parents = std::collections::HashSet::from([parent_process_id]);
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for process in &processes {
+                if !parents.contains(&process.parent_process_id) {
+                    continue;
+                }
+                if process.exe_file.eq_ignore_ascii_case(executable) {
+                    return true;
+                }
+                if parents.insert(process.process_id) {
+                    changed = true;
+                }
+            }
+        }
+        false
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (parent_process_id, executable);
+        false
+    }
+}
+
+fn claude_execution_active(directory: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(directory.join("remote-claude-sessions.json")) else {
+        return false;
+    };
+    let Ok(saved) = serde_json::from_slice::<Value>(&bytes) else {
+        return true;
+    };
+    saved["conversations"]
+        .as_object()
+        .into_iter()
+        .flat_map(|conversations| conversations.values())
+        .filter(|conversation| conversation["shared"] == true && conversation["deleted"] != true)
+        .any(|conversation| {
+            matches!(
+                conversation["nativeStatus"]["tempo"].as_str(),
+                Some("active" | "blocked")
+            ) || conversation["nativeStatus"]["sessionStatus"] == "waiting"
+                || conversation["turns"]
+                    .as_array()
+                    .and_then(|turns| turns.last())
+                    .is_some_and(|turn| {
+                        matches!(
+                            turn["status"].as_str(),
+                            Some("pending" | "inProgress" | "unknown")
+                        )
+                    })
+        })
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Endpoint {
@@ -138,6 +196,13 @@ fn load_endpoint(directory: &Path) -> anyhow::Result<Option<Endpoint>> {
 }
 
 async fn endpoint_is_active(endpoint: &Endpoint) -> anyhow::Result<bool> {
+    Ok(endpoint_health(endpoint).await?.is_some_and(|value| {
+        value["protocolVersion"] == endpoint.protocol_version
+            && value["processId"] == endpoint.process_id
+    }))
+}
+
+async fn endpoint_health(endpoint: &Endpoint) -> anyhow::Result<Option<Value>> {
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(1))
@@ -148,16 +213,12 @@ async fn endpoint_is_active(endpoint: &Endpoint) -> anyhow::Result<bool> {
         .send()
         .await
     else {
-        return Ok(false);
+        return Ok(None);
     };
     if !response.status().is_success() {
-        return Ok(false);
+        return Ok(None);
     }
-    let Ok(value) = response.json::<Value>().await else {
-        return Ok(false);
-    };
-    Ok(value["protocolVersion"] == endpoint.protocol_version
-        && value["processId"] == endpoint.process_id)
+    Ok(response.json::<Value>().await.ok())
 }
 
 async fn active_endpoint(directory: &Path) -> anyhow::Result<Option<Endpoint>> {
@@ -330,7 +391,11 @@ async fn request(endpoint: &Endpoint, action: &str, payload: &Value) -> anyhow::
 
 pub async fn prepare_shutdown_status(reason: &str) -> anyhow::Result<Value> {
     let directory = crate::paths::default_app_state_dir();
-    super::claude::remember_shutdown(&directory, reason)?;
+    // 安装 handoff 不登记 Claude 回收意图；新 Harness 会按 native job 重新 attach。
+    // 普通退出仍保留原有回收记录，空闲会话可安全停止，未知状态继续补偿。
+    if reason != "installer" {
+        super::claude::remember_shutdown(&directory, reason)?;
+    }
     let Some(endpoint) = load_endpoint_any(&directory)? else {
         if client_process_running() {
             // 端点缺失但仍有客户端进程时，状态无法确认；禁止安装器继续强制结束进程。
@@ -344,6 +409,20 @@ pub async fn prepare_shutdown_status(reason: &str) -> anyhow::Result<Value> {
             anyhow::bail!("Elves 后台端点已失效且仍有客户端进程运行，请先退出 Elves 后重试");
         }
         return Ok(json!({"status":"not_running","cleanup":"pending_startup_check"}));
+    }
+    if reason == "installer"
+        && !endpoint_health(&endpoint)
+            .await?
+            .is_some_and(|value| value["buildId"] == crate::assets::DIAGNOSTIC_BUILD_ID)
+        && (descendant_process_running(endpoint.process_id, "codex.exe")
+            || claude_execution_active(&directory))
+    {
+        // 首次从旧直连 stdio 版本升级时不能伪造无损接管；检测到旧 Harness 仍持有 Codex 时必须中止。
+        return Ok(json!({
+            "status":"handoff_unavailable",
+            "message":"当前 Harness 版本不支持执行中无损升级交接，请等待任务完成后重试安装",
+            "cleanup":{"complete":false,"pendingStartupCheck":false}
+        }));
     }
     if endpoint.protocol_version < 9 {
         // 安装包用新 helper 请求旧服务时不恢复旧桥接；旧版无法响应的清理保留到新服务启动。
@@ -417,9 +496,10 @@ async fn admin(
         return Err(StatusCode::NOT_FOUND);
     }
     if action == "prepareShutdown" {
+        let reason = payload["reason"].as_str().unwrap_or("client_exit");
         let mut response = match tokio::time::timeout(
             SHUTDOWN_TIMEOUT,
-            super::prepare_controller_shutdown(),
+            super::prepare_controller_shutdown(reason),
         )
         .await
         {
@@ -508,8 +588,8 @@ fn remote_service_job(
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-        SetInformationJobObject,
+        JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
     };
     use windows::core::PCWSTR;
 
@@ -517,7 +597,9 @@ fn remote_service_job(
         .context("无法创建Harness 后台生命周期保护")?;
     let job = unsafe { OwnedHandle::from_raw_handle(handle.0) };
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // Harness 退出时只回收自身与 proxy；持久 app-server daemon 允许静默脱离 Job。
+    limits.BasicLimitInformation.LimitFlags =
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
     unsafe {
         SetInformationJobObject(
             handle,
@@ -542,6 +624,35 @@ mod tests {
         for status in ["busy", "closing", "legacy_service", "failed"] {
             assert!(!shutdown_response_is_safe(&json!({"status":status})));
         }
+    }
+
+    #[test]
+    fn claude_execution_active_distinguishes_idle_and_running_sessions() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("remote-claude-sessions.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "conversations": {
+                    "idle": {"shared":true,"deleted":false,"nativeStatus":{"tempo":"idle"},"turns":[]},
+                    "running": {"shared":true,"deleted":false,"nativeStatus":{"tempo":"active"},"turns":[]}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(claude_execution_active(directory.path()));
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "conversations": {
+                    "idle": {"shared":true,"deleted":false,"nativeStatus":{"tempo":"idle"},"turns":[]}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(!claude_execution_active(directory.path()));
     }
 
     #[tokio::test]

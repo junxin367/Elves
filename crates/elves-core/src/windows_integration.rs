@@ -46,6 +46,8 @@ use windows::core::{Interface, PCWSTR, PWSTR};
 
 #[cfg(windows)]
 pub const CREATE_NO_WINDOW: u32 = 0x08000000;
+// 持久 Codex daemon 必须脱离 Harness 的 Job；proxy 仍留在 Job 内，随 Harness 一起回收。
+pub const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
 // DETACHED_PROCESS makes Windows ignore CREATE_NO_WINDOW. A detached shell can
 // then create a visible console when it starts the actual CLI process.
 pub const HIDDEN_PROCESS_FLAGS: u32 = CREATE_NO_WINDOW;

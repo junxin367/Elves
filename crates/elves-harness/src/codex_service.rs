@@ -13,6 +13,10 @@ use tokio::sync::mpsc;
 use crate::service_transport::{self, WriteFrame};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(20);
+const DAEMON_SOCKET_DIR: &str = "app-server-control";
+const DAEMON_SOCKET_FILE: &str = "app-server-control.sock";
+const DAEMON_MANIFEST_FILE: &str = "elves-codex-daemon.json";
 
 pub trait ServiceDispatchPermit: Send {
     fn commit(
@@ -100,7 +104,8 @@ async fn spawn_candidate(
     candidate: &Candidate,
     codex_home: &Path,
 ) -> anyhow::Result<RunningService> {
-    let mut command = candidate_command(candidate);
+    let socket = ensure_daemon(candidate, codex_home).await?;
+    let mut command = proxy_command(candidate, &socket);
     // 用户要求服务模式独立于 Codex App；为 app-server 及其命令子进程注入 Elves 自带工具，
     // 只修改子进程环境，不写入用户或系统 PATH。
     let tool_runtime = crate::tool_runtime::apply_to_command(&mut command);
@@ -119,6 +124,7 @@ async fn spawn_candidate(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // Harness 只拥有 proxy；原生 app-server daemon 独立存活，升级时不能随 proxy 一起终止。
         .kill_on_drop(true);
 
     let mut child = command
@@ -159,13 +165,96 @@ async fn spawn_candidate(
     })
 }
 
-fn candidate_command(candidate: &Candidate) -> Command {
+async fn ensure_daemon(candidate: &Candidate, codex_home: &Path) -> anyhow::Result<PathBuf> {
+    let socket = codex_home.join(DAEMON_SOCKET_DIR).join(DAEMON_SOCKET_FILE);
+    let manifest_path = codex_home.join(DAEMON_MANIFEST_FILE);
+    let expected_version = candidate
+        .version
+        .as_ref()
+        .map(|version| version.raw.clone())
+        .context("无法确认 Codex CLI 版本，拒绝接管持久服务")?;
+    let expected_path = candidate.path.to_string_lossy().to_string();
+    if socket.is_file() {
+        let manifest: Value = serde_json::from_slice(
+            &std::fs::read(&manifest_path).with_context(|| {
+                format!("无法读取 Codex 持久服务代次：{}", manifest_path.display())
+            })?,
+        )
+        .context("Codex 持久服务代次格式无效")?;
+        anyhow::ensure!(
+            manifest["cliPath"] == expected_path
+                && manifest["cliVersion"] == expected_version,
+            "Codex 持久服务版本或路径不匹配，拒绝复用旧服务"
+        );
+        return Ok(socket);
+    }
+    let mut command = command_with_args(candidate, ["app-server", "daemon", "start"]);
+    #[cfg(windows)]
+    command.creation_flags(
+        crate::windows_integration::CREATE_NO_WINDOW
+            | crate::windows_integration::CREATE_BREAKAWAY_FROM_JOB,
+    );
+    command
+        .env("CODEX_HOME", codex_home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(DAEMON_START_TIMEOUT, command.output())
+        .await
+        .context("启动 Codex 持久服务超时")?
+        .context("启动 Codex 持久服务失败")?;
+    if !output.status.success() && !socket.is_file() {
+        bail!(
+            "Codex 持久服务启动失败（{}）：{}",
+            output.status,
+            truncate_error(&String::from_utf8_lossy(&output.stderr))
+        );
+    }
+    let deadline = tokio::time::Instant::now() + DAEMON_START_TIMEOUT;
+    while tokio::time::Instant::now() < deadline {
+        if socket.is_file() {
+            crate::settings::atomic_write(
+                &manifest_path,
+                &serde_json::to_vec(&json!({
+                    "cliPath": expected_path,
+                    "cliVersion": expected_version,
+                    "socket": socket,
+                    "createdAtMs": crate::now_ms()
+                }))?,
+            )?;
+            return Ok(socket);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    bail!("Codex 持久服务未创建控制套接字：{}", socket.display())
+}
+
+fn proxy_command(candidate: &Candidate, socket: &Path) -> Command {
+    command_with_args(
+        candidate,
+        [
+            "app-server",
+            "proxy",
+            "--sock",
+            socket.to_string_lossy().as_ref(),
+        ],
+    )
+}
+
+fn command_with_args<const N: usize>(
+    candidate: &Candidate,
+    args: [&str; N],
+) -> Command {
     #[cfg(not(windows))]
     if candidate.shell {
-        let command_line = format!(
-            "\"{}\" app-server --analytics-default-enabled",
-            candidate.path.display()
-        );
+        let command_line = std::iter::once(format!("\"{}\"", candidate.path.display()))
+            .chain(
+                args.iter()
+                    .map(|arg| format!("\"{}\"", arg.replace('"', "\\\""))),
+            )
+            .collect::<Vec<_>>()
+            .join(" ");
         let mut command = Command::new("sh");
         command.args(["-lc", &command_line]);
         return command;
@@ -174,10 +263,15 @@ fn candidate_command(candidate: &Candidate) -> Command {
     // Rust invokes .cmd/.bat through cmd.exe with the required quoting. Building
     // a cmd /c string with ordinary args escapes its quotes as literal backslashes.
     let mut command = Command::new(&candidate.path);
-    command.args(["app-server", "--analytics-default-enabled"]);
+    command.args(args);
     #[cfg(windows)]
     command.creation_flags(crate::windows_create_hidden_process());
     command
+}
+
+#[cfg(test)]
+fn candidate_command(candidate: &Candidate) -> Command {
+    command_with_args(candidate, ["app-server", "--analytics-default-enabled"])
 }
 
 async fn discover_candidates() -> Vec<Candidate> {

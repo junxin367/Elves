@@ -509,6 +509,8 @@ pub struct HarnessController {
     running: AtomicBool,
     closing: AtomicBool,
     shutdown_complete: AtomicBool,
+    // 安装升级时只关闭 Harness 自身；Codex daemon 与 Claude native job 由新 Harness 重接。
+    preserve_execution_on_shutdown: AtomicBool,
     shutdown_serial: Mutex<()>,
     events: broadcast::Sender<Value>,
     key_checks: Arc<tokio::sync::Semaphore>,
@@ -613,6 +615,7 @@ impl HarnessController {
             running: AtomicBool::new(false),
             closing: AtomicBool::new(false),
             shutdown_complete: AtomicBool::new(false),
+            preserve_execution_on_shutdown: AtomicBool::new(false),
             shutdown_serial: Mutex::new(()),
             events,
             key_checks: Arc::new(tokio::sync::Semaphore::new(4)),
@@ -975,6 +978,39 @@ impl HarnessController {
         }
         let _ = self.save_devices(&auth).await;
         self.publish_event(json!({"method":"remote/authorizationChanged"}));
+    }
+
+    pub async fn detach_for_upgrade(self: &Arc<Self>) {
+        // 安装升级只撤下 Harness 入口和公网监听；Codex daemon 与 Claude native job 不走 release，
+        // 由新版本启动后的 reconnect/daemon proxy 重新接管，避免中断执行中的任务。
+        self.desktop_running.store(false, Ordering::Release);
+        self.harness.enabled.store(false, Ordering::Release);
+        self.claude.set_reconnect_enabled(false);
+        self.stop_desktop().await;
+        self.publish_access_policy(&RemoteAccessSettings::default());
+        self.harness_connected.store(false, Ordering::Release);
+        self.publish_event(json!({"method":"remote/disconnected"}));
+
+        let mut live = self.live.lock().await;
+        self.stop_frp(&mut live).await;
+        if let Some(handle) = live.handle.take() {
+            handle.shutdown();
+        }
+        if let Some(task) = live.server.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Some(task) = live.pump.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        live.ngrok.stop().await;
+        live.zrok.reconcile(false, "").await;
+        live.settings = Some(RemoteAccessSettings::default());
+        live.error = None;
+        self.running.store(false, Ordering::Release);
+        drop(live);
+        let _ = self.claude.record_clean_exit();
     }
 
     pub async fn reconcile(self: &Arc<Self>, mut settings: RemoteAccessSettings) {
@@ -2654,7 +2690,14 @@ pub fn start_monitor() -> anyhow::Result<HarnessRuntime> {
                 _ = tokio::time::sleep(Duration::from_secs(2)) => {}
             }
         }
-        controller.reconcile(RemoteAccessSettings::default()).await;
+        if controller
+            .preserve_execution_on_shutdown
+            .load(Ordering::Acquire)
+        {
+            controller.detach_for_upgrade().await;
+        } else {
+            controller.reconcile(RemoteAccessSettings::default()).await;
+        }
     });
     Ok(HarnessRuntime { shutdown, task })
 }
@@ -2672,7 +2715,7 @@ pub async fn admin_request(action: &str, payload: Value) -> Value {
     result.unwrap_or_else(|error| json!({"status":"failed","message":error.to_string()}))
 }
 
-async fn prepare_controller_shutdown() -> Value {
+async fn prepare_controller_shutdown(reason: &str) -> Value {
     let Some(controller) = CONTROLLER.get() else {
         return json!({"status":"stopped","cleanup":{"complete":true}});
     };
@@ -2681,13 +2724,18 @@ async fn prepare_controller_shutdown() -> Value {
         return json!({"status":"stopped","cleanup":controller.claude.cleanup_report()});
     }
 
-    // 用户要求安装或退出时不能中断执行中的 Codex；先锁住新派发，再核对当前轮次、队列、审批、压缩和未知状态。
+    let preserve_execution = reason == "installer";
+    controller
+        .preserve_execution_on_shutdown
+        .store(preserve_execution, Ordering::Release);
+    // 安装升级走 handoff：只关闭 Harness 入口，保留 Codex daemon 与 Claude native job；
+    // 普通退出仍要求确认空闲后再回收，避免把用户主动退出误当作升级接管。
     controller.closing.store(true, Ordering::Release);
     let was_harness_enabled = controller
         .harness
         .enabled
         .swap(false, Ordering::AcqRel);
-    if !controller.harness.idle().await {
+    if !preserve_execution && !controller.harness.idle().await {
         let _ = crate::diagnostic_log::append_diagnostic_log(
             "harness.shutdown_blocked",
             json!({"reason":"codex_active_or_unknown"}),
@@ -2702,6 +2750,22 @@ async fn prepare_controller_shutdown() -> Value {
             "reason":"codex_active",
             "message":"Codex 仍在执行或状态尚未确认，未停止 Elves；请等待任务完成后再重试。",
             "cleanup":{"complete":false,"pendingStartupCheck":false}
+        });
+    }
+    if preserve_execution {
+        controller.stop_desktop().await;
+        controller.publish_access_policy(&RemoteAccessSettings::default());
+        controller.claude.set_reconnect_enabled(false);
+        let _ = controller.claude.record_clean_exit();
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "harness.shutdown_handoff_confirmed",
+            json!({"reason":"installer","preserveExecution":true}),
+        );
+        controller.shutdown_complete.store(true, Ordering::Release);
+        return json!({
+            "status":"stopped",
+            "handoff":"preserve_execution",
+            "cleanup":controller.claude.cleanup_report()
         });
     }
     let _ = crate::diagnostic_log::append_diagnostic_log(
