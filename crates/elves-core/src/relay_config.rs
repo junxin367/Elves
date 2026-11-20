@@ -1039,7 +1039,7 @@ fn relay_profile_test_protocols(
 
     let primary = crate::settings::infer_relay_protocol_for_model(model);
     let mut protocols = vec![primary];
-    if primary != RelayProtocol::ChatCompletions {
+    if primary != RelayProtocol::ChatCompletions && primary != RelayProtocol::Gemini {
         protocols.push(RelayProtocol::ChatCompletions);
     }
     Ok(protocols)
@@ -1058,13 +1058,18 @@ async fn send_relay_profile_test_attempt(
         RelayProtocol::Responses => format!("{base_url}/responses"),
         RelayProtocol::ChatCompletions => format!("{base_url}/chat/completions"),
         RelayProtocol::Anthropic => format!("{base_url}/messages"),
+        RelayProtocol::Gemini => crate::protocol_proxy::gemini_interactions_url(base_url),
     };
     let payload =
         relay_profile_test_payload(protocol, test_model, test_prompt, measure_first_token);
     let request_body =
         serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
     let started_at = Instant::now();
-    let response = relay_profile_test_request(client.post(&endpoint), protocol, api_key)
+    let mut endpoint_request = client.post(&endpoint);
+    if protocol == RelayProtocol::Gemini && measure_first_token {
+        endpoint_request = endpoint_request.query(&[("alt", "sse")]);
+    }
+    let response = relay_profile_test_request(endpoint_request, protocol, api_key)
         .json(&payload)
         .send()
         .await?;
@@ -1079,8 +1084,13 @@ async fn send_relay_profile_test_attempt(
             RelayProtocol::Responses => format!("{v1_url}/responses"),
             RelayProtocol::ChatCompletions => format!("{v1_url}/chat/completions"),
             RelayProtocol::Anthropic => format!("{v1_url}/messages"),
+            RelayProtocol::Gemini => crate::protocol_proxy::gemini_interactions_url(&v1_url),
         };
-        let v1_response = relay_profile_test_request(client.post(&v1_endpoint), protocol, api_key)
+        let mut v1_request = client.post(&v1_endpoint);
+        if protocol == RelayProtocol::Gemini && measure_first_token {
+            v1_request = v1_request.query(&[("alt", "sse")]);
+        }
+        let v1_response = relay_profile_test_request(v1_request, protocol, api_key)
             .json(&payload)
             .send()
             .await?;
@@ -1253,6 +1263,23 @@ fn relay_profile_test_value_has_content(protocol: RelayProtocol, value: &Value) 
                         content.iter().any(|part| non_empty_text(part.get("text")))
                     })
         }
+        RelayProtocol::Gemini => {
+            non_empty_text(value.pointer("/delta/text"))
+                || non_empty_text(value.pointer("/delta/arguments"))
+                || value
+                    .get("steps")
+                    .and_then(Value::as_array)
+                    .is_some_and(|steps| {
+                        steps.iter().any(|step| {
+                            step.get("content")
+                                .and_then(Value::as_array)
+                                .is_some_and(|content| {
+                                    content.iter().any(|part| non_empty_text(part.get("text")))
+                                })
+                                || step.get("type").and_then(Value::as_str) == Some("function_call")
+                        })
+                    })
+        }
     }
 }
 fn relay_profile_test_protocol_label(protocol: RelayProtocol) -> &'static str {
@@ -1260,6 +1287,7 @@ fn relay_profile_test_protocol_label(protocol: RelayProtocol) -> &'static str {
         RelayProtocol::Responses => "Responses API",
         RelayProtocol::ChatCompletions => "Chat Completions",
         RelayProtocol::Anthropic => "Anthropic",
+        RelayProtocol::Gemini => "Gemini Interactions",
     }
 }
 
@@ -1320,6 +1348,13 @@ fn relay_profile_test_payload(
             "max_tokens": output_limit
             ,"stream": stream
         }),
+        RelayProtocol::Gemini => serde_json::json!({
+            "model": model,
+            "input": [{ "type": "user_input", "content": [{ "type": "text", "text": test_prompt }] }],
+            "generation_config": { "max_output_tokens": output_limit },
+            "stream": stream,
+            "store": false
+        }),
     }
 }
 
@@ -1329,18 +1364,24 @@ fn relay_profile_test_request(
     api_key: &str,
 ) -> reqwest::RequestBuilder {
     let request = request.header(reqwest::header::CONTENT_TYPE, "application/json");
-    match protocol {
+    let request = match protocol {
         RelayProtocol::Anthropic => request
             .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01"),
+        RelayProtocol::Gemini => request.header("x-goog-api-key", api_key),
         RelayProtocol::Responses | RelayProtocol::ChatCompletions => request.bearer_auth(api_key),
+    };
+    if protocol == RelayProtocol::Gemini {
+        request.header("Api-Revision", "2026-05-20")
+    } else {
+        request
     }
 }
 
 fn codex_base_url_for_protocol(base_url: &str, protocol: RelayProtocol, proxy_port: u16) -> String {
     match protocol {
         RelayProtocol::Responses => base_url.to_string(),
-        RelayProtocol::ChatCompletions | RelayProtocol::Anthropic => {
+        RelayProtocol::ChatCompletions | RelayProtocol::Anthropic | RelayProtocol::Gemini => {
             crate::protocol_proxy::local_responses_proxy_base_url(proxy_port)
         }
     }
@@ -3043,6 +3084,10 @@ pub(crate) fn relay_profile_catalog_rows(
             RelayProtocol::Anthropic,
             crate::model_catalog::relay_profile_anthropic_model_ids(profile),
         ),
+        (
+            RelayProtocol::Gemini,
+            crate::model_catalog::relay_profile_gemini_model_ids(profile),
+        ),
     ] {
         for model in models {
             let model = model.trim().to_string();
@@ -3076,6 +3121,7 @@ fn upstream_response_protocol_for_relay(
             crate::protocol_proxy::UpstreamResponseProtocol::ChatCompletions
         }
         RelayProtocol::Anthropic => crate::protocol_proxy::UpstreamResponseProtocol::Anthropic,
+        RelayProtocol::Gemini => crate::protocol_proxy::UpstreamResponseProtocol::Gemini,
     }
 }
 
@@ -4714,6 +4760,7 @@ base_url = "http://127.0.0.1:45221/v1"
             RelayProtocol::Responses,
             RelayProtocol::ChatCompletions,
             RelayProtocol::Anthropic,
+            RelayProtocol::Gemini,
         ] {
             let payload = relay_profile_test_payload(protocol, "gpt-test", prompt, true);
             assert_eq!(payload["stream"], true);
@@ -4722,6 +4769,9 @@ base_url = "http://127.0.0.1:45221/v1"
                 RelayProtocol::ChatCompletions | RelayProtocol::Anthropic => {
                     payload["messages"][0]["content"].as_str().unwrap()
                 }
+                RelayProtocol::Gemini => {
+                    payload["input"][0]["content"][0]["text"].as_str().unwrap()
+                }
             };
             assert_eq!(content, prompt);
             let output_limit = match protocol {
@@ -4729,6 +4779,9 @@ base_url = "http://127.0.0.1:45221/v1"
                 RelayProtocol::ChatCompletions | RelayProtocol::Anthropic => {
                     payload["max_tokens"].as_u64().unwrap()
                 }
+                RelayProtocol::Gemini => payload["generation_config"]["max_output_tokens"]
+                    .as_u64()
+                    .unwrap(),
             };
             assert_eq!(output_limit, 8192);
             let connectivity = relay_profile_test_payload(
@@ -4746,6 +4799,10 @@ base_url = "http://127.0.0.1:45221/v1"
                 RelayProtocol::ChatCompletions | RelayProtocol::Anthropic => {
                     assert_eq!(connectivity["messages"][0]["content"], "hi");
                     assert_eq!(connectivity["max_tokens"], 16);
+                }
+                RelayProtocol::Gemini => {
+                    assert_eq!(connectivity["input"][0]["content"][0]["text"], "hi");
+                    assert_eq!(connectivity["generation_config"]["max_output_tokens"], 16);
                 }
             }
         }

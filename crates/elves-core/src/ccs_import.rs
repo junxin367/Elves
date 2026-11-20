@@ -88,7 +88,7 @@ pub fn relay_profile_from_ccs(
         protocol: provider.protocol,
         local_proxy_enabled: Some(matches!(
             provider.protocol,
-            RelayProtocol::ChatCompletions | RelayProtocol::Anthropic
+            RelayProtocol::ChatCompletions | RelayProtocol::Anthropic | RelayProtocol::Gemini
         )),
         relay_mode: RelayMode::PureApi,
         official_mix_api_key: false,
@@ -105,6 +105,7 @@ pub fn relay_profile_from_ccs(
         responses_model_list: String::new(),
         chat_completions_model_list: String::new(),
         anthropic_model_list: String::new(),
+        gemini_model_list: String::new(),
         responses_websocket: Default::default(),
         responses_websocket_enabled: None,
         user_agent: String::new(),
@@ -172,6 +173,9 @@ fn extract_api_key(config: &Value) -> Option<String> {
 
 fn extract_protocol(config: &Value) -> RelayProtocol {
     if let Some(api_format) = string_at(config, &["api_format", "apiFormat"]) {
+        if is_gemini_protocol(&api_format) {
+            return RelayProtocol::Gemini;
+        }
         if is_chat_protocol(&api_format) {
             return RelayProtocol::ChatCompletions;
         }
@@ -181,6 +185,9 @@ fn extract_protocol(config: &Value) -> RelayProtocol {
         .and_then(Value::as_str)
         .and_then(extract_toml_wire_api)
     {
+        if is_gemini_protocol(&wire_api) {
+            return RelayProtocol::Gemini;
+        }
         if is_chat_protocol(&wire_api) {
             return RelayProtocol::ChatCompletions;
         }
@@ -190,6 +197,12 @@ fn extract_protocol(config: &Value) -> RelayProtocol {
         .unwrap_or(false)
     {
         return RelayProtocol::ChatCompletions;
+    }
+    if extract_base_url(config)
+        .map(|value| value.to_ascii_lowercase().ends_with("/interactions"))
+        .unwrap_or(false)
+    {
+        return RelayProtocol::Gemini;
     }
     RelayProtocol::Responses
 }
@@ -230,6 +243,13 @@ fn is_chat_protocol(value: &str) -> bool {
     )
 }
 
+fn is_gemini_protocol(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "gemini" | "interactions" | "gemini_interactions" | "gemini-interactions"
+    )
+}
+
 fn extract_toml_base_url(text: &str) -> Option<String> {
     extract_toml_string_value(text, "base_url")
 }
@@ -265,6 +285,7 @@ fn build_config_toml(base_url: &str, api_key: &str, protocol: RelayProtocol) -> 
         RelayProtocol::Responses => "responses",
         RelayProtocol::ChatCompletions => "chat",
         RelayProtocol::Anthropic => "responses",
+        RelayProtocol::Gemini => "responses",
     };
     [
         "model_provider = \"Elves\"".to_string(),

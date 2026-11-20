@@ -1,6 +1,6 @@
 # 构建性能
 
-日常开发使用 `.\scripts\build-windows-client.ps1`。该入口检查 Harness 网页、准备共享管理页面，再用 `release-fast` 增量编译客户端并生成便携程序，不构建安装包或 Android。
+日常开发使用 `.\scripts\build-windows-client.ps1`。该入口只检查 Harness 网页并用 `release-fast` 增量编译客户端；独立代理管理器使用 `.\scripts\build-windows-manager.ps1` 单独构建，不构建安装包或 Android。
 
 完整优化的客户端使用 `.\scripts\build-windows-client.ps1 -Profile release`。用户明确需要安装包时运行 `.\scripts\build-windows-installer.ps1`，默认同样使用 `release`；`-Profile release-fast` 仅供显式选择的本机调试包。需要缩短本地安装包压缩等待时，可追加 `-FastCompression`，该模式改用 NSIS zlib，安装包体积可能增大。
 
@@ -14,18 +14,18 @@
 
 首次应用配置、更换工作区或缺少缓存时，项目自身需要重新编译；下面的增量耗时不代表首次构建时间。
 
-## 共享管理前端缓存
+## 独立代理管理器前端缓存
 
-`npm --prefix apps/elves-management run build:frontend` 按内容核对项目源码和配置、依赖锁定信息、Node 版本、平台、`NODE_ENV` / `VITE_` 环境及全部生成文件。输入和产物均相同才复用；不依赖文件时间戳。
+`npm --prefix apps/elves-management run build:manager` 按内容核对项目源码和配置、依赖锁定信息、Node 版本、平台、`NODE_ENV` / `VITE_` 环境及全部生成文件。输入和产物均相同才复用；不依赖文件时间戳。
 
 缓存位于该前端的 `node_modules/.cache/elves/`。缓存不存在或损坏、产物缺失或被修改时重新构建；构建失败不记录成功缓存。构建期间输入发生变化也不记录本次结果。新增业务目录同样参与摘要，只有 `node_modules` 和 Git 元数据被排除。
 
-管理页源码、配置与依赖锁定文件纳入 Git；`assets/harness/management/` 是被忽略的生成目录，HTML 和哈希资源均不提交。Windows 构建入口和 CI 在 Cargo 前准备前端。直接使用 Cargo 的开发者须先运行上述前端构建；`elves-assets` 会检查管理页入口及其脚本、样式引用，缺失时给出生成命令并终止，避免把不完整资源嵌入程序。
+管理器源码、配置与依赖锁定文件纳入 Git；`apps/elves-management/dist/manager/` 是 Tauri 构建输入，HTML 和哈希资源均不提交。Harness Cargo 构建不读取该目录，独立管理器构建脚本会在 Cargo 前准备前端。
 
 强制重建：
 
 ```powershell
-npm --prefix apps/elves-management run build:frontend -- --force
+npm --prefix apps/elves-management run build:manager
 ```
 
 原有 `npm --prefix apps/elves-management run vite:build` 保留完整 Vite 构建及其参数支持。Windows 构建入口始终执行 Harness 检查；安装流程继续验证客户端内嵌的网页、工具和许可证。

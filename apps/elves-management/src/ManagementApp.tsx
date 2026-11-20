@@ -2,7 +2,6 @@ import { useEffect, useRef, useState } from "react";
 import { RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { TooltipLayer } from "@/components/ui/tooltip-layer";
-import { RemoteAccessScreen } from "@/components/RemoteAccessScreen";
 import { copyToClipboard } from "@/lib/utils";
 import {
   LocalProxyScreen, RelayScreen, SessionsScreen, defaultSettings, normalizeSettings,
@@ -15,63 +14,26 @@ import {
 import "./styles.css";
 import "./management.css";
 
-type Page = "proxy" | "sessions" | "remoteAccess";
-const titles: Record<Page, string> = { proxy: "代理设置", sessions: "会话管理", remoteAccess: "远程会话" };
+type Page = "proxy" | "sessions";
+const titles: Record<Page, string> = { proxy: "代理设置", sessions: "会话管理" };
 const isPage = (value: unknown): value is Page => typeof value === "string" && Object.hasOwn(titles, value);
 const initialPage = document.documentElement.dataset.managementPage || new URLSearchParams(location.search).get("page");
-const serviceOrigin = parent.location.origin;
-let deleteSequence = 0;
 
-function hslColor(value: unknown, background?: unknown): string | null {
-  if (typeof value !== "string") return null;
-  // 注册过的 CSS 颜色变量会序列化为 rgb()；管理页必须继承当前客户端实际配色，不能只识别十六进制。
-  const hex = /^#([\da-f]{3}|[\da-f]{6})$/i.exec(value.trim());
-  const rgb = /^rgba?\(\s*(\d+(?:\.\d+)?)[,\s]+(\d+(?:\.\d+)?)[,\s]+(\d+(?:\.\d+)?)(?:\s*[,/]\s*(0(?:\.\d+)?|1(?:\.0+)?))?\s*\)$/i.exec(value.trim());
-  let channels = hex
-    ? (hex[1].length === 3 ? [...hex[1]].map(char => char + char).join("") : hex[1])
-        .match(/../g)!.map(channel => parseInt(channel, 16))
-    : rgb?.slice(1, 4).map(Number);
-  if (!channels || channels.some(channel => !Number.isFinite(channel) || channel < 0 || channel > 255)) return null;
-  // Codex 派生的边框、hover 和辅助文字带透明度；按父工作区背景合成后再转 HSL，不能丢弃并残留上个主题的值。
-  const alpha = rgb?.[4] === undefined ? 1 : Number(rgb[4]);
-  if (alpha < 1) {
-    const baseHex = typeof background === "string" ? /^#([\da-f]{6})$/i.exec(background.trim()) : null;
-    const baseRgb = typeof background === "string"
-      ? /^rgb\(\s*(\d+(?:\.\d+)?)[,\s]+(\d+(?:\.\d+)?)[,\s]+(\d+(?:\.\d+)?)\s*\)$/i.exec(background.trim()) : null;
-    const base = baseHex ? baseHex[1].match(/../g)!.map(channel => parseInt(channel, 16)) : baseRgb?.slice(1).map(Number);
-    if (!base || base.some(channel => !Number.isFinite(channel) || channel < 0 || channel > 255)) return null;
-    channels = channels.map((channel, index) => channel * alpha + base[index] * (1 - alpha));
-  }
-  const [r, g, b] = channels.map(channel => channel / 255);
-  const max = Math.max(r, g, b), min = Math.min(r, g, b), delta = max - min, light = (max + min) / 2;
-  let hue = !delta ? 0 : max === r ? (g - b) / delta % 6 : max === g ? (b - r) / delta + 2 : (r - g) / delta + 4;
-  hue = (hue * 60 + 360) % 360;
-  const saturation = !delta ? 0 : delta / (1 - Math.abs(2 * light - 1));
-  return `${hue} ${saturation * 100}% ${light * 100}%`;
+type TauriWindow = Window & {
+  __TAURI__?: { core?: { invoke?: (command: string, args?: Record<string, unknown>) => Promise<unknown> } };
+  __TAURI_INTERNALS__?: { invoke?: (command: string, args?: Record<string, unknown>) => Promise<unknown> };
+};
+
+function standaloneInvoke() {
+  const current = window as TauriWindow;
+  return current.__TAURI__?.core?.invoke || current.__TAURI_INTERNALS__?.invoke || null;
 }
 
-function deleteThroughSession(thread: LocalSession): Promise<void> {
-  // 复用会话工作区原有删除事务、原生接口和持久回执；不再调用管理器的桌面删除入口。
-  const requestId = `management-delete-${Date.now()}-${++deleteSequence}`;
-  return new Promise((resolve, reject) => {
-    const finish = (error?: Error) => {
-      clearTimeout(timeout); window.removeEventListener("message", receive);
-      error ? reject(error) : resolve();
-    };
-    const receive = (event: MessageEvent) => {
-      if (event.origin !== serviceOrigin || event.source !== parent
-        || event.data?.type !== "management-delete-result" || event.data.requestId !== requestId) return;
-      finish(event.data.ok === true ? undefined : new Error(event.data.message || "删除结果尚未确认，请核对原回执。"));
-    };
-    const timeout = window.setTimeout(() => finish(new Error("删除结果尚未确认，请核对原回执，勿重复删除。")), 180000);
-    window.addEventListener("message", receive);
-    parent.postMessage({ type: "management-delete", requestId, id: thread.id, title: thread.title }, serviceOrigin);
-  });
-}
+const standaloneManager = window.parent === window && standaloneInvoke() !== null;
 
 export function App() {
   const [page, setPage] = useState<Page>(isPage(initialPage) ? initialPage : "proxy");
-  const [theme, setTheme] = useState<"light" | "dark">("light");
+  const [theme] = useState<"light" | "dark">("dark");
   const [initialized, setInitialized] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState(false);
@@ -110,26 +72,17 @@ export function App() {
   const edit = (value: BackendSettings) => { noteEdit(); draft.current = value; setForm(value); };
   async function call<T>(command: string, args: Record<string, unknown> = {}, write = false): Promise<T> {
     if (write && uncertain.current) throw new Error("上次保存结果尚未确认，请先刷新配置，再继续修改。");
-    let response: Response;
+    const invoke = standaloneInvoke();
+    if (!invoke) throw new Error("代理管理器本机命令不可用，请从 Elves 代理管理器启动。");
+    let value: any;
     try {
-      response = await fetch(`/api/management/${encodeURIComponent(command)}`, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ args, revision: revision.current }),
-        signal: requests.current.signal
+      value = await invoke("manager_command", {
+        command,
+        payload: { args, revision: revision.current }
       });
     } catch (failure) {
       if (write) uncertain.current = true;
       throw failure;
-    }
-    const value = await response.json().catch(() => {
-      if (write) uncertain.current = true;
-      throw new Error(write ? "保存回执读取失败，请刷新核对原结果，勿重复提交。" : "服务返回了无效数据。");
-    });
-    if (!response.ok) {
-      if (response.status === 401)
-        parent.postMessage({ type: "management-unauthorized" }, serviceOrigin);
-      throw new Error(value.message || `HTTP ${response.status}`);
     }
     if (value.status === "failed") throw new Error(value.message || "操作失败。");
     if (write && typeof value.revision === "string") revision.current = value.revision;
@@ -262,13 +215,23 @@ export function App() {
     refreshLocalSessions: () => run(refreshSessions),
     deleteLocalSession: async thread => {
       if (!window.confirm(`永久删除“${thread.title || "未命名会话"}”及其会话记录？项目文件不受影响，此操作不可恢复。`)) return;
-      await run(async () => { await deleteThroughSession(thread); await refreshSessions(); });
+      await run(async () => {
+        await call<CommandResult<unknown>>("delete_local_session", {
+          request: { sessionId: thread.id.replace(/^local:/, ""), title: thread.title, dbPath: thread.dbPath }
+        }, true);
+        await refreshSessions();
+      });
     },
     deleteLocalSessionsBatch: async threads => {
       if (!window.confirm(`永久删除筛选出的 ${threads.length} 个会话及其记录？项目文件不受影响，此操作不可恢复。`)) return;
       let deleted = 0;
       try {
-        for (const thread of threads) { await deleteThroughSession(thread); deleted++; }
+        for (const thread of threads) {
+          await call<CommandResult<unknown>>("delete_local_session", {
+            request: { sessionId: thread.id.replace(/^local:/, ""), title: thread.title, dbPath: thread.dbPath }
+          }, true);
+          deleted++;
+        }
         report(`已删除 ${deleted} 个会话。`);
       } catch (failure) { report(`已删除 ${deleted} 个会话；${failure instanceof Error ? failure.message : failure}`, true); }
       await run(refreshSessions);
@@ -316,70 +279,15 @@ export function App() {
   };
   useEffect(() => {
     alive.current = true;
-    void run(async () => { await refreshSettings(); await Promise.all([refreshRelay(), refreshConflicts(), refreshStatus(), refreshLogs()]); });
-    const receive = (event: MessageEvent) => {
-      if (event.origin !== serviceOrigin || event.source !== parent) return;
-      if (event.data?.type === "management-page" && isPage(event.data.page)) setPage(event.data.page);
-      if (event.data?.type === "management-visibility") {
-        visible.current = event.data.visible === true;
-        if (visible.current) void checkConfiguration();
-      }
-      if (event.data?.type === "management-config-changed") void checkConfiguration();
-      if (event.data?.type === "management-theme" && ["light", "dark"].includes(event.data.theme)) {
-        setTheme(event.data.theme);
-        const root = document.documentElement;
-        const { colors } = event.data;
-        root.classList.toggle("dark", event.data.theme === "dark");
-        root.classList.toggle("light", event.data.theme === "light");
-        // 用户要求管理卡片与设置卡片沿用默认主题的同一套派生色；旧父页回退时，卡片底色与按钮配色须成对使用旧表面。
-        const cardButtonSource = hslColor(colors?.["appearance-card-bg"]) === null ? "button-composer" : "button-card";
-        // 外观仍按当前客户端保存；管理页只继承主工作区已确认的配色和字体，不另建一套主题偏好。
-        // 原有 primary 语义保持中性前景；普通按钮单独继承按钮色，品牌与表单继续使用原强调色。
-        // 旧网页包缺少字段时按同一前景/背景降级，不将按钮颜色传播到其他控件。
-        for (const [token, sources] of Object.entries({
-          background: ["bg"], foreground: ["text"], card: ["appearance-card-bg", "composer-bg", "bg"], "card-foreground": ["text"],
-          popover: ["control-bg", "side"], "popover-foreground": ["text"],
-          primary: ["primary-bg", "text"], "primary-foreground": ["primary-text", "bg"],
-          secondary: ["side"], "secondary-foreground": ["text"], muted: ["hover"],
-          "muted-foreground": ["text-secondary", "muted"], accent: ["hover"], "accent-foreground": ["text"],
-          border: ["line"], input: ["line"], ring: ["focus-ring", "accent"], destructive: ["danger"],
-          "destructive-foreground": ["on-danger", "bg"], "shell-bg": ["bg"],
-          "surface-raised": ["control-bg", "side"], "surface-sunken": ["code"],
-          "brand-accent": ["accent-text", "accent"], "control-accent": ["accent-solid", "accent"],
-          "control-accent-foreground": ["on-accent", "bg"],
-          "managed-selection": ["selection-bg", "hover"], "managed-selection-text": ["selection-text", "text"]
-        })) {
-          const value = sources.map(color => hslColor(colors?.[color], colors?.bg)).find(Boolean);
-          if (value) root.style.setProperty(`--${token}`, value);
-        }
-        // 不以是否自定义按钮色为条件：未配置的主题也接收同一套中性三态；缺少表面组时不保留上一主题的值。
-        for (const [target, source] of [["managed-button", "button"], ["managed-button-card", cardButtonSource],
-          ["managed-button-modal", "button-control"]]) {
-          const variants = ["bg", "text", "hover", "active"].map(part =>
-            [part, hslColor(colors?.[`${source}-${part}`])] as const);
-          const complete = variants.every(([, value]) => value !== null);
-          if (target === "managed-button") root.dataset.managedButtonPalette = String(complete);
-          for (const [part, value] of variants) {
-            const name = part === "bg" ? `--${target}` : `--${target}-${part}`;
-            if (complete && value) root.style.setProperty(name, value);
-            else root.style.removeProperty(name);
-          }
-          const outline = colors?.[`${source}-outline`];
-          if (complete && typeof outline === "string" && /^#[0-9a-f]{6}$/i.test(outline))
-            root.style.setProperty(`--${target}-outline`, outline);
-          else if (complete) root.style.setProperty(`--${target}-outline`, "transparent");
-          else root.style.removeProperty(`--${target}-outline`);
-        }
-        if (typeof event.data.font === "string" && event.data.font.length <= 500) root.style.setProperty("--managed-font", event.data.font);
-        if (typeof event.data.codeFont === "string" && event.data.codeFont.length <= 500) root.style.setProperty("--font-mono", event.data.codeFont);
-        if (Number.isFinite(event.data.fontSize) && event.data.fontSize >= 10 && event.data.fontSize <= 32)
-          root.style.fontSize = `${event.data.fontSize}px`;
-      }
-    };
-    window.addEventListener("message", receive);
-    parent.postMessage({ type: "management-ready" }, serviceOrigin);
+    void run(async () => {
+      if (standaloneInvoke()) await standaloneInvoke()!("ensure_proxy_service");
+      await refreshSettings();
+      await Promise.all([refreshRelay(), refreshConflicts(), refreshStatus(), refreshLogs()]);
+    });
     const settingsTimer = window.setInterval(() => void checkConfiguration(), 15000);
-    return () => { clearInterval(settingsTimer); alive.current = false; requests.current.abort(); window.removeEventListener("message", receive); };
+    return () => {
+      clearInterval(settingsTimer); alive.current = false; requests.current.abort();
+    };
   }, []);
   useEffect(() => {
     if (!initialized) return;
@@ -401,9 +309,15 @@ export function App() {
     }}>
     <header className="management-header">
       <div className="management-page-width">
-        <div><h1>{titles[page]}</h1><p>同一 Harness的各客户端共用配置</p></div>
+        <div><h1>{titles[page]}</h1><p>独立管理器直接管理本机代理与会话数据</p></div>
         <Button onClick={() => void run(refresh)} variant="outline" aria-label="刷新当前页面"><RefreshCw className="h-4 w-4" />刷新</Button>
       </div>
+      {standaloneManager ? <nav className="manager-nav" aria-label="管理器页面">
+        {(Object.keys(titles) as Page[]).map(item => (
+          <button key={item} className={page === item ? "selected" : ""} aria-current={page === item ? "page" : undefined}
+            onClick={() => setPage(item)} type="button">{titles[item]}</button>
+        ))}
+      </nav> : null}
     </header>
     {message ? <div className={`management-notice ${error ? "error" : ""}`} role={error ? "alert" : "status"}>
       <div className="management-page-width">{message}</div>
@@ -418,11 +332,6 @@ export function App() {
               selectedId={selectedLog} loadingDetailId={loadingLog} form={form} actions={actions} />
           </> : null}
           {page === "sessions" ? <SessionsScreen sessions={sessions} actions={actions} /> : null}
-          {page === "remoteAccess" ? <RemoteAccessScreen settings={form.remoteAccess}
-            onChange={remoteAccess => edit({ ...form, remoteAccess })}
-            onSave={next => save({ ...form, remoteAccess: next })}
-            command={(action, payload) => call("remote_access_command", { action, payload })}
-            onNotice={value => report(value, true)} onSuccess={value => report(value)} /> : null}
         </>}
       </div>
     </main>

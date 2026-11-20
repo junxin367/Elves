@@ -1,8 +1,9 @@
-// 原管理器常用命令迁入共享后台，只保留代理配置、日志和会话读取；会话删除由独立原生服务执行。
+// 独立代理管理器复用当前 Elves 核心能力；不包含 Codex 注入、CDP、launcher 或远程桥接。
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use elves_core::models::{DeleteResult, DeleteStatus, SessionRef};
 use elves_core::settings::{
     BackendSettings, RelayProfile, ResponsesWebsocketCapability, SettingsStore,
 };
@@ -234,6 +235,7 @@ pub struct LocalProxyLogDetailRequest {
 #[serde(rename_all = "camelCase")]
 pub struct LocalProxyStatusPayload {
     pub enabled: bool,
+    pub startup_enabled: bool,
     pub listening: bool,
     pub host: String,
     pub port: u16,
@@ -884,6 +886,50 @@ pub fn list_local_sessions() -> CommandResult<LocalSessionsPayload> {
     }
 }
 
+pub fn delete_local_session(
+    request: DeleteLocalSessionRequest,
+) -> CommandResult<DeleteResult> {
+    let session = match SessionRef::new(request.session_id.trim(), request.title.trim()) {
+        Ok(session) => session,
+        Err(error) => {
+            return failed(
+                &format!("会话标识无效：{error}"),
+                DeleteResult {
+                    status: DeleteStatus::Failed,
+                    session_id: request.session_id,
+                    message: error.to_string(),
+                },
+            );
+        }
+    };
+    let db_paths = if let Some(path) = request.db_path.filter(|value| !value.trim().is_empty()) {
+        vec![PathBuf::from(path)]
+    } else {
+        let home = saved_codex_home_dir();
+        elves_core::codex_sqlite::codex_session_db_paths_from_home(&home)
+    };
+    let result = elves_data::delete_local_from_paths(db_paths, &session);
+    let message = match result.status {
+        DeleteStatus::LocalDeleted | DeleteStatus::ServerDeleted => "本地会话已删除。",
+        DeleteStatus::Partial => "本地会话已删除，但部分记录清理失败。",
+        DeleteStatus::NotFound => "未找到指定本地会话。",
+        DeleteStatus::Failed => "本地会话删除失败。",
+    };
+    CommandResult {
+        status: if matches!(
+            result.status,
+            DeleteStatus::LocalDeleted | DeleteStatus::ServerDeleted
+        ) {
+            "ok"
+        } else {
+            "failed"
+        }
+        .to_string(),
+        message: message.to_string(),
+        payload: result,
+    }
+}
+
 fn local_session_adapter(db_path: &Path) -> elves_data::SQLiteStorageAdapter {
     elves_data::SQLiteStorageAdapter::new(db_path)
 }
@@ -930,7 +976,8 @@ pub async fn local_proxy_status() -> CommandResult<LocalProxyStatusPayload> {
     let enabled = settings.active_relay_uses_protocol_proxy();
     let port = elves_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT;
     let listening = elves_core::ports::loopback_listener_is_running(port).await;
-    // 用户要求代理随 Elves 启动；只使用当前 Harness 的实际监听，不借用旧 launcher 状态文件。
+    // 用户要求单独展示“随 Elves 启动”策略；监听状态仍只取当前独立服务的真实端口。
+    let startup_enabled = settings.local_proxy_startup_enabled;
     let lan_listening = listening && elves_core::local_proxy_service::lan_listening();
     let lan_addresses = if lan_listening {
         elves_core::lan_proxy::lan_ipv4_addresses()
@@ -963,21 +1010,24 @@ pub async fn local_proxy_status() -> CommandResult<LocalProxyStatusPayload> {
     };
     // 内置后台启动失败时展示实际原因，不能只沿用旧 launcher 的泛化监听提示。
     let startup_error = elves_core::local_proxy_service::last_error();
-    let message = if enabled && lan_listening {
+    let message = if !enabled {
+        "当前供应商未启用本地代理。"
+    } else if enabled && lan_listening {
         "本地代理正在通过局域网监听。"
     } else if enabled && listening {
         "本地代理正在监听。"
-    } else if enabled {
+    } else if !startup_enabled {
+        "本地代理已启用，但已关闭随 Elves 启动。"
+    } else {
         startup_error
             .as_deref()
             .unwrap_or("本地代理已启用，但当前未监听端口。")
-    } else {
-        "当前供应商未启用本地代理。"
     };
     let _ = elves_core::diagnostic_log::append_diagnostic_log(
         "manager.local_proxy_status",
         json!({
             "enabled": enabled,
+            "startupEnabled": startup_enabled,
             "listening": listening,
             "message": message,
             "port": port,
@@ -993,6 +1043,7 @@ pub async fn local_proxy_status() -> CommandResult<LocalProxyStatusPayload> {
     );
     let payload = LocalProxyStatusPayload {
         enabled,
+        startup_enabled,
         listening,
         host: "127.0.0.1".to_string(),
         port,

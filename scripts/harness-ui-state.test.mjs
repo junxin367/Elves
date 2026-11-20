@@ -93,14 +93,10 @@ async function navigationFixture(native = false, transport = native ? "desktop" 
 
 test("统一主导航固定排序，切换后保留当前会话草稿、节点与阅读位置", async () => {
   const fixture = await navigationFixture(true);
-  assert.deepEqual(Array.from(fixture.buttons, button => button.label), ["会话", "定时任务", "代理设置", "会话管理", "远程会话"]);
+  assert.deepEqual(Array.from(fixture.buttons, button => button.label), ["会话", "定时任务"]);
   fixture.buttons[1].action();
   assert.equal(fixture.workspace.hidden, true);
   assert.equal(fixture.workspace.inert, true);
-  fixture.buttons[2].action();
-  fixture.buttons[3].action();
-  assert.deepEqual(fixture.opened, ["proxy", "sessions"]);
-  assert.equal(fixture.buttons[3].attributes["aria-current"], "page");
   fixture.messages.scrollTop = 0;
   fixture.buttons[0].action();
   fixture.animation.forEach(callback => callback());
@@ -109,9 +105,9 @@ test("统一主导航固定排序，切换后保留当前会话草稿、节点�
   assert.equal(fixture.workspace.draft, "保留当前输入");
   assert.equal(fixture.messages.scrollTop, 320);
   assert.equal(fixture.context.navigation.shell.children[1], fixture.workspace);
-  assert.deepEqual(fixture.visibility, [false, true, true, false]);
+  assert.deepEqual(fixture.visibility, []);
   rawVm.runInContext("disposeMainNavigation(); disposeMainNavigation();", fixture.context);
-  assert.equal(fixture.callbacks.disposed, 1);
+  assert.equal(fixture.callbacks.disposed, 0);
 });
 
 test("网页和 Android 不提供管理入口，伪造客户端标记也不能打开远程管理页", async () => {
@@ -142,17 +138,14 @@ test("导航底部设置按客户端区分：Windows 直接打开，网页仅有
   assert.equal(native.context.popup, undefined);
 });
 
-test("设置作为主导航页面切换，保留会话节点与管理内容，返回前提交输入框失焦", async () => {
+test("设置作为主导航页面切换，保留会话节点，返回前提交输入框失焦", async () => {
   const fixture = await navigationFixture(true);
   const { buttons, settings, settingsPage, settingViews, workspace, messages, context } = fixture;
-  buttons[2].action();
   settings.action();
   assert.equal(settingViews[0].host, settingsPage);
   assert.equal(context.navigation.shell.children.at(-1), settingsPage);
-  assert.equal(context.navigation.management.hidden, true);
   assert.equal(workspace.hidden && workspace.inert, true);
   assert.equal(settings.attributes["aria-current"], "page");
-  assert.equal(buttons[2].attributes["aria-current"], undefined);
   let blurred = false;
   const input = { blur() { blurred = true; assert.equal(settingViews[0].disposed, false); } };
   settingsPage.append(input);
@@ -161,8 +154,6 @@ test("设置作为主导航页面切换，保留会话节点与管理内容，�
   assert.equal(blurred, true);
   assert.equal(settingViews[0].disposed, true);
   assert.equal(settingsPage.hidden, true);
-  assert.equal(context.navigation.management.hidden, false);
-  assert.equal(buttons[2].attributes["aria-current"], "page");
   settings.action();
   messages.scrollTop = 0;
   buttons[0].action();
@@ -215,14 +206,14 @@ test("手机与 PC 网页切换复用设置按钮并清理监听，不改变会�
   rawVm.runInContext("disposeMainNavigation(); disposeMainNavigation();", fixture.context);
   assert.equal(fixture.listeners.size, 0);
   assert.equal(fixture.sidebar.children.includes(fixture.footer), false);
-  assert.equal(fixture.callbacks.disposed, 1);
+  assert.equal(fixture.callbacks.disposed, 0);
 });
 
 test("Windows 窄窗口仍保留 PC 主导航与直接设置入口，不出现退出按钮", async () => {
   const fixture = await navigationFixture(true, "desktop", { mobile: true });
   assert.equal(fixture.context.navigation.shell.dataset.mobileNavigation, "false");
   assert.equal(fixture.footer, undefined);
-  assert.equal(fixture.buttons.length, 5);
+  assert.equal(fixture.buttons.length, 2);
   fixture.settings.action();
   assert.equal(fixture.callbacks.settings, 1);
   assert.equal(fixture.settingsPage.dataset.settingsMobile, "false");

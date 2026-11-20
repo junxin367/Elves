@@ -1,6 +1,6 @@
 # 工作区前端架构与公共组件
 
-Elves 与 Harness 共用工作区网页，位于 `assets/harness/`。会话工作区使用直接运行的原生 ES module；迁入的管理页面由 React/Vite 构建至 `management/`。同一资源目录同时用于本机 Harness（Rust 构建期内嵌）、浏览器 PWA、Android APK 内置网页包和热更新，以及 Elves Windows 客户端内置网页包。
+Elves 与 Harness 共用工作区网页，位于 `assets/harness/`。会话工作区使用直接运行的原生 ES module；代理管理器由 React/Vite 构建为独立 Tauri 资源，不再进入 Harness 的资源清单。Harness、浏览器 PWA、Android APK 和 Elves Windows 客户端只内嵌会话工作区资源。
 
 原入口 `app.js` 约 1.8 万行，现拆分为 90 行的入口和 `ui/`、`core/`、`features/` 下的 102 个模块（最大模块约 1100 行）。拆分分两步：先按领域拆出模块，再按用户要求完成完整分层重构、消除模块间的循环依赖（2026-11-15）。两步都只移动代码、改写模块间的状态写入与上层调用方式，不改变页面行为；原有注释（含用户需求注释）全部随所属声明迁移。
 
@@ -56,15 +56,15 @@ Elves 与 Harness 共用工作区网页，位于 `assets/harness/`。会话工�
 - 多个功能共用的会话级状态放在 `core/state.js`：`session`、`sidebar`、`selectedId`、`thread`、`turns`、`connected`、`selectionVersion`、`busy`、`creating`、`stopping`、`pageLeaving`、`nativeConnectionVersion`、`selectionToken`。
 - 只在一个领域内共享的状态放在该领域的状态模块（见上一节），由视图与流程模块导入；页面骨架创建的会话菜单、会话工具等共享引用由 `shell()` 写入 `features/shell-state.js`，其他模块只读取。
 
-## 统一导航与共享管理页面
+## 统一导航与独立代理管理器
 
-`features/main-navigation.js` 按[主导航规范](../core/product-behavior.md#统一左侧主导航)挂载导航，切换时隐藏而不销毁会话 DOM；`features/management-frame.js` 保留单个管理 iframe，负责页面切换、主题同步、配置更新事件和会话删除回传。因旧容器会为缓存文档返回禁止嵌入响应头，父页读取固定同源 `/management/index.html` 后写入 `srcdoc`；脚本与样式均使用 `/management/` 绝对资源路径，API 沿用当前服务 Cookie。消息须同时检查 Origin、frame 窗口及当前设备，授权变化卸载整个管理页。
+`features/main-navigation.js` 按[主导航规范](../core/product-behavior.md#统一左侧主导航)挂载 Harness 导航，切换时隐藏而不销毁会话 DOM。Harness 不创建管理 iframe，也不加载 `/management/` 资源；代理设置和会话管理由 `apps/elves-manager/src-tauri/` 的独立 Tauri 窗口提供。
 
 [设置页](../core/product-behavior.md#远程设置分类与实例配置)由主导航在独立内容区挂载，和管理 iframe 分开；登录页使用同一个设置挂载函数，返回时显示原登录表单。离开设置清理当次页面的监听与读取结果订阅，各分类仍通过自身接口保存。
 
-管理前端源码位于 `apps/elves-management/src/ManagementApp.tsx`，已有页面组件在 `management-screens.tsx` 中复用；Rust 管理命令位于 `crates/elves-harness/src/management/`，不再生成管理器二进制。前端修改后先运行 `npm --prefix apps/elves-management run check` 和 `run build:frontend`，再构建内嵌网页的客户端。Git 只保存源码、配置与依赖锁定文件；生成的 `assets/harness/management/` 整体忽略，不提交入口 HTML 或哈希资源。直接运行 Cargo 时若生成资源缺失，构建明确失败并提示先准备前端。
+管理前端源码位于 `apps/elves-management/src/ManagementApp.tsx`，已有代理与会话组件在 `management-screens.tsx` 中复用；独立管理器命令桥位于 `apps/elves-manager/src-tauri/`，直接调用 `elves-core` 与 `elves-data`。前端修改后运行 `npm --prefix apps/elves-management run check` 和 `run build:manager`，再执行 `cargo check -p elves-manager`。生成的 `apps/elves-management/dist/manager/` 只作为 Tauri 输入，不进入 Harness 资源清单。
 
-管理 API 固定为 `POST /api/management/{command}`。命令必须登记在白名单，由服务端核对真实本机监听和本机授权；远程设备无论是否具有会话写权限均不能访问管理页及管理 API。真实回环中的本机管理授权来自私有管理端点签发的一次性证明。配置 revision 覆盖设置及当前 Codex Home 的配置/认证文件，过期版本保存返回 409；草稿和跨端更新遵循[主导航的管理页规则](../core/product-behavior.md#统一左侧主导航)。
+管理器命令固定在 Tauri `manager_command` 白名单内，由独立管理器进程核对配置 revision；远程设备不参与管理器调用。代理服务使用单独的 `--proxy-service` 进程模式，管理器退出不会回收代理监听。
 
 ## 通用 UI 组件
 

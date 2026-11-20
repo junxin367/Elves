@@ -150,18 +150,23 @@ $ToolRuntimeVerifier = Join-Path $RepoRoot "scripts\verify-tool-runtime.mjs"
 Invoke-Checked -FilePath $NodePath -Arguments @($BuildInputVerifier, $RepoRoot, "--source-only") -WorkingDirectory $RepoRoot
 Invoke-Checked -FilePath $NodePath -Arguments @($ToolRuntimeVerifier, $RepoRoot, "--source-only") -WorkingDirectory $RepoRoot
 # 用户要求日常编译提速：安装包默认仍用 release 完整优化；显式 -Profile release-fast 仅用于本机调试包。
-# 客户端入口负责共享管理前端的摘要复用与单次 Cargo 构建，并同时生成经过 PE 校验的便携程序。
+# Elves 客户端与独立代理管理器分别构建；管理器不再嵌入 Harness。
 $clientClock = [Diagnostics.Stopwatch]::StartNew()
 & (Join-Path $RepoRoot "scripts\build-windows-client.ps1") -Version $ResolvedVersion -Profile $Profile
 if ($LASTEXITCODE -ne 0) { throw "Elves client build failed with exit code: $LASTEXITCODE" }
 Write-Output "[TIME] Client stage: $([math]::Round($clientClock.Elapsed.TotalSeconds, 2)) s"
+$managerClock = [Diagnostics.Stopwatch]::StartNew()
+& (Join-Path $RepoRoot "scripts\build-windows-manager.ps1") -Profile $Profile
+if ($LASTEXITCODE -ne 0) { throw "Elves manager build failed with exit code: $LASTEXITCODE" }
+Write-Output "[TIME] Manager stage: $([math]::Round($managerClock.Elapsed.TotalSeconds, 2)) s"
 Invoke-Checked -FilePath $NodePath -Arguments @($BuildInputVerifier, $RepoRoot, $ReleaseDir) -WorkingDirectory $RepoRoot
 
 New-Item -ItemType Directory -Path $DistAppDir -Force | Out-Null
 New-Item -ItemType Directory -Path $ReleaseMirrorDir -Force | Out-Null
 $ClientExe = Join-Path $ReleaseDir "elves.exe"
+$ManagerExe = Join-Path $ReleaseDir "elves-manager.exe"
 
-# 用户要求只安装一个 Elves 程序；后台与管理功能已内置该 EXE，不再构建或打包独立管理器。
+# 清理历史旧程序和旧管理器名；当前安装输入明确保留 Elves 客户端与独立代理管理器。
 foreach ($obsoleteName in @("codex-elves.exe", "codex-elves-manager.exe", "codex-elves-task-board.exe", "codex-elves-remote.exe", "elves-management.exe")) {
     Remove-Item -LiteralPath (Join-Path $DistAppDir $obsoleteName) -Force -ErrorAction SilentlyContinue
 }
@@ -175,7 +180,7 @@ if (Test-Path -LiteralPath $obsoleteTools) {
     }
     Remove-Item -LiteralPath $resolvedTools -Recurse -Force
 }
-foreach ($artifact in @($ClientExe)) {
+foreach ($artifact in @($ClientExe, $ManagerExe)) {
     if (!(Test-Path -LiteralPath $artifact)) {
         throw "Expected release artifact not found: $artifact"
     }
@@ -188,7 +193,7 @@ foreach ($artifact in @($ClientExe)) {
     Copy-Item -LiteralPath $artifact -Destination $DistAppDir -Force
 }
 
-# 单客户端须自带本机后台的工具，安装输入不再附带独立工具程序。
+# Elves 客户端自带本机后台工具；独立管理器只负责管理代理和会话，不重复嵌入工具。
 Invoke-Checked -FilePath $NodePath -Arguments @($ToolRuntimeVerifier, $RepoRoot, "--embedded", $ClientExe) -WorkingDirectory $RepoRoot
 Invoke-Checked -FilePath $NodePath -Arguments @($ToolRuntimeVerifier, $RepoRoot, "--embedded", (Join-Path $DistAppDir "elves.exe")) -WorkingDirectory $RepoRoot
 Invoke-Checked -FilePath $NodePath -Arguments @($BuildInputVerifier, $RepoRoot, $DistAppDir) -WorkingDirectory $RepoRoot

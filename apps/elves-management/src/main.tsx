@@ -4,6 +4,6 @@ import { App } from "./ManagementApp";
 const app = document.getElementById("app");
 
 if (app instanceof HTMLElement) {
-  // 原管理器不再提供独立入口；该前端只作为统一远程导航中的同源管理页面使用。
+  // 该前端只由独立 Elves 代理管理器的 Tauri 壳加载，不由 Harness 工作区嵌入。
   createRoot(app).render(<App />);
 }

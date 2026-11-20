@@ -1,4 +1,4 @@
-// 原管理器的供应商、代理日志与会话列表组件迁入 Elves / Harness 工作区，不再提供独立管理器界面。
+// 沿用原管理器的供应商、代理日志与会话列表交互，由独立 Elves 代理管理器窗口承载。
 import { closestCenter, DndContext, KeyboardSensor, PointerSensor, useSensor, useSensors, type DragEndEvent } from "@dnd-kit/core";
 import { SortableContext, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
@@ -36,6 +36,7 @@ export type BackendSettings = {
   providerSyncManualProviders: string[];
   providerSyncLastSelectedProvider: string;
   relayProfilesEnabled: boolean;
+  localProxyStartupEnabled: boolean;
   lanProxyEnabled: boolean;
   remoteAccess: RemoteAccessSettings;
   layeredCompactionEnabled: boolean;
@@ -95,6 +96,7 @@ export type RelayProfile = {
   responsesModelList: string;
   chatCompletionsModelList: string;
   anthropicModelList: string;
+  geminiModelList: string;
   responsesWebsocket: ResponsesWebsocketCapability;
   responsesWebsocketEnabled: boolean;
   userAgent: string;
@@ -309,6 +311,7 @@ export type EnvConflictsResult = CommandResult<{
 
 export type LocalProxyStatusResult = CommandResult<{
   enabled: boolean;
+  startupEnabled: boolean;
   listening: boolean;
   host: string;
   port: number;
@@ -410,6 +413,7 @@ export const defaultSettings: BackendSettings = {
   providerSyncManualProviders: [],
   providerSyncLastSelectedProvider: "",
   relayProfilesEnabled: true,
+  localProxyStartupEnabled: true,
   lanProxyEnabled: false,
   remoteAccess: { ...defaultRemoteAccessSettings },
   layeredCompactionEnabled: false,
@@ -450,6 +454,7 @@ export const defaultSettings: BackendSettings = {
       responsesModelList: "",
       chatCompletionsModelList: "",
       anthropicModelList: "",
+      geminiModelList: "",
       responsesWebsocket: emptyResponsesWebsocketCapability(),
       responsesWebsocketEnabled: true,
       userAgent: "",
@@ -607,6 +612,23 @@ export function LocalProxyScreen({
           detail="当前运行状态与最近代理活动"
           actions={
             <>
+              {/* 用户要求新增独立的全局启动开关；不改写供应商 localProxyEnabled，只控制 Elves 启动时是否拉起代理服务。 */}
+              <label
+                className="proxy-inline-toggle"
+                data-tooltip="开启后，Elves/Harness 启动时会同步启动独立本地代理服务。"
+              >
+                <input
+                  checked={form.localProxyStartupEnabled}
+                  onChange={(event) =>
+                    void actions.saveSettingsValue(
+                      { ...form, localProxyStartupEnabled: event.currentTarget.checked },
+                      false,
+                    )
+                  }
+                  type="checkbox"
+                />
+                <span>随 Elves 启动</span>
+              </label>
               <label className="proxy-inline-toggle">
                 <input
                   checked={form.lanProxyEnabled}
@@ -1564,12 +1586,16 @@ export function speedTestItemToProxyLogDetail(
       ? "Responses API"
       : protocol === "anthropic"
         ? "Anthropic"
+        : protocol === "gemini"
+          ? "Gemini Interactions"
         : "Chat Completions";
   const defaultPath =
     protocol === "responses"
       ? "/responses"
       : protocol === "anthropic"
         ? "/messages"
+        : protocol === "gemini"
+          ? "/interactions"
         : "/chat/completions";
   let pathname = defaultPath;
   if (item.endpoint) {
@@ -1625,6 +1651,7 @@ export function RelayProfileSpeedTestDialog({
       profile.responsesModelList,
       profile.chatCompletionsModelList,
       profile.anthropicModelList,
+      profile.geminiModelList,
       profile.modelList,
     ],
   );
@@ -2509,6 +2536,7 @@ export function RelayProfileEditor({
     responses: [],
     chatCompletions: [],
     anthropic: [],
+    gemini: [],
   });
   const [fetchingModelChoices, setFetchingModelChoices] = useState(false);
   const [probingResponsesWebsocket, setProbingResponsesWebsocket] = useState(false);
@@ -2584,6 +2612,7 @@ export function RelayProfileEditor({
       responsesModelList: "",
       chatCompletionsModelList: "",
       anthropicModelList: "",
+      geminiModelList: "",
       modelList: "",
     });
   };
@@ -2595,6 +2624,7 @@ export function RelayProfileEditor({
       responses: normalized,
       chatCompletions: normalized,
       anthropic: normalized,
+      gemini: normalized,
     });
     return normalized;
   };
@@ -2657,11 +2687,11 @@ export function RelayProfileEditor({
           <span>{relayProfileEditorStatus(profile, form, isNew)}</span>
         </div>
         <div className="relay-editor-actions">
-          {/* 用户要求删除 GPT 推理续接；本地代理开关只控制代理随 Elves 启动。 */}
+          {/* 用户要求移除 GPT 推理续接；供应商开关只控制请求路由，全局启动策略由本地代理状态卡片单独管理。 */}
           {showApiFields ? (
             <label
               className="inline-check local-proxy-toggle"
-              data-tooltip="启用后，本地协议代理随 Elves 启动。"
+              data-tooltip="启用后，当前供应商的请求会写入本地协议代理地址。"
             >
               <input
                 checked={profile.localProxyEnabled}
@@ -3282,7 +3312,7 @@ export function SortableRelayModelMappingRow({
   );
 }
 
-export const protocolSelectOptions: RelayProtocol[] = ["responses", "chatCompletions", "anthropic"];
+export const protocolSelectOptions: RelayProtocol[] = ["responses", "chatCompletions", "anthropic", "gemini"];
 
 export type SelectMenuOption<T extends string> = {
   value: T;
@@ -4828,6 +4858,7 @@ export function relayProfileCatalogModelCount(profile: RelayProfile): number {
     profile.responsesModelList,
     profile.chatCompletionsModelList,
     profile.anthropicModelList,
+    profile.geminiModelList,
     profile.modelList,
   ]) {
     for (const model of splitRelayModelList(list)) {
@@ -5271,12 +5302,14 @@ export function statusLabel(status: string) {
 export function localProxyState(status: LocalProxyStatusResult | null) {
   if (!status) return "unknown";
   if (!status.enabled) return "disabled";
+  if (status.startupEnabled === false && !status.listening) return "disabled";
   return status.listening ? "running" : "failed";
 }
 
 export function localProxyStateLabel(status: LocalProxyStatusResult | null) {
   const state = localProxyState(status);
   if (state === "running") return "代理运行中";
+  if (status?.enabled && status.startupEnabled === false && !status.listening) return "已关闭随 Elves 启动";
   if (state === "disabled") return "代理未启用";
   if (state === "failed") return "代理未启动";
   return "代理未检查";
@@ -5580,6 +5613,7 @@ export function normalizeSettings(settings: BackendSettings): BackendSettings {
             responsesModelList: "",
             chatCompletionsModelList: "",
             anthropicModelList: "",
+            geminiModelList: "",
             responsesWebsocket: emptyResponsesWebsocketCapability(),
             responsesWebsocketEnabled: true,
             userAgent: "",
@@ -5595,6 +5629,7 @@ export function normalizeSettings(settings: BackendSettings): BackendSettings {
     ...settings,
     codexHomePath: (settings.codexHomePath || "").trim(),
     relayProfilesEnabled: settings.relayProfilesEnabled !== false,
+    localProxyStartupEnabled: settings.localProxyStartupEnabled !== false,
     lanProxyEnabled: settings.lanProxyEnabled === true,
     remoteAccess: { ...defaultRemoteAccessSettings, ...settings.remoteAccess },
 
@@ -5677,6 +5712,7 @@ export function normalizeRelayProfile(profile: RelayProfile, defaultContextSelec
   const responsesModelList = profile.responsesModelList || "";
   const chatCompletionsModelList = profile.chatCompletionsModelList || "";
   const anthropicModelList = profile.anthropicModelList || "";
+  const geminiModelList = profile.geminiModelList || "";
   const modelMappings = normalizeRelayModelMappings(profile.modelMappings);
   let normalized: RelayProfile = {
     ...profile,
@@ -5702,6 +5738,7 @@ export function normalizeRelayProfile(profile: RelayProfile, defaultContextSelec
     responsesModelList,
     chatCompletionsModelList,
     anthropicModelList,
+    geminiModelList,
     responsesWebsocket: normalizeResponsesWebsocketCapability(profile),
     responsesWebsocketEnabled: profile.responsesWebsocketEnabled !== false,
     userAgent: profile.userAgent || "",
@@ -5753,7 +5790,7 @@ export function normalizeRelayModelMappings(mappings: RelayModelMapping[] | unde
 }
 
 export function normalizeRelayProtocol(protocol: RelayProtocol | undefined): RelayProtocol {
-  if (protocol === "chatCompletions" || protocol === "anthropic") return protocol;
+  if (protocol === "chatCompletions" || protocol === "anthropic" || protocol === "gemini") return protocol;
   return "responses";
 }
 
@@ -5761,6 +5798,9 @@ export function defaultProtocolForModel(model: string): RelayProtocol {
   const slug = (model.trim().toLowerCase().split("/").filter(Boolean).pop() || "").trim();
   if (slug === "claude" || slug.startsWith("claude-") || slug.startsWith("anthropic.claude")) {
     return "anthropic";
+  }
+  if (slug === "gemini" || slug.startsWith("gemini-") || slug === "gemma" || slug.startsWith("gemma-")) {
+    return "gemini";
   }
   if (
     slug === "gpt"
@@ -5803,6 +5843,7 @@ export function relayProfileConfiguredModels(profile: RelayProfile): string[] {
     ...profile.responsesModelList.split(/\r?\n/),
     ...profile.chatCompletionsModelList.split(/\r?\n/),
     ...profile.anthropicModelList.split(/\r?\n/),
+    ...(profile.geminiModelList || "").split(/\r?\n/),
     ...profile.modelList.split(/\r?\n/),
   ];
   return uniqueStrings(values.map((value) => value.trim()).filter(Boolean)).sort((left, right) =>
@@ -6017,6 +6058,7 @@ export function relayModeLabel(mode: RelayMode): string {
 export function relayProtocolLabel(protocol: RelayProtocol): string {
   if (protocol === "chatCompletions") return "Chat Completions";
   if (protocol === "anthropic") return "Anthropic";
+  if (protocol === "gemini") return "Gemini Interactions";
   return "Responses API";
 }
 
@@ -6134,6 +6176,7 @@ export function buildRelayConfigToml(
     | "modelMappings"
     | "chatCompletionsModelList"
     | "anthropicModelList"
+    | "geminiModelList"
     | "systemPromptOverride"
     | "responsesWebsocket"
     | "responsesWebsocketEnabled"
@@ -6649,6 +6692,7 @@ export function createRelayProfile(settings: BackendSettings): RelayProfile {
     responsesModelList: "",
     chatCompletionsModelList: "",
     anthropicModelList: "",
+    geminiModelList: "",
     responsesWebsocket: emptyResponsesWebsocketCapability(),
     responsesWebsocketEnabled: true,
     userAgent: "",
@@ -6685,6 +6729,7 @@ export function createAggregateRelayProfile(settings: BackendSettings): RelayPro
       responsesModelList: "",
       chatCompletionsModelList: "",
       anthropicModelList: "",
+      geminiModelList: "",
       responsesWebsocket: emptyResponsesWebsocketCapability(),
       responsesWebsocketEnabled: true,
       userAgent: "",

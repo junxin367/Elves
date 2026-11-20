@@ -21,7 +21,7 @@ SetCompressor /SOLID lzma
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
-; 用户要求安装只提供一个 Elves 程序，完成页直接运行它；取消或静默安装不启动。
+; 完成页直接运行 Elves；独立代理管理器从开始菜单进入，不自动启动。
 !define MUI_FINISHPAGE_RUN "$INSTDIR\elves.exe"
 !define MUI_FINISHPAGE_RUN_TEXT "运行 Elves"
 !insertmacro MUI_PAGE_FINISH
@@ -45,6 +45,7 @@ FunctionEnd
   Delete "${DIRECTORY}\codex-elves-task-board.exe"
   Delete "${DIRECTORY}\codex-elves-remote.exe"
   Delete "${DIRECTORY}\elves-management.exe"
+  Delete "${DIRECTORY}\elves-manager.exe"
   Delete "${DIRECTORY}\tools\windows-x64\rg.exe"
   Delete "${DIRECTORY}\tools\windows-x64\node_repl.exe"
   Delete "${DIRECTORY}\tools\windows-x64\node.exe"
@@ -85,6 +86,8 @@ FunctionEnd
   Pop $0
   nsExec::ExecToLog 'taskkill /IM elves.exe /F'
   Pop $0
+  nsExec::ExecToLog 'taskkill /IM elves-manager.exe /F'
+  Pop $0
 !macroend
 !macro PrepareShutdown EXECUTABLE LABEL OPERATION
   StrCpy $ShutdownAttempt 0
@@ -123,11 +126,13 @@ Section "Install"
   !insertmacro RemoveLegacyShortcuts
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexElves"
   DeleteRegKey HKCU "Software\CodexElves"
-  ; 唯一正式程序，Harness 和代理均由其内部运行模式承载。
+  ; Elves 负责 Harness 工作区；代理设置、会话管理由独立管理器承载。
   File "${ROOT}\dist\windows\app\elves.exe"
+  File "${ROOT}\dist\windows\app\elves-manager.exe"
   CreateShortcut "$DESKTOP\Elves.lnk" "$INSTDIR\elves.exe" "" "$INSTDIR\elves.exe"
   CreateDirectory "$SMPROGRAMS\Elves"
   CreateShortcut "$SMPROGRAMS\Elves\Elves.lnk" "$INSTDIR\elves.exe" "" "$INSTDIR\elves.exe"
+  CreateShortcut "$SMPROGRAMS\Elves\Elves 代理管理器.lnk" "$INSTDIR\elves-manager.exe" "" "$INSTDIR\elves-manager.exe"
   CreateShortcut "$SMPROGRAMS\Elves\卸载 Elves.lnk" "$INSTDIR\uninstall.exe" "" "$INSTDIR\elves.exe"
   WriteUninstaller "$INSTDIR\uninstall.exe"
   WriteRegStr HKCU "Software\Elves" "InstallDir" "$INSTDIR"
@@ -145,10 +150,12 @@ Section "Uninstall"
   !insertmacro RemoveLegacyShortcuts
   Delete "$DESKTOP\Elves.lnk"
   Delete "$SMPROGRAMS\Elves\Elves.lnk"
+  Delete "$SMPROGRAMS\Elves\Elves 代理管理器.lnk"
   Delete "$SMPROGRAMS\Elves\卸载 Elves.lnk"
   RMDir "$SMPROGRAMS\Elves"
   ; 设置、密钥、原生会话及 WebView 缓存位于独立用户目录，卸载保留。
   Delete "$INSTDIR\elves.exe"
+  Delete "$INSTDIR\elves-manager.exe"
   Delete "$INSTDIR\uninstall.exe"
   RMDir "$INSTDIR"
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Elves"

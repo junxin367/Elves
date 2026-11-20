@@ -93,17 +93,18 @@ jobs:
 
       - name: Build frontend
         working-directory: apps/elves-management
-        run: npm run check && npm run vite:build
+        run: npm run check && npm run build:manager
 
       - name: Build binaries
-        # 用户要求统一客户端入口，安装包不再生成独立管理器、launcher 或任务看板。
-        run: cargo build --release -p elves --bin elves
+        # Harness 与独立代理管理器分别构建；不恢复 Codex App 注入、launcher 或任务看板。
+        run: cargo build --release -p elves --bin elves -p elves-manager --bin elves-manager
 
       - name: Stage Windows app files
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist/windows/app | Out-Null
           Copy-Item target/release/elves.exe dist/windows/app/
+          Copy-Item target/release/elves-manager.exe dist/windows/app/
           node scripts/verify-tool-runtime.mjs . --embedded target/release/elves.exe
           node scripts/verify-windows-build-inputs.mjs . target/release
 

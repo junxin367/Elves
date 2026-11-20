@@ -52,16 +52,11 @@ if (!$SkipBuild) {
     $npm = Get-Command "npm.cmd" -CommandType Application -ErrorAction Stop | Select-Object -First 1
     Push-Location $RepoRoot
     try {
-        # 用户要求缩短日常编译并保持资源正确：检查始终执行，前端仅在输入或产物摘要变化时重建。
-        # 统一在 Rust 前准备管理资源，避免单独编译客户端时内嵌到旧页面。
+        # Harness 只内嵌会话工作区；代理管理器使用独立 Tauri 资源，不随客户端编译或运行。
         $checkClock = [Diagnostics.Stopwatch]::StartNew()
         & $npm.Path --prefix apps/elves-management run check:harness
         if ($LASTEXITCODE -ne 0) { throw "Harness resource check failed: $LASTEXITCODE" }
         Write-Output "[TIME] Harness check: $([math]::Round($checkClock.Elapsed.TotalSeconds, 2)) s"
-        $frontendClock = [Diagnostics.Stopwatch]::StartNew()
-        & $npm.Path --prefix apps/elves-management run build:frontend
-        if ($LASTEXITCODE -ne 0) { throw "Management frontend build failed: $LASTEXITCODE" }
-        Write-Output "[TIME] Management frontend: $([math]::Round($frontendClock.Elapsed.TotalSeconds, 2)) s"
         $compileClock = [Diagnostics.Stopwatch]::StartNew()
         & $cargo.Path build --locked --profile $Profile -p elves --bin elves
         if ($LASTEXITCODE -ne 0) { throw "Elves client build failed: $LASTEXITCODE" }

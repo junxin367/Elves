@@ -25,6 +25,7 @@ export type RelayProfile = {
   responsesModelList: string;
   chatCompletionsModelList: string;
   anthropicModelList: string;
+  geminiModelList: string;
   userAgent: string;
 };
 
@@ -54,7 +55,7 @@ export function createPresetPatch(preset: ProviderPreset): PresetPatch {
     baseUrl: preset.baseUrl,
     upstreamBaseUrl: preset.baseUrl,
     protocol: preset.protocol,
-    localProxyEnabled: preset.protocol === "chatCompletions",
+    localProxyEnabled: preset.protocol === "chatCompletions" || preset.protocol === "gemini",
     // 用户要求不再保留独立测试模型；预设只填充供应商当前默认模型。
     model: preset.model,
     modelList,
@@ -62,6 +63,7 @@ export function createPresetPatch(preset: ProviderPreset): PresetPatch {
     responsesModelList: preset.protocol === "responses" ? modelList : "",
     chatCompletionsModelList: preset.protocol === "chatCompletions" ? modelList : "",
     anthropicModelList: preset.protocol === "anthropic" ? modelList : "",
+    geminiModelList: preset.protocol === "gemini" ? modelList : "",
     relayMode: preset.category === "official" ? "official" : "pureApi",
     officialMixApiKey: false,
   };

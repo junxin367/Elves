@@ -1,4 +1,4 @@
-export type RelayProtocol = "responses" | "chatCompletions" | "anthropic";
+export type RelayProtocol = "responses" | "chatCompletions" | "anthropic" | "gemini";
 
 export type RelayMode = "official" | "mixedApi" | "pureApi" | "aggregate";
 

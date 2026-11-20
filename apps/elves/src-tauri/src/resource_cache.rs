@@ -230,7 +230,6 @@ pub struct ResourceCache {
     update_lock: Arc<tokio::sync::Mutex<()>>,
     network: reqwest::Client,
     loopback: reqwest::Client,
-    desktop_cookie: Arc<RwLock<Option<(url::Origin, String)>>>,
 }
 
 fn client(no_proxy: bool) -> anyhow::Result<reqwest::Client> {
@@ -285,16 +284,12 @@ async fn request(
     client: &reqwest::Client,
     url: Url,
     limit: usize,
-    cookie: Option<String>,
 ) -> anyhow::Result<(Vec<u8>, String)> {
     let mut request = client
         .get(url)
         .header("skip_zrok_interstitial", "1")
         .header("ngrok-skip-browser-warning", "true")
         .header("Accept-Encoding", "gzip");
-    if let Some(cookie) = cookie {
-        request = request.header(reqwest::header::COOKIE, cookie);
-    }
     let mut response = request.send().await?;
     ensure!(response.status().is_success(), "无法取得网页资源");
     let encoded_limit = limit.saturating_add(64 * 1024);
@@ -341,7 +336,6 @@ pub async fn fetch_manifest(
         client,
         origin.join("app-resources.json")?,
         MAX_MANIFEST,
-        None,
     )
     .await?;
     Ok((Manifest::parse(&bytes)?, headers))
@@ -422,7 +416,6 @@ impl ResourceCache {
             update_lock: Arc::new(tokio::sync::Mutex::new(())),
             network: client(false)?,
             loopback: client(true)?,
-            desktop_cookie: Arc::new(RwLock::new(None)),
         }))
     }
     pub fn fork_view(&self, url: &Url) -> Arc<Self> {
@@ -445,30 +438,7 @@ impl ResourceCache {
             update_lock: self.update_lock.clone(),
             network: self.network.clone(),
             loopback: self.loopback.clone(),
-            desktop_cookie: self.desktop_cookie.clone(),
         })
-    }
-    pub(crate) fn set_desktop_identity(&self, url: &Url, cookie: &str) -> anyhow::Result<()> {
-        ensure!(
-            url.scheme() == "http" && url.host_str() == Some("127.0.0.1") && valid_hash(cookie),
-            "本机资源授权无效"
-        );
-        *self.desktop_cookie.write().unwrap() =
-            Some((url.origin(), format!("elves_desktop={cookie}")));
-        Ok(())
-    }
-    fn cookie_for(&self, url: &Url) -> Option<String> {
-        // 管理页转为本机专用后，缓存下载仅为原生已确认的同一回环 Origin 的管理资源附带授权。
-        // 不向公开资源、API、其他端口或远程地址发送 Cookie；凭据仅驻留内存，不写缓存文件。
-        if !url.path().starts_with("/management/") {
-            return None;
-        }
-        self.desktop_cookie
-            .read()
-            .unwrap()
-            .as_ref()
-            .filter(|(origin, _)| *origin == url.origin())
-            .map(|(_, cookie)| cookie.clone())
     }
     pub fn enable(&self) {
         self.enabled.store(true, Ordering::SeqCst);
@@ -676,9 +646,7 @@ impl ResourceCache {
                     bytes
                 } else {
                     let target = url.join(&entry.path)?;
-                    let cookie = self.cookie_for(&target);
-                    let (bytes, _) =
-                        request(self.http(url), target, entry.size as usize, cookie).await?;
+                    let (bytes, _) = request(self.http(url), target, entry.size as usize).await?;
                     ensure!(
                         bytes.len() as u64 == entry.size && hex(&bytes) == entry.sha256,
                         "网页资源摘要不匹配"
@@ -883,41 +851,6 @@ mod tests {
             files: BTreeMap::from([("/".into(), bytes)]),
             headers: DEFAULT_HEADERS.into(),
         }
-    }
-
-    #[test]
-    fn desktop_cache_credentials_are_bound_to_the_local_origin_and_management_resources() {
-        let directory = tempfile::tempdir().unwrap();
-        let cache = ResourceCache::new(directory.path().into()).unwrap();
-        let home = Url::parse("http://127.0.0.1:45223/").unwrap();
-        cache.set_desktop_identity(&home, &"a".repeat(64)).unwrap();
-        let target = home.join("management/index.html").unwrap();
-        assert_eq!(
-            cache.cookie_for(&target),
-            Some(format!("elves_desktop={}", "a".repeat(64)))
-        );
-        for url in [
-            "http://127.0.0.1:45223/api/session",
-            "http://127.0.0.1:45223/app.js",
-            "http://127.0.0.1:45222/management/index.html",
-            "https://remote.example/management/index.html",
-        ] {
-            assert!(cache.cookie_for(&Url::parse(url).unwrap()).is_none());
-        }
-        let child = cache.fork_view(&home);
-        cache.set_desktop_identity(&home, &"b".repeat(64)).unwrap();
-        assert_eq!(
-            child.cookie_for(&target),
-            Some(format!("elves_desktop={}", "b".repeat(64)))
-        );
-        assert!(
-            cache
-                .set_desktop_identity(
-                    &Url::parse("https://remote.example/").unwrap(),
-                    &"c".repeat(64)
-                )
-                .is_err()
-        );
     }
 
     #[tokio::test]

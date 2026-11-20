@@ -6,7 +6,7 @@
 
 ## 核心原则
 
-保留 Elves 项目命名、本地代理及 Elves 工作区与独立 Harness。管理功能从 Elves 主导航进入，不恢复独立管理器窗口或安装入口。
+保留 Elves 项目命名、本地代理及 Elves 工作区与独立 Harness。Harness 只负责会话执行与工作区；代理设置、会话管理和上下文压缩由独立代理管理器提供。
 
 ## 需求提交与推送
 
@@ -44,15 +44,15 @@
 ## 产品与架构命名
 
 - 产品名统一为 `Elves`，仓库为 `https://github.com/junxin367/Elves`。
-- Windows 只安装一个 `elves.exe`，桌面、开始菜单和安装完成页只提供 Elves 程序入口；后台由同一程序的 `--harness-service` 模式承载。
-- `Harness` 是独立执行与管理产品，代码位于 `crates/elves-harness/`；远程会话只是它的网页和 Android 访问能力，不得用它称呼 Elves 或整体架构。
-- `crates/elves-core/` 提供配置与协议代理基础能力，`crates/elves-data/` 提供会话数据访问；`apps/elves/` 为原生客户端，`apps/elves-management/` 仅为共享管理前端，`assets/harness/` 为工作区资源。
+- Windows 安装 `elves.exe` 和 `elves-manager.exe`；桌面与完成页提供 Elves，开始菜单额外提供 Elves 代理管理器；后台由 `elves.exe --harness-service` 模式承载。
+- `Harness` 是独立执行产品，代码位于 `crates/elves-harness/`；远程会话只是它的网页和 Android 访问能力，不得用它称呼 Elves 或整体架构。
+- `crates/elves-core/` 提供配置与协议代理基础能力，`crates/elves-data/` 提供会话数据访问；`apps/elves/` 为原生客户端，`apps/elves-management/` 为独立代理管理器前端，`apps/elves-manager/` 为其 Tauri 壳，`assets/harness/` 为工作区资源。
 - Elves 启动必须直接打开本机 Harness，不显示远程地址或配对页，不读取上次远程地址，不自动修改远程会话开关。只有本机初始化失败时显示原因和重试。
 - Harness 本机入口默认回环端口 `45223`，本地代理默认 `45221`，网页默认 `45222`。禁止远程监听占用本机或代理端口。远程关闭、只读、换密钥、撤销设备及公网变化不能影响 Elves 本机授权、执行或代理。
-- 本地代理由当前已启用供应商的开关控制；开关已开启时必须随 Elves / Harness 启动，不能依赖远程会话已开启。
+- 本地代理由当前已启用供应商的开关控制；开关已开启时可随 Elves / Harness 启动，也可由独立代理管理器启动 `--proxy-service`，不能依赖远程会话或管理器窗口已开启。
 - 项目不再提供 Codex App 注入。禁止恢复 launcher、CDP、renderer 脚本、桌面桥接或其功能开关；允许通过独立原生 CLI / app-server 执行、只读解析项目元数据和检查会话占用。
 - 旧数据目录、已发布协议字段、设备 Cookie、Android applicationId 与签名材料可保留兼容名称，不作为当前产品名；升级清理旧程序和快捷方式，保留设置、历史、授权和缓存。
-- Windows 产物为 `target/release/elves.exe`、`dist/windows/app/elves.exe`、`dist/windows/Elves-<version>-windows-x64-setup.exe` 和同一程序的便携副本 `dist/windows/Elves-<version>-windows-x64.exe`。
+- Windows 产物为 `target/release/elves.exe`、`target/release/elves-manager.exe`、`dist/windows/app/` 下的两个程序、`dist/windows/Elves-<version>-windows-x64-setup.exe` 和 Elves 客户端便携副本。
 - 历史发布与验收记录按当时事实保留，不批量重写历史。
 
 ## 产品行为约束
@@ -62,7 +62,7 @@
 - Windows 客户端及共享管理库版本号以根 `Cargo.toml` 的 `workspace.package.version` 为准。Android 版本独立维护于 `apps/elves-android/version.properties`，不随 Windows 版本号同步。普通编译不调整 Android 版本；桌面发版需要同步发布 Android 时，按下方发布规则递增 Android 独立版本和 `versionCode`，并保持现有正式签名证书。
 - 默认本地协议代理端口保持 `45221`。
 - Windows 客户端关闭主窗口时收进托盘，再次启动唤回原窗口，并保持上次窗口大小、位置及显示器。
-- Elves 本机主导航固定为会话、代理设置、会话管理、远程会话；网页、PWA、Android 仅显示会话入口，不开放任何管理页面、供应商/API 配置、本地代理、请求日志或相应管理接口。服务端必须核对本机监听入口及真实本机授权，不能只隐藏按钮或信任客户端标记。导航宽 52px，按钮 36px，左右各 8px，设置固定底部。
+- Elves/Harness 本机主导航固定为会话、定时任务；网页、PWA、Android 仅显示会话入口，不开放代理设置、会话管理、供应商/API 配置、本地代理、请求日志或相应管理接口。代理管理器使用独立窗口和 Tauri 命令桥；导航宽 52px，按钮 36px，左右各 8px，设置固定底部。
 - 会话管理只保留浏览、筛选及单个/批量删除，不恢复历史会话修复和上下文压缩入口。
 - 各端设置与退出入口遵循[产品规范的主导航约定](docs/product-standards/core/product-behavior.md#统一左侧主导航)。
 - 快捷入口中文不能乱码；NSIS 编译必须使用 `/INPUTCHARSET UTF8`。
@@ -108,9 +108,9 @@
 
 ## 构建约定
 
-### Harness 与网页资源更新
+### Harness、管理器与网页资源更新
 
-Harness 与工作区资源内嵌于唯一的 Elves 程序。更新采用新的 Windows 安装包，升级会短暂关闭 Elves 及其拥有的后台，不重建独立管理器或旧启动器。仅编译或改源码时不安装、不切换正式服务。
+Harness 与工作区资源内嵌于 Elves 客户端，代理管理器单独编译为 `elves-manager.exe`。更新采用新的 Windows 安装包，升级会短暂关闭 Elves 及其拥有的后台，并同步替换管理器。仅编译或改源码时不安装、不切换正式服务。
 
 工作区资源变更后递增 `assets/harness/resource-revision.txt`。共享管理页面变更后先构建前端，再构建客户端；核对程序内嵌资源与当前源码相同。远程网页入口更新与 Elves 本机入口分别验收，不能将网页可用当作本机客户端可用。
 
@@ -190,4 +190,4 @@ Harness 与工作区资源内嵌于唯一的 Elves 程序。更新采用新的 W
 
 ## 共享管理前端检查入口
 
-在仓库根目录执行共享管理前端检查时，使用 `npm --prefix apps/elves-management run check`；构建使用 `npm --prefix apps/elves-management run vite:build`，输出为 `assets/harness/management/`，由独立 Harness 提供。
+在仓库根目录执行代理管理器前端检查时，使用 `npm --prefix apps/elves-management run check`；构建使用 `npm --prefix apps/elves-management run build:manager`，输出为独立管理器的 `dist/manager/`，由 `apps/elves-manager/` 的 Tauri 壳提供。

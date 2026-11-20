@@ -62,6 +62,7 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 const ANTHROPIC_THINKING_REPLAY_PREFIX: &str = "codex-elves-anthropic-thinking-v1:";
 const ANTHROPIC_THINKING_REPLAY_V2_PREFIX: &str = "codex-elves-anthropic-thinking-v2:";
 const ANTHROPIC_CONTENT_REPLAY_PREFIX: &str = "codex-elves-anthropic-content-v1:";
+const GEMINI_THOUGHT_REPLAY_PREFIX: &str = "codex-elves-gemini-thought-v1:";
 const ANTHROPIC_PAUSE_TURN_ERROR: &str = "Anthropic pause_turn requires upstream continuation, which this protocol bridge does not support";
 const WEB_SEARCH_DISCOVERY_QUERY: &str = "web search tavily exa";
 const WEB_SEARCH_UNAVAILABLE_ERROR: &str = "上游返回了客户端 web_search 调用，但当前会话没有可执行的搜索工具。请启用搜索 MCP 工具和客户端 tool_search 后重试。";
@@ -1934,6 +1935,396 @@ fn responses_to_anthropic_messages_with_diagnostic_id(
     Ok(result)
 }
 
+/// 将 Responses 请求转换为 Google Gemini Interactions API。
+///
+/// Interactions 的无状态模式要求完整保留 `thought`、`function_call` 和
+/// `function_result` 步骤；不能像 Chat Completions 一样只拼成一组 messages。
+pub fn responses_to_gemini_interactions(body: Value) -> anyhow::Result<Value> {
+    validate_translated_history_references(&body)?;
+    let body = crate::layered_compaction::prepare_remote_compaction_v2_bridge_request(&body);
+    validate_translated_request(&body, false)?;
+    let conversion_tools = tools_for_proxy_conversion(&body);
+    let tool_context = build_codex_tool_context_from_tools(&conversion_tools);
+    validate_explicit_tool_choice(&body, &tool_context)?;
+
+    let mut input_steps = Vec::new();
+    let mut system_chunks = Vec::new();
+    let mut function_names = BTreeMap::<String, String>::new();
+    if let Some(instructions) = body.get("instructions") {
+        let text = instruction_text(instructions);
+        if !text.trim().is_empty() {
+            system_chunks.push(text);
+        }
+    }
+    if let Some(input) = body.get("input") {
+        append_responses_input_to_gemini(
+            input,
+            &tool_context,
+            &mut input_steps,
+            &mut system_chunks,
+            &mut function_names,
+        );
+    }
+    if input_steps.is_empty() {
+        input_steps.push(json!({
+            "type": "user_input",
+            "content": [{ "type": "text", "text": "" }]
+        }));
+    }
+
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("");
+    let mut result = json!({
+        "model": model,
+        "input": input_steps,
+        // Gemini stateless 模式由本地代理重发完整历史，避免供应商保存 Codex 会话。
+        "store": false,
+        "stream": body.get("stream").and_then(Value::as_bool).unwrap_or(false)
+    });
+    if let Some(system) = system_chunks
+        .into_iter()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .reduce(|left, right| format!("{left}\n\n{right}"))
+    {
+        result["system_instruction"] = json!(system);
+    }
+
+    let mut tools = gemini_interaction_tools(&conversion_tools, &tool_context);
+    if !tools.is_empty() {
+        result["tools"] = Value::Array(std::mem::take(&mut tools));
+    }
+    let mut generation_config = json!({});
+    for (source, target) in [
+        ("max_output_tokens", "max_output_tokens"),
+        ("temperature", "temperature"),
+        ("top_p", "top_p"),
+        ("stop", "stop_sequences"),
+    ] {
+        if let Some(value) = body.get(source) {
+            generation_config[target] = value.clone();
+        }
+    }
+    if let Some(effort) = extract_requested_reasoning_effort(&body)
+        .and_then(|effort| normalize_reasoning_effort(&effort))
+    {
+        generation_config["thinking_level"] = json!(match effort {
+            "minimal" | "low" => "low",
+            "medium" => "medium",
+            _ => "high",
+        });
+    }
+    if let Some(format) = body
+        .pointer("/text/format")
+        .filter(|value| !value.is_null())
+    {
+        if format.get("type").and_then(Value::as_str) == Some("json_schema") {
+            result["response_format"] = json!({
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": format.get("schema").cloned().unwrap_or_else(|| json!({}))
+            });
+        }
+    }
+    if let Some(tool_choice) =
+        gemini_interaction_tool_choice(body.get("tool_choice"), &tool_context)
+    {
+        generation_config["tool_choice"] = tool_choice;
+    }
+    if generation_config
+        .as_object()
+        .is_some_and(|object| !object.is_empty())
+    {
+        result["generation_config"] = generation_config;
+    }
+    Ok(result)
+}
+
+fn append_responses_input_to_gemini(
+    input: &Value,
+    tool_context: &CodexToolContext,
+    steps: &mut Vec<Value>,
+    system_chunks: &mut Vec<String>,
+    function_names: &mut BTreeMap<String, String>,
+) {
+    let items = match input {
+        Value::Array(items) => items.clone(),
+        Value::Object(item) => vec![Value::Object(item.clone())],
+        Value::String(text) => {
+            steps.push(json!({
+                "type": "user_input",
+                "content": [{ "type": "text", "text": text }]
+            }));
+            return;
+        }
+        _ => return,
+    };
+    for item in items {
+        let item_type = item.get("type").and_then(Value::as_str);
+        match item_type {
+            Some("function_call" | "custom_tool_call" | "tool_call" | "tool_search_call") => {
+                let (name, arguments, call_id) = gemini_function_call_fields(&item, tool_context);
+                if name.is_empty() || call_id.is_empty() {
+                    continue;
+                }
+                function_names.insert(call_id.clone(), name.clone());
+                steps.push(json!({
+                    "type": "function_call",
+                    "id": call_id,
+                    "name": name,
+                    "arguments": parse_gemini_arguments(arguments)
+                }));
+            }
+            Some(
+                "function_call_output"
+                | "custom_tool_call_output"
+                | "tool_result"
+                | "tool_search_output",
+            ) => {
+                let call_id = item
+                    .get("call_id")
+                    .or_else(|| item.pointer("/content/tool_use_id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if call_id.is_empty() {
+                    continue;
+                }
+                let name = function_names.get(&call_id).cloned().unwrap_or_default();
+                let output = item
+                    .get("output")
+                    .or_else(|| item.pointer("/content/content"))
+                    .unwrap_or(&item);
+                steps.push(json!({
+                    "type": "function_result",
+                    "name": name,
+                    "call_id": call_id,
+                    "result": [{ "type": "text", "text": tool_output_text(output) }]
+                }));
+            }
+            Some("reasoning") => {
+                let signature = gemini_thought_signature_from_response_item(&item);
+                let summary = responses_reasoning_text(&item).unwrap_or_default();
+                if signature.is_some() || !summary.is_empty() {
+                    let mut thought = json!({ "type": "thought" });
+                    if let Some(signature) = signature {
+                        thought["signature"] = json!(signature);
+                    }
+                    if !summary.is_empty() {
+                        thought["summary"] = json!([{ "type": "text", "text": summary }]);
+                    }
+                    steps.push(thought);
+                }
+            }
+            Some("compaction") => {
+                if let Some(text) =
+                    crate::layered_compaction::synthetic_remote_compaction_history_text(&item)
+                {
+                    steps.push(json!({
+                        "type": "user_input",
+                        "content": [{ "type": "text", "text": text }]
+                    }));
+                }
+            }
+            _ => {
+                if item.get("role").is_none() && item.get("content").is_none() {
+                    continue;
+                }
+                let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+                let content = item.get("content").unwrap_or(&Value::Null);
+                if matches!(role, "system" | "developer") {
+                    let text = responses_content_to_gemini_text(content);
+                    if !text.is_empty() {
+                        system_chunks.push(text);
+                    }
+                    continue;
+                }
+                let step_type = if role == "assistant" {
+                    "model_output"
+                } else {
+                    "user_input"
+                };
+                let content = gemini_interaction_content(content);
+                if !content.is_empty() {
+                    steps.push(json!({ "type": step_type, "content": content }));
+                }
+            }
+        }
+    }
+}
+
+fn gemini_function_call_fields(
+    item: &Value,
+    tool_context: &CodexToolContext,
+) -> (String, String, String) {
+    let source = item.get("tool_use").unwrap_or(item);
+    let raw_name = source
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let namespace = source
+        .get("namespace")
+        .or_else(|| item.get("namespace"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let name = if raw_name.is_empty() {
+        String::new()
+    } else {
+        tool_context.upstream_function_name(namespace, raw_name)
+    };
+    let arguments = source
+        .get("arguments")
+        .or_else(|| source.get("input"))
+        .map(|value| match value {
+            Value::String(text) => text.to_string(),
+            other => canonical_json_string(other),
+        })
+        .unwrap_or_else(|| "{}".to_string());
+    let call_id = source
+        .get("call_id")
+        .or_else(|| source.get("id"))
+        .or_else(|| item.get("call_id"))
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    (name, arguments, call_id)
+}
+
+fn parse_gemini_arguments(arguments: String) -> Value {
+    serde_json::from_str::<Value>(&arguments)
+        .ok()
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({ "input": arguments }))
+}
+
+fn gemini_interaction_content(content: &Value) -> Vec<Value> {
+    match content {
+        Value::String(text) => vec![json!({ "type": "text", "text": text })],
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| {
+                let part_type = part.get("type").and_then(Value::as_str).unwrap_or("");
+                match part_type {
+                    "input_text" | "output_text" | "text" => part
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map(|text| json!({ "type": "text", "text": text })),
+                    "refusal" => part
+                        .get("refusal")
+                        .and_then(Value::as_str)
+                        .map(|text| json!({ "type": "text", "text": text })),
+                    "input_image" => gemini_image_content(part),
+                    _ => Some(json!({
+                        "type": "text",
+                        "text": canonical_json_string(part)
+                    })),
+                }
+            })
+            .collect(),
+        Value::Null => Vec::new(),
+        other => vec![json!({ "type": "text", "text": response_output_text(other) })],
+    }
+}
+
+fn responses_content_to_gemini_text(content: &Value) -> String {
+    gemini_interaction_content(content)
+        .into_iter()
+        .filter_map(|part| {
+            part.get("text")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn gemini_image_content(part: &Value) -> Option<Value> {
+    let url = part.get("image_url").and_then(|value| {
+        value
+            .as_str()
+            .or_else(|| value.get("url").and_then(Value::as_str))
+    })?;
+    let payload = url.strip_prefix("data:")?;
+    let (mime_type, data) = payload.split_once(";base64,")?;
+    Some(json!({ "type": "image", "mime_type": mime_type, "data": data }))
+}
+
+fn gemini_interaction_tools(tools: &[Value], context: &CodexToolContext) -> Vec<Value> {
+    responses_tools_to_chat_tools(tools, context)
+        .into_iter()
+        .filter_map(|tool| {
+            let function = tool.get("function")?;
+            let name = function.get("name").and_then(Value::as_str)?;
+            Some(json!({
+                "type": "function",
+                "name": name,
+                "description": function.get("description").cloned().unwrap_or_else(|| json!("")),
+                "parameters": function.get("parameters").cloned().unwrap_or_else(|| json!({
+                    "type": "object",
+                    "properties": {}
+                }))
+            }))
+        })
+        .collect()
+}
+
+fn gemini_interaction_tool_choice(
+    choice: Option<&Value>,
+    context: &CodexToolContext,
+) -> Option<Value> {
+    let choice = choice?;
+    let (mode, names) = match choice {
+        Value::String(value) => match value.as_str() {
+            "auto" => ("auto", Vec::new()),
+            "required" => ("any", Vec::new()),
+            "none" => ("none", Vec::new()),
+            _ => return None,
+        },
+        Value::Object(object) => match object.get("type").and_then(Value::as_str) {
+            Some("auto") => ("auto", Vec::new()),
+            Some("required") => ("any", Vec::new()),
+            Some("none") => ("none", Vec::new()),
+            Some("function" | "custom") => {
+                let chat = responses_tool_choice_to_chat(choice, context)?;
+                let name = chat.pointer("/function/name").and_then(Value::as_str)?;
+                ("any", vec![name.to_string()])
+            }
+            Some("allowed_tools") => {
+                let allowed = object.get("allowed_tools").unwrap_or(choice);
+                let mode = match allowed.get("mode").and_then(Value::as_str) {
+                    Some("required") => "any",
+                    _ => "auto",
+                };
+                let names = allowed
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|tool| responses_tool_choice_to_chat(tool, context))
+                    .filter_map(|tool| {
+                        tool.pointer("/function/name")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string)
+                    })
+                    .collect();
+                (mode, names)
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if names.is_empty() {
+        Some(Value::String(mode.to_string()))
+    } else {
+        Some(json!({
+            "allowed_tools": {
+                "mode": mode,
+                "tools": names
+            }
+        }))
+    }
+}
+
 pub fn anthropic_message_to_response(body: Value) -> anyhow::Result<Value> {
     anthropic_message_to_response_with_context(body, &CodexToolContext::default(), None, None)
 }
@@ -2026,6 +2417,181 @@ fn anthropic_message_to_response_with_context(
     copy_response_request_fields(&mut response, original_request);
 
     Ok(response)
+}
+
+pub fn gemini_interaction_to_response(body: Value) -> anyhow::Result<Value> {
+    gemini_interaction_to_response_with_context(body, &CodexToolContext::default(), None)
+}
+
+pub fn gemini_interaction_to_response_with_request(
+    body: Value,
+    original_request: &Value,
+) -> anyhow::Result<Value> {
+    gemini_interaction_to_response_with_request_and_options(
+        body,
+        original_request,
+        current_layered_compaction_options(),
+    )
+}
+
+pub(crate) fn gemini_interaction_to_response_with_request_and_options(
+    body: Value,
+    original_request: &Value,
+    options: LayeredCompactionOptions,
+) -> anyhow::Result<Value> {
+    let context = build_codex_tool_context_for_request(original_request);
+    let response =
+        gemini_interaction_to_response_with_context(body, &context, Some(original_request))?;
+    Ok(
+        rewrite_remote_compaction_v2_response_with_options(original_request, &response, options)
+            .unwrap_or(response),
+    )
+}
+
+fn gemini_interaction_to_response_with_context(
+    body: Value,
+    tool_context: &CodexToolContext,
+    original_request: Option<&Value>,
+) -> anyhow::Result<Value> {
+    reject_upstream_response_error(&body)?;
+    let response_id = response_id_from_chat_id(body.get("id").and_then(Value::as_str));
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("");
+    let status = match body.get("status").and_then(Value::as_str) {
+        Some("failed" | "cancelled" | "canceled") => "failed",
+        Some("incomplete") => "incomplete",
+        _ => "completed",
+    };
+    let mut output = Vec::new();
+    if let Some(steps) = body.get("steps").and_then(Value::as_array) {
+        for step in steps {
+            match step.get("type").and_then(Value::as_str).unwrap_or("") {
+                "thought" => {
+                    let summary = step
+                        .get("summary")
+                        .and_then(Value::as_array)
+                        .map(|parts| {
+                            parts
+                                .iter()
+                                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .unwrap_or_default();
+                    let mut item = json!({
+                        "id": format!("rs_{response_id}_{}", output.len()),
+                        "type": "reasoning",
+                        "reasoning_content": summary,
+                        "summary": if summary.is_empty() {
+                            json!([])
+                        } else {
+                            json!([{ "type": "summary_text", "text": summary }])
+                        }
+                    });
+                    if let Some(signature) = step.get("signature").and_then(Value::as_str) {
+                        item["encrypted_content"] =
+                            json!(format!("{GEMINI_THOUGHT_REPLAY_PREFIX}{signature}"));
+                    }
+                    output.push(item);
+                }
+                "function_call" => {
+                    let call_id = step
+                        .get("id")
+                        .or_else(|| step.get("call_id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_else(|| "call_0");
+                    let name = step.get("name").and_then(Value::as_str).unwrap_or("");
+                    let arguments =
+                        canonical_json_string(step.get("arguments").unwrap_or(&json!({})));
+                    output.push(response_tool_call_item(
+                        call_id,
+                        name,
+                        &arguments,
+                        tool_context,
+                    ));
+                }
+                "model_output" => {
+                    let content = step.get("content").cloned().unwrap_or_else(|| json!([]));
+                    let text = content
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|part| part.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("");
+                    if !text.is_empty() {
+                        output.push(json!({
+                            "id": response_message_item_id(&response_id),
+                            "type": "message",
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [{ "type": "output_text", "text": text, "annotations": [] }]
+                        }));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if output.is_empty()
+        && let Some(text) = body.get("output_text").and_then(Value::as_str)
+        && !text.is_empty()
+    {
+        output.push(json!({
+            "id": response_message_item_id(&response_id),
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": text, "annotations": [] }]
+        }));
+    }
+    if status == "incomplete" {
+        mark_messages_incomplete(&mut output);
+    } else if status == "completed" {
+        tool_context.validate_web_search_output(&output)?;
+    }
+    let mut response = json!({
+        "id": response_id,
+        "object": "response",
+        "created_at": 0,
+        "status": status,
+        "model": model,
+        "output": output,
+        "usage": chat_usage_to_responses_usage(body.get("usage"))
+    });
+    if status == "failed" {
+        let message = body
+            .get("errors")
+            .and_then(Value::as_array)
+            .and_then(|errors| errors.first())
+            .and_then(|error| {
+                error
+                    .get("message")
+                    .or_else(|| error.get("detail"))
+                    .and_then(Value::as_str)
+            })
+            .or_else(|| body.get("message").and_then(Value::as_str))
+            .unwrap_or("Gemini Interactions 请求失败");
+        response["error"] = json!({
+            "type": "upstream_error",
+            "message": message
+        });
+    }
+    if status == "incomplete" {
+        response["incomplete_details"] = json!({ "reason": "max_output_tokens" });
+    }
+    copy_response_request_fields(&mut response, original_request);
+    Ok(response)
+}
+
+fn gemini_thought_signature_from_response_item(item: &Value) -> Option<String> {
+    let value = item
+        .get("encrypted_content")
+        .or_else(|| item.get("signature"))
+        .and_then(Value::as_str)?;
+    value
+        .strip_prefix(GEMINI_THOUGHT_REPLAY_PREFIX)
+        .map(ToString::to_string)
+        .or_else(|| (!value.is_empty()).then(|| value.to_string()))
 }
 
 pub struct ProxyHttpResponse {
@@ -2402,6 +2968,7 @@ pub enum UpstreamResponseProtocol {
     Responses,
     ChatCompletions,
     Anthropic,
+    Gemini,
 }
 
 fn cache_protocol_for_response_protocol(
@@ -2413,6 +2980,7 @@ fn cache_protocol_for_response_protocol(
             crate::compaction_cache::CacheProtocol::ChatCompletions
         }
         UpstreamResponseProtocol::Anthropic => crate::compaction_cache::CacheProtocol::Anthropic,
+        UpstreamResponseProtocol::Gemini => crate::compaction_cache::CacheProtocol::Gemini,
     }
 }
 
@@ -2496,6 +3064,13 @@ fn validate_remote_compaction_v2_bridge_candidate(
                     options,
                 )
             }
+            UpstreamResponseProtocol::Gemini => {
+                gemini_interactions_sse_to_responses_sse_with_request_and_options(
+                    &upstream_sse,
+                    request_json,
+                    options,
+                )
+            }
         };
         crate::protocol_proxy::extract_terminal_response_object(&rewritten)
             .context("V2 候选流缺少终止响应")?
@@ -2523,6 +3098,13 @@ fn validate_remote_compaction_v2_bridge_candidate(
                     upstream_json,
                     request_json,
                     Some(diagnostic_id),
+                    options,
+                )?
+            }
+            UpstreamResponseProtocol::Gemini => {
+                gemini_interaction_to_response_with_request_and_options(
+                    upstream_json,
+                    request_json,
                     options,
                 )?
             }
@@ -3260,6 +3842,367 @@ impl AnthropicSseToResponsesConverter {
     }
 }
 
+pub struct GeminiInteractionsSseToResponsesConverter {
+    buffer: String,
+    utf8_remainder: Vec<u8>,
+    framing: SseTextFraming,
+    state: ChatSseState,
+    diagnostic_id: Option<String>,
+    failed: bool,
+    saw_completed: bool,
+    failure_source: Option<&'static str>,
+    failure_message: Option<String>,
+    failure_type: Option<String>,
+    tool_indices: BTreeMap<String, usize>,
+    next_tool_index: usize,
+}
+
+impl Default for GeminiInteractionsSseToResponsesConverter {
+    fn default() -> Self {
+        Self {
+            buffer: String::new(),
+            utf8_remainder: Vec::new(),
+            framing: SseTextFraming::default(),
+            state: ChatSseState::default(),
+            diagnostic_id: None,
+            failed: false,
+            saw_completed: false,
+            failure_source: None,
+            failure_message: None,
+            failure_type: None,
+            tool_indices: BTreeMap::new(),
+            next_tool_index: 0,
+        }
+    }
+}
+
+impl GeminiInteractionsSseToResponsesConverter {
+    pub fn with_request(original_request: &Value) -> Self {
+        Self::with_request_and_diagnostic_id(original_request, None)
+    }
+
+    pub fn with_request_and_diagnostic_id(
+        original_request: &Value,
+        diagnostic_id: Option<&str>,
+    ) -> Self {
+        let mut converter = Self {
+            state: ChatSseState::with_request(original_request),
+            diagnostic_id: diagnostic_id.map(ToString::to_string),
+            ..Self::default()
+        };
+        converter.state.response_id = format!(
+            "resp_gemini_{}",
+            diagnostic_id.unwrap_or("compat").replace('-', "_")
+        );
+        converter
+    }
+
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> Vec<u8> {
+        if self.failed {
+            return Vec::new();
+        }
+        self.framing
+            .append_bytes(&mut self.buffer, &mut self.utf8_remainder, bytes);
+        let mut output = String::new();
+        while let Some(block) = take_sse_block(&mut self.buffer) {
+            if !block.trim().is_empty() {
+                self.handle_block(&block, &mut output);
+            }
+            if self.failed {
+                break;
+            }
+        }
+        output.into_bytes()
+    }
+
+    pub fn finish(&mut self) -> Vec<u8> {
+        if !self.utf8_remainder.is_empty() {
+            self.buffer
+                .push_str(&String::from_utf8_lossy(&self.utf8_remainder));
+            self.utf8_remainder.clear();
+        }
+        let mut output = String::new();
+        if !self.failed && !self.buffer.trim().is_empty() {
+            let pending = std::mem::take(&mut self.buffer);
+            self.handle_block(&pending, &mut output);
+        }
+        if !self.failed && !self.state.completed {
+            if !self.saw_completed {
+                self.record_failure_into(
+                    &mut output,
+                    "missing_completion_marker",
+                    "Gemini Interactions stream ended before interaction.completed".to_string(),
+                    Some("stream_error".to_string()),
+                );
+            } else {
+                self.state.finalize_into(&mut output);
+            }
+        }
+        output.into_bytes()
+    }
+
+    pub fn fail(&mut self, message: String, error_type: Option<String>) -> Vec<u8> {
+        let mut output = String::new();
+        self.record_failure_into(&mut output, "stream_read_error", message, error_type);
+        output.into_bytes()
+    }
+
+    pub fn diagnostic_summary(&self) -> Value {
+        json!({
+            "diagnosticId": self.diagnostic_id.as_deref(),
+            "responseProtocol": "gemini",
+            "model": self.state.model,
+            "terminalStatus": stream_terminal_status(self.failed, self.state.completed),
+            "sawCompleted": self.saw_completed,
+            "failureSource": self.failure_source,
+            "failureType": self.failure_type,
+            "failureMessage": self.failure_message.as_deref().map(diagnostic_text_preview),
+        })
+    }
+
+    fn handle_block(&mut self, block: &str, output: &mut String) {
+        let mut event_name = None;
+        let mut data_parts = Vec::new();
+        for line in block.lines() {
+            if let Some(event) = strip_sse_field(line, "event") {
+                event_name = Some(event.trim().to_string());
+            }
+            if let Some(data) = strip_sse_field(line, "data") {
+                data_parts.push(data.to_string());
+            }
+        }
+        if data_parts.is_empty() {
+            return;
+        }
+        let data = data_parts.join("\n");
+        let Ok(chunk) = serde_json::from_str::<Value>(&data) else {
+            self.record_failure_into(
+                output,
+                "invalid_sse_json",
+                "Gemini Interactions stream sent invalid JSON data".to_string(),
+                Some("invalid_sse_json".to_string()),
+            );
+            return;
+        };
+        if event_name.as_deref() == Some("error")
+            || chunk.get("event_type").and_then(Value::as_str) == Some("error")
+            || upstream_response_has_error(&chunk)
+        {
+            let (message, error_type) = extract_chat_sse_error(&chunk);
+            self.record_failure_into(output, "upstream_sse_error", message, error_type);
+            return;
+        }
+        let event = event_name
+            .as_deref()
+            .or_else(|| chunk.get("event_type").and_then(Value::as_str))
+            .unwrap_or("");
+        match event {
+            "interaction.created" => {
+                let interaction = chunk.get("interaction").unwrap_or(&chunk);
+                if let Some(id) = interaction.get("id").and_then(Value::as_str) {
+                    self.state.response_id = response_id_from_chat_id(Some(id));
+                }
+                self.set_model_and_start(interaction, output);
+            }
+            "step.start" => self.handle_step_start(&chunk, output),
+            "step.delta" => self.handle_step_delta(&chunk, output),
+            "step.stop" => {
+                if let Some(usage) = chunk.get("usage").or_else(|| chunk.get("step_usage")) {
+                    self.state.latest_usage = Some(chat_usage_to_responses_usage(Some(usage)));
+                }
+            }
+            "interaction.completed" => {
+                self.saw_completed = true;
+                let interaction = chunk.get("interaction").unwrap_or(&chunk);
+                self.set_model_and_usage(interaction);
+                self.state.finish_reason = match interaction.get("status").and_then(Value::as_str) {
+                    Some("requires_action") => Some("tool_calls".to_string()),
+                    Some("incomplete") => Some("length".to_string()),
+                    _ => Some("stop".to_string()),
+                };
+                self.state.finalize_into(output);
+            }
+            "interaction.status_update" => {
+                if let Some(usage) = chunk.get("usage") {
+                    self.state.latest_usage = Some(chat_usage_to_responses_usage(Some(usage)));
+                }
+                if chunk.get("status").and_then(Value::as_str) == Some("failed") {
+                    let message = chunk
+                        .get("error")
+                        .and_then(|error| error.get("message"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("Gemini Interactions 请求失败")
+                        .to_string();
+                    self.record_failure_into(
+                        output,
+                        "upstream_sse_error",
+                        message,
+                        Some("upstream_error".to_string()),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn set_model_and_start(&mut self, interaction: &Value, output: &mut String) {
+        if let Some(model) = interaction.get("model").and_then(Value::as_str) {
+            self.state.model = model.to_string();
+        }
+        self.state.ensure_response_started_into(output);
+    }
+
+    fn set_model_and_usage(&mut self, interaction: &Value) {
+        if let Some(model) = interaction.get("model").and_then(Value::as_str) {
+            self.state.model = model.to_string();
+        }
+        if let Some(usage) = interaction.get("usage") {
+            self.state.latest_usage = Some(chat_usage_to_responses_usage(Some(usage)));
+        }
+    }
+
+    fn handle_step_start(&mut self, chunk: &Value, output: &mut String) {
+        let step = chunk.get("step").unwrap_or(chunk);
+        self.set_model_and_start(chunk.get("interaction").unwrap_or(&Value::Null), output);
+        match step.get("type").and_then(Value::as_str).unwrap_or("") {
+            "thought" => {
+                self.state.flush_inline_think_at_boundary_into(output);
+                self.state.finalize_text_into(output);
+                self.state.reasoning = ReasoningItemState::default();
+                self.state.ensure_reasoning_started_into(output);
+                if let Some(signature) = step.get("signature").and_then(Value::as_str) {
+                    self.state.reasoning.encrypted_content =
+                        Some(format!("{GEMINI_THOUGHT_REPLAY_PREFIX}{signature}"));
+                }
+            }
+            "function_call" => {
+                let id = step
+                    .get("id")
+                    .or_else(|| step.get("call_id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let name = step.get("name").and_then(Value::as_str).unwrap_or("");
+                let index = self.next_tool_index;
+                self.next_tool_index += 1;
+                self.tool_indices.insert(id.clone(), index);
+                if let Some(stream_index) = chunk.get("index") {
+                    self.tool_indices.insert(stream_index.to_string(), index);
+                }
+                let arguments = step
+                    .get("arguments")
+                    .filter(|value| !value.is_null())
+                    .map(canonical_json_string)
+                    .unwrap_or_default();
+                self.state.flush_inline_think_at_boundary_into(output);
+                self.state.finalize_reasoning_into(output);
+                self.state.push_tool_call_delta_into(
+                    &json!({
+                        "index": index,
+                        "id": id,
+                        "function": { "name": name, "arguments": arguments }
+                    }),
+                    output,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_step_delta(&mut self, chunk: &Value, output: &mut String) {
+        let delta = chunk.get("delta").unwrap_or(chunk);
+        match delta.get("type").and_then(Value::as_str).unwrap_or("") {
+            "text" => {
+                if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                    self.state.handle_chat_chunk_into(
+                        &json!({"model": self.state.model, "choices":[{"delta":{"content":text}}]}),
+                        output,
+                    );
+                }
+            }
+            "thought_summary" => {
+                let text = delta
+                    .get("text")
+                    .or_else(|| delta.get("summary"))
+                    .and_then(Value::as_str)
+                    .or_else(|| delta.pointer("/content/text").and_then(Value::as_str))
+                    .unwrap_or("");
+                if !text.is_empty() {
+                    self.state.push_reasoning_delta_into(text, output);
+                }
+            }
+            "thought_signature" => {
+                if let Some(signature) = delta.get("signature").and_then(Value::as_str) {
+                    self.state.reasoning.encrypted_content =
+                        Some(format!("{GEMINI_THOUGHT_REPLAY_PREFIX}{signature}"));
+                }
+            }
+            "arguments_delta" => {
+                let step_id = chunk
+                    .get("step")
+                    .and_then(|step| step.get("id"))
+                    .or_else(|| chunk.get("step_id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let index_key = chunk
+                    .get("index")
+                    .map(|value| value.to_string())
+                    .unwrap_or_default();
+                let index = self
+                    .tool_indices
+                    .get(step_id)
+                    .or_else(|| self.tool_indices.get(&index_key))
+                    .copied()
+                    .unwrap_or_else(|| {
+                        let index = self.next_tool_index;
+                        self.next_tool_index += 1;
+                        if !step_id.is_empty() {
+                            self.tool_indices.insert(step_id.to_string(), index);
+                        }
+                        if !index_key.is_empty() {
+                            self.tool_indices.insert(index_key, index);
+                        }
+                        index
+                    });
+                let arguments = delta.get("arguments").and_then(Value::as_str).unwrap_or("");
+                self.state.push_tool_call_delta_into(
+                    &json!({
+                        "index": index,
+                        "function": { "arguments": arguments }
+                    }),
+                    output,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn record_failure_into(
+        &mut self,
+        output: &mut String,
+        source: &'static str,
+        message: String,
+        error_type: Option<String>,
+    ) {
+        if self.state.completed {
+            return;
+        }
+        self.failure_source = Some(source);
+        self.failure_message = Some(message.clone());
+        self.failure_type = error_type.clone();
+        log_stream_conversion_failure(
+            "gemini",
+            self.diagnostic_id.as_deref(),
+            self.state.model.as_str(),
+            source,
+            error_type.as_deref(),
+            &message,
+        );
+        self.state.failed_into(output, message, error_type);
+        self.failed = true;
+    }
+}
+
 pub fn is_responses_proxy_path(path: &str) -> bool {
     let path = path.split_once('?').map_or(path, |(path, _)| path);
     matches!(
@@ -3863,6 +4806,13 @@ fn decode_compaction_response(
                     LayeredCompactionOptions::default(),
                 )
             }
+            UpstreamResponseProtocol::Gemini => {
+                gemini_interactions_sse_to_responses_sse_with_request_and_options(
+                    &text,
+                    conversion_context,
+                    LayeredCompactionOptions::default(),
+                )
+            }
         };
         let (response, verdict) = crate::layered_compaction::validate_compaction_sse(&converted);
         Ok((response.context("压缩流没有唯一终止响应")?, verdict))
@@ -3882,6 +4832,13 @@ fn decode_compaction_response(
                     response,
                     conversion_context,
                     Some(&upstream.diagnostic_id),
+                    LayeredCompactionOptions::default(),
+                )
+            }
+            UpstreamResponseProtocol::Gemini => {
+                gemini_interaction_to_response_with_request_and_options(
+                    response,
+                    conversion_context,
                     LayeredCompactionOptions::default(),
                 )
             }
@@ -4824,6 +5781,16 @@ async fn send_responses_upstream_request(
             )
             .await
         }
+        UpstreamResponseProtocol::Gemini => {
+            send_gemini_interactions_request(
+                client,
+                relay,
+                &upstream_request,
+                is_stream,
+                header_timeout,
+            )
+            .await
+        }
     }?;
     Ok((response, upstream_request, false))
 }
@@ -4845,6 +5812,9 @@ fn responses_upstream_request_for_protocol(
                 Some(diagnostic_id),
             )?;
             Ok(request)
+        }
+        UpstreamResponseProtocol::Gemini => {
+            responses_to_gemini_interactions(responses_request_with_stream(request_json, is_stream))
         }
     }
 }
@@ -4893,6 +5863,7 @@ fn upstream_endpoint_for_protocol(
         UpstreamResponseProtocol::Responses => responses_url(&relay.base_url),
         UpstreamResponseProtocol::ChatCompletions => chat_completions_url(&relay.base_url),
         UpstreamResponseProtocol::Anthropic => anthropic_messages_url(&relay.base_url),
+        UpstreamResponseProtocol::Gemini => gemini_interactions_url(&relay.base_url),
     }
 }
 
@@ -4922,6 +5893,7 @@ fn response_protocol_for_relay_protocol(
             UpstreamResponseProtocol::ChatCompletions
         }
         crate::settings::RelayProtocol::Anthropic => UpstreamResponseProtocol::Anthropic,
+        crate::settings::RelayProtocol::Gemini => UpstreamResponseProtocol::Gemini,
     }
 }
 
@@ -4947,6 +5919,28 @@ async fn send_anthropic_messages_request(
         header_timeout,
     )
     .await
+}
+
+async fn send_gemini_interactions_request(
+    client: &reqwest::Client,
+    relay: &crate::settings::RelayProfile,
+    gemini_request: &Value,
+    is_stream: bool,
+    header_timeout: Option<Duration>,
+) -> anyhow::Result<reqwest::Response> {
+    let mut builder = client
+        .post(gemini_interactions_url(&relay.base_url))
+        .header("x-goog-api-key", relay.api_key.trim())
+        .header("Api-Revision", "2026-05-20")
+        .header(reqwest::header::CONTENT_TYPE, "application/json");
+    if is_stream {
+        builder = builder.query(&[("alt", "sse")]);
+        builder = builder
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .header(reqwest::header::CACHE_CONTROL, "no-cache");
+    }
+    send_upstream_request_with_optional_header_timeout(builder.json(gemini_request), header_timeout)
+        .await
 }
 
 pub async fn open_models_proxy_request(
@@ -5370,6 +6364,9 @@ fn buffered_upstream_response_as_responses_sse(
             UpstreamResponseProtocol::Anthropic => {
                 anthropic_message_to_response_with_request(value, original_request)?
             }
+            UpstreamResponseProtocol::Gemini => {
+                gemini_interaction_to_response_with_request(value, original_request)?
+            }
         };
         let status = response
             .get("status")
@@ -5526,6 +6523,13 @@ fn buffered_upstream_response_as_responses_sse(
         }
         UpstreamResponseProtocol::Anthropic => {
             anthropic_sse_to_responses_sse_with_request(text, original_request)
+        }
+        UpstreamResponseProtocol::Gemini => {
+            gemini_interactions_sse_to_responses_sse_with_request_and_options(
+                text,
+                original_request,
+                LayeredCompactionOptions::default(),
+            )
         }
     })
 }
@@ -5922,6 +6926,14 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
                 )
                 .into_bytes()
             }
+            UpstreamResponseProtocol::Gemini => {
+                gemini_interactions_sse_to_responses_sse_with_request_and_options(
+                    &text,
+                    &request_json,
+                    layered_compaction_options,
+                )
+                .into_bytes()
+            }
             UpstreamResponseProtocol::Responses => unreachable!(),
         };
         return Ok(ProxyHttpResponse {
@@ -5981,6 +6993,13 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
                     upstream_json,
                     &request_json,
                     Some(&diagnostic_id),
+                    layered_compaction_options,
+                )
+            }
+            UpstreamResponseProtocol::Gemini => {
+                gemini_interaction_to_response_with_request_and_options(
+                    upstream_json,
+                    &request_json,
                     layered_compaction_options,
                 )
             }
@@ -6079,6 +7098,25 @@ pub fn anthropic_messages_url(base_url: &str) -> String {
     url
 }
 
+pub fn gemini_interactions_url(base_url: &str) -> String {
+    let base = base_url.trim().trim_end_matches('#').trim_end_matches('/');
+    if base.to_ascii_lowercase().ends_with("/interactions") {
+        return base.to_string();
+    }
+    let origin_only = base
+        .split_once("://")
+        .map_or(!base.contains('/'), |(_, rest)| !rest.contains('/'));
+    let mut url = if has_version_suffix(base) || !origin_only {
+        format!("{base}/interactions")
+    } else {
+        format!("{base}/v1beta/interactions")
+    };
+    while url.contains("/v1beta/v1beta/") {
+        url = url.replace("/v1beta/v1beta/", "/v1beta/");
+    }
+    url
+}
+
 pub fn models_url(base_url: &str) -> String {
     let skip_version_prefix = base_url.trim().ends_with('#');
     let mut base = base_url
@@ -6086,7 +7124,12 @@ pub fn models_url(base_url: &str) -> String {
         .trim_end_matches('#')
         .trim_end_matches('/')
         .to_string();
-    for endpoint in ["/chat/completions", "/responses", "/messages"] {
+    for endpoint in [
+        "/chat/completions",
+        "/responses",
+        "/messages",
+        "/interactions",
+    ] {
         if base.to_ascii_lowercase().ends_with(endpoint) {
             base.truncate(base.len() - endpoint.len());
             break;
@@ -6182,6 +7225,19 @@ fn anthropic_sse_to_responses_sse_with_request_diagnostic_id_and_options(
         original_request,
         diagnostic_id,
     );
+    let mut output = converter.push_bytes(input.as_bytes());
+    output.extend(converter.finish());
+    let converted = String::from_utf8(output).unwrap_or_default();
+    rewrite_remote_compaction_v2_sse_with_options(original_request, converted.clone(), options)
+        .unwrap_or(converted)
+}
+
+fn gemini_interactions_sse_to_responses_sse_with_request_and_options(
+    input: &str,
+    original_request: &Value,
+    options: LayeredCompactionOptions,
+) -> String {
+    let mut converter = GeminiInteractionsSseToResponsesConverter::with_request(original_request);
     let mut output = converter.push_bytes(input.as_bytes());
     output.extend(converter.finish());
     let converted = String::from_utf8(output).unwrap_or_default();
@@ -13281,18 +14337,21 @@ fn chat_usage_to_responses_usage(usage: Option<&Value>) -> Value {
         .get("prompt_tokens")
         .or_else(|| usage.get("input_tokens"))
         .or_else(|| usage.get("promptTokenCount"))
+        .or_else(|| usage.get("total_input_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let output_tokens = usage
         .get("completion_tokens")
         .or_else(|| usage.get("output_tokens"))
         .or_else(|| usage.get("candidatesTokenCount"))
+        .or_else(|| usage.get("total_output_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let cached_tokens = usage
         .pointer("/prompt_tokens_details/cached_tokens")
         .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
         .or_else(|| usage.get("cachedContentTokenCount"))
+        .or_else(|| usage.get("total_cached_tokens"))
         .or_else(|| usage.get("cache_read_input_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
@@ -13327,6 +14386,9 @@ fn chat_usage_to_responses_usage(usage: Option<&Value>) -> Value {
         "output_tokens_details": responses_output_tokens_details_from_usage(usage),
         "total_tokens": input_tokens.saturating_add(output_tokens)
     });
+    if let Some(total_tokens) = usage.get("total_tokens").and_then(Value::as_u64) {
+        result["total_tokens"] = json!(total_tokens);
+    }
 
     if let Some(cache_read) = usage.get("cache_read_input_tokens") {
         result["cache_read_input_tokens"] = cache_read.clone();
@@ -13449,6 +14511,8 @@ fn responses_output_tokens_details_from_usage(usage: &Value) -> Value {
                 .and_then(Value::as_u64)
         })
         .or_else(|| usage.get("thinking_tokens").and_then(Value::as_u64));
+    let thinking_tokens =
+        thinking_tokens.or_else(|| usage.get("total_thought_tokens").and_then(Value::as_u64));
     let reasoning_tokens = details
         .get("reasoning_tokens")
         .and_then(Value::as_u64)

@@ -1340,6 +1340,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "elves-manager"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "elves-core",
+ "elves-data",
+ "fs2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tauri",
+ "tauri-build",
+ "tokio",
+]
+
+[[package]]
 name = "embed-resource"
 version = "3.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"

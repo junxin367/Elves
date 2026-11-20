@@ -24,7 +24,6 @@ import {
 import { app, connected, creating, nativeConnectionVersion, selectedId, session, sidebar } from "../core/state.js";
 import { api } from "./api.js";
 import { disposeMainNavigation, isElvesClient, mountMainNavigation } from "./main-navigation.js";
-import { createManagementPages } from "./management-frame.js";
 import { mountSettingsPage } from "./appearance/dialog.js";
 import { mountScheduledTasksPage } from "./scheduled-tasks.js";
 import { setApprovalSignature } from "./approval-state.js";
@@ -424,8 +423,7 @@ export function shell() {
     workspace,
     openSettings: mountSettingsPage,
     openScheduledTasks: mountScheduledTasksPage,
-    logout,
-    openPage: createManagementPages()
+    logout
   });
   $("#connection-state").onclick = refreshConnectionFromIndicator;
   const toolsTrigger = $("#open-session-tools");
