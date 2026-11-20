@@ -12778,6 +12778,16 @@ function sideCreationNavigationHarness() {
     async complete(operation) { creationReply.resolve(result); await operation.promise; await settle(); } };
 }
 
+test("再次点击当前会话也提交已读，不能被同会话快速返回路径跳过", async () => {
+  const h = sideCreationNavigationHarness(), reads = [];
+  h.context.markVisibleThreadRead = async (...args) => reads.push(args);
+  h.context.thread = { id: "main", title: "M", status: { type: "idle" }, hasUnreadTurn: true };
+  await h.context.selectThread("main");
+  assert.equal(reads.length, 1);
+  assert.equal(reads[0][0], "main");
+  assert.equal(reads[0][1].opened, true);
+});
+
 test("PC 打开侧边会话交给右侧标签，不切换主会话、不改主草稿和历史", async () => {
   const h = sideCreationNavigationHarness(), opened = [];
   const beforeHistory = JSON.stringify(h.historyEntries), beforeDraft = h.prompt.value;

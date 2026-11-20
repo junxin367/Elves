@@ -169,6 +169,10 @@ export async function selectThread(id, { closeSidebar = true, force = false, rel
     if (selectedThreadReadIncomplete() && !selectionController && !threadRequest && !historyRequest)
       await reloadThread();
     if (focusRelatedInput) syncRequestedSideInput();
+    // 用户要求当前会话再次点击也能立即清除蓝点；同一会话的快速路径不会重新读取详情，
+    // 因此这里必须复用已读提交，不能只依赖首次切换会话的异步流程。
+    if (!isActiveThread())
+      void markVisibleThreadRead(id, { opened: true }).catch(error => notice(error.message, true));
     return;
   }
   stopGoalLiveTimer();
