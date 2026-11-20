@@ -101,7 +101,9 @@ pub use management::{
 };
 pub use service::{
     ensure_running as ensure_service_running, owns_service,
-    prepare_shutdown as prepare_service_shutdown, run as run_service, set_service_executable,
+    prepare_shutdown as prepare_service_shutdown,
+    prepare_shutdown_status as prepare_service_shutdown_status, run as run_service,
+    set_service_executable,
 };
 use zrok_tunnel::ZrokTunnelService;
 
@@ -123,6 +125,8 @@ const MAX_INPUT_IMAGES_TOTAL_BYTES: usize = 12 * 1024 * 1024;
 // 原有图片最多 12 MiB，新增本地文件/目录另限 12 MiB；base64 为 4/3，再为目录清单和消息保留 4 MiB。
 const MAX_ACTION_BODY_BYTES: usize = 36 * 1024 * 1024;
 static CONTROLLER: OnceLock<Arc<HarnessController>> = OnceLock::new();
+// 安装器只对“明确仍在执行”的结果重试；连接断开、旧服务和未知结果继续中止，避免覆盖运行中的程序。
+pub const SERVICE_SHUTDOWN_BUSY_EXIT_CODE: i32 = 10;
 static STARTUP_ERROR: OnceLock<std::sync::Mutex<Option<String>>> = OnceLock::new();
 static WEB_ASSETS: OnceLock<HashMap<&'static str, StaticWebAsset>> = OnceLock::new();
 

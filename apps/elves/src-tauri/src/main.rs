@@ -12,7 +12,28 @@ fn main() {
             .and_then(|runtime| {
                 runtime.block_on(async {
                     if shutdown {
-                        elves_harness::prepare_service_shutdown("installer").await?;
+                        let response =
+                            elves_harness::prepare_service_shutdown_status("installer").await?;
+                        match response["status"].as_str() {
+                            Some("stopped" | "not_running") => {}
+                            Some("busy") => {
+                                // 安装器可等待明确的执行中状态；未知、旧服务和连接错误不进入重试。
+                                let _ = elves_core::diagnostic_log::append_diagnostic_log(
+                                    "harness.installer_shutdown_busy",
+                                    serde_json::json!({
+                                        "status":"busy",
+                                        "message":response["message"]
+                                    }),
+                                );
+                                std::process::exit(elves_harness::SERVICE_SHUTDOWN_BUSY_EXIT_CODE);
+                            }
+                            _ => {
+                                let message = response["message"]
+                                    .as_str()
+                                    .unwrap_or("远程后台未确认安全退出，请等待当前任务完成后重试");
+                                anyhow::bail!("{message}");
+                            }
+                        }
                     } else {
                         #[cfg(windows)]
                         {

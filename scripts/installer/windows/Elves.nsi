@@ -30,6 +30,11 @@ SetCompressor /SOLID lzma
 !insertmacro MUI_LANGUAGE "SimpChinese"
 !insertmacro MUI_LANGUAGE "English"
 Var LegacyInstallDir
+Var ShutdownAttempt
+; 用户要求安装体验恢复为可连续完成：仅对明确 busy 结果等待，最多 5 分钟；未知结果仍中止，不强杀执行中的 Codex。
+!define SHUTDOWN_BUSY_EXIT_CODE 10
+!define SHUTDOWN_RETRY_LIMIT 150
+!define SHUTDOWN_RETRY_DELAY_MS 2000
 Function .onInit
   ; 旧品牌只用于迁移，不继续创建旧产品入口或覆盖用户数据。
   ReadRegStr $LegacyInstallDir HKCU "Software\CodexElves" "InstallDir"
@@ -81,18 +86,31 @@ FunctionEnd
   nsExec::ExecToLog 'taskkill /IM elves.exe /F'
   Pop $0
 !macroend
+!macro PrepareShutdown EXECUTABLE LABEL OPERATION
+  StrCpy $ShutdownAttempt 0
+  ${LABEL}_shutdown_retry:
+    nsExec::ExecToLog '"${EXECUTABLE}" --prepare-shutdown'
+    Pop $0
+    ${If} $0 == ${SHUTDOWN_BUSY_EXIT_CODE}
+      IntOp $ShutdownAttempt $ShutdownAttempt + 1
+      ${If} $ShutdownAttempt >= ${SHUTDOWN_RETRY_LIMIT}
+        DetailPrint "Codex 持续执行，等待安全空闲超时，${OPERATION}已中止，请稍后重试。"
+        Abort
+      ${EndIf}
+      DetailPrint "Codex 正在执行，等待安全完成... ($ShutdownAttempt/${SHUTDOWN_RETRY_LIMIT})"
+      Sleep ${SHUTDOWN_RETRY_DELAY_MS}
+      Goto ${LABEL}_shutdown_retry
+    ${ElseIf} $0 != 0
+      DetailPrint "Codex 或 Harness 未确认安全退出，${OPERATION}已中止，请稍后重试。"
+      Abort
+    ${EndIf}
+!macroend
 Section "Install"
   InitPluginsDir
   SetOutPath "$PLUGINSDIR"
   ; 退出 helper 只是同一 Elves 程序的临时副本，不作为第二个应用安装。
   File /oname=elves-shutdown-helper.exe "${ROOT}\dist\windows\app\elves.exe"
-  nsExec::ExecToLog '"$PLUGINSDIR\elves-shutdown-helper.exe" --prepare-shutdown'
-  Pop $0
-  ${If} $0 != 0
-    ; 用户要求执行中的 Codex 不得因安装被重启；忙碌、超时、旧服务或未知结果均中止安装。
-    DetailPrint "Codex 或 Harness 尚未确认安全空闲，安装已中止，请等待当前任务完成后重试。"
-    Abort
-  ${EndIf}
+  !insertmacro PrepareShutdown "$PLUGINSDIR\elves-shutdown-helper.exe" install "安装"
   !insertmacro StopElves
   SetOutPath "$INSTDIR"
   !insertmacro RemoveLegacyPrograms "$INSTDIR"
@@ -121,13 +139,7 @@ Section "Install"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Elves" "UninstallString" "$INSTDIR\uninstall.exe"
 SectionEnd
 Section "Uninstall"
-  nsExec::ExecToLog '"$INSTDIR\elves.exe" --prepare-shutdown'
-  Pop $0
-  ; 用户要求执行中的 Codex 不得因卸载被强制结束；未确认安全空闲时保留现有程序。
-  ${If} $0 != 0
-    DetailPrint "Codex 或 Harness 尚未确认安全空闲，卸载已中止，请等待当前任务完成后重试。"
-    Abort
-  ${EndIf}
+  !insertmacro PrepareShutdown "$INSTDIR\elves.exe" uninstall "卸载"
   !insertmacro StopElves
   !insertmacro RemoveLegacyPrograms "$INSTDIR"
   !insertmacro RemoveLegacyShortcuts

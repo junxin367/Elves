@@ -46,10 +46,7 @@ pub fn owns_service() -> bool {
 }
 
 fn shutdown_response_is_safe(value: &Value) -> bool {
-    matches!(
-        value["status"].as_str(),
-        Some("stopped" | "not_running")
-    )
+    matches!(value["status"].as_str(), Some("stopped" | "not_running"))
 }
 
 fn client_process_running() -> bool {
@@ -331,7 +328,7 @@ async fn request(endpoint: &Endpoint, action: &str, payload: &Value) -> anyhow::
     response.json().await.context("Harness 后台返回了无效状态")
 }
 
-pub async fn prepare_shutdown(reason: &str) -> anyhow::Result<Value> {
+pub async fn prepare_shutdown_status(reason: &str) -> anyhow::Result<Value> {
     let directory = crate::paths::default_app_state_dir();
     super::claude::remember_shutdown(&directory, reason)?;
     let Some(endpoint) = load_endpoint_any(&directory)? else {
@@ -352,15 +349,16 @@ pub async fn prepare_shutdown(reason: &str) -> anyhow::Result<Value> {
         // 安装包用新 helper 请求旧服务时不恢复旧桥接；旧版无法响应的清理保留到新服务启动。
         return Ok(json!({"status":"legacy_service","cleanup":"pending_startup_check"}));
     }
-    let value = request(&endpoint, "prepareShutdown", &json!({"reason":reason})).await?;
+    request(&endpoint, "prepareShutdown", &json!({"reason":reason})).await
+}
+
+pub async fn prepare_shutdown(reason: &str) -> anyhow::Result<Value> {
+    let value = prepare_shutdown_status(reason).await?;
     let message = value["message"]
         .as_str()
         .unwrap_or("远程后台未确认安全退出，请等待当前任务完成后重试")
         .to_owned();
-    anyhow::ensure!(
-        shutdown_response_is_safe(&value),
-        "{message}"
-    );
+    anyhow::ensure!(shutdown_response_is_safe(&value), "{message}");
     Ok(value)
 }
 
