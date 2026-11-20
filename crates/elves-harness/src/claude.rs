@@ -563,6 +563,11 @@ impl Claude {
                 "Claude 会话类型或身份无效，未改写记录"
             );
             conversation.remote_queue.recover();
+            conversation.remote_queue.pause_for_version_recovery(
+                conversation.native_control["versionRecovery"]["reason"]
+                    .as_str()
+                    .unwrap_or_default(),
+            );
             if conversation.shared {
                 // 兼容旧版曾被其他状态写入带入的临时记录，升级后只从原生日志恢复正文。
                 for turn in &mut conversation.turns {
@@ -2973,6 +2978,11 @@ impl Claude {
                 if frame["native_control"].is_object() {
                     c.native_control = frame["native_control"].clone();
                     c.apply_native_settings(&frame["native_control"]["settings"]);
+                    c.remote_queue.pause_for_version_recovery(
+                        c.native_control["versionRecovery"]["reason"]
+                            .as_str()
+                            .unwrap_or_default(),
+                    );
                 }
                 let previous_queue = c.queue_snapshot(&self.epoch);
                 c.native_id = native_id.into();

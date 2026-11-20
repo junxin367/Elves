@@ -267,6 +267,34 @@ impl RemoteQueue {
         }
     }
 
+    pub(super) fn pause_for_version_recovery(&mut self, reason: &str) {
+        let Some(reason) = (match reason {
+            "native_draft" => Some("Claude 终端有未发送草稿，请先处理后重试"),
+            "interaction_unknown" => Some("无法确认 Claude 原生输入状态，请在原生终端核对后重试"),
+            _ => None,
+        }) else {
+            return;
+        };
+        let mut changed = false;
+        for message in &mut self.messages {
+            // 有原生派发意图的消息仍需核对送达结果，不能因版本提示覆盖成可重试暂停。
+            if !message.direct
+                && message.native_intent.is_none()
+                && matches!(message.state.as_str(), "queued" | "sending" | "unknown")
+            {
+                message.state = "paused".into();
+                message.reason = reason.into();
+                changed = true;
+            }
+        }
+        if changed {
+            self.paused = true;
+            self.awaiting_turn = None;
+            self.awaiting_started = false;
+            self.revision += 1;
+        }
+    }
+
     pub(super) fn native_intents(&self) -> Vec<Value> {
         self.messages
             .iter()
@@ -363,10 +391,20 @@ impl Conversation {
             "queuedEdits":self.remote_queue.edits(),"queuePaused":self.remote_queue.paused})
     }
 
+    fn version_recovery_blocks_auto_send(&self) -> bool {
+        self.native_control["versionRecovery"]["state"] == "pending"
+            && matches!(
+                self.native_control["versionRecovery"]["reason"].as_str(),
+                Some("native_draft" | "interaction_unknown")
+            )
+    }
+
     fn can_auto_send(&self) -> bool {
         self.shared
             && !self.deleted
             && !self.active()
+            // 原生草稿或输入状态未知时必须等用户处理，不能由 750ms 自动轮询反复触发版本恢复。
+            && !self.version_recovery_blocks_auto_send()
             && !matches!(
                 self.native_control["compaction"]["state"].as_str(),
                 Some("pending" | "running" | "unknown")
@@ -793,6 +831,12 @@ impl Claude {
                     .is_some_and(|e| !e.dispatched)
         });
         let deferred = result.as_ref().is_ok_and(|r| r["deferred"] == true);
+        let manual_version_recovery = result.as_ref().is_ok_and(|r| {
+            matches!(
+                r["versionRecovery"]["reason"].as_str(),
+                Some("native_draft" | "interaction_unknown")
+            )
+        });
         self.change(|saved| {
             let c = saved
                 .conversations
@@ -814,14 +858,34 @@ impl Claude {
             }
             if deferred {
                 c.remote_queue.awaiting_turn = None;
+                c.remote_queue.awaiting_started = false;
                 if let Some(m) = c
                     .remote_queue
                     .messages
                     .iter_mut()
                     .find(|m| m.id == message.id)
                 {
-                    m.state = "queued".into();
+                    // 版本恢复遇到原生草稿或无法确认输入画面时转为暂停，避免旧运行时或后台轮询把
+                    // 同一条消息永久显示为 sending；执行中的版本错位仍保留 queued 以便自动等待。
+                    m.state = if manual_version_recovery {
+                        "paused".into()
+                    } else {
+                        "queued".into()
+                    };
                     m.direct = false;
+                    m.reason = match manual_version_recovery {
+                        true if result
+                            .as_ref()
+                            .is_ok_and(|r| r["versionRecovery"]["reason"] == "native_draft") =>
+                        {
+                            "Claude 终端有未发送草稿，请先处理后重试".into()
+                        }
+                        true => "无法确认 Claude 原生输入状态，请在原生终端核对后重试".into(),
+                        false => String::new(),
+                    };
+                }
+                if manual_version_recovery {
+                    c.remote_queue.paused = true;
                 }
             } else if result.is_ok() {
                 if message.compact {
@@ -1190,6 +1254,7 @@ mod tests {
     enum Reply {
         Accepted,
         Deferred,
+        DeferredNativeDraft,
         Rejected,
         ControlRejected,
         Unknown,
@@ -1355,6 +1420,10 @@ mod tests {
                     ),
                     Reply::Accepted => Ok(json!({"accepted":true})),
                     Reply::Deferred => Ok(json!({"deferred":true,"accepted":false})),
+                    Reply::DeferredNativeDraft => Ok(json!({
+                        "deferred":true,"accepted":false,
+                        "versionRecovery":{"state":"pending","reason":"native_draft"}
+                    })),
                     Reply::Rejected => Err(ApiError::new(409, "尚未投递").into()),
                     Reply::ControlRejected => Err(ApiError::new(
                         503,
@@ -2552,6 +2621,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(calls.lock().await.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn version_recovery_draft_pauses_queue_and_blocks_auto_retry() {
+        let (_directory, _auth_directory, service, c, auth, calls, replies) = fixture().await;
+        service
+            .change(|saved| {
+                let current = saved.conversations.get_mut(&c.id).unwrap();
+                current.native_status = json!({"tempo":"idle"});
+                current.turns.last_mut().unwrap()["status"] = json!("completed");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        replies.lock().await.push_back(Reply::DeferredNativeDraft);
+        let result = service
+            .command("send", &payload(&c, "draft-blocked"), &auth)
+            .await
+            .unwrap();
+        assert_eq!(result["deliveryState"], "queued");
+        let current = service.conversation(&c.id).await.unwrap();
+        assert!(current.remote_queue.paused);
+        assert_eq!(current.remote_queue.messages[0].state, "paused");
+        assert_eq!(
+            current.remote_queue.messages[0].reason,
+            "Claude 终端有未发送草稿，请先处理后重试"
+        );
+        assert!(current.remote_queue.awaiting_turn.is_none());
+
+        service
+            .change(|saved| {
+                let current = saved.conversations.get_mut(&c.id).unwrap();
+                current.remote_queue.paused = false;
+                current.remote_queue.messages[0].state = "queued".into();
+                current.remote_queue.messages[0].reason.clear();
+                current.native_control = json!({
+                    "versionRecovery":{"state":"pending","reason":"native_draft"}
+                });
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let mut restored = service.conversation(&c.id).await.unwrap();
+        restored
+            .remote_queue
+            .pause_for_version_recovery("native_draft");
+        assert_eq!(restored.remote_queue.messages[0].state, "paused");
+        assert!(restored.remote_queue.paused);
+        service.drain_remote_queues().await;
+        assert_eq!(
+            calls.lock().await.len(),
+            1,
+            "旧持久化状态也不能在原生草稿存在时循环重试"
+        );
     }
 
     #[tokio::test]
