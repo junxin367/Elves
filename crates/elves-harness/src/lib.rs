@@ -76,7 +76,7 @@ mod image_preview;
 mod input_files;
 mod instance_settings;
 mod instances;
-mod management;
+mod local_proof;
 mod ngrok_tunnel;
 mod open_in;
 mod permissions;
@@ -95,10 +95,6 @@ mod zrok_tunnel;
 use credentials::{AccessKey, AccessKeyStore, lock_access_key_store};
 pub use credentials::{access_credentials_status, configure_access_key};
 pub use frp_tunnel::program_directory as frp_program_directory;
-pub use management::{
-    ManagementConflict, ManagementFuture, publish_updated as publish_management_updated,
-    register_handler as register_management_handler,
-};
 pub use service::{
     ensure_running as ensure_service_running, owns_service,
     prepare_shutdown as prepare_service_shutdown,
@@ -2921,11 +2917,7 @@ fn build_app_resources_manifest(
 ) -> AppResourcesManifest {
     let mut files: Vec<_> = assets
         .iter()
-        .filter(|(path, _)| {
-            // 管理页由本机客户端通过独立 iframe 直接加载，不属于 Service Worker 版本壳；
-            // 即使桌面端保留管理页路由，也必须从资源清单排除，否则任一管理页文件都会使清单校验失败。
-            !management_page_path(path) && (desktop || !desktop_only_web_page(path))
-        })
+        .filter(|(path, _)| desktop || !desktop_only_web_page(path))
         .map(|(path, asset)| AppResourceFile {
             path: (*path).to_string(),
             content_type: asset.content_type.to_string(),
@@ -2985,19 +2977,11 @@ fn app_resources_asset(desktop: bool) -> &'static StaticWebAsset {
     })
 }
 
-fn management_page_path(path: &str) -> bool {
-    path == "/management" || path.starts_with("/management/")
-}
-
-fn management_request_path(path: &str) -> bool {
-    management_page_path(path) || path == "/api/management" || path.starts_with("/api/management/")
-}
-
 // 独立文件窗口只由本机客户端打开；远程资源清单与 PWA、Android 缓存拦截要同时排除此页面。
 const PREVIEW_WINDOW_PATH: &str = "/file-preview.html";
 
 fn desktop_only_web_page(path: &str) -> bool {
-    management_page_path(path) || path == PREVIEW_WINDOW_PATH
+    path == PREVIEW_WINDOW_PATH
 }
 
 fn strong_etag(bytes: &[u8]) -> HeaderValue {
@@ -3205,11 +3189,6 @@ fn scoped_router(
         .route("/api/channels", get(channels::discover))
         .route("/api/channel-events", get(channels::catch_up))
         .route("/api/logout", post(logout))
-        // 供应商配置包含完整 TOML/JSON 与模型表；同一授权校验下允许最多 4 MiB，避免沿用普通 API 的 256 KiB 上限。
-        .route(
-            "/api/management/{command}",
-            post(management::command).layer(DefaultBodyLimit::max(4 * 1024 * 1024)),
-        )
         .route(
             "/api/diagnostics",
             post(diagnostics::upload).layer(DefaultBodyLimit::max(diagnostics::MAX_BODY_BYTES)),
@@ -3482,9 +3461,7 @@ async fn access_boundary_response(
     next: Next,
 ) -> Response {
     let path = request.uri().path();
-    let desktop_only_message = if management_request_path(path) {
-        Some("管理功能仅可在 Elves 独立客户端使用")
-    } else if path == PREVIEW_WINDOW_PATH {
+    let desktop_only_message = if path == PREVIEW_WINDOW_PATH {
         Some("独立预览仅可在 Elves 本机客户端使用")
     } else if path == "/api/desktop/input-files" || path.starts_with("/api/desktop/input-files/") {
         Some("本机附件暂存仅可在 Elves 独立客户端使用")
@@ -3675,9 +3652,8 @@ async fn access_boundary_response(
         external_public,
         external_https,
     });
-    let private_api = management_page_path(&path)
-        || (path == "/api" || path.starts_with("/api/"))
-            && !matches!(path.as_str(), "/api/connect" | "/api/login-status");
+    let private_api = (path == "/api" || path.starts_with("/api/"))
+        && !matches!(path.as_str(), "/api/connect" | "/api/login-status");
     let private_image = path.starts_with("/api/images/")
         || path.starts_with("/api/videos/") && path.ends_with("/poster");
     // Reject unauthorized uploads before JSON/body extraction and before routing.
@@ -3798,7 +3774,7 @@ async fn connect(
     if !state.controller.accepting_requests() {
         return Err(ApiError::new(503, "服务已关闭"));
     }
-    let local_owner = management::consume_local_proof(&state, &headers, trust, peer, &payload)?;
+    let local_owner = local_proof::consume_local_proof(&state, &headers, trust, peer, &payload)?;
     if state.desktop {
         if !local_owner {
             return Err(ApiError::new(403, "Elves 本机入口只接受 Harness 启动证明"));
@@ -4097,8 +4073,8 @@ async fn session(
         json!(state.desktop && device.key_id == desktop::DEVICE_KEY_ID && native_write_available);
     response["capabilities"]["sideIdleRelease"] = json!(true);
     response["transport"] = json!(if state.desktop { "desktop" } else { "remote" });
-    // 管理权限由服务端真实入口决定，普通网页或 Android 不能通过伪造客户端标记取得能力。
-    response["capabilities"]["management"] = json!(state.desktop && management::available());
+    // 代理设置和会话管理已迁移到独立管理器；Harness 不再声明管理页面或管理 API 能力。
+    response["capabilities"]["management"] = json!(false);
     Ok(Json(response))
 }
 
@@ -18613,12 +18589,14 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
         assert!(paths.iter().all(|path| !path.starts_with("/api/")));
         assert!(paths.contains(&"/session-files.js"));
         let desktop_manifest = build_app_resources_manifest(web_assets(), true);
-        assert!(web_assets().contains_key("/management/index.html"));
+        assert!(!web_assets()
+            .keys()
+            .any(|path| path.starts_with("/management")));
         assert!(
             desktop_manifest
                 .files
                 .iter()
-                .all(|file| !management_page_path(&file.path))
+                .all(|file| !file.path.starts_with("/management"))
         );
         assert!(
             desktop_manifest

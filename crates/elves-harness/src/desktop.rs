@@ -51,7 +51,7 @@ impl HarnessController {
             self.desktop_running.load(Ordering::Acquire),
             "Harness 本机入口尚未就绪"
         );
-        let mut value = management::issue_local_proof(&self.state_dir);
+        let mut value = local_proof::issue_local_proof(&self.state_dir);
         value["url"] = json!(format!(
             "http://127.0.0.1:{}/",
             self.desktop_port.load(Ordering::Acquire)
@@ -363,7 +363,7 @@ mod tests {
     #[tokio::test]
     async fn desktop_proof_is_single_use_and_rejected_on_remote_transport() {
         let (directory, state) = fixture();
-        let proof = management::issue_local_proof(directory.path());
+        let proof = local_proof::issue_local_proof(directory.path());
         let payload = json!({"localProof": proof["proof"]});
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:45223"));
@@ -371,7 +371,7 @@ mod tests {
         remote.desktop = false;
         let peer = "127.0.0.1:50000".parse().unwrap();
         assert_eq!(
-            management::consume_local_proof(
+            local_proof::consume_local_proof(
                 &remote,
                 &headers,
                 RequestTrustContext::default(),
@@ -383,7 +383,7 @@ mod tests {
             403
         );
         assert!(
-            management::consume_local_proof(
+            local_proof::consume_local_proof(
                 &state,
                 &headers,
                 RequestTrustContext::default(),
@@ -393,7 +393,7 @@ mod tests {
             .unwrap()
         );
         assert_eq!(
-            management::consume_local_proof(
+            local_proof::consume_local_proof(
                 &state,
                 &headers,
                 RequestTrustContext::default(),
@@ -506,7 +506,7 @@ mod tests {
                 .status(),
             403
         );
-        let proof = management::issue_local_proof(&controller.state_dir);
+        let proof = local_proof::issue_local_proof(&controller.state_dir);
         let connected = client
             .post(format!("{local_url}/api/connect"))
             .header("Origin", &local_url)
@@ -605,44 +605,24 @@ mod tests {
         assert_eq!(
             client
                 .get(format!("{local_url}/management/index.html"))
-                .send()
-                .await
-                .unwrap()
-                .status(),
-            401
-        );
-        assert_eq!(
-            client
-                .get(format!("{local_url}/management/index.html"))
                 .header("Cookie", &local_cookie)
                 .send()
                 .await
                 .unwrap()
                 .status(),
-            200
+            404
         );
-        for path in web_assets()
-            .keys()
-            .copied()
-            .filter(|path| management_page_path(path))
-            .chain([
-                "/management",
-                "/management/",
-                "/api/management",
-                "/api/management/load_settings",
-            ])
-        {
-            for cookie in [None, Some(&remote_cookie), Some(&local_cookie)] {
-                let mut request = client
-                    .get(format!("{remote_url}{path}"))
-                    .header("User-Agent", "Elves")
-                    .header("X-Elves-Client", "desktop")
-                    .header("If-None-Match", "*");
-                if let Some(cookie) = cookie {
-                    request = request.header("Cookie", cookie);
-                }
-                assert_eq!(request.send().await.unwrap().status(), 403, "{path}");
-            }
+        for path in ["/management", "/management/", "/management/index.html"] {
+            let denied = client
+                .get(format!("{remote_url}{path}"))
+                .header("User-Agent", "Elves")
+                .header("X-Elves-Client", "desktop")
+                .header("If-None-Match", "*")
+                .header("Cookie", &remote_cookie)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(denied.status(), 404, "{path}");
         }
         for command in [
             "load_settings",
@@ -653,7 +633,7 @@ mod tests {
             "read_local_proxy_log_detail",
             "remote_access_command",
         ] {
-            // 无效 JSON 也先被权限边界拒绝，不能靠绕开页面或正文解析探测管理功能。
+            // 旧管理 API 已从 Harness 删除；即使携带远程授权也只能得到未找到。
             assert_eq!(
                 client
                     .post(format!("{remote_url}/api/management/{command}"))
@@ -665,7 +645,7 @@ mod tests {
                     .await
                     .unwrap()
                     .status(),
-                403,
+                404,
                 "{command}"
             );
         }
@@ -686,18 +666,18 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            local_manifest["files"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|file| file["path"].as_str().is_some_and(management_page_path))
-        );
-        assert!(
             !remote_manifest["files"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|file| file["path"].as_str().is_some_and(management_page_path))
+                .any(|file| file["path"].as_str().is_some_and(|path| path.starts_with("/management")))
+        );
+        assert!(
+            !local_manifest["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|file| file["path"].as_str().is_some_and(|path| path.starts_with("/management")))
         );
         assert_ne!(local_manifest["version"], remote_manifest["version"]);
         local_server.abort();

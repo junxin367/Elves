@@ -669,7 +669,10 @@ impl UpstreamResponseModelObserver {
             self.outcome,
             Some(ProxyRequestOutcome::Failed | ProxyRequestOutcome::Incomplete)
         ) && (status == Some("completed")
-            || matches!(event_type, "response.completed" | "message_stop")
+            || matches!(
+                event_type,
+                "response.completed" | "message_stop" | "interaction.completed"
+            )
             || value.get("object").and_then(Value::as_str) == Some("chat.completion")
             || value.get("object").and_then(Value::as_str) == Some("response.compaction")
             || (matches!(protocol, UpstreamResponseProtocol::ChatCompletions)
@@ -698,6 +701,9 @@ impl UpstreamResponseModelObserver {
             UpstreamResponseProtocol::Anthropic => {
                 [value.pointer("/message/model"), value.get("model")]
             }
+            UpstreamResponseProtocol::Gemini => {
+                [value.pointer("/interaction/model"), value.get("model")]
+            }
         };
         let model = candidates
             .into_iter()
@@ -717,6 +723,7 @@ impl UpstreamResponseModelObserver {
                 | "response.incomplete"
                 | "response.cancelled"
                 | "response.canceled"
+                | "interaction.completed"
         ) {
             self.terminal = Some(model);
         } else if self.first.is_none() {

@@ -3,21 +3,24 @@ use elves_core::layered_compaction::{
     rewrite_remote_compaction_v2_response_with_layered_compaction,
 };
 use elves_core::protocol_proxy::{
-    AnthropicSseToResponsesConverter, ChatSseToResponsesConverter, UpstreamResponseProtocol,
+    AnthropicSseToResponsesConverter, ChatSseToResponsesConverter,
+    GeminiInteractionsSseToResponsesConverter, UpstreamResponseProtocol,
     anthropic_message_to_response_with_request, anthropic_messages_url,
     anthropic_sse_to_responses_sse_with_request, chat_completion_to_response,
     chat_completion_to_response_with_request, chat_completions_url, chat_sse_to_responses_sse,
     chat_sse_to_responses_sse_with_request,
-    clear_anthropic_reasoning_compatibility_cache_for_tests, handle_responses_proxy_request,
-    is_chat_completions_proxy_path, is_models_proxy_path, is_responses_proxy_path, models_url,
-    open_chat_completions_proxy_request, open_models_proxy_request, open_responses_proxy_request,
+    clear_anthropic_reasoning_compatibility_cache_for_tests,
+    gemini_interaction_to_response_with_request, gemini_interactions_url,
+    handle_responses_proxy_request, is_chat_completions_proxy_path, is_models_proxy_path,
+    is_responses_proxy_path, models_url, open_chat_completions_proxy_request,
+    open_models_proxy_request, open_responses_proxy_request,
     open_responses_proxy_request_with_settings,
     open_responses_proxy_request_with_settings_and_request_context, responses_error_from_upstream,
     responses_to_anthropic_messages, responses_to_chat_completions,
-    send_upstream_request_with_header_timeout, stream_idle_timeout_for_reasoning_effort,
-    stream_idle_timeout_for_request, stream_idle_timeout_ms_for_reasoning_effort,
-    supported_reasoning_efforts_for_model, upstream_error_is_timeout, upstream_http_client,
-    upstream_models_header_timeout,
+    responses_to_gemini_interactions, send_upstream_request_with_header_timeout,
+    stream_idle_timeout_for_reasoning_effort, stream_idle_timeout_for_request,
+    stream_idle_timeout_ms_for_reasoning_effort, supported_reasoning_efforts_for_model,
+    upstream_error_is_timeout, upstream_http_client, upstream_models_header_timeout,
 };
 use elves_core::request_headers::RequestContext;
 use elves_core::settings::{
@@ -695,6 +698,235 @@ mod protocol_stream_integrity_review {
             }
         }
     }
+}
+
+#[test]
+fn gemini_interactions_url_uses_v1beta_endpoint() {
+    assert_eq!(
+        gemini_interactions_url("https://generativelanguage.googleapis.com"),
+        "https://generativelanguage.googleapis.com/v1beta/interactions"
+    );
+    assert_eq!(
+        gemini_interactions_url("https://gateway.example/v1beta"),
+        "https://gateway.example/v1beta/interactions"
+    );
+}
+
+#[test]
+fn responses_to_gemini_interactions_preserves_history_tools_and_function_results() {
+    let request = json!({
+        "model": "gemini-3.1-pro",
+        "instructions": "You are a concise assistant.",
+        "stream": false,
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "天气怎么样？"}]
+            },
+            {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "get_weather",
+                "arguments": "{\"city\":\"上海\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": {"temperature": 24, "condition": "sunny"}
+            }
+        ],
+        "tools": [{
+            "type": "function",
+            "name": "get_weather",
+            "description": "Get weather.",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"]
+            }
+        }],
+        "tool_choice": "auto",
+        "max_output_tokens": 256
+    });
+
+    let converted = responses_to_gemini_interactions(request).unwrap();
+    assert_eq!(converted["model"], "gemini-3.1-pro");
+    assert_eq!(converted["store"], false);
+    assert_eq!(
+        converted["system_instruction"],
+        "You are a concise assistant."
+    );
+    assert_eq!(converted["input"][0]["type"], "user_input");
+    assert_eq!(converted["input"][0]["content"][0]["text"], "天气怎么样？");
+    assert_eq!(converted["input"][1]["type"], "function_call");
+    assert_eq!(converted["input"][1]["id"], "call_1");
+    assert_eq!(converted["input"][1]["arguments"]["city"], "上海");
+    assert_eq!(converted["input"][2]["type"], "function_result");
+    assert_eq!(converted["input"][2]["call_id"], "call_1");
+    assert_eq!(
+        converted["input"][2]["result"][0]["text"],
+        "{\"condition\":\"sunny\",\"temperature\":24}"
+    );
+    assert_eq!(converted["tools"][0]["name"], "get_weather");
+    assert_eq!(converted["generation_config"]["tool_choice"], "auto");
+    assert_eq!(converted["generation_config"]["max_output_tokens"], 256);
+}
+
+#[test]
+fn gemini_interaction_json_maps_text_function_call_usage_and_errors() {
+    let request = json!({
+        "model": "gemini-3.1-pro",
+        "input": "hello",
+        "stream": false,
+        "tools": [{
+            "type": "function",
+            "name": "get_weather",
+            "parameters": {"type": "object"}
+        }]
+    });
+    let response = gemini_interaction_to_response_with_request(
+        json!({
+            "id": "interaction_1",
+            "model": "gemini-3.1-pro",
+            "status": "requires_action",
+            "steps": [
+                {"type": "thought", "summary": [{"type": "text", "text": "Need weather"}], "signature": "sig-1"},
+                {"type": "function_call", "id": "call_1", "name": "get_weather", "arguments": {"city": "上海"}}
+            ],
+            "usage": {"promptTokenCount": 10, "candidatesTokenCount": 5, "thoughtsTokenCount": 2}
+        }),
+        &request,
+    )
+    .unwrap();
+    assert_eq!(response["status"], "completed");
+    assert_eq!(response["output"][0]["type"], "reasoning");
+    assert_eq!(
+        response["output"][0]["encrypted_content"],
+        "codex-elves-gemini-thought-v1:sig-1"
+    );
+    assert_eq!(response["output"][1]["type"], "function_call");
+    assert_eq!(response["output"][1]["call_id"], "call_1");
+    assert_eq!(response["output"][1]["arguments"], "{\"city\":\"上海\"}");
+    assert_eq!(response["usage"]["input_tokens"], 10);
+    assert_eq!(response["usage"]["output_tokens"], 5);
+
+    let error = gemini_interaction_to_response_with_request(
+        json!({"error": {"code": "INVALID_ARGUMENT", "message": "bad request"}}),
+        &request,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("bad request"));
+}
+
+#[test]
+fn gemini_interactions_sse_maps_text_and_function_call_to_responses_sse() {
+    let request = json!({
+        "model": "gemini-3.1-pro",
+        "stream": true,
+        "input": "hello"
+    });
+    let sse = concat!(
+        "event: interaction.created\n",
+        "data: {\"event_type\":\"interaction.created\",\"interaction\":{\"id\":\"interaction_1\",\"model\":\"gemini-3.1-pro\"}}\n\n",
+        "event: step.start\n",
+        "data: {\"event_type\":\"step.start\",\"step\":{\"id\":\"step_1\",\"type\":\"model_output\"}}\n\n",
+        "event: step.delta\n",
+        "data: {\"event_type\":\"step.delta\",\"step_id\":\"step_1\",\"delta\":{\"type\":\"text\",\"text\":\"天气 \"}}\n\n",
+        "event: step.delta\n",
+        "data: {\"event_type\":\"step.delta\",\"step_id\":\"step_1\",\"delta\":{\"type\":\"text\",\"text\":\"晴朗\"}}\n\n",
+        "event: interaction.completed\n",
+        "data: {\"event_type\":\"interaction.completed\",\"interaction\":{\"id\":\"interaction_1\",\"model\":\"gemini-3.1-pro\",\"status\":\"completed\",\"usage\":{\"promptTokenCount\":3,\"candidatesTokenCount\":4}}}\n\n"
+    );
+    let mut converter = GeminiInteractionsSseToResponsesConverter::with_request(&request);
+    let mut converted = converter.push_bytes(sse.as_bytes());
+    converted.extend(converter.finish());
+    let converted = String::from_utf8(converted).unwrap();
+    assert!(converted.contains("response.output_text.delta"));
+    assert!(converted.contains("天气 "));
+    assert!(converted.contains("response.completed"));
+    assert!(converted.contains("\"input_tokens\":3"));
+
+    let function_sse = concat!(
+        "event: interaction.created\n",
+        "data: {\"event_type\":\"interaction.created\",\"interaction\":{\"id\":\"interaction_2\",\"model\":\"gemini-3.1-pro\"}}\n\n",
+        "event: step.start\n",
+        "data: {\"event_type\":\"step.start\",\"step\":{\"id\":\"call_1\",\"type\":\"function_call\",\"name\":\"get_weather\"}}\n\n",
+        "event: step.delta\n",
+        "data: {\"event_type\":\"step.delta\",\"step_id\":\"call_1\",\"delta\":{\"type\":\"arguments_delta\",\"arguments\":\"{\\\"city\\\":\\\"上海\\\"}\"}}\n\n",
+        "event: interaction.completed\n",
+        "data: {\"event_type\":\"interaction.completed\",\"interaction\":{\"id\":\"interaction_2\",\"model\":\"gemini-3.1-pro\",\"status\":\"requires_action\"}}\n\n"
+    );
+    let mut converter = GeminiInteractionsSseToResponsesConverter::with_request(&request);
+    let mut function_converted = converter.push_bytes(function_sse.as_bytes());
+    function_converted.extend(converter.finish());
+    let function_converted = String::from_utf8(function_converted).unwrap();
+    assert!(function_converted.contains("response.function_call_arguments.delta"));
+    assert!(function_converted.contains("response.function_call_arguments.done"));
+    assert!(function_converted.contains("\"name\":\"get_weather\""));
+}
+
+#[tokio::test]
+async fn gemini_interactions_proxy_sends_native_endpoint_and_auth_headers() {
+    let server = spawn_chat_server_with_response(
+        json!({
+            "id": "interaction_1",
+            "model": "gemini-3.1-pro",
+            "status": "completed",
+            "steps": [{
+                "type": "model_output",
+                "content": [{"type": "text", "text": "ok"}]
+            }]
+        })
+        .to_string(),
+    );
+    let settings = BackendSettings {
+        relay_profiles: vec![RelayProfile {
+            id: "gemini".to_string(),
+            name: "Gemini".to_string(),
+            base_url: server.base_url.clone(),
+            upstream_base_url: server.base_url.clone(),
+            api_key: "gemini-key".to_string(),
+            relay_mode: RelayMode::MixedApi,
+            local_proxy_enabled: Some(true),
+            model_mappings: vec![RelayModelMapping {
+                request_model: "gemini-3.1-pro".to_string(),
+                alias: String::new(),
+                protocol: RelayProtocol::Gemini,
+                context_window: "1000000".to_string(),
+                system_prompt_override: String::new(),
+            }],
+            ..RelayProfile::default()
+        }],
+        active_relay_id: "gemini".to_string(),
+        ..BackendSettings::default()
+    };
+    let request = json!({
+        "model": "gemini-3.1-pro",
+        "input": "hello",
+        "stream": false
+    });
+    let upstream = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+        .await
+        .unwrap();
+    assert_eq!(upstream.response_protocol, UpstreamResponseProtocol::Gemini);
+    let body = upstream.into_body_bytes().await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["status"],
+        "completed"
+    );
+
+    let captured = server.finish();
+    assert_eq!(captured.path, "/v1/interactions");
+    assert_eq!(captured.x_goog_api_key, "gemini-key");
+    assert_eq!(captured.api_revision, "2026-05-20");
+    let wire: Value = serde_json::from_str(&captured.body).unwrap();
+    assert_eq!(wire["model"], "gemini-3.1-pro");
+    assert_eq!(wire["input"][0]["type"], "user_input");
+    assert_eq!(wire["input"][0]["content"][0]["text"], "hello");
+    assert_eq!(wire["stream"], false);
 }
 
 // 旧供应商兼容用例显式启用，普通请求默认保持原始正文。
@@ -14335,6 +14567,7 @@ async fn responses_proxy_model_system_prompt_wins_for_all_protocols_and_aliases(
                         responses_to_chat_completions(expected).unwrap()
                     }
                     RelayProtocol::Anthropic => responses_to_anthropic_messages(expected).unwrap(),
+                    RelayProtocol::Gemini => responses_to_gemini_interactions(expected).unwrap(),
                 };
                 for key in ["instructions", "input", "messages", "system"] {
                     assert_eq!(body.get(key), expected.get(key), "{protocol:?}: {key}");
@@ -16736,6 +16969,8 @@ struct ChatRequest {
     path: String,
     user_agent: String,
     x_api_key: String,
+    x_goog_api_key: String,
+    api_revision: String,
     anthropic_version: String,
     x_codex_beta_features: String,
     body: String,
@@ -16829,6 +17064,8 @@ fn spawn_chat_server_with_status_responses(responses: Vec<(String, String)>) -> 
             };
             let user_agent = header_value("user-agent").unwrap_or_default();
             let x_api_key = header_value("x-api-key").unwrap_or_default();
+            let x_goog_api_key = header_value("x-goog-api-key").unwrap_or_default();
+            let api_revision = header_value("api-revision").unwrap_or_default();
             let anthropic_version = header_value("anthropic-version").unwrap_or_default();
             let x_codex_beta_features = header_value("x-codex-beta-features").unwrap_or_default();
             let request_body = request
@@ -16845,6 +17082,8 @@ fn spawn_chat_server_with_status_responses(responses: Vec<(String, String)>) -> 
                 path,
                 user_agent,
                 x_api_key,
+                x_goog_api_key,
+                api_revision,
                 anthropic_version,
                 x_codex_beta_features,
                 body: request_body,
@@ -16944,6 +17183,8 @@ fn spawn_raw_response_server(
             path,
             user_agent: header_value("user-agent").unwrap_or_default(),
             x_api_key: header_value("x-api-key").unwrap_or_default(),
+            x_goog_api_key: header_value("x-goog-api-key").unwrap_or_default(),
+            api_revision: header_value("api-revision").unwrap_or_default(),
             anthropic_version: header_value("anthropic-version").unwrap_or_default(),
             x_codex_beta_features: header_value("x-codex-beta-features").unwrap_or_default(),
             body: request_body,
@@ -17056,6 +17297,11 @@ async fn disabled_compaction_preserves_harness_legacy_requests_and_untagged_summ
                 "content":[{"type":"text","text":"HARNESS SUMMARY"}],"stop_reason":"end_turn",
                 "usage":{"input_tokens":10,"output_tokens":5}
             }),
+            RelayProtocol::Gemini => json!({
+                "id":"interaction_harness","model":model,"status":"completed",
+                "steps":[{"type":"model_output","content":[{"type":"text","text":"HARNESS SUMMARY"}]}],
+                "usage":{"input_tokens":10,"output_tokens":5}
+            }),
         };
         let server = spawn_chat_server_with_response(reply.to_string());
         let settings = BackendSettings {
@@ -17115,6 +17361,7 @@ async fn disabled_compaction_preserves_harness_legacy_requests_and_untagged_summ
             RelayProtocol::Responses => request.clone(),
             RelayProtocol::ChatCompletions => responses_to_chat_completions(request).unwrap(),
             RelayProtocol::Anthropic => responses_to_anthropic_messages(request).unwrap(),
+            RelayProtocol::Gemini => responses_to_gemini_interactions(request).unwrap(),
         };
         for field in [
             "model",

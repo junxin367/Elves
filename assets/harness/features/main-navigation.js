@@ -1,4 +1,4 @@
-// 用户要求主入口固定排序，“定时任务”紧跟会话之后；设置固定底部。
+// Harness 只保留会话执行和定时任务；代理设置、会话管理由独立代理管理器承载。
 // 切页保留当前会话、草稿、侧边标签及阅读位置。
 import { button, element } from "../ui/dom.js";
 import { icon } from "../ui/icons.js";
@@ -8,19 +8,11 @@ import { isAndroidContainer } from "../platform.js";
 
 export const mainNavigationItems = Object.freeze([
   { id: "conversation", label: "会话", icon: "chat" },
-  { id: "scheduled", label: "定时任务", icon: "recent" },
-  { id: "proxy", label: "代理设置", icon: "network" },
-  { id: "sessions", label: "会话管理", icon: "recent" },
-  { id: "remoteAccess", label: "远程会话", icon: "globe" }
+  { id: "scheduled", label: "定时任务", icon: "recent" }
 ]);
 
 export function isElvesClient() {
   return typeof globalThis.__ELVES_CLIENT__?.open === "function";
-}
-
-export function canManageHarness() {
-  // 网页、PWA、Android 只显示会话；管理页要求原生容器和服务端确认的本机传输及管理能力同时成立。
-  return isElvesClient() && session?.transport === "desktop" && session?.capabilities?.management === true;
 }
 
 let disposeNavigation = null;
@@ -32,7 +24,7 @@ export function disposeMainNavigation() {
   chooseNavigation = null;
 }
 
-export function mountMainNavigation({ workspace, openSettings, openScheduledTasks, logout, openPage }) {
+export function mountMainNavigation({ workspace, openSettings, openScheduledTasks, logout }) {
   disposeMainNavigation();
   const shell = element("div", "remote-shell");
   const navigation = element("nav", "main-navigation");
@@ -43,9 +35,6 @@ export function mountMainNavigation({ workspace, openSettings, openScheduledTask
   const footer = element("div", "sidebar-footer mobile-sidebar-footer");
   const footerActions = element("div", "footer-actions");
   let mobileNavigation = false;
-  const management = element("main", "management-workspace");
-  management.id = "management-workspace";
-  management.hidden = true;
   const scheduledPage = element("main", "scheduled-workspace");
   scheduledPage.id = "scheduled-workspace";
   scheduledPage.hidden = true;
@@ -54,10 +43,10 @@ export function mountMainNavigation({ workspace, openSettings, openScheduledTask
   settingsPage.hidden = true;
   let current = "conversation", savedPosition = null;
   let settingsFrom = "conversation", disposeSettings = null, disposeScheduled = null;
-  const items = mainNavigationItems.filter(item => item.id === "conversation" || canManageHarness());
+  const items = mainNavigationItems.filter(item =>
+    item.id === "conversation" || isElvesClient() && session?.transport === "desktop");
   const controls = new Map();
-  const canChoose = id => id === "conversation" || id === "settings"
-    || canManageHarness() && items.some(item => item.id === id);
+  const canChoose = id => id === "conversation" || id === "settings" || items.some(item => item.id === id);
   const choose = id => {
     if (current === id || !canChoose(id)) return;
     closePopup();
@@ -85,11 +74,9 @@ export function mountMainNavigation({ workspace, openSettings, openScheduledTask
     // 隐藏而不销毁会话 DOM，实时消息和会话操作继续使用原来的实例与授权。
     workspace.hidden = current !== "conversation";
     workspace.inert = workspace.hidden;
-    // 设置、定时任务与会话管理占同一内容列并共享选中状态；只隐藏页面，不用弹窗锁住主导航。
+    // 设置与定时任务占同一内容列并共享选中状态；只隐藏页面，不用弹窗锁住主导航。
     settingsPage.hidden = current !== "settings";
     scheduledPage.hidden = current !== "scheduled";
-    management.hidden = current === "conversation" || current === "settings" || current === "scheduled";
-    openPage.setVisible?.(!management.hidden);
     if (current === "conversation") {
       if (savedPosition?.node.isConnected) savedPosition.node.scrollTop = savedPosition.top;
       requestAnimationFrame(() => {
@@ -107,16 +94,13 @@ export function mountMainNavigation({ workspace, openSettings, openScheduledTask
     } else if (current === "scheduled") {
       scheduledPage.setAttribute("aria-label", "定时任务");
       disposeScheduled = openScheduledTasks?.(scheduledPage) || null;
-    } else {
-      management.setAttribute("aria-label", items.find(page => page.id === current).label);
-      openPage(current, management);
     }
   };
   for (const item of items) {
     const control = button("", item.label, () => choose(item.id), "main-navigation-button");
     control.dataset.page = item.id;
     control.setAttribute("aria-controls", item.id === "conversation" ? "session-sidebar"
-      : item.id === "scheduled" ? scheduledPage.id : management.id);
+      : scheduledPage.id);
     control.append(icon(item.icon));
     if (item.id === current) {
       control.classList.add("selected");
@@ -186,13 +170,12 @@ export function mountMainNavigation({ workspace, openSettings, openScheduledTask
   chooseNavigation = choose;
   navigation.append(pages, settingsArea);
   workspace.before(shell);
-  shell.append(navigation, workspace, scheduledPage, management, settingsPage);
+  shell.append(navigation, workspace, scheduledPage, settingsPage);
   disposeNavigation = () => {
     mobileMedia.removeEventListener("change", syncMobileNavigation);
     footer.remove();
     disposeSettings?.();
     disposeScheduled?.();
-    openPage.dispose?.();
   };
-  return { choose, shell, management, settingsPage };
+  return { choose, shell, settingsPage };
 }

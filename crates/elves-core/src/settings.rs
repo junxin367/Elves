@@ -173,6 +173,8 @@ pub struct RelayProfile {
     pub chat_completions_model_list: String,
     #[serde(rename = "anthropicModelList", default)]
     pub anthropic_model_list: String,
+    #[serde(rename = "geminiModelList", default)]
+    pub gemini_model_list: String,
     #[serde(rename = "responsesWebsocket", default)]
     pub responses_websocket: ResponsesWebsocketCapability,
     #[serde(
@@ -251,6 +253,7 @@ impl Default for RelayProfile {
             responses_model_list: String::new(),
             chat_completions_model_list: String::new(),
             anthropic_model_list: String::new(),
+            gemini_model_list: String::new(),
             responses_websocket: ResponsesWebsocketCapability::default(),
             responses_websocket_enabled: None,
             user_agent: String::new(),
@@ -398,6 +401,7 @@ impl RelayProfile {
                 self.chat_completions_model_list.as_str(),
             ),
             (RelayProtocol::Anthropic, self.anthropic_model_list.as_str()),
+            (RelayProtocol::Gemini, self.gemini_model_list.as_str()),
         ] {
             if split_relay_model_ids(model_list).any(|candidate| candidate == model) {
                 resolved = Some(protocol);
@@ -431,6 +435,7 @@ impl RelayProfile {
                 self.chat_completions_model_list.as_str(),
             ),
             (RelayProtocol::Anthropic, self.anthropic_model_list.as_str()),
+            (RelayProtocol::Gemini, self.gemini_model_list.as_str()),
         ] {
             for model in split_relay_model_ids(model_list) {
                 insert_model_protocol_assignment(&mut assignments, model, protocol)?;
@@ -659,6 +664,15 @@ pub fn infer_relay_protocol_for_model(model: &str) -> RelayProtocol {
         return RelayProtocol::Anthropic;
     }
 
+    if slug == "gemini"
+        || slug.starts_with("gemini-")
+        || slug == "gemma"
+        || slug.starts_with("gemma-")
+        || normalized.contains("google/gemini")
+    {
+        return RelayProtocol::Gemini;
+    }
+
     if slug == "gpt"
         || slug.starts_with("gpt-")
         || slug == "chatgpt"
@@ -707,6 +721,7 @@ fn relay_protocol_label(protocol: RelayProtocol) -> &'static str {
         RelayProtocol::Responses => "Responses API",
         RelayProtocol::ChatCompletions => "Chat Completions",
         RelayProtocol::Anthropic => "Anthropic",
+        RelayProtocol::Gemini => "Gemini Interactions",
     }
 }
 
@@ -727,6 +742,7 @@ pub enum RelayProtocol {
     Responses,
     ChatCompletions,
     Anthropic,
+    Gemini,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -807,6 +823,9 @@ pub struct BackendSettings {
     pub provider_sync_last_selected_provider: String,
     #[serde(rename = "relayProfilesEnabled", default = "default_true")]
     pub relay_profiles_enabled: bool,
+    // 用户要求将“是否随 Elves 启动代理服务”独立于供应商代理路由；默认开启以保持既有启动行为。
+    #[serde(rename = "localProxyStartupEnabled", default = "default_true")]
+    pub local_proxy_startup_enabled: bool,
     #[serde(rename = "lanProxyEnabled", default)]
     pub lan_proxy_enabled: bool,
     #[serde(rename = "remoteAccess", default)]
@@ -883,6 +902,7 @@ impl Default for BackendSettings {
             provider_sync_manual_providers: Vec::new(),
             provider_sync_last_selected_provider: String::new(),
             relay_profiles_enabled: true,
+            local_proxy_startup_enabled: true,
             lan_proxy_enabled: false,
             remote_access: RemoteAccessSettings::default(),
             layered_compaction_enabled: false,
@@ -976,6 +996,7 @@ impl BackendSettings {
                 responses_model_list: String::new(),
                 chat_completions_model_list: String::new(),
                 anthropic_model_list: String::new(),
+                gemini_model_list: String::new(),
                 responses_websocket: ResponsesWebsocketCapability::default(),
                 responses_websocket_enabled: None,
                 user_agent: String::new(),
@@ -1027,6 +1048,7 @@ impl BackendSettings {
             responses_model_list: String::new(),
             chat_completions_model_list: String::new(),
             anthropic_model_list: String::new(),
+            gemini_model_list: String::new(),
             responses_websocket: ResponsesWebsocketCapability::default(),
             responses_websocket_enabled: None,
             user_agent: String::new(),
@@ -1285,6 +1307,7 @@ fn merge_known_setting_fields(
     if let Some(value) = source.get("relayProfilesEnabled").and_then(Value::as_bool) {
         target.insert("relayProfilesEnabled".to_string(), Value::Bool(value));
     }
+    merge_bool_setting(target, source, "localProxyStartupEnabled");
     merge_bool_setting(target, source, "lanProxyEnabled");
     if let Some(value) = source.get("remoteAccess") {
         let current = target
@@ -1695,6 +1718,7 @@ mod tests {
         let settings = BackendSettings::default();
         assert!(!settings.provider_sync_enabled);
         assert!(settings.relay_profiles_enabled);
+        assert!(settings.local_proxy_startup_enabled);
         assert!(!settings.lan_proxy_enabled);
         assert!(!settings.remote_access.enabled);
         assert_eq!(settings.remote_access.bind_host, "127.0.0.1");
@@ -1727,11 +1751,12 @@ mod tests {
     #[test]
     fn settings_deserialize_uses_existing_json_keys() {
         let settings: BackendSettings = serde_json::from_str(
-            r#"{"codexAppPath":"C:\\Portable\\Codex\\app","codexHomePath":" C:\\Portable\\CodexHome ","providerSyncEnabled":true,"codexGoalsEnabled":true,"lanProxyEnabled":true,"wsFailureFallbackToHttp":true,"cliWrapperEnabled":true,"cliWrapperBaseUrl":"https://example.test","cliWrapperApiKey":"sk-test","cliWrapperApiKeyEnv":""}"#,
+            r#"{"codexAppPath":"C:\\Portable\\Codex\\app","codexHomePath":" C:\\Portable\\CodexHome ","providerSyncEnabled":true,"codexGoalsEnabled":true,"localProxyStartupEnabled":false,"lanProxyEnabled":true,"wsFailureFallbackToHttp":true,"cliWrapperEnabled":true,"cliWrapperBaseUrl":"https://example.test","cliWrapperApiKey":"sk-test","cliWrapperApiKeyEnv":""}"#,
         )
         .unwrap();
         assert_eq!(settings.codex_home_path, r"C:\Portable\CodexHome");
         assert!(settings.provider_sync_enabled);
+        assert!(!settings.local_proxy_startup_enabled);
         assert!(settings.lan_proxy_enabled);
         assert!(settings.cli_wrapper_enabled);
         assert_eq!(settings.cli_wrapper_base_url, "https://example.test");
@@ -1864,6 +1889,20 @@ mod tests {
     }
 
     #[test]
+    fn settings_store_update_persists_local_proxy_startup_enabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+
+        store
+            .update(json!({ "localProxyStartupEnabled": false }))
+            .unwrap();
+        assert!(!store.load().unwrap().local_proxy_startup_enabled);
+
+        let saved: Value = serde_json::from_slice(&fs::read(&store.path).unwrap()).unwrap();
+        assert_eq!(saved["localProxyStartupEnabled"], json!(false));
+    }
+
+    #[test]
     fn legacy_ws_fallback_setting_is_ignored_and_not_persisted() {
         let temp = tempfile::tempdir().unwrap();
         let store = SettingsStore::new(temp.path().join("settings.json"));
@@ -1895,7 +1934,11 @@ mod tests {
         assert!(settings.layered_compaction_enabled);
         let serialized = serde_json::to_value(&settings).unwrap();
         assert!(serialized.get("gptReasoningContinuation").is_none());
-        assert!(serialized.get("gptReasoningContinuationMaxRounds").is_none());
+        assert!(
+            serialized
+                .get("gptReasoningContinuationMaxRounds")
+                .is_none()
+        );
         store
             .update(json!({
                 "gptReasoningContinuation": true,
@@ -2193,7 +2236,6 @@ mod tests {
         for model in [
             "deepseek-v4-flash",
             "zai-org/glm-5.1",
-            "google/gemini-3.1-pro",
             "Qwen/Qwen3-Coder",
             "vendor/future-model",
         ] {
@@ -2203,6 +2245,10 @@ mod tests {
                 "{model}"
             );
         }
+        assert_eq!(
+            infer_relay_protocol_for_model("google/gemini-3.1-pro"),
+            RelayProtocol::Gemini
+        );
         assert_eq!(infer_relay_protocol_for_model(""), RelayProtocol::Responses);
     }
 

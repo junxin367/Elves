@@ -92,6 +92,7 @@ pub(super) async fn settings(
             crate::settings::RelayProtocol::Responses => crate::protocol_proxy::UpstreamResponseProtocol::Responses,
             crate::settings::RelayProtocol::ChatCompletions => crate::protocol_proxy::UpstreamResponseProtocol::ChatCompletions,
             crate::settings::RelayProtocol::Anthropic => crate::protocol_proxy::UpstreamResponseProtocol::Anthropic,
+            crate::settings::RelayProtocol::Gemini => crate::protocol_proxy::UpstreamResponseProtocol::Gemini,
         };
         let declared = entry.and_then(|entry| entry["supported_reasoning_levels"].as_array()
             .or_else(|| entry["supportedReasoningEfforts"].as_array()));

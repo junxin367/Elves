@@ -6,6 +6,7 @@ members = [
   "crates/elves-data",
   "crates/elves-harness",
   "apps/elves/src-tauri",
+  "apps/elves-manager/src-tauri",
 ]
 
 [workspace.package]
@@ -69,4 +70,7 @@ opt-level = 1
 opt-level = 1
 
 [profile.release-fast.package.elves]
+opt-level = 1
+
+[profile.release-fast.package.elves-manager]
 opt-level = 1

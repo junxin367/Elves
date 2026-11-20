@@ -29,6 +29,7 @@ pub(crate) enum CacheProtocol {
     Responses,
     ChatCompletions,
     Anthropic,
+    Gemini,
 }
 
 impl CacheProtocol {
@@ -37,6 +38,7 @@ impl CacheProtocol {
             Self::Responses => "responses",
             Self::ChatCompletions => "chatCompletions",
             Self::Anthropic => "anthropic",
+            Self::Gemini => "gemini",
         }
     }
 }

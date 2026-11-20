@@ -1,20 +1,20 @@
 # Elves 与 Harness 更新
 
-Elves 客户端、本机 Harness、协议代理和工作区资源由同一个 `elves.exe` 提供。当前升级入口是 Windows 安装包，旧管理器和 launcher 的服务替换脚本已删除。
+Elves 客户端、本机 Harness 和工作区资源由 `elves.exe` 提供；代理管理器由独立的 `elves-manager.exe` 提供，协议代理可由 Harness 或管理器启动为独立服务。当前升级入口是 Windows 安装包，旧 CodexElves 管理器和 launcher 的服务替换脚本已删除。
 
 ## 准备与构建
 
-工作区资源变化时递增 `assets/harness/resource-revision.txt`。共享管理界面变化时先检查并生成 `assets/harness/management/`，再构建内嵌资源的客户端：
+工作区资源变化时递增 `assets/harness/resource-revision.txt`。代理管理器界面变化时先构建独立管理器前端，再构建管理器 Rust 壳：
 
 ```powershell
 npm --prefix apps/elves-management run check
-npm --prefix apps/elves-management run vite:build
+npm --prefix apps/elves-management run build:manager
 cargo fmt --all -- --check
 cargo check --workspace
-.\scripts\build-windows-installer.ps1
+.\scripts\build-windows-manager.ps1
 ```
 
-核对安装包及便携程序存在，`target/release/elves.exe` 与 `dist/windows/app/elves.exe` 的 SHA-256 一致。构建脚本核对内嵌工作区资源及工具的完整性，只将一个正式程序交给安装包。
+核对 `target/release/elves.exe`、`target/release/elves-manager.exe` 及 `dist/windows/app/` 中两份程序存在。构建脚本核对 Elves 内嵌工作区资源及工具的完整性，安装包同时安装客户端与独立代理管理器。
 
 仅改代码或构建不执行安装，不切换正在使用的服务，也不发布标签或 Android 安装包。构建成功、安装成功和发布成功分别记录。
 

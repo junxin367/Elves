@@ -8,8 +8,9 @@ use serde_json::{Value, json};
 
 use crate::protocol_proxy::{
     UpstreamResponseProtocol, anthropic_message_to_response_with_request_and_diagnostic_id,
-    chat_completion_to_response_with_request, open_responses_proxy_request_with_settings,
-    responses_error_from_upstream, stream_idle_timeout_for_reasoning_effort,
+    chat_completion_to_response_with_request, gemini_interaction_to_response_with_request,
+    open_responses_proxy_request_with_settings, responses_error_from_upstream,
+    stream_idle_timeout_for_reasoning_effort,
 };
 use crate::settings::BackendSettings;
 
@@ -509,6 +510,9 @@ async fn execute_optimize(
                 &original_request,
                 Some(&diagnostic_id),
             )?
+        }
+        UpstreamResponseProtocol::Gemini => {
+            gemini_interaction_to_response_with_request(upstream_json, &original_request)?
         }
     };
     let total_tokens = extract_total_tokens(&response);

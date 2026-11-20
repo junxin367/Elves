@@ -564,8 +564,7 @@ pub async fn run() -> anyhow::Result<()> {
     let server = axum_server::from_tcp(listener)?
         .handle(handle)
         .serve(router.into_make_service());
-    // Harness 先建立独立本机工作区及代理，再对外报告就绪；远程会话可以始终关闭。
-    super::management::register_management();
+    // Harness 先建立独立本机工作区及代理，再对外报告就绪；管理器单独负责供应商与会话管理。
     let controller = super::shared_controller()?;
     let settings = crate::settings::SettingsStore::default().load()?;
     controller

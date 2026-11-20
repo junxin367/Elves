@@ -42,7 +42,7 @@ fn regular_target(path: &Path) -> anyhow::Result<()> {
 }
 
 pub fn prepare(state_directory: &Path) -> anyhow::Result<PathBuf> {
-    // 用户要求安装程序只安装一个 Elves 程序；固定版本工具随 EXE 内嵌，原安装目录不再需要额外程序。
+    // 固定版本工具随 Elves 客户端内嵌；独立代理管理器不重复携带这些执行工具。
     std::fs::create_dir_all(state_directory)?;
     let cache = state_directory.join("tool-runtime");
     regular_target(&cache)?;

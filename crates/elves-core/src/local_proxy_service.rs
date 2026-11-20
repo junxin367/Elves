@@ -49,7 +49,7 @@ pub fn start_monitor() -> ProxyMonitor {
         loop {
             match SettingsStore::default().load() {
                 Ok(settings) => {
-                    // 用户仍由“启用本地代理”控制代理；仅启动客户端或保存普通供应商不擅自启用代理。
+                    // 用户分别控制供应商路由和“随 Elves 启动”策略；关闭启动策略时保留独立监视进程但不监听端口。
                     let desired = desired_state(&settings);
                     let enabled = desired.0;
                     if active != Some(desired) {
@@ -91,7 +91,10 @@ pub fn start_monitor() -> ProxyMonitor {
 }
 
 fn desired_state(settings: &crate::settings::BackendSettings) -> (bool, bool) {
-    let enabled = settings.relay_profiles_enabled && settings.active_relay_uses_protocol_proxy();
+    // 用户要求启动策略与供应商 localProxyEnabled 分离；这里只决定服务生命周期，不改写供应商配置。
+    let enabled = settings.local_proxy_startup_enabled
+        && settings.relay_profiles_enabled
+        && settings.active_relay_uses_protocol_proxy();
     (enabled, enabled && settings.lan_proxy_enabled)
 }
 
@@ -112,6 +115,7 @@ mod tests {
             relay_profiles: vec![profile],
             active_relay_id: "proxy".into(),
             relay_profiles_enabled: true,
+            local_proxy_startup_enabled: true,
             ..Default::default()
         };
         for enabled in [false, true] {
@@ -123,5 +127,9 @@ mod tests {
         assert_eq!(desired_state(&settings), (true, true));
         settings.relay_profiles[0].local_proxy_enabled = Some(false);
         assert_eq!(desired_state(&settings), (false, false));
+        settings.relay_profiles[0].local_proxy_enabled = Some(true);
+        settings.local_proxy_startup_enabled = false;
+        assert_eq!(desired_state(&settings), (false, false));
+        assert!(settings.active_relay_uses_protocol_proxy());
     }
 }

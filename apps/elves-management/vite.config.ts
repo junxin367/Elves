@@ -3,10 +3,12 @@ import tailwindcss from "@tailwindcss/vite";
 import path from "node:path";
 import { defineConfig } from "vite";
 
-export default defineConfig({
-  base: "/management/",
+export default defineConfig(({ mode }) => {
+  const standaloneManager = mode === "manager";
+  return {
+  base: standaloneManager ? "./" : "/management/",
   build: {
-    outDir: "../../assets/harness/management",
+    outDir: standaloneManager ? "dist/manager" : "../../assets/harness/management",
     emptyOutDir: true,
   },
   plugins: [react(), tailwindcss()],
@@ -20,4 +22,5 @@ export default defineConfig({
     port: 1420,
     strictPort: true,
   },
+  };
 });

@@ -1,0 +1,28 @@
+[package]
+name = "elves-manager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "elves_manager_lib"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "elves-manager"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+elves-core = { path = "../../../crates/elves-core" }
+elves-data = { path = "../../../crates/elves-data" }
+fs2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tauri = { version = "2", features = ["custom-protocol", "tray-icon"] }
+tokio = { workspace = true, features = ["fs", "io-util", "sync"] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }

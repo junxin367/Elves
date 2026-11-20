@@ -379,10 +379,6 @@ async fn authorize_workspace(app: &tauri::AppHandle) -> Result<Url, String> {
     receiver
         .await
         .map_err(|_| "Elves 工作区初始化未完成".to_owned())??;
-    state
-        .cache
-        .set_desktop_identity(&url, &stored_cookie)
-        .map_err(|error| error.to_string())?;
     *state.home.lock().unwrap() = Some(url.clone());
     *identity = Some(DesktopIdentity {
         url: url.clone(),

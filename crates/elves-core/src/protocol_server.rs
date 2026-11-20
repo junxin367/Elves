@@ -25,7 +25,7 @@ impl LocalProxyRuntime {
 pub async fn start(
     settings: &crate::settings::BackendSettings,
 ) -> anyhow::Result<LocalProxyRuntime> {
-    // 用户要求已开启本地代理时随 Elves 启动；监听生命周期独立于网页和 Android 远程会话开关。
+    // 用户要求由独立启动策略决定是否随 Elves 拉起；监听生命周期仍独立于网页和 Android 远程会话开关。
     start_on_port(settings, crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT).await
 }
 
@@ -300,6 +300,7 @@ async fn handle_models_proxy_connection(
 enum EitherResponsesStreamConverter<'a> {
     Chat(&'a mut crate::protocol_proxy::ChatSseToResponsesConverter),
     Anthropic(&'a mut crate::protocol_proxy::AnthropicSseToResponsesConverter),
+    Gemini(&'a mut crate::protocol_proxy::GeminiInteractionsSseToResponsesConverter),
 }
 
 impl EitherResponsesStreamConverter<'_> {
@@ -307,6 +308,7 @@ impl EitherResponsesStreamConverter<'_> {
         match self {
             Self::Chat(converter) => converter.push_bytes(bytes),
             Self::Anthropic(converter) => converter.push_bytes(bytes),
+            Self::Gemini(converter) => converter.push_bytes(bytes),
         }
     }
 
@@ -314,6 +316,7 @@ impl EitherResponsesStreamConverter<'_> {
         match self {
             Self::Chat(converter) => converter.fail(message, error_type),
             Self::Anthropic(converter) => converter.fail(message, error_type),
+            Self::Gemini(converter) => converter.fail(message, error_type),
         }
     }
 
@@ -321,6 +324,7 @@ impl EitherResponsesStreamConverter<'_> {
         match self {
             Self::Chat(converter) => converter.finish(),
             Self::Anthropic(converter) => converter.finish(),
+            Self::Gemini(converter) => converter.finish(),
         }
     }
 
@@ -328,6 +332,7 @@ impl EitherResponsesStreamConverter<'_> {
         match self {
             Self::Chat(converter) => converter.diagnostic_summary(),
             Self::Anthropic(converter) => converter.diagnostic_summary(),
+            Self::Gemini(converter) => converter.diagnostic_summary(),
         }
     }
 }
@@ -351,6 +356,7 @@ fn should_defer_protocol_stream(request_json: Option<&serde_json::Value>) -> any
         deferred_stream_target_protocol(request)?,
         crate::protocol_proxy::UpstreamResponseProtocol::ChatCompletions
             | crate::protocol_proxy::UpstreamResponseProtocol::Anthropic
+            | crate::protocol_proxy::UpstreamResponseProtocol::Gemini
     ))
 }
 
@@ -487,6 +493,7 @@ fn deferred_stream_target_protocol(
             crate::protocol_proxy::UpstreamResponseProtocol::ChatCompletions
         }
         RelayProtocol::Anthropic => crate::protocol_proxy::UpstreamResponseProtocol::Anthropic,
+        RelayProtocol::Gemini => crate::protocol_proxy::UpstreamResponseProtocol::Gemini,
     })
 }
 
@@ -501,6 +508,17 @@ fn responses_stream_failure_bytes(
         let mut converter = request_json
             .map(|request| {
                 crate::protocol_proxy::AnthropicSseToResponsesConverter::with_request_and_diagnostic_id(
+                    request,
+                    diagnostic_id,
+                )
+            })
+            .unwrap_or_default();
+        return converter.fail(message, error_type);
+    }
+    if response_protocol == Some(crate::protocol_proxy::UpstreamResponseProtocol::Gemini) {
+        let mut converter = request_json
+            .map(|request| {
+                crate::protocol_proxy::GeminiInteractionsSseToResponsesConverter::with_request_and_diagnostic_id(
                     request,
                     diagnostic_id,
                 )
@@ -1366,6 +1384,7 @@ async fn handle_protocol_proxy_connection_inner(
             .await?;
         let mut chat_converter;
         let mut anthropic_converter;
+        let mut gemini_converter;
         let response_protocol = upstream.response_protocol;
         let converter_kind = if response_protocol
             == crate::protocol_proxy::UpstreamResponseProtocol::ChatCompletions
@@ -1380,6 +1399,17 @@ async fn handle_protocol_proxy_connection_inner(
                 })
                 .unwrap_or_default();
             EitherResponsesStreamConverter::Chat(&mut chat_converter)
+        } else if response_protocol == crate::protocol_proxy::UpstreamResponseProtocol::Gemini {
+            gemini_converter = request_json
+                .as_ref()
+                .map(|request| {
+                    crate::protocol_proxy::GeminiInteractionsSseToResponsesConverter::with_request_and_diagnostic_id(
+                        request,
+                        Some(&diagnostic_id),
+                    )
+                })
+                .unwrap_or_default();
+            EitherResponsesStreamConverter::Gemini(&mut gemini_converter)
         } else {
             anthropic_converter = request_json
                 .as_ref()
@@ -1677,6 +1707,17 @@ async fn handle_protocol_proxy_connection_inner(
                     )
                 } else {
                     crate::protocol_proxy::anthropic_message_to_response(upstream_json)
+                }
+            }
+            crate::protocol_proxy::UpstreamResponseProtocol::Gemini => {
+                if let Some(request_json) = request_json.as_ref() {
+                    crate::protocol_proxy::gemini_interaction_to_response_with_request_and_options(
+                        upstream_json,
+                        request_json,
+                        layered_compaction_options,
+                    )
+                } else {
+                    crate::protocol_proxy::gemini_interaction_to_response(upstream_json)
                 }
             }
             crate::protocol_proxy::UpstreamResponseProtocol::Responses => unreachable!(),
@@ -2430,6 +2471,7 @@ async fn handle_deferred_protocol_proxy_stream_connection(
 
     let mut chat_converter;
     let mut anthropic_converter;
+    let mut gemini_converter;
     let converter_kind = if response_protocol
         == crate::protocol_proxy::UpstreamResponseProtocol::ChatCompletions
     {
@@ -2443,6 +2485,17 @@ async fn handle_deferred_protocol_proxy_stream_connection(
             })
             .unwrap_or_default();
         EitherResponsesStreamConverter::Chat(&mut chat_converter)
+    } else if response_protocol == crate::protocol_proxy::UpstreamResponseProtocol::Gemini {
+        gemini_converter = request_json
+            .as_ref()
+            .map(|request| {
+                crate::protocol_proxy::GeminiInteractionsSseToResponsesConverter::with_request_and_diagnostic_id(
+                    request,
+                    Some(&diagnostic_id),
+                )
+            })
+            .unwrap_or_default();
+        EitherResponsesStreamConverter::Gemini(&mut gemini_converter)
     } else {
         anthropic_converter = request_json
                 .as_ref()
