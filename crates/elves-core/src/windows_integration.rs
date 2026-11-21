@@ -59,6 +59,9 @@ pub struct WindowsProcessInfo {
     pub parent_process_id: u32,
     pub exe_file: String,
     pub executable_path: Option<PathBuf>,
+    /// 进程快照里的线程数。为 0 时进程不会再执行任何代码，例如 Windows 错误报告为无响应程序
+    /// 留下的进程快照；安装与退出前的进程说明据此区分，见 elves-harness `service::classify_leftovers`。
+    pub thread_count: u32,
 }
 
 #[cfg(windows)]
@@ -315,6 +318,7 @@ pub fn enumerate_processes() -> Vec<WindowsProcessInfo> {
             parent_process_id: entry.th32ParentProcessID,
             exe_file: nul_terminated_wide_to_string(&entry.szExeFile),
             executable_path: query_process_image_path(process_id),
+            thread_count: entry.cntThreads,
         });
         if unsafe { Process32NextW(snapshot, &mut entry) }.is_err() {
             break;

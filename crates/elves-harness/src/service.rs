@@ -49,28 +49,134 @@ fn shutdown_response_is_safe(value: &Value) -> bool {
     matches!(value["status"].as_str(), Some("stopped" | "not_running"))
 }
 
-fn client_process_running() -> bool {
+/// 安装器 `StopElves` 会结束的 Elves 进程名（含旧品牌），用于关停说明。
+const ELVES_PROCESS_NAMES: &[&str] = &[
+    "elves.exe",
+    "elves-manager.exe",
+    "codex-elves.exe",
+    "codex-elves-manager.exe",
+    "codex-elves-task-board.exe",
+    "codex-elves-remote.exe",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcessSample {
+    process_id: u32,
+    exe_file: String,
+    executable_path: Option<std::path::PathBuf>,
+    thread_count: u32,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LeftoverProcesses {
+    running: Vec<ProcessSample>,
+    /// 没有线程的同名进程，只记录 PID。
+    snapshots: Vec<u32>,
+}
+
+/// 后台端点缺失或失效时，列出仍在的 Elves 进程，只写进安装日志和诊断日志，不再据此中止。
+///
+/// 用户要求（2026-11-21）：安装和卸载由安装程序自己关闭 Elves，任何情况下都不要求用户先退出；
+/// 剩余进程交给 NSIS `StopElves` 结束。此前这里只要找到同名进程就中止安装，而 Elves 无响应被
+/// 系统结束时，Windows 错误报告会留下一个没有线程、读不到映像路径的进程快照（父进程是原客户端），
+/// 它不会再执行任何代码，却被当成“仍有客户端进程运行”拦住了安装。没有线程的进程单独列出，不算在运行。
+fn classify_leftovers(
+    current_process_id: u32,
+    processes: impl IntoIterator<Item = ProcessSample>,
+) -> LeftoverProcesses {
+    let mut leftovers = LeftoverProcesses::default();
+    for process in processes {
+        if process.process_id == current_process_id
+            || !ELVES_PROCESS_NAMES.contains(&process.exe_file.to_ascii_lowercase().as_str())
+        {
+            continue;
+        }
+        if process.thread_count == 0 {
+            leftovers.snapshots.push(process.process_id);
+        } else {
+            leftovers.running.push(process);
+        }
+    }
+    leftovers
+}
+
+fn leftover_processes() -> LeftoverProcesses {
     #[cfg(windows)]
     {
-        let current_process_id = std::process::id();
-        return elves_core::windows_integration::enumerate_processes()
-            .into_iter()
-            .any(|process| {
-                process.process_id != current_process_id
-                    && matches!(
-                        process.exe_file.to_ascii_lowercase().as_str(),
-                        "elves.exe"
-                            | "codex-elves.exe"
-                            | "codex-elves-manager.exe"
-                            | "codex-elves-task-board.exe"
-                            | "codex-elves-remote.exe"
-                    )
-            });
+        classify_leftovers(
+            std::process::id(),
+            elves_core::windows_integration::enumerate_processes()
+                .into_iter()
+                .map(|process| ProcessSample {
+                    process_id: process.process_id,
+                    exe_file: process.exe_file,
+                    executable_path: process.executable_path,
+                    thread_count: process.thread_count,
+                }),
+        )
     }
     #[cfg(not(windows))]
     {
-        false
+        LeftoverProcesses::default()
     }
+}
+
+/// 端点缺失或失效时的关停结论：一律 `not_running`，有剩余进程时附上逐行说明。
+/// NSIS 详情列表会截断长行，所以每个进程单独一行。
+fn not_running_response(endpoint_state: &str, leftovers: &LeftoverProcesses) -> Value {
+    let mut lines = Vec::new();
+    if !leftovers.running.is_empty() {
+        lines.push(format!(
+            "Elves 后台{endpoint_state}，仍有 {} 个 Elves 进程在运行：",
+            leftovers.running.len()
+        ));
+        for process in &leftovers.running {
+            let path = process
+                .executable_path
+                .as_ref()
+                .map(|path| format!(" {}", path.display()))
+                .unwrap_or_default();
+            lines.push(format!(
+                "{}（PID {}）{path}",
+                process.exe_file, process.process_id
+            ));
+        }
+    }
+    if !leftovers.snapshots.is_empty() {
+        let ids = leftovers
+            .snapshots
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join("、");
+        lines.push(format!(
+            "忽略没有线程的进程快照（PID {ids}），系统错误报告留下的，不会再运行"
+        ));
+    }
+    let mut value = json!({"status":"not_running","cleanup":"pending_startup_check"});
+    if !lines.is_empty() {
+        value["message"] = json!(lines.join("\n"));
+    }
+    value
+}
+
+fn not_running_status(endpoint_state: &str) -> Value {
+    let leftovers = leftover_processes();
+    if !leftovers.running.is_empty() || !leftovers.snapshots.is_empty() {
+        let _ = elves_core::diagnostic_log::append_diagnostic_log(
+            "harness.shutdown_not_running",
+            json!({
+                "endpoint": endpoint_state,
+                "running": leftovers.running.iter().map(|process| json!({
+                    "processId": process.process_id,
+                    "exeFile": process.exe_file,
+                    "path": process.executable_path.as_ref().map(|path| path.display().to_string()),
+                })).collect::<Vec<_>>(),
+                "threadlessSnapshots": leftovers.snapshots,
+            }),
+        );
+    }
+    not_running_response(endpoint_state, &leftovers)
 }
 
 fn claude_execution_active(directory: &Path) -> bool {
@@ -400,19 +506,14 @@ pub async fn prepare_shutdown_status(reason: &str) -> anyhow::Result<Value> {
     if reason != "installer" {
         super::claude::remember_shutdown(&directory, reason)?;
     }
+    // 用户要求（2026-11-21）：安装程序自己关闭 Elves，不要求用户先退出。端点缺失或失效时没有可询问的
+    // Harness，剩余进程（含无响应的旧客户端、独立代理）只列进日志，由安装器 StopElves 结束；新版执行中的
+    // Codex 在私有服务里，不随这些进程结束。
     let Some(endpoint) = load_endpoint_any(&directory)? else {
-        if client_process_running() {
-            // 端点缺失但仍有客户端进程时，状态无法确认；禁止安装器继续强制结束进程。
-            anyhow::bail!("Elves 后台端点不可用且仍有客户端进程运行，请先退出 Elves 后重试");
-        }
-        return Ok(json!({"status":"not_running","cleanup":"pending_startup_check"}));
+        return Ok(not_running_status("找不到端点"));
     };
     if !endpoint_is_active(&endpoint).await? {
-        if client_process_running() {
-            // 端点失效但仍有客户端进程时，不能把未知状态当作“未运行”。
-            anyhow::bail!("Elves 后台端点已失效且仍有客户端进程运行，请先退出 Elves 后重试");
-        }
-        return Ok(json!({"status":"not_running","cleanup":"pending_startup_check"}));
+        return Ok(not_running_status("端点已失效"));
     }
     let build_matches = endpoint_health(&endpoint)
         .await?
@@ -628,6 +729,57 @@ mod tests {
         for status in ["busy", "closing", "legacy_service", "failed"] {
             assert!(!shutdown_response_is_safe(&json!({"status":status})));
         }
+    }
+
+    #[test]
+    fn stale_endpoint_reports_leftovers_without_blocking_and_ignores_threadless_snapshots() {
+        let sample = |process_id, exe_file: &str, thread_count, path: Option<&str>| ProcessSample {
+            process_id,
+            exe_file: exe_file.to_owned(),
+            executable_path: path.map(std::path::PathBuf::from),
+            thread_count,
+        };
+        let leftovers = classify_leftovers(
+            7,
+            [
+                // 当前 helper 自身、无关进程不列出。
+                sample(7, "elves.exe", 3, None),
+                sample(8, "explorer.exe", 90, None),
+                // 2026-11-21 现场：Windows 错误报告留下的无响应快照，没有线程、读不到映像路径。
+                sample(44300, "elves.exe", 0, None),
+                sample(46780, "ELVES.EXE", 12, Some(r"C:\Elves\elves.exe")),
+                sample(51000, "elves-manager.exe", 20, None),
+            ],
+        );
+        assert_eq!(leftovers.snapshots, vec![44300]);
+        assert_eq!(
+            leftovers
+                .running
+                .iter()
+                .map(|process| process.process_id)
+                .collect::<Vec<_>>(),
+            vec![46780, 51000]
+        );
+
+        let response = not_running_response("端点已失效", &leftovers);
+        assert_eq!(response["status"], "not_running");
+        assert!(shutdown_response_is_safe(&response));
+        let message = response["message"].as_str().unwrap();
+        assert_eq!(
+            message.lines().collect::<Vec<_>>(),
+            vec![
+                "Elves 后台端点已失效，仍有 2 个 Elves 进程在运行：",
+                r"ELVES.EXE（PID 46780） C:\Elves\elves.exe",
+                "elves-manager.exe（PID 51000）",
+                "忽略没有线程的进程快照（PID 44300），系统错误报告留下的，不会再运行",
+            ]
+        );
+
+        let quiet = not_running_response("找不到端点", &LeftoverProcesses::default());
+        assert_eq!(
+            quiet,
+            json!({"status":"not_running","cleanup":"pending_startup_check"})
+        );
     }
 
     #[tokio::test]

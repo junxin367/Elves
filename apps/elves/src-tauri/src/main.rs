@@ -106,6 +106,8 @@ fn main() {
 /// 和完整日志位置直接写进安装日志。新版 Harness 一律放行（第二次确认）：执行中的 Codex 留在私有服务里
 /// 继续，没有执行中的会话时 Codex 一并关闭；等待审批、随退出中断和已保存待续的工作逐条列出。
 /// busy 只会来自尚未升级的旧版 Harness。NSIS 详情列表会截断长行，所以每条说明单独一行。
+/// 第三次确认：安装程序自己关闭 Elves，不论这里的结论如何都不再中止安装（见 Elves.nsi `PrepareShutdown`）；
+/// 后台端点失效时列出的剩余进程来自 helper 自己的检查，对应诊断事件 `harness.shutdown_not_running`。
 fn report_installer_shutdown(response: &serde_json::Value) {
     let status = response["status"].as_str().unwrap_or("unknown");
     let summary = match status {
@@ -131,9 +133,8 @@ fn report_installer_shutdown(response: &serde_json::Value) {
         }
     }
     let event = match status {
-        "stopped" | "not_running" if response["message"].is_string() => {
-            "harness.shutdown_confirmed"
-        }
+        "stopped" if response["message"].is_string() => "harness.shutdown_confirmed",
+        "not_running" if response["message"].is_string() => "harness.shutdown_not_running",
         "stopped" | "not_running" => return,
         _ => "harness.shutdown_blocked",
     };

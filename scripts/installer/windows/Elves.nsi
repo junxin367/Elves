@@ -35,6 +35,8 @@ Var LegacyInstallDir
 ; 用户第二次确认：安装和卸载一律放行。执行中的 Codex 留在 Elves 私有服务里继续（安装后新版自动接上），
 ; 没有执行中的会话时 Codex 一并关闭；新版 Harness 不再返回 busy，busy 只会来自尚未升级的旧版。
 ; 卸载传 --shutdown-mode=uninstall，只用于提示“卸载后不会再有 Elves 接上”。
+; 用户第三次确认（2026-11-21）：安装程序自己关闭 Elves，任何情况下都不要求用户先退出，也不中止安装或卸载；
+; helper 的退出码只决定安装日志里的说明，随后 StopElves 一律结束剩余的 Elves 进程。
 !define SHUTDOWN_BUSY_EXIT_CODE 10
 Function .onInit
   ; 旧品牌只用于迁移，不继续创建旧产品入口或覆盖用户数据。
@@ -77,6 +79,7 @@ FunctionEnd
   Delete "$SMPROGRAMS\Elves\Elves 管理工具.lnk"
 !macroend
 !macro StopElves
+  DetailPrint "正在关闭 Elves 进程…"
   nsExec::ExecToLog 'taskkill /IM codex-elves.exe /F'
   Pop $0
   nsExec::ExecToLog 'taskkill /IM codex-elves-manager.exe /F'
@@ -91,14 +94,15 @@ FunctionEnd
   Pop $0
 !macroend
 !macro PrepareShutdown EXECUTABLE LABEL OPERATION
+  ; 只说明结论，不 Abort：0 为已确认；busy 只会来自尚未升级的旧版（旧版的 Codex 是 Harness 子进程，
+  ; 做不到退出后继续执行）；其他值为状态无法确认。三种情况都接着由 StopElves 关闭 Elves。
   nsExec::ExecToLog '"${EXECUTABLE}" --prepare-shutdown --shutdown-mode=${LABEL}'
   Pop $0
   ${If} $0 == ${SHUTDOWN_BUSY_EXIT_CODE}
-    DetailPrint "正在运行的旧版 Elves 判断仍有任务，未能停止，${OPERATION}已中止；确认没有任务在执行后，在任务管理器结束所有 elves.exe 再重新运行。"
-    Abort
+    DetailPrint "旧版 Elves 判断仍有任务在执行，旧版做不到退出后继续执行；"
+    DetailPrint "${OPERATION}程序直接关闭 Elves，这些任务会中断。"
   ${ElseIf} $0 != 0
-    DetailPrint "未能确认 Elves 已安全停止，${OPERATION}已中止；请查看上方关停检查结果。"
-    Abort
+    DetailPrint "未能确认 Elves 状态（见上方说明），${OPERATION}程序直接关闭 Elves。"
   ${EndIf}
 !macroend
 Section "Install"
