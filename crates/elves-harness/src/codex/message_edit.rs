@@ -39,9 +39,10 @@ fn definite_failure(failure: &anyhow::Error) -> bool {
 impl CodexHarness {
     pub(super) async fn message_edit_ready(&self, id: &str, thread: &Value) -> bool {
         let status = &thread["status"];
+        // 原生状态 systemError（上游或引擎报错后）同样不在执行，允许编辑重发；与退出判定口径一致。
         if !matches!(
             status.as_str().or_else(|| status["type"].as_str()),
-            Some("idle" | "completed" | "failed" | "interrupted" | "notLoaded")
+            Some("idle" | "systemError" | "completed" | "failed" | "interrupted" | "notLoaded")
         ) {
             return false;
         }

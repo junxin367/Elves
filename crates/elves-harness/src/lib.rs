@@ -7670,6 +7670,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
  }
  case 'test/seedHistory':
    if(p.finish){finish(p.threadId,p.status||'completed');break;}
+   if(p.nativeStatus&&t){t.status=p.nativeStatus;event('thread/status/changed',{threadId:p.threadId,status:t.status});break;}
    for(const frame of p.events||[])output(frame);
    for(const context of p.contexts||[])if(t?.path)fs.appendFileSync(t.path,JSON.stringify({type:'turn_context',payload:context})+'\n');
    if(!p.turns)break;
@@ -9093,6 +9094,31 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
                     Some("thread/delete" | "thread/unsubscribe" | "turn/interrupt")
                 ))
         );
+        controller.harness.release().await;
+    }
+
+    #[tokio::test]
+    async fn harness_delete_accepts_thread_left_in_system_error() {
+        // 用户要求（2026-11-21）：上游或引擎报错后原生状态为 systemError 的会话已不在执行，必须能删除，
+        // 不能一直提示“执行状态未确认”。
+        let (_directory, authorization, id) = deletion_fixture().await;
+        let controller = &authorization.controller;
+        controller
+            .harness
+            .seed_test_history(json!({"threadId":id,"nativeStatus":{"type":"systemError"}}))
+            .await
+            .unwrap();
+        let deleted = controller
+            .execute(
+                authorization.device.clone(),
+                "delete-system-error".into(),
+                "deleteThread".into(),
+                json!({"threadId":id}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted["state"], "completed", "{deleted}");
+        assert_eq!(deleted["result"]["deleted"], true, "{deleted}");
         controller.harness.release().await;
     }
 

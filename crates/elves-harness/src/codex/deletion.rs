@@ -72,9 +72,11 @@ impl CodexHarness {
             .as_str()
             .or_else(|| status["type"].as_str())
             .unwrap_or("");
+        // 用户要求（2026-11-21）：上游或引擎报错后原生状态为 systemError 的会话已不在执行，必须能删除；
+        // 与退出判定（codex::native_execution）的“非执行”口径保持一致。
         let terminal_status = matches!(
             status_type,
-            "idle" | "notLoaded" | "completed" | "failed" | "interrupted"
+            "idle" | "notLoaded" | "systemError" | "completed" | "failed" | "interrupted"
         );
         let terminal_failure_status = status_type == "unknown" && terminal_failure;
         if matches!(
@@ -236,9 +238,11 @@ impl CodexHarness {
             .as_str()
             .or_else(|| status["type"].as_str())
             .unwrap_or("");
+        // 用户要求（2026-11-21）：上游或引擎报错后原生状态为 systemError 的会话已不在执行，必须能删除；
+        // 与退出判定（codex::native_execution）的“非执行”口径保持一致。
         let terminal_status = matches!(
             status_type,
-            "idle" | "notLoaded" | "completed" | "failed" | "interrupted"
+            "idle" | "notLoaded" | "systemError" | "completed" | "failed" | "interrupted"
         );
         let terminal_failure_status = status_type == "unknown" && terminal_failure;
         if matches!(
