@@ -783,6 +783,38 @@ fn responses_to_gemini_interactions_preserves_history_tools_and_function_results
 }
 
 #[test]
+fn responses_to_gemini_interactions_preserves_supported_xhigh_and_clamps_older_models() {
+    for (model, effort, expected) in [
+        ("gemini-4-neon-xhigh", "xhigh", "xhigh"),
+        ("google/gemini-4-neon", "max", "xhigh"),
+        ("gemini-4-hydrogen", "xhigh", "xhigh"),
+        ("gemini-4-hydrogen", "ultra", "xhigh"),
+        ("gemini-4-neon", "minimal", "low"),
+        ("gemini-4-carbon", "xhigh", "high"),
+        ("gemini-4-argon", "xhigh", "high"),
+        ("gemini-3.1-pro", "xhigh", "high"),
+        ("gemini-3-pro", "medium", "low"),
+        ("gemini-3-flash-preview", "minimal", "low"),
+        ("custom-gemini", "xhigh", "high"),
+    ] {
+        for source in ["reasoning", "reasoning_effort", "model_reasoning_effort"] {
+            let mut request = json!({"model": model, "input": "hello", "stream": false});
+            request[source] = if source == "reasoning" {
+                json!({"effort": effort})
+            } else {
+                json!(effort)
+            };
+            let converted = responses_to_gemini_interactions(request).unwrap();
+            assert_eq!(
+                converted["generation_config"]["thinking_level"],
+                expected,
+                "{model} {source}={effort}"
+            );
+        }
+    }
+}
+
+#[test]
 fn gemini_interaction_json_maps_text_function_call_usage_and_errors() {
     let request = json!({
         "model": "gemini-3.1-pro",
@@ -8634,6 +8666,29 @@ fn future_models_inherit_top_reasoning_efforts_across_families() {
         supported_reasoning_efforts_for_model("gemini-3-pro", UpstreamResponseProtocol::Responses),
         vec!["low", "high"]
     );
+    for protocol in [
+        UpstreamResponseProtocol::Responses,
+        UpstreamResponseProtocol::Gemini,
+    ] {
+        for model in [
+            "gemini-4-neon",
+            "gemini-4-neon-xhigh",
+            "google/gemini-4-hydrogen",
+        ] {
+            assert_eq!(
+                supported_reasoning_efforts_for_model(model, protocol),
+                vec!["low", "medium", "high", "xhigh"],
+                "{model} 应开放 xhigh"
+            );
+        }
+        for model in ["gemini-4-carbon", "gemini-4-argon", "gemini-4-pro"] {
+            assert_eq!(
+                supported_reasoning_efforts_for_model(model, protocol),
+                vec!["low", "medium", "high"],
+                "{model} 不能借用 Neon/Hydrogen 的 xhigh"
+            );
+        }
+    }
 
     // StepFun：能力按家族前缀识别，不绑定单个日期快照名。
     for model in ["step-3.5-flash", "step-3.5-flash-2603", "step-4-flash"] {

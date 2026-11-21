@@ -2007,9 +2007,15 @@ pub fn responses_to_gemini_interactions(body: Value) -> anyhow::Result<Value> {
     if let Some(effort) = extract_requested_reasoning_effort(&body)
         .and_then(|effort| normalize_reasoning_effort(&effort))
     {
+        // 用户要求 Gemini 4 Neon/Hydrogen 的 xhigh 真正生效；目录和出站参数共用能力表，
+        // 不能再统一降为 high，旧模型及过高等级仍按各自上限兼容。
+        let effort =
+            clamp_reasoning_effort_for_model(effort, model, UpstreamResponseProtocol::Gemini)
+                .unwrap_or("low");
         generation_config["thinking_level"] = json!(match effort {
             "minimal" | "low" => "low",
             "medium" => "medium",
+            "xhigh" => "xhigh",
             _ => "high",
         });
     }
@@ -15482,6 +15488,15 @@ pub fn supported_reasoning_efforts_for_model(
     if let Some(version) =
         model_family_version(&model, "gemini").filter(|version| *version >= (3, 0))
     {
+        // 用户要求 Gemini 4 的 Neon/Hydrogen 开放 xhigh；Carbon/Argon 等不能跟随开放，
+        // 且 4 代不再提供 minimal。生成模型目录与 Interactions 转换必须同步使用此表。
+        if version >= (4, 0) {
+            return if model.contains("neon") || model.contains("hydrogen") {
+                levels(&["low", "medium", "high", "xhigh"])
+            } else {
+                levels(&["low", "medium", "high"])
+            };
+        }
         if model.contains("pro") {
             // gemini-3-pro 只有 low/high，3.1 起补齐 medium，更新版本继承该能力。
             return if version >= (3, 1) {
@@ -15502,6 +15517,8 @@ pub fn supported_reasoning_efforts_for_model(
 fn default_reasoning_efforts(protocol: UpstreamResponseProtocol) -> Vec<&'static str> {
     match protocol {
         UpstreamResponseProtocol::Anthropic => levels(&["low", "medium", "high", "xhigh", "max"]),
+        // 未识别的 Gemini 型号不能借用其他协议的 max/xhigh，已知型号由上方能力表开放。
+        UpstreamResponseProtocol::Gemini => levels(&["low", "medium", "high"]),
         _ => levels(&["minimal", "low", "medium", "high", "xhigh", "max"]),
     }
 }

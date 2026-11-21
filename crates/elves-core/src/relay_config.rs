@@ -5464,6 +5464,60 @@ base_url = "http://127.0.0.1:45221/v1"
     }
 
     #[test]
+    fn generated_model_catalog_exposes_gemini_xhigh_and_preserves_model_limits() {
+        let profile = RelayProfile {
+            local_proxy_enabled: Some(true),
+            model_mappings: [
+                ("gemini-4-neon-xhigh", "neon"),
+                ("gemini-4-hydrogen", ""),
+                ("gemini-4-carbon", ""),
+                ("gemini-3.1-pro", ""),
+            ]
+            .into_iter()
+            .map(|(model, alias)| crate::settings::RelayModelMapping {
+                request_model: model.to_string(),
+                alias: alias.to_string(),
+                protocol: RelayProtocol::Gemini,
+                context_window: String::new(),
+                system_prompt_override: String::new(),
+            })
+            .collect(),
+            ..RelayProfile::default()
+        };
+        let catalog = generated_model_catalog_json(
+            &profile,
+            "model_reasoning_effort = \"xhigh\"",
+            relay_profile_catalog_rows(&profile).unwrap(),
+        )
+        .unwrap();
+        for (slug, maximum) in [
+            ("neon", "xhigh"),
+            ("gemini-4-hydrogen", "xhigh"),
+            ("gemini-4-carbon", "high"),
+            ("gemini-3.1-pro", "high"),
+        ] {
+            let model = catalog["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|model| model["slug"] == slug)
+                .unwrap();
+            let efforts: Vec<_> = model["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|level| level["effort"].as_str().unwrap())
+                .collect();
+            let mut expected = vec!["low", "medium", "high"];
+            if maximum == "xhigh" {
+                expected.push("xhigh");
+            }
+            assert_eq!(efforts, expected, "{slug}");
+            assert_eq!(model["default_reasoning_level"], maximum, "{slug}");
+        }
+    }
+
+    #[test]
     fn generated_model_catalog_uses_swe_version_efforts_and_preserves_mapping_aliases() {
         let profile = RelayProfile {
             relay_mode: crate::settings::RelayMode::PureApi,
