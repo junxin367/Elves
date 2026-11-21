@@ -80,7 +80,8 @@ pub(super) async fn codex(
     effort: Option<&str>,
     authorization: &HarnessAuthorization,
 ) -> anyhow::Result<String> {
-    let service = crate::codex_service::spawn_service().await?;
+    // 命名只用独立 stdio 进程，不进入 Elves 私有 Codex 服务（见 spawn_inference_service）。
+    let service = crate::codex_service::spawn_inference_service().await?;
     codex_with_service(service, settings, input, effort, authorization).await
 }
 

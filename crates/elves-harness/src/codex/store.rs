@@ -113,6 +113,25 @@ pub(super) struct Deletion {
     pub attached_to_thread_id: Option<String>,
 }
 
+/// 用户要求（2026-11-21）：Codex 的后台终端（exec_command 让出后仍在运行的命令）也算执行中，退出或升级时
+/// 不能被静默结束。协议没有列出后台终端的接口，thread/read 在命令结束前也看不到它，只能按 item/started 与
+/// item/completed 跟踪；Harness 交接时随私有服务代次保存在这里，新 Harness 只在接上同一代次服务时沿用。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct OpenCommand {
+    pub thread_id: String,
+    pub item_id: String,
+    pub command: String,
+    #[serde(default)]
+    pub process_id: Option<String>,
+    /// 私有服务代次；stdio 连接为空，Harness 一断开就随 app-server 结束。
+    #[serde(default)]
+    pub server: Option<String>,
+    /// 由上一个 Harness 交接而来：本连接收不到它的 item/completed，需要用 thread/read 核对是否已结束。
+    #[serde(default)]
+    pub inherited: bool,
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub(super) struct Data {
@@ -136,6 +155,8 @@ pub(super) struct Data {
     pub thread_devices: BTreeMap<String, String>,
     pub queue_gates: BTreeMap<String, QueueGate>,
     pub deletions: BTreeMap<String, Deletion>,
+    /// 交接给下一个 Harness 的后台终端，键为 `会话ID:条目ID`；见 OpenCommand。
+    pub background_commands: BTreeMap<String, OpenCommand>,
 }
 
 pub(super) struct Store {
@@ -251,24 +272,47 @@ impl Data {
     /// 用户确认历史 inProgress、已完成编辑回执和编辑草稿不代表真实执行。
     /// 退出只应被待派发、发送中、结果未知或其他仍需处理的队列状态阻塞；
     /// 草稿、完成/取消回执及仅绑定草稿的 queue gate 必须保留数据但允许 Harness 退出。
-    pub fn has_release_blocking_work(&self) -> bool {
-        let queue_blocks_release = self
-            .queues
-            .values()
-            .flatten()
-            .any(|message| message.state != "editing");
-        let edit_blocks_release = self
-            .edits
-            .values()
-            .any(|edit| !matches!(edit.state.as_str(), "editing" | "committed" | "canceled"));
-        let gate_blocks_release = self.queue_gates.iter().any(|(thread_id, _)| {
-            self.queues
-                .get(thread_id)
-                .into_iter()
-                .flatten()
-                .any(|message| message.state != "editing")
-        });
-        queue_blocks_release || edit_blocks_release || gate_blocks_release
+    /// 用户要求安装/退出被拦截时直接给出可排查的原因：逐条列出仍需派发、发送中、
+    /// 结果未知的队列消息，以及未完成的编辑和删除，不能只返回一个布尔值。
+    /// queue gate 只有在同一会话仍有非草稿消息时才会阻塞，此时已由 queue_pending 覆盖，
+    /// 所以只作为附加信息输出。
+    pub fn release_blockers(&self) -> Vec<Value> {
+        let mut blockers = Vec::new();
+        for (thread_id, messages) in &self.queues {
+            let states: Vec<&str> = messages
+                .iter()
+                .filter(|message| message.state != "editing")
+                .map(|message| message.state.as_str())
+                .collect();
+            if !states.is_empty() {
+                blockers.push(json!({
+                    "kind":"queue_pending",
+                    "threadId":thread_id,
+                    "states":states,
+                    "gate":self.queue_gates.get(thread_id).map(|gate| gate.phase.as_str())
+                }));
+            }
+        }
+        for (edit_id, edit) in &self.edits {
+            if !matches!(edit.state.as_str(), "editing" | "committed" | "canceled") {
+                blockers.push(json!({
+                    "kind":"edit_pending",
+                    "threadId":edit.thread_id,
+                    "editId":edit_id,
+                    "state":edit.state
+                }));
+            }
+        }
+        for (thread_id, deletion) in &self.deletions {
+            if deletion.state != "deleted" {
+                blockers.push(json!({
+                    "kind":"deletion_pending",
+                    "threadId":thread_id,
+                    "state":deletion.state
+                }));
+            }
+        }
+        blockers
     }
 
     pub fn queue(&self, thread_id: &str, epoch: &str, revision: u64) -> Value {
@@ -353,14 +397,33 @@ mod tests {
             },
         );
         assert!(
-            !data.has_release_blocking_work(),
+            data.release_blockers().is_empty(),
             "历史回执、编辑草稿和仅绑定草稿的 gate 不能阻塞退出"
         );
 
         data.queues.get_mut("draft-thread").unwrap()[0].state = "queued".into();
         assert!(
-            data.has_release_blocking_work(),
+            !data.release_blockers().is_empty(),
             "待发送队列必须继续阻塞退出"
+        );
+        data.deletions.insert(
+            "deleting-thread".into(),
+            Deletion {
+                state: "unknown".into(),
+                device_id: "device".into(),
+                request_id: None,
+                cleanup_pending: false,
+                attached_to_thread_id: None,
+            },
+        );
+        // 安装器和托盘退出要逐条展示原因，明细必须带出会话 ID 与具体状态。
+        assert_eq!(
+            data.release_blockers(),
+            vec![
+                json!({"kind":"queue_pending","threadId":"draft-thread",
+                    "states":["queued"],"gate":"paused"}),
+                json!({"kind":"deletion_pending","threadId":"deleting-thread","state":"unknown"}),
+            ]
         );
     }
 

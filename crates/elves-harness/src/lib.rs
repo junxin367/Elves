@@ -1,5 +1,6 @@
 //! Harness：Elves 的独立执行、会话与管理产品。远程会话仅是可选的网页/Android 访问能力。
 pub use elves_core::settings;
+mod codex_server;
 mod codex_service;
 pub use elves_core::assets;
 pub use elves_core::cli_wrapper;
@@ -505,8 +506,6 @@ pub struct HarnessController {
     running: AtomicBool,
     closing: AtomicBool,
     shutdown_complete: AtomicBool,
-    // 安装升级时只关闭 Harness 自身；Codex daemon 与 Claude native job 由新 Harness 重接。
-    preserve_execution_on_shutdown: AtomicBool,
     shutdown_serial: Mutex<()>,
     events: broadcast::Sender<Value>,
     key_checks: Arc<tokio::sync::Semaphore>,
@@ -611,7 +610,6 @@ impl HarnessController {
             running: AtomicBool::new(false),
             closing: AtomicBool::new(false),
             shutdown_complete: AtomicBool::new(false),
-            preserve_execution_on_shutdown: AtomicBool::new(false),
             shutdown_serial: Mutex::new(()),
             events,
             key_checks: Arc::new(tokio::sync::Semaphore::new(4)),
@@ -974,39 +972,6 @@ impl HarnessController {
         }
         let _ = self.save_devices(&auth).await;
         self.publish_event(json!({"method":"remote/authorizationChanged"}));
-    }
-
-    pub async fn detach_for_upgrade(self: &Arc<Self>) {
-        // 安装升级只撤下 Harness 入口和公网监听；Codex daemon 与 Claude native job 不走 release，
-        // 由新版本启动后的 reconnect/daemon proxy 重新接管，避免中断执行中的任务。
-        self.desktop_running.store(false, Ordering::Release);
-        self.harness.enabled.store(false, Ordering::Release);
-        self.claude.set_reconnect_enabled(false);
-        self.stop_desktop().await;
-        self.publish_access_policy(&RemoteAccessSettings::default());
-        self.harness_connected.store(false, Ordering::Release);
-        self.publish_event(json!({"method":"remote/disconnected"}));
-
-        let mut live = self.live.lock().await;
-        self.stop_frp(&mut live).await;
-        if let Some(handle) = live.handle.take() {
-            handle.shutdown();
-        }
-        if let Some(task) = live.server.take() {
-            task.abort();
-            let _ = task.await;
-        }
-        if let Some(task) = live.pump.take() {
-            task.abort();
-            let _ = task.await;
-        }
-        live.ngrok.stop().await;
-        live.zrok.reconcile(false, "").await;
-        live.settings = Some(RemoteAccessSettings::default());
-        live.error = None;
-        self.running.store(false, Ordering::Release);
-        drop(live);
-        let _ = self.claude.record_clean_exit();
     }
 
     pub async fn reconcile(self: &Arc<Self>, mut settings: RemoteAccessSettings) {
@@ -2686,14 +2651,9 @@ pub fn start_monitor() -> anyhow::Result<HarnessRuntime> {
                 _ = tokio::time::sleep(Duration::from_secs(2)) => {}
             }
         }
-        if controller
-            .preserve_execution_on_shutdown
-            .load(Ordering::Acquire)
-        {
-            controller.detach_for_upgrade().await;
-        } else {
-            controller.reconcile(RemoteAccessSettings::default()).await;
-        }
+        // 关停判定已在 prepare_controller_shutdown 中完成（含是否保留 Elves 私有 Codex 服务）；
+        // 这里只回收尚未走受控关停的情况，已完成关停时 reconcile 直接返回。
+        controller.reconcile(RemoteAccessSettings::default()).await;
     });
     Ok(HarnessRuntime { shutdown, task })
 }
@@ -2720,114 +2680,106 @@ async fn prepare_controller_shutdown(reason: &str) -> Value {
         return json!({"status":"stopped","cleanup":controller.claude.cleanup_report()});
     }
 
-    let installer_requested = reason == "installer";
-    let installer_stdio_idle_shutdown = if installer_requested {
-        let handoff = controller.harness.handoff_status().await;
-        if handoff == codex::HandoffStatus::Unknown {
-            let _ = crate::diagnostic_log::append_diagnostic_log(
-                "harness.shutdown_handoff_unavailable",
-                json!({"reason":"installer","transport":handoff.as_str()}),
-            );
-            return json!({
-                "status":"busy",
-                "reason":"handoff_unavailable",
-                "handoff":"unavailable",
-                "transport":handoff.as_str(),
-                "message":"当前 Codex 连接不能脱离 Harness 安全交接，未停止 Elves；请等待连接恢复后重试。"
+    // 卸载只影响提示文字：任务同样留在私有服务里继续，但卸载后不会再有 Elves 接上它们。
+    let uninstall_requested = reason == "uninstall";
+    // 先停止派发和重连，再核对 Codex 状态。
+    controller.closing.store(true, Ordering::Release);
+    controller.harness.enabled.store(false, Ordering::Release);
+    // 用户要求（2026-11-21，第二次确认）：托盘退出和安装升级一律放行，不能因 Codex 状态拦住；Codex 在
+    // 执行就留在 Elves 私有服务里继续，下次启动自动接上。release_blockers 最多等 RELEASE_DRAIN_WAIT
+    // 让在途请求返回，之后每条原因只决定处理方式和提示，分类见 codex::ShutdownPlan；修改口径时同步核对
+    // describe_release_blocker、apps/elves 的安装日志输出和产品规范“Elves 安装、启动与 Harness”。
+    let mut blockers = controller
+        .harness
+        .release_blockers(codex::RELEASE_DRAIN_WAIT)
+        .await;
+    let transport = controller.harness.handoff_status().await;
+    // 用户要求（2026-11-21）：没有执行中的会话时退出要连同 Codex 一起关闭。私有服务当前没有可用连接
+    // （连接断开，或上次留下、本次尚未连上）时直接只读核对它：确认空闲就停止，读取失败才按状态未知保留。
+    let unknown_server = |blocker: &Value| {
+        blocker["kind"] == "server_not_connected"
+            || blocker["kind"] == "engine_disconnected" && blocker["transport"] == "private_server"
+    };
+    let runtime_server = controller
+        .harness
+        .private_server()
+        .await
+        .filter(crate::codex_server::alive);
+    let mut unconnected = None;
+    if transport != codex::HandoffStatus::PrivateServer {
+        // 断开连接对应的服务进程已经不在时，它里面不可能再有任务，不再按状态未知保留。
+        if runtime_server.is_none() {
+            blockers.retain(|blocker| {
+                !(blocker["kind"] == "engine_disconnected"
+                    && blocker["transport"] == "private_server")
             });
         }
-        // stdio 连接无法脱离 Harness，但空闲时可以按普通安全关停回收；
-        // 只有 daemon proxy 才能在仍有执行任务时走 preserve-execution handoff。
-        handoff == codex::HandoffStatus::Stdio
-    } else {
-        false
-    };
-    let preserve_execution = installer_requested && !installer_stdio_idle_shutdown;
-    controller
-        .preserve_execution_on_shutdown
-        .store(preserve_execution, Ordering::Release);
-    // 安装升级走 handoff：只关闭 Harness 入口，保留 Codex daemon 与 Claude native job；
-    // 普通退出仍要求确认空闲后再回收，避免把用户主动退出误当作升级接管。
-    controller.closing.store(true, Ordering::Release);
-    let was_harness_enabled = controller
-        .harness
-        .enabled
-        .swap(false, Ordering::AcqRel);
-    if !preserve_execution {
-        if !controller.harness.idle().await {
-            let _ = crate::diagnostic_log::append_diagnostic_log(
-                "harness.shutdown_blocked",
-                json!({
-                    "reason":if installer_stdio_idle_shutdown {
-                        "installer_stdio_active_or_unknown"
-                    } else {
-                        "codex_active_or_unknown"
-                    }
-                }),
-            );
-            controller
+        if let Some(server) = runtime_server
+            .clone()
+            .or_else(crate::codex_server::running_for_settings)
+        {
+            match controller
                 .harness
-                .enabled
-                .store(was_harness_enabled, Ordering::Release);
-            controller.closing.store(false, Ordering::Release);
-            controller
-                .preserve_execution_on_shutdown
-                .store(false, Ordering::Release);
-            return json!({
-                "status":"busy",
-                "reason":"codex_active",
-                "message":if installer_stdio_idle_shutdown {
-                    "当前 Codex 使用 stdio 连接且仍在执行或状态尚未确认，安装暂缓；任务完成后会自动继续。"
-                } else {
-                    "Codex 仍在执行或状态尚未确认，未停止 Elves；请等待任务完成后再重试。"
-                },
-                "cleanup":{"complete":false,"pendingStartupCheck":false}
-            });
+                .unconnected_server_blockers(&server)
+                .await
+            {
+                Ok(found) => {
+                    blockers.retain(|blocker| !unknown_server(blocker));
+                    blockers.extend(found);
+                }
+                Err(error) => {
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "harness.shutdown_server_check_failed",
+                        json!({"processId":server.process_id,"error":format!("{error:#}")}),
+                    );
+                    if !blockers.iter().any(unknown_server) {
+                        blockers.push(json!({"kind":"server_not_connected"}));
+                    }
+                }
+            }
+            unconnected = Some(server);
         }
     }
-    if preserve_execution {
-        // 安装交接只允许已确认的 daemon proxy；在设置 closing 后再次核对，
-        // 防止连接在首次检查与 detach 之间断开而把未知状态当成安全交接。
-        let handoff = controller.harness.handoff_status().await;
-        if !handoff.allows_upgrade() {
-            let _ = crate::diagnostic_log::append_diagnostic_log(
-                "harness.shutdown_handoff_unavailable",
-                json!({"reason":"installer","transport":handoff.as_str()}),
-            );
-            controller
-                .harness
-                .enabled
-                .store(was_harness_enabled, Ordering::Release);
-            controller.closing.store(false, Ordering::Release);
-            controller
-                .preserve_execution_on_shutdown
-                .store(false, Ordering::Release);
-            return json!({
-                "status":"busy",
-                "reason":"handoff_unavailable",
-                "handoff":"unavailable",
-                "transport":handoff.as_str(),
-                "message":"Codex 连接在安装交接前变为未知状态，未停止 Elves；请等待连接恢复后重试。"
-            });
-        }
-        controller.stop_desktop().await;
-        controller.publish_access_policy(&RemoteAccessSettings::default());
-        controller.claude.set_reconnect_enabled(false);
-        let _ = controller.claude.record_clean_exit();
-        let _ = crate::diagnostic_log::append_diagnostic_log(
-            "harness.shutdown_handoff_confirmed",
-            json!({"reason":"installer","preserveExecution":true}),
-        );
-        controller.shutdown_complete.store(true, Ordering::Release);
-        return json!({
-            "status":"stopped",
-            "handoff":"preserve_execution",
-            "cleanup":controller.claude.cleanup_report()
-        });
+    let plan = codex::ShutdownPlan::new(blockers, transport.preserves_execution());
+    // 诊断日志只记录会话 ID 和状态，不写入会话标题、命令等用户内容；它们只随响应展示给本机用户。
+    let redact = |items: &[Value]| -> Vec<Value> {
+        items
+            .iter()
+            .map(|blocker| {
+                let mut blocker = blocker.clone();
+                if let Some(object) = blocker.as_object_mut() {
+                    object.remove("name");
+                    object.remove("command");
+                }
+                blocker
+            })
+            .collect()
+    };
+    if plan.keeps_server()
+        && let Some(server) = runtime_server.as_ref().or(unconnected.as_ref())
+    {
+        controller
+            .harness
+            .hand_over_background_commands(&server.generation)
+            .await;
     }
     let _ = crate::diagnostic_log::append_diagnostic_log(
         "harness.shutdown_confirmed",
-        json!({"reason":"safe_idle"}),
+        json!({
+            "reason":if plan.keeps_server() {
+                "codex_continues"
+            } else if plan.is_empty() {
+                "safe_idle"
+            } else {
+                "codex_released"
+            },
+            "request":reason,
+            "transport":transport.as_str(),
+            "continuing":redact(&plan.continuing),
+            "waiting":redact(&plan.waiting),
+            "interrupted":redact(&plan.interrupted),
+            "saved":redact(&plan.saved)
+        }),
     );
 
     controller.stop_desktop().await;
@@ -2841,6 +2793,20 @@ async fn prepare_controller_shutdown(reason: &str) -> Value {
         .clone()
         .unwrap_or_default();
     controller.reconcile(settings).await;
+    if !plan.keeps_server() {
+        // 私有服务里没有要继续的任务：释放引擎并停止私有服务（reconcile 内的 stop_preparation 还会因
+        // 打开中的临时侧边保留引擎，退出时不需要保留）。stdio 兜底时执行中的任务在这里随引擎结束。
+        controller.harness.release().await;
+        // 上次留下、本次没连上的服务不在引擎连接里，release 停不到它，核对确认空闲后在这里单独停止。
+        if let Some(server) = unconnected.filter(crate::codex_server::alive)
+            && let Err(error) = crate::codex_server::stop(&server)
+        {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "remote_access.codex_server.stop_failed",
+                json!({"processId":server.process_id,"error":format!("{error:#}")}),
+            );
+        }
+    }
     if controller.claude.record_clean_exit().is_err() {
         let _ = crate::diagnostic_log::append_diagnostic_log(
             "claude.cleanup_exit_journal_failed",
@@ -2848,7 +2814,24 @@ async fn prepare_controller_shutdown(reason: &str) -> Value {
         );
     }
     controller.shutdown_complete.store(true, Ordering::Release);
-    json!({"status":"stopped","cleanup":controller.claude.cleanup_report()})
+    let mut response = json!({"status":"stopped","cleanup":controller.claude.cleanup_report()});
+    if plan.keeps_server() {
+        response["codex"] = json!("continuing");
+    }
+    for (key, items) in [
+        ("continuing", &plan.continuing),
+        ("waiting", &plan.waiting),
+        ("interrupted", &plan.interrupted),
+        ("saved", &plan.saved),
+    ] {
+        if !items.is_empty() {
+            response[key] = json!(items);
+        }
+    }
+    if let Some(message) = plan.message(uninstall_requested) {
+        response["message"] = json!(message);
+    }
+    response
 }
 
 pub async fn service_admin_request(action: &str, payload: Value) -> Value {

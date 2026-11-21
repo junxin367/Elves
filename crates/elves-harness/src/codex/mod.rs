@@ -43,24 +43,34 @@ use projection::Projection;
 use runtime::Runtime;
 use store::{Queued, Store};
 
+/// 关停前等待在途请求自然返回的上限。prepare_controller_shutdown 已先设置 closing、
+/// 停止队列派发，新请求不会进入；这里只给已派发的请求一个返回窗口，超时后按方法名列为阻塞原因。
+/// 与下面两个原生查询上限合计约 5 + 5 + 20 = 30 秒，须小于 service.rs 的 SHUTDOWN_TIMEOUT（60 秒），
+/// 否则关停请求超时被取消后 closing 标志无法复位。调整任一数值时同步核对三处。
+pub(crate) const RELEASE_DRAIN_WAIT: Duration = Duration::from_secs(5);
+const NATIVE_CHECK_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const NATIVE_CHECK_BUDGET: Duration = Duration::from_secs(20);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HandoffStatus {
     // Runtime 尚未持有执行连接；它与“已有连接后断开”的 Unknown 必须分开处理。
     NoConnection,
-    DaemonProxy,
+    /// Elves 私有 app-server：Harness 退出或升级后，执行中的任务在服务里继续。
+    PrivateServer,
     Stdio,
     Unknown,
 }
 
 impl HandoffStatus {
-    pub(crate) fn allows_upgrade(self) -> bool {
-        matches!(self, Self::NoConnection | Self::DaemonProxy)
+    /// 只有私有服务能让执行中的 Codex 在 Harness 退出后继续；stdio 子进程会随 Harness 结束。
+    pub(crate) fn preserves_execution(self) -> bool {
+        matches!(self, Self::PrivateServer)
     }
 
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::NoConnection => "no_connection",
-            Self::DaemonProxy => "daemon_proxy",
+            Self::PrivateServer => "private_server",
             Self::Stdio => "stdio",
             Self::Unknown => "unknown",
         }
@@ -83,6 +93,10 @@ pub(super) struct CodexHarness {
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     queue_recovery_after: Mutex<HashMap<String, std::time::Instant>>,
     loaded: Mutex<HashMap<String, String>>,
+    /// 正在运行的命令（含后台终端），键为 `会话ID:条目ID`；见 store::OpenCommand。
+    open_commands: Mutex<std::collections::BTreeMap<String, store::OpenCommand>>,
+    /// 当前连接代次与对应的私有服务代次；只跟踪当前连接上的命令事件。
+    connection_identity: Mutex<(String, Option<String>)>,
     pin_capability: Mutex<Option<(String, bool)>>,
     project_preferences: Mutex<Option<(std::path::PathBuf, projects::ProjectPreferences)>>,
     #[cfg(test)]
@@ -164,6 +178,17 @@ impl CodexHarness {
                 initial_projection.forget_deleted_thread(id);
             }
         }
+        // 上一个 Harness 交接下来的后台终端；接上同一代次的私有服务后才继续计入（见 observe_open_commands）。
+        let inherited_commands = store
+            .data
+            .background_commands
+            .iter()
+            .map(|(key, command)| {
+                let mut command = command.clone();
+                command.inherited = true;
+                (key.clone(), command)
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
         let projection = Arc::new(Mutex::new(initial_projection));
         Ok(Arc::new(Self {
             audit: audit.clone(),
@@ -181,6 +206,8 @@ impl CodexHarness {
             locks: Mutex::new(HashMap::new()),
             queue_recovery_after: Mutex::new(HashMap::new()),
             loaded: Mutex::new(HashMap::new()),
+            open_commands: Mutex::new(inherited_commands),
+            connection_identity: Mutex::new((String::new(), None)),
             pin_capability: Mutex::new(None),
             project_preferences: Mutex::new(None),
             #[cfg(test)]
@@ -227,6 +254,7 @@ impl CodexHarness {
                         {
                             service.side_idle.lock().await.observe(&frame);
                         }
+                        service.observe_open_commands(&frame).await;
                         // 加载标记只属于当前独立引擎；收到卸载事件后清除旧代次记录。
                         let generation = frame["_generation"].as_str().unwrap_or("");
                         if frame["method"] == "thread/deleted"
@@ -373,55 +401,68 @@ impl CodexHarness {
         self.projection.lock().await.side_session_metrics(thread_id)
     }
 
+    /// 引擎内部释放（stop_preparation）沿用比退出更保守的口径：除退出阻塞原因外，
+    /// 仍由当前引擎承载的临时侧边即使空闲也保留引擎，避免远程开关变化时丢掉正在查看的侧边上下文。
+    /// 引擎重连后侧边只标记 expired（closed 仍为 false），它已不在当前引擎内，不能继续阻止释放。
     pub async fn idle(&self) -> bool {
-        if !self.runtime.can_release().await {
-            // 连接已经异常断开时，Projection 会清空 active；此时不能把未知执行当成空闲释放引擎。
-            return false;
-        }
-        let store = self.store.lock().await;
-        // 用户确认历史回执和编辑草稿不代表真实执行；Store 仍须保留它们，
-        // 但退出判断只读取仍需派发、核对或处理的队列状态。
-        let store_blocks_release = store.data.has_release_blocking_work();
-        let deletions_confirmed = store
-            .data
-            .deletions
-            .values()
-            .all(|deletion| deletion.state == "deleted");
-        drop(store);
-        let live_connection = self.runtime.has_live_connection().await;
-        if !live_connection && codex_child_running() {
-            // 原生连接已断开但当前 Harness 仍持有 Codex 子进程时，执行状态未知，不能关闭后台。
-            return false;
-        }
-        let projection = self.projection.lock().await;
-        if !live_connection
-            && (!projection.threads.is_empty()
-                || !projection.active.is_empty()
-                || !projection.requests.is_empty()
-                || !projection.compactions.is_empty())
-        {
-            // 已有会话但原生连接已断开时，状态未知，不能让安装流程强制结束后台。
-            return false;
-        }
-        let threads_safe = projection
-            .threads
-            .values()
-            .all(|thread| !native_thread_is_busy(thread));
-        let projection_safe = projection.active.is_empty()
-            && projection.requests.is_empty()
-            && projection.compactions.is_empty()
-            && threads_safe
-            && projection.sides.threads.values().all(|side| side.closed);
-        drop(projection);
-        !store_blocks_release
-            && deletions_confirmed
-            && projection_safe
-            && (!live_connection || self.native_threads_idle().await)
+        self.release_blockers(Duration::ZERO).await.is_empty()
+            && self
+                .projection
+                .lock()
+                .await
+                .sides
+                .threads
+                .values()
+                .all(|side| side.closed || side.expired)
     }
 
-    async fn native_threads_idle(&self) -> bool {
-        // 上游失败已通过事件投影确认终态时，原生列表偶尔仍返回 unknown；
-        // 只对同一会话且没有活动/压缩/待处理请求的失败轮次放行，其他 unknown 继续阻止退出。
+    /// 用户要求（2026-11-21）：安装和托盘退出只能被“真实执行中”或“仍在途的写操作”阻塞，
+    /// 并逐条给出原因，不能再把所有情况折叠成 codex_active。判定口径：
+    /// 1. 执行证据只认本 Harness 原生引擎里“已加载”线程的原生 ThreadStatus（thread/loaded/list
+    ///    + thread/read）。未加载的线程不可能在本引擎内执行；投影里由 markRead、token 用量、
+    ///    设置更新等事件补出的条目没有原生 status，不能当成执行中——此前正是这类条目让安装器
+    ///    在没有任何任务执行时一直返回 codex_active。
+    /// 2. 原生状态未知、查询失败、引擎连接断开但 Codex 子进程仍在 → 保守阻塞（fail-closed）。
+    /// 3. 持久队列待派发/发送中/结果未知、编辑和删除未完成 → 阻塞（见 Data::release_blockers）。
+    /// 4. 在途 RPC 最多等待 drain_wait；仍未返回的按方法名列出后阻塞。
+    /// 修改口径时同步核对 prepare_controller_shutdown 的提示文案和 describe_release_blocker。
+    pub async fn release_blockers(&self, drain_wait: Duration) -> Vec<Value> {
+        let mut blockers = self.store.lock().await.data.release_blockers();
+        match self.runtime.connection_state().await {
+            runtime::ConnectionState::Alive => {}
+            runtime::ConnectionState::NoConnection | runtime::ConnectionState::Lost => {
+                // 没有存活连接时无法读取原生状态。私有服务断线：服务里的任务可能仍在执行；stdio 断线但
+                // 本 Harness 名下仍有 Codex 子进程：同样无法确认。没有连接但上次留下的私有服务仍在运行：
+                // 状态未知。以上都不能当成空闲；没有任何 Codex 进程时本引擎内不可能有任务执行。
+                if self.runtime.private_server().await.is_some() {
+                    blockers
+                        .push(json!({"kind":"engine_disconnected","transport":"private_server"}));
+                } else if codex_child_running() {
+                    blockers.push(json!({"kind":"engine_disconnected"}));
+                } else if crate::codex_server::running_for_settings().is_some() {
+                    blockers.push(json!({"kind":"server_not_connected"}));
+                }
+                return blockers;
+            }
+        }
+        let deadline = tokio::time::Instant::now() + drain_wait;
+        let pending = loop {
+            let pending = self.runtime.pending_methods().await;
+            if pending.is_empty() || tokio::time::Instant::now() >= deadline {
+                break pending;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        if !pending.is_empty() {
+            blockers.push(json!({"kind":"request_in_flight","methods":pending}));
+        }
+        blockers.extend(self.native_execution_blockers().await);
+        blockers
+    }
+
+    async fn native_execution_blockers(&self) -> Vec<Value> {
+        // 沿用上游失败修复的放行条件：原生状态未知但投影已确认最后一轮以失败结束、
+        // 且没有活动轮次/压缩/待处理请求时，不视为执行中。
         let terminal_failure_ids = {
             let projection = self.projection.lock().await;
             projection
@@ -431,20 +472,41 @@ impl CodexHarness {
                 .cloned()
                 .collect::<HashSet<_>>()
         };
-        let mut loaded_ids = HashSet::new();
-        let mut loaded_params = json!({"limit":100});
-        let mut loaded_cursors = HashSet::new();
-        loop {
-            let page = match self
-                .runtime
-                .request("thread/loaded/list", loaded_params.clone(), None)
-                .await
+        let unavailable = |method: &str, thread_id: Option<&str>, error: String| {
+            json!({"kind":"native_state_unavailable","method":method,
+                "threadId":thread_id,"error":error})
+        };
+        // 每个原生查询最多 5 秒、整体最多 20 秒；超时按“读取失败”保守阻塞，不能拖过关停预算。
+        let budget = tokio::time::Instant::now() + NATIVE_CHECK_BUDGET;
+        let query = |method: &'static str, params: Value| async move {
+            let remaining = budget.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(
+                remaining.min(NATIVE_CHECK_REQUEST_TIMEOUT),
+                self.runtime.request(method, params, None),
+            )
+            .await
             {
+                Ok(result) => result.map_err(|error| format!("{error:#}")),
+                Err(_) => Err("查询超时".to_owned()),
+            }
+        };
+        let mut loaded_ids = Vec::new();
+        let mut seen = HashSet::new();
+        let mut params = json!({"limit":100});
+        let mut cursors = HashSet::new();
+        loop {
+            let page = match query("thread/loaded/list", params.clone()).await {
                 Ok(page) => page,
-                Err(_) => return false,
+                Err(error) => {
+                    return vec![unavailable("thread/loaded/list", None, error)];
+                }
             };
             let Some(rows) = page["data"].as_array() else {
-                return false;
+                return vec![unavailable(
+                    "thread/loaded/list",
+                    None,
+                    "返回格式无效".into(),
+                )];
             };
             for row in rows {
                 let Some(id) = row
@@ -453,91 +515,322 @@ impl CodexHarness {
                     .or_else(|| row["threadId"].as_str())
                     .filter(|id| !id.is_empty())
                 else {
-                    return false;
-                };
-                loaded_ids.insert(id.to_owned());
-            }
-            let Some(cursor) = page["nextCursor"].as_str().filter(|cursor| !cursor.is_empty())
-            else {
-                break;
-            };
-            if !loaded_cursors.insert(cursor.to_owned()) {
-                return false;
-            }
-            loaded_params["cursor"] = json!(cursor);
-        }
-
-        let mut params = json!({"limit":100,"archived":false});
-        let mut cursors = HashSet::new();
-        loop {
-            let page = match self.runtime.request("thread/list", params.clone(), None).await {
-                Ok(page) => page,
-                Err(_) => return false,
-            };
-            let Some(rows) = page["data"].as_array() else {
-                return false;
-            };
-            for row in rows {
-                let row_id = row
-                    .as_str()
-                    .or_else(|| row["id"].as_str())
-                    .or_else(|| row["threadId"].as_str());
-                if row["status"].is_object()
-                    || row["status"].is_string()
-                    || row["nativeStatus"].is_object()
-                    || row["nativeStatus"].is_string()
-                {
-                    if native_thread_is_busy(row)
-                        && !row_id.is_some_and(|id| terminal_failure_ids.contains(id))
-                        && !native_active_marker_is_persisted_only(row, row_id, &loaded_ids)
-                    {
-                        return false;
-                    }
-                    continue;
-                }
-                let Some(id) = row_id.filter(|id| !id.is_empty()) else {
-                    return false;
-                };
-                let thread = match self
-                    .runtime
-                    .request(
-                        "thread/read",
-                        json!({"threadId":id,"includeTurns":false}),
+                    return vec![unavailable(
+                        "thread/loaded/list",
                         None,
-                    )
-                    .await
-                {
-                    Ok(thread) => thread,
-                    Err(_) => return false,
+                        "返回了无效会话 ID".into(),
+                    )];
                 };
-                if native_thread_is_busy(&thread["thread"])
-                    && !terminal_failure_ids.contains(id)
-                    && !native_active_marker_is_persisted_only(
-                        &thread["thread"],
-                        Some(id),
-                        &loaded_ids,
-                    )
-                {
-                    return false;
+                if seen.insert(id.to_owned()) {
+                    loaded_ids.push(id.to_owned());
                 }
             }
-            let Some(cursor) = page["nextCursor"].as_str().filter(|cursor| !cursor.is_empty())
+            let Some(cursor) = page["nextCursor"]
+                .as_str()
+                .filter(|cursor| !cursor.is_empty())
             else {
                 break;
             };
             if !cursors.insert(cursor.to_owned()) {
-                return false;
+                return vec![unavailable(
+                    "thread/loaded/list",
+                    None,
+                    "分页游标重复".into(),
+                )];
             }
             params["cursor"] = json!(cursor);
         }
-        true
+        let mut blockers = Vec::new();
+        // 会话已从引擎卸载时，它的后台终端随之结束，不再计入。
+        let loaded_set: HashSet<&String> = loaded_ids.iter().collect();
+        self.open_commands
+            .lock()
+            .await
+            .retain(|_, command| loaded_set.contains(&command.thread_id));
+        for id in loaded_ids {
+            let thread =
+                match query("thread/read", json!({"threadId":id,"includeTurns":false})).await {
+                    Ok(response) => response["thread"].clone(),
+                    Err(error) => {
+                        blockers.push(unavailable("thread/read", Some(&id), error));
+                        continue;
+                    }
+                };
+            match native_execution(&thread) {
+                NativeExecution::Running => {
+                    // 等待审批或用户输入的轮次交接后无法再响应（重新接上时协议不会补发请求），单独标记。
+                    let kind = if waiting_on_user(&thread["status"]) {
+                        "turn_waiting"
+                    } else {
+                        "turn_active"
+                    };
+                    blockers.push(json!({"kind":kind,"threadId":id,
+                        "status":thread["status"],"name":thread["name"]}));
+                    continue;
+                }
+                NativeExecution::Unknown if !terminal_failure_ids.contains(&id) => {
+                    blockers.push(json!({"kind":"native_status_unknown","threadId":id,
+                        "status":thread["status"],"name":thread["name"]}));
+                    continue;
+                }
+                _ => {}
+            }
+            // 轮次已结束：仍在运行的后台终端单独列出。交接来的记录收不到结束事件，先用条目状态核对。
+            let inherited = self
+                .open_commands
+                .lock()
+                .await
+                .values()
+                .any(|command| command.thread_id == id && command.inherited);
+            if inherited
+                && let Ok(response) =
+                    query("thread/read", json!({"threadId":id,"includeTurns":true})).await
+            {
+                let finished: HashSet<String> = response["thread"]["turns"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|turn| turn["items"].as_array())
+                    .flatten()
+                    .filter(|item| {
+                        item["type"] == "commandExecution" && item["status"] != "inProgress"
+                    })
+                    .filter_map(|item| item["id"].as_str().map(str::to_owned))
+                    .collect();
+                self.open_commands.lock().await.retain(|_, command| {
+                    !(command.thread_id == id
+                        && command.inherited
+                        && finished.contains(&command.item_id))
+                });
+            }
+            let running: Vec<store::OpenCommand> = self
+                .open_commands
+                .lock()
+                .await
+                .values()
+                .filter(|command| command.thread_id == id)
+                .cloned()
+                .collect();
+            for command in running {
+                blockers.push(json!({"kind":"background_terminal","threadId":id,
+                    "name":thread["name"],"command":command.command,
+                    "processId":command.process_id}));
+            }
+        }
+        blockers
+    }
+
+    /// 跟踪命令执行条目：item/started 记录、item/completed 移除。exec_command 让出后命令仍在运行时，
+    /// 这里是唯一能看到后台终端的地方。只接受当前连接的事件；重连到新服务或 stdio 时清空旧记录。
+    async fn observe_open_commands(self: &Arc<Self>, frame: &Value) {
+        let method = frame["method"].as_str().unwrap_or("");
+        let generation = frame["_generation"].as_str().unwrap_or("");
+        if method == "harness/connected" {
+            let server = frame["_server"].as_str().map(str::to_owned);
+            *self.connection_identity.lock().await = (generation.to_owned(), server.clone());
+            self.open_commands
+                .lock()
+                .await
+                .retain(|_, command| server.is_some() && command.server == server);
+            if server.is_some() {
+                let service = self.clone();
+                let generation = generation.to_owned();
+                execution::spawn_service(self.audit.clone(), "reattach-running", async move {
+                    service.reattach_running_threads(&generation).await;
+                });
+            }
+            return;
+        }
+        let current = self.connection_identity.lock().await.clone();
+        if generation.is_empty() || generation != current.0 {
+            return;
+        }
+        let params = &frame["params"];
+        let Some(thread_id) = params["threadId"].as_str() else {
+            return;
+        };
+        let item = &params["item"];
+        match method {
+            "item/started" | "item/completed" if item["type"] == "commandExecution" => {
+                let Some(item_id) = item["id"].as_str() else {
+                    return;
+                };
+                let key = format!("{thread_id}:{item_id}");
+                let mut commands = self.open_commands.lock().await;
+                if method == "item/completed" {
+                    commands.remove(&key);
+                } else if item["status"] == "inProgress" {
+                    commands.insert(
+                        key,
+                        store::OpenCommand {
+                            thread_id: thread_id.to_owned(),
+                            item_id: item_id.to_owned(),
+                            command: item["command"].as_str().unwrap_or("").to_owned(),
+                            process_id: item["processId"].as_str().map(str::to_owned),
+                            server: current.1.clone(),
+                            inherited: false,
+                        },
+                    );
+                }
+            }
+            "thread/closed" | "thread/unloaded" => {
+                self.open_commands
+                    .lock()
+                    .await
+                    .retain(|_, command| command.thread_id != thread_id);
+            }
+            "thread/status/changed" if params["status"]["type"] == "notLoaded" => {
+                self.open_commands
+                    .lock()
+                    .await
+                    .retain(|_, command| command.thread_id != thread_id);
+            }
+            _ => {}
+        }
+    }
+
+    /// 用户要求（2026-11-21）：Harness 重启或升级后自动接上仍在私有服务里执行的会话。新连接默认只收到
+    /// 会话状态变化，resume 后才会继续收到流式条目与轮次完成事件。这里只订阅，不改 loaded 记录：
+    /// 之后的写入仍按 ensure_loaded 套用保存的会话设置。
+    async fn reattach_running_threads(&self, generation: &str) {
+        let Ok(page) = self
+            .runtime
+            .request("thread/loaded/list", json!({"limit":100}), None)
+            .await
+        else {
+            return;
+        };
+        let ids: Vec<String> = page["data"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|row| row.as_str().or_else(|| row["id"].as_str()))
+            .map(str::to_owned)
+            .collect();
+        let with_commands: HashSet<String> = self
+            .open_commands
+            .lock()
+            .await
+            .values()
+            .map(|command| command.thread_id.clone())
+            .collect();
+        for id in ids {
+            if self.connection_identity.lock().await.0 != generation {
+                return;
+            }
+            let running = match self
+                .runtime
+                .request(
+                    "thread/read",
+                    json!({"threadId":id,"includeTurns":false}),
+                    None,
+                )
+                .await
+            {
+                Ok(read) => native_execution(&read["thread"]) == NativeExecution::Running,
+                Err(_) => false,
+            };
+            if !running && !with_commands.contains(&id) {
+                continue;
+            }
+            let result = self
+                .runtime
+                .request(
+                    "thread/resume",
+                    json!({"threadId":id,"excludeTurns":true}),
+                    None,
+                )
+                .await;
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "remote_access.codex_server.reattached",
+                json!({"threadId":id,"running":running,
+                    "error":result.err().map(|error| format!("{error:#}"))}),
+            );
+        }
+    }
+
+    /// 当前（含已断开）连接对应的私有服务；stdio 或从未连接时为空。
+    pub async fn private_server(&self) -> Option<crate::codex_server::PrivateServer> {
+        self.runtime.private_server().await
+    }
+
+    /// 关停时保留私有服务：把该服务代次下仍在运行的命令交给下一个 Harness（只有接上同一代次才会沿用）。
+    /// 保留的可能是当前连接的服务，也可能是上次留下、本次没连上的服务，所以由调用方指定代次。
+    pub async fn hand_over_background_commands(&self, generation: &str) {
+        let commands: std::collections::BTreeMap<String, store::OpenCommand> = self
+            .open_commands
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, command)| command.server.as_deref() == Some(generation))
+            .map(|(key, command)| (key.clone(), command.clone()))
+            .collect();
+        if let Err(error) = self.store.lock().await.commit(|data| {
+            data.background_commands = commands;
+            Ok(())
+        }) {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "remote_access.codex_server.handover_failed",
+                json!({"error":format!("{error:#}")}),
+            );
+        }
+    }
+
+    /// 用户要求（2026-11-21）：没有执行中的会话时退出要连同 Codex 一起关闭。私有服务当前没有可用连接时
+    /// （连接断开，或上次留下、本次尚未连上），退出前直接只读核对它，得到与已连接时同一口径的执行证据：
+    /// 执行中或等待中的会话、仍在运行的后台终端（交接记录按条目状态核对）。返回空表示确认空闲，调用方
+    /// 随后停止该服务；读取失败返回 Err，调用方保留服务并如实说明状态未知。
+    pub async fn unconnected_server_blockers(
+        &self,
+        server: &crate::codex_server::PrivateServer,
+    ) -> anyhow::Result<Vec<Value>> {
+        let inherited: Vec<store::OpenCommand> = self
+            .open_commands
+            .lock()
+            .await
+            .values()
+            .filter(|command| command.server.as_deref() == Some(server.generation.as_str()))
+            .cloned()
+            .collect();
+        let with_turns: HashSet<String> = inherited
+            .iter()
+            .map(|command| command.thread_id.clone())
+            .collect();
+        let threads = crate::codex_server::read_loaded_threads(server, &with_turns).await?;
+        let (blockers, ended) = server_thread_blockers(&threads, &inherited);
+        if !ended.is_empty() {
+            self.open_commands.lock().await.retain(|_, command| {
+                command.server.as_deref() != Some(server.generation.as_str())
+                    || !ended.contains(&(command.thread_id.clone(), command.item_id.clone()))
+            });
+        }
+        Ok(blockers)
     }
 
     pub async fn release(&self) {
         self.catalog.reset().await;
+        let server = self.runtime.private_server().await;
         self.runtime.shutdown().await;
         self.loaded.lock().await.clear();
         self.side_idle.lock().await.clear_loaded();
+        self.open_commands.lock().await.clear();
+        // 用户要求（2026-11-21）：确认空闲后释放引擎时，Elves 私有 Codex 服务一并停止，不在后台留下没有
+        // 任务的进程。只有 stop_preparation 核对 idle 后、或关停判定确认没有可继续的任务时才会调用这里。
+        if let Some(server) = server
+            && let Err(error) = crate::codex_server::stop(&server)
+        {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "remote_access.codex_server.stop_failed",
+                json!({"processId":server.process_id,"error":format!("{error:#}")}),
+            );
+        }
+        let mut store = self.store.lock().await;
+        if !store.data.background_commands.is_empty() {
+            let _ = store.commit(|data| {
+                data.background_commands.clear();
+                Ok(())
+            });
+        }
     }
 
     pub(crate) async fn thread_lock(&self, id: &str) -> Arc<Mutex<()>> {
@@ -1050,42 +1343,322 @@ fn terminal_failure_from_projection(projection: &Projection, id: &str) -> bool {
         && projection.requests_for(id).is_empty()
 }
 
-fn native_thread_is_busy(thread: &Value) -> bool {
-    let status = thread
-        .get("status")
-        .or_else(|| thread.get("nativeStatus"))
-        .and_then(|status| status.as_str().or_else(|| status["type"].as_str()));
-    let terminal_failure = status == Some("unknown") && terminal_failure_outcome(thread);
-    if !terminal_failure
-        && !matches!(
-            status,
-            Some("idle" | "notLoaded" | "completed" | "failed" | "interrupted" | "stopped")
-        )
-    {
-        return true;
-    }
-    thread["requests"]
-        .as_array()
-        .is_some_and(|requests| !requests.is_empty())
+#[derive(Debug, PartialEq, Eq)]
+enum NativeExecution {
+    NotRunning,
+    Running,
+    Unknown,
 }
 
-fn native_active_marker_is_persisted_only(
-    thread: &Value,
-    row_id: Option<&str>,
-    loaded_ids: &HashSet<String>,
-) -> bool {
-    let status = thread
-        .get("status")
-        .or_else(|| thread.get("nativeStatus"))
-        .and_then(|status| status.as_str().or_else(|| status["type"].as_str()));
-    // Codex 的 thread/loaded/list 只返回当前加载到内存中的会话。
-    // 用户已确认历史 inProgress 记录可以退出；未加载、无待处理请求的
-    // active/inProgress/running 只代表持久历史标记，不能继续阻塞 Harness 退出。
-    matches!(status, Some("active" | "inProgress" | "running"))
-        && row_id.is_some_and(|id| !loaded_ids.contains(id))
-        && thread["requests"]
+/// 按 Codex app-server 协议的 ThreadStatus 判断已加载线程是否正在本引擎内执行：
+/// notLoaded / idle / systemError 表示当前没有轮次在跑（systemError 是失败后的终态，
+/// 不能当成执行中）；active（含 waitingOnApproval / waitingOnUserInput）表示执行中。
+/// 兼容旧引擎的 completed/failed/interrupted/stopped 与 inProgress/running/waiting 写法；
+/// 缺失或无法识别的状态返回 Unknown，由调用方保守阻塞。
+fn native_execution(thread: &Value) -> NativeExecution {
+    let status = &thread["status"];
+    match status.as_str().or_else(|| status["type"].as_str()) {
+        Some(
+            "notLoaded" | "idle" | "systemError" | "completed" | "failed" | "interrupted"
+            | "stopped",
+        ) => NativeExecution::NotRunning,
+        Some("active" | "inProgress" | "running" | "waiting") => NativeExecution::Running,
+        _ => NativeExecution::Unknown,
+    }
+}
+
+/// 把直接读到的私有服务会话转换成关停原因（口径同 native_execution_blockers）：执行中或等待中的会话、
+/// 状态无法识别的会话，以及轮次已结束但交接记录显示仍在运行的后台终端。第二个返回值是已结束或会话已
+/// 卸载的交接记录（会话 ID、条目 ID），调用方据此清理。
+fn server_thread_blockers(
+    threads: &[Value],
+    inherited: &[store::OpenCommand],
+) -> (Vec<Value>, HashSet<(String, String)>) {
+    let mut blockers = Vec::new();
+    let mut settled = HashSet::new();
+    let mut finished = HashSet::new();
+    for thread in threads {
+        let id = thread["id"].as_str().unwrap_or_default();
+        match native_execution(thread) {
+            NativeExecution::Running => {
+                let kind = if waiting_on_user(&thread["status"]) {
+                    "turn_waiting"
+                } else {
+                    "turn_active"
+                };
+                blockers.push(json!({"kind":kind,"threadId":id,"status":thread["status"],
+                    "name":thread["name"],"transport":"private_server"}));
+            }
+            NativeExecution::Unknown => {
+                blockers.push(json!({"kind":"native_status_unknown","threadId":id,
+                    "status":thread["status"],"name":thread["name"],"transport":"private_server"}));
+            }
+            NativeExecution::NotRunning => {
+                settled.insert(id.to_owned());
+            }
+        }
+        for item in thread["turns"]
             .as_array()
-            .is_none_or(Vec::is_empty)
+            .into_iter()
+            .flatten()
+            .filter_map(|turn| turn["items"].as_array())
+            .flatten()
+            .filter(|item| item["type"] == "commandExecution" && item["status"] != "inProgress")
+        {
+            if let Some(item_id) = item["id"].as_str() {
+                finished.insert((id.to_owned(), item_id.to_owned()));
+            }
+        }
+    }
+    let loaded: HashSet<&str> = threads
+        .iter()
+        .filter_map(|thread| thread["id"].as_str())
+        .collect();
+    let mut ended = HashSet::new();
+    for command in inherited {
+        let key = (command.thread_id.clone(), command.item_id.clone());
+        if !loaded.contains(command.thread_id.as_str()) || finished.contains(&key) {
+            ended.insert(key);
+        } else if settled.contains(&command.thread_id) {
+            let name = threads
+                .iter()
+                .find(|thread| thread["id"] == command.thread_id.as_str())
+                .map(|thread| thread["name"].clone())
+                .unwrap_or(Value::Null);
+            blockers.push(
+                json!({"kind":"background_terminal","threadId":command.thread_id,
+                "name":name,"command":command.command,"processId":command.process_id,
+                "transport":"private_server"}),
+            );
+        }
+    }
+    (blockers, ended)
+}
+
+/// 用户要求（2026-11-21，第二次确认）：托盘退出和安装升级一律放行，不能因 Codex 状态拦住；Codex 在执行
+/// 就留在 Elves 私有服务里继续。关停时每条原因只决定处理方式和提示：
+/// - Execution：执行中的轮次、后台终端、状态未知。私有服务保留并继续执行，下次启动自动接上；stdio 兜底
+///   无法保留，随退出中断。
+/// - Waiting：等待审批或用户输入。私有服务里会继续等待，但当前 Codex（0.167）重新连接后不会再发出这条
+///   请求，重新打开 Elves 后只能停止这一轮再重新发送；stdio 下随退出中断。
+/// - Saved：队列、编辑、删除未完成或请求未返回。状态已持久保存，Store::open 会把发送中转为待核对、
+///   删除转为未知并保持保护、排队消息重新核对上一轮正常结束，下次启动后继续处理，不会重发。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShutdownEffect {
+    Execution,
+    Waiting,
+    Saved,
+}
+
+pub(crate) fn shutdown_effect(blocker: &Value) -> ShutdownEffect {
+    match blocker["kind"].as_str() {
+        Some("turn_waiting") => ShutdownEffect::Waiting,
+        Some("queue_pending" | "edit_pending" | "deletion_pending" | "request_in_flight") => {
+            ShutdownEffect::Saved
+        }
+        _ => ShutdownEffect::Execution,
+    }
+}
+
+/// 一次退出或安装要如何处理 Codex：只分类和生成提示，从不拦截（见 shutdown_effect）。
+#[derive(Debug, Default)]
+pub(crate) struct ShutdownPlan {
+    /// 留在私有服务里继续执行。
+    pub continuing: Vec<Value>,
+    /// 留在私有服务里继续等待审批或输入，重新连接后无法再回应。
+    pub waiting: Vec<Value>,
+    /// 没有运行在私有服务上，随退出中断。
+    pub interrupted: Vec<Value>,
+    /// 已持久保存，下次启动后继续处理。
+    pub saved: Vec<Value>,
+}
+
+impl ShutdownPlan {
+    /// runtime_preserves：当前连接本身就是私有服务。没有可用连接时，来自私有服务的原因（带
+    /// transport=private_server，或上次留下的服务尚未连上）同样能留在服务里继续。
+    pub fn new(blockers: Vec<Value>, runtime_preserves: bool) -> Self {
+        let mut plan = Self::default();
+        for blocker in blockers {
+            let preserved = runtime_preserves
+                || blocker["transport"] == "private_server"
+                || blocker["kind"] == "server_not_connected";
+            match (shutdown_effect(&blocker), preserved) {
+                (ShutdownEffect::Saved, _) => plan.saved.push(blocker),
+                (ShutdownEffect::Execution, true) => plan.continuing.push(blocker),
+                (ShutdownEffect::Waiting, true) => plan.waiting.push(blocker),
+                (_, false) => plan.interrupted.push(blocker),
+            }
+        }
+        plan
+    }
+
+    /// 仍有任务在私有服务里执行或等待时保留服务，否则退出时连同私有服务一起停止。
+    pub fn keeps_server(&self) -> bool {
+        !self.continuing.is_empty() || !self.waiting.is_empty()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.continuing.is_empty()
+            && self.waiting.is_empty()
+            && self.interrupted.is_empty()
+            && self.saved.is_empty()
+    }
+
+    /// 托盘退出记录与安装日志使用的逐条说明；没有任何需要说明的任务时为空。
+    pub fn message(&self, uninstall: bool) -> Option<String> {
+        let continuing = if uninstall {
+            "以下 Codex 任务会在后台执行完，结果保存在 Codex 会话记录里；卸载后不会再有 Elves 接上它们："
+        } else {
+            "以下 Codex 任务将在后台继续执行，下次启动 Elves 会自动接上："
+        };
+        let sections = [
+            (continuing, &self.continuing),
+            (
+                "以下会话正在等待审批或你的输入：Codex 会在后台继续等待，但当前 Codex 版本在重新连接后不会再发出这条请求，重新打开 Elves 后需要停止这一轮并重新发送：",
+                &self.waiting,
+            ),
+            (
+                "当前 Codex 没有运行在 Elves 私有服务上，以下任务无法在后台继续，已随退出中断：",
+                &self.interrupted,
+            ),
+            (
+                "以下未完成的操作已保存，下次启动 Elves 后继续处理（排队消息在确认上一轮正常结束后发送，结果未知的消息按会话记录核对，不会重发）：",
+                &self.saved,
+            ),
+        ];
+        let lines: Vec<String> = sections
+            .into_iter()
+            .filter(|(_, items)| !items.is_empty())
+            .flat_map(|(title, items)| {
+                std::iter::once(title.to_owned()).chain(
+                    items
+                        .iter()
+                        .map(|blocker| format!("- {}", describe_release_blocker(blocker))),
+                )
+            })
+            .collect();
+        (!lines.is_empty()).then(|| lines.join("\n"))
+    }
+}
+
+fn waiting_on_user(status: &Value) -> bool {
+    status["activeFlags"].as_array().is_some_and(|flags| {
+        flags
+            .iter()
+            .any(|flag| flag == "waitingOnApproval" || flag == "waitingOnUserInput")
+    })
+}
+
+/// 把 release_blockers 的单条原因转成面向用户的中文说明，供托盘退出弹窗和安装器日志逐行展示。
+/// 新增阻塞类型时须同步补充这里的文案。
+pub(crate) fn describe_release_blocker(blocker: &Value) -> String {
+    let thread = || {
+        let id = blocker["threadId"].as_str().unwrap_or("未知会话");
+        match blocker["name"]
+            .as_str()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            Some(name) => {
+                let short: String = name.chars().take(24).collect();
+                let ellipsis = if name.chars().count() > 24 { "…" } else { "" };
+                format!("会话「{short}{ellipsis}」（{id}）")
+            }
+            None => format!("会话 {id}"),
+        }
+    };
+    let list = |key: &str| {
+        blocker[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("、")
+    };
+    match blocker["kind"].as_str().unwrap_or("") {
+        "turn_active" => {
+            let flags = list_flags(&blocker["status"]["activeFlags"]);
+            if flags.is_empty() {
+                format!("{}：Codex 正在执行", thread())
+            } else {
+                format!("{}：Codex 正在执行（{flags}）", thread())
+            }
+        }
+        "turn_waiting" => {
+            let reason = if blocker["status"]["activeFlags"]
+                .as_array()
+                .is_some_and(|flags| flags.iter().any(|flag| flag == "waitingOnApproval"))
+            {
+                "等待审批"
+            } else {
+                "等待你的输入"
+            };
+            format!("{}：Codex 正在{reason}", thread())
+        }
+        "background_terminal" => {
+            let command: String = blocker["command"]
+                .as_str()
+                .unwrap_or("")
+                .chars()
+                .take(80)
+                .collect();
+            format!("{}：后台终端仍在运行：{command}", thread())
+        }
+        "native_status_unknown" => format!(
+            "{}：原生状态无法识别（{}），按执行中处理",
+            thread(),
+            blocker["status"]
+        ),
+        "native_state_unavailable" => match blocker["threadId"].as_str() {
+            Some(_) => format!(
+                "{}：读取原生状态失败（{}），按执行中处理",
+                thread(),
+                blocker["error"].as_str().unwrap_or("未知错误")
+            ),
+            None => format!(
+                "读取 Codex 已加载会话失败（{}），按执行中处理",
+                blocker["error"].as_str().unwrap_or("未知错误")
+            ),
+        },
+        "request_in_flight" => format!("请求尚未返回：{}", list("methods")),
+        "queue_pending" => format!("{}：消息队列尚未发送完成（{}）", thread(), list("states")),
+        "edit_pending" => format!(
+            "{}：消息编辑尚未完成（{}）",
+            thread(),
+            blocker["state"].as_str().unwrap_or("未知")
+        ),
+        "deletion_pending" => format!(
+            "{}：删除结果尚未确认（{}）",
+            thread(),
+            blocker["state"].as_str().unwrap_or("未知")
+        ),
+        "engine_disconnected" if blocker["transport"] == "private_server" => {
+            "与 Elves 私有 Codex 服务的连接已断开，无法确认任务状态".into()
+        }
+        "engine_disconnected" => {
+            "Codex 引擎连接已断开，但 Codex 子进程仍在运行，无法确认是否在执行".into()
+        }
+        "server_not_connected" => {
+            "上次留下的 Elves 私有 Codex 服务仍在运行，本次尚未连接，任务状态未知".into()
+        }
+        other => format!("未分类的阻塞原因：{other}"),
+    }
+}
+
+fn list_flags(flags: &Value) -> String {
+    flags
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|flag| match flag {
+            "waitingOnApproval" => "等待审批",
+            "waitingOnUserInput" => "等待用户输入",
+            other => other,
+        })
+        .collect::<Vec<_>>()
+        .join("、")
 }
 
 fn codex_child_running() -> bool {
@@ -1138,51 +1711,335 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_thread_idle_check_fails_closed_for_missing_or_active_state() {
-        assert!(!native_thread_is_busy(&json!({"status":{"type":"idle"}})));
-        assert!(!native_thread_is_busy(&json!({"status":{"type":"notLoaded"}})));
-        assert!(native_thread_is_busy(&json!({"status":{"type":"active"}})));
-        assert!(native_thread_is_busy(&json!({"status":{"type":"waiting"}})));
-        assert!(native_thread_is_busy(&json!({"status":{"type":"idle"},"requests":[{"id":1}]})));
-        assert!(!native_thread_is_busy(&json!({
-            "status":{"type":"unknown"},
-            "lastTurnOutcome":{"status":"failed"}
-        })));
-        assert!(native_thread_is_busy(&json!({
-            "status":{"type":"unknown"},
-            "lastTurnOutcome":{"status":"completed"}
-        })));
-        assert!(native_thread_is_busy(&json!({
-            "status":{"type":"unknown"},
-            "lastTurnOutcome":{"status":"failed"},
-            "requests":[{"id":1}]
-        })));
-        assert!(native_thread_is_busy(&json!({})));
+    fn native_execution_follows_thread_status_protocol_and_fails_closed() {
+        for status in [
+            json!({"type":"idle"}),
+            json!({"type":"notLoaded"}),
+            json!({"type":"systemError"}),
+        ] {
+            assert_eq!(
+                native_execution(&json!({"status":status})),
+                NativeExecution::NotRunning,
+                "{status}"
+            );
+        }
+        assert_eq!(
+            native_execution(&json!({"status":{"type":"active","activeFlags":[]}})),
+            NativeExecution::Running
+        );
+        assert_eq!(
+            native_execution(
+                &json!({"status":{"type":"active","activeFlags":["waitingOnApproval"]}})
+            ),
+            NativeExecution::Running
+        );
+        assert_eq!(native_execution(&json!({})), NativeExecution::Unknown);
+        assert_eq!(
+            native_execution(&json!({"status":{"type":"unknown"}})),
+            NativeExecution::Unknown
+        );
     }
 
     #[test]
-    fn persisted_active_marker_is_ignored_only_when_not_loaded_and_without_requests() {
-        let empty = HashSet::new();
-        assert!(native_active_marker_is_persisted_only(
-            &json!({"id":"stale","status":{"type":"active"}}),
-            Some("stale"),
-            &empty,
-        ));
-        assert!(!native_active_marker_is_persisted_only(
-            &json!({"id":"live","status":{"type":"active"}}),
-            Some("live"),
-            &HashSet::from(["live".to_owned()]),
-        ));
-        assert!(!native_active_marker_is_persisted_only(
-            &json!({"id":"waiting","status":{"type":"active"},"requests":[{"id":1}]}),
-            Some("waiting"),
-            &empty,
-        ));
-        assert!(!native_active_marker_is_persisted_only(
-            &json!({"id":"unknown","status":{"type":"unknown"}}),
-            Some("unknown"),
-            &empty,
-        ));
+    fn release_blocker_descriptions_name_the_session_and_reason() {
+        let line = describe_release_blocker(&json!({
+            "kind":"turn_active","threadId":"thread-a","name":"修复安装器",
+            "status":{"type":"active","activeFlags":["waitingOnApproval"]}
+        }));
+        assert!(
+            line.contains("修复安装器") && line.contains("thread-a") && line.contains("等待审批")
+        );
+        let line = describe_release_blocker(&json!({
+            "kind":"request_in_flight","methods":["thread/resume","turn/start"]
+        }));
+        assert!(line.contains("thread/resume、turn/start"));
+        let line = describe_release_blocker(&json!({
+            "kind":"queue_pending","threadId":"thread-b","states":["queued","sending"]
+        }));
+        assert!(line.contains("thread-b") && line.contains("queued、sending"));
+        // 退出一律放行；每条原因只决定处理方式：执行类留在私有服务继续，等待审批单独提示，其余保存待续。
+        let waiting = json!({"kind":"turn_waiting","threadId":"thread-c",
+            "status":{"type":"active","activeFlags":["waitingOnUserInput"]}});
+        assert!(describe_release_blocker(&waiting).contains("等待你的输入"));
+        assert_eq!(shutdown_effect(&waiting), ShutdownEffect::Waiting);
+        for kind in [
+            "queue_pending",
+            "edit_pending",
+            "deletion_pending",
+            "request_in_flight",
+        ] {
+            assert_eq!(
+                shutdown_effect(&json!({"kind":kind})),
+                ShutdownEffect::Saved,
+                "{kind}"
+            );
+        }
+        for kind in [
+            "turn_active",
+            "background_terminal",
+            "native_status_unknown",
+            "native_state_unavailable",
+            "engine_disconnected",
+            "server_not_connected",
+        ] {
+            assert_eq!(
+                shutdown_effect(&json!({"kind":kind})),
+                ShutdownEffect::Execution,
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn shutdown_plan_never_blocks_and_reports_each_effect() {
+        let blockers = || {
+            vec![
+                json!({"kind":"turn_active","threadId":"run","status":{"type":"active","activeFlags":[]}}),
+                json!({"kind":"background_terminal","threadId":"term","command":"npm run dev"}),
+                json!({"kind":"turn_waiting","threadId":"ask",
+                    "status":{"type":"active","activeFlags":["waitingOnApproval"]}}),
+                json!({"kind":"queue_pending","threadId":"queue","states":["queued"]}),
+            ]
+        };
+        // 私有服务：执行和后台终端继续，等待审批单独提示，排队消息保存待续，服务保留。
+        let plan = ShutdownPlan::new(blockers(), true);
+        assert_eq!(plan.continuing.len(), 2);
+        assert_eq!(plan.waiting.len(), 1);
+        assert_eq!(plan.saved.len(), 1);
+        assert!(plan.interrupted.is_empty() && plan.keeps_server());
+        let message = plan.message(false).unwrap();
+        assert!(message.contains("后台继续执行") && message.contains("npm run dev"));
+        assert!(message.contains("停止这一轮并重新发送") && message.contains("ask"));
+        assert!(message.contains("已保存") && message.contains("queue"));
+        assert!(
+            plan.message(true)
+                .unwrap()
+                .contains("卸载后不会再有 Elves 接上")
+        );
+        // stdio：执行和等待都无法保留，如实说明已中断，不保留服务；排队消息照样保存。
+        let plan = ShutdownPlan::new(blockers(), false);
+        assert_eq!(plan.interrupted.len(), 3);
+        assert_eq!(plan.saved.len(), 1);
+        assert!(!plan.keeps_server());
+        assert!(plan.message(false).unwrap().contains("已随退出中断"));
+        // 空闲：没有任何说明，连同私有服务一起停止。
+        let plan = ShutdownPlan::new(Vec::new(), true);
+        assert!(plan.is_empty() && !plan.keeps_server() && plan.message(false).is_none());
+        // 当前没有连上私有服务（stdio 或连接断开）时，带私有服务标记的原因仍能留在服务里继续。
+        let plan = ShutdownPlan::new(
+            vec![
+                json!({"kind":"turn_active","threadId":"server","transport":"private_server"}),
+                json!({"kind":"server_not_connected"}),
+                json!({"kind":"turn_active","threadId":"stdio"}),
+            ],
+            false,
+        );
+        assert_eq!(plan.continuing.len(), 2);
+        assert_eq!(plan.interrupted.len(), 1);
+        assert!(plan.keeps_server());
+    }
+
+    #[test]
+    fn unconnected_server_threads_map_to_execution_evidence() {
+        let command = |thread: &str, item: &str| store::OpenCommand {
+            thread_id: thread.into(),
+            item_id: item.into(),
+            command: format!("run {item}"),
+            process_id: Some("61802".into()),
+            server: Some("server-a".into()),
+            inherited: true,
+        };
+        let threads = vec![
+            json!({"id":"running","name":"执行中","status":{"type":"active","activeFlags":[]}}),
+            json!({"id":"asking","status":{"type":"active","activeFlags":["waitingOnApproval"]}}),
+            // 轮次已结束：仍在运行的命令不出现在 turns 里，已结束的以非 inProgress 状态出现。
+            json!({"id":"idle","name":"空闲","status":{"type":"idle"},"turns":[{"items":[
+                {"id":"done","type":"commandExecution","status":"completed"}]}]}),
+        ];
+        let inherited = vec![
+            command("idle", "still-running"),
+            command("idle", "done"),
+            command("unloaded", "gone"),
+        ];
+        let (blockers, ended) = server_thread_blockers(&threads, &inherited);
+        let kinds: Vec<&str> = blockers
+            .iter()
+            .map(|blocker| blocker["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            ["turn_active", "turn_waiting", "background_terminal"]
+        );
+        assert!(
+            blockers
+                .iter()
+                .all(|blocker| blocker["transport"] == "private_server")
+        );
+        assert_eq!(blockers[2]["command"], "run still-running");
+        assert_eq!(blockers[2]["name"], "空闲");
+        assert!(ended.contains(&("idle".into(), "done".into())));
+        assert!(ended.contains(&("unloaded".into(), "gone".into())));
+        assert_eq!(ended.len(), 2);
+        // 全部空闲且没有仍在运行的交接记录：确认空闲，调用方随后停止该服务。
+        let (blockers, ended) =
+            server_thread_blockers(&[json!({"id":"idle","status":{"type":"idle"}})], &[]);
+        assert!(blockers.is_empty() && ended.is_empty());
+    }
+
+    const RELEASE_TEST_ENGINE: &str = r#"
+const readline = require('readline');
+const statuses = JSON.parse(process.argv[1]);
+const input = readline.createInterface({input: process.stdin});
+input.on('line', line => {
+  const q = JSON.parse(line);
+  if (q.id === undefined) return;
+  let result;
+  switch (q.method) {
+    case 'initialize': result = {userAgent: 'release-test-engine'}; break;
+    case 'thread/loaded/list': result = {data: Object.keys(statuses), nextCursor: null}; break;
+    case 'thread/read': result = {thread: {id: q.params.threadId, name: 'name-' + q.params.threadId,
+      status: statuses[q.params.threadId]}}; break;
+    case 'test/hang': return;
+    default:
+      process.stdout.write(JSON.stringify({id: q.id, error: {code: -32601, message: 'unsupported'}}) + '\n');
+      return;
+  }
+  process.stdout.write(JSON.stringify({id: q.id, result}) + '\n');
+});
+"#;
+
+    async fn release_test_harness(statuses: Value) -> (tempfile::TempDir, Arc<CodexHarness>) {
+        let directory = tempfile::tempdir().unwrap();
+        let service = CodexHarness::new(directory.path()).unwrap();
+        let mut command = tokio::process::Command::new("node");
+        command
+            .args(["-e", RELEASE_TEST_ENGINE, &statuses.to_string()])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        command.creation_flags(crate::windows_create_hidden_process());
+        service
+            .install_test_process(
+                crate::codex_service::RunningService::for_test(command.spawn().unwrap()).unwrap(),
+            )
+            .await;
+        service.prepare().await.unwrap();
+        (directory, service)
+    }
+
+    #[tokio::test]
+    async fn release_ignores_projection_entries_without_native_execution() {
+        let (_directory, service) = release_test_harness(json!({
+            "opened":{"type":"idle"},
+            "upstream-failed":{"type":"systemError"}
+        }))
+        .await;
+        {
+            let mut projection = service.projection.lock().await;
+            // 打开会话时 markRead 注入的已读事件只补出 readState，没有原生 status；
+            // 旧判定把它当成执行中，导致安装器在空闲时也返回 codex_active。
+            projection.ingest(json!({"method":"thread/readState/changed","params":{
+                "threadId":"opened","readState":{"firstUnread":null,"revision":"r1"}}}));
+            projection.ingest(json!({"method":"thread/tokenUsage/updated","params":{
+                "threadId":"never-loaded","tokenUsage":{"total":1}}}));
+            assert!(projection.threads["opened"].get("status").is_none());
+        }
+        let blockers = service.release_blockers(Duration::from_millis(200)).await;
+        assert!(blockers.is_empty(), "{blockers:?}");
+        assert!(service.idle().await);
+        service.release().await;
+    }
+
+    #[tokio::test]
+    async fn release_blocks_native_active_unknown_and_in_flight_requests() {
+        let (_directory, service) = release_test_harness(json!({
+            "running":{"type":"active","activeFlags":["waitingOnApproval"]},
+            "working":{"type":"active","activeFlags":[]},
+            "mystery":{"type":"mystery"},
+            "idle":{"type":"idle"}
+        }))
+        .await;
+        let hanging = service.clone();
+        let hang = tokio::spawn(async move {
+            let _ = hanging.runtime.request("test/hang", json!({}), None).await;
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let blockers = service.release_blockers(Duration::from_millis(200)).await;
+        hang.abort();
+        let kinds: Vec<_> = blockers
+            .iter()
+            .map(|blocker| {
+                (
+                    blocker["kind"].as_str().unwrap(),
+                    blocker["threadId"].as_str(),
+                )
+            })
+            .collect();
+        assert!(kinds.contains(&("request_in_flight", None)), "{blockers:?}");
+        assert!(
+            kinds.contains(&("turn_waiting", Some("running"))),
+            "{blockers:?}"
+        );
+        assert!(
+            kinds.contains(&("turn_active", Some("working"))),
+            "{blockers:?}"
+        );
+        assert!(
+            kinds.contains(&("native_status_unknown", Some("mystery"))),
+            "{blockers:?}"
+        );
+        assert!(
+            !kinds.iter().any(|(_, id)| *id == Some("idle")),
+            "{blockers:?}"
+        );
+        let in_flight = blockers
+            .iter()
+            .find(|blocker| blocker["kind"] == "request_in_flight")
+            .unwrap();
+        assert_eq!(in_flight["methods"], json!(["test/hang"]));
+        assert!(!service.idle().await);
+        service.release().await;
+    }
+
+    /// 后台终端：exec_command 让出后轮次结束、会话回到 idle，命令仍在运行，必须按执行中列出，
+    /// 直到同一连接收到该条目的 item/completed；旧连接代次的事件不能改动当前记录。
+    #[tokio::test]
+    async fn background_terminals_are_tracked_until_their_command_completes() {
+        let (_directory, service) = release_test_harness(json!({"idle":{"type":"idle"}})).await;
+        let generation = loop {
+            let current = service.connection_identity.lock().await.0.clone();
+            if !current.is_empty() {
+                break current;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let event = |method: &str, generation: &str, status: &str| {
+            json!({"method":method,"_generation":generation,"params":{"threadId":"idle","turnId":"t",
+                "item":{"type":"commandExecution","id":"call-bg","status":status,
+                    "command":"npm run dev","processId":"61802","source":"unifiedExecStartup"}}})
+        };
+        service
+            .observe_open_commands(&event("item/started", &generation, "inProgress"))
+            .await;
+        let blockers = service.release_blockers(Duration::ZERO).await;
+        assert_eq!(blockers.len(), 1, "{blockers:?}");
+        assert_eq!(blockers[0]["kind"], "background_terminal");
+        assert_eq!(blockers[0]["threadId"], "idle");
+        assert_eq!(shutdown_effect(&blockers[0]), ShutdownEffect::Execution);
+        assert!(describe_release_blocker(&blockers[0]).contains("npm run dev"));
+        assert!(!service.idle().await);
+        service
+            .observe_open_commands(&event("item/completed", "stale-generation", "completed"))
+            .await;
+        assert_eq!(service.release_blockers(Duration::ZERO).await.len(), 1);
+        service
+            .observe_open_commands(&event("item/completed", &generation, "completed"))
+            .await;
+        assert!(service.release_blockers(Duration::ZERO).await.is_empty());
+        assert!(service.idle().await);
+        service.release().await;
     }
 
     #[tokio::test]

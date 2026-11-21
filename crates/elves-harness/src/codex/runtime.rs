@@ -22,7 +22,21 @@ const TIMEOUT: Duration = Duration::from_secs(45);
 const NEW_THREAD_METADATA_WINDOW: Duration = Duration::from_secs(30);
 const NEW_THREAD_METADATA_RETRY_BUDGET: Duration = Duration::from_secs(3);
 const NEW_THREAD_METADATA_RETRY_DELAYS_MS: [u64; 5] = [100, 200, 400, 800, 1000];
-type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>;
+type Pending = Arc<Mutex<HashMap<u64, PendingRequest>>>;
+
+// 关停诊断需要说明“哪个请求还没返回”，所以在途表同时记录方法名，不只保存回调。
+struct PendingRequest {
+    method: String,
+    reply: oneshot::Sender<Value>,
+}
+
+/// 退出判定使用的连接快照：从未建立连接、连接存活、连接已断开三者含义不同。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ConnectionState {
+    NoConnection,
+    Alive,
+    Lost,
+}
 
 fn is_empty_rollout_metadata_failure(failure: &anyhow::Error) -> bool {
     failure
@@ -84,6 +98,8 @@ pub(super) struct Connection {
     pub user_agent: OnceLock<String>,
     codex_home: Option<PathBuf>,
     transport: ServiceTransport,
+    /// 私有服务身份；断线后仍保留，关停判定据此区分“私有服务状态未知”与“stdio 子进程断开”。
+    server: Option<crate::codex_server::PrivateServer>,
     alive: Arc<AtomicBool>,
     stdin: mpsc::Sender<WriteFrame>,
     write_gate: Mutex<()>,
@@ -149,7 +165,9 @@ impl Runtime {
         }
         let service = match supplied {
             Some(service) => service,
-            None => match spawn_service().await {
+            // 启动链路（私有服务 ensure、proxy 握手、stdio 兜底）的 future 较大，放到堆上：否则会内联进
+            // connection/request 的状态机，调试构建下逐层累加，撑爆 2 MiB 的测试线程栈。
+            None => match Box::pin(spawn_service()).await {
                 Ok(service) => service,
                 Err(error) => {
                     *self.retry_after.lock().await = Some(Instant::now() + Duration::from_secs(30));
@@ -160,6 +178,7 @@ impl Runtime {
         let generation = uuid::Uuid::new_v4().to_string();
         let generation_index = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let transport = service.transport;
+        let server = service.server.clone();
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(true));
         let reader_pending = pending.clone();
@@ -168,8 +187,13 @@ impl Runtime {
         let reader_generation = generation.clone();
         self.reads.clear().await;
         let reader_reads = self.reads.clone();
+        // _server 是私有服务代次：同一代次重连时，原生会话和后台终端仍在服务里运行，需要重新接上。
         self.events
-            .send(json!({"method":"harness/connected","_generation":generation,"_generationIndex":generation_index}))
+            .send(
+                json!({"method":"harness/connected","_generation":generation,
+                "_generationIndex":generation_index,
+                "_server":server.as_ref().map(|server| server.generation.clone())}),
+            )
             .await
             .context("会话事件接收器已关闭")?;
         let codex_home = service.codex_home.clone();
@@ -208,8 +232,8 @@ impl Runtime {
                         break;
                     }
                 } else if let Some(id) = frame["id"].as_u64() {
-                    if let Some(reply) = reader_pending.lock().await.remove(&id) {
-                        let _ = reply.send(frame);
+                    if let Some(pending) = reader_pending.lock().await.remove(&id) {
+                        let _ = pending.reply.send(frame);
                     }
                 }
             }
@@ -228,6 +252,7 @@ impl Runtime {
             user_agent: OnceLock::new(),
             codex_home,
             transport,
+            server,
             alive,
             stdin: service.stdin,
             write_gate: Mutex::new(()),
@@ -415,20 +440,29 @@ impl Runtime {
         self.health.lock().await.take();
     }
 
-    pub async fn can_release(&self) -> bool {
-        let connection = self.connection.lock().await.clone();
-        let Some(connection) = connection else {
-            return true;
-        };
-        connection.alive.load(Ordering::Acquire) && connection.pending.lock().await.is_empty()
+    pub async fn connection_state(&self) -> ConnectionState {
+        match self.connection.lock().await.as_ref() {
+            None => ConnectionState::NoConnection,
+            Some(connection) if connection.alive.load(Ordering::Acquire) => ConnectionState::Alive,
+            Some(_) => ConnectionState::Lost,
+        }
     }
 
-    pub async fn has_live_connection(&self) -> bool {
-        self.connection
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(|connection| connection.alive.load(Ordering::Acquire))
+    /// 当前连接上仍在等待引擎响应的请求方法（去重、排序）；没有存活连接时为空。
+    pub async fn pending_methods(&self) -> Vec<String> {
+        let connection = self.connection.lock().await.clone();
+        let Some(connection) = connection.filter(|c| c.alive.load(Ordering::Acquire)) else {
+            return Vec::new();
+        };
+        let mut pending = connection.pending.lock().await;
+        pending.retain(|_, request| !request.reply.is_closed());
+        let mut methods: Vec<String> = pending
+            .values()
+            .map(|request| request.method.clone())
+            .collect();
+        methods.sort();
+        methods.dedup();
+        methods
     }
 
     pub async fn handoff_status(&self) -> super::HandoffStatus {
@@ -436,7 +470,7 @@ impl Runtime {
         match connection.as_ref() {
             Some(connection) if connection.alive.load(Ordering::Acquire) => {
                 if connection.transport.supports_handoff() {
-                    super::HandoffStatus::DaemonProxy
+                    super::HandoffStatus::PrivateServer
                 } else {
                     super::HandoffStatus::Stdio
                 }
@@ -444,6 +478,15 @@ impl Runtime {
             Some(_) => super::HandoffStatus::Unknown,
             None => super::HandoffStatus::NoConnection,
         }
+    }
+
+    /// 当前（含已断开）连接对应的私有服务；stdio 或从未连接时为空。
+    pub async fn private_server(&self) -> Option<crate::codex_server::PrivateServer> {
+        self.connection
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|connection| connection.server.clone())
     }
 
     pub async fn check_health(&self) -> anyhow::Result<()> {
@@ -548,9 +591,15 @@ impl Connection {
         let (sender, receiver) = oneshot::channel();
         {
             let mut pending = self.pending.lock().await;
-            pending.retain(|_, sender| !sender.is_closed());
+            pending.retain(|_, request| !request.reply.is_closed());
             anyhow::ensure!(pending.len() < 128, "远程会话请求过多，请稍后再试");
-            pending.insert(id, sender);
+            pending.insert(
+                id,
+                PendingRequest {
+                    method: method.to_owned(),
+                    reply: sender,
+                },
+            );
         }
         if let Err(error) = self
             .write(json!({"id":id,"method":method,"params":params}), guard)
@@ -635,19 +684,19 @@ input.on('line', line => {
     }
 
     #[tokio::test]
-    async fn handoff_status_distinguishes_stdio_and_daemon_proxy() {
+    async fn handoff_status_distinguishes_stdio_and_private_server() {
         let (events, _receiver) = mpsc::channel(8);
         let empty = Runtime::new(events, Arc::new(execution::Audit::default()));
         assert_eq!(empty.handoff_status().await, HandoffStatus::NoConnection);
 
         let stdio = runtime_with_transport(ServiceTransport::Stdio).await;
         assert_eq!(stdio.handoff_status().await, HandoffStatus::Stdio);
-        assert!(!stdio.handoff_status().await.allows_upgrade());
+        assert!(!stdio.handoff_status().await.preserves_execution());
         stdio.shutdown().await;
 
-        let daemon = runtime_with_transport(ServiceTransport::DaemonProxy).await;
-        assert_eq!(daemon.handoff_status().await, HandoffStatus::DaemonProxy);
-        assert!(daemon.handoff_status().await.allows_upgrade());
-        daemon.shutdown().await;
+        let private = runtime_with_transport(ServiceTransport::PrivateServer).await;
+        assert_eq!(private.handoff_status().await, HandoffStatus::PrivateServer);
+        assert!(private.handoff_status().await.preserves_execution());
+        private.shutdown().await;
     }
 }

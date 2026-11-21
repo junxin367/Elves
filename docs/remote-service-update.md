@@ -20,9 +20,9 @@ cargo check --workspace
 
 ## 安装与升级
 
-获得明确的升级要求后运行 `dist/windows/Elves-<版本>-windows-x64-setup.exe`。没有执行中的任务时，安装包通过同一程序的退出模式正常关闭 Harness，再替换程序。存在执行中的 Codex/Claude 任务时，退出模式必须先确认 handoff：旧 Harness 只撤下入口，原生 daemon/job 保留，新版本启动后核对服务代次并重新连接；handoff 失败、旧服务版本不兼容或状态未知时中止安装，不能强杀任务。共享设置、密钥、设备授权及 WebView 数据保留。
+获得明确的升级要求后运行 `dist/windows/Elves-<版本>-windows-x64-setup.exe`。安装包通过同一程序的退出模式关闭 Harness 后再替换程序，一律放行：Codex 仍在执行时，任务留在 Elves 私有 Codex 服务里继续，新版本启动后自动接上；没有执行中的会话时 Codex 一并关闭。等待审批的轮次、随退出中断的任务和已保存待续的操作逐条写入安装日志。共享设置、密钥、设备授权及 WebView 数据保留。判定口径及安装日志的逐条提示，以[产品行为与交互规范](product-standards/core/product-behavior.md#elves-安装启动与-harness)中托盘退出与安装升级的约定为准。
 
-首次从不支持 handoff 的旧版直连 stdio Harness 升级时，若仍检测到旧 Codex 子进程，安装器会中止而不是假装可接管；先等待该轮任务结束完成一次空闲升级。完成这次迁移后，后续版本使用持久 Codex daemon/proxy 与 Claude native job handoff。
+关停判定由正在运行的旧版 Harness 做出。从尚未使用私有服务的旧版升级时，旧版的 Codex 是 stdio 子进程，执行中的任务无法交接，旧版也可能把没有执行的会话误判为执行中；确认没有任务在执行后完全退出 Elves（托盘退出被拦时在任务管理器结束全部 `elves.exe`）再安装。完成这次升级后，执行中的 Codex 由 Elves 私有服务承载。
 
 升级后启动 Elves，应直接进入本机工作区。本机入口默认 `45223`，代理默认 `45221`，远程网页默认 `45222`。远程会话可以保持关闭；验证 Elves 和代理时不要求开启网页或公网入口。
 

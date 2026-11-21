@@ -1310,7 +1310,11 @@ fn quit_app(app: &tauri::AppHandle) {
                     .store(false, Ordering::SeqCst);
                 // 退出失败不能静默回到托盘；把安全关停原因交给原生弹窗，用户可等待任务结束后重试。
                 let dialog_app = app.clone();
-                let message = format!("无法退出 Elves：{error:#}\n\n请等待当前任务完成后再从托盘退出。");
+                // 用户要求关停原因和日志直接显示：弹窗同时给出诊断日志位置（含 harness.shutdown_blocked 明细）。
+                let message = format!(
+                    "无法退出 Elves：{error:#}\n\n请稍后再从托盘退出。\n诊断日志：{}",
+                    elves_core::diagnostic_log::diagnostic_log_path().display()
+                );
                 let _ = app.run_on_main_thread(move || {
                     if let Some(window) = dialog_app.get_window(WINDOW_LABEL) {
                         report_native_error(&window, &message);
@@ -1318,6 +1322,8 @@ fn quit_app(app: &tauri::AppHandle) {
                 });
                 return;
             }
+            // 用户要求（2026-11-21，第二次确认）：退出一律放行。Codex 在执行就留在 Elves 私有服务里继续，
+            // 下次启动自动接上；没有执行中的会话时 Codex 一并关闭。上面的弹窗只在 Harness 本身无法完成关停时出现。
             app.exit(0);
         });
     } else {

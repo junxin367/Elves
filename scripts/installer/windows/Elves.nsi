@@ -30,11 +30,12 @@ SetCompressor /SOLID lzma
 !insertmacro MUI_LANGUAGE "SimpChinese"
 !insertmacro MUI_LANGUAGE "English"
 Var LegacyInstallDir
-Var ShutdownAttempt
-; 用户要求安装体验恢复为可连续完成：仅对明确 busy 结果等待，最多 5 分钟；未知结果仍中止，不强杀执行中的 Codex。
+; 用户要求（2026-11-21）：安装/卸载只执行一次关停检查，不再轮询 150 次；
+; helper 按系统代码页逐行输出关停结论、每条说明（会话、状态、在途请求）和完整日志位置。
+; 用户第二次确认：安装和卸载一律放行。执行中的 Codex 留在 Elves 私有服务里继续（安装后新版自动接上），
+; 没有执行中的会话时 Codex 一并关闭；新版 Harness 不再返回 busy，busy 只会来自尚未升级的旧版。
+; 卸载传 --shutdown-mode=uninstall，只用于提示“卸载后不会再有 Elves 接上”。
 !define SHUTDOWN_BUSY_EXIT_CODE 10
-!define SHUTDOWN_RETRY_LIMIT 150
-!define SHUTDOWN_RETRY_DELAY_MS 2000
 Function .onInit
   ; 旧品牌只用于迁移，不继续创建旧产品入口或覆盖用户数据。
   ReadRegStr $LegacyInstallDir HKCU "Software\CodexElves" "InstallDir"
@@ -90,23 +91,15 @@ FunctionEnd
   Pop $0
 !macroend
 !macro PrepareShutdown EXECUTABLE LABEL OPERATION
-  StrCpy $ShutdownAttempt 0
-  ${LABEL}_shutdown_retry:
-    nsExec::ExecToLog '"${EXECUTABLE}" --prepare-shutdown'
-    Pop $0
-    ${If} $0 == ${SHUTDOWN_BUSY_EXIT_CODE}
-      IntOp $ShutdownAttempt $ShutdownAttempt + 1
-      ${If} $ShutdownAttempt >= ${SHUTDOWN_RETRY_LIMIT}
-        DetailPrint "Codex 持续执行，等待安全空闲超时，${OPERATION}已中止，请稍后重试。"
-        Abort
-      ${EndIf}
-      DetailPrint "Codex 正在执行，等待安全完成... ($ShutdownAttempt/${SHUTDOWN_RETRY_LIMIT})"
-      Sleep ${SHUTDOWN_RETRY_DELAY_MS}
-      Goto ${LABEL}_shutdown_retry
-    ${ElseIf} $0 != 0
-      DetailPrint "Codex 或 Harness 未确认安全退出，${OPERATION}已中止，请稍后重试。"
-      Abort
-    ${EndIf}
+  nsExec::ExecToLog '"${EXECUTABLE}" --prepare-shutdown --shutdown-mode=${LABEL}'
+  Pop $0
+  ${If} $0 == ${SHUTDOWN_BUSY_EXIT_CODE}
+    DetailPrint "正在运行的旧版 Elves 判断仍有任务，未能停止，${OPERATION}已中止；确认没有任务在执行后，在任务管理器结束所有 elves.exe 再重新运行。"
+    Abort
+  ${ElseIf} $0 != 0
+    DetailPrint "未能确认 Elves 已安全停止，${OPERATION}已中止；请查看上方关停检查结果。"
+    Abort
+  ${EndIf}
 !macroend
 Section "Install"
   InitPluginsDir
