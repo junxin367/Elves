@@ -2720,10 +2720,10 @@ async fn prepare_controller_shutdown(reason: &str) -> Value {
         return json!({"status":"stopped","cleanup":controller.claude.cleanup_report()});
     }
 
-    let preserve_execution = reason == "installer";
-    if preserve_execution {
+    let installer_requested = reason == "installer";
+    let installer_stdio_idle_shutdown = if installer_requested {
         let handoff = controller.harness.handoff_status().await;
-        if !handoff.allows_upgrade() {
+        if handoff == codex::HandoffStatus::Unknown {
             let _ = crate::diagnostic_log::append_diagnostic_log(
                 "harness.shutdown_handoff_unavailable",
                 json!({"reason":"installer","transport":handoff.as_str()}),
@@ -2736,7 +2736,13 @@ async fn prepare_controller_shutdown(reason: &str) -> Value {
                 "message":"当前 Codex 连接不能脱离 Harness 安全交接，未停止 Elves；请等待连接恢复后重试。"
             });
         }
-    }
+        // stdio 连接无法脱离 Harness，但空闲时可以按普通安全关停回收；
+        // 只有 daemon proxy 才能在仍有执行任务时走 preserve-execution handoff。
+        handoff == codex::HandoffStatus::Stdio
+    } else {
+        false
+    };
+    let preserve_execution = installer_requested && !installer_stdio_idle_shutdown;
     controller
         .preserve_execution_on_shutdown
         .store(preserve_execution, Ordering::Release);
@@ -2747,22 +2753,37 @@ async fn prepare_controller_shutdown(reason: &str) -> Value {
         .harness
         .enabled
         .swap(false, Ordering::AcqRel);
-    if !preserve_execution && !controller.harness.idle().await {
-        let _ = crate::diagnostic_log::append_diagnostic_log(
-            "harness.shutdown_blocked",
-            json!({"reason":"codex_active_or_unknown"}),
-        );
-        controller
-            .harness
-            .enabled
-            .store(was_harness_enabled, Ordering::Release);
-        controller.closing.store(false, Ordering::Release);
-        return json!({
-            "status":"busy",
-            "reason":"codex_active",
-            "message":"Codex 仍在执行或状态尚未确认，未停止 Elves；请等待任务完成后再重试。",
-            "cleanup":{"complete":false,"pendingStartupCheck":false}
-        });
+    if !preserve_execution {
+        if !controller.harness.idle().await {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "harness.shutdown_blocked",
+                json!({
+                    "reason":if installer_stdio_idle_shutdown {
+                        "installer_stdio_active_or_unknown"
+                    } else {
+                        "codex_active_or_unknown"
+                    }
+                }),
+            );
+            controller
+                .harness
+                .enabled
+                .store(was_harness_enabled, Ordering::Release);
+            controller.closing.store(false, Ordering::Release);
+            controller
+                .preserve_execution_on_shutdown
+                .store(false, Ordering::Release);
+            return json!({
+                "status":"busy",
+                "reason":"codex_active",
+                "message":if installer_stdio_idle_shutdown {
+                    "当前 Codex 使用 stdio 连接且仍在执行或状态尚未确认，安装暂缓；任务完成后会自动继续。"
+                } else {
+                    "Codex 仍在执行或状态尚未确认，未停止 Elves；请等待任务完成后再重试。"
+                },
+                "cleanup":{"complete":false,"pendingStartupCheck":false}
+            });
+        }
     }
     if preserve_execution {
         // 安装交接只允许已确认的 daemon proxy；在设置 closing 后再次核对，

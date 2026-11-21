@@ -379,9 +379,9 @@ impl CodexHarness {
             return false;
         }
         let store = self.store.lock().await;
-        let queues_empty = store.data.queues.values().all(Vec::is_empty);
-        let edits_empty = store.data.edits.is_empty();
-        let queue_gates_empty = store.data.queue_gates.is_empty();
+        // 用户确认历史回执和编辑草稿不代表真实执行；Store 仍须保留它们，
+        // 但退出判断只读取仍需派发、核对或处理的队列状态。
+        let store_blocks_release = store.data.has_release_blocking_work();
         let deletions_confirmed = store
             .data
             .deletions
@@ -413,9 +413,7 @@ impl CodexHarness {
             && threads_safe
             && projection.sides.threads.values().all(|side| side.closed);
         drop(projection);
-        queues_empty
-            && edits_empty
-            && queue_gates_empty
+        !store_blocks_release
             && deletions_confirmed
             && projection_safe
             && (!live_connection || self.native_threads_idle().await)
@@ -433,71 +431,104 @@ impl CodexHarness {
                 .cloned()
                 .collect::<HashSet<_>>()
         };
-        for (method, base_params) in [
-            ("thread/list", json!({"limit":100,"archived":false})),
-            ("thread/loaded/list", json!({"limit":100})),
-        ] {
-            let mut params = base_params;
-            let mut cursors = HashSet::new();
-            loop {
-                let page = match self.runtime.request(method, params.clone(), None).await {
-                    Ok(page) => page,
+        let mut loaded_ids = HashSet::new();
+        let mut loaded_params = json!({"limit":100});
+        let mut loaded_cursors = HashSet::new();
+        loop {
+            let page = match self
+                .runtime
+                .request("thread/loaded/list", loaded_params.clone(), None)
+                .await
+            {
+                Ok(page) => page,
+                Err(_) => return false,
+            };
+            let Some(rows) = page["data"].as_array() else {
+                return false;
+            };
+            for row in rows {
+                let Some(id) = row
+                    .as_str()
+                    .or_else(|| row["id"].as_str())
+                    .or_else(|| row["threadId"].as_str())
+                    .filter(|id| !id.is_empty())
+                else {
+                    return false;
+                };
+                loaded_ids.insert(id.to_owned());
+            }
+            let Some(cursor) = page["nextCursor"].as_str().filter(|cursor| !cursor.is_empty())
+            else {
+                break;
+            };
+            if !loaded_cursors.insert(cursor.to_owned()) {
+                return false;
+            }
+            loaded_params["cursor"] = json!(cursor);
+        }
+
+        let mut params = json!({"limit":100,"archived":false});
+        let mut cursors = HashSet::new();
+        loop {
+            let page = match self.runtime.request("thread/list", params.clone(), None).await {
+                Ok(page) => page,
+                Err(_) => return false,
+            };
+            let Some(rows) = page["data"].as_array() else {
+                return false;
+            };
+            for row in rows {
+                let row_id = row
+                    .as_str()
+                    .or_else(|| row["id"].as_str())
+                    .or_else(|| row["threadId"].as_str());
+                if row["status"].is_object()
+                    || row["status"].is_string()
+                    || row["nativeStatus"].is_object()
+                    || row["nativeStatus"].is_string()
+                {
+                    if native_thread_is_busy(row)
+                        && !row_id.is_some_and(|id| terminal_failure_ids.contains(id))
+                        && !native_active_marker_is_persisted_only(row, row_id, &loaded_ids)
+                    {
+                        return false;
+                    }
+                    continue;
+                }
+                let Some(id) = row_id.filter(|id| !id.is_empty()) else {
+                    return false;
+                };
+                let thread = match self
+                    .runtime
+                    .request(
+                        "thread/read",
+                        json!({"threadId":id,"includeTurns":false}),
+                        None,
+                    )
+                    .await
+                {
+                    Ok(thread) => thread,
                     Err(_) => return false,
                 };
-                let Some(rows) = page["data"].as_array() else {
-                    return false;
-                };
-                for row in rows {
-                    let row_id = row
-                        .as_str()
-                        .or_else(|| row["id"].as_str())
-                        .or_else(|| row["threadId"].as_str());
-                    if row["status"].is_object()
-                        || row["status"].is_string()
-                        || row["nativeStatus"].is_object()
-                        || row["nativeStatus"].is_string()
-                    {
-                        if native_thread_is_busy(row)
-                            && !row_id.is_some_and(|id| terminal_failure_ids.contains(id))
-                        {
-                            return false;
-                        }
-                        continue;
-                    }
-                    let Some(id) = row
-                        .as_str()
-                        .or_else(|| row["id"].as_str())
-                        .filter(|id| !id.is_empty())
-                    else {
-                        return false;
-                    };
-                    let thread = match self
-                        .runtime
-                        .request(
-                            "thread/read",
-                            json!({"threadId":id,"includeTurns":false}),
-                            None,
-                        )
-                        .await
-                    {
-                        Ok(thread) => thread,
-                        Err(_) => return false,
-                    };
-                    if native_thread_is_busy(&thread["thread"])
-                        && !terminal_failure_ids.contains(id)
-                    {
-                        return false;
-                    }
-                }
-                let Some(cursor) = page["nextCursor"].as_str().filter(|cursor| !cursor.is_empty())
-                else {
-                    break;
-                };
-                if !cursors.insert(cursor.to_owned()) {
+                if native_thread_is_busy(&thread["thread"])
+                    && !terminal_failure_ids.contains(id)
+                    && !native_active_marker_is_persisted_only(
+                        &thread["thread"],
+                        Some(id),
+                        &loaded_ids,
+                    )
+                {
                     return false;
                 }
-                params["cursor"] = json!(cursor);
             }
+            let Some(cursor) = page["nextCursor"].as_str().filter(|cursor| !cursor.is_empty())
+            else {
+                break;
+            };
+            if !cursors.insert(cursor.to_owned()) {
+                return false;
+            }
+            params["cursor"] = json!(cursor);
         }
         true
     }
@@ -1038,6 +1069,25 @@ fn native_thread_is_busy(thread: &Value) -> bool {
         .is_some_and(|requests| !requests.is_empty())
 }
 
+fn native_active_marker_is_persisted_only(
+    thread: &Value,
+    row_id: Option<&str>,
+    loaded_ids: &HashSet<String>,
+) -> bool {
+    let status = thread
+        .get("status")
+        .or_else(|| thread.get("nativeStatus"))
+        .and_then(|status| status.as_str().or_else(|| status["type"].as_str()));
+    // Codex 的 thread/loaded/list 只返回当前加载到内存中的会话。
+    // 用户已确认历史 inProgress 记录可以退出；未加载、无待处理请求的
+    // active/inProgress/running 只代表持久历史标记，不能继续阻塞 Harness 退出。
+    matches!(status, Some("active" | "inProgress" | "running"))
+        && row_id.is_some_and(|id| !loaded_ids.contains(id))
+        && thread["requests"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+}
+
 fn codex_child_running() -> bool {
     #[cfg(windows)]
     {
@@ -1108,6 +1158,31 @@ mod tests {
             "requests":[{"id":1}]
         })));
         assert!(native_thread_is_busy(&json!({})));
+    }
+
+    #[test]
+    fn persisted_active_marker_is_ignored_only_when_not_loaded_and_without_requests() {
+        let empty = HashSet::new();
+        assert!(native_active_marker_is_persisted_only(
+            &json!({"id":"stale","status":{"type":"active"}}),
+            Some("stale"),
+            &empty,
+        ));
+        assert!(!native_active_marker_is_persisted_only(
+            &json!({"id":"live","status":{"type":"active"}}),
+            Some("live"),
+            &HashSet::from(["live".to_owned()]),
+        ));
+        assert!(!native_active_marker_is_persisted_only(
+            &json!({"id":"waiting","status":{"type":"active"},"requests":[{"id":1}]}),
+            Some("waiting"),
+            &empty,
+        ));
+        assert!(!native_active_marker_is_persisted_only(
+            &json!({"id":"unknown","status":{"type":"unknown"}}),
+            Some("unknown"),
+            &empty,
+        ));
     }
 
     #[tokio::test]

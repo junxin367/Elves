@@ -248,6 +248,29 @@ impl Store {
 }
 
 impl Data {
+    /// 用户确认历史 inProgress、已完成编辑回执和编辑草稿不代表真实执行。
+    /// 退出只应被待派发、发送中、结果未知或其他仍需处理的队列状态阻塞；
+    /// 草稿、完成/取消回执及仅绑定草稿的 queue gate 必须保留数据但允许 Harness 退出。
+    pub fn has_release_blocking_work(&self) -> bool {
+        let queue_blocks_release = self
+            .queues
+            .values()
+            .flatten()
+            .any(|message| message.state != "editing");
+        let edit_blocks_release = self
+            .edits
+            .values()
+            .any(|edit| !matches!(edit.state.as_str(), "editing" | "committed" | "canceled"));
+        let gate_blocks_release = self.queue_gates.iter().any(|(thread_id, _)| {
+            self.queues
+                .get(thread_id)
+                .into_iter()
+                .flatten()
+                .any(|message| message.state != "editing")
+        });
+        queue_blocks_release || edit_blocks_release || gate_blocks_release
+    }
+
     pub fn queue(&self, thread_id: &str, epoch: &str, revision: u64) -> Value {
         let messages: Vec<_> = self
             .queues
@@ -279,6 +302,67 @@ impl Data {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_ignores_history_and_editing_drafts_but_keeps_pending_work_blocked() {
+        let queued = |id: &str, prompt: &str| Queued {
+            id: id.into(),
+            payload: json!({"prompt":prompt,"clientUserMessageId":id}),
+            compact: false,
+            created_at: 1,
+            device_id: "device".into(),
+            key_id: "key".into(),
+            state: "queued".into(),
+            request_id: None,
+        };
+        let mut data = Data::default();
+        data.edits.insert(
+            "completed".into(),
+            Edit {
+                thread_id: "draft-thread".into(),
+                message_id: "completed-message".into(),
+                state: "committed".into(),
+                original: queued("completed-message", "done"),
+                result: json!({"ok":true}),
+                terminal_fingerprint: Some("fingerprint".into()),
+            },
+        );
+        data.edits.insert(
+            "editing".into(),
+            Edit {
+                thread_id: "draft-thread".into(),
+                message_id: "editing-message".into(),
+                state: "editing".into(),
+                original: queued("editing-message", "draft"),
+                result: Value::Null,
+                terminal_fingerprint: None,
+            },
+        );
+        data.queues.insert(
+            "draft-thread".into(),
+            vec![Queued {
+                state: "editing".into(),
+                ..queued("draft-message", "draft")
+            }],
+        );
+        data.queue_gates.insert(
+            "draft-thread".into(),
+            QueueGate {
+                phase: "paused".into(),
+                ..Default::default()
+            },
+        );
+        assert!(
+            !data.has_release_blocking_work(),
+            "历史回执、编辑草稿和仅绑定草稿的 gate 不能阻塞退出"
+        );
+
+        data.queues.get_mut("draft-thread").unwrap()[0].state = "queued".into();
+        assert!(
+            data.has_release_blocking_work(),
+            "待发送队列必须继续阻塞退出"
+        );
+    }
 
     #[test]
     fn harness_store_restart_never_replays_an_unconfirmed_dispatch() {
