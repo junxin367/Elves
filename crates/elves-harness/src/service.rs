@@ -564,7 +564,8 @@ pub async fn run() -> anyhow::Result<()> {
     let server = axum_server::from_tcp(listener)?
         .handle(handle)
         .serve(router.into_make_service());
-    // Harness 先建立独立本机工作区及代理，再对外报告就绪；管理器单独负责供应商与会话管理。
+    // Harness 只建立本机工作区；本地代理由 Elves/管理器单独拉起并通过锁文件复用，
+    // 不能把代理监视器嵌入 Harness 生命周期，否则 Harness 退出会误停独立代理。
     let controller = super::shared_controller()?;
     let settings = crate::settings::SettingsStore::default().load()?;
     controller
@@ -575,9 +576,7 @@ pub async fn run() -> anyhow::Result<()> {
         &serde_json::to_vec(&endpoint)?,
     )?;
     let monitor = super::start_monitor()?;
-    let proxy_monitor = crate::local_proxy_service::start_monitor();
     let result = server.await;
-    proxy_monitor.shutdown().await;
     let shutdown = tokio::time::timeout(SHUTDOWN_TIMEOUT, monitor.shutdown()).await;
     std::fs::remove_file(directory.join(ENDPOINT_FILE))
         .context("无法清理已停止的Harness 后台状态")?;

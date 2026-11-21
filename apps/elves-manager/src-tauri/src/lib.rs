@@ -1,12 +1,10 @@
 mod commands;
 
 use anyhow::Context;
-use fs2::FileExt;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use std::fs::{self, File};
+use std::fs;
 use std::sync::OnceLock;
-use std::time::Duration;
 use tauri::Manager;
 
 static COMMAND_SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -149,56 +147,26 @@ async fn manager_command(command: String, payload: Value) -> Result<Value, Strin
 
 #[tauri::command]
 async fn ensure_proxy_service() -> Result<Value, String> {
-    let settings = elves_core::settings::SettingsStore::default()
-        .load()
-        .map_err(|error| format!("读取代理设置失败：{error:#}"))?;
-    // 用户要求自动启动策略可独立关闭；关闭时管理器不因打开页面而偷偷拉起代理服务。
-    if !settings.local_proxy_startup_enabled || !settings.active_relay_uses_protocol_proxy() {
-        return Ok(json!({"status":"disabled","managed":false}));
-    }
-    if elves_core::ports::loopback_listener_is_running(
-        elves_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
-    )
-    .await
-    {
-        return Ok(json!({"status":"running","managed":false}));
-    }
-
-    // 用户要求代理服务独立于管理器窗口；这里启动脱离管理器生命周期的子进程，
-    // 管理器退出、崩溃或不参与请求处理时，45221 代理仍由该进程继续监视设置。
     let executable =
         std::env::current_exe().map_err(|error| format!("读取管理器路径失败：{error}"))?;
-    let child = std::process::Command::new(executable)
-        .arg("--proxy-service")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|error| format!("启动独立本地代理服务失败：{error}"))?;
-    Ok(json!({"status":"started","managed":true,"processId":child.id()}))
+    match elves_core::local_proxy_service::ensure_service_process(&executable)
+        .await
+        .map_err(|error| format!("{error:#}"))?
+    {
+        elves_core::local_proxy_service::EnsureServiceResult::Disabled => {
+            Ok(json!({"status":"disabled","managed":false}))
+        }
+        elves_core::local_proxy_service::EnsureServiceResult::AlreadyRunning => {
+            Ok(json!({"status":"running","managed":false}))
+        }
+        elves_core::local_proxy_service::EnsureServiceResult::Started { process_id } => {
+            Ok(json!({"status":"started","managed":true,"processId":process_id}))
+        }
+    }
 }
 
 pub fn run_proxy_service() -> anyhow::Result<()> {
-    let state_dir = elves_core::paths::default_app_state_dir();
-    fs::create_dir_all(&state_dir)?;
-    let lock_path = state_dir.join("local-proxy-service.lock");
-    let lock = File::create(&lock_path)?;
-    if lock.try_lock_exclusive().is_err() {
-        return Ok(());
-    }
-
-    let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async move {
-        let _lock = lock;
-        let monitor = elves_core::local_proxy_service::start_monitor();
-        if std::env::var_os("ELVES_PROXY_SERVICE_ONESHOT").is_some() {
-            monitor.shutdown().await;
-            return Ok::<(), anyhow::Error>(());
-        }
-        loop {
-            tokio::time::sleep(Duration::from_secs(60)).await;
-        }
-    })
+    elves_core::local_proxy_service::run_service_process()
 }
 
 pub fn run() {

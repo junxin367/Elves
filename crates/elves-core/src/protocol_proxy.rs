@@ -7099,7 +7099,24 @@ pub fn anthropic_messages_url(base_url: &str) -> String {
 }
 
 pub fn gemini_interactions_url(base_url: &str) -> String {
-    let base = base_url.trim().trim_end_matches('#').trim_end_matches('/');
+    let mut base = base_url
+        .trim()
+        .trim_end_matches('#')
+        .trim_end_matches('/')
+        .to_string();
+    // 供应商通常复用 Responses 的 /v1 Base URL；Gemini Interactions 固定使用 /v1beta。
+    // 同时接受用户把 /responses、/chat/completions 或旧 /interactions 端点填进 Base URL。
+    for endpoint in ["/responses", "/chat/completions", "/messages", "/interactions"] {
+        if base.to_ascii_lowercase().ends_with(endpoint) {
+            base.truncate(base.len() - endpoint.len());
+            break;
+        }
+    }
+    if base.to_ascii_lowercase().ends_with("/v1") {
+        base.truncate(base.len() - "/v1".len());
+        base.push_str("/v1beta");
+    }
+    let base = base.as_str();
     if base.to_ascii_lowercase().ends_with("/interactions") {
         return base.to_string();
     }

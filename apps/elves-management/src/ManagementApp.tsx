@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { RefreshCw } from "lucide-react";
+import { KeyRound, MessageCircle, Network, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { TooltipLayer } from "@/components/ui/tooltip-layer";
 import { copyToClipboard } from "@/lib/utils";
@@ -13,10 +13,28 @@ import {
 } from "./management-screens";
 import "./styles.css";
 import "./management.css";
+import elvesLogoUrl from "../../../assets/harness/icons/elves-logo.svg";
 
-type Page = "proxy" | "sessions";
-const titles: Record<Page, string> = { proxy: "代理设置", sessions: "会话管理" };
-const isPage = (value: unknown): value is Page => typeof value === "string" && Object.hasOwn(titles, value);
+// 用户要求恢复历史管理器的三页交互：渠道管理、本地代理、会话管理；
+// GPT 续接已经从设置、日志和请求链路移除，不能随旧页面恢复。
+type Page = "relay" | "localProxy" | "sessions";
+const titles: Record<Page, string> = {
+  relay: "渠道管理",
+  localProxy: "本地代理",
+  sessions: "会话管理",
+};
+const subtitles: Record<Page, string> = {
+  relay: "管理 API 渠道、协议、Key 与模型配置",
+  localProxy: "查看本地代理状态、请求日志和完整返回内容",
+  sessions: "浏览、筛选和删除本机 Codex 会话",
+};
+const navItems: Array<{ id: Page; label: string; icon: typeof KeyRound }> = [
+  { id: "relay", label: "渠道管理", icon: KeyRound },
+  { id: "localProxy", label: "本地代理", icon: Network },
+  { id: "sessions", label: "会话管理", icon: MessageCircle },
+];
+const isPage = (value: unknown): value is Page =>
+  typeof value === "string" && Object.hasOwn(titles, value);
 const initialPage = document.documentElement.dataset.managementPage || new URLSearchParams(location.search).get("page");
 
 type TauriWindow = Window & {
@@ -32,7 +50,8 @@ function standaloneInvoke() {
 const standaloneManager = window.parent === window && standaloneInvoke() !== null;
 
 export function App() {
-  const [page, setPage] = useState<Page>(isPage(initialPage) ? initialPage : "proxy");
+  const initialRoute = initialPage === "proxy" ? "relay" : initialPage;
+  const [page, setPage] = useState<Page>(isPage(initialRoute) ? initialRoute : "relay");
   const [theme] = useState<"light" | "dark">("dark");
   const [initialized, setInitialized] = useState(false);
   const [message, setMessage] = useState("");
@@ -189,7 +208,8 @@ export function App() {
     generation.current++;
     if (!await enqueue(refreshSettings)) return;
     setReloadEpoch(value => value + 1);
-    if (page === "proxy") await Promise.all([refreshRelay(), refreshConflicts(), refreshStatus(), refreshLogs()]);
+    if (page === "relay") await Promise.all([refreshRelay(), refreshConflicts(), refreshProviders()]);
+    if (page === "localProxy") await Promise.all([refreshStatus(), refreshLogs()]);
     if (page === "sessions") await refreshSessions();
     report("已读取服务器当前配置。");
   }
@@ -282,7 +302,13 @@ export function App() {
     void run(async () => {
       if (standaloneInvoke()) await standaloneInvoke()!("ensure_proxy_service");
       await refreshSettings();
-      await Promise.all([refreshRelay(), refreshConflicts(), refreshStatus(), refreshLogs()]);
+      await Promise.all([
+        refreshRelay(),
+        refreshConflicts(),
+        refreshProviders(),
+        refreshStatus(),
+        refreshLogs(),
+      ]);
     });
     const settingsTimer = window.setInterval(() => void checkConfiguration(), 15000);
     return () => {
@@ -292,7 +318,7 @@ export function App() {
   useEffect(() => {
     if (!initialized) return;
     if (page === "sessions") void run(refreshSessions);
-    if (page !== "proxy") return;
+    if (page !== "localProxy") return;
     let polling = false;
     const poll = async () => {
       if (!visible.current || document.hidden || polling) return;
@@ -303,37 +329,83 @@ export function App() {
     const timer = window.setInterval(() => void poll(), 10000);
     return () => window.clearInterval(timer);
   }, [page, initialized]);
-  return <div className="management-app" onInputCapture={noteEdit} onChangeCapture={noteEdit}
+  return <div className={`shell dark ${standaloneManager ? "manager-shell" : ""}`}
+    onInputCapture={noteEdit} onChangeCapture={noteEdit}
     onClickCapture={event => {
       if (event.target instanceof Element && event.target.closest('[role="option"],[role="menuitemradio"],[role="combobox"]')) noteEdit();
     }}>
-    <header className="management-header">
-      <div className="management-page-width">
-        <div><h1>{titles[page]}</h1><p>独立管理器直接管理本机代理与会话数据</p></div>
-        <Button onClick={() => void run(refresh)} variant="outline" aria-label="刷新当前页面"><RefreshCw className="h-4 w-4" />刷新</Button>
+    <aside className="sidebar">
+      <div className="brand">
+        <img className="brand-mark" src={elvesLogoUrl} alt="" aria-hidden="true" />
+        <div className="brand-copy">
+          <div className="brand-title">Elves</div>
+          <div className="brand-subtitle">代理管理器</div>
+        </div>
       </div>
-      {standaloneManager ? <nav className="manager-nav" aria-label="管理器页面">
-        {(Object.keys(titles) as Page[]).map(item => (
-          <button key={item} className={page === item ? "selected" : ""} aria-current={page === item ? "page" : undefined}
-            onClick={() => setPage(item)} type="button">{titles[item]}</button>
-        ))}
-      </nav> : null}
-    </header>
-    {message ? <div className={`management-notice ${error ? "error" : ""}`} role={error ? "alert" : "status"}>
-      <div className="management-page-width">{message}</div>
-    </div> : null}
-    <main className="management-content" key={reloadEpoch}>
-      <div className="management-page-width">
+      <nav aria-label="管理器页面" className="nav">
+        <div className="nav-groups">
+          <div className="nav-group" role="group" aria-labelledby="manager-nav-group">
+            <div className="nav-group-label" id="manager-nav-group">工作台</div>
+            <div className="nav-group-items">
+              {navItems.map(({ id, label, icon: Icon }) => {
+                const active = page === id;
+                return (
+                  <button
+                    aria-current={active ? "page" : undefined}
+                    className={`nav-item ${active ? "active" : ""}`}
+                    key={id}
+                    onClick={() => setPage(id)}
+                    type="button"
+                  >
+                    <span className="nav-icon" data-tooltip={label}>
+                      <Icon className="h-4 w-4" aria-hidden="true" />
+                    </span>
+                    <span className="nav-label">{label}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      </nav>
+    </aside>
+    <main className="workspace">
+      <header className="topbar">
+        <div>
+          <h1>{titles[page]}</h1>
+          <p>{subtitles[page]}</p>
+        </div>
+        <div className="topbar-actions">
+          {proxyStatus ? (
+            <span className={`manager-proxy-status ${proxyStatus.listening ? "running" : ""}`}>
+              <span className="proxy-status-dot" aria-hidden="true" />
+              {proxyStatus.listening ? `代理运行中 · ${proxyStatus.port}` : "代理未运行"}
+            </span>
+          ) : null}
+          <Button onClick={() => void run(refresh)} variant="outline" aria-label="刷新当前页面">
+            <RefreshCw className="h-4 w-4" />
+            刷新
+          </Button>
+        </div>
+      </header>
+      {message ? <div className={`management-notice ${error ? "error" : ""}`} role={error ? "alert" : "status"}>
+        {message}
+      </div> : null}
+      <section className="screen" key={`${page}-${reloadEpoch}`}>
         {!initialized ? <p>{error ? "配置未读取成功，请刷新后重试。" : "正在读取服务器配置…"}</p> : <>
-          {page === "proxy" ? <>
+          {page === "relay" ? (
             <RelayScreen settings={settings} relayFiles={relayFiles} envConflicts={conflicts} ccsProviders={providers}
               form={form} onFormChange={edit} actions={actions} />
+          ) : null}
+          {page === "localProxy" ? (
             <LocalProxyScreen status={proxyStatus} logs={proxyLogs} logsError={proxyError} detail={detail}
               selectedId={selectedLog} loadingDetailId={loadingLog} form={form} actions={actions} />
-          </> : null}
-          {page === "sessions" ? <SessionsScreen sessions={sessions} actions={actions} /> : null}
+          ) : null}
+          {page === "sessions" ? (
+            <SessionsScreen sessions={sessions} form={form} onFormChange={edit} actions={actions} />
+          ) : null}
         </>}
-      </div>
+      </section>
     </main>
     <TooltipLayer theme={theme} />
   </div>;

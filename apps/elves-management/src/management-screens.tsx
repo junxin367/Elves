@@ -2019,8 +2019,11 @@ export function envConflictSourceLabel(source: string): string {
   return source || "环境变量";
 }
 
-export function SessionsScreen({ sessions, actions }: {
-  sessions: LocalSessionsResult | null; actions: Actions;
+export function SessionsScreen({ sessions, form, onFormChange, actions }: {
+  sessions: LocalSessionsResult | null;
+  form: BackendSettings;
+  onFormChange: (value: BackendSettings) => void;
+  actions: Actions;
 }) {
 
   const items = sessions?.sessions ?? [];
@@ -2104,7 +2107,6 @@ export function SessionsScreen({ sessions, actions }: {
     }
   };
   return (<>
-  {/* 用户要求仅保留会话浏览、筛选及删除，移除历史会话修复和上下文压缩配置。 */}
   <Panel>
     <CardHead title="会话管理" detail="浏览当前服务的会话，按项目和时间筛选后删除" />
     <CardContent>
@@ -2116,6 +2118,7 @@ export function SessionsScreen({ sessions, actions }: {
       <Button onClick={() => void actions.refreshLocalSessions()}><RefreshCw className="h-4 w-4" />刷新会话</Button>
     </CardContent>
   </Panel>
+  <CompactionSettingsPanel form={form} onFormChange={onFormChange} actions={actions} />
   <Panel>
         <CardHead title="会话列表" detail={items.length ? "按更新时间倒序显示；可按项目和时间筛选后批量删除" : "点击刷新会话读取服务端 Codex 会话"} />
         <CardContent>
@@ -2223,6 +2226,219 @@ export function SessionsScreen({ sessions, actions }: {
         </CardContent>
       </Panel>
 </>);
+}
+
+const COMPACTION_MODEL_FAMILIES: Array<{ value: ModelFamily; label: string }> = [
+  { value: "gpt", label: "GPT / Codex" },
+  { value: "claude", label: "Claude" },
+  { value: "other", label: "其他模型" },
+];
+
+function CompactionSettingsPanel({
+  form,
+  onFormChange,
+  actions,
+}: {
+  form: BackendSettings;
+  onFormChange: (value: BackendSettings) => void;
+  actions: Actions;
+}) {
+  const [retainTokensInput, setRetainTokensInput] = useState(String(form.layeredCompactionRetainTokens));
+  const profile = activeRelayProfile(form);
+  const configuredModels = relayProfileConfiguredModels(profile);
+  const modelOptions = [
+    { value: "", label: "使用会话原模型（不覆盖）" },
+    ...configuredModels.map((model) => {
+      const contextWindow = relayProfileContextWindowForModel(profile, model);
+      return {
+        value: model,
+        label: contextWindow ? `${model} · ${contextWindow} context` : model,
+      };
+    }),
+  ];
+
+  useEffect(() => {
+    setRetainTokensInput(String(form.layeredCompactionRetainTokens));
+  }, [form.layeredCompactionRetainTokens]);
+
+  const save = (patch: Partial<BackendSettings>) => {
+    const next = { ...form, ...patch };
+    onFormChange(next);
+    void actions.saveSettingsValue(next, false);
+  };
+  const saveRetainTokens = () => {
+    const parsed = Number.parseInt(retainTokensInput, 10);
+    const value = Number.isFinite(parsed)
+      ? clampNumber(parsed, 20000, 64000)
+      : form.layeredCompactionRetainTokens;
+    setRetainTokensInput(String(value));
+    if (value !== form.layeredCompactionRetainTokens) save({ layeredCompactionRetainTokens: value });
+  };
+  const selectedModels = form.layeredCompactionModels;
+  const modelWarnings = COMPACTION_MODEL_FAMILIES.flatMap(({ value, label }) => {
+    const model = selectedModels[value].trim();
+    if (!model || configuredModels.includes(model)) return [];
+    return [`${label}「${model}」不在当前渠道模型列表中，实际会回落到会话原模型`];
+  });
+
+  return (
+    <Panel>
+      <CardHead
+        title="上下文压缩"
+        detail="独立压缩模型只用于本地代理压缩；原生 Remote Compaction V2 仍使用会话原模型"
+      />
+      <CardContent>
+        {/* 用户要求保留旧管理器的独立压缩模型替换能力；这里不恢复 GPT 续接，只保存压缩模型选择与生效策略。 */}
+        <div className="session-runtime-settings">
+          <div className="session-runtime-setting session-context-compaction-setting">
+            <input
+              checked={form.layeredCompactionEnabled}
+              id="context-compaction-enabled"
+              onChange={(event) => save({ layeredCompactionEnabled: event.currentTarget.checked })}
+              type="checkbox"
+            />
+            <div className="session-runtime-setting-copy session-context-compaction-copy">
+              <label className="session-context-compaction-heading" htmlFor="context-compaction-enabled">
+                <strong>启用本地上下文压缩</strong>
+                <small>开启后，本地代理在需要时生成并校验摘要；关闭时不启用本地分层压缩。</small>
+              </label>
+              <div className="session-context-compaction-options">
+                <div className="session-context-compaction-option">
+                  <div className="session-context-compaction-option-copy">
+                    <strong>保留最近一轮原始记录</strong>
+                    <small>额外保留最近一轮用户、助手和工具记录，避免摘要丢失最近上下文。</small>
+                  </div>
+                  <div className="session-context-compaction-option-control">
+                    <button
+                      aria-checked={form.layeredCompactionRetainRecentRoundEnabled}
+                      aria-label="保留最近一轮原始记录"
+                      className={`context-enabled-switch ${form.layeredCompactionRetainRecentRoundEnabled ? "active" : ""}`}
+                      disabled={!form.layeredCompactionEnabled}
+                      onClick={() => save({
+                        layeredCompactionRetainRecentRoundEnabled:
+                          !form.layeredCompactionRetainRecentRoundEnabled,
+                      })}
+                      role="switch"
+                      type="button"
+                    >
+                      <span className="context-switch-track" aria-hidden="true"><span className="context-switch-thumb" /></span>
+                    </button>
+                  </div>
+                </div>
+                {form.layeredCompactionEnabled && form.layeredCompactionRetainRecentRoundEnabled ? (
+                  <div className="session-context-compaction-option">
+                    <div className="session-context-compaction-option-copy">
+                      <strong>保留目标</strong>
+                      <small>范围 20,000–64,000 token，用于控制补回原始记录的长度。</small>
+                    </div>
+                    <div className="session-context-compaction-option-control session-context-compaction-limit-control">
+                      <Input
+                        aria-label="上下文压缩保留目标 token"
+                        className="session-context-compaction-limit"
+                        inputMode="numeric"
+                        maxLength={5}
+                        onBlur={saveRetainTokens}
+                        onChange={(event) => setRetainTokensInput(event.currentTarget.value.replace(/[^0-9]/g, "").slice(0, 5))}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter") event.currentTarget.blur();
+                        }}
+                        value={retainTokensInput}
+                      />
+                      <span className="session-context-compaction-unit">token</span>
+                    </div>
+                  </div>
+                ) : null}
+                <div className="session-context-compaction-option">
+                  <div className="session-context-compaction-option-copy">
+                    <strong>独立压缩模型</strong>
+                    <small data-warning={modelWarnings.length > 0 || undefined}>
+                      {modelWarnings.length
+                        ? `${modelWarnings.join("；")}。`
+                        : form.layeredCompactionModelOverrideEnabled
+                          ? form.layeredCompactionModelUsage === "default"
+                            ? "每次本地压缩优先使用所选模型。"
+                            : "仅在缓存租约过期或未知时使用所选模型。"
+                          : "关闭时使用会话原模型。"}
+                    </small>
+                  </div>
+                  <div className="session-context-compaction-option-control">
+                    <button
+                      aria-checked={form.layeredCompactionModelOverrideEnabled}
+                      aria-label="启用独立压缩模型"
+                      className={`context-enabled-switch ${form.layeredCompactionModelOverrideEnabled ? "active" : ""}`}
+                      disabled={!form.layeredCompactionEnabled}
+                      onClick={() => save({
+                        layeredCompactionModelOverrideEnabled:
+                          !form.layeredCompactionModelOverrideEnabled,
+                      })}
+                      role="switch"
+                      type="button"
+                    >
+                      <span className="context-switch-track" aria-hidden="true"><span className="context-switch-thumb" /></span>
+                    </button>
+                  </div>
+                </div>
+                {form.layeredCompactionEnabled && form.layeredCompactionModelOverrideEnabled ? (
+                  <>
+                    <div className="session-context-compaction-mode-row">
+                      <div className="session-context-compaction-mode-copy">
+                        <strong>生效方式</strong>
+                        <small>
+                          {form.layeredCompactionModelUsage === "default"
+                            ? "每次本地压缩都优先使用独立模型。"
+                            : "仅在缓存租约过期或未知时使用独立模型。"}
+                        </small>
+                      </div>
+                      <div aria-label="独立压缩模型生效方式" className="session-context-compaction-mode-switch" role="group">
+                        {([
+                          ["cacheMiss", "缓存失效时使用"],
+                          ["default", "默认使用"],
+                        ] as const).map(([usage, label]) => (
+                          <button
+                            aria-pressed={form.layeredCompactionModelUsage === usage}
+                            className={form.layeredCompactionModelUsage === usage ? "active" : ""}
+                            key={usage}
+                            onClick={() => save({ layeredCompactionModelUsage: usage })}
+                            type="button"
+                          >
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="session-context-compaction-family-grid">
+                      {COMPACTION_MODEL_FAMILIES.map(({ value: family, label }) => (
+                        <label className="session-context-compaction-family-field" key={family}>
+                          <span>{label}</span>
+                          <SelectMenu
+                            ariaLabel={`${label}使用的上下文压缩模型`}
+                            className="session-context-compaction-model-select"
+                            menuClassName="session-context-compaction-model-menu"
+                            menuMaxWidth={260}
+                            menuMinWidth={260}
+                            onChange={(next) => save({
+                              layeredCompactionModels: {
+                                ...form.layeredCompactionModels,
+                                [family]: next,
+                              },
+                              layeredCompactionModel: "",
+                            })}
+                            options={modelOptions}
+                            placeholder="使用会话原模型（不覆盖）"
+                            value={form.layeredCompactionModels[family]}
+                          />
+                        </label>
+                      ))}
+                    </div>
+                  </>
+                ) : null}
+              </div>
+            </div>
+          </div>
+        </div>
+      </CardContent>
+    </Panel>
+  );
 }
 
 export function RelayProfileList({

@@ -26,6 +26,13 @@ html,body,#app{width:100%;height:100%;min-width:0;margin:0;overflow:hidden}
 .management-notice.error{color:hsl(var(--destructive))}
 .management-content .session-summary-grid{grid-template-columns:repeat(3,minmax(0,1fr));margin-bottom:16px}
 .management-content .session-management-grid{display:none}
+/* 用户要求恢复历史管理器的三页导航；状态提示与页面滚动区必须保持在同一工作区，不再把渠道和本地代理挤在一页。 */
+.manager-shell .management-notice{flex:0 0 auto;padding:10px 20px;background:hsl(var(--secondary));font-size:13px;overflow-wrap:anywhere}
+.manager-shell .management-notice.error{color:hsl(var(--destructive))}
+.manager-proxy-status{display:inline-flex;align-items:center;gap:6px;min-height:32px;padding:0 9px;border:1px solid hsl(var(--border));border-radius:7px;color:hsl(var(--muted-foreground));font-size:12px;white-space:nowrap}
+.manager-proxy-status.running{border-color:hsl(var(--brand-accent) / .38);color:hsl(var(--brand-accent))}
+.manager-proxy-status .proxy-status-dot{width:7px;height:7px;border-radius:50%;background:hsl(var(--muted-foreground));box-shadow:none}
+.manager-proxy-status.running .proxy-status-dot{background:hsl(var(--brand-accent));box-shadow:0 0 0 3px hsl(var(--brand-accent) / .14)}
 /* 窄屏二级页沿用单列布局：同时清除旧字段的第 2 列定位，避免隐式列把标题和输入挤窄；操作按钮按可用宽度换行。 */
 @media(max-width:860px){
   .management-content .relay-editor-head{flex-wrap:wrap;align-items:flex-start}

@@ -5,9 +5,9 @@ const root=resolve(process.argv[2]||resolve(import.meta.dirname,".."));
 const sourceOnly=process.argv[3]==="--source-only";
 const binaryDirectory=resolve(sourceOnly?resolve(root,"target/release-fast"):process.argv[3]||resolve(root,"target/release-fast"));
 const read=path=>readFileSync(resolve(root,path),"utf8");
-const backend=read("crates/elves-harness/src/lib.rs"),service=read("crates/elves-harness/src/service.rs"),client=read("apps/elves/src-tauri/src/desktop.rs");
+const backend=read("crates/elves-harness/src/lib.rs"),service=read("crates/elves-harness/src/service.rs"),proxy=read("crates/elves-core/src/local_proxy_service.rs"),client=read("apps/elves/src-tauri/src/desktop.rs"),entry=read("apps/elves/src-tauri/src/main.rs");
 const protocol=Number(service.match(/const PROTOCOL_VERSION:\s*u32\s*=\s*(\d+);/)?.[1]);
-if(protocol<10||!/\bcontroller\s*\.start_desktop\s*\(/.test(service)||!service.includes("start_monitor"))throw Error("Harness 必须提供独立本机入口和代理生命周期。");
+if(protocol<10||!/\bcontroller\s*\.start_desktop\s*\(/.test(service)||!proxy.includes("PROXY_SERVICE_ARG")||!entry.includes("run_service_process"))throw Error("Elves 必须提供独立本机入口和本地代理服务启动入口。");
 for(const file of ["assets/inject/renderer-features.js","crates/elves-core/src/bridge.rs","crates/elves-core/src/cdp.rs","crates/elves-core/src/launcher.rs"])
  if(existsSync(resolve(root,file)))throw Error(`不应恢复 Codex App 注入代码：${file}`);
 if(!client.includes('open_workspace(startup_app)')||client.includes('async fn connect_remote(')||client.includes('saved.remote_access.enabled'))throw Error("Elves 启动不能依赖远程会话连接或开关。");

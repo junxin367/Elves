@@ -707,7 +707,15 @@ fn gemini_interactions_url_uses_v1beta_endpoint() {
         "https://generativelanguage.googleapis.com/v1beta/interactions"
     );
     assert_eq!(
+        gemini_interactions_url("https://gateway.example/v1"),
+        "https://gateway.example/v1beta/interactions"
+    );
+    assert_eq!(
         gemini_interactions_url("https://gateway.example/v1beta"),
+        "https://gateway.example/v1beta/interactions"
+    );
+    assert_eq!(
+        gemini_interactions_url("https://gateway.example/v1/responses"),
         "https://gateway.example/v1beta/interactions"
     );
 }
@@ -919,7 +927,7 @@ async fn gemini_interactions_proxy_sends_native_endpoint_and_auth_headers() {
     );
 
     let captured = server.finish();
-    assert_eq!(captured.path, "/v1/interactions");
+    assert_eq!(captured.path, "/v1beta/interactions");
     assert_eq!(captured.x_goog_api_key, "gemini-key");
     assert_eq!(captured.api_revision, "2026-05-20");
     let wire: Value = serde_json::from_str(&captured.body).unwrap();

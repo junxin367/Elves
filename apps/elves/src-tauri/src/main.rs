@@ -1,6 +1,13 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 fn main() {
+    if std::env::args().any(|arg| arg == elves_core::local_proxy_service::PROXY_SERVICE_ARG) {
+        if let Err(error) = elves_core::local_proxy_service::run_service_process() {
+            eprintln!("独立本地代理服务启动失败：{error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let Ok(executable) = std::env::current_exe() {
         elves_harness::set_service_executable(executable);
     }
@@ -55,6 +62,22 @@ fn main() {
             std::process::exit(1);
         }
         return;
+    }
+    #[cfg(windows)]
+    {
+        // 用户要求增加“随 Elves 启动”策略：代理先作为独立子进程启动，
+        // 不嵌入 Harness，也不依赖管理器窗口存活；关闭策略时由共享设置直接禁止拉起。
+        if let Ok(executable) = std::env::current_exe()
+            && let Ok(runtime) = tokio::runtime::Runtime::new()
+            && let Err(error) = runtime.block_on(
+                elves_core::local_proxy_service::ensure_service_process(&executable),
+            )
+        {
+            let _ = elves_core::diagnostic_log::append_diagnostic_log(
+                "elves.local_proxy_start_failed",
+                serde_json::json!({"message":format!("{error:#}")}),
+            );
+        }
     }
     #[cfg(windows)]
     if let Err(error) = elves::desktop::run() {

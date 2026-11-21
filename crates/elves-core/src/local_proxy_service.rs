@@ -1,12 +1,20 @@
 //! 单客户端安装后的本地协议代理生命周期，不启动 launcher、管理器或 Codex App。
+use std::fs::{self, File};
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::{
     Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
 
+use anyhow::Context;
+use fs2::FileExt;
+
 use crate::settings::SettingsStore;
 
+pub const PROXY_SERVICE_ARG: &str = "--proxy-service";
+const PROXY_SERVICE_LOCK_FILE: &str = "local-proxy-service.lock";
 static LAN_LISTENING: AtomicBool = AtomicBool::new(false);
 static ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
@@ -39,6 +47,67 @@ impl ProxyMonitor {
         let _ = self.shutdown.send(());
         let _ = self.task.await;
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnsureServiceResult {
+    Disabled,
+    AlreadyRunning,
+    Started { process_id: u32 },
+}
+
+/// 由 Elves 客户端或独立管理器调用，确保本地代理以独立进程运行。
+///
+/// 代理进程只读取共享设置并自行监视供应商切换；调用方退出、管理器关闭或页面不参与请求
+/// 都不会回收该进程。用户要求“随 Elves 启动”开关只控制这里是否拉起服务，不改变供应商路由。
+pub async fn ensure_service_process(executable: &Path) -> anyhow::Result<EnsureServiceResult> {
+    let settings = SettingsStore::default()
+        .load()
+        .context("读取本地代理设置失败")?;
+    if !desired_state(&settings).0 {
+        return Ok(EnsureServiceResult::Disabled);
+    }
+    if crate::ports::loopback_listener_is_running(
+        crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+    )
+    .await
+    {
+        return Ok(EnsureServiceResult::AlreadyRunning);
+    }
+    let child = Command::new(executable)
+        .arg(PROXY_SERVICE_ARG)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("启动独立本地代理服务失败：{}", executable.display()))?;
+    Ok(EnsureServiceResult::Started {
+        process_id: child.id(),
+    })
+}
+
+/// 运行独立本地代理服务。进程使用锁文件保证 Elves、管理器重复启动时只保留一个实例。
+pub fn run_service_process() -> anyhow::Result<()> {
+    let state_dir = crate::paths::default_app_state_dir();
+    fs::create_dir_all(&state_dir)?;
+    let lock_path = state_dir.join(PROXY_SERVICE_LOCK_FILE);
+    let lock = File::create(&lock_path)?;
+    if lock.try_lock_exclusive().is_err() {
+        return Ok(());
+    }
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async move {
+        let _lock = lock;
+        let monitor = start_monitor();
+        if std::env::var_os("ELVES_PROXY_SERVICE_ONESHOT").is_some() {
+            monitor.shutdown().await;
+            return Ok::<(), anyhow::Error>(());
+        }
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    })
 }
 
 pub fn start_monitor() -> ProxyMonitor {
