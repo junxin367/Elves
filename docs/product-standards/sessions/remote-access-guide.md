@@ -20,11 +20,11 @@ Windows 使用 [Elves 本机工作区](../clients/windows-workspace.md)，无需
 
 类型图标随对应文字字号缩放；最近、项目和置顶列表中的 Codex 与 Claude 会话均在标题前显示对应品牌图标，两类图标与文字居中对齐、间隔 3px，最近列表的项目名不预留图标列。实例菜单与项目菜单共用行高、间距、圆角和展开背景，以 200px 为最小宽度，随内容自适应并限制在视口内。实例名称不拼接“本机”“WSL”标签，本机仅显示类型名，其他实例保留实际发行版，例如“Codex”“Claude · Ubuntu”；Claude 不附加 Linux 用户名。设置、新建、自定义指令及历史实例使用同一命名规则；已有会话路径继续显示实际 WSL 发行版名称。
 
-Claude 会话进入最近列表和所属项目列表，标题前显示 Claude 图标，支持现有搜索、排序和置顶。从列表移除 Claude 会话保留原生 Claude 历史及项目文件，确认框会说明这一点。移除前的后台停止条件与失败提示见[Claude 会话退出回收与启动补偿](../core/product-behavior.md#claude-会话退出回收与启动补偿)。网页与 Android 共用这套页面，不向 Codex 桌面原生列表伪造 Claude 会话。
+Claude 会话进入最近列表和所属项目列表，标题前显示 Claude 图标，支持现有搜索、排序和置顶。从列表移除 Claude 会话保留原生 Claude 历史及项目文件，确认框会说明这一点。移除前的停止条件与失败提示见[Claude 会话退出与启动接回](../core/product-behavior.md#claude-会话退出与启动接回)。网页与 Android 共用这套页面，不向 Codex 桌面原生列表伪造 Claude 会话。
 
-新建 Claude 会话使用原版 CLI 的后台会话，网页保持现有消息、Markdown、工具卡片和执行状态展示，页头展示对应品牌与实际 WSL 路径。在该环境的电脑终端可用原版 `claude attach <id>` 连接同一个原生会话。网页发出的消息、执行过程和回复可在 CLI 查看，CLI 发起的消息和执行结果也会自动更新到网页。
+Claude 会话通过 Claude Agent SDK 的 stream-json 控制协议驱动所选 WSL 里的原版 CLI（实现与进程分工见[Harness 架构](../../harness-architecture.md#claude-执行引擎)），网页保持现有消息、Markdown、工具卡片和执行状态展示，页头展示对应品牌与实际 WSL 路径。执行状态、审批、问答、计划确认、模型、思考深度、权限模式和消息回执都来自 CLI 的结构化事件，不识别终端画面。CLI 由 WSL 内独立宿主持有：退出 Elves 或安装升级时，执行中的任务继续，没有执行中的会话则一并关闭；重新打开 Elves 后接回（见[Claude 会话退出与启动接回](../core/product-behavior.md#claude-会话退出与启动接回)）。同一个会话同一时间只允许一个应用写入：不再支持 `claude attach`，也不支持 Elves 和终端同时打开同一会话。别的应用已持有时，会话内提示“已在另一个应用中打开”（见[会话被其他应用持有](../core/product-behavior.md#会话被其他应用持有)）；要在 WSL 里继续同一个会话，经 Open in 的 WSL 项，确认关闭 Elves 的占用后再用 `claude --resume <原生 ID>` 打开（见[Open in 的应用识别与前台显示](../core/product-behavior.md#open-in-的应用识别与前台显示)）。终端里新增的内容由历史读取器按原生记录自动更新到网页。新版本不兼容旧版本的 daemon 后台任务，它们仍持有会话时按“已在另一个应用中打开”处理，不迁移也不停止。
 
-启用 Claude 后，加载列表会只读发现指定 WSL 用户的原生 JSONL 和后台任务，不依赖旧网页登记文件或 `sessions-index.json`，也不启动模型来探测会话。原生 UUID 与环境参与去重，已有网页 ID、手动标题、项目选择、置顶、已读和删除状态保留。早期 print 登记在没有执行连接时接入完整原生历史；已打开的发现会话在首次网页发送前也会同步 CLI 后续内容，首次网页发送继续使用原 UUID。匹配现有项目根目录的原生会话归入同一个 Codex 项目；没有匹配项目的只进入最近列表。
+启用 Claude 后，加载列表会只读发现指定 WSL 用户的原生 JSONL，不依赖旧网页登记文件或 `sessions-index.json`，也不启动模型来探测会话。原生 UUID 与环境参与去重，已有网页 ID、手动标题、项目选择、置顶、已读和删除状态保留。早期 print 登记在没有执行连接时接入完整原生历史；已打开的发现会话在首次网页发送前也会同步 CLI 后续内容，首次网页发送继续使用原 UUID。匹配现有项目根目录的原生会话归入同一个 Codex 项目；没有匹配项目的只进入最近列表。
 
 列表请求通过 `enabledInstanceIds` 选择具体实例，只扫描并合并其中的 Claude 环境；空数组表示全部关闭。旧客户端的 `includeClaude: true` 只启用原默认 Claude 实例；未传两者时保持 Codex 列表，不启动 WSL 发现连接。
 
@@ -82,11 +82,7 @@ Codex 独立服务保存当前引擎代次已收到的每轮最新计划，通�
 
 在 Claude 开始输出前停止时，原生会撤回这条输入，把原文放回原版终端输入框，记录中不留标记。连接端同时满足以下条件时判定输入已撤回：会话空闲且在线；该消息之后没有回复或中断记录；终端输入框内容与原文开头一致。网页随即结束该轮次并显示「已撤回」，不再停在「等待开始」。之后网页发送的新消息正常送达；留在原版终端输入框里的原文，需要在终端中自行清除或发送。
 
-原版终端打开 `/rewind` 回退菜单时，原生状态为等待中（`dialog open`），记录中不写任何内容。这时网页发送的消息会被原生接收并放进原生队列，但菜单关闭前不会执行。终端按 Esc 取消后，这些消息在原对话上执行。终端选择「Restore conversation」完成回退后，这些消息接在回退点之后执行，被回退的消息随之从网页移除，所选消息原文放回终端输入框。连接端按画面识别回退菜单的两页：选消息页显示 `Restore the code and/or conversation…`，底栏为 `Esc to cancel`；确认页显示 `Confirm you want to restore…`、所选消息原文和包含 `Never mind` 的编号选项。网页显示「原版终端打开了回退菜单（/rewind）」及上述排队说明，并提供「关闭终端回退菜单」按钮。点击并二次确认后，连接端重新读取画面，核对菜单仍在，再执行取消：选消息页发送 Esc；确认页先选「Never mind」退回选消息页，再发送 Esc。网页只能关闭菜单，不能确认回退；终端已自行关闭菜单时，旧卡片的点击不会发送任何按键。
-
-连接端读取终端画面时，单行上限由 1 MiB 提高到 16 MiB，避免较大的画面帧被截断后读不到底栏和弹窗。以上行为在 Claude Code 2.1.323 上实测，见 [Claude 渲染与交互验收](../../validation/claude-rendering-interaction-20261114.md)。
-
-原生带 `interruptedMessageId` 的中断控制记录显示为原回复下方的「请求已中断」，悬停可查看原生标记，不单独形成用户消息。仅隐藏明确非 API 错误的原生合成占位回复 `No response requested.`；真实模型正文、用户引用和错误信息保留。HTTP 分页与实时同步均核对有效轮次 ID，清理旧误分类缓存并重算游标，不改写原生 JSONL。详见 [Claude 消息渲染排查](../../validation/claude-message-rendering-20261112.md)。
+原生带 `interruptedMessageId` 的中断控制记录显示为原回复下方的「请求已中断」，悬停可查看原生标记，不单独形成用户消息。SDK 传输用 interrupt 控制请求中止回复时，CLI 写入的标记行没有 `interruptedMessageId`（CLI 2.1.329 实测）；读取器只在同时满足以下原生元数据时才补充中断证据：`entrypoint` 为 `sdk-*`、文字恰为 `[Request interrupted by user]` 或 `[Request interrupted by user for tool use]`、不带真人输入才有的 `promptSource` / `turnOrigin` / `turnAttributionKey` / `permissionMode`、与被中断提示共用 `promptId`。用户自己输入同样文字的消息是新提示，带有这些属性，仍是普通消息。仅隐藏明确非 API 错误的原生合成占位回复 `No response requested.`；真实模型正文、用户引用和错误信息保留。HTTP 分页与实时同步均核对有效轮次 ID，清理旧误分类缓存并重算游标，不改写原生 JSONL。详见 [Claude 消息渲染排查](../../validation/claude-message-rendering-20261112.md)。
 
 Claude 终端预览与正式历史分开保存。预览绑定当前连接、原生用户消息和已读取的正文摘要；仅工具状态或用量变化时保留已显示内容，正式正文到达后一次性接替。迟到、缩短、无法确认归属的终端片段不覆盖正式消息；终端工具状态行不作为回复展示：连续工具被 CLI 折叠成的分组行（如 `Calling playwright 3 times…`、`Searching for 1 pattern, reading 2 files…`，带或不带 `(ctrl+o to expand)`）按进度行过滤，记录里存在尚未返回结果的 `tool_use` 时整段暂停终端预览；实时进度由正式的进行中工具条目在活动区显示，结果返回后恢复预览。过去式句式取自 CLI 源码，尚未在真实画面观察，CLI 升级后若出现新的分组句式，需用真实画面补充 `scripts/claude-shared-history.test.py` 的样例，Markdown 与终端纯文本的重复只用于过滤预览，不改写正式正文。临时预览不进入服务端持久化历史，升级后清理旧版残留的预览记录；HTTP 读取和实时通知使用同一接替规则。
 
@@ -488,9 +484,9 @@ Codex 会话删除只调用 App Server 的原生 `thread/delete`，不使用任�
 
 zrok 没有独立启停开关，跟随「远程会话网页」启停。关闭该开关会立即停止 zrok；退出负责启动远程后台的 Elves 进程时，Windows Job Object 会同时回收远程网页后台和 zrok。关闭 Elves 主窗口只会最小化到托盘，需要从托盘退出才算退出程序。
 
-计划退出会先请求本机独立后台完成安全回收，再结束 Windows 进程；Elves 托盘退出和安装／卸载使用同一安全回收入口。普通退出仍只停止明确空闲且没有草稿、审批、问答、压缩、后台任务、原生队列或未确认派发的受管会话。安装升级对 Claude 受管会话使用同一回收规则：只停止上述明确空闲的会话，仍在执行的原生后台任务保留，由新版本启动后重新连接。Codex 在托盘退出和安装升级时按[产品行为约定](../core/product-behavior.md#elves-安装启动与-harness)处理：一律放行，仍在执行的任务留在 Elves 私有 Codex 服务里继续，新版本或下次启动后重新连接；没有执行中的会话时 Codex 一并关闭。不能强制结束私有服务里的任务，也不能静默继续使用旧 Harness。
+计划退出会先请求本机独立后台完成安全回收，再结束 Windows 进程；Elves 托盘退出和安装／卸载使用同一安全回收入口。Claude 会话由 WSL 内的宿主持有，不需要逐个回收：执行中的任务继续，没有执行中任务的会话随连接断开自行收尾，由新版本启动后重新连接（见[Claude 会话退出与启动接回](../core/product-behavior.md#claude-会话退出与启动接回)）。Codex 在托盘退出和安装升级时按[产品行为约定](../core/product-behavior.md#elves-安装启动与-harness)处理：一律放行，仍在执行的任务留在 Elves 私有 Codex 服务里继续，新版本或下次启动后重新连接；没有执行中的会话时 Codex 一并关闭。不能强制结束私有服务里的任务，也不能静默继续使用旧 Harness。
 
-`remote-claude-cleanup.json` 保存待回收身份和最近结果，不保存消息或凭据。启动先补偿退出遗漏，后台仍运行时每 15 秒复查；用户继续使用该会话会取消旧意图。只有确认对应进程退出才移除待回收项，`done` 仅代表轮次结束。超时、状态不可读、保留及失败分别记录，不将其合并为“全部回收成功”。本机管理状态的 `claudeCleanup` 提供最近回收结果；退出不会改动保存的服务开关、访问密钥和设备授权。
+本机管理状态的 `claudeCleanup` 和退出响应的 `cleanup` 字段保持原有结构并恒为已完成；`remote-claude-cleanup.json` 不再生成或读取，旧版本遗留的文件保持原样。退出不会改动保存的服务开关、访问密钥和设备授权。
 
 不再保留主Elves心跳、3 小时超时或程序退出后继续运行公网服务的逻辑。网络短暂中断或 zrok 异常退出时，当前运行期内会按状态自动重试；固定名称不变，因此不会因重启 Elves 频繁申请新的公网地址。
 

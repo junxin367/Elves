@@ -1,11 +1,18 @@
-"""原生执行中吸收队列消息的回归样例；只读取临时日志，不连接或启动 Claude。"""
+"""Claude Agent SDK 历史读取器的回归样例：只读取临时日志和进程登记，不连接或启动 Claude。
+
+用户要求改用 Claude Agent SDK 对接后，旧 daemon 后台任务与终端画面识别的测试随旧代码一并删除；
+执行状态、审批、问答和消息回执由 Rust 对端的 stream-json 连接提供，对应测试在 claude_sdk/ 内。"""
 import json
 import contextlib
 import io
 import os
 from pathlib import Path
+import socket
+import struct
+import subprocess
+import sys
 import tempfile
-from types import SimpleNamespace
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -13,7 +20,8 @@ from unittest.mock import MagicMock, patch
 source = Path(__file__).resolve().parents[1] / "crates/elves-harness/src/claude_shared.py"
 namespace = {"__name__": "claude_shared_history_test"}
 exec(compile(source.read_text(encoding="utf-8"), str(source), "exec"), namespace)
-NativeSession = namespace["NativeSession"]
+SdkReader = namespace["SdkReader"]
+
 NativeDiscovery = namespace["NativeDiscovery"]
 trust_source = source.with_name("claude_project_trust.py")
 trust_namespace = {"__name__": "claude_project_trust_test"}
@@ -21,280 +29,14 @@ exec(compile(trust_source.read_text(encoding="utf-8"), str(trust_source), "exec"
 
 
 class SharedQueueHistoryTests(unittest.TestCase):
-    def waiting_questions(self):
-        native = self.waiting_dialog()
-        questions = [
-            {"question": "选择目标分支？", "options": [{"label": "test"}, {"label": "pre-production"}]},
-            {"question": "仅有主分支怎么办？", "options": [{"label": "master"}, {"label": "跳过"}]},
-        ]
-        native.job.update(needs="input needed", block={"questions": questions})
-        native.screen = namespace["Screen"]()
-        native.screen.feed("← ☐ 分支 ☐ 主分支 ✔ Submit →\n选择目标分支？\n"
-                           "❯ 1. test\n2. pre-production\n3. Type something.\n")
-        return native
 
-    def test_live_questions_are_visible_before_any_tool_use_is_written_to_history(self):
-        native = self.waiting_questions()
-        with contextlib.redirect_stdout(io.StringIO()):
-            native.poll()
-        request = next(iter(native.requests.values()))
-        self.assertEqual(request["tool_name"], "AskUserQuestion")
-        self.assertEqual(len(request["input"]["questions"]), 2)
-        self.assertEqual(request["nativeQuestion"]["state"], "waiting")
-        self.assertIsNone(native.dialog)
-        native.job.update(sessionStatus="idle", needs=None)
-        with contextlib.redirect_stdout(io.StringIO()):
-            native.poll()
-        self.assertEqual(native.requests, {}, "旧 block 不能在原生已恢复执行后继续弹问答")
-
-    def test_native_question_identity_is_stable_and_retires_when_waiting_or_options_change(self):
-        native = self.waiting_questions()
-        request = namespace["native_question_request"](native.job, native.native_id)
-        original = request["nativeQuestion"]["id"]
-        self.assertEqual(original, namespace["native_question_request"](native.job, native.native_id)["nativeQuestion"]["id"])
-        native.job["sessionStatusAtMs"] += 1
-        self.assertNotEqual(original, namespace["native_question_request"](native.job, native.native_id)["nativeQuestion"]["id"])
-        native.job["sessionStatusAtMs"] -= 1
-        native.job["block"]["questions"][0]["options"][0]["label"] = "另一个分支"
-        self.assertNotEqual(original, namespace["native_question_request"](native.job, native.native_id)["nativeQuestion"]["id"])
-
-    def test_history_discovery_restores_live_questions_without_starting_or_contacting_cli(self):
-        native, session_path, record = self.activity_fixture("waiting")
-        record["waitingFor"] = "input needed"
-        session_path.write_text(json.dumps(record))
-        job_path = native.root / "jobs/1234abcd/state.json"
-        stored = json.loads(job_path.read_text())
-        stored.update(block={"questions": [{"question": "选择分支？", "options": [{"label": "test"}, {"label": "main"}],
-                                           "privateField": "must-not-be-cached"}]},
-                      providerEnv={"SECRET": "must-not-be-cached"})
-        job_path.write_text(json.dumps(stored))
-        logs = native.root / "projects/fixture"
-        logs.mkdir(parents=True)
-        (logs / f"{native.native_id}.jsonl").write_text(json.dumps({"type": "user", "uuid": "input",
-            "cwd": "/fixture", "sessionId": native.native_id, "timestamp": 1000,
-            "message": {"content": "原问题"}}) + "\n")
-        reader = NativeDiscovery(native.root)
-        with patch.object(NativeSession, "rpc", side_effect=AssertionError("只读发现不能调用 CLI")):
-            frame = reader.control({"subtype": "read_history", "native_id": native.native_id})
-        request = next(iter(frame["requests"].values()))
-        self.assertEqual(request["input"]["questions"][0]["question"], "选择分支？")
-        self.assertEqual(frame["native_status"]["sessionStatus"], "waiting")
-        self.assertNotIn("must-not-be-cached", json.dumps(reader.jobs))
-        self.assertNotIn("must-not-be-cached", json.dumps(frame))
-
-    def test_question_review_matches_full_answers_and_ignores_native_diff_column(self):
-        native = self.waiting_questions()
-        questions = native.job["block"]["questions"]
-        lines = ["← ☒ 分支 ☒ 主分支 ✔ Submit →", "Review your answers      Diff unavailable",
-                 "│ ● 选择目标分支？", "→ pre-production", "● 仅有主分支怎么办？", "→ master",
-                 "Ready to submit your answers?", "❯ 1. Submit answers", "2. Cancel"]
-        page = namespace["native_question_page"](lines, questions)
-        self.assertEqual(page["index"], 2)
-        answers = {"选择目标分支？": "pre-production", "仅有主分支怎么办？": "master"}
-        self.assertTrue(namespace["native_question_review_matches"](page["review"], questions, answers))
-        self.assertFalse(namespace["native_question_review_matches"](
-            page["review"], questions, {**answers, "仅有主分支怎么办？": "跳过"}))
-        underscored = [line.replace("→ master", "→ feature_a") for line in page["review"]]
-        self.assertFalse(namespace["native_question_review_matches"](
-            underscored, questions, {**answers, "仅有主分支怎么办？": "featurea"}),
-            "答案中的下划线不是 Markdown 标记，不能在核对时丢掉")
-
-    def test_question_review_accepts_wrapped_lines_that_start_with_native_markers(self):
-        # 版式取自 2026-11-15 原版 2.1.325（120x40）汇总页实测：长问题在竖线内折行，续行行首可能恰好是正文里的“→ ”或“● ”。
-        questions = [
-            {"question": "要做到完全无环，需要把整个网页横向重新分层为“状态 → 视图 → 编排”：搬移或反转 200 个以上的声明。你希望怎么做？",
-             "options": [{"label": "完整分层重构（推荐）"}, {"label": "暂不处理"}]},
-            {"question": "列表前缀 ● 也可能出现在续行行首，这部分现在是否提交？",
-             "options": [{"label": "现在提交（推荐）"}, {"label": "先不提交"}]},
-        ]
-        screen = ["←  ☒ 循环依赖  ☒ 提交 a  ✔ Submit  →", "", "Review your answers", "",
-                  " │ ● 要做到完全无环，需要把整个网页横向重新分层为“状态",
-                  " │   → 视图 → 编排”：搬移或反转 200 个以上的声明。你希望怎么做？",
-                  "   → 完整分层重构（推荐）",
-                  " │ ● 列表前缀",
-                  " │   ● 也可能出现在续行行首，这部分现在是否提交？",
-                  "   → 这是一段较长的自定义回答，折行后",
-                  "   ● 出现在行首也属于同一个回答",
-                  "", "Ready to submit your answers?", "", "❯ 1. Submit answers", "  2. Cancel"]
-        page = namespace["native_question_page"](screen, questions)
-        self.assertEqual(page["index"], 2)
-        matches = namespace["native_question_review_matches"]
-        answers = {questions[0]["question"]: "完整分层重构（推荐）",
-                   questions[1]["question"]: "这是一段较长的自定义回答，折行后 ● 出现在行首也属于同一个回答"}
-        self.assertTrue(matches(page["review"], questions, answers), "续行以“→ ”“● ”开头时仍按完整问题与答案核对")
-        self.assertFalse(matches(page["review"], questions, {**answers, questions[0]["question"]: "暂不处理"}))
-        self.assertFalse(matches(page["review"], questions, {**answers, questions[1]["question"]: "这是一段较长的自定义回答"}),
-                         "答案只匹配开头时不能视为一致")
-        ready = page["review"].index("Ready to submit your answers?")
-        extra = page["review"][:ready] + ["多余内容"] + page["review"][ready:]
-        self.assertFalse(matches(extra, questions, answers), "汇总里出现预期之外的内容时不提交")
-        # 原版只列出已回答的问题并提示未答完；缺项时不能把下一问的内容当成本问的回答。
-        start = page["review"].index("Review your answers")
-        missing = (page["review"][:start + 1] + ["⚠ You have not answered all questions"]
-                   + page["review"][page["review"].index("● 列表前缀"):])
-        self.assertFalse(matches(missing, questions, answers))
-
-    def test_question_page_keeps_first_option_when_wrapped_description_starts_with_number(self):
-        # 版式取自 2026-11-15 原版 2.1.325（120x40）问题页实测：选项说明在缩进内折行，续行去掉缩进后以“1. ”开头。
-        questions = [
-            {"question": "选项说明折行后行首出现编号时，问题页能否正确识别选项？",
-             "options": [{"label": "按步骤处理"}, {"label": "暂不处理"}]},
-            {"question": "第二问：是否继续？", "options": [{"label": "继续"}, {"label": "停止"}]},
-        ]
-        screen = ["←  ☐ 编号说明  ☐ 继续  ✔ Submit  →", "", "选项说明折行后行首出现编号时，问题页能否正确识别选项？", "",
-                  "❯ 1. 按步骤处理", "     1. 先整理依赖关系 1. 先整理依赖关系 1. 先整理依赖关系",
-                  "     1. 先整理依赖关系 1. 先整理依赖关系", "  2. 暂不处理", "     保持现状", "  3. Type something.",
-                  "────────────", "  4. Chat about this", "",
-                  "Enter to select · Tab/Arrow keys to navigate · Esc to cancel"]
-        page = namespace["native_question_page"](screen, questions)
-        self.assertEqual(page["index"], 0)
-        self.assertEqual(page["choices"]["按步骤处理"], "1", "说明续行不能顶替真正的选项 1")
-        self.assertEqual(page["choices"]["暂不处理"], "2")
-        self.assertEqual(page["choices"]["Type something."], "3")
-
-    def test_live_question_checkbox_display_enriches_multi_select_without_changing_request_id(self):
-        native = self.waiting_questions()
-        native.screen = namespace["Screen"]()
-        native.screen.feed("← ☐ 分支 ☐ 主分支 ✔ Submit →\n选择目标分支？\n"
-                           "❯ 1. [ ] test\n2. [x] pre-production\n3. [ ] Type something\nSubmit\n")
-        raw = namespace["native_question_request"](native.job, native.native_id)
-        identity = raw["nativeQuestion"]["id"]
-        with contextlib.redirect_stdout(io.StringIO()):
-            native.poll()
-        self.assertEqual(next(iter(native.requests)), identity)
-        self.assertTrue(native.requests[identity]["input"]["questions"][0]["multiSelect"])
-        self.assertNotIn("multiSelect", native.job["block"]["questions"][0], "显示补充不能反写原生问题")
-        page = namespace["native_question_page"](native.screen.text(), raw["input"]["questions"])
-        self.assertTrue(page["multi"])
-        self.assertEqual(page["choices"]["Type something"], "3")
-
-    def test_multiple_native_questions_are_submitted_together_without_replying_as_a_chat_message(self):
-        native = self.waiting_questions()
-        with contextlib.redirect_stdout(io.StringIO()):
-            native.poll()
-        request = next(iter(native.requests.values()))
-        pages = [
-            {"index": 0, "choices": {"test": "1", "pre-production": "2", "Type something.": "3"}, "multi": False},
-            {"index": 1, "choices": {"master": "1", "跳过": "2", "Type something.": "3"}, "multi": False},
-            {"index": 2, "review": ["Review your answers", "● 选择目标分支？", "→ pre-production",
-                                      "● 仅有主分支怎么办？", "→ master", "Ready to submit your answers?"]},
-        ]
-        stage, keys = [0], []
-        native.read_question_page = lambda _request, index=None: pages[stage[0]]
-        def key(data, **options):
-            keys.append((data, options.get("final_question", False)))
-            stage[0] = min(stage[0] + 1, 2)
-        native.terminal_input = key
-        native.rpc = MagicMock()
-        with contextlib.redirect_stdout(io.StringIO()):
-            native.answer({"response": {"request_id": request["nativeQuestion"]["id"],
-                "response": {"updatedInput": {"answers": {"选择目标分支？": "pre-production", "仅有主分支怎么办？": "master"}}}}})
-        self.assertEqual(keys, [(b"2", False), (b"1", False), (b"1", True)])
-        native.rpc.assert_not_called()
-        self.assertEqual(native.question_reply["state"], "submitted")
-        with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, "已提交"):
-            native.answer({"response": {"request_id": request["nativeQuestion"]["id"], "response": {}}})
-        self.assertEqual(len(keys), 3)
-        restored = self.waiting_questions()
-        restored.restore_question_reply(native.control_projection())
-        with contextlib.redirect_stdout(io.StringIO()):
-            restored.poll()
-        self.assertEqual(next(iter(restored.requests.values()))["nativeQuestion"]["state"], "submitted")
-
-    def test_question_answers_reject_missing_values_and_terminal_control_sequences_without_keys(self):
-        native = self.waiting_questions()
-        request = namespace["native_question_request"](native.job, native.native_id)
-        native.terminal_input = MagicMock()
-        for values in ({}, {"选择目标分支？": "test"},
-                       {"选择目标分支？": "test", "仅有主分支怎么办？": "\x1b[201~command"}):
-            with self.assertRaises(namespace["NativeError"]):
-                native.answer_questions(request, values)
-        native.terminal_input.assert_not_called()
-
-    def test_native_multi_select_keeps_custom_answer_selected_and_uses_native_review_tab(self):
-        native = self.waiting_questions()
-        native.job["block"]["questions"] = native.job["block"]["questions"][:1]
-        request = namespace["native_question_request"](native.job, native.native_id)
-        state = {"focus": 1, "other": False, "text": "", "review": False}
-        keys = []
-        def page(_request, index=None):
-            if state["review"]:
-                return {"index": 1, "review": ["Review your answers", "● 选择目标分支？",
-                    "→ " + json.dumps(state["text"], ensure_ascii=False), "Ready to submit your answers?"]}
-            labels = ["test", "pre-production", state["text"] or "Type something"]
-            lines = [("❯ " if state["focus"] == i else "") + f"{i}. "
-                     + ("[x] " if i == 3 and state["other"] else "[ ] ") + label
-                     for i, label in enumerate(labels, 1)]
-            lines.append(("❯ " if state["focus"] == 4 else "") + "Submit")
-            return {"index": 0, "choices": {label: str(i) for i, label in enumerate(labels, 1)},
-                    "multi": True, "lines": lines}
-        def key(data, **options):
-            keys.append((data, options.get("final_question", False)))
-            if data == b"3":
-                state["other"] = not state["other"]
-            elif data == b"\x1b[B":
-                state["focus"] += 1
-            elif data == b"\x1b[A":
-                state["focus"] -= 1
-            elif data.startswith(b"\x15\x1b[200~"):
-                state["text"] = data[len(b"\x15\x1b[200~"):-len(b"\x1b[201~")].decode()
-            elif data == b"\t":
-                self.assertEqual(state["focus"], 1, "在普通选项位置切换到汇总，不能在文字输入或 Submit 位置发送数字")
-                self.assertTrue(state["other"])
-                state["review"] = True
-        native.read_question_page, native.terminal_input = page, key
-        with contextlib.redirect_stdout(io.StringIO()):
-            native.answer_questions(request, {"选择目标分支？": "/custom, answer"})
-        self.assertEqual(keys[-3:], [(b"3", False), (b"\t", False), (b"1", True)])
-        self.assertGreater([data for data, _ in keys].index(b"3"),
-                           next(i for i, (data, _) in enumerate(keys) if data.startswith(b"\x15\x1b[200~")),
-                           "离开文字输入焦点后才能用数字键勾选 Other")
-        self.assertNotIn(b"\r", [data for data, _ in keys])
-        self.assertEqual(native.question_reply["state"], "submitted")
-
-    def test_native_predefined_multi_answers_select_checkboxes_instead_of_one_quoted_custom_value(self):
-        native = self.waiting_questions()
-        native.job["block"]["questions"] = native.job["block"]["questions"][:1]
-        request = namespace["native_question_request"](native.job, native.native_id)
-        stage = [0]
-        pages = [
-            {"index": 0, "multi": True, "choices": {"test": "1", "pre-production": "2", "Type something": "3"}},
-            {"index": 1, "review": ["Review your answers", "● 选择目标分支？",
-                                  "→ test, pre-production", "Ready to submit your answers?"]},
-        ]
-        native.read_question_page = lambda *args: pages[stage[0]]
-        native.submit_multi_question = MagicMock(side_effect=lambda *args: stage.__setitem__(0, 1))
-        native.terminal_input = MagicMock()
-        with contextlib.redirect_stdout(io.StringIO()):
-            native.answer_questions(request, {"选择目标分支？": "pre-production, test"})
-        native.submit_multi_question.assert_called_once_with(request, 0, ["1", "2"])
-        native.terminal_input.assert_called_once_with(b"1", question=request, final_question=True)
-
-    def test_stale_question_cannot_write_after_native_dialog_disappears(self):
-        native = self.waiting_questions()
-        request = namespace["native_question_request"](native.job, native.native_id)
-        native.job.update(sessionStatus="busy", needs=None)
-        native.terminal_input = MagicMock()
-        with self.assertRaisesRegex(RuntimeError, "已经结束或变化"):
-            native.answer_questions(request, {"选择目标分支？": "test", "仅有主分支怎么办？": "master"})
-        native.terminal_input.assert_not_called()
-
-    def test_waiting_input_without_structured_questions_has_a_readonly_notice(self):
-        native = self.waiting_questions()
-        native.job.pop("block")
-        with contextlib.redirect_stdout(io.StringIO()):
-            native.poll()
-        request = next(iter(native.requests.values()))
-        self.assertEqual(request["subtype"], "native_dialog")
-        self.assertFalse(request["dialog"]["remoteSupported"])
-        self.assertIn("等待回答", request["dialog"]["description"])
 
     dialog_text = ("Switch model?\nYour next response will be slower and use more tokens\n"
                    "This conversation is cached for the current model. Switching to Opus 5.5 means "
                    "the full history gets re-read.\n❯ 1. Yes, switch to Opus 5.5\n  2. No, go back\n")
 
     def waiting_dialog(self):
-        native = NativeSession("unused", "test-session", "saved-job")
+        native = SdkReader("unused", "test-session")
         native.initialized = True
         native.model = "sonnet"
         native.messages = [{"type": "system", "subtype": "turn_duration", "uuid": "old-done"}]
@@ -309,128 +51,6 @@ class SharedQueueHistoryTests(unittest.TestCase):
         native.screen.feed(self.dialog_text)
         return native
 
-    def test_model_dialog_waiting_survives_old_completion_and_keeps_the_original_message(self):
-        native = self.waiting_dialog()
-        native.pending = [{"clientUserMessageId": "original", "_nativeText": "原消息", "deliveryConfirmed": True}]
-        with contextlib.redirect_stdout(io.StringIO()):
-            native.poll()
-        status = NativeDiscovery.status(native.job, native.messages)
-        self.assertEqual((status["tempo"], status["state"], status["endedAtMs"]), ("blocked", "blocked", None))
-        request = next(iter(native.requests.values()))
-        self.assertEqual(request["subtype"], "native_dialog")
-        self.assertTrue(request["dialog"]["remoteSupported"])
-        self.assertEqual(native.settings_projection()["model"], "sonnet")
-        self.assertEqual(native.setting_changes["model"]["state"], "confirmation")
-        self.assertEqual(native.pending[0]["clientUserMessageId"], "original")
-        self.assertEqual(len(native.messages), 1, "确认框不能伪造新轮次或正文")
-
-    def test_unknown_or_unnumbered_dialog_only_prompts_local_confirmation(self):
-        native = self.waiting_dialog()
-        for text in ("Unknown native dialog\n1. Allow\n2. Cancel",
-                     self.dialog_text.replace("1. ", "").replace("2. ", "")):
-            native.screen = namespace["Screen"]()
-            native.screen.feed(text)
-            with contextlib.redirect_stdout(io.StringIO()):
-                native.poll()
-            request = next(iter(native.requests.values()))
-            self.assertEqual(request["dialog"]["kind"], "unknown")
-            self.assertFalse(request["dialog"]["remoteSupported"])
-            native.terminal_input = MagicMock()
-            with self.assertRaisesRegex(RuntimeError, "原版 Claude"):
-                native.answer({"response": {"request_id": request["dialog"]["id"],
-                    "response": {"behavior": "allow"}}})
-            native.terminal_input.assert_not_called()
-
-    def test_native_dialog_confirm_or_decline_sends_one_number_without_resending_messages(self):
-        for decision, key in (("allow", b"1"), ("deny", b"2")):
-            native = self.waiting_dialog()
-            native.terminal_input, native.reply = MagicMock(), MagicMock()
-            with contextlib.redirect_stdout(io.StringIO()):
-                native.poll()
-                identity = native.dialog["id"]
-                native.answer({"response": {"request_id": identity, "response": {"behavior": decision}}})
-                with self.assertRaisesRegex(RuntimeError, "已提交"):
-                    native.answer({"response": {"request_id": identity, "response": {"behavior": decision}}})
-            native.terminal_input.assert_called_once_with(key, dialog={
-                **native.dialog, "state": "waiting"})
-            native.reply.assert_not_called()
-            self.assertEqual(native.setting_changes["model"]["state"], "confirming")
-            self.assertEqual(native.actual_settings["model"], "sonnet")
-
-    def test_dialog_identity_changes_with_new_wait_epoch_but_not_cursor_navigation(self):
-        native = self.waiting_dialog()
-        first = namespace["native_dialog"](native.job, self.dialog_text, native.native_id)
-        moved = self.dialog_text.replace("❯ 1.", "  1.").replace("  2.", "❯ 2.")
-        self.assertEqual(first["id"], namespace["native_dialog"](native.job, moved, native.native_id)["id"])
-        wrapped = moved.replace("for the current model.", "for the\ncurrent model.")
-        self.assertEqual(first["id"], namespace["native_dialog"](native.job, wrapped, native.native_id)["id"])
-        newer = {**native.job, "sessionStatusAtMs": 2001}
-        self.assertNotEqual(first["id"], namespace["native_dialog"](newer, moved, native.native_id)["id"])
-        native.job = newer
-        native.terminal_input = MagicMock()
-        with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, "已经结束"):
-            native.answer({"response": {"request_id": first["id"], "response": {"behavior": "allow"}}})
-        native.terminal_input.assert_not_called()
-
-    def test_reconnect_keeps_submitted_dialog_locked_until_native_result_arrives(self):
-        native = self.waiting_dialog()
-        with contextlib.redirect_stdout(io.StringIO()):
-            native.poll()
-        native.setting_changes["model"]["state"] = "confirming"
-        resumed = self.waiting_dialog()
-        resumed.restore_settings(native.control_projection())
-        resumed.terminal_input = MagicMock()
-        with contextlib.redirect_stdout(io.StringIO()):
-            resumed.poll()
-            self.assertEqual(resumed.dialog["state"], "submitted")
-            with self.assertRaisesRegex(RuntimeError, "已提交"):
-                resumed.answer({"response": {"request_id": resumed.dialog["id"],
-                    "response": {"behavior": "allow"}}})
-        resumed.terminal_input.assert_not_called()
-
-    def test_decline_without_command_history_waits_for_dialog_close_then_restores_original_model(self):
-        native = self.waiting_dialog()
-        native.terminal_input = MagicMock()
-        with contextlib.redirect_stdout(io.StringIO()):
-            native.poll()
-            native.answer({"response": {"request_id": native.dialog["id"],
-                                       "response": {"behavior": "deny"}}})
-            self.assertEqual(native.setting_changes["model"]["state"], "confirming")
-            native.job.update(sessionStatus="idle", needs=None)
-            native.poll()
-        self.assertIsNone(native.dialog)
-        self.assertEqual(native.setting_changes["model"]["state"], "rejected")
-        self.assertEqual(native.model, "sonnet")
-        self.assertFalse(native.requests)
-
-    def test_local_cli_decision_without_command_history_uses_the_next_actual_request(self):
-        for actual, state in (("sonnet", "rejected"), ("opus", "applied")):
-            native = self.waiting_dialog()
-            with contextlib.redirect_stdout(io.StringIO()):
-                native.poll()
-            native.job.update(sessionStatus="busy", needs=None)
-            native.observe_setting_record({"type": "assistant", "uuid": "new", "timestamp": 3000,
-                                          "requestedModel": actual, "message": {"model": actual}})
-            self.assertEqual(native.setting_changes["model"]["state"], state)
-            self.assertEqual(native.model, actual)
-
-    def test_dialog_answer_revalidates_a_fresh_native_snapshot_before_sending_keys(self):
-        native = self.waiting_dialog()
-        expected = namespace["native_dialog"](native.job, self.dialog_text, native.native_id)
-        for same in (True, False):
-            connection = MagicMock()
-            connection.__enter__.return_value = connection
-            text = self.dialog_text if same else "Claude input is ready"
-            connection.makefile.return_value = io.BytesIO(
-                (json.dumps({"type": "snapshot", "streamTail": [text]}) + "\n").encode())
-            with patch.object(namespace["socket"], "socket", return_value=connection):
-                if same:
-                    native.verify_dialog(expected)
-                else:
-                    with self.assertRaisesRegex(RuntimeError, "界面已变化"):
-                        native.verify_dialog(expected)
-            self.assertEqual(len(connection.sendall.call_args_list), 1, "核对只能订阅，不能发送审批按键")
-            self.assertEqual(json.loads(connection.sendall.call_args.args[0])["op"], "subscribe")
 
     def test_native_setting_result_roundtrips_through_history_and_reconnection(self):
         rows = [
@@ -443,62 +63,13 @@ class SharedQueueHistoryTests(unittest.TestCase):
         native = self.read(rows)
         self.assertEqual(native.settings_projection()["model"], "opus")
         self.assertEqual(native.setting_changes["model"]["state"], "applied")
-        resumed = NativeSession("unused", "test-session")
+        resumed = SdkReader("unused", "test-session")
         resumed.restore_settings(native.control_projection())
         self.assertEqual(resumed.settings_projection(), native.settings_projection())
         quote = {**rows[-1], "uuid": "quoted", "promptSource": "typed", "origin": {"kind": "human"}}
         rows.append(quote)
         self.assertEqual(self.read(rows).settings_projection()["model"], "opus")
 
-    def test_model_command_acceptance_and_native_results_are_separate(self):
-        for output, state, actual in (("Set model to `Opus 5.5`", "applied", "opus"),
-                                      ("Kept model as `Sonnet 5.5`", "rejected", "sonnet"),
-                                      ("Kept model as Sonnet 5.5", "rejected", "sonnet"),
-                                      ("Kept model as \x1b[1mSonnet 5.5\x1b[22m", "rejected", "sonnet")):
-            native = self.waiting_dialog()
-            native.reply = MagicMock()
-            with patch.object(namespace["time"], "time", return_value=1):
-                native.change_setting("model", "opus")
-                native.change_setting("model", "opus")
-            native.reply.assert_called_once_with("/model opus", next_turn=False)
-            self.assertEqual(native.settings_projection()["model"], "sonnet")
-            change_id = native.setting_changes["model"]["id"]
-            native.observe_setting_record({"type": "user", "uuid": "result", "timestamp": 3000,
-                "nativeSettingOutput": {"name": "model", "value": "opus", "commandId": "command"},
-                "message": {"content": f"<local-command-stdout>{output}</local-command-stdout>"}})
-            self.assertEqual(native.actual_settings["model"], actual)
-            self.assertEqual(native.model, actual)
-            self.assertEqual(native.setting_changes["model"]["id"], change_id)
-            self.assertEqual(native.setting_changes["model"]["state"], state)
-            native.observe_setting_record({"type": "assistant", "uuid": "old", "timestamp": 500,
-                                          "message": {"model": "old-model"}})
-            self.assertEqual(native.actual_settings["model"], actual)
-
-    def test_dialog_wait_does_not_defer_a_direct_send_to_the_web_queue(self):
-        native = self.waiting_dialog()
-        native.reply = MagicMock()
-        native.terminal_input = MagicMock()
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = native.send({"client_id": "new", "idle_only": True,
-                                  "content": [{"type": "text", "text": "待确认后处理"}]})
-        self.assertTrue(result["accepted"])
-        native.reply.assert_called_once_with("待确认后处理", next_turn=False)
-
-    def test_pending_permission_does_not_block_a_message_or_answer_the_native_dialog(self):
-        native = self.waiting_dialog()
-        native.reply = MagicMock()
-        native.terminal_input = MagicMock()
-        native.read_terminal_screen = lambda: self.dialog_text.splitlines()
-        changed = native.change_permission_mode("plan")
-        self.assertTrue(changed["permissionPending"])
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = native.send({"client_id": "permission-pending", "idle_only": True,
-                                  "content": [{"type": "text", "text": "仍正常投递"}]})
-        self.assertTrue(result["accepted"])
-        native.reply.assert_called_once_with("仍正常投递", next_turn=False)
-        native.terminal_input.assert_not_called()
-        self.assertEqual(native.setting_changes["permissionMode"]["state"], "pending")
-        native.terminal_input.assert_not_called()
 
     def test_goal_statistics_use_only_native_numbers_and_reset_on_replacement(self):
         start = {"type": "attachment", "uuid": "goal", "timestamp": 1000,
@@ -517,33 +88,6 @@ class SharedQueueHistoryTests(unittest.TestCase):
         self.assertNotIn("timeUsedSeconds", native.goal)
         self.assertNotIn("iterations", native.goal)
 
-    def test_compaction_timeline_waits_for_native_start_and_keeps_identity_on_completion(self):
-        native = self.native_active()
-        native.native_commands = [{"id": "operation", "name": "compact", "state": "pending",
-                                   "issuedAt": 1000, "baseline": None}]
-        self.assertEqual(native.control_projection()["compactionEvents"], [])
-        with patch.object(namespace["time"], "time", return_value=2):
-            native.screen.feed("✶ Compacting conversation…")
-            native.observe_control_screen()
-        running = native.control_projection()["compactionEvents"]
-        self.assertEqual(len(running), 1)
-        self.assertEqual((running[0]["id"], running[0]["status"], running[0]["afterUuid"]),
-                         ("operation", "inProgress", "active-user"))
-        native.observe_control_record({"type": "system", "subtype": "compact_boundary",
-            "uuid": "boundary", "timestamp": 3000,
-            "compactMetadata": {"trigger": "auto", "preTokens": 2000, "postTokens": 500, "durationMs": 1000,
-                                "compactionModel": "actual-compact-model"}})
-        event = native.control_projection()["compactionEvents"][0]
-        self.assertEqual((event["id"], event["nativeId"], event["status"], event["source"]),
-                         ("operation", "boundary", "completed", "automatic"))
-        self.assertEqual(event["compactionModel"], "actual-compact-model")
-        restored = NativeSession("unused", "test-session")
-        restored.restore_compaction_events(native.control_projection())
-        restored.observe_control_record({"type": "system", "subtype": "compact_boundary",
-            "uuid": "boundary", "timestamp": 3000, "compactMetadata": {"trigger": "auto"}})
-        self.assertEqual(len(restored.compaction_events), 1)
-        self.assertEqual(next(iter(restored.compaction_events)), "operation")
-        self.assertEqual(restored.compaction_events["operation"]["compactionModel"], "actual-compact-model")
 
     def test_compaction_model_never_uses_current_session_selection(self):
         native = self.native_active()
@@ -560,40 +104,6 @@ class SharedQueueHistoryTests(unittest.TestCase):
             "compactMetadata": {"trigger": "manual", "compactionModel": "bad\nmodel"}})
         self.assertNotIn("compactionModel", native.compaction_events["invalid-model"])
 
-    def test_compaction_terminal_results_survive_next_command_and_reconnect(self):
-        native = self.native_active()
-        native.native_commands = [{"id": "stopped-operation", "name": "compact", "state": "pending", "issuedAt": 0}]
-        native.screen.feed("✶ Compacting conversation…")
-        native.observe_control_screen()
-        native.terminal_input = lambda data: None
-        native.control({"subtype": "interrupt"})
-        native.screen = namespace["Screen"]()
-        native.observe_control_screen()
-        self.assertEqual(native.compaction_events["stopped-operation"]["status"], "interrupted")
-        native.native_commands = [{"id": "new-operation", "name": "compact", "state": "pending", "issuedAt": 0}]
-        native.screen.feed("✶ Compacting conversation…")
-        native.observe_control_screen()
-        self.assertEqual(len(native.compaction_events), 2)
-        restored = NativeSession("unused", "test-session")
-        restored.compaction = {"state": "unknown"}
-        restored.restore_compaction_events(native.control_projection())
-        self.assertEqual(restored.compaction_events["stopped-operation"]["status"], "interrupted")
-        self.assertEqual(restored.compaction_events["new-operation"]["status"], "unknown")
-
-    def test_compaction_missing_terminal_evidence_keeps_same_row_unknown_until_boundary_arrives(self):
-        native = self.native_active()
-        with patch.object(namespace["time"], "time", return_value=1):
-            native.screen.feed("✶ Compacting conversation…")
-            native.observe_control_screen()
-        identity = native.compaction_event_id
-        native.screen = namespace["Screen"]()
-        native.observe_control_screen()
-        self.assertEqual(native.compaction_events[identity]["status"], "unknown")
-        self.assertEqual(native.compaction["state"], "unknown")
-        native.observe_control_record({"type": "system", "subtype": "compact_boundary",
-                                      "uuid": "done", "timestamp": 2000})
-        self.assertEqual(native.compaction_events[identity]["status"], "completed")
-        self.assertEqual(len(native.compaction_events), 1)
 
     def test_native_goal_records_distinguish_clear_from_evaluated_completion(self):
         def goal(identity, at, met=False, sentinel=True):
@@ -636,58 +146,9 @@ class SharedQueueHistoryTests(unittest.TestCase):
         reader = self.read([old])
         self.assertEqual(reader.messages[0]["subtype"], "compact_boundary")
 
-    def test_native_command_acceptance_does_not_claim_goal_or_compaction_completion(self):
-        native = self.native_active()
-        native.native_capabilities = {"goal": True, "compact": True}
-        replies = []
-        native.reply = lambda text, **kwargs: replies.append((text, kwargs))
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = native.native_command({"id": "goal-request", "name": "goal", "argument": "完成验收"})
-        self.assertEqual(replies, [("/goal 完成验收", {"next_turn": False})])
-        self.assertEqual(result["nativeCommand"]["state"], "pending")
-        self.assertIsNone(native.goal)
-        self.assertEqual(native.pending, [], "控制命令不能进入普通消息确认队列")
-        with self.assertRaisesRegex(RuntimeError, "尚未确认"):
-            native.native_command({"id": "duplicate", "name": "goal", "argument": "完成验收"})
-        self.assertEqual(len(replies), 1)
-
-    def test_native_goal_errors_are_not_success_and_concurrent_replacement_blocks_only_the_stale_control(self):
-        native = self.native_active()
-        native.native_capabilities = {"goal": True}
-        native.goal = {"nativeId": "current", "objective": "当前目标", "status": "active"}
-        native.observe_control_record({"type": "system", "subtype": "informational",
-                                      "content": "Goal paused · the goal check could not complete"})
-        self.assertEqual(native.goal["status"], "blocked")
-        self.assertIn("Goal paused", native.goal_notice)
-        native.reply = MagicMock()
-        with self.assertRaisesRegex(RuntimeError, "目标已变化"):
-            native.native_command({"id": "edit", "name": "goal", "argument": "替换",
-                                   "expectedGoal": {"nativeId": "older", "objective": "旧目标", "status": "active"}})
-        native.reply.assert_not_called()
-        native.observe_control_record({"type": "attachment", "uuid": "cleared", "timestamp": 1000,
-                                      "attachment": {"type": "goal_status", "condition": "当前目标",
-                                                     "met": True, "sentinel": True}})
-        self.assertIsNone(native.goal)
-        self.assertEqual(native.goal_notice, "")
-
-    def test_running_compaction_is_active_for_native_send_and_stale_screen_does_not_revive_completion(self):
-        native = self.native_active()
-        native.screen.feed("✶ Compacting conversation…")
-        native.observe_control_screen()
-        self.assertEqual(native.compaction["state"], "running")
-        native.observe_control_record({"type": "system", "subtype": "compact_boundary",
-                                      "uuid": "completed", "timestamp": int(namespace["time"].time() * 1000) + 1})
-        native.observe_control_screen()
-        self.assertEqual(native.compaction["state"], "idle")
-        native.compaction["state"] = "running"
-        native.lookup = lambda: {"short": "saved-job", "sessionId": "test-session", "tempo": "idle"}
-        native.reply = MagicMock()
-        self.assertTrue(native.send({"client_id": "next", "idle_only": True,
-                        "content": [{"type": "text", "text": "下一条"}]})["deferred"])
-        native.reply.assert_not_called()
 
     def test_completed_native_job_clears_stale_working_and_permission_states(self):
-        native = NativeSession("unused", "test-session", "saved-job")
+        native = SdkReader("unused", "test-session")
         native.initialized = True
         native.read_messages = lambda: None
         native.context_configuration = lambda: {}
@@ -703,144 +164,6 @@ class SharedQueueHistoryTests(unittest.TestCase):
             self.assertEqual(frame["native_status"]["tempo"], "idle")
             self.assertEqual(frame["requests"], {})
 
-    def test_shared_snapshot_reports_native_last_activity_for_reconnect_sorting(self):
-        native = self.waiting_dialog()
-        native.messages = [
-            {"type": "user", "uuid": "real-user", "timestampMs": 1000,
-             "message": {"content": "真实问题"}},
-            {"type": "assistant", "uuid": "reply", "timestampMs": 2000,
-             "message": {"content": []}},
-            {"type": "system", "uuid": "compact", "subtype": "compact_boundary", "timestampMs": 9000},
-            {"type": "system", "uuid": "done", "subtype": "turn_duration", "timestampMs": 3000},
-        ]
-        native.all_messages = native.messages
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output):
-            native.poll(force=True)
-        frame = json.loads(output.getvalue())
-        self.assertEqual(frame["updated_at"], 3000,
-                         "恢复快照必须使用原生最后活动时间，不能把压缩边界或服务当前时间当作最近活动")
-
-    def activity_fixture(self, status="idle"):
-        folder = tempfile.TemporaryDirectory()
-        self.addCleanup(folder.cleanup)
-        native = NativeSession("unused", "1234abcd-0000-4000-8000-000000000000", "1234abcd")
-        native.root = Path(folder.name)
-        native.read_messages = lambda: None
-        native.poll = lambda **kwargs: None
-        pid = namespace["os"].getpid()
-        started = (Path("/proc") / str(pid) / "stat").read_text().rsplit(") ", 1)[1].split()[19]
-        for directory in ("jobs/1234abcd", "daemon", "sessions"):
-            (native.root / directory).mkdir(parents=True, exist_ok=True)
-        stored = {"sessionId": native.native_id, "state": "done", "tempo": "idle",
-                  "lastTerminalAt": 2000, "updatedAt": 2000,
-                  "respawnFlags": ["--settings", json.dumps({"env": {"TZ": namespace["native_time_zone"]()}})]}
-        (native.root / "jobs/1234abcd/state.json").write_text(json.dumps(stored))
-        (native.root / "daemon/roster.json").write_text(json.dumps(
-            {"workers": {native.short: {"sessionId": native.native_id, "replPid": pid}}}))
-        record = {"pid": pid, "procStart": started, "sessionId": native.native_id,
-                  "jobId": native.short, "status": status, "statusUpdatedAt": 2100}
-        path = native.root / "sessions" / f"{pid}.json"
-        path.write_text(json.dumps(record))
-        native.rpc = lambda request: {"jobs": [{"short": native.short, "sessionId": native.native_id,
-                                               "tempo": "active", "state": "resuming"}]}
-        native.messages = [{"type": "user", "uuid": "old-user", "timestampMs": 1000,
-                            "message": {"content": "first"}},
-                           {"type": "system", "subtype": "turn_duration", "timestampMs": 2000}]
-        return native, path, record
-
-    def test_idle_live_session_overrides_active_host_and_second_message_sends_once(self):
-        native, _, _ = self.activity_fixture()
-        native.reply = MagicMock()
-        native.terminal_input = MagicMock()
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = native.send({"client_id": "second", "idle_only": True,
-                                  "content": [{"type": "text", "text": "second"}]})
-        self.assertTrue(result["accepted"])
-        self.assertNotIn("interruptedUserId", result)
-        native.reply.assert_called_once_with("second", next_turn=False)
-        native.terminal_input.assert_not_called()
-        self.assertEqual(NativeDiscovery.status(native.lookup(), native.messages)["endedAtMs"], 2000)
-
-    def test_new_busy_live_session_overrides_old_completion_and_defers_second_send(self):
-        native, _, _ = self.activity_fixture("busy")
-        native.reply = MagicMock()
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = native.send({"client_id": "next", "idle_only": True,
-                                  "content": [{"type": "text", "text": "next"}]})
-        self.assertTrue(result["deferred"], "原生已进入新执行时，旧完成记录不能改成空闲")
-        native.reply.assert_not_called()
-        self.assertIsNone(NativeDiscovery.status(native.lookup(), native.messages)["endedAtMs"])
-
-    def test_job_metadata_update_is_not_a_turn_completion_timestamp(self):
-        native, _, _ = self.activity_fixture()
-        path = native.root / "jobs/1234abcd/state.json"
-        stored = json.loads(path.read_text())
-        stored.pop("lastTerminalAt")
-        stored["updatedAt"] = 3000
-        path.write_text(json.dumps(stored))
-        self.assertEqual(NativeDiscovery.status(native.lookup(), native.messages)["endedAtMs"], 0)
-
-    def test_native_status_rejects_other_sessions_and_reused_process_records(self):
-        native, path, record = self.activity_fixture("busy")
-        for changed in [
-            {"sessionId": "other-session"}, {"jobId": "ffffffff"},
-            {"pid": record["pid"] + 1}, {"procStart": "0"},
-        ]:
-            with self.subTest(changed=changed):
-                path.write_text(json.dumps({**record, **changed}))
-                status = NativeDiscovery.status(native.lookup(), native.messages)
-                self.assertEqual(status["tempo"], "idle")
-                self.assertIsNone(status["sessionStatus"])
-
-    def test_completed_history_corrects_host_activity_without_live_execution_evidence(self):
-        native = self.native_active()
-        native.messages.append({"type": "system", "subtype": "turn_duration", "timestampMs": 2000})
-        native.reply = MagicMock()
-        native.terminal_input = MagicMock()
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = native.send({"client_id": "after-done", "steer": True,
-                                  "content": [{"type": "text", "text": "next"}]})
-        self.assertTrue(result["accepted"])
-        self.assertNotIn("interruptedUserId", result)
-        native.reply.assert_called_once()
-        native.terminal_input.assert_not_called()
-
-    def test_terminal_handshake_disconnect_and_oversize_do_not_send_keys_or_loop(self):
-        native = NativeSession("unused", "test-session", "saved-job")
-        native.lookup = lambda: {"tempo": "active"}
-        for reply, pattern in [(b"", "握手期间断开"), (b"x", "响应过大")]:
-            connection = MagicMock()
-            connection.__enter__.return_value = connection
-            connection.recv.return_value = reply
-            with self.subTest(reply=reply), patch.object(namespace["socket"], "socket", return_value=connection), \
-                    patch.object(Path, "read_text", return_value="fixture-auth"):
-                with self.assertRaisesRegex(RuntimeError, pattern):
-                    native.terminal_input(b"\x1b")
-            self.assertEqual(connection.sendall.call_count, 1, "只能发送握手，不能发送交互按键")
-            self.assertLessEqual(connection.recv.call_count, 64 * 1024)
-
-    def test_terminal_handshake_success_sends_only_requested_key(self):
-        native = NativeSession("unused", "test-session", "saved-job")
-        native.lookup = lambda: {"tempo": "active"}
-        connection = MagicMock()
-        connection.__enter__.return_value = connection
-        connection.recv.side_effect = [bytes([byte]) for byte in b'{"ok":true}\n']
-        with patch.object(namespace["socket"], "socket", return_value=connection), \
-                patch.object(Path, "read_text", return_value="fixture-auth"), \
-                patch.object(namespace["time"], "sleep"):
-            native.terminal_input(b"\x1b")
-        self.assertEqual(connection.sendall.call_args_list[-1].args[0], b"\x1b")
-        self.assertEqual(connection.sendall.call_count, 2)
-
-    def test_reply_uses_native_next_priority_and_keeps_setting_commands_separate(self):
-        native = NativeSession("unused", "test-session", "saved-job")
-        native.rpc = MagicMock(return_value={"ok": True})
-        native.reply("引导消息", next_turn=True)
-        native.rpc.assert_called_once_with(
-            {"op": "reply", "short": "saved-job", "text": "引导消息", "nextTurn": True})
-        native.reply("/effort max", next_turn=False)
-        self.assertFalse(native.rpc.call_args.args[0]["nextTurn"], "模型设置仍使用原生命令解析")
 
     def test_history_replacement_with_same_length_reloads_native_records(self):
         native = self.read([{"type": "user", "uuid": "user-one", "message": {"content": "first"}}])
@@ -872,7 +195,7 @@ class SharedQueueHistoryTests(unittest.TestCase):
         self.assertEqual(native.messages[1]["timestampMs"], 1794416642798)
 
     def native_active(self):
-        native = NativeSession("unused", "test-session", "saved-job")
+        native = SdkReader("unused", "test-session")
         native.messages = [{"type": "user", "uuid": "active-user", "message": {"content": "正在处理"}}]
         native.read_messages = lambda: None
         native.poll = lambda **kwargs: None
@@ -880,196 +203,6 @@ class SharedQueueHistoryTests(unittest.TestCase):
                                  "tempo": "active"}
         return native
 
-    def test_idle_only_delivery_defers_when_cli_started_work_without_touching_input(self):
-        native = self.native_active()
-        replies = []
-        native.reply = lambda *args, **kwargs: replies.append(args)
-        result = native.send({"client_id": "C", "idle_only": True,
-                              "content": [{"type": "text", "text": "只投递 C"}]})
-        self.assertTrue(result["deferred"])
-        self.assertFalse(result["accepted"])
-        self.assertEqual(replies, [])
-        self.assertEqual(native.pending, [])
-        self.assertFalse(native.delivery_started)
-
-    def test_completed_turn_waiting_for_user_reply_sends_directly(self):
-        native = self.native_active()
-        native.messages.append({"type": "system", "subtype": "turn_duration"})
-        job = {"short": "saved-job", "sessionId": "test-session",
-               "tempo": "blocked", "state": "blocked", "needs": "Waiting for the user's next answer"}
-        native.lookup = lambda: job
-        replies = []
-        native.reply = lambda text, **kwargs: replies.append(text)
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = native.send({"client_id": "after-completion", "idle_only": True,
-                                  "content": [{"type": "text", "text": "continue"}]})
-        self.assertTrue(result.get("accepted"), "完成后的澄清等待不能被误判为执行中")
-        self.assertEqual(replies, ["continue"])
-        self.assertEqual(NativeDiscovery.status(job, native.messages)["tempo"], "idle")
-
-    def test_new_user_after_completion_still_keeps_real_permission_wait_blocked(self):
-        native = self.native_active()
-        native.messages.extend([
-            {"type": "system", "subtype": "turn_duration"},
-            {"type": "user", "uuid": "new-native", "message": {"content": "new task"}},
-            {"type": "assistant", "message": {"content": [
-                {"type": "tool_use", "id": "permission-tool", "name": "Bash", "input": {}}]}},
-        ])
-        job = {"short": "saved-job", "sessionId": "test-session",
-               "tempo": "blocked", "needs": "permission"}
-        native.lookup = lambda: job
-        native.reply = MagicMock()
-        result = native.send({"client_id": "waiting", "idle_only": True,
-                              "content": [{"type": "text", "text": "next"}]})
-        self.assertTrue(result["deferred"])
-        native.reply.assert_not_called()
-
-    def test_steering_an_idle_queue_does_not_interrupt_the_new_turn(self):
-        native = self.native_active()
-        native.lookup = lambda: {"short": "saved-job", "sessionId": "test-session", "tempo": "idle"}
-        replies, keys = [], []
-        def reply(text, **kwargs):
-            replies.append(text)
-            native.job["tempo"] = "active"
-        native.reply = reply
-        native.terminal_input = lambda data, **kwargs: keys.append(data)
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = native.send({"client_id": "idle-steer", "steer": True,
-                                  "content": [{"type": "text", "text": "start new work"}]})
-        self.assertTrue(result["accepted"])
-        self.assertNotIn("interruptedUserId", result)
-        self.assertEqual(replies, ["start new work"])
-        self.assertEqual(keys, [], "不能把本次发送启动的轮次当成需要中断的旧轮次")
-
-    def test_steer_does_not_interrupt_a_different_turn_started_during_delivery(self):
-        native = self.native_active()
-        def reply(text, **kwargs):
-            native.messages.append({"type": "user", "uuid": "other-turn", "message": {"content": "another input"}})
-        native.reply = MagicMock(side_effect=reply)
-        native.terminal_input = MagicMock()
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = native.send({"client_id": "selected", "steer": True,
-                                  "content": [{"type": "text", "text": "selected input"}]})
-        self.assertTrue(result["accepted"], "轮次变化后由同一原生会话决定吸收时机，不停止新轮次")
-        native.terminal_input.assert_not_called()
-        native.reply.assert_called_once_with("selected input", next_turn=True)
-
-    def test_interrupted_turn_waiting_for_user_can_accept_a_new_message(self):
-        native = self.native_active()
-        native.messages.append({"type": "user", "uuid": "interrupt", "interruptedMessageId": "response",
-                                "message": {"content": [{"type": "text", "text": "[Request interrupted by user]"}]}})
-        native.lookup = lambda: {"short": "saved-job", "sessionId": "test-session",
-                                 "tempo": "blocked", "needs": "Waiting for a new instruction"}
-        native.reply = MagicMock()
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = native.send({"client_id": "after-stop", "idle_only": True,
-                                  "content": [{"type": "text", "text": "new instruction"}]})
-        self.assertTrue(result.get("accepted"))
-        native.reply.assert_called_once()
-
-    def test_status_error_after_native_acceptance_cannot_claim_not_sent(self):
-        native = self.native_active()
-        native.reply = MagicMock()
-        native.poll = lambda **kwargs: (_ for _ in ()).throw(namespace["NativeError"]("ESTATUS"))
-        incoming = namespace["queue"].Queue()
-        incoming.put(json.dumps({"type": "control_request", "request_id": "fixture",
-                                 "request": {"subtype": "shared_send", "client_id": "accepted-before-status",
-                                             "content": [{"type": "text", "text": "one input"}]}}))
-        incoming.put(None)
-        output = io.StringIO()
-        with patch.dict(namespace, {"NativeSession": lambda *args: native}), \
-                patch.object(namespace["argparse"].ArgumentParser, "parse_args",
-                             return_value=SimpleNamespace(cli="unused", native_id="", job_id="", discover=False, cleanup=False, autocompact=None)), \
-                patch.object(namespace["queue"], "Queue", return_value=incoming), \
-                patch.object(namespace["threading"], "Thread"), contextlib.redirect_stdout(output):
-            namespace["main"]()
-        response = [json.loads(line) for line in output.getvalue().splitlines()
-                    if json.loads(line).get("type") == "control_response"][-1]["response"]
-        self.assertFalse(response["not_sent"], "已经被原生接收后，状态查询失败只能待核对，不能允许作为未发送重试")
-        native.reply.assert_called_once()
-        self.assertTrue(native.pending[0]["deliveryConfirmed"])
-
-    def preview_frames(self, native, screen):
-        native.preview_at = 0
-        native.job.setdefault("tempo", "active")
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output):
-            native.stream_preview("\x1b[2J\x1b[H" + screen.replace("\n", "\r\n"))
-        return [json.loads(line) for line in output.getvalue().splitlines()
-                if json.loads(line).get("type") == "shared_preview"]
-
-    def test_terminal_preview_does_not_repeat_markdown_or_render_tool_status(self):
-        native = self.native_active()
-        native.messages[0]["message"]["content"] = "fixture prompt"
-        native.messages.append({"type": "assistant", "uuid": "reply-row", "message": {
-            "id": "reply", "content": [{"type": "text", "text": "Use `Example <dev@example.test>` now."}]}})
-        self.assertEqual(self.preview_frames(native,
-            "❯ fixture prompt\n● Use Example dev@example.test now.\n  Running 3 shell commands...\n"), [])
-        self.assertEqual(self.preview_frames(native,
-            "❯ fixture prompt\n● Running 3 shell commands...\n"), [])
-        self.assertEqual(self.preview_frames(native, "  An unrelated terminal fragment\n"), [])
-
-    def test_terminal_preview_never_shrinks_on_redraw_and_retires_after_native_text_arrives(self):
-        native = self.native_active()
-        native.messages[0]["message"]["content"] = "fixture prompt"
-        first = self.preview_frames(native, "❯ fixture prompt\n● A partial response\n")
-        self.assertEqual(first[-1]["text"], "A partial response")
-        self.assertEqual(self.preview_frames(native, "❯ fixture prompt\n● A partial\n"), [])
-        grown = self.preview_frames(native, "❯ fixture prompt\n● A partial response continues\n")
-        self.assertEqual(grown[-1]["text"], "A partial response continues")
-        self.assertEqual(first[-1]["preview_basis"], grown[-1]["preview_basis"])
-        native.messages.append({"type": "assistant", "uuid": "reply-row", "message": {
-            "id": "reply", "content": [{"type": "text", "text": "A **partial** response continues"}]}})
-        self.assertEqual(self.preview_frames(native,
-            "❯ fixture prompt\n● A partial response continues\n"), [])
-
-    def test_elapsed_terminal_status_never_blocks_the_following_real_response(self):
-        for status in ("Running 1 shell command · 2s…",
-                       "Running 3 shell commands · 1m 2s...",
-                       "Running 1 tool · 0.5s",
-                       "Running 2 tools • 250ms…",
-                       "Reading 2 files, running 2 shell commands · 3s...",
-                       "Reading 1 file, running 1 shell command · 3s…",
-                       "Searching 3 patterns, reading 2 files, running 1 shell command • 2m 3.5s...",
-                       "Editing 2 files and running 1 tool"):
-            with self.subTest(status=status):
-                native = self.native_active()
-                native.messages[0]["message"]["content"] = "fixture prompt"
-                self.assertEqual(self.preview_frames(native, f"❯ fixture prompt\n● {status}\n"), [])
-                self.assertEqual(native.preview, "", "终端状态不能占据后续预览的正文前缀")
-                first = self.preview_frames(native, "❯ fixture prompt\n● Actual response\n")
-                grown = self.preview_frames(native, "❯ fixture prompt\n● Actual response continues\n")
-                self.assertEqual(first[-1]["text"], "Actual response")
-                self.assertEqual(grown[-1]["text"], "Actual response continues")
-                self.assertEqual(first[-1]["preview_basis"], grown[-1]["preview_basis"])
-
-    def test_elapsed_status_after_real_text_is_trimmed_without_hiding_normal_sentences(self):
-        native = self.native_active()
-        native.messages[0]["message"]["content"] = "fixture prompt"
-        frames = self.preview_frames(native,
-            "❯ fixture prompt\n● Actual response\n  Running 1 shell command · 2s…\n")
-        self.assertEqual(frames[-1]["text"], "Actual response")
-        frames = self.preview_frames(native,
-            "❯ fixture prompt\n● Actual response continues: Running 1 shell command is an example.\n")
-        self.assertEqual(frames[-1]["text"], "Actual response continues: Running 1 shell command is an example.")
-
-    def test_split_progress_fragments_never_become_a_reply_but_normal_sentences_do(self):
-        self.assertFalse(namespace["terminal_progress_line"]("Reading" + " " * 3000 + "!", partial=True))
-        for status in ("Reading 2 files, running 2 shell commands · 3s...",
-                       "Editing 2 files and running 1 tool • 250ms…"):
-            native = self.native_active()
-            native.messages[0]["message"]["content"] = "fixture prompt"
-            for length in range(1, len(status) + 1):
-                with self.subTest(fragment=status[:length]):
-                    self.assertEqual(self.preview_frames(native, f"❯ fixture prompt\n● {status[:length]}"), [])
-                    self.assertEqual(native.preview, "")
-            sentence = "Reading 2 files makes the check faster."
-            frames = self.preview_frames(native, f"❯ fixture prompt\n● {sentence}")
-            self.assertEqual(frames[-1]["text"], sentence)
-        native = self.native_active()
-        native.messages[0]["message"]["content"] = "fixture prompt"
-        frames = self.preview_frames(native, "❯ fixture prompt\n● Actual reply\n  Reading 2 fi")
-        self.assertEqual(frames[-1]["text"], "Actual reply")
 
     # 真实 CLI 2.1.325（本地模拟 API + 并行 MCP / 读取 / 搜索）的工具分组行；末尾展开提示可有可无。
     # 过去式来自 CLI 源码，尚未在真实画面观察到。
@@ -1083,48 +216,6 @@ class SharedQueueHistoryTests(unittest.TestCase):
         "Listing 2 directories…",
     )
 
-    def test_cli_tool_group_lines_are_never_shown_as_reply_text(self):
-        for line in self.TOOL_GROUP_LINES:
-            with self.subTest(line=line):
-                self.assertTrue(namespace["terminal_progress_line"](line))
-                native = self.native_active()
-                native.messages[0]["message"]["content"] = "fixture prompt"
-                self.assertEqual(self.preview_frames(native, f"❯ fixture prompt\n● {line}\n"), [])
-                self.assertEqual(native.preview, "")
-                # 分组行行首圆点随进行中闪烁，会以两格缩进接在上一段正文后面；正文照常预览，分组行被截掉。
-                frames = self.preview_frames(native, f"❯ fixture prompt\n● 先检查一下显示效果。\n\n  {line}\n")
-                self.assertEqual(frames[-1]["text"], "先检查一下显示效果。")
-
-    def test_split_tool_group_fragments_wait_and_normal_sentences_with_the_same_verbs_show(self):
-        for line in self.TOOL_GROUP_LINES[:4]:
-            native = self.native_active()
-            native.messages[0]["message"]["content"] = "fixture prompt"
-            for length in range(1, len(line) + 1):
-                with self.subTest(fragment=line[:length]):
-                    self.assertEqual(self.preview_frames(native, f"❯ fixture prompt\n● {line[:length]}"), [])
-        for sentence in ("Calling the API requires a token.", "Searching for answers takes time.",
-                         "Read the file first, then run it.", "Calling playwright 3 times is slow, so batch them."):
-            with self.subTest(sentence=sentence):
-                native = self.native_active()
-                native.messages[0]["message"]["content"] = "fixture prompt"
-                frames = self.preview_frames(native, f"❯ fixture prompt\n● {sentence}")
-                self.assertEqual(frames[-1]["text"], sentence)
-        self.assertFalse(namespace["terminal_progress_line"]("Calling" + " a," * 2000 + "!", partial=True))
-
-    def test_pending_native_tool_use_blocks_terminal_preview_until_its_result_returns(self):
-        # 工具调用已写入记录而结果未返回时，模型在等工具，终端上的 “●” 只能是工具进度；
-        # 进度由正式 tool_use 条目（inProgress）在活动区显示，不进入回复正文。
-        native = self.native_active()
-        native.messages[0]["message"]["content"] = "fixture prompt"
-        native.messages.append({"type": "assistant", "uuid": "tool-row", "message": {
-            "id": "tool-message", "content": [{"type": "tool_use", "id": "toolu_1", "name": "mcp__fake__ping",
-                                               "input": {}}]}})
-        self.assertEqual(self.preview_frames(native, "❯ fixture prompt\n● 一行未收录的工具状态\n"), [])
-        native.messages.append({"type": "user", "uuid": "result-row", "message": {
-            "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "pong"}]}})
-        frames = self.preview_frames(native, "❯ fixture prompt\n● 工具返回后的真实回复\n")
-        self.assertEqual(frames[-1]["text"], "工具返回后的真实回复")
-        self.assertEqual(namespace["native_pending_tool_uses"](native.messages), set())
 
     def test_native_skill_wrapper_confirms_the_original_slash_input_once(self):
         text = ("<command-message>simplify</command-message>\n"
@@ -1165,116 +256,6 @@ class SharedQueueHistoryTests(unittest.TestCase):
         self.assertEqual(native.messages[0]["message"]["content"], text)
         self.assertEqual(native.clients, {})
 
-    def test_multiline_and_wrapped_prompt_matches_all_visible_input_not_a_prefix(self):
-        native = self.native_active()
-        native.messages[0]["message"]["content"] = "First line\nSecond requirement with more details"
-        frames = self.preview_frames(native,
-            "❯ First line\n  Second requirement with\n  more details\n\n● Actual response\n")
-        self.assertEqual(frames[-1]["text"], "Actual response")
-        self.assertEqual(namespace["terminal_reply_region"](
-            ["❯ First line", "  Second requirement with different details", "● Wrong response"],
-            namespace["preview_prompt_key"](native.messages[0]["message"]["content"]), 1), [])
-
-    def test_matching_twenty_character_prefix_cannot_claim_an_old_terminal_reply(self):
-        native = self.native_active()
-        prefix = "12345678901234567890"
-        native.messages[0]["message"]["content"] = prefix + " old question"
-        native.messages.extend([
-            {"type": "assistant", "uuid": "old-row", "message": {
-                "id": "old-reply", "content": [{"type": "text", "text": "Old reply"}]}},
-            {"type": "system", "subtype": "turn_duration"},
-            {"type": "user", "uuid": "new-user", "message": {"content": prefix + " new question"}},
-        ])
-        self.assertEqual(self.preview_frames(native, f"❯ {prefix} old question\n● Old reply\n"), [])
-        frames = self.preview_frames(native, f"❯ {prefix} new question\n● New reply\n")
-        self.assertEqual((frames[-1]["native_user_id"], frames[-1]["text"]), ("new-user", "New reply"))
-
-    def test_repeated_prompt_requires_its_native_occurrence_and_image_only_never_claims_old_text(self):
-        native = self.native_active()
-        native.messages[0]["message"]["content"] = "continue"
-        native.messages.extend([
-            {"type": "assistant", "uuid": "old-row", "message": {
-                "id": "old-reply", "content": [{"type": "text", "text": "Old reply"}]}},
-            {"type": "system", "subtype": "turn_duration"},
-            {"type": "user", "uuid": "new-user", "message": {"content": "continue"}},
-        ])
-        self.assertEqual(self.preview_frames(native, "❯ continue\n● Old reply\n"), [])
-        frames = self.preview_frames(native, "❯ continue\n● Old reply\n❯ continue\n● New reply\n")
-        self.assertEqual((frames[-1]["native_user_id"], frames[-1]["text"]), ("new-user", "New reply"))
-        self.assertEqual(self.preview_frames(native, "❯ continue\n● Old reply\n❯ continue\n"), [],
-                         "新输入已出现但还没有回复时，不能回退到前一次同名输入")
-        image_native = self.native_active()
-        image_native.messages[0]["message"]["content"] = [{"type": "image", "source": {}}]
-        self.assertEqual(self.preview_frames(image_native, "❯ Previous question\n● Previous reply\n"), [])
-
-    def test_screen_erase_display_clears_current_line_without_erasing_unrelated_visible_text(self):
-        screen = namespace["Screen"]()
-        screen.feed("before\r\nABCDE\r\nbelow\x1b[2;3H\x1b[")
-        screen.feed("J")
-        self.assertEqual(screen.text(), ["before", "AB"])
-        self.assertEqual((screen.x, screen.y), (2, 1), "清屏不移动光标")
-        screen = namespace["Screen"]()
-        screen.feed("before\r\nABCDE\r\nbelow\x1b[2;3H\x1b[1J")
-        self.assertEqual(screen.text(), ["", "   DE", "below"])
-        screen.feed("\x1b[3J")
-        self.assertEqual(screen.text(), ["", "   DE", "below"], "清滚动历史不能删除当前画面")
-        screen.feed("\x1b[2J")
-        self.assertEqual(screen.text(), [])
-
-    def test_throttled_last_fragment_flushes_on_existing_poll_without_new_stream_or_snapshot(self):
-        native = self.native_active()
-        native.messages[0]["message"]["content"] = "fixture prompt"
-        native.initialized = True
-        native.context_configuration = lambda: {}
-        native.observe_control_screen = lambda: None
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output), patch("time.monotonic", return_value=100):
-            native.job["tempo"] = "active"
-            native.stream_preview("❯ fixture prompt\r\n● Actual")
-            NativeSession.poll(native)
-        self.assertEqual(native.preview, "Actual")
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output), patch("time.monotonic", return_value=100.05):
-            native.stream_preview(" response")
-        self.assertEqual(output.getvalue(), "")
-        self.assertTrue(native.preview_dirty)
-        with contextlib.redirect_stdout(output), patch("time.monotonic", return_value=100.2):
-            NativeSession.poll(native)
-        frames = [json.loads(line) for line in output.getvalue().splitlines()]
-        self.assertEqual([frame["type"] for frame in frames], ["shared_preview"])
-        self.assertEqual(frames[0]["text"], "Actual response")
-        self.assertFalse(native.preview_dirty)
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output), patch("time.monotonic", return_value=100.4):
-            NativeSession.poll(native)
-        self.assertEqual(output.getvalue(), "", "补发后没有新片段时不得重复推送")
-
-    def test_pending_preview_is_rechecked_after_native_completion(self):
-        native = self.native_active()
-        native.messages[0]["message"]["content"] = "fixture prompt"
-        with contextlib.redirect_stdout(io.StringIO()), patch("time.monotonic", return_value=100):
-            native.job["tempo"] = "active"
-            native.stream_preview("❯ fixture prompt\r\n● Actual")
-        with patch("time.monotonic", return_value=100.05):
-            native.stream_preview(" stale fragment")
-        native.messages.append({"type": "system", "subtype": "turn_duration"})
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output), patch("time.monotonic", return_value=100.2):
-            native.flush_preview()
-        self.assertEqual(output.getvalue(), "")
-        self.assertFalse(native.preview_dirty)
-
-    def test_preview_identity_is_scoped_to_the_current_native_user(self):
-        native = self.native_active()
-        native.messages.extend([
-            {"type": "assistant", "message": {"id": "old-reply", "content": [
-                {"type": "text", "text": "Repeated answer"}]}},
-            {"type": "system", "subtype": "turn_duration"},
-            {"type": "user", "uuid": "next-user", "message": {"content": "next question"}},
-        ])
-        frames = self.preview_frames(native, "❯ next question\n● Repeated answer\n")
-        self.assertEqual(frames[-1]["native_user_id"], "next-user")
-        self.assertEqual(frames[-1]["text"], "Repeated answer")
 
     def test_preview_basis_changes_for_real_text_not_tool_metadata_or_synthetic_placeholders(self):
         native = self.native_active()
@@ -1291,488 +272,6 @@ class SharedQueueHistoryTests(unittest.TestCase):
             "content": [{"type": "text", "text": "No response requested."}]}})
         self.assertNotEqual(native.preview_context()[1], basis, "真实正文不能按同名文本隐藏")
 
-    def test_single_steer_delivers_only_selected_message_and_preserves_draft(self):
-        native = self.native_active()
-        native.reply = MagicMock()
-        native.terminal_input = MagicMock()
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = native.send({"client_id": "C", "steer": True,
-                                  "content": [{"type": "text", "text": "只投递 C"}]})
-        native.reply.assert_called_once_with("只投递 C", next_turn=True)
-        native.terminal_input.assert_not_called()
-        self.assertTrue(result["accepted"])
-        self.assertNotIn("interruptedUserId", result)
-        self.assertEqual(native.job["tempo"], "active", "引导受理不能伪造旧轮次结束")
-        self.assertTrue(native.pending[0]["deliveryConfirmed"])
-
-    def test_steer_does_not_require_the_interactive_terminal(self):
-        native = self.native_active()
-        native.reply = MagicMock()
-        native.terminal_input = MagicMock(side_effect=AssertionError("引导不应连接终端发送按键"))
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = native.send({"client_id": "C", "steer": True,
-                                  "content": [{"type": "text", "text": "只投递 C"}]})
-        self.assertTrue(result["accepted"])
-        native.reply.assert_called_once()
-        native.terminal_input.assert_not_called()
-
-    def test_steer_does_not_wait_for_the_running_turn_to_stop(self):
-        native = self.native_active()
-        native.reply = MagicMock()
-        with patch.object(namespace["time"], "sleep", side_effect=AssertionError("引导不能等待旧轮次停止")), \
-                contextlib.redirect_stdout(io.StringIO()):
-            result = native.send({"client_id": "C", "steer": True,
-                                  "content": [{"type": "text", "text": "selected"}]})
-        self.assertTrue(result["accepted"])
-        native.reply.assert_called_once_with("selected", next_turn=True)
-        self.assertEqual(native.lookup()["tempo"], "active")
-
-    def test_explicit_rejection_and_unknown_transport_keep_different_delivery_states(self):
-        for failure, started, pending in [(namespace["NativeError"]("ENOREPLY"), False, 0),
-                                          (TimeoutError(), True, 1)]:
-            native = self.native_active()
-            native.reply = lambda *args, **kwargs: (_ for _ in ()).throw(failure)
-            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(type(failure)):
-                native.send({"client_id": "C", "content": [{"type": "text", "text": "只投递 C"}]})
-            self.assertEqual(native.delivery_started, started)
-            self.assertEqual(len(native.pending), pending)
-            if pending:
-                self.assertFalse(native.pending[0]["deliveryConfirmed"])
-
-    def test_steer_never_uses_escape_to_answer_a_permission_panel(self):
-        native = self.native_active()
-        native.lookup = lambda: {"short": "saved-job", "sessionId": "test-session",
-                                 "tempo": "blocked", "needs": "permission"}
-        replies = []
-        native.reply = lambda *args, **kwargs: replies.append((args, kwargs))
-        native.terminal_input = MagicMock()
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = native.send({"client_id": "C", "steer": True,
-                                  "content": [{"type": "text", "text": "只投递 C"}]})
-        self.assertTrue(result["accepted"])
-        self.assertEqual(replies, [(("只投递 C",), {"next_turn": True})])
-        native.terminal_input.assert_not_called()
-        self.assertEqual(native.job["needs"], "permission", "原生审批继续保留")
-
-    def test_recovery_uses_original_job_and_sends_only_the_new_message(self):
-        native = NativeSession("native-cli", "test-session", "saved-job")
-        native.model = "gpt-6.1-sol"
-        native.effort = "max"
-        native.messages = [{"type": "user", "message": {"content": "历史消息"}}]
-        native.read_messages = lambda: None
-        native.poll = lambda **kwargs: None
-        job = {"short": "saved-job", "sessionId": "test-session", "tempo": "idle"}
-        lookups = iter([None, job])
-        native.lookup = lambda: next(lookups)
-        replies = []
-        native.reply = lambda text, next_turn=True: replies.append((text, next_turn))
-        with patch.object(namespace["subprocess"], "run") as run:
-            run.return_value.returncode = 0
-            result = native.send({"client_id": "new-client",
-                                  "content": [{"type": "text", "text": "新的补充"}]})
-        self.assertEqual(run.call_args.args[0], ["native-cli", "respawn", "saved-job"])
-        self.assertEqual(replies, [("/model gpt-6.1-sol", False),
-                                  ("/effort max", False), ("新的补充", False)])
-        self.assertEqual(result["nativeId"], "test-session")
-        self.assertEqual(result["jobId"], "saved-job")
-        self.assertEqual(len(native.pending), 1)
-        self.assertEqual(native.pending[0]["_after"], 1)
-
-    def test_stopped_native_job_is_respawned_before_sending_after_service_release(self):
-        native = NativeSession("native-cli", "test-session", "saved-job")
-        native.read_messages = lambda: None
-        native.poll = lambda **kwargs: None
-        stopped = {"short": "saved-job", "sessionId": "test-session", "tempo": "idle",
-                   "state": "stopped"}
-        recovered = {**stopped, "state": "idle"}
-        native.lookup = lambda: stopped
-        native.restore_job = MagicMock(return_value=recovered)
-        replies = []
-        native.reply = lambda text, next_turn=True: replies.append((text, next_turn))
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = native.send({"client_id": "released-job",
-                                  "content": [{"type": "text", "text": "恢复后发送"}]})
-        native.restore_job.assert_called_once_with()
-        self.assertEqual(replies, [("恢复后发送", False)])
-        self.assertTrue(result["accepted"])
-
-    def test_shutdown_stops_only_an_idle_native_job_without_draft_or_background_work(self):
-        native = NativeSession("native-cli", "test-session", "saved-job")
-        native.read_messages = lambda: None
-        live = {"short": "saved-job", "sessionId": "test-session", "tempo": "idle",
-                "state": "idle", "sessionStatus": "idle"}
-        native.lookup = lambda: live
-        native.read_terminal_screen = lambda: ["❯ ", "────────────────", "? for shortcuts"]
-        native.rpc = lambda operation: {"ok": True, "alive": False} if operation["op"] == "has" else {}
-        with patch.object(namespace["subprocess"], "run") as run:
-            run.return_value.returncode = 0
-            result = native.shutdown()
-        self.assertTrue(result["stopped"])
-        self.assertEqual(run.call_args.args[0], ["native-cli", "stop", "saved-job"])
-
-    def test_shutdown_keeps_busy_native_job_running(self):
-        native = NativeSession("native-cli", "test-session", "saved-job")
-        native.read_messages = lambda: None
-        live = {"short": "saved-job", "sessionId": "test-session", "tempo": "active",
-                "state": "working", "sessionStatus": "busy"}
-        native.lookup = lambda: live
-        with patch.object(namespace["subprocess"], "run") as run:
-            result = native.shutdown()
-        self.assertFalse(result["stopped"])
-        self.assertEqual(result["reason"], "active")
-        run.assert_not_called()
-
-    def test_shutdown_done_turn_does_not_imply_worker_has_exited(self):
-        native = NativeSession("native-cli", "test-session", "saved-job")
-        native.read_messages = lambda: None
-        native.lookup = lambda: {"short": "saved-job", "sessionId": "test-session",
-                                  "tempo": "idle", "state": "done", "sessionStatus": "idle"}
-        native.read_terminal_screen = lambda: ["❯ ", "────────────────", "? for shortcuts"]
-        native.stop_job = MagicMock()
-        self.assertTrue(native.shutdown()["stopped"])
-        native.stop_job.assert_called_once()
-
-    def test_shutdown_preserves_native_draft_and_unknown_screen(self):
-        native = NativeSession("native-cli", "test-session", "saved-job")
-        native.read_messages = lambda: None
-        native.lookup = lambda: {"short": "saved-job", "sessionId": "test-session",
-                                  "tempo": "idle", "state": "idle", "sessionStatus": "idle"}
-        native.stop_job = MagicMock()
-        for lines, reason in ((["❯ 未发送的草稿", "────────────────"], "native_draft"),
-                              (["没有可核对的输入框"], "screen_unknown"),
-                              (["❯ ", "────────────────", "1 shell · ↓ to manage"], "background_work")):
-            native.current_screen = lambda value=lines: value
-            self.assertEqual(native.shutdown()["reason"], reason)
-        native.stop_job.assert_not_called()
-
-    def test_shutdown_checks_recovery_placeholder_against_the_fresh_screen(self):
-        native = NativeSession("native-cli", "test-session", "saved-job")
-        live = {"short": native.short, "sessionId": native.native_id, "tempo": "idle",
-                "state": "idle", "sessionStatus": "idle"}
-        native.lookup = lambda: live
-        native.read_messages = lambda: None
-        native.messages = [{"type": "assistant", "isApiErrorMessage": True}]
-        native.stop_job = MagicMock()
-        hint = "Once fixed, resend your message"
-        faint_hint = f"\x1b[39m\x1b[2m{hint}\x1b[22m"
-        # 缓存可能尚未反映终端新输入；回收必须以新订阅画面区分提示和真实草稿。
-        footer = "\r\n────────────────\r\n? for shortcuts"
-        native.screen.feed(f"❯ {faint_hint}{footer}")
-        cases = (
-            ("恢复占位", f"❯ {faint_hint}{footer}", None),
-            ("同文草稿", f"❯ \x1b[38;5;2m{hint}{footer}", "native_draft"),
-            ("亮色重绘", f"❯ {faint_hint}\r\x1b[2K❯ {hint}{footer}", "native_draft"),
-            ("混合样式", f"❯ \x1b[2mOnce fixed, \x1b[0mresend your message{footer}", "native_draft"),
-            ("多行草稿", f"❯ {faint_hint}\r\n真实输入{footer}", "native_draft"),
-            ("画面截断", f"❯ {faint_hint}", "native_draft"),
-            ("快照不可读", None, "screen_unknown"),
-        )
-        for label, snapshot, reason in cases:
-            with self.subTest(label=label), patch.object(namespace["socket"], "socket") as sock:
-                native.stop_job.reset_mock()
-                connection = sock.return_value.__enter__.return_value
-                frame = {"type": "snapshot", "streamTail": [snapshot]} if snapshot is not None else {}
-                connection.makefile.return_value.__enter__.return_value = io.BytesIO(
-                    (json.dumps(frame) + "\n").encode())
-                result = native.shutdown()
-                self.assertEqual(result.get("reason"), reason)
-                self.assertEqual(result["stopped"], reason is None)
-                self.assertEqual(native.stop_job.call_count, int(reason is None))
-                connection.sendall.assert_called_once()
-
-        # 旧错误或 pending 原生交互都不能因出现相同画面而放行。
-        native.stop_job.reset_mock()
-        native.messages.append({"type": "user", "message": {"content": "新一轮"}})
-        self.assertEqual(native.shutdown(), {"stopped": False, "reason": "native_draft"})
-        live.update(sessionStatus="waiting")
-        self.assertEqual(native.shutdown(), {"stopped": False, "reason": "active"})
-        native.stop_job.assert_not_called()
-
-    def test_shutdown_rechecks_a_new_native_turn_before_stop(self):
-        native = NativeSession("native-cli", "test-session", "saved-job")
-        native.read_messages = lambda: None
-        idle = {"short": "saved-job", "sessionId": "test-session",
-                "tempo": "idle", "state": "idle", "sessionStatus": "idle"}
-        lookups = iter([idle, {**idle, "tempo": "active", "sessionStatus": "busy"}])
-        native.lookup = lambda: next(lookups)
-        native.current_screen = lambda: ["❯ ", "────────────────", "? for shortcuts"]
-        native.stop_job = MagicMock()
-        self.assertEqual(native.shutdown()["reason"], "state_changed")
-        native.stop_job.assert_not_called()
-
-    def test_shutdown_accepts_complete_borderless_idle_prompt_but_preserves_wrapped_draft(self):
-        native = NativeSession("native-cli", "test-session", "saved-job")
-        native.read_messages = lambda: None
-        native.lookup = lambda: {"short": "saved-job", "sessionId": "test-session",
-                                  "tempo": "idle", "state": "done", "sessionStatus": "idle"}
-        native.stop_job = MagicMock()
-        # 实际 2.1.325 后台快照在最终回复后显示裸提示符，没有旧版输入框的下横线。
-        native.current_screen = lambda: ["● 已完成", "", "❯", "", ""]
-        self.assertTrue(native.shutdown()["stopped"])
-        native.stop_job.assert_called_once()
-        native.stop_job.reset_mock()
-        native.current_screen = lambda: ["● 已完成", "", "❯", "第二行草稿", ""]
-        self.assertEqual(native.shutdown()["reason"], "native_draft")
-        native.current_screen = lambda: ["● 已完成", "", "❯"]
-        self.assertEqual(native.shutdown()["reason"], "screen_unknown")
-        native.stop_job.assert_not_called()
-
-    def test_shutdown_does_not_treat_unidentified_live_job_as_already_stopped(self):
-        native = NativeSession("native-cli", "test-session", "saved-job")
-        native.lookup = lambda: None
-        native.job_alive = lambda: True
-        native.stop_job = MagicMock()
-        self.assertEqual(native.shutdown()["reason"], "identity_unknown")
-        native.stop_job.assert_not_called()
-
-    def test_background_start_passes_wsl_timezone_in_native_session_settings(self):
-        native = NativeSession("native-cli", "")
-        native.model = "gpt-6.1-sol"
-        native.rpc = lambda operation: {"jobs": [{"short": "1234abcd", "sessionId": "test-session"}]}
-        native.bind = MagicMock()
-        with patch.dict(os.environ, {"TZ": "America/Los_Angeles"}), \
-                patch.object(namespace["subprocess"], "run") as run:
-            run.return_value.returncode = 0
-            run.return_value.stdout = b"backgrounded: 1234abcd"
-            run.return_value.stderr = b""
-            native.start("只查询当前时间")
-        arguments = run.call_args.args[0]
-        settings = json.loads(arguments[arguments.index("--settings") + 1])
-        self.assertEqual(settings["env"], {"TZ": "America/Los_Angeles"})
-        self.assertEqual(settings["worktree"], {"bgIsolation": "none"})
-        self.assertEqual(arguments[arguments.index("--model") + 1], "gpt-6.1-sol")
-
-    def test_timezone_missing_or_invalid_never_defaults_to_host_timezone(self):
-        with patch.dict(os.environ, {"TZ": ""}), \
-                patch.object(namespace["Path"], "resolve", return_value=Path("/unidentified/localtime")):
-            with self.assertRaises(namespace["NativeError"]):
-                namespace["native_time_zone"]()
-        with patch.dict(os.environ, {"TZ": "America/Los_Angeles\nUTC"}):
-            with self.assertRaises(namespace["NativeError"]):
-                namespace["native_time_zone"]()
-
-    def test_idle_cli_version_skew_respawns_same_job_before_sending(self):
-        native = NativeSession("native-cli", "test-session", "saved-job")
-        native.read_messages = lambda: None
-        native.poll = lambda **kwargs: None
-        live = {"short": "saved-job", "sessionId": "test-session", "tempo": "idle",
-                "sessionStatus": "idle", "cliVersion": "2.1.323"}
-        recovered = {**live, "cliVersion": "2.1.325"}
-        native.lookup = lambda: live
-        native.daemon_version = lambda: "2.1.325"
-        native.read_terminal_screen = lambda: ["❯ ", "────────────────", "? for shortcuts"]
-        native.restore_job = MagicMock(return_value=recovered)
-        replies = []
-        native.reply = lambda text, next_turn=True: replies.append((text, next_turn))
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = native.send({"client_id": "version-skew", "steer": True,
-                                  "content": [{"type": "text", "text": "版本恢复后发送"}]})
-        native.restore_job.assert_called_once_with(expected_cli_version="2.1.325")
-        self.assertEqual(replies, [("版本恢复后发送", True)])
-        self.assertEqual(native.version_recovery["state"], "ready")
-        self.assertTrue(result["accepted"])
-
-    def test_idle_cli_version_skew_ordinary_message_recovers_before_normal_reply(self):
-        native = NativeSession("native-cli", "test-session", "saved-job")
-        native.read_messages = lambda: None
-        native.poll = lambda **kwargs: None
-        live = {"short": "saved-job", "sessionId": "test-session", "tempo": "idle",
-                "sessionStatus": "idle", "cliVersion": "2.1.323"}
-        recovered = {**live, "cliVersion": "2.1.325"}
-        native.lookup = lambda: live
-        native.daemon_version = lambda: "2.1.325"
-        native.read_terminal_screen = lambda: ["❯ ", "────────────────", "? for shortcuts"]
-        native.restore_job = MagicMock(return_value=recovered)
-        replies = []
-        native.reply = lambda text, next_turn=True: replies.append((text, next_turn))
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = native.send({"client_id": "ordinary-version-skew",
-                                  "content": [{"type": "text", "text": "普通消息"}]})
-        self.assertEqual(replies, [("普通消息", False)])
-        native.restore_job.assert_called_once_with(expected_cli_version="2.1.325")
-        self.assertEqual(native.version_recovery["state"], "ready")
-        self.assertTrue(result["accepted"])
-
-    def test_busy_cli_version_skew_ordinary_message_defers_before_starting_old_worker(self):
-        native = NativeSession("native-cli", "test-session", "saved-job")
-        native.read_messages = lambda: None
-        native.poll = lambda **kwargs: None
-        live = {"short": "saved-job", "sessionId": "test-session", "tempo": "active",
-                "state": "working", "sessionStatus": "busy", "cliVersion": "2.1.323"}
-        native.lookup = lambda: live
-        native.daemon_version = lambda: "2.1.325"
-        native.restore_job = MagicMock(side_effect=AssertionError("执行中不能自动重启旧会话"))
-        native.reply = MagicMock(side_effect=AssertionError("普通消息不能投递到旧 worker"))
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = native.send({"client_id": "ordinary-version-skew-busy",
-                                  "content": [{"type": "text", "text": "稍后发送"}]})
-        self.assertTrue(result["deferred"])
-        self.assertFalse(result["accepted"])
-        self.assertEqual(native.version_recovery["state"], "pending")
-        native.restore_job.assert_not_called()
-        native.reply.assert_not_called()
-
-    def test_busy_cli_version_skew_defers_without_stopping_the_old_worker(self):
-        native = NativeSession("native-cli", "test-session", "saved-job")
-        native.read_messages = lambda: None
-        native.poll = lambda **kwargs: None
-        live = {"short": "saved-job", "sessionId": "test-session", "tempo": "active",
-                "state": "working", "sessionStatus": "busy", "cliVersion": "2.1.323"}
-        native.lookup = lambda: live
-        native.daemon_version = lambda: "2.1.325"
-        native.restore_job = MagicMock(side_effect=AssertionError("执行中不能自动重启旧会话"))
-        native.reply = MagicMock(side_effect=AssertionError("执行中不能投递版本错位消息"))
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = native.send({"client_id": "version-skew-busy", "steer": True,
-                                  "content": [{"type": "text", "text": "稍后发送"}]})
-        self.assertTrue(result["deferred"])
-        self.assertFalse(result["accepted"])
-        self.assertEqual(native.version_recovery["state"], "pending")
-        native.restore_job.assert_not_called()
-        native.reply.assert_not_called()
-        self.assertEqual(native.pending, [])
-
-    def test_idle_cli_version_skew_with_native_draft_defers_without_respawn(self):
-        native = NativeSession("native-cli", "test-session", "saved-job")
-        native.read_messages = lambda: None
-        native.poll = lambda **kwargs: None
-        live = {"short": "saved-job", "sessionId": "test-session", "tempo": "idle",
-                "sessionStatus": "idle", "cliVersion": "2.1.323"}
-        native.lookup = lambda: live
-        native.daemon_version = lambda: "2.1.325"
-        native.read_terminal_screen = lambda: ["❯ 用户尚未发送的草稿", "────────────────", "? for shortcuts"]
-        native.restore_job = MagicMock(side_effect=AssertionError("不能覆盖原生草稿"))
-        native.reply = MagicMock(side_effect=AssertionError("草稿存在时不能发送"))
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = native.send({"client_id": "ordinary-version-skew-draft",
-                                  "content": [{"type": "text", "text": "稍后发送"}]})
-        self.assertTrue(result["deferred"])
-        self.assertFalse(result["accepted"])
-        self.assertEqual(native.version_recovery["state"], "pending")
-        self.assertEqual(native.version_recovery["reason"], "native_draft")
-        native.restore_job.assert_not_called()
-        native.reply.assert_not_called()
-
-    def test_eskew_after_admission_recovers_once_before_resubmitting(self):
-        native = NativeSession("native-cli", "test-session", "saved-job")
-        native.read_messages = lambda: None
-        native.poll = lambda **kwargs: None
-        live = {"short": "saved-job", "sessionId": "test-session", "tempo": "idle",
-                "sessionStatus": "idle"}
-        recovered = {**live, "cliVersion": "2.1.325"}
-        native.lookup = lambda: live
-        native.recover_version_skew = MagicMock(return_value=recovered)
-        calls = []
-
-        def reply(text, next_turn=True):
-            calls.append((text, next_turn))
-            if len(calls) == 1:
-                raise namespace["NativeError"]("ESKEW")
-
-        native.reply = reply
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = native.send({"client_id": "version-skew-race", "steer": True,
-                                  "content": [{"type": "text", "text": "只重试一次"}]})
-        native.recover_version_skew.assert_called_once_with(live, force=True)
-        self.assertEqual(calls, [("只重试一次", True), ("只重试一次", True)])
-        self.assertTrue(result["accepted"])
-        self.assertEqual(len(native.pending), 1)
-
-    def test_eskew_after_admission_preserves_ordinary_next_turn(self):
-        native = NativeSession("native-cli", "test-session", "saved-job")
-        native.read_messages = lambda: None
-        native.poll = lambda **kwargs: None
-        live = {"short": "saved-job", "sessionId": "test-session", "tempo": "idle",
-                "sessionStatus": "idle"}
-        recovered = {**live, "cliVersion": "2.1.325"}
-        native.lookup = lambda: live
-        native.read_terminal_screen = lambda: ["❯ ", "────────────────", "? for shortcuts"]
-        native.recover_version_skew = MagicMock(return_value=recovered)
-        calls = []
-
-        def reply(text, next_turn=True):
-            calls.append((text, next_turn))
-            if len(calls) == 1:
-                raise namespace["NativeError"]("ESKEW")
-
-        native.reply = reply
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = native.send({"client_id": "ordinary-version-skew-race",
-                                  "content": [{"type": "text", "text": "普通消息只重试一次"}]})
-        native.recover_version_skew.assert_called_once_with(live, force=True)
-        self.assertEqual(calls, [("普通消息只重试一次", False), ("普通消息只重试一次", False)])
-        self.assertTrue(result["accepted"])
-        self.assertEqual(len(native.pending), 1)
-
-    def test_unknown_native_lookup_does_not_restart_or_resubmit(self):
-        native = NativeSession("native-cli", "test-session", "saved-job")
-        native.read_messages = lambda: None
-        native.rpc = lambda operation: (_ for _ in ()).throw(TimeoutError())
-        with patch.object(namespace["subprocess"], "run") as run:
-            with self.assertRaisesRegex(RuntimeError, "未重新启动或提交消息"):
-                native.send({"client_id": "new-client",
-                             "content": [{"type": "text", "text": "新的补充"}]})
-        run.assert_not_called()
-        self.assertEqual(native.pending, [])
-
-    def test_failed_native_recovery_does_not_fork_or_submit(self):
-        native = NativeSession("native-cli", "test-session", "saved-job")
-        native.read_messages = lambda: None
-        native.lookup = lambda: None
-        replies = []
-        native.reply = lambda text, next_turn=True: replies.append(text)
-        with patch.object(namespace["subprocess"], "run") as run:
-            run.return_value.returncode = 1
-            with self.assertRaisesRegex(RuntimeError, "未创建副本或提交消息"):
-                native.send({"client_id": "new-client",
-                             "content": [{"type": "text", "text": "新的补充"}]})
-        self.assertEqual(run.call_count, 1)
-        self.assertEqual(run.call_args.args[0], ["native-cli", "respawn", "saved-job"])
-        self.assertEqual(replies, [])
-        self.assertEqual(native.pending, [])
-
-    def test_interactive_session_rejects_before_launch_and_stale_pid_does_not_block(self):
-        with tempfile.TemporaryDirectory() as folder:
-            native_id = "00000000-0000-4000-8000-000000000001"
-            native = NativeSession("unused", native_id)
-            native.root = Path(folder)
-            sessions = native.root / "sessions"
-            sessions.mkdir()
-            (sessions / "123.json").write_text(json.dumps({
-                "sessionId": native_id, "pid": 123, "kind": "interactive"
-            }), encoding="utf-8")
-            native.read_messages = lambda: None
-            native.lookup = lambda: None
-            native.rpc = lambda operation: {"ok": True, "alive": False, "present": False}
-            with patch.object(namespace["os"], "kill", return_value=None), \
-                    patch.object(namespace["subprocess"], "run") as run, \
-                    contextlib.redirect_stdout(io.StringIO()):
-                with self.assertRaises(namespace["NativeError"]) as failure:
-                    native.send({"client_id": "interactive-rejected",
-                                 "content": [{"type": "text", "text": "未投递的输入"}]})
-            self.assertEqual(failure.exception.code, "ESESSIONOPEN")
-            self.assertEqual(native.pending, [])
-            self.assertFalse(native.delivery_started)
-            run.assert_not_called()
-            # 区分真实交互式进程占用和已退出的登记，不能据此启动第二个会话或误称模型请求失败。
-            with patch.object(namespace["os"], "kill", side_effect=ProcessLookupError), \
-                    patch.object(namespace["subprocess"], "run") as run:
-                native.check_history_resume()
-            run.assert_not_called()
-
-    def test_live_effort_change_from_default_uses_native_command_without_restarting(self):
-        native = NativeSession("unused", "test-session", "saved-job")
-        native.lookup = lambda: {"short": "saved-job", "tempo": "active"}
-        replies = []
-        native.reply = lambda text, next_turn=True: replies.append((text, next_turn))
-        native.change_setting("effort", "max")
-        native.change_setting("effort", "max")
-        self.assertEqual(replies, [("/effort max", False)])
-        self.assertEqual(native.effort, "max")
-        native.lookup = lambda: None
-        native.change_setting("effort", "high")
-        self.assertEqual(len(replies), 1)
-        self.assertEqual(native.effort, "high")
 
     def read(self, rows, after=0, job_id="", pending_text="待接收消息"):
         folder = tempfile.TemporaryDirectory()
@@ -1780,7 +279,7 @@ class SharedQueueHistoryTests(unittest.TestCase):
         log = Path(folder.name) / "native.jsonl"
         log.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
                        encoding="utf-8")
-        native = NativeSession("unused", "test-session", job_id)
+        native = SdkReader("unused", "test-session")
         native.log_path = log
         native.pending = [{"clientUserMessageId": "web-client", "_nativeText": pending_text,
                            "_after": after}]
@@ -1879,7 +378,7 @@ class SharedQueueHistoryTests(unittest.TestCase):
         ]
         log = root / "native.jsonl"
         log.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
-        native = NativeSession("unused", "test-session")
+        native = SdkReader("unused", "test-session")
         native.root, native.log_path = root, log
         native.read_messages()
         result = next(row for row in native.messages if row["uuid"] == "r")["nativeToolResult"]
@@ -1991,69 +490,6 @@ class SharedQueueHistoryTests(unittest.TestCase):
         self.assertEqual(rows["s6"]["nativeSystemNotice"],
                          {"kind": "stopHook", "prevented": True, "reason": "测试未通过", "errors": ["exit 2"]})
 
-    def test_prompt_withdrawn_before_output_is_confirmed_by_the_terminal_input(self):
-        # 2.1.323 实测：出字前按 Esc，原生撤回本条输入并把原文放回终端输入框，记录不写中断标记。
-        messages = [
-            {"type": "user", "uuid": "u0", "message": {"content": "第一条"}},
-            {"type": "assistant", "uuid": "a0", "message": {"content": [{"type": "text", "text": "好"}]}},
-            {"type": "system", "uuid": "d0", "subtype": "turn_duration"},
-            {"type": "user", "uuid": "u1", "message": {"content": "用三句话介绍一下杭州西湖。"}},
-        ]
-        idle = {"tempo": "idle", "sessionAlive": True}
-
-        def session(rows, terminal):
-            native = NativeSession("unused", "test-session", "job")
-            native.messages = rows
-            native.screen.feed(terminal)
-            return native
-
-        native = session(messages, " ▐▛███▛█   Claude Code v2.1.323\n ❯ 用三句话介绍一下杭州西湖。\n"
-                                   "   ⏵⏵ auto mode on (shift+tab to cycle)\n")
-        self.assertIsNone(native.withdrawn_prompt({"tempo": "active", "sessionAlive": True}))
-        self.assertIsNone(native.withdrawn_prompt({"tempo": "idle", "sessionAlive": False}))
-        self.assertEqual(native.withdrawn_prompt(idle), "u1")
-        native.screen = namespace["Screen"]()
-        native.screen.feed("❯ \n")
-        self.assertEqual(native.withdrawn_prompt(idle), "u1", "已确认的撤回不因终端用户清空输入框而反复")
-        self.assertIsNone(session(messages, "❯ 别的内容\n").withdrawn_prompt(idle))
-        replied = messages + [{"type": "assistant", "uuid": "a1", "message": {"content": [{"type": "text", "text": "西湖"}]}}]
-        self.assertIsNone(session(replied, "❯ 用三句话介绍一下杭州西湖。\n").withdrawn_prompt(idle), "已有回复不是撤回")
-
-    def test_background_summary_reads_only_the_native_footer(self):
-        summary = NativeSession.background_summary
-        self.assertEqual(summary(["回复正文", "", "⏵⏵ auto mode on (shift+tab to cycle) · 1 shell · ↓ to manage"]),
-                         "1 shell")
-        # 2.1.323 实测：执行中与空闲时的底栏；“← 2 agents” 与 “esc to interrupt” 不是后台任务。
-        self.assertEqual(summary(["⏵⏵ auto mode on · ← 2 agents · 1 shell · esc to interrupt · ↓ to manage"]), "1 shell")
-        self.assertEqual(summary(["⏵⏵ auto mode on · ← 2 agents · 1 monitor · ↓ to manage"]), "1 monitor")
-        self.assertEqual(summary(["⏵⏵ auto mode on · 2 shells, 1 monitor · ↓ to manage"]), "2 shells, 1 monitor")
-        self.assertEqual(summary(["⏵⏵ auto mode on · 1 shell · 1 monitor · ↓ to manage"]), "1 shell, 1 monitor")
-        self.assertEqual(summary(["⏵⏵ auto mode on (shift+tab to cycle) · ← 2 agents · esc to interrupt"]), "")
-        self.assertEqual(summary(["· 2 shells · ↓ to manage", "⏵⏵ auto mode on"]), "2 shells")
-        self.assertEqual(summary(["正文引用：1 shell · ↓ to manage", "a", "b", "⏵⏵ auto mode on"]), "",
-                         "只认底部三行，正文引用不算后台任务")
-        self.assertEqual(summary(["↓ to manage"]), "background")
-        self.assertIsNone(summary(["", "  "]))
-
-    def test_native_interruption_keeps_metadata_without_consuming_a_literal_pending_message(self):
-        marker = "[Request interrupted by user]"
-        native = self.read([
-            {"type": "user", "uuid": "real-user", "message": {"content": "正在处理"}},
-            {"type": "user", "uuid": "interruption", "parentUuid": "assistant-row",
-             "interruptedMessageId": "response-id",
-             "message": {"role": "user", "content": [{"type": "text", "text": marker}]}},
-        ], pending_text=marker)
-        self.assertEqual(native.messages[1]["interruptedMessageId"], "response-id")
-        self.assertEqual(native.messages[1]["parentUuid"], "assistant-row")
-        self.assertFalse(namespace["real_user"](native.messages[1]))
-        self.assertEqual(native.clients, {})
-        self.assertEqual(len(native.pending), 1)
-        native.job = {"tempo": "active"}
-        preview_output = io.StringIO()
-        with contextlib.redirect_stdout(preview_output):
-            native.stream_preview("正在处理\n新回复")
-        self.assertEqual(native.preview_user, "real-user")
-        self.assertEqual(preview_output.getvalue(), "", "真实中断之后不再显示终端残留预览")
 
     def test_native_interruption_does_not_hide_human_quotes_or_unmarked_identical_text(self):
         marker = "[Request interrupted by user]"
@@ -2165,22 +601,6 @@ class SharedQueueHistoryTests(unittest.TestCase):
                 self.assertEqual(len(native.pending), 1)
                 self.assertEqual(native.messages, [])
 
-    def test_compact_summary_metadata_survives_without_confirming_a_real_prompt(self):
-        text = "This session is being continued from a previous conversation."
-        native = self.read([
-            {"type": "user", "uuid": "compact", "isCompactSummary": True,
-             "isVisibleInTranscriptOnly": True, "message": {"content": "待接收消息"}},
-            {"type": "user", "uuid": "quoted", "message": {"content": text}},
-        ])
-        self.assertTrue(native.messages[0]["isCompactSummary"])
-        self.assertTrue(native.messages[0]["isVisibleInTranscriptOnly"])
-        self.assertEqual(native.clients, {})
-        self.assertEqual(len(native.pending), 1)
-        self.assertEqual(native.messages[1]["message"]["content"], text)
-        native.job = {"tempo": "active"}
-        with contextlib.redirect_stdout(io.StringIO()):
-            native.stream_preview("  新回复\n")
-        self.assertEqual(native.preview_user, "quoted")
 
     def test_setting_commands_and_paired_outputs_are_control_records_but_typed_quotes_survive(self):
         command = ("<command-name>/effort</command-name>\n"
@@ -2240,7 +660,7 @@ class SharedQueueHistoryTests(unittest.TestCase):
                         "type": "image", "file": {"type": "image/png", "base64": images[-1]["source"]["data"]}}}}]
         log = root / "native.jsonl"
         log.write_text("".join(json.dumps(row) + "\n" for row in rows))
-        native = NativeSession("unused", "test-session")
+        native = SdkReader("unused", "test-session")
         native.root, native.log_path = root, log
         native.pending = [{"clientUserMessageId": "web-client", "_nativeText": prompt, "_after": 0,
                            "content": [{"type": "text", "text": "八张图片"}, *images]}]
@@ -2248,7 +668,7 @@ class SharedQueueHistoryTests(unittest.TestCase):
         self.assertEqual(len(native.messages[0]["web_images"]), 8)
         self.assertEqual(len(native.messages[0]["remote_upload_paths"]), 8)
         self.assertEqual(native.pending, [])
-        restored = NativeSession("unused", "test-session")
+        restored = SdkReader("unused", "test-session")
         restored.root, restored.log_path = root, log
         restored.control({"subtype": "initialize", "catalog": {}, "clients": native.clients})
         restored.read_messages()
@@ -2272,7 +692,7 @@ class SharedQueueHistoryTests(unittest.TestCase):
     def test_context_configuration_keeps_compaction_separate_and_bound_to_the_usage_model(self):
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
-        native = NativeSession("unused", "test-session")
+        native = SdkReader("unused", "test-session")
         native.root = Path(folder.name)
         settings = native.root / "settings.json"
         key = "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
@@ -2336,310 +756,6 @@ class SharedQueueHistoryTests(unittest.TestCase):
         native.log_path.write_text("", encoding="utf-8")
         native.read_messages()
         self.assertEqual(native.native_context, {})
-
-    def test_native_discovery_uses_logs_jobs_and_incremental_offsets_without_registry_or_execution(self):
-        folder = tempfile.TemporaryDirectory()
-        self.addCleanup(folder.cleanup)
-        root = Path(folder.name)
-        project = root / "projects" / "native-project"
-        project.mkdir(parents=True)
-        primary = "38515c78-cbe6-4961-b5b0-6ee76e81876c"
-        history = "00000000-0000-4000-8000-000000000001"
-        def write(native, rows):
-            path = project / f"{native}.jsonl"
-            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
-            return path
-        message = lambda native: {"type": "user", "uuid": f"user-{native}", "sessionId": native,
-            "cwd": "/mnt/e/shared", "timestamp": "2026-11-11T01:00:00Z", "message": {"content": "原生真实问题"}}
-        path = write(primary, [message(primary), {"type": "custom-title", "sessionId": primary, "customTitle": "原生自定义标题"}])
-        write(history, [message(history), {"type": "custom-title", "sessionId": history, "customTitle": "elves-b831d35da2"}])
-        write("00000000-0000-4000-8000-000000000002", [{"type": "assistant", "message": {"content": []}}])
-        branch = "00000000-0000-4000-8000-000000000003"
-        compact = "00000000-0000-4000-8000-000000000004"
-        internal = "00000000-0000-4000-8000-000000000005"
-        write(branch, [{**message(branch), "isSidechain": True}])
-        write(compact, [{**message(compact), "isCompactSummary": True}])
-        write(internal, [{"type": "attachment", "sessionId": internal, "cwd": "/mnt/e/shared", "isMeta": True,
-            "attachment": {"type": "queued_command", "commandMode": "prompt", "humanTurn": True,
-                           "origin": {"kind": "human"}, "prompt": "内部记录"}}])
-        job = root / "jobs" / primary[:8]
-        job.mkdir(parents=True)
-        (job / "state.json").write_text(json.dumps({"sessionId": primary, "cwd": "/mnt/e/shared", "tempo": "active"}))
-        discovery = NativeDiscovery(root)
-        self.assertFalse((root / "remote-claude-sessions.json").exists())
-        with patch.object(namespace["subprocess"], "run", side_effect=AssertionError("发现不能启动程序")), \
-             patch.object(NativeSession, "rpc", side_effect=AssertionError("发现不操作守护进程")):
-            rows = discovery.control({"subtype": "discover"})["sessions"]
-            self.assertEqual({row["nativeId"] for row in rows}, {primary, history})
-            found = next(row for row in rows if row["nativeId"] == primary)
-            self.assertEqual(found["title"], "原生自定义标题")
-            self.assertEqual(found["jobId"], primary[:8])
-            self.assertEqual(next(row for row in rows if row["nativeId"] == history)["jobId"], "")
-            self.assertEqual(next(row for row in rows if row["nativeId"] == history)["title"], "原生真实问题")
-            count = discovery.bytes_read
-            self.assertEqual(discovery.control({"subtype": "discover"})["sessions"], rows)
-            self.assertEqual(discovery.bytes_read, count, "重复刷新不能重读既有正文")
-            extra = json.dumps({"type": "assistant", "uuid": "new-reply", "sessionId": primary,
-                "timestamp": "2026-11-11T02:00:00Z", "message": {"model": "gpt-6.1-sol", "content": [{"type": "text", "text": "新回复"}]}}) + "\n"
-            with path.open("a", encoding="utf-8", newline="") as stream:
-                stream.write(extra)
-            updated = discovery.control({"subtype": "discover"})["sessions"]
-            self.assertEqual(discovery.bytes_read - count, len(extra.encode()))
-            self.assertGreater(next(row for row in updated if row["nativeId"] == primary)["updatedAt"], found["updatedAt"])
-
-    def test_unregistered_history_reads_29_turns_eight_and_two_original_images_and_usage_without_a_job(self):
-        folder = tempfile.TemporaryDirectory()
-        self.addCleanup(folder.cleanup)
-        root = Path(folder.name)
-        native = "00000000-0000-4000-8000-000000000029"
-        project = root / "projects" / "only-cli"
-        project.mkdir(parents=True)
-        (root / "settings.json").write_text(json.dumps({"env": {"CLAUDE_CODE_MAX_CONTEXT_TOKENS": "600000"}}))
-        rows = []
-        for index in range(29):
-            prompt = f"原生第{index}轮"
-            if index < 2:
-                uploads = root / "remote-attachments" / f"accepted-{index}"
-                uploads.mkdir(parents=True)
-                for image in range(8 if index == 0 else 2):
-                    path = uploads / f"{image}.png"
-                    path.write_bytes(bytes([image + 1, 2, 3]))
-                    prompt += f"\n@{path}"
-            rows.append({"type": "user", "uuid": f"user-{index}", "sessionId": native, "cwd": "/mnt/e/shared",
-                         "timestamp": "2026-11-11T01:00:00Z", "message": {"content": prompt}})
-            if index == 0:
-                rows.append({"type": "attachment", "uuid": "partial-native-image", "attachment": {
-                    "type": "file", "filename": str(uploads / "7.png"), "content": {"type": "image", "file": {
-                        "type": "image/png", "base64": "CAID"}}}})
-            rows.append({"type": "assistant", "uuid": f"assistant-{index}", "sessionId": native,
-                         "timestamp": "2026-11-11T02:00:00Z", "message": {"id": f"reply-{index}", "model": "gpt-6.1-sol",
-                         "content": [{"type": "text", "text": "原生回复"}], "usage": {"input_tokens": 181,
-                         "cache_read_input_tokens": 108032, "cache_creation_input_tokens": 0, "output_tokens": 545}}})
-        path = project / f"{native}.jsonl"
-        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
-        original = path.read_bytes()
-        with patch.object(namespace["subprocess"], "run", side_effect=AssertionError("读历史不得启动模型")), \
-             patch.object(NativeSession, "rpc", side_effect=AssertionError("读历史不得调用原生执行协议")):
-            discovery = NativeDiscovery(root)
-            for reader in (discovery, discovery, NativeDiscovery(root)):
-                frame = reader.control({"subtype": "read_history", "native_id": native})
-                users = [row for row in frame["messages"] if row["type"] == "user"]
-                self.assertEqual(len(users), 29)
-                self.assertEqual(len(users[0]["web_images"]), 8)
-                self.assertEqual(len(users[1]["web_images"]), 2)
-                self.assertEqual(frame["clients"], {})
-                self.assertEqual(frame["native_id"], native)
-                self.assertEqual(frame["job_id"], "")
-                self.assertEqual(frame["context_configuration"]["maxContextTokens"], 600000)
-                self.assertEqual(frame["messages"][-1]["message"]["usage"]["cache_read_input_tokens"], 108032)
-            with self.assertRaisesRegex(RuntimeError, "不接受执行"):
-                discovery.control({"subtype": "shared_send"})
-        self.assertEqual(path.read_bytes(), original)
-
-    def test_history_first_user_send_preserves_uuid_and_refuses_occupied_sessions_without_forking(self):
-        folder = tempfile.TemporaryDirectory()
-        self.addCleanup(folder.cleanup)
-        native_id = "00000000-0000-4000-8000-000000000029"
-        native = NativeSession("native-cli", native_id)
-        native.root = Path(folder.name)
-        native.read_messages = lambda: None
-        native.poll = lambda **kwargs: None
-        native.lookup = lambda: None
-        job = {"short": native_id[:8], "sessionId": native_id, "tempo": "idle"}
-        native.rpc = lambda operation: {"ok": True, "alive": False, "present": False} if operation["op"] == "has" else {"jobs": [job]}
-        with patch.object(namespace["subprocess"], "run") as run, contextlib.redirect_stdout(io.StringIO()):
-            run.return_value.returncode = 0
-            run.return_value.stdout = f"backgrounded · {job['short']}".encode()
-            run.return_value.stderr = b""
-            result = native.send({"client_id": "accepted", "content": [{"type": "text", "text": "真实续聊"}]})
-        arguments = run.call_args.args[0]
-        self.assertEqual(arguments[arguments.index("--resume") + 1], native_id)
-        self.assertNotIn("--fork-session", arguments)
-        self.assertNotIn("--name", arguments)
-        self.assertEqual(result["nativeId"], native_id)
-        self.assertEqual(native.native_id, native_id)
-        occupied = NativeSession("native-cli", native_id)
-        occupied.root = Path(folder.name)
-        occupied.read_messages = lambda: None
-        occupied.lookup = lambda: None
-        sessions = occupied.root / "sessions"
-        sessions.mkdir()
-        (sessions / f"{namespace['os'].getpid()}.json").write_text(json.dumps({"sessionId": native_id,
-            "kind": "interactive", "pid": namespace["os"].getpid()}))
-        with patch.object(namespace["subprocess"], "run") as run, contextlib.redirect_stdout(io.StringIO()):
-            with self.assertRaisesRegex(namespace["NativeError"], "未接管草稿"):
-                occupied.send({"client_id": "must-not-send", "content": [{"type": "text", "text": "不能分叉"}]})
-            run.assert_not_called()
-        self.assertEqual(occupied.pending, [])
-        self.assertFalse(occupied.delivery_started)
-
-    def test_finished_session_can_reconcile_history_without_a_running_supervisor(self):
-        native = self.read([self.queued()], job_id="saved-job")
-        native.root = native.log_path.parent
-        native.initialized = True
-        native.lookup = lambda: None
-        job = native.root / "jobs" / native.short
-        job.mkdir(parents=True)
-        (job / "state.json").write_text(json.dumps({"tempo": "idle", "state": "done"}))
-        with contextlib.redirect_stdout(io.StringIO()) as output:
-            native.poll(force=True)
-        frame = json.loads(output.getvalue())
-        self.assertEqual(frame["job_id"], "saved-job")
-        self.assertEqual(frame["native_id"], "test-session")
-        self.assertEqual(frame["pending"], [])
-        self.assertEqual(frame["clients"]["absorbed-user"], "web-client")
-
-
-class PlanDialogTests(unittest.TestCase):
-    # 选项与提示取自 2.1.323 实测画面（测试 WSL，权限默认 auto）。
-    options = ("Claude has written up a plan and is ready to execute. Would you like to proceed?\n"
-               "❯ 1. Yes, and use auto mode\n  2. Yes, manually approve edits\n  3. Tell Claude what to change\n"
-               "     shift+tab to approve with this feedback\n")
-
-    def screen(self, root, options=None, path=None):
-        path = path or f"{root}/plans/plan-a.md"
-        return (" Ready to code?\n Here is Claude's plan:\n ╌╌╌╌\n 计划（画面）\n ╌╌╌╌\n"
-                + (options or self.options) + f" ctrl+g to edit in VS Code · {path}\n")
-
-    def native(self):
-        folder = tempfile.TemporaryDirectory()
-        self.addCleanup(folder.cleanup)
-        root = Path(folder.name)
-        (root / "plans").mkdir()
-        (root / "plans" / "plan-a.md").write_text("# 计划\n\n1. 追加一行\n2. 验证\n", encoding="utf-8")
-        native = NativeSession("unused", "test-session", "plan-job")
-        native.root = root
-        native.initialized = True
-        # ExitPlanMode 的 tool_use 可能已写入记录；计划审批框必须取代通用工具审批，不能盲按 1。
-        native.messages = [{"type": "assistant", "uuid": "a1", "message": {"content": [
-            {"type": "tool_use", "id": "toolu_plan", "name": "ExitPlanMode", "input": {"plan": "旧"}}]}}]
-        native.job = {"short": "plan-job", "sessionId": "test-session", "tempo": "blocked", "state": "blocked",
-                      "sessionStatus": "waiting", "sessionStatusAtMs": 3000, "needs": "permission prompt"}
-        native.lookup = lambda: native.job
-        native.read_messages = lambda: None
-        native.context_configuration = lambda: {}
-        native.screen.feed(self.screen(root))
-        with contextlib.redirect_stdout(io.StringIO()):
-            native.poll()
-        return native
-
-    def test_plan_dialog_is_read_from_the_screen_and_replaces_the_generic_tool_prompt(self):
-        native = self.native()
-        dialog = native.dialog
-        self.assertEqual(list(native.requests), [dialog["id"]])
-        self.assertEqual(native.requests[dialog["id"]]["subtype"], "native_dialog")
-        self.assertEqual((dialog["kind"], dialog["remoteSupported"], dialog["state"]), ("plan", True, "waiting"))
-        self.assertEqual(dialog["description"], "# 计划\n\n1. 追加一行\n2. 验证")
-        self.assertEqual([(option["index"], option["action"]) for option in dialog["options"]],
-                         [(1, "approve"), (2, "approve"), (3, "feedback")])
-        native_dialog, root = namespace["native_dialog"], native.root
-        moved = self.options.replace("❯ 1.", "  1.").replace("  3. Tell", "❯ 3. Tell")
-        self.assertEqual(native_dialog(native.job, self.screen(root, moved), "test-session", root)["id"], dialog["id"],
-                         "光标移动不是新的审批")
-        typed = native_dialog(native.job, self.screen(root, self.options.replace(
-            "3. Tell Claude what to change", "3. 改成 cat notes.txt")), "test-session", root)
-        self.assertNotEqual(typed["id"], dialog["id"])
-        self.assertEqual(typed["options"][2]["action"], "unknown", "终端里正在输入修改意见时网页不再提交修改意见")
-        outside = namespace["native_plan_dialog"](self.screen(root, path="/etc/hostname"), root)
-        self.assertEqual(outside["description"], "计划（画面）", "只读取当前配置 plans/ 目录内的计划文件")
-        self.assertIsNone(namespace["native_plan_dialog"](SharedQueueHistoryTests.dialog_text, root))
-
-    def test_plan_answers_use_native_option_numbers_and_single_line_feedback(self):
-        cases = [({"behavior": "allow", "option": 2}, [b"2"]),
-                 ({"behavior": "deny", "feedback": " 改成\n  cat notes.txt "}, [b"3", "改成 cat notes.txt".encode(), b"\r"])]
-        for answer, expected in cases:
-            native, sent = self.native(), []
-            native.terminal_input = lambda keys, dialog=None, sent=sent, **_: sent.append(keys)
-            request = native.dialog["id"]
-            with contextlib.redirect_stdout(io.StringIO()):
-                native.answer({"response": {"request_id": request, "response": answer}})
-            self.assertEqual(sent, [expected])
-            self.assertEqual(native.dialog["state"], "submitted", "已提交的审批不能被另一端重复提交")
-        for answer in ({"behavior": "allow", "option": 3}, {"behavior": "allow"},
-                       {"behavior": "deny", "feedback": "  "}):
-            native = self.native()
-            native.terminal_input = lambda *_args, **_kwargs: self.fail("非法回答不能发送按键")
-            with self.assertRaises(namespace["NativeError"]) as raised, contextlib.redirect_stdout(io.StringIO()):
-                native.answer({"response": {"request_id": native.dialog["id"], "response": answer}})
-            self.assertEqual(raised.exception.code, "EINVAL")
-
-
-class RewindDialogTests(unittest.TestCase):
-    # 画面取自 2.1.323 实测（测试 WSL，120 列，原样保留空行）：终端执行 /rewind 后的选消息页与确认页。
-    select = ("❯ 只回复 R1-OK\n● R1-OK\n" + "▔" * 40 + "\n   Rewind\n\n"
-              "   Restore the code and/or conversation to the point before…\n\n     只回复 R1-OK\n     No code changes\n\n"
-              "   ❯ 只回复 R2-OK\n     No code changes\n\n\n     ↓ 1 more\n\n   Enter to continue · Esc to cancel\n")
-    confirm = ("❯ 只回复 R1-OK\n● R1-OK\n" + "▔" * 40 + "\n   Rewind\n\n"
-               "   Confirm you want to restore to the point before you sent this message:\n\n   │ 只回复 R2-OK\n"
-               "   │ (5m ago)\n\n   The conversation goes back to before this message.\n   The code will be unchanged.\n\n"
-               "   ❯ 1. Restore conversation\n     2. Summarize from here\n     3. Summarize up to here\n"
-               "     4. Never mind\n")
-
-    def native(self, screen):
-        folder = tempfile.TemporaryDirectory()
-        self.addCleanup(folder.cleanup)
-        native = NativeSession("unused", "test-session", "rewind-job")
-        native.root = Path(folder.name)
-        native.initialized = True
-        native.job = {"short": "rewind-job", "sessionId": "test-session", "tempo": "blocked", "state": "blocked",
-                      "sessionStatus": "waiting", "sessionStatusAtMs": 4000, "needs": "dialog open"}
-        native.lookup = lambda: native.job
-        native.read_messages = lambda: None
-        native.context_configuration = lambda: {}
-        native.screen.feed(screen)
-        with contextlib.redirect_stdout(io.StringIO()):
-            native.poll()
-        return native
-
-    def answer(self, native, behavior="deny"):
-        with contextlib.redirect_stdout(io.StringIO()):
-            native.answer({"response": {"request_id": native.dialog["id"], "response": {"behavior": behavior}}})
-
-    def test_rewind_menu_pages_are_recognized_from_the_native_screen(self):
-        native = self.native(self.select)
-        dialog = native.dialog
-        self.assertEqual((dialog["kind"], dialog["step"], dialog["remoteSupported"], dialog["state"]),
-                         ("rewind", "select", True, "waiting"))
-        self.assertEqual(list(native.requests), [dialog["id"]])
-        moved = self.select.replace("   ❯ 只回复 R2-OK", "     只回复 R2-OK").replace("     只回复 R1-OK", "   ❯ 只回复 R1-OK")
-        self.assertNotEqual(moved, self.select)
-        self.assertEqual(namespace["native_dialog"](native.job, moved, "test-session")["id"], dialog["id"],
-                         "在选消息页移动光标不是新的菜单")
-        confirm = self.native(self.confirm).dialog
-        self.assertEqual((confirm["kind"], confirm["step"], confirm["description"]), ("rewind", "confirm", "只回复 R2-OK"))
-        self.assertEqual([option["label"] for option in confirm["options"]],
-                         ["Restore conversation", "Summarize from here", "Summarize up to here", "Never mind"])
-        self.assertNotEqual(confirm["id"], dialog["id"])
-        parse = namespace["native_rewind_dialog"]
-        self.assertIsNone(parse(self.select.replace("Esc to cancel", "")), "没有原生底栏时不认作菜单")
-        self.assertIsNone(parse(self.confirm.replace("4. Never mind", "4. Something else")), "没有取消项时不开放网页关闭")
-        self.assertIsNone(parse("● Rewind\n   Rewind\n正文\n"))
-        idle = {**native.job, "sessionStatus": "idle", "needs": None}
-        self.assertIsNone(namespace["native_dialog"](idle, self.select, "test-session"), "原生不在等待时不识别")
-
-    def test_rewind_menu_can_only_be_closed_from_the_web(self):
-        native, sent = self.native(self.select), []
-        native.terminal_input = lambda keys, dialog=None, **_: sent.append((keys, dialog["step"]))
-        self.answer(native)
-        self.assertEqual(sent, [(b"\x1b", "select")])
-        self.assertEqual(native.dialog["state"], "submitted", "已提交的关闭不能被另一端重复提交")
-        # 确认页：先选 Never mind 退回选消息页，重新读到选消息页后再按 Esc。
-        native, sent = self.native(self.confirm), []
-        native.terminal_input = lambda keys, dialog=None, **_: sent.append((keys, dialog["step"]))
-        native.read_terminal_screen = lambda: self.select.splitlines()
-        self.answer(native)
-        self.assertEqual(sent, [(b"4", "confirm"), (b"\x1b", "select")])
-        # 退回后读不到选消息页（终端已关闭菜单）时不追加按键。
-        native, sent = self.native(self.confirm), []
-        native.terminal_input = lambda keys, dialog=None, **_: sent.append((keys, dialog["step"]))
-        native.read_terminal_screen = lambda: ["❯", "⏵⏵ auto mode on (shift+tab to cycle)"]
-        self.answer(native)
-        self.assertEqual(sent, [(b"4", "confirm")])
-        native = self.native(self.select)
-        native.terminal_input = lambda *_args, **_kwargs: self.fail("网页不能确认回退")
-        with self.assertRaises(namespace["NativeError"]) as raised:
-            self.answer(native, "allow")
-        self.assertEqual(raised.exception.code, "EUNSUPPORTED")
 
 
 class NativeSubagentHistoryTests(unittest.TestCase):
@@ -3099,7 +1215,7 @@ class HistoryEditTests(unittest.TestCase):
         self.addCleanup(folder.cleanup)
         path = Path(folder.name) / "session.jsonl"
         path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
-        native = NativeSession("unused", "00000000-0000-4000-8000-000000000001", "00000000")
+        native = SdkReader("unused", "00000000-0000-4000-8000-000000000001")
         native.log_path = path
         native.read_messages()
         return native
@@ -3133,11 +1249,6 @@ class HistoryEditTests(unittest.TestCase):
         self.assertEqual([row["uuid"] for row in native.messages], ["a", "aa", "replacement", "new-reply"])
         self.assertTrue(all("content" not in row["message"] for row in native.retired_usage))
 
-    def test_native_terminal_charset_switch_does_not_invent_draft_text(self):
-        screen = namespace["Screen"]()
-        screen.feed("❯ \x1b(")
-        screen.feed("B\x0f")
-        self.assertEqual(screen.text(), ["❯"])
 
     def test_new_input_after_rewind_is_confirmed_by_append_offset_instead_of_old_index(self):
         native = self.read(self.rows())
@@ -3163,160 +1274,6 @@ class HistoryEditTests(unittest.TestCase):
         self.assertFalse(next(row for row in native.messages if row["uuid"] == "summary")["nativeEditable"])
         self.assertEqual(len(native.retired_usage), 2)
 
-    def edit_fixture(self):
-        # 用户确认的 B 方案：停止同一后台会话 → print 进程结构化回退 → respawn 同一会话 → 发送修改；全程不发终端按键。
-        native = self.read(self.rows())
-        folder = native.log_path.parent
-        native.lock_folder = folder / "locks"
-        native.session_cwd = str(folder)
-        native.model, native.effort = "test-model", "max"
-        native.read_messages = lambda: None
-        native.bind = lambda job: None
-        native.poll = lambda **options: None
-        live = {"short": "00000000", "tempo": "idle", "state": "done", "sessionStatus": "idle"}
-        native.lookup = lambda: live
-        footer = ["正文引用：1 shell · ↓ to manage", "────────────────", "❯ ", "────────────────",
-                  "⏵⏵ auto mode on (shift+tab to cycle)"]
-        native.current_screen = lambda: list(footer)
-        native.read_terminal_screen = MagicMock(side_effect=namespace["NativeError"]("EQUESTIONCHANGED"))
-        calls, sent = [], []
-        native.stop_job = lambda: calls.append("stop")
-        native.job_alive = lambda: False
-        native.session_holders = lambda: []
-
-        def rewind(target, last_seen, cwd):
-            calls.append(("rewind", target, last_seen, cwd))
-            native.delivery_started = True
-            return {"rewound": True, "targetMessageUuid": target}
-        native.run_rewind = rewind
-        native.restore_job = lambda: calls.append("respawn")
-        native.start = lambda text=None: calls.append("start")
-        native.terminal_input = lambda *args, **options: calls.append("keys")
-        native.reply = lambda *args, **options: calls.append("reply")
-        native.send = lambda request: sent.append(request) or {"accepted": True, "nativeId": native.native_id}
-        request = {"native_user_id": "b", "history_head": "done", "client_id": "new-message",
-                   "prompt": "修改后的问题B", "model": "test-model", "effort": "max"}
-        return native, request, sent, calls, live, footer
-
-    def test_edit_hands_off_with_structured_rewind_and_keeps_the_same_session(self):
-        native, request, sent, calls, _, _ = self.edit_fixture()
-        result = native.edit_message(request)
-        self.assertTrue(result["reverted"])
-        self.assertEqual(result["nativeId"], native.native_id)
-        # 正文里出现“to manage”不算后台任务；last_seen 取网页当前分支最后一条 user 记录。
-        self.assertEqual(calls, ["stop", ("rewind", "b", "b", native.session_cwd), "respawn"])
-        self.assertEqual([row["uuid"] for row in native.messages], ["a", "aa"])
-        self.assertEqual(sent[0]["content"], [{"type": "text", "text": request["prompt"]}])
-        self.assertTrue(sent[0]["idle_only"])
-
-    def test_busy_background_or_stale_edit_does_not_stop_or_rewind(self):
-        for case in ("busy", "waiting", "background", "no-footer", "stale"):
-            native, request, sent, calls, live, footer = self.edit_fixture()
-            if case == "background":
-                # 订阅流只重绘变化区域：底栏可能只剩被改写的后半段，也没有分隔线。
-                footer[:] = ["回复正文", "                  · 1 shell · ↓ to manage"]
-            elif case == "no-footer":
-                footer[:] = []
-            elif case == "stale":
-                request["history_head"] = "old"
-            else:
-                live["sessionStatus"] = case
-            with self.assertRaises(namespace["NativeError"]) as raised:
-                native.edit_message(request)
-            self.assertEqual(calls, [], case)
-            self.assertFalse(sent, case)
-            self.assertFalse(native.delivery_started, case)
-            self.assertEqual(raised.exception.code, "ESTALE" if case == "stale" else "EBUSY", case)
-
-    def test_current_screen_applies_pending_frames_and_keeps_web_requests_in_order(self):
-        native = NativeSession("unused", "00000000-0000-4000-8000-000000000001", "00000000")
-        native.incoming = namespace["queue"].Queue()
-        native.incoming.put({"_stream": "\x1b[2J\x1b[H回复\r\n  · 1 shell · ↓ to manage"})
-        native.incoming.put('{"type":"control_request","request_id":"1"}')
-        native.incoming.put('{"type":"control_request","request_id":"2"}')
-        self.assertTrue(native.background_work(native.current_screen()))
-        native.incoming.put({"_stream": "\r\x1b[K⏵⏵ auto mode on"})
-        self.assertFalse(native.background_work(native.current_screen()))
-        self.assertEqual([native.incoming.get_nowait() for _ in range(2)],
-                         ['{"type":"control_request","request_id":"1"}', '{"type":"control_request","request_id":"2"}'])
-
-    def test_refused_rewind_restores_the_same_session_without_changing_history(self):
-        native, request, sent, calls, _, _ = self.edit_fixture()
-        def refuse(target, last_seen, cwd):
-            calls.append("rewind")
-            raise namespace["NativeError"]("ESTALE", "原生会话有网页尚未显示的新内容，请刷新后重新编辑")
-        native.run_rewind = refuse
-        with self.assertRaisesRegex(namespace["NativeError"], "尚未显示"):
-            native.edit_message(request)
-        self.assertEqual(calls, ["stop", "rewind", "respawn"])
-        self.assertFalse(sent)
-        self.assertFalse(native.delivery_started)
-        self.assertIsNone(native.history.cut_before)
-        self.assertEqual([row["uuid"] for row in native.messages], ["a", "aa", "b", "bb", "done"])
-
-    def test_lost_rewind_answer_keeps_unknown_delivery_and_restores_the_session(self):
-        native, request, sent, calls, _, _ = self.edit_fixture()
-        def lost(target, last_seen, cwd):
-            calls.append("rewind")
-            native.delivery_started = True
-            raise RuntimeError("原生回退结果未知，修改后的消息未发送，请刷新核对历史")
-        native.run_rewind = lost
-        with self.assertRaisesRegex(RuntimeError, "结果未知"):
-            native.edit_message(request)
-        self.assertEqual(calls, ["stop", "rewind", "respawn"])
-        self.assertTrue(native.delivery_started)
-        self.assertFalse(sent)
-
-    def test_session_reopened_during_handoff_is_reported_without_respawn_or_send(self):
-        native, request, sent, calls, _, _ = self.edit_fixture()
-        native.job_alive = lambda: True
-        with self.assertRaisesRegex(namespace["NativeError"], "重新打开"):
-            native.edit_message(request)
-        self.assertEqual(calls, ["stop", ("rewind", "b", "b", native.session_cwd)])
-        self.assertFalse(sent)
-        self.assertFalse(native.delivery_started)
-
-    def test_failed_respawn_after_rewind_reports_the_edit_as_unsent(self):
-        native, request, sent, calls, _, _ = self.edit_fixture()
-        native.restore_job = MagicMock(side_effect=RuntimeError("原版 Claude 后台恢复失败"))
-        with self.assertRaisesRegex(namespace["NativeError"], "未发送"):
-            native.edit_message(request)
-        self.assertFalse(native.delivery_started)
-        self.assertEqual(native.history.cut_before, "b")
-        self.assertFalse(sent)
-
-    def test_failed_send_after_rewind_keeps_the_rewound_history(self):
-        native, request, sent, calls, _, _ = self.edit_fixture()
-        native.send = MagicMock(side_effect=namespace["NativeError"]("EBUSY"))
-        with self.assertRaises(namespace["NativeError"]):
-            native.edit_message(request)
-        self.assertEqual(native.history.cut_before, "b")
-        self.assertEqual(calls, ["stop", ("rewind", "b", "b", native.session_cwd), "respawn"])
-
-    def test_stopped_session_is_rewound_only_when_no_other_cli_holds_it(self):
-        native, request, sent, calls, _, _ = self.edit_fixture()
-        native.lookup = lambda: None
-        native.session_holders = lambda: [4321]
-        with self.assertRaises(namespace["NativeError"]) as raised:
-            native.edit_message(request)
-        self.assertEqual(raised.exception.code, "ESESSIONOPEN")
-        self.assertEqual(calls, [])
-        native, request, sent, calls, _, _ = self.edit_fixture()
-        native.lookup = lambda: None
-        native.edit_message(request)
-        self.assertEqual(calls, [("rewind", "b", "b", native.session_cwd), "respawn"])
-
-    def test_concurrent_web_edits_of_one_session_are_rejected(self):
-        native, request, sent, calls, _, _ = self.edit_fixture()
-        other = NativeSession("unused", native.native_id, "00000000")
-        other.lock_folder = native.lock_folder
-        with other.edit_lock():
-            with self.assertRaises(namespace["NativeError"]) as raised:
-                native.edit_message(request)
-        self.assertEqual(raised.exception.code, "EBUSY")
-        self.assertEqual(calls, [])
-        native.edit_message(request)
-        self.assertEqual(calls[-1], "respawn")
 
     def test_structured_rewind_marker_cuts_branch_until_the_edited_message_arrives(self):
         marker = {"type": "last-prompt", "leafUuid": "aa", "explicit": True, "rewound": True, "cutUuid": "b"}
@@ -3361,7 +1318,7 @@ class HistoryEditTests(unittest.TestCase):
             "    print(json.dumps({'type': 'control_response', 'response': value}), flush=True)",
         ]) + "\n", encoding="utf-8")
         cli.chmod(0o755)
-        native = NativeSession(str(cli), "00000000-0000-4000-8000-000000000001", "00000000")
+        native = SdkReader(str(cli), "00000000-0000-4000-8000-000000000001")
         self.assertTrue(native.run_rewind("b", "b", str(root))["rewound"])
         self.assertTrue(native.delivery_started)
         with self.assertRaises(namespace["NativeError"]) as raised:
@@ -3395,399 +1352,161 @@ class HistoryEditTests(unittest.TestCase):
         self.assertEqual(len(native.edit_content(target, "重复添加的原图仍保留")), 3)
 
 
-class SharedPermissionTests(unittest.TestCase):
-    def fixture(self, cycle=("default", "acceptEdits", "plan"), draft=""):
-        native = NativeSession("/fixture/claude", "11111111-2222-4333-8444-555555555555", "1234abcd")
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        native.root = Path(directory.name)
-        native.permission_catalog = ["default", "acceptEdits", "plan", "bypassPermissions", "dontAsk"]
-        live = {"short": "1234abcd", "pid": 1, "sessionStatus": "idle"}
-        native.lookup = lambda: live
-        position, keys = [0], []
-        labels = {"default": "? for shortcuts", "acceptEdits": "accept edits on",
-                  "plan": "plan mode on", "bypassPermissions": "bypass permissions on"}
-        native.read_terminal_screen = lambda: [
-            "助手正文提及 bypass permissions", "────────────────", "❯ " + draft,
-            "────────────────", labels[cycle[position[0]]] + " (shift+tab to cycle)"
+class SdkInterruptionTests(unittest.TestCase):
+    """Claude Agent SDK 传输下 interrupt 产生的中断标记行（字段取自 CLI 2.1.329 的真实记录）。"""
+    MARKER = "[Request interrupted by user]"
+
+    def rows(self):
+        return [
+            {"type": "user", "uuid": "u1", "promptId": "p1", "message": {"content": [{"type": "text", "text": "SLOW"}]}},
+            {"type": "assistant", "uuid": "a1", "parentUuid": "u1", "message": {"id": "msg_1", "content": [
+                {"type": "text", "text": "slow-0"}]}},
         ]
-        def switch(data, **options):
-            keys.append((data, options["permission"]["mode"]))
-            position[0] = (position[0] + 1) % len(cycle)
-        native.terminal_input = switch
-        return native, live, position, keys
 
-    def test_permission_footer_ignores_assistant_body_and_requires_empty_prompt(self):
-        native, _, _, _ = self.fixture()
-        self.assertEqual(namespace["permission_footer_mode"](native.read_terminal_screen()), "default")
-        self.assertTrue(namespace["empty_permission_prompt"](native.read_terminal_screen()))
-        self.assertIsNone(namespace["permission_footer_mode"](["助手正文：bypass permissions"]))
-        self.assertFalse(namespace["empty_permission_prompt"](["❯ 草稿", "────────────────", "? for shortcuts"]))
-        self.assertFalse(namespace["empty_permission_prompt"](["❯ ", "继续输入的第二行", "────────────────"]))
+    def marker(self, **overrides):
+        row = {"type": "user", "uuid": "m1", "parentUuid": "a1", "promptId": "p1", "entrypoint": "sdk-cli",
+               "userType": "external", "message": {"role": "user", "content": [{"type": "text", "text": self.MARKER}]}}
+        row.update(overrides)
+        return row
 
-    def test_idle_permission_switch_uses_only_verified_shift_tab_and_keeps_session(self):
-        native, _, _, keys = self.fixture()
-        result = native.change_permission_mode("plan")
-        self.assertEqual(keys, [(b"\x1b[Z", "default"), (b"\x1b[Z", "acceptEdits")])
-        self.assertEqual(result["nativeSettings"]["permissionMode"], "plan")
-        self.assertEqual(native.native_id, "11111111-2222-4333-8444-555555555555")
-        self.assertEqual(native.permission_mode, "plan")
+    def test_marker_written_by_an_sdk_interrupt_is_recognised_and_is_not_a_user_message(self):
+        evidence = namespace["native_sdk_interruption"](self.marker(), self.rows())
+        self.assertEqual(evidence["responseId"], "msg_1")
+        row = {**self.marker(), "nativeSdkInterruption": evidence}
+        self.assertTrue(namespace["native_interruption"](row))
+        self.assertFalse(namespace["real_user"](row), "中断标记不能成为可编辑的用户消息")
 
-    def test_bypass_permission_idle_session_respawns_same_uuid_and_confirms_native_mode(self):
-        native, live, position, keys = self.fixture(cycle=("default", "bypassPermissions"))
-        native.restore_job = MagicMock(side_effect=lambda: position.__setitem__(0, 1))
-        result = native.change_permission_mode("bypassPermissions")
-        native.restore_job.assert_called_once_with()
-        self.assertEqual(result["nativeSettings"]["permissionMode"], "bypassPermissions")
-        self.assertEqual(native.actual_settings["permissionMode"], "bypassPermissions")
-        self.assertEqual(native.permission_mode, "bypassPermissions")
-        self.assertEqual(keys, [])
-        self.assertEqual(live["sessionStatus"], "idle")
+    def test_marker_right_after_the_prompt_points_at_the_prompt_row(self):
+        evidence = namespace["native_sdk_interruption"](self.marker(parentUuid="u1"), self.rows()[:1])
+        self.assertEqual(evidence["responseId"], "u1")
 
-    def test_bypass_permission_busy_session_waits_without_respawn(self):
-        native, live, _, keys = self.fixture(cycle=("default", "bypassPermissions"))
-        live["sessionStatus"] = "busy"
-        native.restore_job = MagicMock(side_effect=AssertionError("执行中不能重启会话"))
-        result = native.change_permission_mode("bypassPermissions")
-        self.assertTrue(result["permissionPending"])
-        self.assertEqual(native.setting_changes["permissionMode"]["state"], "pending")
-        native.restore_job.assert_not_called()
-        self.assertEqual(keys, [])
+    def test_the_same_words_typed_by_the_user_stay_an_ordinary_message(self):
+        # 用户要求只认原生元数据：真人输入的新提示带 promptSource / turnOrigin / permissionMode，且有自己的 promptId。
+        typed = self.marker(promptId="p2", promptSource="typed", turnOrigin="human", permissionMode="default")
+        self.assertIsNone(namespace["native_sdk_interruption"](typed, self.rows()))
+        self.assertIsNone(namespace["native_sdk_interruption"](self.marker(promptSource="typed"), self.rows()))
+        self.assertTrue(namespace["real_user"](typed))
 
-    def test_bypass_permission_preserves_native_draft_without_respawn(self):
-        native, live, _, keys = self.fixture(cycle=("default", "bypassPermissions"), draft="保留草稿")
-        native.restore_job = MagicMock(side_effect=AssertionError("草稿存在时不能重启会话"))
-        result = native.change_permission_mode("bypassPermissions")
-        self.assertTrue(result["permissionPending"])
-        self.assertEqual(native.setting_changes["permissionMode"]["state"], "pending")
-        self.assertIn("草稿", native.setting_changes["permissionMode"]["reason"])
-        native.restore_job.assert_not_called()
-        self.assertEqual(keys, [])
-        self.assertEqual(live["sessionStatus"], "idle")
-
-    def test_pending_bypass_permission_respawns_after_current_turn_becomes_idle(self):
-        native, live, position, keys = self.fixture(cycle=("default", "bypassPermissions"))
-        live["sessionStatus"] = "busy"
-        native.change_permission_mode("bypassPermissions")
-        native.permission_retry_at = 0
-        native.restore_job = MagicMock(side_effect=lambda: position.__setitem__(0, 1))
-        live["sessionStatus"] = "idle"
-        native.retry_permission_mode(live)
-        native.restore_job.assert_called_once_with()
-        self.assertEqual(native.actual_settings["permissionMode"], "bypassPermissions")
-        self.assertEqual(native.setting_changes["permissionMode"]["state"], "applied")
-        self.assertEqual(keys, [])
-
-    def test_same_permission_preserves_native_draft_and_waiting_without_sending_keys(self):
-        for status, draft in (("idle", "保留原生未发送草稿"), ("busy", ""), ("waiting", "")):
-            with self.subTest(status=status, draft=draft):
-                native, live, _, keys = self.fixture(cycle=("acceptEdits",), draft=draft)
-                live["sessionStatus"] = status
-                if status == "waiting":
-                    live["needs"] = "permission prompt"
-                original_screen = native.read_terminal_screen()
-                result = native.change_permission_mode("acceptEdits")
-                self.assertEqual(result["nativeSettings"]["permissionMode"], "acceptEdits")
-                self.assertEqual(native.read_terminal_screen(), original_screen)
-                self.assertEqual(keys, [], "相同权限只确认状态，不能向草稿或审批面板发送快捷键")
-
-    def test_running_permission_switch_uses_native_cycle_without_interrupt_or_submission(self):
-        native, live, _, keys = self.fixture()
-        live["sessionStatus"] = "busy"
-        result = native.change_permission_mode("plan")
-        self.assertFalse(result.get("permissionPending", False))
-        self.assertEqual(result["nativeSettings"]["permissionMode"], "plan")
-        self.assertEqual(result["nativeSettings"]["changes"]["permissionMode"]["state"], "applied")
-        self.assertEqual([data for data, _ in keys], [b"\x1b[Z", b"\x1b[Z"])
-        self.assertEqual(live["sessionStatus"], "busy")
-
-    def test_instance_without_native_live_shortcut_defers_until_idle(self):
-        native, live, _, keys = self.fixture()
-        screen = native.read_terminal_screen
-        native.read_terminal_screen = lambda: [line.replace(" (shift+tab to cycle)", "") for line in screen()]
-        live["sessionStatus"] = "busy"
-        result = native.change_permission_mode("plan")
-        self.assertTrue(result["permissionPending"])
-        self.assertEqual(keys, [])
-        live["sessionStatus"] = "idle"
-        native.permission_retry_at = 0
-        native.retry_permission_mode(live)
-        self.assertEqual(native.actual_settings["permissionMode"], "plan")
-        self.assertEqual(native.setting_changes["permissionMode"]["state"], "applied")
-
-    def test_waiting_draft_unknown_or_unavailable_mode_stays_pending_without_sending_keys(self):
-        for reason in ("waiting", "draft", "unknown", "unavailable"):
-            native, live, _, keys = self.fixture(draft="未发送草稿" if reason == "draft" else "")
-            if reason == "waiting":
-                live.update(sessionStatus="waiting", needs="permission prompt")
-            elif reason == "unknown":
-                native.read_terminal_screen = lambda: ["────────────────", "❯ ", "────────────────", "unknown"]
-            result = native.change_permission_mode("bypassPermissions" if reason == "unavailable" else "plan")
-            self.assertTrue(result["permissionPending"], reason)
-            self.assertEqual(result["nativeSettings"]["changes"]["permissionMode"]["state"], "pending")
-            self.assertTrue(result["nativeSettings"]["changes"]["permissionMode"]["reason"])
-            self.assertEqual(keys, [], reason)
-
-    def test_unreachable_mode_restores_original_and_preserves_pending_choice(self):
-        native, _, position, keys = self.fixture(cycle=("default", "acceptEdits"))
-        result = native.change_permission_mode("plan")
-        self.assertTrue(result["permissionPending"])
-        self.assertIn("已恢复原权限", result["nativeSettings"]["changes"]["permissionMode"]["reason"])
-        self.assertEqual(position[0], 0)
-        self.assertEqual(len(keys), 2)
-        self.assertEqual(native.permission_mode, "plan")
-        self.assertEqual(native.actual_settings["permissionMode"], "default")
-
-    def test_pending_permission_retries_only_after_native_interaction_has_finished(self):
-        native, live, _, keys = self.fixture()
-        live.update(sessionStatus="waiting", needs="permission prompt")
-        native.change_permission_mode("plan")
-        native.permission_retry_at = 0
-        native.retry_permission_mode(live)
-        self.assertEqual(keys, [])
-        live.update(sessionStatus="idle", needs=None)
-        native.retry_permission_mode(live)
-        self.assertEqual(native.actual_settings["permissionMode"], "plan")
-        self.assertEqual(native.setting_changes["permissionMode"]["state"], "applied")
-
-    def test_pending_permission_restores_only_the_current_saved_choice(self):
-        native, live, _, _ = self.fixture(draft="保留草稿")
-        native.change_permission_mode("plan")
-        saved = {"settings": native.settings_projection()}
-        reopened = NativeSession("/fixture/claude", native.native_id, native.short)
-        reopened.permission_mode = "plan"
-        reopened.restore_settings(saved)
-        self.assertEqual(reopened.setting_changes["permissionMode"], native.setting_changes["permissionMode"])
-        other_choice = NativeSession("/fixture/claude", native.native_id, native.short)
-        other_choice.permission_mode = "acceptEdits"
-        other_choice.restore_settings(saved)
-        self.assertNotIn("permissionMode", other_choice.setting_changes)
-
-    def test_configured_mode_reads_only_the_selected_instance_and_keeps_rules(self):
-        native, _, _, _ = self.fixture()
-        original = {"permissions": {"defaultMode": "acceptEdits", "deny": ["Write"]}, "hooks": {"Stop": []}}
-        path = native.root / "settings.json"
-        path.write_text(json.dumps(original))
-        result = native.change_permission_mode("configured")
-        self.assertEqual(result["nativeSettings"]["permissionMode"], "acceptEdits")
-        self.assertEqual(native.permission_mode, "configured")
-        self.assertEqual(json.loads(path.read_text()), original)
-
-    def test_existing_global_bypass_mode_is_available_when_instance_configuration_allows_it(self):
-        native, _, _, keys = self.fixture(cycle=("bypassPermissions",))
-        (native.root / "settings.json").write_text(json.dumps({"permissions": {"defaultMode": "bypassPermissions"}}))
-        self.assertIn("bypassPermissions", native.permission_modes(), "实例全局配置已明确允许绕过权限")
-        result = native.change_permission_mode("configured")
-        self.assertEqual(result["nativeSettings"]["permissionMode"], "bypassPermissions")
-        self.assertEqual(keys, [], "原生状态栏已确认同一目标时不发送切换快捷键")
-
-    def test_native_launch_only_opens_bypass_when_explicitly_selected(self):
-        for mode in ("configured", "default", "bypassPermissions"):
-            native = NativeSession("/fixture/claude", "")
-            native.permission_mode = mode
-            native.permission_catalog = ["manual", "bypassPermissions"]
-            native.rpc = lambda _: {"jobs": [{"short": "1234abcd", "sessionId": "same-native-session"}]}
-            native.bind = MagicMock()
-            with patch.object(namespace["subprocess"], "run",
-                              return_value=SimpleNamespace(returncode=0, stdout=b"backgrounded: 1234abcd", stderr=b"")) as run:
-                native.start("fixture")
-            arguments = run.call_args.args[0]
-            self.assertEqual("--allow-dangerously-skip-permissions" in arguments, mode == "bypassPermissions")
-            self.assertEqual("--permission-mode" in arguments, mode != "configured")
-            if mode == "default":
-                self.assertEqual(arguments[arguments.index("--permission-mode") + 1], "manual")
+    def test_markers_without_the_native_evidence_are_not_recognised(self):
+        recognise = namespace["native_sdk_interruption"]
+        self.assertIsNone(recognise(self.marker(entrypoint="cli"), self.rows()), "终端传输沿用原有规则")
+        self.assertIsNone(recognise(self.marker(promptId="unknown"), self.rows()))
+        self.assertIsNone(recognise(self.marker(parentUuid="missing"), self.rows()))
+        quoted = {"content": [{"type": "text", "text": "请解释 " + self.MARKER}]}
+        self.assertIsNone(recognise(self.marker(message=quoted), self.rows()))
 
 
-class SharedTimeZoneRecoveryTests(unittest.TestCase):
-    def setUp(self):
-        folder = tempfile.TemporaryDirectory()
-        self.addCleanup(folder.cleanup)
-        self.environment = patch.dict(os.environ, {"TZ": "America/Los_Angeles"})
-        self.environment.start()
-        self.addCleanup(self.environment.stop)
-        self.native = NativeSession("native-cli", "1234abcd-0000-4000-8000-000000000000", "1234abcd")
-        self.native.root = Path(folder.name) / "native"
-        self.native.lock_folder = Path(folder.name) / "locks"
-        self.native.recovery_folder = Path(folder.name) / "recovery"
-        self.path = self.native.root / "jobs/1234abcd/state.json"
-        self.path.parent.mkdir(parents=True)
-        self.flags = ["--settings", '{"worktree":{"bgIsolation":"none"}}',
-                      "--model", "gpt-6.1-sol", "--effort", "max", "--autocompact", "200000",
-                      "--permission-mode", "bypassPermissions", "--allow-dangerously-skip-permissions"]
-        self.record = {"sessionId": self.native.native_id, "cwd": folder.name, "template": "bg",
-                       "name": "保留的名称", "nameSource": "user", "respawnFlags": self.flags,
-                       "providerEnv": {"PRIVATE_TOKEN": "must-not-be-copied"}}
-        self.path.write_text(json.dumps(self.record))
-        self.job = {"short": self.native.short, "sessionId": self.native.native_id, "tempo": "idle"}
-        self.native.shutdown = MagicMock(return_value={"stopped": True})
-        self.native.job_alive = MagicMock(return_value=False)
-        self.native.session_holders = MagicMock(return_value=[])
-        self.native.wait_restored_job = MagicMock(return_value=self.job)
-        self.native.start = MagicMock(side_effect=self.started)
-        self.journal = self.native.time_zone_recovery_directory() / f"timezone-{self.native.native_id}.json"
+class SessionHoldersTests(unittest.TestCase):
+    """别的进程持有原生会话时网页只读：只枚举 CLI 的进程登记，不抢占、不停止对方。"""
 
-    def started(self, *, launch_flags, registration_released, launch_cwd):
-        self.assertTrue(registration_released)
-        self.assertEqual(launch_cwd, self.record["cwd"])
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps({**self.record, "respawnFlags": launch_flags}))
+    NATIVE = "11111111-2222-4333-8444-555555555555"
 
-    def removed(self, arguments, **kwargs):
-        self.assertEqual(arguments, ["native-cli", "rm", "1234abcd"])
-        self.assertEqual(self.journal.stat().st_mode & 0o777, 0o600)
-        self.assertNotIn("must-not-be-copied", self.journal.read_text())
-        self.path.unlink()
-        return SimpleNamespace(returncode=0)
+    def register(self, root, pid, *, session=None, start=True, entrypoint="cli", kind="interactive"):
+        directory = Path(root) / "sessions"
+        directory.mkdir(parents=True, exist_ok=True)
+        record = {"pid": pid, "sessionId": session or self.NATIVE, "entrypoint": entrypoint, "kind": kind}
+        if start:
+            record["procStart"] = namespace["native_process_start"](pid)
+        (directory / f"{pid}.json").write_text(json.dumps(record), encoding="utf-8")
 
-    def test_old_job_recovers_same_identity_and_preserves_launch_options(self):
-        with patch.object(namespace["subprocess"], "run", side_effect=self.removed):
-            result = self.native.restore_job()
-        self.assertEqual(result["sessionId"], self.native.native_id)
-        flags = self.native.start.call_args.kwargs["launch_flags"]
-        settings = json.loads(flags[flags.index("--settings") + 1])
-        self.assertEqual(settings["env"], {"TZ": "America/Los_Angeles"})
-        self.assertEqual(flags[2:len(self.flags)], self.flags[2:])
-        self.assertEqual(flags[-1], "--name=保留的名称")
-        self.native.wait_restored_job.assert_called_once_with("1234abcd", self.native.native_id, None)
-        self.assertFalse(self.journal.exists())
+    def test_live_registered_process_holds_the_session_and_others_do_not(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.register(root, os.getpid(), entrypoint="cli")
+            holders = namespace["native_session_holders"](root, self.NATIVE)
+            self.assertEqual(holders, [{"pid": os.getpid(), "entrypoint": "cli", "kind": "interactive"}])
+            self.assertEqual(namespace["native_session_holders"](root, "99999999-2222-4333-8444-555555555555"), [])
 
-    def test_safe_refusals_preserve_job_and_never_remove_registration(self):
-        for reason in ("active", "native_draft", "background_work", "screen_unknown", "state_changed"):
-            with self.subTest(reason=reason):
-                self.native.shutdown.return_value = {"stopped": False, "reason": reason}
-                with patch.object(namespace["subprocess"], "run") as run:
-                    with self.assertRaises(namespace["NativeError"]):
-                        self.native.restore_job()
-                run.assert_not_called()
-                self.assertTrue(self.path.exists())
-                self.assertFalse(self.journal.exists())
-                self.native.start.assert_not_called()
+    def test_stale_registration_never_counts_even_when_the_pid_is_reused(self):
+        with tempfile.TemporaryDirectory() as root:
+            # PID 仍存在但启动标识不同：旧登记属于已退出的进程，不能造成永久“已在另一个应用中打开”。
+            self.register(root, os.getpid())
+            record = Path(root) / "sessions" / f"{os.getpid()}.json"
+            data = json.loads(record.read_text())
+            data["procStart"] = "1"
+            record.write_text(json.dumps(data), encoding="utf-8")
+            self.assertEqual(namespace["native_session_holders"](root, self.NATIVE), [])
+            # 进程已退出：登记残留也不算。
+            dead = 4_194_000
+            while Path(f"/proc/{dead}").exists():
+                dead -= 1
+            self.register(root, dead, start=False)
+            self.assertEqual(namespace["native_session_holders"](root, self.NATIVE), [])
+            # 损坏的登记文件按不存在处理，不抛错。
+            (Path(root) / "sessions" / "broken.json").write_text("{", encoding="utf-8")
+            self.assertEqual(namespace["native_session_holders"](root, self.NATIVE), [])
 
-    def test_failed_start_retries_from_private_journal_without_new_identity(self):
-        artifact = self.path.parent / "tmp/result.txt"
-        artifact.parent.mkdir()
-        artifact.write_text("启动失败也保留运行文件")
-        self.native.start.side_effect = RuntimeError("fixture launch failed")
-        with patch.object(namespace["subprocess"], "run", side_effect=self.removed):
-            with self.assertRaisesRegex(RuntimeError, "fixture launch failed"):
-                self.native.restore_job()
-        self.assertFalse(self.path.exists())
-        self.assertTrue(self.journal.exists())
-        self.native.start.side_effect = self.started
-        with patch.object(namespace["subprocess"], "run") as run:
-            result = self.native.restore_job()
-        run.assert_not_called()
-        self.assertEqual(result["sessionId"], self.native.native_id)
-        self.assertFalse(self.journal.exists())
-        self.assertEqual(artifact.read_text(), "启动失败也保留运行文件")
+    def test_processes_started_by_this_program_are_not_external_holders(self):
+        with tempfile.TemporaryDirectory() as root:
+            host = Path(root) / "claude-sdk-host.py"
+            # 宿主脚本启动一个子进程（相当于 CLI），子进程登记为该会话；它的父进程命令行里有宿主脚本路径。
+            host.write_text(
+                "import subprocess, sys, time\n"
+                "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+                "print(child.pid, flush=True)\n"
+                "time.sleep(30)\n", encoding="utf-8")
+            process = subprocess.Popen([sys.executable, str(host), "--serve"], stdout=subprocess.PIPE, text=True)
+            try:
+                child = int(process.stdout.readline())
+                self.register(root, child, entrypoint="sdk-cli")
+                self.assertEqual(len(namespace["native_session_holders"](root, self.NATIVE)), 1)
+                self.assertEqual(namespace["native_session_holders"](root, self.NATIVE, [str(host)]), [])
+                # 路径不完全相同的标记不能误伤：必须是命令行里的完整参数。
+                self.assertEqual(len(namespace["native_session_holders"](root, self.NATIVE, [str(host) + "x", "claude"])), 1)
+                self.assertEqual(len(namespace["native_session_holders"](root, self.NATIVE, [])), 1)
+            finally:
+                process.kill()
+                process.wait()
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(child, 9)
 
-    def test_worktree_auth_settings_and_changed_identity_are_not_migrated(self):
-        cases = [{"worktreePath": "/fixture/worktree"},
-                 {"sessionId": "other-session"},
-                 {"sessionPermissionRules": {"allow": ["Bash"]}},
-                 {"respawnFlags": ["--settings", '{"worktree":{"bgIsolation":"none"},"env":{"TOKEN":"private"}}']},
-                 {"respawnFlags": ["--settings", '{"env":{"TOKEN":"private"}}',
-                                   "--settings", '{"worktree":{"bgIsolation":"none"}}']},
-                 {"respawnFlags": ["--settings", "/fixture/private-settings.json"]}]
-        for fields in cases:
-            with self.subTest(fields=fields):
-                self.path.write_text(json.dumps({**self.record, **fields}))
-                with patch.object(namespace["subprocess"], "run") as run:
-                    with self.assertRaises(namespace["NativeError"]):
-                        self.native.restore_job()
-                run.assert_not_called()
-                self.native.shutdown.assert_not_called()
+    def test_discovery_reports_holders_without_starting_anything(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.register(root, os.getpid())
+            discovery = NativeDiscovery(root)
+            reply = discovery.control({"subtype": "holders", "native_id": self.NATIVE, "own": []})
+            self.assertEqual([holder["pid"] for holder in reply["holders"]], [os.getpid()])
+            with self.assertRaises(ValueError):
+                discovery.control({"subtype": "holders", "native_id": "not-a-uuid"})
+            with self.assertRaises(RuntimeError):
+                discovery.control({"subtype": "holders", "native_id": self.NATIVE, "own": ["x"] * 9})
 
-    def test_queued_native_input_and_reopened_session_block_registration_removal(self):
-        self.path.write_text(json.dumps({**self.record, "queuedPrompt": "尚未处理的输入"}))
-        with patch.object(namespace["subprocess"], "run") as run:
-            with self.assertRaises(namespace["NativeError"]):
-                self.native.restore_job()
-        run.assert_not_called()
-        self.native.shutdown.assert_not_called()
-        self.path.write_text(json.dumps(self.record))
-        self.native.job_alive.return_value = True
-        with patch.object(namespace["subprocess"], "run") as run:
-            with self.assertRaises(namespace["NativeError"]):
-                self.native.restore_job()
-        run.assert_not_called()
-        self.assertTrue(self.path.exists())
 
-    def test_matching_timezone_uses_native_respawn_without_reregistration(self):
-        self.path.write_text(json.dumps({**self.record, "respawnFlags": [
-            "--settings", '{"env":{"TZ":"America/Los_Angeles"}}']}))
-        with patch.object(namespace["subprocess"], "run", return_value=SimpleNamespace(returncode=0)) as run:
-            self.native.restore_job()
-        self.assertEqual(run.call_args.args[0], ["native-cli", "respawn", "1234abcd"])
-        self.native.shutdown.assert_not_called()
-        self.native.start.assert_not_called()
 
-    def test_same_session_history_edit_can_nest_environment_recovery_lock(self):
-        with self.native.edit_lock():
-            with self.native.edit_lock():
-                self.assertEqual(self.native.edit_lock_owner, namespace["threading"].get_ident())
-        self.assertIsNone(self.native.edit_lock_owner)
+class SdkHostConnectionTests(unittest.TestCase):
+    """宿主对 Harness 连接的超时只能限制发送，读取必须保持阻塞。
 
-    def test_original_runtime_files_are_restored_before_new_cli_starts(self):
-        runtime = self.path.parent / "tmp"
-        runtime.mkdir()
-        artifact = runtime / "result.txt"
-        artifact.write_text("保留已有运行文件")
-        original_start = self.started
+    真实联调里，计划确认等待超过一分钟时宿主丢掉了 Harness 连接：网页显示会话空闲、审批请求消失，CLI 仍在等回答。"""
 
-        def started(**kwargs):
-            self.assertEqual(artifact.read_text(), "保留已有运行文件")
-            return original_start(**kwargs)
+    def load_host(self):
+        # 与其他样例一样直接执行源码，不经导入机制，避免在源码目录留下字节码缓存。
+        path = Path(__file__).resolve().parents[1] / "crates/elves-harness/src/claude_sdk/host.py"
+        scope = {"__name__": "claude_sdk_host_test"}
+        exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), scope)
+        return scope
 
-        self.native.start.side_effect = started
-        with patch.object(namespace["subprocess"], "run", side_effect=self.removed):
-            self.native.restore_job()
-        self.assertEqual(artifact.read_text(), "保留已有运行文件")
-        self.assertFalse(any(self.native.time_zone_recovery_directory().glob("files-*")))
+    def test_a_silent_harness_is_not_dropped_by_a_read_timeout(self):
+        scope = self.load_host()
+        scope["CLIENT_SEND_TIMEOUT"] = 0.3
+        host = scope["Host"]("00000000-0000-4000-8000-000000000000", {})
+        # cat 充当 CLI：写入的内容原样回显，足以证明连接在沉默之后仍然双向可用。
+        host.cli = subprocess.Popen(["cat"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        server, client = socket.socketpair(socket.AF_UNIX)
+        self.addCleanup(client.close)
+        self.addCleanup(host.cli.wait)
+        self.addCleanup(host.cli.kill)
+        host.attach(server)
+        reader = client.makefile("rb")
+        self.assertEqual(json.loads(reader.readline())["type"], "host_hello")
+        # 读取方向不能有超时；旧实现 settimeout(60) 会在 Harness 沉默 60 秒后丢掉连接。
+        self.assertIsNone(server.gettimeout())
+        sending = server.getsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, 16)
+        seconds, micros = struct.unpack("ll", sending)
+        self.assertAlmostEqual(seconds + micros / 1_000_000, 0.3, places=1)
 
-    def test_idle_send_repairs_before_delivering_only_the_new_message(self):
-        native = self.native
-        native.lookup = lambda: self.job
-        native.bind = lambda job: None
-        native.read_messages = lambda: None
-        native.poll = lambda **kwargs: None
-        native.restore_job = MagicMock(return_value=self.job)
-        native.reply = MagicMock()
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = native.send({"client_id": "new-message", "content": [{"type": "text", "text": "新消息"}]})
-        self.assertTrue(result["accepted"])
-        native.restore_job.assert_called_once_with()
-        native.reply.assert_called_once_with("新消息", next_turn=False)
-
-    def test_active_send_waits_without_restarting_or_accepting_the_message(self):
-        native = self.native
-        live = {**self.job, "tempo": "active", "state": "working", "sessionStatus": "busy"}
-        native.lookup = lambda: live
-        native.bind = lambda job: None
-        native.read_messages = lambda: None
-        native.restore_job = MagicMock()
-        native.reply = MagicMock()
-        result = native.send({"client_id": "later", "steer": True,
-                              "content": [{"type": "text", "text": "稍后处理"}]})
-        self.assertTrue(result["deferred"])
-        self.assertFalse(result["accepted"])
-        native.restore_job.assert_not_called()
-        native.reply.assert_not_called()
-        native.shutdown.assert_not_called()
-
-    def test_failed_native_remove_can_retry_without_losing_runtime_files(self):
-        artifact = self.path.parent / "tmp/result.txt"
-        artifact.parent.mkdir()
-        artifact.write_text("移除失败也保留运行文件")
-        with patch.object(namespace["subprocess"], "run", return_value=SimpleNamespace(returncode=1)):
-            with self.assertRaises(namespace["NativeError"]):
-                self.native.restore_job()
-        self.assertTrue(self.journal.exists())
-        self.assertTrue(self.path.exists())
-        with patch.object(namespace["subprocess"], "run", side_effect=self.removed):
-            self.native.restore_job()
-        self.assertEqual(artifact.read_text(), "移除失败也保留运行文件")
-        self.assertFalse(self.journal.exists())
+        time.sleep(1.0)  # 超过发送超时数倍的沉默
+        self.assertIs(host.client, server)
+        client.sendall(b'{"type":"user","message":"still attached"}\n')
+        self.assertIn(b"still attached", host.cli.stdout.readline())
 
 
 if __name__ == "__main__":

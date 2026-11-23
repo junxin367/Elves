@@ -1,4 +1,7 @@
-"""原版 Claude 后台会话的 WSL 连接端；不运行模型、不修改 CLI、设置或权限。"""
+"""Claude 会话的 WSL 读取端：单个会话的历史读取器与只读原生发现；不运行模型、不连接 CLI、不修改 CLI、设置或权限。
+
+用户要求改用 Claude Agent SDK 对接后，执行、审批、问答和消息回执由 Rust 对端经 stream-json 控制协议完成，
+这里不再有 daemon 后台任务和终端画面识别。"""
 import argparse
 import base64
 import contextlib
@@ -48,166 +51,6 @@ REWIND_REFUSALS = {
 }
 
 
-class _FaintCell(str):
-    __slots__ = ()
-
-
-class Screen:
-    """只读取原版输出形成正文预览；最终 Markdown 和工具结果仍来自原生消息记录。"""
-    def __init__(self, *, track_intensity=False):
-        self.lines = {}
-        self.x = self.y = 0
-        self.carry = ""
-        self.track_intensity = track_intensity
-        self.faint = False
-
-    def update_intensity(self, parameters):
-        codes = iter(parameters.split(";"))
-        for code in codes:
-            if code in ("38", "48", "58"):
-                # 扩展颜色的参数不是独立样式；例如 38;5;2 的 2 是颜色索引，不是淡显。
-                mode = next(codes, "")
-                if mode not in ("2", "5"):
-                    self.faint = False
-                    break
-                for _ in range(3 if mode == "2" else 1):
-                    next(codes, None)
-            elif code in ("", "0", "1", "22"):
-                self.faint = False
-            elif code == "2":
-                self.faint = True
-
-    def feed(self, chunk):
-        text, self.carry = self.carry + chunk, ""
-        index = 0
-        while index < len(text):
-            character = text[index]
-            if character == "\x1b":
-                start = index
-                if index + 1 >= len(text):
-                    self.carry = text[start:]
-                    break
-                kind = text[index + 1]
-                if kind in ("(", ")", "*", "+", "-", ".", "/"):
-                    # 原生 attach 会发送 ESC(B 等字符集切换；跨包保留完整序列，不能把 B 当成输入内容。
-                    if index + 2 >= len(text):
-                        self.carry = text[start:]
-                        break
-                    index += 3
-                    continue
-                if kind in ("]", "P", "_", "^"):
-                    ends = [position for position in (text.find("\x07", index + 2),
-                            text.find("\x1b\\", index + 2)) if position >= 0]
-                    if not ends:
-                        self.carry = text[start:]
-                        break
-                    end = min(ends)
-                    index = end + (1 if text[end] == "\x07" else 2)
-                    continue
-                if kind == "[":
-                    end = index + 2
-                    while end < len(text) and not "@" <= text[end] <= "~":
-                        end += 1
-                    if end == len(text):
-                        self.carry = text[start:]
-                        break
-                    raw = text[index + 2:end]
-                    numbers = [int(value) if value.isdigit() else 0 for value in raw.split(";")]
-                    value = (numbers[0] or 1) if numbers else 1
-                    command = text[end]
-                    if not raw.startswith("?"):
-                        if command in ("H", "f"):
-                            self.y = max(0, value - 1)
-                            self.x = max(0, (numbers[1] if len(numbers) > 1 and numbers[1] else 1) - 1)
-                        elif command == "A":
-                            self.y = max(0, self.y - value)
-                        elif command == "B":
-                            self.y = min(4095, self.y + value)
-                        elif command == "C":
-                            self.x = min(4095, self.x + value)
-                        elif command == "D":
-                            self.x = max(0, self.x - value)
-                        elif command == "G":
-                            self.x = max(0, value - 1)
-                        elif command == "J":
-                            mode = numbers[0] if numbers else 0
-                            # 清屏必须同时处理光标所在行，否则短文本重绘会把上一帧的尾巴带进正文。
-                            # ED 3 仅清滚动历史；此缓冲只保存可见画面，不能因此清掉当前回复。
-                            if mode == 2:
-                                self.lines.clear()
-                            elif mode == 0:
-                                self.lines = {row: line for row, line in self.lines.items() if row <= self.y}
-                                self.lines[self.y] = self.lines.get(self.y, [])[:self.x]
-                            elif mode == 1:
-                                self.lines = {row: line for row, line in self.lines.items() if row >= self.y}
-                                line = self.lines.get(self.y, [])
-                                self.lines[self.y] = [" "] * min(self.x + 1, len(line)) + line[self.x + 1:]
-                        elif command == "K":
-                            mode = numbers[0] if numbers else 0
-                            if mode == 2:
-                                self.lines[self.y] = []
-                            elif mode == 0:
-                                self.lines[self.y] = self.lines.get(self.y, [])[:self.x]
-                            else:
-                                line = self.lines.get(self.y, [])
-                                self.lines[self.y] = [" "] * min(self.x + 1, len(line)) + line[self.x + 1:]
-                        elif command == "m" and self.track_intensity:
-                            self.update_intensity(raw)
-                    index = end + 1
-                    continue
-                if kind == "c":
-                    self.faint = False
-                index += 2
-                continue
-            if character == "\r":
-                self.x = 0
-            elif character == "\n":
-                self.y = min(4095, self.y + 1)
-            elif character == "\b":
-                self.x = max(0, self.x - 1)
-            elif character >= " " and character != "\x7f":
-                line = self.lines.setdefault(self.y, [])
-                while len(line) <= self.x:
-                    line.append(" ")
-                if unicodedata.combining(character):
-                    if self.x:
-                        line[self.x - 1] += character
-                else:
-                    line[self.x] = _FaintCell(character) if self.faint else character
-                    self.x += 1
-                    if unicodedata.east_asian_width(character) in ("W", "F"):
-                        if len(line) <= self.x:
-                            line.append("")
-                        else:
-                            line[self.x] = ""
-                        self.x += 1
-            index += 1
-
-    def text(self):
-        return ["".join(self.lines.get(row, [])).rstrip()
-                for row in range(max(self.lines, default=-1) + 1)]
-
-    def recovery_input_lines(self):
-        lines = self.text()
-        position = next((i for i in range(len(lines) - 1, -1, -1)
-                         if re.match(r"^\s*❯", lines[i])), None)
-        # 2.1.326/327 实测：失败后原版以 ANSI 淡显绘制恢复占位。只识别有完整下边框的精确占位，
-        # 普通样式的同文草稿、重绘后的输入、额外文本及无法读全的画面仍按原保护处理。
-        hint = "Once fixed, resend your message"
-        if (position is None or position + 1 == len(lines)
-                or not re.match(r"^\s*[─╌━]{6,}", lines[position + 1])
-                or lines[position].split("❯", 1)[1].strip() != hint):
-            return lines
-        cells = self.lines[position]
-        end = len(cells)
-        while end and not cells[end - 1].strip():
-            end -= 1
-        span = cells[end - len(hint):end]
-        if "".join(span) == hint and all(isinstance(cell, _FaintCell) for cell in span):
-            lines[position] = lines[position].split("❯", 1)[0] + "❯"
-        return lines
-
-
 def native_time(value):
     try:
         if isinstance(value, str):
@@ -215,20 +58,6 @@ def native_time(value):
         return max(0, int(value or 0))
     except (ValueError, TypeError, OverflowError):
         return 0
-
-
-def native_time_zone():
-    """只认当前 WSL 登录环境；没有可核对来源时不借用 Windows 或固定时区。"""
-    value = os.environ.get("TZ", "").strip()
-    if value:
-        if len(value) > 256 or any(c in value for c in "\0\r\n"):
-            raise NativeError("ETIMEZONE", "目标 WSL 的 TZ 无效，Claude 消息尚未发送")
-        return value
-    localtime = str(Path("/etc/localtime").resolve())
-    for prefix in ("/usr/share/zoneinfo/", "/usr/lib/zoneinfo/"):
-        if localtime.startswith(prefix) and len(localtime) > len(prefix):
-            return localtime[len(prefix):]
-    raise NativeError("ETIMEZONE", "无法核对目标 WSL 时区，Claude 消息尚未发送")
 
 
 def native_interruption(row):
@@ -243,10 +72,42 @@ def native_interruption(row):
     if not isinstance(reference, str) or not reference.strip():
         interruption = row.get("nativeToolInterruption")
         reference = interruption.get("responseId") if isinstance(interruption, dict) else None
+    if not isinstance(reference, str) or not reference.strip():
+        interruption = row.get("nativeSdkInterruption")
+        reference = interruption.get("responseId") if isinstance(interruption, dict) else None
     return (isinstance(reference, str) and bool(reference.strip()) and isinstance(content, list)
             and len(content) == 1 and isinstance(content[0], dict) and content[0].get("type") == "text"
             and isinstance(content[0].get("text"), str) and content[0]["text"].strip() in
             ("[Request interrupted by user]", "[Request interrupted by user for tool use]"))
+
+
+SDK_INTERRUPTION_TEXTS = ("[Request interrupted by user]", "[Request interrupted by user for tool use]")
+
+
+def native_sdk_interruption(row, previous):
+    """Claude Agent SDK（stream-json）传输下，用 interrupt 控制请求中止回复时 CLI 写入的中断标记（2.1.329 实测）。
+
+    这行没有 interruptedMessageId，entrypoint 是 sdk-cli，不带真人输入才有的 promptSource / turnOrigin /
+    turnAttributionKey / permissionMode，并且与被中断的那条提示共用同一个 promptId。用户要求只修正经原生元数据
+    确认的中断，所以这几条同时满足才认；用户自己输入同样文字的消息是一条新提示，带有这些属性，不会被吞掉。"""
+    message = row.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if (row.get("type") != "user" or not str(row.get("entrypoint") or "").startswith("sdk")
+            or not isinstance(content, list) or len(content) != 1 or not isinstance(content[0], dict)
+            or content[0].get("type") != "text" or content[0].get("text") not in SDK_INTERRUPTION_TEXTS):
+        return None
+    if any(key in row for key in ("promptSource", "turnOrigin", "turnAttributionKey", "permissionMode",
+                                  "interruptedMessageId")):
+        return None
+    prompt = row.get("promptId")
+    if not isinstance(prompt, str) or not prompt.strip() or not any(value.get("promptId") == prompt for value in previous):
+        return None
+    parent = next((value for value in reversed(previous) if value.get("uuid") == row.get("parentUuid")), None)
+    if not parent:
+        return None
+    response = parent.get("message", {}).get("id") if parent.get("type") == "assistant" else None
+    return {"responseId": response if isinstance(response, str) and response.strip() else parent["uuid"],
+            "source": "sdk-interrupt"}
 
 
 def native_tool_interruption(row, previous):
@@ -364,257 +225,6 @@ def normalize_skill_records(messages, pending):
         row["nativeSkillCommand"] = {"name": command["name"], "accepted": True}
         changed = True
     return changed
-
-
-def native_setting_dialog(text):
-    """仅识别原版完整的编号确认框；无编号、未知 Hook 面板等保留本机确认。"""
-    lines = [line.strip().strip("│").strip() for line in (text.splitlines() if isinstance(text, str) else text)]
-    for index in range(len(lines) - 1, -1, -1):
-        if lines[index] not in ("Switch model?", "Change effort level?"):
-            continue
-        body = lines[index:]
-        yes = next((i for i, line in enumerate(body)
-                    if re.fullmatch(r"(?:❯\s*)?1\.\s+Yes, switch to .+", line)), None)
-        if yes is None or yes + 1 >= len(body) or not re.fullmatch(
-                r"(?:❯\s*)?2\.\s+No, go back", body[yes + 1]):
-            return None
-        description = "\n".join(line for line in body[1:yes] if line)
-        if not any(hint in description for hint in (
-                "Your next response will be slower and use more tokens",
-                "A PreModelSwitch hook asked you to confirm")):
-            return None
-        target = body[yes].split("Yes, switch to ", 1)[1].strip()
-        return {"kind": "model" if lines[index] == "Switch model?" else "effort",
-                "target": target, "description": description}
-    return None
-
-
-PLAN_FEEDBACK_OPTION = "Tell Claude what to change"
-
-
-def native_plan_dialog(text, root=None):
-    """原版计划模式的 “Would you like to proceed?” 审批框（2.1.323 实测）。
-
-    用户要求网页能处理计划审批，不能再卡在“等待本机确认”：以 Yes 开头的批准项按编号即提交；
-    “Tell Claude what to change” 按编号后输入修改意见再回车。其余未知选项只读展示，不猜按键。
-    对话框出现时 ExitPlanMode 的 tool_use 可能尚未写入记录，所以只能依据画面识别。
-    """
-    lines = [line.strip().strip("│").strip() for line in (text.splitlines() if isinstance(text, str) else text)]
-    index = next((i for i in range(len(lines) - 1, -1, -1) if "Would you like to proceed?" in lines[i]
-                  and "written up a plan" in " ".join(lines[max(0, i - 1):i + 1])), None)
-    if index is None:
-        return None
-    options, footer = [], ""
-    for line in lines[index + 1:]:
-        match = re.fullmatch(r"(?:❯\s*)?(\d)\.\s+(.+)", line)
-        if match:
-            label = match[2].strip()
-            action = "approve" if label.startswith("Yes") else "feedback" if label == PLAN_FEEDBACK_OPTION else "unknown"
-            options.append({"index": int(match[1]), "label": label, "action": action})
-        elif "ctrl+g" in line or re.match(r"[─╌▔]{3}", line):
-            footer = line
-            break
-    if ([option["index"] for option in options] != list(range(1, len(options) + 1))
-            or not any(option["action"] == "approve" for option in options)):
-        return None
-    plan, path = "", ""
-    match = re.search(r"·\s*(~?/\S+/plans/[^/\s]+\.md)\s*$", footer)
-    if match and root:
-        try:
-            # 计划正文以原生计划文件为准（画面可能只显示一部分）；只读取当前配置目录 plans/ 下的文件。
-            resolved = Path(os.path.expanduser(match[1])).resolve()
-            if (resolved.is_relative_to((Path(root) / "plans").resolve()) and resolved.is_file()
-                    and resolved.stat().st_size <= 64 * 1024):
-                plan, path = resolved.read_text(encoding="utf-8", errors="replace").strip(), str(resolved)
-        except OSError:
-            plan, path = "", ""
-    if not plan:
-        start = next((i for i, line in enumerate(lines[:index]) if line == "Here is Claude's plan:"), None)
-        if start is not None:
-            plan = "\n".join(line for line in lines[start + 1:index]
-                             if line and not re.fullmatch(r"[╌─▔]+", line)).strip()
-    return {"kind": "plan", "target": "", "description": plan, "planPath": path, "options": options}
-
-
-REWIND_CANCEL_OPTION = "Never mind"
-
-
-def native_rewind_dialog(text):
-    """原版终端的回退菜单（/rewind，2.1.323 实测）。
-
-    用户要求网页能看出终端打开了回退菜单，并可从网页关闭（只取消，见 answer_rewind）。菜单打开期间原生状态为
-    waiting / dialog open，网页消息只进入原生队列，菜单关闭后才执行；终端确认回退时，排队消息接在回退点之后执行。
-    菜单分两页：选消息页标题下为 “Restore the code and/or conversation to the point before…”，底栏
-    “Enter to continue · Esc to cancel”；确认页为 “Confirm you want to restore to the point before you sent
-    this message:”，以 “│” 引用所选消息，下列编号选项（含 “Never mind”）。两页都必须完整匹配才识别。
-    """
-    raw = text.splitlines() if isinstance(text, str) else list(text)
-    lines = [line.strip().strip("│").strip() for line in raw]
-    index = next((i for i in range(len(lines) - 1, -1, -1) if lines[i] == "Rewind"), None)
-    # 原生菜单的标题、说明与列表之间隔有空行（实测），按非空行依次匹配。
-    rest = [line for line in lines[index + 1:] if line] if index is not None else []
-    if not rest:
-        return None
-    heading, body = rest[0], rest[1:]
-    if heading.startswith("Restore the code and/or conversation"):
-        if not any("Esc to cancel" in line for line in body):
-            return None
-        return {"kind": "rewind", "target": "", "description": "", "step": "select", "options": []}
-    if not heading.startswith("Confirm you want to restore"):
-        return None
-    quoted = [line.strip()[1:].strip() for line in raw[index + 1:] if line.strip().startswith("│")]
-    message = "\n".join(line for line in quoted
-                        if line and not re.fullmatch(r"\((?:[^()]*\bago|just now)\)", line))
-    options = []
-    for line in body:
-        match = re.fullmatch(r"(?:❯\s*)?(\d)\.\s+(.+)", line)
-        if match:
-            options.append({"index": int(match[1]), "label": match[2].strip()})
-    if ([option["index"] for option in options] != list(range(1, len(options) + 1))
-            or not any(option["label"] == REWIND_CANCEL_OPTION for option in options)):
-        return None
-    return {"kind": "rewind", "target": "", "description": message[:2000], "step": "confirm", "options": options}
-
-
-def native_dialog(job, text, native_id, root=None):
-    if job.get("sessionStatus") != "waiting":
-        return None
-    # 计划审批框的原生 needs 是 “permission prompt”，与工具审批相同，只能按画面区分。
-    plan = native_plan_dialog(text, root)
-    if plan is None and job.get("needs") != "dialog open":
-        return None
-    parsed = plan or native_setting_dialog(text) or native_rewind_dialog(text)
-    # 用户要求未知弹窗也可见，但不得猜按键；没有原生等待代次时只提供本机处理提示。
-    stamp = job.get("sessionStatusAtMs")
-    value = parsed or {"kind": "unknown", "target": "", "description": ""}
-    # attach 可能改变终端列宽；仅排版换行不构成新审批，实际说明或原生等待代次变化仍更换身份。
-    identity = [native_id, job.get("short"), stamp,
-                {key: " ".join(raw.split()) if isinstance(raw, str) else raw for key, raw in value.items()}]
-    return {**value, "id": "native-dialog-" + hashlib.sha256(
-        json.dumps(identity, sort_keys=True).encode()).hexdigest()[:32],
-        "statusAtMs": stamp, "remoteSupported": bool(parsed and stamp),
-        "state": "waiting"}
-
-
-def native_questions(block):
-    raw = block.get("questions") if isinstance(block, dict) else None
-    if not isinstance(raw, list) or not raw:
-        return None
-    questions, names = [], set()
-    for row in raw:
-        if not isinstance(row, dict) or not isinstance(row.get("question"), str) or not row["question"].strip():
-            return None
-        if row["question"] in names or not isinstance(row.get("options"), list):
-            return None
-        names.add(row["question"])
-        options = [{"label": option["label"], "description": option.get("description")
-                    if isinstance(option.get("description"), str) else ""}
-                   for option in row["options"] if isinstance(option, dict) and isinstance(option.get("label"), str)]
-        questions.append({"question": row["question"], "options": options,
-                          **{key: row[key] for key in ("header", "multiSelect") if key in row}})
-    return questions
-
-
-def native_question_request(job, native_id):
-    # 原生问答在回答前可能只存在于实时 block，不能等待 JSONL 出现 AskUserQuestion 才展示。
-    if job.get("sessionStatus") != "waiting" or job.get("needs") != "input needed":
-        return None
-    questions = native_questions(job.get("block"))
-    if not questions:
-        # 原生没有提供完整问题结构时也必须显示等待原因，不能退回“仍在执行”或猜测审批按键。
-        identity = [native_id, job.get("short"), job.get("sessionStatusAtMs"), "input needed"]
-        return {"subtype": "native_dialog", "dialog": {
-            "id": "native-question-" + hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:32],
-            "kind": "unknown", "target": "", "state": "waiting", "remoteSupported": False,
-            "description": "Claude 正在等待回答，但原生未提供完整问题数据，请在同一 CLI 会话中处理。"}}
-    stamp = job.get("sessionStatusAtMs")
-    if not stamp:
-        return None
-    identity = [native_id, job.get("short"), stamp, questions]
-    request_id = "native-question-" + hashlib.sha256(
-        json.dumps(identity, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:32]
-    return {"subtype": "can_use_tool", "tool_name": "AskUserQuestion", "input": {"questions": questions},
-            "nativeQuestion": {"id": request_id, "statusAtMs": stamp, "state": "waiting"}}
-
-
-def question_screen_lines(lines):
-    # 只解析问答左栏；原版右侧 diff 面板可能占同一终端行，连续空白分栏不能混入答案。
-    # 多选的焦点行是“❯    Submit”；先折叠光标后的缩进，不能把这个原生提交按钮当右栏截掉。
-    return [re.split(r"\s{3,}", re.sub(r"^❯\s+", "❯ ", line.strip().strip("│").strip()), maxsplit=1)[0]
-            for line in lines]
-
-
-def question_text_key(text):
-    return re.sub(r"[\s`*_│]", "", text)
-
-
-def native_question_page(lines, questions):
-    lines = question_screen_lines(lines)
-    starts = [index for index, line in enumerate(lines) if "✔ Submit" in line and ("←" in line or "→" in line)]
-    # 单问单选的原版面板没有 Submit 标签，选择后直接提交；仍须从当前问题和编号选项核对界面。
-    body = lines[starts[-1] + 1:] if starts else lines if len(questions) == 1 else []
-    if "Review your answers" in body and "Ready to submit your answers?" in body:
-        return {"index": len(questions), "review": body}
-    numbered = [i for i, line in enumerate(body) if re.match(r"^(?:❯\s*)?1\.\s", line)]
-    if not numbered:
-        return None
-
-    def first_option(line):
-        shown = question_text_key(re.sub(r"^(?:❯\s*)?1\.\s+(?:\[[^\]]\]\s+)?", "", line))
-        return bool(shown) and any(question["options"] and question_text_key(
-            question["options"][0]["label"]).startswith(shown) for question in questions)
-
-    # 选项说明同样按终端宽度折行，去掉缩进后续行行首可能是“1. ”（2026-11-15 实测 2.1.325：说明续行被当成选项 1，
-    # 真正的选项 1 丢失，回答会被改成自定义文字）。优先取显示为某个问题首个选项的编号行；对不上时沿用最后一个编号行。
-    option_start = ([i for i in numbered if first_option(body[i])] or numbered)[-1]
-    heading = question_text_key("".join(body[:option_start]))
-    matches = [i for i, question in enumerate(questions) if question_text_key(question["question"]) in heading]
-    if len(matches) != 1:
-        return None
-    choices, multi = {}, False
-    for line in body[option_start:]:
-        match = re.match(r"^(?:❯\s*)?([1-9])\.\s+(.*)$", line)
-        if match:
-            checkbox = re.match(r"^\[[^\]]\]\s+(.*)$", match[2])
-            multi = multi or checkbox is not None
-            choices[checkbox[1] if checkbox else match[2]] = match[1]
-    return {"index": matches[0], "choices": choices, "lines": body,
-            "multi": multi}
-
-
-def native_question_review_matches(lines, questions, answers):
-    # 汇总页的问题与答案都会按终端宽度折行，续行去掉竖线和缩进后，行首可能恰好是正文里的“→ ”或“● ”。
-    # 2026-11-15 实测 2.1.325（120x40）：长问题在竖线内折行，续行“→ 视图 → 编排”被当成答案，正确回答被判不一致。
-    # 因此不按行首符号切分，而是按预期问题与答案依次累积核对：累积内容必须始终是预期文本的前缀，完整后才进入下一部分；
-    # 缺项（原版只列已回答的问题）、多余内容或任何不同都判为不一致，不提交。
-    body = lines[lines.index("Review your answers") + 1:]
-    if "Ready to submit your answers?" not in body:
-        return False
-    body = body[:body.index("Ready to submit your answers?")]
-    position = 0
-
-    def take(marker, expected, normalize):
-        nonlocal position
-        while position < len(body) and not body[position]:
-            position += 1
-        if position >= len(body) or not body[position].startswith(marker):
-            return False
-        text = normalize(body[position][len(marker):])
-        position += 1
-        while text != expected:
-            if position >= len(body) or not expected.startswith(text):
-                return False
-            text += normalize(body[position])
-            position += 1
-        return True
-
-    for row in questions:
-        # 问题按原版显示文本比较（去掉 Markdown 标记与空白）；答案只去空白，下划线等字符必须原样一致。
-        if not take("● ", question_text_key(row["question"]), question_text_key):
-            return False
-        if not take("→ ", re.sub(r"\s", "", answers[row["question"]]), lambda text: re.sub(r"\s", "", text)):
-            return False
-    return not any(body[position:])
 
 
 def native_control_command(row):
@@ -997,108 +607,6 @@ def preview_prompt_key(content):
     return "".join(text.split())
 
 
-_PROGRESS_ACTIONS = ("reading", "writing", "editing", "creating", "deleting", "searching", "running", "executing")
-_PROGRESS_TARGETS = ("file", "files", "folder", "folders", "directory", "directories", "pattern", "patterns",
-                     "search", "searches", "shell command", "shell commands", "command", "commands", "tool", "tools")
-_PROGRESS_ACTION = "(?:" + "|".join(_PROGRESS_ACTIONS) + ")"
-_PROGRESS_TARGET = "(?:" + "|".join(sorted(_PROGRESS_TARGETS, key=len, reverse=True)) + ")"
-_PROGRESS_CLAUSE = rf"{_PROGRESS_ACTION}\s+\d+\s+{_PROGRESS_TARGET}"
-_PROGRESS_SEPARATOR = r"(?:\s*,\s*|\s+and\s+)"
-# 用户要求实时预览不能把 CLI 的工具分组行当成回复正文。2.1.325 真实画面（并行 MCP、读取、搜索）会把连续工具
-# 折叠成一行，例如：
-#   Calling playwright 3 times… (ctrl+o to expand)
-#   Searching for 1 pattern, reading 2 files, calling fake, other 3 times… (ctrl+o to expand)
-# 末尾展开提示只在 CLI 尚未多次显示时出现，所以可有可无。
-# 已完成的过去式（Searched for / Read / Listed / Called）取自 CLI 源码，尚未在真实画面观察到，按同一语法处理。
-_GROUP_LABEL = r"[\w.:@/-]+"
-
-
-def _literal_prefix(text):
-    # 固定文字展开成“任意前缀”的嵌套可选写法，用于被分包截断的最后一行。
-    pattern = ""
-    for char in reversed(text):
-        pattern = f"(?:{re.escape(char)}{pattern})?"
-    return pattern
-
-
-def _group_word(*words):
-    return "(?:" + "|".join(words) + ")", "(?:" + "|".join(_literal_prefix(word) for word in words) + ")"
-
-
-_GROUP_COUNT = (r"\d+", r"\d+")
-_GROUP_LABELS = (rf"{_GROUP_LABEL}(?:\s*,\s*{_GROUP_LABEL})*", rf"{_GROUP_LABEL}(?:\s*,\s*(?:{_GROUP_LABEL})?)*")
-# 每个模板是一个从句；“reading N files”等已由 _PROGRESS_CLAUSE 覆盖，这里只补句式不同的从句和过去式。
-_GROUP_TEMPLATES = (
-    (_group_word("searching", "searched"), _group_word("for"), _GROUP_COUNT, _group_word("pattern", "patterns")),
-    (_group_word("read"), _GROUP_COUNT, _group_word("file", "files")),
-    (_group_word("listing", "listed"), _GROUP_COUNT, _group_word("directory", "directories")),
-    (_group_word("calling", "called"), _GROUP_LABELS, _GROUP_COUNT, _group_word("time", "times")),
-)
-
-
-def _group_sequence_prefix(tokens):
-    full, prefix = tokens[0]
-    if len(tokens) == 1:
-        return prefix
-    return rf"(?:{full}(?:\s+(?:{_group_sequence_prefix(tokens[1:])})?)?|{prefix})"
-
-
-_GROUP_CLAUSE = "(?:" + "|".join(r"\s+".join(full for full, _ in tokens) for tokens in _GROUP_TEMPLATES) + ")"
-_GROUP_CLAUSE_PREFIX = "(?:" + "|".join(_group_sequence_prefix(tokens) for tokens in _GROUP_TEMPLATES) + ")"
-_PROGRESS_ANY = rf"(?:{_PROGRESS_CLAUSE}|{_GROUP_CLAUSE})"
-_PROGRESS_HINT = r"\(ctrl\+o to expand\)"
-_PROGRESS_HINT_PREFIX = _literal_prefix("(ctrl+o to expand)")
-_PROGRESS_LINE = re.compile(
-    rf"\s*{_PROGRESS_ANY}(?:{_PROGRESS_SEPARATOR}{_PROGRESS_ANY})*"
-    rf"(?:\s*[·•]\s*(?:\d+(?:\.\d+)?(?:ms|[hms])\s*)+)?(?:\.{{3}}|…)?(?:\s*{_PROGRESS_HINT})?\s*", re.IGNORECASE)
-# 只在尚未结束的最后一行延迟不完整的进度前缀，避免 Reading… 分包时先污染正文；
-# 一旦后续文字表明它是普通句子就正常展示，不能全局隐藏以这些单词开头的回复。
-_PROGRESS_ACTION_PREFIX = "(?:" + "|".join(sorted(
-    {word[:end] for word in _PROGRESS_ACTIONS for end in range(1, len(word) + 1)}, key=len, reverse=True)) + ")"
-_PROGRESS_TARGET_PREFIX = "(?:" + "|".join(sorted(
-    {word[:end] for word in _PROGRESS_TARGETS for end in range(1, len(word) + 1)}, key=len, reverse=True)) + ")"
-_PROGRESS_PARTIAL_CLAUSE = rf"(?:{_PROGRESS_ACTION_PREFIX}|{_PROGRESS_ACTION}\s+\d*|{_PROGRESS_ACTION}\s+\d+\s+{_PROGRESS_TARGET_PREFIX}?)?"
-_PROGRESS_PARTIAL = re.compile(
-    rf"\s*(?:{_PROGRESS_ANY}{_PROGRESS_SEPARATOR})*(?:{_PROGRESS_PARTIAL_CLAUSE}|{_GROUP_CLAUSE_PREFIX})\s*|"
-    rf"\s*{_PROGRESS_ANY}(?:{_PROGRESS_SEPARATOR}{_PROGRESS_ANY})*"
-    r"(?:\s+a(?:n(?:d\s*)?)?|\s*,\s*|\s*[·•]\s*[\d.hms\s…]*|\.{1,3}|…)\s*|"
-    rf"\s*{_PROGRESS_ANY}(?:{_PROGRESS_SEPARATOR}{_PROGRESS_ANY})*(?:\.{{3}}|…)?\s*{_PROGRESS_HINT_PREFIX}\s*",
-    re.IGNORECASE)
-
-
-def terminal_progress_line(line, partial=False):
-    # 工具进度可组合多个动作；只匹配完整进度语法，正式原生正文始终保持原文。
-    # 识别前合并空白，避免终端长缩进在不完整语法分支中反复回溯；不改写实际展示文本。
-    line = " ".join(line.split())
-    return _PROGRESS_LINE.fullmatch(line) is not None or (
-        partial and bool(line) and _PROGRESS_PARTIAL.fullmatch(line) is not None)
-
-
-def terminal_reply_region(lines, prompt, occurrences):
-    if not prompt:
-        # 纯图片或被终端折叠的输入没有可核对文字时，等待原生历史；不能借用上一条输入框。
-        return []
-    anchors = [index for index, line in enumerate(lines) if line.startswith("❯ ")]
-    matches = []
-    for position, anchor in enumerate(anchors):
-        end = anchors[position + 1] if position + 1 < len(anchors) else len(lines)
-        prompt_end = next((index for index in range(anchor + 1, end)
-                           if re.match(r"^● |^[✻✽✶✢·*]\s|^[─╌]{8}|^\s*ctrl\+", lines[index])), end)
-        visible = "\n".join([lines[anchor][2:]] + lines[anchor + 1:prompt_end])
-        if preview_prompt_key(visible) == prompt:
-            matches.append((prompt_end, end))
-    # 重复输入必须在当前画面中出现到同一原生序次，不能把旧画面回复绑定到新 UUID。
-    # 终端尾部被截断、序次无法确认时仅停用临时预览，不影响发送、工具或正式历史。
-    if len(matches) < occurrences:
-        return []
-    start, end = matches[-1]
-    marker = next((index for index in range(end - 1, start - 1, -1)
-                   if lines[index].startswith("● ")), None)
-    if marker is None:
-        return []
-    return [lines[marker][2:]] + [line[2:] if line.startswith("  ") else line for line in lines[marker + 1:end]]
-
-
 def native_pending_tool_uses(rows):
     # 用户要求实时预览不能把工具进度当回复正文：记录里已有 tool_use 而结果未返回时模型在等工具，不可能在流式输出文字，
     # 此时终端上的 “●” 一定是工具分组行。工具进度改由正式 tool_use 条目（inProgress）在活动区显示。
@@ -1368,66 +876,72 @@ def native_json(path):
         return {}
 
 
-def native_activity(root, job, native_id, *, stored=None, workers=None):
-    """后台列表负责定位进程；执行状态来自同一原生任务和存活会话的记录。"""
-    short = job.get("short", "")
-    if not isinstance(short, str) or not re.fullmatch(r"[0-9a-f]{8}", short):
-        return job
-    fields = ("tempo", "state", "needs", "detail", "outcome", "block")
-    result = {**job, **dict.fromkeys(fields)}
-    stored = native_json(root / "jobs" / short / "state.json") if stored is None else stored
-    if (stored.get("resumeSessionId") or stored.get("sessionId")) == native_id:
-        result.update({key: stored.get(key) for key in fields})
-        if stored.get("state") in ("done", "stopped", "failed", "ended"):
-            # updatedAt 也会被重命名/设置更新，不能当作本轮完成时间。
-            result["endedAtMs"] = native_time(stored.get("lastTerminalAt") or stored.get("firstTerminalAt"))
-    if job.get("outcome"):
-        result["outcome"] = job["outcome"]
-    # 用户要求仅明确执行中才排队。daemon list 的 running/resuming 是宿主记录，
-    # 不能覆盖已结束轮次；只定向读取此 job 的 REPL，不扫描其他会话或启动 CLI。
-    if workers is None:
-        workers = native_json(root / "daemon" / "roster.json").get("workers", {})
-    worker = workers.get(short, {}) if isinstance(workers, dict) else {}
-    if not isinstance(worker, dict):
-        return result
-    pid = worker.get("replPid")
-    if worker.get("sessionId") not in (native_id, job.get("sessionId")) or type(pid) is not int or pid <= 1:
-        return result
-    record = native_json(root / "sessions" / f"{pid}.json")
-    if (record.get("pid") != pid or record.get("sessionId") != native_id
-            or record.get("jobId") != short or record.get("procStart") is None):
-        return result
+def native_process_start(pid):
+    """/proc 的第 22 列是进程启动标识；先越过可能含空格的 comm，用来识别被复用的 PID。"""
     try:
-        # /proc 的第 22 列为进程启动标识；先越过可能含空格的 comm，防止复用 PID 的旧登记误报执行中。
-        started = (Path("/proc") / str(pid) / "stat").read_text().rsplit(") ", 1)[1].split()[19]
-        if str(record["procStart"]) != started:
-            return result
+        return (Path("/proc") / str(pid) / "stat").read_text().rsplit(") ", 1)[1].split()[19]
     except (OSError, IndexError):
-        return result
-    state = record.get("status")
-    if state not in ("busy", "idle", "waiting"):
-        return result
-    result["sessionStatus"] = state
-    result["sessionStatusAtMs"] = native_time(record.get("statusUpdatedAt"))
-    if state == "busy":
-        result.update(tempo="active", state="working", needs=None, outcome=None)
-        result.pop("endedAtMs", None)
-    elif state == "waiting":
-        result.update(tempo="blocked", state="blocked",
-                      needs=record.get("waitingFor") or result.get("needs"), outcome=None)
-        result.pop("endedAtMs", None)
-    else:
-        result.update(tempo="idle", needs=None)
-        if result.get("state") not in ("done", "stopped", "failed", "ended"):
-            result["state"] = "idle"
-    return result
+        return None
+
+
+def native_owned_by(pid, markers):
+    """进程自身或最多六层父进程的命令行参数恰为某个标记（本程序的宿主/读取器脚本路径）时视为本程序所有。"""
+    markers = {marker for marker in markers if isinstance(marker, str) and marker}
+    if not markers:
+        return False
+    for _ in range(6):
+        if pid <= 1:
+            return False
+        try:
+            arguments = (Path("/proc") / str(pid) / "cmdline").read_bytes().split(b"\0")
+            if any(argument.decode("utf-8", "replace") in markers for argument in arguments):
+                return True
+            pid = int((Path("/proc") / str(pid) / "stat").read_text().rsplit(") ", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            return False
+    return False
+
+
+def native_session_holders(root, native_id, own=()):
+    """仍在运行并登记为该原生会话的 CLI 进程：用户终端里的 claude、旧版 Elves 的后台任务、其他应用的 SDK 宿主等。
+
+    用户要求别的应用持有会话时网页只读，所以这里只枚举，不抢占、不停止对方。
+    `own` 是本程序宿主和读取器脚本的 WSL 路径；属于它们（含子进程）的 CLI 是本程序自己持有的，不算在内。
+    登记文件在进程退出后会被清理，残留文件靠 PID 存活和启动标识核对，防止复用 PID 造成永久误报。
+    """
+    holders = []
+    for path in (Path(root) / "sessions").glob("*.json"):
+        record = native_json(path)
+        if record.get("sessionId") != native_id:
+            continue
+        try:
+            pid = int(record.get("pid", path.stem))
+        except (TypeError, ValueError):
+            continue
+        if pid <= 1:
+            continue
+        started = native_process_start(pid)
+        if started is None:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                continue
+            except PermissionError:
+                pass
+        elif record.get("procStart") is not None and str(record["procStart"]) != started:
+            continue
+        if native_owned_by(pid, own):
+            continue
+        holders.append({"pid": pid, "entrypoint": str(record.get("entrypoint") or "")[:40],
+                        "kind": str(record.get("kind") or "")[:40]})
+    return sorted(holders, key=lambda holder: holder["pid"])
 
 
 class NativeDiscovery:
     """只读原生目录；不调用 CLI、守护进程或模型，也不使用网页登记文件作为发现来源。"""
     def __init__(self, root=None):
         self.root = Path(root or os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")).resolve()
-        self.logs, self.readers, self.rows, self.jobs = {}, {}, {}, {}
+        self.logs, self.readers, self.rows = {}, {}, {}
         self.scanned_at = None
         self.bytes_read = 0
 
@@ -1435,7 +949,7 @@ class NativeDiscovery:
         # 用户要求正常刷新自动发现且不高频重扫正文：目录元数据最多每两秒核对，JSONL 仅从已读取偏移继续。
         if not force and self.scanned_at is not None and time.monotonic() - self.scanned_at < 2:
             return list(self.rows.values())
-        rows, jobs, alive = {}, {}, set()
+        rows, alive = {}, set()
         projects = (self.root / "projects").resolve()
         for path in projects.glob("*/*.jsonl"):
             try:
@@ -1507,46 +1021,12 @@ class NativeDiscovery:
             except (OSError, ValueError, TypeError):
                 continue
         self.logs = {path: data for path, data in self.logs.items() if path in alive}
-        for path in (self.root / "jobs").glob("*/state.json"):
-            try:
-                if not re.fullmatch(r"[0-9a-f]{8}", path.parent.name) or not path.resolve().is_relative_to((self.root / "jobs").resolve()):
-                    continue
-                raw_job = json.loads(path.read_text(encoding="utf-8"))
-                # 只保留会话归属/展示元数据；providerEnv、提示模板和认证信息不能进入发现缓存或返回值。
-                job = {key: raw_job[key] for key in ("sessionId", "resumeSessionId", "cwd", "name", "nameSource", "createdAt", "updatedAt", "firstTerminalAt", "lastTerminalAt",
-                       "tempo", "state", "needs", "detail", "outcome") if key in raw_job}
-                # 已有会话首次打开也要恢复实时问答；只保留问题与选项，不带入原始 job 的其他私有字段。
-                questions = native_questions(raw_job.get("block"))
-                if questions:
-                    job["block"] = {"questions": questions}
-                flags = raw_job.get("respawnFlags", [])
-                for index, flag in enumerate(flags[:-1]):
-                    if flag in ("--model", "--effort"):
-                        job[flag[2:]] = flags[index + 1]
-                native = str(uuid.UUID(job.get("resumeSessionId") or job["sessionId"]))
-                if native not in rows:
-                    continue
-                current = jobs.get(native)
-                if current is None or (job.get("tempo") in ("active", "blocked") and not job.get("outcome"), native_time(job.get("updatedAt"))) > (
-                        current.get("tempo") in ("active", "blocked") and not current.get("outcome"), native_time(current.get("updatedAt"))):
-                    jobs[native] = {**job, "short": path.parent.name}
-            except (OSError, ValueError, KeyError, TypeError):
-                continue
-        workers = native_json(self.root / "daemon" / "roster.json").get("workers", {})
         for native, row in rows.items():
-            job = jobs.get(native, {})
-            row["jobId"] = job.get("short", "")
-            row["nativeStatus"] = self.status(native_activity(self.root, job, native, stored=job, workers=workers))
-            if job.get("nameSource") == "user" and job.get("name") and not row["title"]:
-                row["title"] = str(job["name"])[:120]
-            for key in ("cwd", "model", "effort"):
-                if not row[key] and isinstance(job.get(key), str):
-                    row[key] = job[key]
-            for key in ("createdAt", "updatedAt"):
-                if not row[key]:
-                    row[key] = native_time(job.get(key))
+            # 用户要求改用 Claude Agent SDK 对接：不再读取 daemon 后台任务；会话是否被别的进程持有由 holders 单独核对，
+            # 发现列表里的会话没有 Elves 自己的执行状态，一律按空闲展示。
+            row["nativeStatus"] = self.status({})
         rows = {native: row for native, row in rows.items() if row["cwd"].startswith("/")}
-        self.rows, self.jobs, self.scanned_at = rows, jobs, time.monotonic()
+        self.rows, self.scanned_at = rows, time.monotonic()
         return list(rows.values())
 
     @staticmethod
@@ -1573,6 +1053,13 @@ class NativeDiscovery:
             return {}
         if subtype == "discover":
             return {"sessions": self.scan(force=True)}
+        if subtype == "holders":
+            # 只读核对别的进程是否持有某个原生会话；不 initialize、不恢复会话、不启动 CLI。
+            native = str(uuid.UUID(request["native_id"]))
+            own = request.get("own", [])
+            if not isinstance(own, list) or len(own) > 8:
+                raise RuntimeError("本程序脚本标记无效")
+            return {"holders": native_session_holders(self.root, native, own)}
         if subtype not in ("read_history", "read_subagents", "read_subagent"):
             raise RuntimeError("只读发现连接不接受执行操作")
         native = str(uuid.UUID(request["native_id"]))
@@ -1581,7 +1068,7 @@ class NativeDiscovery:
             raise RuntimeError("指定 WSL 内没有该原生会话的有效历史")
         reader = self.readers.get(native)
         if reader is None:
-            reader = NativeSession("unused", native)
+            reader = SdkReader("unused", native)
             reader.root = self.root
             self.readers[native] = reader
             # 只缓存最近四条打开的完整历史，发现索引本身只保存非敏感元数据和偏移。
@@ -1605,85 +1092,20 @@ class NativeDiscovery:
         reader.restore_compaction_events(request.get("native_control") or {})
         reader.model = request.get("model", "")
         reader.restore_settings(request.get("native_control") or {})
-        reader.restore_question_reply(request.get("native_control") or {})
         reader.read_messages()
         row = self.rows[native]
-        reader.short = row["jobId"]
-        reader.job = self.jobs.get(native, row["nativeStatus"])
-        reader.dialog = native_dialog(row["nativeStatus"], "", native)
-        question = native_question_request(
-            {**self.jobs.get(native, {}), **row["nativeStatus"], "short": row["jobId"]}, native)
-        requests = reader.question_requests(question) if question else (
-            {reader.dialog["id"]: {"subtype": "native_dialog", "dialog": reader.dialog}} if reader.dialog else {})
-        return {"type": "shared_snapshot", "native_id": native, "job_id": row["jobId"],
+        # 发现的会话没有 Elves 自己的 CLI，也就没有待回答的审批或问答；执行状态按空闲展示。
+        return {"type": "shared_snapshot", "native_id": native, "job_id": "",
                 "native_status": self.status(row["nativeStatus"], reader.messages), "messages": reader.messages,
                 "history_head": reader.history.current_head(),
                 "retired_usage": reader.retired_usage,
                 "clients": reader.clients, "pending": reader.pending,
-                "requests": requests,
+                "requests": {},
                 "context_configuration": reader.context_configuration(), "updated_at": row["updatedAt"],
                 "native_control": reader.control_projection()}
 
     def poll(self, force=False):
         pass
-
-
-def permission_footer_mode(lines):
-    # 只识别输入框下方的原生状态栏，不能把助手正文或用户引用当成权限已切换的证据。
-    separators = [index for index, line in enumerate(lines) if re.match(r"^\s*[─╌━]{6,}", line)]
-    if not separators:
-        return None
-    footer = " ".join(lines[separators[-1] + 1:]).strip().lower()
-    for phrase, mode in (
-        ("bypass permissions", "bypassPermissions"), ("permissions bypassed", "bypassPermissions"),
-        ("accept edits", "acceptEdits"), ("plan mode", "plan"), ("auto mode", "auto"),
-        ("don't ask", "dontAsk"), ("dontask", "dontAsk"),
-        ("manual mode", "default"), ("default mode", "default"),
-    ):
-        if phrase in footer:
-            return mode
-    if "for shortcuts" in footer and "mode" not in footer and "permissions" not in footer:
-        return "default"
-    return None
-
-
-def empty_permission_prompt(lines):
-    # 改权限不能清除或提交另一个终端正在编辑的草稿，也不能把快捷键送入确认框。
-    positions = [index for index, line in enumerate(lines) if re.match(r"^\s*❯", line)]
-    if not positions:
-        return False
-    position = positions[-1]
-    if re.sub(r"^\s*❯", "", lines[position]).strip():
-        return False
-    trailing = lines[position + 1:]
-    end = next((index for index, line in enumerate(trailing) if re.match(r"^\s*[─╌━]{6,}", line)), None)
-    return end is not None and not any(line.strip() for line in trailing[:end])
-
-
-def native_input_state(lines, *, allow_borderless=False):
-    """判断原生输入框是空闲、含草稿还是无法确认。"""
-    positions = [index for index, line in enumerate(lines) if re.match(r"^\s*❯", line)]
-    if not positions:
-        return "unknown"
-    position = positions[-1]
-    if re.sub(r"^\s*❯", "", lines[position]).strip():
-        return "draft"
-    trailing = lines[position + 1:]
-    end = next((index for index, line in enumerate(trailing) if re.match(r"^\s*[─╌━]{6,}", line)), None)
-    if end is None:
-        # Claude 2.1.325 后台完整快照实测：空闲输入区可只有 ❯ 和后续空白行，没有下边框。
-        # 仅回收路径在原生状态明确 idle 时启用；截断在 ❯ 的单行片段仍保持未知。
-        if allow_borderless and trailing:
-            return "draft" if any(line.strip() for line in trailing) else "empty"
-        return "unknown"
-    return "draft" if any(line.strip() for line in trailing[:end]) else "empty"
-
-
-def permission_live_shortcut(lines):
-    # 只有当前实例的原生状态栏明确提示此快捷键时，才确认执行中可用；其它版本保留空闲后切换。
-    separators = [index for index, line in enumerate(lines) if re.match(r"^\s*[─╌━]{6,}", line)]
-    footer = " ".join(lines[separators[-1] + 1:]) if separators else ""
-    return bool(re.search(r"shift\s*\+\s*tab\s+to\s+cycle", footer, re.I))
 
 
 def native_history_updated_at(rows):
@@ -1703,15 +1125,11 @@ def native_history_updated_at(rows):
 
 
 class NativeSession:
-    def __init__(self, cli, native_id, job_id=""):
+    def __init__(self, cli, native_id):
         self.cli = cli
-        self.auto_compact_window = None
         self.root = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")).resolve()
         digest = hashlib.sha256(str(self.root).encode()).hexdigest()[:8]
-        self.address = f"/tmp/cc-daemon-{os.getuid()}/{digest}/control.sock"
         self.native_id = native_id
-        # 已结束会话也要按保存的后台 ID 读取历史；不能依赖仍在线的 supervisor 才能补齐排队状态。
-        self.short = job_id
         self.model = ""
         self.effort = ""
         self.messages = []
@@ -1721,7 +1139,6 @@ class NativeSession:
         self.image_inputs = {}
         self.clients = {}
         self.pending = []
-        self.job = {}
         self.signature = None
         self.log_path = None
         self.log_offset = 0
@@ -1731,22 +1148,15 @@ class NativeSession:
         self.initialized = False
         self.seen = set()
         self.incoming = None
-        self.observer = None
-        self.observed_short = ""
-        self.screen = Screen()
-        # 已确认被原生撤回（出字前停止）的输入 UUID，见 withdrawn_prompt。
-        self.withdrawn = set()
         # 定时任务触发记录 UUID → 原生说明，见 scheduled_prompt。
         self.scheduled_fires = {}
         self.preview_user = ""
         self.preview_basis = ""
         self.preview_context_cache = None
         self.preview_prompt_cache = None
-        self.preview_dirty = False
         self.delivery_started = False
         self.preview = ""
         self.preview_emitted = ""
-        self.preview_at = 0
         self.context_files = {}
         self.native_context = {}
         self.goal = None
@@ -1755,7 +1165,6 @@ class NativeSession:
         self.compaction = {"state": "idle"}
         self.native_commands = []
         self.native_capabilities = {}
-        self.control_screen_before = ""
         self.compaction_screen_active = False
         self.compaction_events = {}
         self.compaction_event_id = ""
@@ -1764,25 +1173,14 @@ class NativeSession:
         self.actual_settings = {}
         self.setting_evidence_at = {}
         self.setting_catalog = []
-        self.dialog = None
-        self.answered_dialog = ""
-        self.question_reply = None
-        self.question_layout = {"id": "", "multi": set()}
         self.permission_mode = None
         self.permission_catalog = []
-        self.permission_launch_key = None
-        self.permission_launch_flags = []
-        self.permission_retry_at = 0
-        # bypassPermissions 依赖会话启动权限；同一会话只允许一次自动 respawn，
-        # 避免旧 CLI 无法实时切换时每次轮询都重启原生进程。
-        self.permission_respawn_key = None
         self.session_cwd = ""
         # Claude CLI 升级后，旧会话进程可能仍在运行；记录自动迁移状态，让网页能解释延迟，
         # 并确保同一条消息只在确认新进程接管同一会话后重试一次。
         self.version_recovery = None
         self.lock_folder = Path(f"/tmp/codex-elves-claude-{os.getuid()}")
         self.edit_lock_owner = None
-        self.recovery_folder = Path.home() / ".local/state/elves/claude-environment-recovery"
 
     def control_projection(self):
         current = self.compaction_events.get(self.compaction_event_id)
@@ -1794,31 +1192,8 @@ class NativeSession:
                 "capabilities": {**self.native_capabilities, "permissionModes": self.permission_modes()},
                 "compactionEvents": list(self.compaction_events.values()),
                 "compactionEventId": self.compaction_event_id,
-                "settings": self.settings_projection(), "dialog": self.dialog,
-                "questionReply": self.question_reply,
+                "settings": self.settings_projection(),
                 "versionRecovery": self.version_recovery}
-
-    def restore_question_reply(self, control):
-        reply = control.get("questionReply")
-        if isinstance(reply, dict) and isinstance(reply.get("id"), str) and reply.get("state") == "submitted":
-            self.question_reply = dict(reply)
-
-    def question_requests(self, request):
-        if not request.get("nativeQuestion"):
-            return {request["dialog"]["id"]: request}
-        identity = request["nativeQuestion"]["id"]
-        if self.question_layout["id"] != identity:
-            self.question_layout = {"id": identity, "multi": set()}
-        # 当前 CLI 的 block 摘要没有多选字段；仅按同一原生问题实际显示的复选框补齐，不按问题文字猜测。
-        questions = request["input"]["questions"]
-        page = native_question_page(self.screen.text(), questions)
-        if page and page["index"] < len(questions) and page.get("multi"):
-            self.question_layout["multi"].add(page["index"])
-        for index in self.question_layout["multi"]:
-            questions[index]["multiSelect"] = True
-        if self.question_reply and self.question_reply.get("id") == identity:
-            request["nativeQuestion"]["state"] = "submitted"
-        return {identity: request}
 
     def settings_projection(self):
         return {**self.actual_settings, "changes": self.setting_changes}
@@ -1838,44 +1213,11 @@ class NativeSession:
                 and permission.get("requested") == self.permission_mode):
             self.setting_changes["permissionMode"] = dict(permission)
 
-    def launch_permission_flags(self):
-        key = (self.short, self.job.get("pid"), self.job.get("cliVersion"))
-        if key != self.permission_launch_key:
-            self.permission_launch_key = key
-            self.permission_launch_flags = []
-            if re.fullmatch(r"[0-9a-f]{8}", self.short):
-                try:
-                    record = json.loads((self.root / "jobs" / self.short / "state.json").read_text())
-                    flags = record.get("respawnFlags", [])
-                    if isinstance(flags, list):
-                        # 只保留权限参数，不能把原始启动参数中的凭据或项目内容带入快照。
-                        for index, flag in enumerate(flags):
-                            if flag in ("--allow-dangerously-skip-permissions", "--dangerously-skip-permissions"):
-                                self.permission_launch_flags.append(flag)
-                            elif flag == "--permission-mode" and index + 1 < len(flags):
-                                self.permission_launch_flags += [flag, flags[index + 1]]
-                except (OSError, ValueError):
-                    pass
-        return self.permission_launch_flags
-
     def permission_modes(self):
-        modes = self.permission_catalog or ["default", "manual", "acceptEdits", "plan",
-                                            "auto", "bypassPermissions", "dontAsk"]
-        if not self.short:
-            return list(modes)
-        flags = self.launch_permission_flags()
-        # 用户要求实例全局明确设置 bypassPermissions 时，已有原生会话也应显示并允许该模式；
-        # 显式启动参数仍然优先作为能力证据，配置读取失败时保持原有收敛行为，不扩大权限。
-        configured_bypass = False
-        try:
-            configured_bypass = self.configured_permission_mode() == "bypassPermissions"
-        except NativeError:
-            pass
-        bypass = configured_bypass or any(flag in flags for flag in (
-            "--allow-dangerously-skip-permissions", "--dangerously-skip-permissions", "bypassPermissions"))
-        # 原生共享会话只能选择已提供的运行模式；启动参数和实例配置都未开放时不能由网页补开。
-        return [mode for mode in modes if (mode != "bypassPermissions" or bypass)
-                and (mode != "dontAsk" or mode in flags)]
+        # 可选模式来自 Rust 对端交来的实例目录（initialize 的 catalog）；bypassPermissions 必须在 CLI 启动时声明，
+        # 由对端在空闲时通过重启 CLI 切换，所以这里不再按旧后台任务的启动参数收敛。
+        return list(self.permission_catalog or ["default", "manual", "acceptEdits", "plan",
+                                                "auto", "bypassPermissions", "dontAsk"])
 
     def configured_permission_mode(self):
         path = self.root / "settings.json"
@@ -1890,148 +1232,6 @@ class NativeSession:
             raise NativeError("ECONFIG", "Claude 实例的默认权限模式无效，已暂缓切换权限")
         return mode
 
-    def change_permission_mode(self, requested):
-        # 用户要求切换权限不能阻断普通消息：目标选择与原生实际权限分开保存。
-        # 审批、草稿或画面暂不可读时只登记待生效，不发送取消/提交按键，也不把正常发送报成失败。
-        if requested not in ("configured", "default", "manual", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"):
-            raise NativeError("EINVAL", "Claude 权限模式无效")
-        previous = self.setting_changes.get("permissionMode") or {}
-        if previous.get("requested") != requested:
-            self.permission_respawn_key = None
-        change = {**previous} if previous.get("requested") == requested else {
-            "id": str(uuid.uuid4()), "requested": requested, "issuedAt": int(time.time() * 1000)}
-        self.permission_retry_at = time.monotonic() + 1
-        try:
-            result = self._change_permission_mode(requested)
-            pending = result.get("permissionPending") is True
-            change.update(state="pending" if pending else "applied")
-            change.pop("reason", None)
-            if not pending:
-                change["actual"] = self.actual_settings.get("permissionMode")
-        except (OSError, ValueError, RuntimeError) as failure:
-            # 有效选择的原生切换失败只影响权限生效状态；连接端稍后在安全画面重试，消息仍走原生投递入口。
-            self.permission_mode = requested
-            change.update(state="pending", reason=str(failure))
-            result = {"permissionPending": True}
-        if change != previous:
-            self.setting_changes["permissionMode"] = change
-            self.signature = None
-        return {**result, "nativeSettings": self.settings_projection()}
-
-    def retry_permission_mode(self, job):
-        change = self.setting_changes.get("permissionMode") or {}
-        if (change.get("state") != "pending" or time.monotonic() < self.permission_retry_at
-                or not job or job.get("outcome") or job.get("needs")
-                or job.get("sessionStatus") not in ("idle", "busy")):
-            return
-        self.change_permission_mode(change["requested"])
-
-    def _change_permission_mode(self, requested):
-        modes = ("default", "manual", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions")
-        mode = self.configured_permission_mode() if requested == "configured" else requested
-        if mode not in modes:
-            raise NativeError("EINVAL", "Claude 权限模式无效")
-        target = "default" if mode == "manual" else mode
-        live = self.lookup() if self.native_id else None
-        if not live or live.get("outcome"):
-            # 尚未启动的轮次由原生 --permission-mode 实施；不为设置权限提前启动模型或复制会话。
-            self.permission_mode = requested
-            return {"nativeSettings": self.settings_projection(), "permissionPending": True}
-        self.short = live["short"]
-        self.job = live
-        expected_short = self.short
-        allow_busy = False
-
-        # 用户要求普通发送不被重复应用同一权限阻断：原生状态栏已是目标模式时只确认，不发送快捷键。
-        # 这里允许保留原生草稿、执行和审批等待；只有确实需要切换模式时，才要求下方的空闲、空输入框检查。
-        observed = permission_footer_mode(self.read_terminal_screen())
-        current_job = self.lookup()
-        if (observed == target and current_job and current_job["short"] == expected_short
-                and not current_job.get("outcome")):
-            self.permission_mode = requested
-            self.actual_settings["permissionMode"] = observed
-            self.signature = None
-            return {"nativeSettings": self.settings_projection()}
-
-        def read_current():
-            nonlocal allow_busy
-            job = self.lookup()
-            if (not job or job["short"] != expected_short or job.get("outcome")
-                    or job.get("sessionStatus") not in ("idle", "busy") or job.get("needs")):
-                raise NativeError("EPERMISSIONBUSY", "原生会话正在等待交互，权限将在可安全切换时生效")
-            lines = self.read_terminal_screen()
-            if not empty_permission_prompt(lines):
-                raise NativeError("EPERMISSIONDRAFT", "原生 CLI 正在编辑或显示交互面板，未发送权限快捷键")
-            if job.get("sessionStatus") == "busy":
-                allow_busy = allow_busy or permission_live_shortcut(lines)
-                if not allow_busy:
-                    raise NativeError("EPERMISSIONBUSY", "当前实例未确认支持执行中切换，权限将在空闲后生效")
-            value = permission_footer_mode(lines)
-            if value is None:
-                raise NativeError("EPERMISSIONUNKNOWN", "无法识别原生权限状态栏，已暂缓切换权限")
-            self.actual_settings["permissionMode"] = value
-            return value
-
-        def switch(current):
-            self.terminal_input(b"\x1b[Z", permission={"short": expected_short, "mode": current,
-                                                    "allowBusy": allow_busy})
-            # 原生按键接收与终端重绘异步完成；短暂等待状态栏变化，避免将旧一帧误判成模式循环结束。
-            deadline = time.monotonic() + 0.6
-            while True:
-                value = read_current()
-                if value != current or time.monotonic() >= deadline:
-                    return value
-                time.sleep(0.04)
-
-        if mode == "bypassPermissions":
-            # 用户选择“绕过权限”时必须确认原生实际模式已经切换；旧 CLI 或执行中的会话
-            # 不能靠网页显示的目标值冒充已生效，空闲时先接管同一 UUID，再按原生循环核对底栏。
-            current_job = self.lookup()
-            if (not current_job or current_job.get("sessionStatus") != "idle"
-                    or current_job.get("needs")):
-                raise NativeError("EPERMISSIONBUSY", "当前轮次尚未结束，绕过权限将在会话空闲后自动应用")
-            # respawn 会重建原生输入界面；用户已有未发送草稿时必须先保留选择，
-            # 不能为了切换权限覆盖草稿或把它误当成已应用。
-            if native_input_state(self.read_terminal_screen()) != "empty":
-                raise NativeError("EPERMISSIONDRAFT", "原生 CLI 正在编辑草稿或显示交互面板，绕过权限将在安全状态应用")
-            respawn_key = (expected_short, current_job.get("cliVersion"), target)
-            if self.permission_respawn_key != respawn_key:
-                self.permission_respawn_key = respawn_key
-                try:
-                    self.restore_job()
-                except (OSError, RuntimeError, subprocess.SubprocessError):
-                    self.permission_respawn_key = None
-                    raise
-
-        original = current = read_current()
-        if current != target:
-            supported = self.permission_modes()
-            if mode not in supported and not (target == "default" and any(
-                    value in supported for value in ("default", "manual"))):
-                raise NativeError("EPERMISSIONMODE",
-                    "该原生共享会话未开放所选权限模式，选择暂未生效；可在新建会话时选择")
-        visited = set()
-        for _ in range(8):
-            if current == target:
-                # 实例全局配置已让 CLI 处于目标模式时直接保留；缺少启动开关仍禁止网页另行开放该能力。
-                self.permission_mode = requested
-                self.actual_settings["permissionMode"] = current
-                self.signature = None
-                return {"nativeSettings": self.settings_projection()}
-            if current in visited:
-                break
-            visited.add(current)
-            # Claude Code 2.1.325 实测支持执行中 Shift+Tab；仅在同一会话、无交互面板且空输入框时操作，
-            # 每一步重新核对原生状态栏，不能取消任务、覆盖草稿或替用户处理审批。
-            current = switch(current)
-        for _ in range(8):
-            if current == original:
-                self.actual_settings["permissionMode"] = original
-                raise NativeError("EPERMISSIONMODE",
-                    "原生会话未提供所选权限模式，已恢复原权限，选择暂未生效；可在新建会话时选择")
-            current = switch(current)
-        self.actual_settings.pop("permissionMode", None)
-        raise NativeError("EPERMISSIONUNKNOWN", "原生权限状态待核对，已暂停切换权限，请在 CLI 确认当前模式")
 
     def resolve_setting_label(self, name, label):
         if name == "effort":
@@ -2057,7 +1257,6 @@ class NativeSession:
         if normalize(actual) == normalize(change["requested"]):
             state = "applied"
         elif (change.get("dialogId") and at >= change.get("dialogAtMs", 0)
-              and self.job.get("sessionStatus") != "waiting"
               and normalize(actual) == normalize(change.get("previous", ""))):
             # CLI 的拒绝结果可能不写 JSONL；确认框之后的新请求实际使用原模型，也是保留原设置的证据。
             state = "rejected"
@@ -2114,38 +1313,6 @@ class NativeSession:
         self.setting_evidence_at[name] = at
         setattr(self, name, actual)
 
-    def observe_dialog(self, job):
-        dialog = native_dialog(job, self.screen.text(), self.native_id, self.root)
-        if dialog and (dialog["id"] == self.answered_dialog or any(
-                change.get("dialogId") == dialog["id"] and change.get("state") == "confirming"
-                for change in self.setting_changes.values())):
-            dialog["state"] = "submitted"
-        self.dialog = dialog
-        if job.get("sessionStatus") in ("busy", "idle"):
-            for name, change in self.setting_changes.items():
-                if change.get("state") == "confirming" and change.get("decision") == "decline":
-                    # 原生取消不一定落盘：显式拒绝且确认框确已关闭后恢复原值，不能只凭按键写入宣告完成。
-                    actual = self.actual_settings.get(name, change.get("previous", ""))
-                    change.update(state="rejected", actual=actual)
-                    setattr(self, name, actual)
-        if not dialog or dialog["kind"] not in ("model", "effort"):
-            return
-        name = dialog["kind"]
-        change = self.setting_changes.get(name)
-        target = self.resolve_setting_label(name, dialog["target"])
-        if change and change.get("dialogId") == dialog["id"] and change["state"] in ("applied", "rejected"):
-            self.dialog = None
-            return
-        if change and target and change["requested"] != target and change["state"] in ("pending", "confirmation", "confirming"):
-            return
-        if not change or change["state"] in ("applied", "rejected"):
-            change = {"id": dialog["id"], "requested": target or dialog["target"],
-                      "previous": self.actual_settings.get(name, getattr(self, name)),
-                      "issuedAt": dialog["statusAtMs"] or 0, "source": "native"}
-            self.setting_changes[name] = change
-        change.update(state="confirming" if dialog["state"] == "submitted" else "confirmation",
-                      targetLabel=dialog["target"], dialogId=dialog["id"],
-                      dialogAtMs=dialog["statusAtMs"] or 0)
 
     def restore_compaction_events(self, control):
         # 正文状态行属于已观察到的原生活动；重连和下一条命令不能删除已确认的中断、失败记录。
@@ -2260,130 +1427,6 @@ class NativeSession:
                         and at >= command["issuedAt"] and row["uuid"] != command.get("baseline")):
                     command["state"], command["nativeId"] = "completed", row["uuid"]
 
-    def native_command(self, request):
-        name, argument = request.get("name"), request.get("argument", "").strip()
-        self.delivery_started = False
-        if name not in ("goal", "compact") or not self.native_capabilities.get(name):
-            raise NativeError("EUNSUPPORTED", "当前 Claude CLI 未提供此原生命令")
-        if name == "goal" and (not argument or len(argument.encode("utf-16-le")) // 2 > 4000):
-            raise NativeError("EINVAL", "Claude 目标需要 1–4000 个字符")
-        if name == "compact" and not self.native_id:
-            raise NativeError("EINVAL", "请先创建会话并产生对话，再压缩上下文")
-        self.read_messages()
-        expected = request.get("expectedGoal")
-        if expected is not None and (not self.goal or any(
-                self.goal.get(key) != expected.get(key) for key in ("nativeId", "objective", "status"))):
-            raise NativeError("EBUSY", "原生目标已变化，请重新读取后操作")
-        if any(command["name"] == name and command["state"] in ("pending", "running", "stopping", "unknown")
-               for command in self.native_commands):
-            raise NativeError("EBUSY", "上一条同类原生命令尚未确认，请先核对状态")
-        live = self.lookup() if self.native_id else None
-        if live:
-            self.bind(live)
-        if self.native_id and self.short and (
-                not live or live.get("outcome")
-                or live.get("state") in ("done", "stopped", "failed", "ended")
-                and live.get("sessionStatus") not in ("busy", "idle", "waiting")):
-            live = self.restore_job()
-        elif live and not (name == "goal" and argument == "clear") and self.time_zone_restore_plan() is not None:
-            live = self.restore_job()
-        command = {"id": request["id"], "name": name, "argument": argument,
-                   "state": "pending", "issuedAt": int(time.time() * 1000),
-                   "baseline": self.goal_revision if name == "goal" else self.compaction.get("itemId"),
-                   "beforeOutput": hashlib.sha256(self.compact_output().encode()).hexdigest()}
-        # 只保留每类最近一次操作；已接收操作重连后仅核对，绝不重新发送。
-        self.native_commands = [value for value in self.native_commands if value["name"] != name] + [command]
-        self.control_screen_before = "\n".join(self.screen.text())
-        if name == "compact":
-            self.compaction_event_id = ""
-            self.compaction = {"state": "pending", "itemId": command["id"]}
-        emit({"type": "shared_native_command_intent", "native_control": self.control_projection()})
-        self.delivery_started = True
-        try:
-            text = f"/{name}" + (f" {argument}" if argument else "")
-            if live and not live.get("outcome"):
-                self.reply(text, next_turn=False)
-            else:
-                self.start(text)
-        except NativeError:
-            self.delivery_started = False
-            command["state"] = "failed"
-            if name == "compact":
-                self.compaction = {"state": "idle", "itemId": command["id"]}
-            self.poll(force=True)
-            raise
-        except (OSError, RuntimeError, subprocess.SubprocessError):
-            command["state"] = "unknown"
-            if name == "compact":
-                self.compaction["state"] = "unknown"
-                event = self.compaction_events.get(self.compaction_event_id)
-                if event and event.get("status") == "inProgress":
-                    event["status"] = "unknown"
-            self.poll(force=True)
-            raise
-        self.poll(force=True)
-        return {"accepted": True, "nativeId": self.native_id, "jobId": self.short,
-                "nativeCommand": {key: command[key] for key in ("id", "name", "state")},
-                "nativeControl": self.control_projection()}
-
-    def compact_output(self):
-        lines = self.screen.text()
-        starts = [index for index, line in enumerate(lines) if re.match(r"^\s*❯\s*/compact\s*$", line)]
-        return " ".join(lines[starts[-1] + 1:starts[-1] + 6]) if starts else ""
-
-    def observe_control_screen(self):
-        lines = self.screen.text()
-        text = "\n".join(lines)
-        compacting = bool(re.search(r"(?m)^[✶✻✽✢·*]\s+Compacting conversation", text))
-        ended_display = self.compaction_screen_active and not compacting
-        if compacting and not self.compaction_screen_active:
-            self.compaction = {**self.compaction, "state": "running"}
-            command = next((command for command in self.native_commands if command["name"] == "compact"
-                            and command["state"] in ("pending", "running", "unknown")), None)
-            previous = self.compaction_events.get(self.compaction_event_id)
-            identity = command["id"] if command else previous["id"] if previous and previous.get("status") == "unknown" else str(uuid.uuid4())
-            self.compaction_event_id = identity
-            self.record_compaction_event(identity, "inProgress")
-            for command in self.native_commands:
-                if command["name"] == "compact" and command["state"] in ("pending", "unknown"):
-                    command["state"] = "running"
-        if self.compaction_screen_active and not compacting:
-            event = self.compaction_events.get(self.compaction_event_id)
-            if event and event.get("phase") == "stopping":
-                self.record_compaction_event(event["id"], "interrupted")
-                self.compaction = {"state": "idle", "itemId": event["id"]}
-            for command in self.native_commands:
-                if command["name"] == "compact" and command["state"] == "stopping":
-                    command.update(state="completed", message="压缩已停止")
-                    self.record_compaction_event(command["id"], "interrupted")
-                    self.compaction = {"state": "idle", "itemId": command["id"]}
-        self.compaction_screen_active = compacting
-        # 无历史/失败可能只有原生终端回显。仅关联本次 /compact 行后的回显，不按旧错误或用户引用判断。
-        if text != self.control_screen_before:
-            for command in self.native_commands:
-                if command["name"] != "compact" or command["state"] not in ("pending", "running"):
-                    continue
-                output = self.compact_output()
-                if command["state"] == "pending" and hashlib.sha256(output.encode()).hexdigest() == command.get("beforeOutput"):
-                    continue
-                if re.search(r"Nothing to compact|Not enough messages|Conversation too short", output, re.I):
-                    command.update(state="completed", message="当前历史无需压缩")
-                    self.record_compaction_event(command["id"], "completed", outcome="noop")
-                    self.compaction_event_id = command["id"]
-                    self.compaction = {"state": "idle", "itemId": command["id"]}
-                elif re.search(r"Error:|Failed to compact|Compaction failed", output, re.I):
-                    command.update(state="failed", message="原生压缩未完成，请在 CLI 中核对错误")
-                    self.record_compaction_event(command["id"], "failed")
-                    self.compaction_event_id = command["id"]
-                    self.compaction = {"state": "idle", "itemId": command["id"]}
-        event = self.compaction_events.get(self.compaction_event_id)
-        if ended_display and event and event.get("status") == "inProgress":
-            # 原生画面已结束但还没有终态证据时保留同一行待核对，不无限显示“压缩中”或猜测成功。
-            event["status"] = "unknown"
-            self.compaction["state"] = "unknown"
-            for command in self.native_commands:
-                if command["name"] == "compact" and command["state"] == "running":
-                    command["state"] = "unknown"
 
     def context_configuration(self):
         # 用户要求容量与压缩设置分开：这里只传配置来源，不能把任何配置值当作原生容量。
@@ -2458,437 +1501,6 @@ class NativeSession:
                 if type(usage.get(key)) is int and 0 <= usage[key] <= 9007199254740991}
         self.native_context = report
 
-    def rpc(self, operation):
-        # 2.1.322 的原生后台协议 v1；control.key 只用于同一 WSL 用户的本地连接，不回传网页。
-        message = {"proto": 1, **operation}
-        if message["op"] in ("reply", "attach"):
-            message["auth"] = (self.root / "daemon" / "control.key").read_text().strip()
-        with socket.socket(socket.AF_UNIX) as connection:
-            connection.settimeout(8)
-            connection.connect(self.address)
-            connection.sendall(json.dumps(message, ensure_ascii=False).encode() + b"\n")
-            response = json.loads(connection.makefile("rb").readline(1024 * 1024))
-        if not response.get("ok"):
-            raise NativeError(response.get("code", "UNKNOWN"))
-        return response
-
-    def lookup(self):
-        try:
-            jobs = self.rpc({"op": "list"}).get("jobs", [])
-        except (FileNotFoundError, ConnectionRefusedError):
-            return None
-        except (OSError, RuntimeError) as failure:
-            # 查询超时或协议错误不等于原任务已结束，不能据此另起执行或重启正在工作的会话。
-            raise RuntimeError("暂时无法核对原生 Claude 后台状态，未重新启动或提交消息") from failure
-        job = next((job for job in jobs if (job.get("resumeSessionId") or job.get("sessionId")) == self.native_id), None)
-        return native_activity(self.root, job, self.native_id) if job else None
-
-    def daemon_version(self):
-        try:
-            version = self.rpc({"op": "ping"}).get("version")
-        except (OSError, RuntimeError, ValueError):
-            return None
-        return version if isinstance(version, str) and version else None
-
-    def worker_version_mismatch(self, live):
-        worker = live.get("cliVersion") if isinstance(live, dict) else None
-        if not isinstance(worker, str) or not worker:
-            return None
-        controller = self.daemon_version()
-        if not controller or controller == worker:
-            return None
-        return {"workerVersion": worker, "controllerVersion": controller}
-
-    @staticmethod
-    def version_recovery_blocked(live):
-        # 用户要求升级不能打断当前任务或抢走权限/问答面板；这些状态只登记待恢复，
-        # 等原生会话自己回到 idle 后再由远程队列触发同一会话的 respawn。
-        if not isinstance(live, dict) or live.get("outcome"):
-            return False
-        if live.get("sessionStatus") == "waiting" or live.get("needs"):
-            return True
-        if live.get("sessionStatus") not in (None, "idle"):
-            return True
-        return live.get("tempo") == "active" or live.get("state") in ("working", "compacting")
-
-    def version_recovery_input_state(self):
-        # 版本恢复会重建原生输入界面；发送前必须确认没有未提交草稿，无法读取时也不能冒险重启。
-        return native_input_state(self.read_terminal_screen())
-
-    def recover_version_skew(self, live, *, force=False):
-        mismatch = self.worker_version_mismatch(live) if not force else None
-        if not force and mismatch is None:
-            return live
-        if not isinstance(live, dict):
-            return live
-        if self.version_recovery_blocked(live):
-            details = mismatch or {
-                "workerVersion": live.get("cliVersion"),
-                "controllerVersion": self.daemon_version(),
-            }
-            self.version_recovery = {"state": "pending", "reason": "cli_version_skew", **details}
-            self.signature = None
-            return None
-        details = mismatch or {
-            "workerVersion": live.get("cliVersion"),
-            "controllerVersion": self.daemon_version(),
-        }
-        try:
-            input_state = self.version_recovery_input_state()
-        except (OSError, ValueError, RuntimeError, NativeError):
-            input_state = "unknown"
-        if input_state != "empty":
-            self.version_recovery = {"state": "pending",
-                                     "reason": "native_draft" if input_state == "draft"
-                                     else "interaction_unknown", **details}
-            self.signature = None
-            return None
-        self.version_recovery = {"state": "recovering", "reason": "cli_version_skew", **details}
-        self.signature = None
-        try:
-            recovered = self.restore_job(expected_cli_version=details.get("controllerVersion"))
-        except (OSError, RuntimeError, subprocess.SubprocessError):
-            self.version_recovery = {"state": "failed", "reason": "cli_version_skew", **details}
-            self.signature = None
-            raise
-        self.version_recovery = {"state": "ready", "reason": "cli_version_skew",
-                                 "workerVersion": recovered.get("cliVersion") or details.get("workerVersion"),
-                                 "controllerVersion": details.get("controllerVersion")}
-        self.signature = None
-        return recovered
-
-    def bind(self, job):
-        self.job = job
-        self.short = job["short"]
-        self.native_id = job.get("resumeSessionId") or job["sessionId"]
-        if self.incoming is not None and (self.observed_short != self.short
-                                         or not self.observer or not self.observer.is_alive()):
-            self.observed_short = self.short
-            self.screen = Screen()
-            self.observer = threading.Thread(target=self.observe_stream, args=(self.short,), daemon=True)
-            self.observer.start()
-
-    def observe_stream(self, short):
-        try:
-            with socket.socket(socket.AF_UNIX) as connection:
-                connection.connect(self.address)
-                connection.sendall(json.dumps({"proto": 1, "op": "subscribe",
-                                               "short": short, "tail": 200}).encode() + b"\n")
-                for line in connection.makefile("rb"):
-                    value = json.loads(line)
-                    if value.get("type") == "snapshot":
-                        # 一次性读取完整终端快照，避免历史压缩画面的中间帧被识别成新的压缩开始。
-                        self.incoming.put({"_stream": "".join(value.get("streamTail", []))})
-                    elif value.get("type") == "stream":
-                        self.incoming.put({"_stream": value.get("line", "")})
-        except (OSError, ValueError):
-            return
-
-    def reply(self, text, next_turn=False):
-        # 远程队列自己管理普通消息，默认走原生普通回复；只有点击“引导”时显式传 next_turn=True，
-        # 才在 CLI 内对应 priority="next"，等待当前工具调用结束后吸收消息。
-        deadline = time.monotonic() + 20
-        while True:
-            try:
-                return self.rpc({"op": "reply", "short": self.short,
-                                 "text": text, "nextTurn": next_turn})
-            except NativeError as failure:
-                # 原版后台冷启动也会明确拒绝尚未就绪的提交；仅在“尚未接受”时短暂等待，不重发未知结果。
-                if failure.code not in ("ERESPAWNING", "ESTARTING", "ENOREPLY") or time.monotonic() >= deadline:
-                    raise
-                time.sleep(0.2)
-
-    def check_history_resume(self, *, registration_released=False):
-        # 用户要求不创建副本：原生 2.1.322 在被占用/短 ID 冲突/状态不可核对时会自动分叉，首次发送前只读预检并明确拒绝这些情况。
-        job_directory = self.root / "jobs" / self.native_id[:8]
-        if (str(uuid.UUID(self.native_id)) != self.native_id
-                or (job_directory / "state.json" if registration_released else job_directory).exists()):
-            raise NativeError("ESESSIONCONFLICT", "原生会话身份或后台登记有冲突，未创建副本或提交消息")
-        try:
-            for path in (self.root / "sessions").glob("*.json"):
-                record = json.loads(path.read_text(encoding="utf-8"))
-                if record.get("sessionId") != self.native_id or record.get("kind") == "interactive" and record.get("parkedJobId"):
-                    continue
-                pid = int(record.get("pid", path.stem))
-                try:
-                    os.kill(pid, 0)
-                except ProcessLookupError:
-                    continue
-                raise NativeError("ESESSIONOPEN", "原生会话仍在其他 CLI 中打开，未接管草稿、创建副本或提交消息")
-            try:
-                state = self.rpc({"op": "has", "short": self.native_id[:8]})
-                if not isinstance(state.get("alive"), bool) or "present" in state and not isinstance(state["present"], bool):
-                    raise ValueError("无法核对原生后台占用状态")
-                occupied = state.get("alive") or state.get("present")
-            except (FileNotFoundError, ConnectionRefusedError):
-                path = self.root / "daemon/roster.json"
-                roster = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-                worker = roster.get("workers", {}).get(self.native_id[:8])
-                occupied = False
-                if worker:
-                    try:
-                        os.kill(int(worker["pid"]), 0)
-                        occupied = True
-                    except ProcessLookupError:
-                        pass
-            if occupied:
-                raise NativeError("ESESSIONBUSY", "原生后台仍持有该 UUID，未创建副本或提交消息")
-        except (OSError, ValueError, KeyError, TypeError) as failure:
-            raise NativeError("ERESUMECHECK", "无法只读确认原生会话未被占用，未恢复、创建副本或提交消息") from failure
-
-    def start(self, text=None, *, launch_flags=None, registration_released=False, launch_cwd=None):
-        if self.native_id:
-            self.check_history_resume(registration_released=registration_released)
-        # 用户要求实际后台执行继承当前 WSL 时区；--bg 可复用旧 daemon/预热 worker，
-        # 必须经 CLI 原生的会话设置传递 TZ，不能只依赖外层 Python 的环境或强制重启其他会话。
-        settings = {"worktree": {"bgIsolation": "none"}, "env": {"TZ": native_time_zone()}}
-        arguments = [self.cli, "--bg", *(launch_flags if launch_flags is not None else
-                     ["--settings", json.dumps(settings, separators=(",", ":"))])]
-        # 用户要求窗口只用于本实例后续新建的远程会话；恢复已有原生会话不替换其启动参数。
-        if not self.native_id and self.auto_compact_window is not None:
-            arguments += ["--autocompact", self.auto_compact_window]
-        if self.permission_mode and self.permission_mode != "configured":
-            mode = self.permission_mode
-            if mode == "default" and "manual" in self.permission_catalog and "default" not in self.permission_catalog:
-                mode = "manual"
-            elif mode == "manual" and "default" in self.permission_catalog and "manual" not in self.permission_catalog:
-                mode = "default"
-            arguments += ["--permission-mode", mode]
-            if mode == "bypassPermissions":
-                arguments += ["--allow-dangerously-skip-permissions"]
-        if self.native_id:
-            arguments += ["--resume", self.native_id]
-        if self.model:
-            arguments += ["--model", self.model]
-        if self.effort:
-            arguments += ["--effort", self.effort]
-        # 恢复历史时不附加新名称，保留原生自定义标题；新会话仍沿用既有命名。
-        if not self.native_id:
-            arguments += ["--name", f"elves-{uuid.uuid4().hex[:10]}"]
-        if text is not None:
-            arguments += ["--", text]
-        result = subprocess.run(arguments, stdin=subprocess.DEVNULL,
-                                capture_output=True, timeout=60, cwd=launch_cwd)
-        output = (result.stdout + result.stderr).decode("utf-8", "replace")
-        match = re.search(r"backgrounded\s*[·:]\s*([0-9a-f]{8})", output)
-        if result.returncode or not match:
-            # CLI 错误可能包含认证环境；只报告可操作说明，不转发 stderr 或设置文件。
-            raise RuntimeError("无法启动原版 Claude 后台会话，请先在该 WSL 项目目录完成 CLI 安装、登录和目录信任")
-        job = next((job for job in self.rpc({"op": "list"}).get("jobs", [])
-                    if job.get("short") == match[1]), None)
-        if not job:
-            raise RuntimeError("Claude 已启动，后台会话身份尚未返回，请核对原生会话")
-        if self.native_id and (job.get("resumeSessionId") or job["sessionId"]) != self.native_id:
-            raise RuntimeError("原版 Claude 未返回同一 UUID，未替换原会话、历史或停止其他任务")
-        self.bind(job)
-
-    def time_zone_recovery_directory(self):
-        return self.recovery_folder / hashlib.sha256(str(self.root).encode()).hexdigest()[:16]
-
-    def time_zone_restore_plan(self):
-        # 用户要求旧会话恢复也继承当前 WSL 登录时区。respawn 忽略 --settings，
-        # 带新设置直接 --bg --resume 会分叉；必须先核对无 worktree 的同一原生身份。
-        if not re.fullmatch(r"[0-9a-f]{8}", self.short):
-            return None
-        try:
-            if str(uuid.UUID(self.native_id)) != self.native_id:
-                return None
-        except ValueError:
-            return None
-        recovery = self.time_zone_recovery_directory()
-        journal = recovery / f"timezone-{self.native_id}.json"
-        saved = native_json(journal) if journal.exists() else None
-        if saved is not None and (saved.get("nativeId") != self.native_id or saved.get("jobId") != self.short
-                or saved.get("root") != str(self.root) or saved.get("cli") != self.cli):
-            raise NativeError("ETIMEZONE", "Claude 时区恢复记录无法核对，未停止会话或发送消息")
-        record = native_json(self.root / "jobs" / self.short / "state.json")
-        if not record and saved is None:
-            return None
-        if record and (record.get("resumeSessionId") or record.get("sessionId")) != self.native_id:
-            raise NativeError("ETIMEZONE", "Claude 后台任务身份已变化，未停止会话或发送消息")
-        flags = record.get("respawnFlags", []) if record else saved.get("flags")
-        if not isinstance(flags, list) or any(not isinstance(flag, str) or "\0" in flag for flag in flags):
-            raise NativeError("ETIMEZONE", "Claude 原启动参数无法核对，未停止会话或发送消息")
-        flags, settings, setting_index = list(flags), {}, None
-        for index, flag in enumerate(flags):
-            raw = flags[index + 1] if flag == "--settings" and index + 1 < len(flags) else (
-                flag[len("--settings="):] if flag.startswith("--settings=") else None)
-            if raw is not None:
-                try:
-                    # 自动迁移仅接纳 Harness 生成的内联设置；不复制外部配置文件或认证环境。
-                    settings = json.loads(raw)
-                    if (not isinstance(settings, dict) or not isinstance(settings.get("env", {}), dict)
-                            or not isinstance(settings.get("worktree", {}), dict)
-                            or set(settings) - {"worktree", "env", "disableAllHooks"}
-                            or set(settings.get("env", {})) - {"TZ"}
-                            or settings.get("worktree", {}) not in ({}, {"bgIsolation": "none"})
-                            or ("disableAllHooks" in settings and type(settings["disableAllHooks"]) is not bool)):
-                        raise ValueError()
-                except (ValueError, TypeError):
-                    raise NativeError("ETIMEZONE", "旧 Claude 会话包含无法安全迁移的设置，未停止会话或发送消息") from None
-                setting_index = index
-        target = native_time_zone()
-        if record and settings.get("env", {}).get("TZ") == target:
-            if saved is not None:
-                if (recovery / f"files-{self.native_id}").exists():
-                    raise NativeError("ETIMEZONE", "Claude 仍有待恢复的运行文件，已保留恢复记录，尚未发送消息")
-                journal.unlink(missing_ok=True)
-            return None
-        cwd = record.get("cwd") if record else saved.get("cwd")
-        if (self.short != self.native_id[:8] or not isinstance(cwd, str) or not cwd.startswith("/")
-                or not Path(cwd).is_dir() or record.get("worktreePath") or record.get("worktreeBranch")
-                or record.get("originCwd") or record.get("worktreeHookBased") or record.get("routine")
-                or record.get("interactiveLineage") or record.get("template") == "exec"
-                or record.get("sessionPermissionRules") or record.get("memoryToggledOff")
-                or record.get("autoMemoryOffThisSession")
-                or (record.get("bgIsolation") != "none" and settings.get("worktree", {}).get("bgIsolation") != "none")):
-            raise NativeError("ETIMEZONE", "旧 Claude 会话的目录或后台身份不支持安全更新时区，未停止会话或发送消息")
-        if "worktree" not in settings and record.get("bgIsolation") == "none":
-            settings["worktree"] = {"bgIsolation": "none"}
-        if (set(settings) - {"worktree", "env", "disableAllHooks"}
-                or set(settings.get("env", {})) - {"TZ"}
-                or settings.get("worktree", {}) != {"bgIsolation": "none"}):
-            raise NativeError("ETIMEZONE", "旧 Claude 会话含自定义启动设置，当前无法安全保留并更新时区，未停止会话或发送消息")
-        value_flags = {"--settings", "--model", "--effort", "--name", "-n", "--permission-mode",
-                       "--autocompact", "--allowedTools", "--allowed-tools"}
-        switches = {"--allow-dangerously-skip-permissions", "--dangerously-skip-permissions",
-                    "--strict-mcp-config"}
-        index = 0
-        while index < len(flags):
-            flag = flags[index].split("=", 1)[0]
-            if flag in value_flags:
-                index += 1 if "=" in flags[index] else 2
-                if index > len(flags):
-                    raise NativeError("ETIMEZONE", "Claude 原启动参数不完整，未停止会话或发送消息")
-            elif flags[index] in switches:
-                index += 1
-            else:
-                raise NativeError("ETIMEZONE", "旧 Claude 会话含无法安全迁移的启动参数，未停止会话或发送消息")
-        settings["env"] = {"TZ": target}
-        encoded = json.dumps(settings, ensure_ascii=False, separators=(",", ":"))
-        if setting_index is None:
-            flags += ["--settings", encoded]
-        elif flags[setting_index] == "--settings":
-            flags[setting_index + 1] = encoded
-        else:
-            flags[setting_index] = f"--settings={encoded}"
-        if record.get("nameSource") in ("user", "collision") and isinstance(record.get("name"), str):
-            flags += [f"--name={record['name']}"]
-        return {"nativeId": self.native_id, "jobId": self.short, "root": str(self.root),
-                "cli": self.cli, "cwd": cwd, "flags": flags, "timeZone": target}
-
-    def restore_time_zone(self, expected_cli_version=None):
-        with self.edit_lock():
-            plan = self.time_zone_restore_plan()
-            if plan is None:
-                return None
-            stored = native_json(self.root / "jobs" / self.short / "state.json")
-            in_flight = stored.get("inFlight") or {}
-            if (not isinstance(in_flight, dict) or stored.get("queuedPrompt")
-                    or in_flight.get("tasks") or in_flight.get("queued")
-                    or in_flight.get("kinds") or in_flight.get("drainableMonitors")):
-                raise NativeError("ETIMEZONE", "旧 Claude 会话仍有原生排队输入或后台任务，未更新时区或发送消息")
-            recovery = self.time_zone_recovery_directory()
-            recovery.mkdir(mode=0o700, parents=True, exist_ok=True)
-            if recovery.is_symlink() or recovery.stat().st_uid != os.getuid():
-                raise NativeError("ETIMEZONE", "Claude 时区恢复目录归属异常，未停止会话或发送消息")
-            source_directory = self.root / "jobs" / self.short
-            if not source_directory.exists():
-                source_directory = source_directory.parent
-            if source_directory.stat().st_dev != recovery.stat().st_dev:
-                raise NativeError("ETIMEZONE", "Claude 配置与恢复目录不在同一文件系统，当前无法安全迁移，未停止会话或发送消息")
-            journal = recovery / f"timezone-{self.native_id}.json"
-            preserved = recovery / f"files-{self.native_id}"
-            # 用户要求恢复失败后仍可继续原会话；移除登记前原子保存非认证启动参数。
-            # 清单只在目标 WSL 用户私有目录保存，成功核对同一 UUID 和时区后删除。
-            temporary = journal.with_suffix(f".{uuid.uuid4().hex}.tmp")
-            try:
-                descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                    json.dump(plan, stream, ensure_ascii=False, separators=(",", ":"))
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(temporary, journal)
-            finally:
-                temporary.unlink(missing_ok=True)
-            outcome = self.shutdown()
-            if outcome.get("stopped") is not True:
-                if not preserved.exists():
-                    journal.unlink(missing_ok=True)
-                reasons = {"active": "会话仍在执行或等待交互", "native_draft": "原生终端仍有未发送草稿",
-                           "background_work": "会话仍有后台任务", "screen_unknown": "无法确认终端输入和后台任务",
-                           "state_changed": "会话状态已变化"}
-                raise NativeError("ETIMEZONE", f"旧 Claude 会话暂不能更新时区：{reasons.get(outcome.get('reason'), '无法核对安全空闲状态')}；未发送消息")
-            # 停止后再次核对，外部终端若重新打开会话，保留它并拒绝移除登记。
-            if self.job_alive() or self.session_holders():
-                raise NativeError("ETIMEZONE", "Claude 会话已被重新打开，未移除后台登记或发送消息")
-            record_path = self.root / "jobs" / self.short / "state.json"
-            if record_path.exists():
-                # 用户要求保留旧会话数据：rm 只负责释放登记，原任务的 tmp、时间线等运行文件
-                # 先移到同一 WSL 用户的持久私有目录，再于新进程启动前按原路径放回，不覆盖同名文件。
-                preserved.mkdir(mode=0o700, exist_ok=True)
-                if preserved.is_symlink() or preserved.stat().st_uid != os.getuid():
-                    raise NativeError("ETIMEZONE", "Claude 运行文件恢复目录无法核对，未移除后台登记")
-                for entry in record_path.parent.iterdir():
-                    if entry.name == "state.json":
-                        continue
-                    destination = preserved / entry.name
-                    if destination.exists() or destination.is_symlink():
-                        raise NativeError("ETIMEZONE", "Claude 运行文件存在恢复冲突，已保留原文件，未移除后台登记")
-                    entry.rename(destination)
-                result = subprocess.run([self.cli, "rm", self.short], stdin=subprocess.DEVNULL,
-                                        capture_output=True, timeout=30)
-                if result.returncode or record_path.exists():
-                    raise NativeError("ETIMEZONE", "Claude 未释放旧后台登记，历史已保留，尚未恢复时区或发送消息")
-            if preserved.exists():
-                record_path.parent.mkdir(parents=True, exist_ok=True)
-                for entry in preserved.iterdir():
-                    destination = record_path.parent / entry.name
-                    if destination.exists() or destination.is_symlink():
-                        raise NativeError("ETIMEZONE", "Claude 运行文件存在恢复冲突，已保留两份文件，尚未启动或发送消息")
-                    entry.rename(destination)
-                preserved.rmdir()
-            # 恢复使用原任务登记的目录，不借用连接端或其他会话当前所在的项目。
-            self.start(launch_flags=plan["flags"], registration_released=True, launch_cwd=plan["cwd"])
-            job = self.wait_restored_job(plan["jobId"], plan["nativeId"], expected_cli_version)
-            verified = self.time_zone_restore_plan()
-            if verified is not None:
-                raise NativeError("ETIMEZONE", "Claude 尚未确认原会话已使用目标 WSL 时区，未发送消息")
-            journal.unlink(missing_ok=True)
-            return job
-
-    def restore_job(self, expected_cli_version=None):
-        if self.time_zone_restore_plan() is not None:
-            recovered = self.restore_time_zone(expected_cli_version)
-            if recovered is not None:
-                return recovered
-        # 用户要求恢复同一原生会话：已有后台 ID 用原版 respawn 重新连接；
-        # --bg --resume 遇到残留的运行标记会自动创建副本，不能用它代替原会话。
-        expected_short = self.short
-        expected_native = self.native_id
-        result = subprocess.run([self.cli, "respawn", expected_short],
-                                stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
-        if result.returncode:
-            raise RuntimeError("原版 Claude 后台恢复失败，未创建副本或提交消息，请核对原版 CLI")
-        return self.wait_restored_job(expected_short, expected_native, expected_cli_version)
-
-    def wait_restored_job(self, expected_short, expected_native, expected_cli_version=None):
-        deadline = time.monotonic() + 20
-        while True:
-            job = self.lookup()
-            if (job and job.get("short") == expected_short and not job.get("outcome")
-                    and (job.get("resumeSessionId") or job.get("sessionId")) == expected_native
-                    and (not expected_cli_version or job.get("cliVersion") == expected_cli_version)):
-                self.bind(job)
-                # respawn 复用原生任务保存的启动参数；网页最近选择的模型/等级仍需由原生命令应用。
-                for name in ("model", "effort"):
-                    value = getattr(self, name)
-                    if value:
-                        self.reply(f"/{name} {value}", next_turn=False)
-                return job
-            if time.monotonic() >= deadline:
-                raise RuntimeError("原生 Claude 尚未恢复同一会话，未提交消息，请稍后核对")
-            time.sleep(0.2)
 
     def prepare_text(self, content, client_id):
         text = "\n".join(part["text"] for part in content if part.get("type") == "text")
@@ -2906,97 +1518,11 @@ class NativeSession:
                 text += f"\n@{path}"
         return text
 
-    def send(self, request):
-        self.delivery_started = False
-        client_id = request["client_id"]
-        content = request["content"]
-        steer = bool(request.get("steer"))
-        live = self.lookup() if self.native_id else None
-        if live:
-            self.bind(live)
-        # 查询期间 CLI 可能写入完成或新输入；准入和引导都使用这次查询后的原生历史。
-        self.read_messages()
-        status = NativeDiscovery.status(live or {}, self.messages)
-        if self.compaction.get("state") == "running" and status.get("sessionStatus") != "waiting":
-            status.update(tempo="active", state="compacting")
-        active_at_admission = status.get("tempo") == "active"
-        # 自动续发必须以实时原生状态为准；CLI 恰好开始新任务时继续等，不能抢先把下一条塞入原生队列。
-        if request.get("idle_only") and live:
-            if active_at_admission or status.get("tempo") == "blocked" and status.get("needs") \
-                    and status.get("needs") != "dialog open":
-                self.poll(force=True)
-                return {"deferred": True, "accepted": False}
-        if live and self.worker_version_mismatch(live):
-            # 普通消息虽然使用 nextTurn=False，也必须先把旧 worker 恢复到当前控制器版本；
-            # 否则普通轮次会在旧进程上启动，随后点击“引导”只能被版本错位 deferred。
-            recovered = self.recover_version_skew(live)
-            if recovered is None:
-                self.poll(force=True)
-                return {"deferred": True, "accepted": False,
-                        "versionRecovery": self.version_recovery}
-            live = recovered
-            self.read_messages()
-            status = NativeDiscovery.status(live or {}, self.messages)
-        if live and not live.get("outcome") and self.time_zone_restore_plan() is not None:
-            # 旧会话在首次继续发送时迁移；正在执行时先保留队列，不能为修正时区中断原轮次。
-            if status.get("tempo") == "active":
-                return {"deferred": True, "accepted": False}
-            live = self.restore_job()
-            self.read_messages()
-        # 远程队列由本程序管理：普通消息直接送入原生普通回复入口，只有点击“引导”的消息
-        # 才使用 nextTurn=True；已有审批继续由 CLI 处理，不借此替用户批准、拒绝或取消工具。
-        text = self.prepare_text(content, client_id)
-        if self.native_id and self.short and (
-                not live or live.get("outcome")
-                or live.get("state") in ("done", "stopped", "failed", "ended")
-                and live.get("sessionStatus") not in ("busy", "idle", "waiting")):
-            live = self.restore_job()
-        after = len(self.messages)
-        intent = {"id": client_id, "clientUserMessageId": client_id,
-                  "text": "\n".join(p.get("text", "") for p in content if p.get("type") == "text"),
-                  "content": content, "_nativeText": text, "_after": after,
-                  "_afterOffset": self.log_offset, "deliveryConfirmed": False}
-        # 只有选中的远程消息才到达这里；先报告派发意图，断线后可按原生记录核对，不能盲目重发。
-        self.pending.append(intent)
-        emit({"type": "shared_delivery_intent", "intent": intent})
-        self.delivery_started = True
-        try:
-            if live and not live.get("outcome"):
-                self.bind(live)
-                try:
-                    self.reply(text, next_turn=steer)
-                except NativeError as failure:
-                    if failure.code != "ESKEW":
-                        raise
-                    # CLI 在检查版本不一致后才返回 ESKEW，消息尚未进入旧 worker；
-                    # 仅在安全状态下接管同一会话，并最多重新提交这一次，避免重复发送。
-                    recovered = self.recover_version_skew(live, force=True)
-                    if recovered is None:
-                        self.pending.remove(intent)
-                        self.delivery_started = False
-                        self.poll(force=True)
-                        return {"deferred": True, "accepted": False,
-                                "versionRecovery": self.version_recovery}
-                    self.bind(recovered)
-                    # 竞态恢复不能改变消息语义；普通消息仍是 nextTurn=False，
-                    # 只有用户点击“引导”时才保留 nextTurn=True。
-                    self.reply(text, next_turn=steer)
-            else:
-                self.start(text)
-        except NativeError:
-            self.pending.remove(intent)
-            self.delivery_started = False
-            raise
-        intent["deliveryConfirmed"] = True
-        self.poll(force=True)
-        # 引导只投递选中的一条；由原生 next 队列决定吸收时机，前后均不发送中断按键或等待旧轮停止。
-        # accepted 仅代表原生入口接收，正文仍由随后关联到的原生用户消息确认，不能伪造执行完成。
-        return {"nativeId": self.native_id, "jobId": self.short, "accepted": True}
 
     @contextlib.contextmanager
     def edit_lock(self):
         # 用户要求只禁止同时编辑历史：同一 WSL 用户下连接同一原生会话的多个连接端（如正式服务与验收服务）
-        # 串行执行编辑，第二个编辑直接拒绝；不阻止原版终端，终端打开回退面板时由 waiting 状态拒绝。
+        # 串行执行编辑，第二个编辑直接拒绝；别的应用已打开该会话时由 session_holders 在回退前拒绝，不改写历史。
         owner = threading.get_ident()
         if self.edit_lock_owner == owner:
             yield
@@ -3022,114 +1548,8 @@ class NativeSession:
 
     def session_holders(self):
         # 两个进程不能同时写同一份原生记录：交接前后确认没有任何 CLI 进程（后台或终端）打开该会话。
-        holders = []
-        for path in (self.root / "sessions").glob("*.json"):
-            record = native_json(path)
-            if record.get("sessionId") != self.native_id:
-                continue
-            try:
-                pid = int(record.get("pid", path.stem))
-                if pid <= 1:
-                    continue
-                os.kill(pid, 0)
-            except (TypeError, ValueError, ProcessLookupError):
-                continue
-            except PermissionError:
-                pass
-            holders.append(pid)
-        return holders
+        return [holder["pid"] for holder in native_session_holders(self.root, self.native_id)]
 
-    def job_alive(self):
-        try:
-            return self.rpc({"op": "has", "short": self.short}).get("alive") is True
-        except (FileNotFoundError, ConnectionRefusedError):
-            return False
-
-    def stop_job(self):
-        # 用户要求（B 方案）：编辑前用原版 claude stop 停止同一后台会话，让 print 进程独占记录完成回退；
-        # 已连接的原版终端会提示会话已退出，需重新 claude attach，这是用户已确认接受的代价。
-        result = subprocess.run([self.cli, "stop", self.short], stdin=subprocess.DEVNULL,
-                                capture_output=True, timeout=30)
-        if result.returncode:
-            raise NativeError("ESESSION", "原生后台会话未能停止，未修改历史")
-        deadline = time.monotonic() + 15
-        while True:
-            try:
-                alive = self.job_alive()
-            except (OSError, NativeError):
-                alive = True
-            if not alive and not self.session_holders():
-                return
-            if time.monotonic() >= deadline:
-                raise NativeError("ESESSION", "原生后台会话仍未退出，未修改历史")
-            time.sleep(0.2)
-
-    def shutdown(self):
-        # 远程服务关闭时只回收安全的空闲后台 job；执行、审批、问答、草稿或后台任务
-        # 均保留原生会话，避免服务重启把正在执行的消息变成未核对结果。
-        live = self.lookup() if self.native_id else None
-        if not live:
-            if self.short and self.job_alive() or self.session_holders():
-                return {"stopped": False, "reason": "identity_unknown"}
-            return {"stopped": True, "alreadyStopped": True}
-        if ((live.get("resumeSessionId") or live.get("sessionId")) != self.native_id
-                or self.short and live.get("short") != self.short):
-            return {"stopped": False, "reason": "identity_changed"}
-        # done/outcome 仅说明轮次结束，不能当成后台进程已退出；真实存活状态仍须核对。
-        if (live.get("sessionStatus") not in ("busy", "idle", "waiting")
-                and live.get("state") in ("done", "stopped", "failed", "ended")
-                and not self.job_alive() and not self.session_holders()):
-            return {"stopped": True, "alreadyStopped": True}
-        self.bind(live)
-        self.read_messages()
-        status = NativeDiscovery.status(live, self.messages)
-        if (status.get("tempo") != "idle" or status.get("needs") or self.pending
-                or self.compaction.get("state") == "running"):
-            return {"stopped": False, "reason": "active"}
-        # 最后一条原生记录是 API 错误且同一 REPL 明确空闲时，才用新快照识别恢复占位。
-        # 不能依赖缓存画面放行：用户可能已在原生终端输入真实草稿，画面读取失败则保留会话。
-        try:
-            if (live.get("sessionStatus") == "idle" and self.messages
-                    and self.messages[-1].get("isApiErrorMessage") is True):
-                lines = self.read_terminal_screen(ignore_recovery_placeholder=True)
-            else:
-                lines = self.current_screen() or self.read_terminal_screen()
-        except (OSError, ValueError, RuntimeError):
-            return {"stopped": False, "reason": "screen_unknown"}
-        input_state = native_input_state(lines, allow_borderless=live.get("sessionStatus") == "idle")
-        if input_state != "empty":
-            return {"stopped": False, "reason": "native_draft" if input_state == "draft" else "screen_unknown"}
-        background = self.background_work(lines)
-        if background is None:
-            return {"stopped": False, "reason": "screen_unknown"}
-        if background:
-            return {"stopped": False, "reason": "background_work"}
-        # 用户要求退出只回收安全空闲进程；发出 stop 前再次核对，避免检查期间终端启动了新任务。
-        latest = self.lookup()
-        if (not latest or latest.get("short") != self.short
-                or (latest.get("resumeSessionId") or latest.get("sessionId")) != self.native_id
-                or latest.get("sessionStatus") not in (None, "idle")
-                or NativeDiscovery.status(latest, self.messages).get("tempo") != "idle"
-                or latest.get("needs")):
-            return {"stopped": False, "reason": "state_changed"}
-        stored = native_json(self.root / "jobs" / self.short / "state.json")
-        in_flight = stored.get("inFlight") or {}
-        if (in_flight.get("tasks") or in_flight.get("queued") or in_flight.get("kinds")
-                or in_flight.get("drainableMonitors")):
-            return {"stopped": False, "reason": "background_work"}
-        self.stop_job()
-        return {"stopped": True, "jobId": self.short}
-
-    @staticmethod
-    def background_work(lines):
-        # 用户要求交接只在完全空闲时进行：停止进程会结束后台命令、监控和后台子代理。
-        # 2.1.323 实测后台命令运行时，原生底栏显示“1 shell · ↓ to manage”，结束后提示消失。
-        # 订阅流只重绘变化区域，分隔线未必在画面里；因此只看画面最底部三行（输入框与底栏），
-        # 并要求带箭头的“↓ to manage”，正文里的同样文字不算。画面为空返回 None 表示无法确认。
-        bottom = [line.strip() for line in lines if line.strip()][-3:]
-        if not bottom:
-            return None
-        return "↓ to manage" in " ".join(bottom)
 
     def scheduled_prompt(self, row):
         fire = self.scheduled_fires.get(row.get("parentUuid")) if row.get("type") == "user" else None
@@ -3141,69 +1561,6 @@ class NativeSession:
             return None
         return {"taskId": "scheduled", "kind": "schedule", "summary": text.strip()[:400], "event": fire}
 
-    def withdrawn_prompt(self, status):
-        # 出字前停止（2.1.323 实测）：原生撤回本条输入并把原文放回终端输入框，记录不写中断标记，
-        # 下一条输入也不再以它为父节点。用户要求网页如实显示“已撤回”而不是一直等待开始：
-        # 仅当会话在线空闲、本条之后没有回复或中断记录、且终端输入框正显示同一原文时认定；同一条只需观察到一次。
-        start = next((index for index in range(len(self.messages) - 1, -1, -1)
-                      if native_turn_start(self.messages[index])), None)
-        if start is None or not real_user(self.messages[start]):
-            return None
-        row = self.messages[start]
-        if row["uuid"] in self.withdrawn:
-            return row["uuid"]
-        if (status.get("tempo") != "idle" or not status.get("sessionAlive")
-                or any(later.get("type") == "assistant" or native_interruption(later)
-                       for later in self.messages[start + 1:])):
-            return None
-        content = row.get("message", {}).get("content")
-        text = content if isinstance(content, str) else "\n".join(
-            part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") == "text") \
-            if isinstance(content, list) else ""
-        expected = "".join(text.split())
-        bottom = [line.strip() for line in self.screen.text() if line.strip()][-6:]
-        shown = next(("".join(line[1:].split()) for line in reversed(bottom) if line.startswith("❯")), "")
-        size = min(len(shown), len(expected), 24)
-        if not expected or size < min(len(expected), 6) or shown[:size] != expected[:size]:
-            return None
-        self.withdrawn.add(row["uuid"])
-        return row["uuid"]
-
-    @staticmethod
-    def background_summary(lines):
-        # 用户要求网页看到原版仍在运行的后台任务：与 background_work 同样只认底部三行的原生底栏。
-        # 2.1.323 实测底栏如 “auto mode on · ← 2 agents · 1 shell · esc to interrupt · ↓ to manage”，
-        # 只有带 “↓ to manage” 时才有后台任务；取其中“数字 + 名词”段（1 shell / 1 monitor），
-        # 跳过 “← 2 agents”（会话一开始就有，与后台任务无关）和 “esc to interrupt”。由网页翻译；画面不可读时返回 None。
-        bottom = [line.strip() for line in lines if line.strip()][-3:]
-        if not bottom:
-            return None
-        for line in reversed(bottom):
-            if "↓ to manage" in line:
-                segments = [segment.strip() for segment in line.split("·")]
-                # 多类任务同时运行时的写法未实测（可能分段，也可能 “1 shell, 1 monitor” 同段），两种都按逗号再拆。
-                counts = [piece.strip() for segment in segments[:next(index for index, segment in enumerate(segments)
-                                                                      if "↓ to manage" in segment)]
-                          for piece in segment.split(",") if re.fullmatch(r"\d+ [a-z][a-z ]{0,30}", piece.strip())]
-                return ", ".join(counts)[:80] or "background"
-        return ""
-
-    def current_screen(self):
-        # 后台会话画面由订阅流持续投影到 self.screen；编辑在主循环内同步执行，
-        # 先补齐已到达但未处理的画面帧，其他输入（网页控制请求）按原顺序放回。
-        deferred = []
-        while self.incoming is not None:
-            try:
-                frame = self.incoming.get_nowait()
-            except queue.Empty:
-                break
-            if isinstance(frame, dict) and "_stream" in frame:
-                self.stream_preview(frame["_stream"])
-            else:
-                deferred.append(frame)
-        for frame in deferred:
-            self.incoming.put(frame)
-        return self.screen.text()
 
     def run_rewind(self, target, last_seen, cwd):
         # 用户要求（B 方案）用结构化接口回退，不再模拟按键操作 /rewind 菜单。原生 print 进程按 stream-json
@@ -3222,8 +1579,8 @@ class NativeSession:
                 lines.put(line)
             lines.put(None)
 
-        reader = threading.Thread(target=drain, daemon=True)
-        reader.start()
+        drain_thread = threading.Thread(target=drain, daemon=True)
+        drain_thread.start()
 
         def request(subtype, timeout, **fields):
             identity = uuid.uuid4().hex
@@ -3272,7 +1629,7 @@ class NativeSession:
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait()
-            reader.join(timeout=5)
+            drain_thread.join(timeout=5)
             with contextlib.suppress(OSError):
                 process.stdout.close()
         value = response.get("response") if response.get("subtype") == "success" else None
@@ -3285,94 +1642,6 @@ class NativeSession:
         code, message = REWIND_REFUSALS.get(reason, ("EUNSUPPORTED", f"原版 Claude 拒绝回退（{reason}），未修改历史"))
         raise NativeError(code, message)
 
-    def edit_message(self, request):
-        # 用户要求（2026-11-13 确认 B 方案）：网页编辑历史改为交接。停止同一后台会话 → print 进程用
-        # rewind_conversation 结构化回退 → claude respawn 恢复同一会话 → 发送修改后的消息。
-        # 必须保持原 UUID 与后台短 ID；已连接的原版终端会提示会话退出，需重新 claude attach。
-        # 仅在完全空闲时允许：无执行中轮次、无后台任务、无待确认弹窗、无压缩、无其他网页编辑。
-        # 不模拟按键操作 /rewind 菜单，失败时恢复会话并如实区分“未修改”和“结果未知”。
-        self.delivery_started = False
-        self.read_messages()
-        target = next((row for row in self.messages if row.get("uuid") == request.get("native_user_id")
-                       and row.get("nativeEditable") is True), None)
-        if target is None or request.get("history_head") != self.history.current_head():
-            raise NativeError("ESTALE", "原生历史已变化，请重新打开要编辑的消息")
-        prompt = request.get("prompt")
-        if not isinstance(prompt, str) or not prompt.strip() or len(prompt.encode()) > 128 * 1024:
-            raise NativeError("EINVAL", "修改后的消息不能为空或超过 128 KiB")
-        content = self.edit_content(target, prompt)
-        with self.edit_lock():
-            live = self.lookup()
-            if live:
-                self.bind(live)
-            self.read_messages()
-            if request.get("history_head") != self.history.current_head():
-                raise NativeError("ESTALE", "原生历史已变化，未提交编辑")
-            status = NativeDiscovery.status(live or {}, self.messages)
-            if (status.get("tempo") != "idle" or status.get("needs")
-                    or live and live.get("sessionStatus") not in (None, "idle")
-                    or self.compaction.get("state") == "running"):
-                raise NativeError("EBUSY", "请等待 Claude 结束当前执行后再编辑历史消息")
-            was_live = bool(live and not live.get("outcome"))
-            if was_live:
-                background = self.background_work(self.current_screen())
-                if background is None:
-                    # 连接端尚未收到画面时才单独订阅一次快照。
-                    try:
-                        background = self.background_work(self.read_terminal_screen())
-                    except (OSError, ValueError, RuntimeError):
-                        background = None
-                if background is None:
-                    raise NativeError("EBUSY", "暂时无法确认 Claude 后台任务状态，未修改历史")
-                if background:
-                    raise NativeError("EBUSY", "Claude 仍有后台任务在运行；编辑会停止会话并结束这些任务，请等任务结束后再编辑")
-            elif self.session_holders():
-                raise NativeError("ESESSIONOPEN", "原生会话仍在其他 CLI 中打开，未修改历史")
-            last_seen = next((row["uuid"] for row in reversed(self.messages)
-                              if row.get("type") == "user" and not row.get("isMeta")), None)
-            cwd = self.session_cwd or self.job.get("cwd") or ""
-            if not isinstance(cwd, str) or not cwd.startswith("/") or not Path(cwd).is_dir():
-                raise NativeError("ESESSION", "找不到原生会话的项目目录，未修改历史")
-            if was_live:
-                self.stop_job()
-            try:
-                self.run_rewind(target["uuid"], last_seen, cwd)
-            except Exception:
-                # 回退未完成：恢复原本在运行的同一后台会话；结果未知时也须恢复，再由网页按原生记录核对。
-                if was_live:
-                    with contextlib.suppress(OSError, RuntimeError, subprocess.SubprocessError):
-                        self.restore_job()
-                raise
-            # 回退已被原生确认；修改后的消息尚未发送，后续失败按“未发送”报告并把文字退回输入框。
-            self.delivery_started = False
-            self.read_messages()
-            if any(row.get("uuid") == target["uuid"] for row in self.messages):
-                self.history.cut_before = target["uuid"]
-                self.messages = self.history.select(self.all_messages)
-            self.preview = self.preview_emitted = self.preview_user = self.preview_basis = ""
-            self.preview_context_cache = self.preview_prompt_cache = None
-            try:
-                reopened = bool(self.short) and self.job_alive()
-            except (OSError, NativeError):
-                reopened = True
-            if reopened or self.session_holders():
-                # 交接期间若终端抢先 claude attach，新进程可能载入了回退前的状态；不能再发消息覆盖。
-                raise NativeError("ESESSION", "编辑期间原生会话被重新打开，回退可能未生效；修改后的消息未发送，请刷新核对")
-            try:
-                if self.short:
-                    self.restore_job()
-                else:
-                    self.start()
-            except (OSError, RuntimeError, subprocess.SubprocessError) as failure:
-                raise NativeError("ESESSION", "历史已回退，但原生会话未能重新启动；修改后的消息未发送，可直接重新发送") from failure
-            if request.get("model") != self.model:
-                self.change_setting("model", request.get("model", self.model))
-            if request.get("effort") != self.effort:
-                self.change_setting("effort", request.get("effort", self.effort))
-            result = self.send({"client_id": request["client_id"], "content": content, "idle_only": True})
-            if result.get("deferred"):
-                raise RuntimeError("历史已回退，但原生会话已开始新的执行；修改后的消息未发送，请稍后重新发送")
-            return {**result, "reverted": True}
 
     def edit_content(self, target, prompt):
         # 编辑文字保留原图；图片从原生消息/已读取附件还原，继续经现有上传入口进入同一 CLI。
@@ -3411,361 +1680,6 @@ class NativeSession:
             content.append({"type": "image", "source": image})
         return content
 
-    def read_terminal_screen(self, *, ignore_recovery_placeholder=False):
-        # 按需订阅一次新画面；每次读取等候最多 2 秒，最多 4 帧，不增加发送轮询。
-        # 单帧上限 16 MiB：长会话的 200 段终端快照可超过 1 MiB（2026-11-13 编辑交接验收实测），
-        # 原 1 MiB 上限会让问答、确认框直接报“无法读取原生交互界面”；与 Rust MAX_FRAME_BYTES 同为 16 MiB。
-        screen = Screen(track_intensity=ignore_recovery_placeholder)
-        with socket.socket(socket.AF_UNIX) as connection:
-            connection.settimeout(2)
-            connection.connect(self.address)
-            connection.sendall(json.dumps({"proto": 1, "op": "subscribe", "short": self.short,
-                                           "tail": 200}).encode() + b"\n")
-            with connection.makefile("rb") as stream:
-                for _ in range(4):
-                    line = stream.readline(16 * 1024 * 1024)
-                    if not line.endswith(b"\n"):
-                        break
-                    frame = json.loads(line)
-                    if frame.get("type") == "snapshot":
-                        screen.feed("".join(frame.get("streamTail", [])))
-                    return screen.recovery_input_lines() if ignore_recovery_placeholder else screen.text()
-        raise NativeError("EQUESTIONCHANGED", "暂时无法读取原生交互界面，未发送交互按键")
-
-    def verify_dialog(self, expected):
-        # 回答前读取同一后台的新终端快照，再核对原生等待代次；迟到点击不能落入新弹窗或聊天输入框。
-        screen = self.read_terminal_screen()
-        current = native_dialog(self.lookup() or {}, screen, self.native_id, self.root)
-        if current and current["id"] == expected["id"] and current["remoteSupported"]:
-            return
-        raise NativeError("EDIALOGCHANGED", "原生确认界面已变化，请重新读取；未发送确认按键")
-
-    def check_question(self, expected):
-        current = native_question_request(self.lookup() or {}, self.native_id)
-        identity = expected["nativeQuestion"]["id"]
-        if not current or current.get("nativeQuestion", {}).get("id") != identity:
-            raise NativeError("EQUESTIONCHANGED", "原生问题已经结束或变化，请重新读取；未提交回答")
-        if self.question_reply and self.question_reply.get("id") == identity:
-            raise NativeError("EQUESTIONCHANGED", "回答已经提交，请等待原生结果；不会重复提交")
-
-    def read_question_page(self, request, index=None):
-        # 原生面板重绘沿用同一问题身份；只等最多 2 秒，不把旧页面上的按键盲目发送到下一问。
-        deadline = time.monotonic() + 2
-        while True:
-            self.check_question(request)
-            page = native_question_page(self.read_terminal_screen(), request["input"]["questions"])
-            if page and (index is None or page["index"] == index):
-                return page
-            if time.monotonic() >= deadline:
-                raise NativeError("EQUESTIONCHANGED", "原生问答界面未按预期切换，回答尚未提交，请在 CLI 核对后重试")
-            time.sleep(0.1)
-
-    def submit_multi_question(self, request, index, selected):
-        page = self.read_question_page(request, index)
-        # 原版多选勾选时已保存答案。先回到首个普通选项以退出文字输入，数字键才不会污染答案或触发 Submit。
-        # 最多跨过全部选项、Other、Submit 和底部 Chat 入口；每一步都重新核对同一问题。
-        for _ in range(len(request["input"]["questions"][index]["options"]) + 3):
-            if any(re.match(r"^❯\s*1\.\s+\[", line) for line in page["lines"]):
-                break
-            self.terminal_input(b"\x1b[A", question=request)
-            page = self.read_question_page(request, index)
-        else:
-            raise NativeError("EQUESTIONCHANGED", "未找到原生多选位置，未提交回答")
-        checkboxes = [(match[1], match[2] != " ") for line in page["lines"]
-                      if (match := re.match(r"^(?:❯\s*)?([1-9])\.\s+\[([^\]])\]", line))]
-        if not set(selected).issubset(number for number, _ in checkboxes):
-            raise NativeError("EQUESTIONCHANGED", "原生多选选项已变化，未提交回答")
-        # 网页提交的是完整答案集合；清掉原生面板尚未提交的旧勾选，再按选项顺序恢复本次选择。
-        for number, checked in checkboxes:
-            if checked:
-                self.terminal_input(number.encode(), question=request)
-        for number in selected:
-            self.terminal_input(number.encode(), question=request)
-        # 在普通选项焦点上用原生 Tab 切到下一问/汇总；不能在 Submit 焦点上发送数字选择。
-        self.terminal_input(b"\t", question=request)
-
-    def answer_questions(self, request, values):
-        questions = request["input"]["questions"]
-        if not isinstance(values, dict) or any(
-                not isinstance(values.get(q["question"]), str) or not values[q["question"]].strip()
-                for q in questions):
-            raise NativeError("EINVAL", "请回答所有问题")
-        answers = {q["question"]: values[q["question"]].strip() for q in questions}
-        # 自由回答经原版输入框粘贴；拒绝终端控制字符，答案不能变成快捷键或退出粘贴后的命令。
-        if any(re.search(r"[\x00-\x1f\x7f]", value) for value in answers.values()):
-            raise NativeError("EINVAL", "回答请使用单行文字，不能包含终端控制字符")
-        identity = request["nativeQuestion"]["id"]
-        try:
-            for index, question in enumerate(questions):
-                page = self.read_question_page(request)
-                for _ in range(len(questions) + 1):
-                    if page["index"] == index:
-                        break
-                    direction = b"\x1b[Z" if page["index"] > index else b"\t"
-                    destination = page["index"] + (-1 if page["index"] > index else 1)
-                    self.terminal_input(direction, question=request)
-                    page = self.read_question_page(request, destination)
-                if page["index"] != index:
-                    raise NativeError("EQUESTIONCHANGED", "无法定位原生问题，未提交回答")
-                answer = answers[question["question"]]
-                choices = page["choices"]
-                if "Type something." not in choices and "Type something" not in choices:
-                    raise NativeError("EQUESTIONCHANGED", "原生正在编辑回答或使用不同面板，请在 CLI 核对后重试")
-                single_final = len(questions) == 1 and not page["multi"]
-                parts = answer.split(", ")
-                labels = [option["label"] for option in question["options"]]
-                predefined = page["multi"] and len(set(parts)) == len(parts) and all(part in labels for part in parts)
-                if predefined:
-                    selected = [label for label in labels if label in parts]
-                    if any(label not in choices for label in selected):
-                        raise NativeError("EQUESTIONCHANGED", "原生多选选项未完整显示，请在 CLI 核对")
-                    self.submit_multi_question(request, index, [choices[label] for label in selected])
-                    # 与原版多选编码一致：含逗号分隔符或引号的单项使用 JSON 引号，其余按选项顺序连接。
-                    answers[question["question"]] = ", ".join(
-                        json.dumps(label, ensure_ascii=False) if ', ' in label or '"' in label else label
-                        for label in selected)
-                elif answer in choices and not page["multi"]:
-                    self.terminal_input(choices[answer].encode(), question=request, final_question=single_final)
-                else:
-                    other = choices.get("Type something.") or choices.get("Type something")
-                    if not other:
-                        raise NativeError("EQUESTIONCHANGED", "此原生面板暂不支持网页填写，请在 CLI 回答")
-                    if not page["multi"]:
-                        self.terminal_input(other.encode(), question=request)
-                    # 只有当前问题的 Other 输入获得焦点后才粘贴；不向普通聊天输入框发送回答。
-                    focused = self.read_question_page(request, index)
-                    if page["multi"]:
-                        # 原版多选的数字键只勾选、不移动焦点；先移到 Other 输入，离开输入后再核对勾选状态。
-                        for _ in range(int(other) + 1):
-                            selected = next((int(match[1]) for line in focused["lines"]
-                                             if (match := re.match(r"^❯\s*([1-9])\.", line))), None)
-                            if selected == int(other):
-                                break
-                            if selected is None:
-                                raise NativeError("EQUESTIONCHANGED", "原生多选焦点已变化，未粘贴回答")
-                            self.terminal_input(b"\x1b[B" if selected < int(other) else b"\x1b[A",
-                                                question=request)
-                            focused = self.read_question_page(request, index)
-                    if not any(re.match(rf"^❯\s*{other}\.", line) for line in focused["lines"]):
-                        raise NativeError("EQUESTIONCHANGED", "原生回答输入框没有获得焦点，未粘贴答案")
-                    self.terminal_input(b"\x15\x1b[200~" + answer.encode() + b"\x1b[201~", question=request)
-                    if not page["multi"]:
-                        self.terminal_input(b"\r", question=request, final_question=single_final)
-                    else:
-                        self.submit_multi_question(request, index, [other])
-                        answers[question["question"]] = (
-                            json.dumps(answer, ensure_ascii=False) if ', ' in answer or '"' in answer else answer)
-                if single_final:
-                    self.question_reply = {"id": identity, "state": "submitted"}
-                    return
-                self.read_question_page(request, index + 1)
-            page = self.read_question_page(request, len(questions))
-            if not native_question_review_matches(page["review"], questions, answers):
-                raise NativeError("EQUESTIONCHANGED", "原生汇总与本次回答不一致，未提交，请在 CLI 核对")
-            # 多问必须核对完整汇总后一次提交；不用 reply(text)，该入口只回答第一问。
-            self.terminal_input(b"1", question=request, final_question=True)
-            self.question_reply = {"id": identity, "state": "submitted"}
-        finally:
-            if self.question_reply and self.question_reply.get("id") == identity:
-                self.poll(force=True)
-
-    def terminal_input(self, data, dialog=None, question=None, final_question=False, permission=None):
-        job = self.lookup()
-        if not job or job.get("outcome"):
-            raise RuntimeError("原生 Claude 会话已停止")
-        with socket.socket(socket.AF_UNIX) as connection:
-            connection.settimeout(5)
-            connection.connect(self.address)
-            auth = (self.root / "daemon" / "control.key").read_text().strip()
-            connection.sendall(json.dumps({"proto": 1, "op": "attach", "short": self.short,
-                                           "auth": auth, "cols": 120, "rows": 40,
-                                           "attachId": str(uuid.uuid4())}).encode() + b"\n")
-            response = bytearray()
-            deadline = time.monotonic() + 5
-            while b"\n" not in response:
-                # 原生连接在握手时断开不能卡住整个会话；限制总等待与帧大小，确认前不发送停止/审批按键。
-                remaining = deadline - time.monotonic()
-                if remaining <= 0 or len(response) >= 64 * 1024:
-                    raise RuntimeError("原生交互握手超时或响应过大，未发送交互按键")
-                connection.settimeout(remaining)
-                chunk = connection.recv(1)
-                if not chunk:
-                    raise RuntimeError("原生连接在握手期间断开，未发送交互按键")
-                response.extend(chunk)
-            if not json.loads(response).get("ok"):
-                raise RuntimeError("无法连接原版 Claude 的交互界面")
-            if dialog:
-                self.verify_dialog(dialog)
-                # 按键一旦开始写入就不自动重试；同一确认即使回执丢失，也不能再次执行。
-                self.answered_dialog = dialog["id"]
-                change = self.setting_changes.get(dialog["kind"])
-                if change and change.get("dialogId") == dialog["id"]:
-                    change["state"] = "confirming"
-            if question:
-                self.check_question(question)
-                if final_question:
-                    # 最后提交按键开始写入后即保留回执，断线或多端迟到点击不能再提交同一问题。
-                    self.question_reply = {"id": question["nativeQuestion"]["id"], "state": "submitted"}
-            if permission:
-                current = self.lookup() or {}
-                lines = self.read_terminal_screen()
-                if (current.get("short") != permission["short"] or current.get("outcome")
-                        or current.get("sessionStatus") not in ("idle", "busy") or current.get("needs")
-                        or current.get("sessionStatus") == "busy" and not permission.get("allowBusy")
-                        or not empty_permission_prompt(lines)
-                        or permission_footer_mode(lines) != permission["mode"]):
-                    raise NativeError("EPERMISSIONCHANGED", "原生输入或权限状态已变化，未发送切换按键")
-            # 仅停止、审批和经逐步核对的空闲权限切换使用按键；普通消息和引导仍走原生消息入口。
-            # 多段按键（如计划审批“编号 → 修改意见 → 回车”）在同一连接内依次发送，段间留出原生重绘时间。
-            for index, chunk in enumerate(data if isinstance(data, list) else [data]):
-                if index:
-                    time.sleep(0.3)
-                connection.sendall(chunk)
-            time.sleep(0.15)
-            return True
-
-    def change_setting(self, name, value):
-        old = getattr(self, name)
-        pending = self.setting_changes.get(name) or {}
-        if value == pending.get("requested") and pending.get("state") in ("pending", "confirmation", "confirming"):
-            return
-        # 用户选定 Max 后必须实际应用到同一原生会话；从默认空值切换也需要发送原生命令。
-        if self.native_id and value != old:
-            job = self.lookup()
-            if job and not job.get("outcome"):
-                command = "model" if name == "model" else "effort"
-                # 模型设置也由原版命令入口决定立即应用还是排队，不增加网页忙碌锁。
-                self.short = job["short"]
-                self.read_messages()
-                previous = self.actual_settings.get(name, old)
-                issued_at = int(time.time() * 1000)
-                self.reply(f"/{command} {value or 'auto'}", next_turn=False)
-                # 命令受理不是设置生效；仅原生关联回显更新实际值，确认期间保留已收到的消息。
-                self.actual_settings.setdefault(name, previous)
-                self.setting_changes[name] = {"id": str(uuid.uuid4()), "requested": value,
-                    "previous": previous, "state": "pending", "issuedAt": issued_at}
-            else:
-                self.actual_settings[name] = value
-                self.setting_changes.pop(name, None)
-        setattr(self, name, value)
-
-    def answer(self, frame):
-        response = frame["response"]
-        request_id = response["request_id"]
-        self.poll()
-        request = self.requests.get(request_id)
-        if not request:
-            raise RuntimeError("该原生请求已经结束")
-        answer = response["response"]
-        if request.get("nativeQuestion"):
-            if request["nativeQuestion"]["state"] != "waiting":
-                raise NativeError("EQUESTIONCHANGED", "回答已提交，正在等待原生结果")
-            self.answer_questions(request, answer.get("updatedInput", {}).get("answers", {}))
-            return
-        if request.get("subtype") == "native_dialog":
-            dialog = request["dialog"]
-            if not dialog["remoteSupported"] or dialog["state"] != "waiting" or request_id == self.answered_dialog:
-                raise NativeError("EDIALOGCHANGED", "该确认已提交或需要在原版 Claude CLI 中处理")
-            if dialog["kind"] == "plan":
-                self.answer_plan(request_id, dialog, answer)
-                return
-            if dialog["kind"] == "rewind":
-                self.answer_rewind(request_id, dialog, answer)
-                return
-            if answer.get("behavior") not in ("allow", "deny"):
-                raise NativeError("EINVAL", "请选择确认切换或保留原设置")
-            change = self.setting_changes.get(dialog["kind"])
-            if change and change.get("dialogId") == dialog["id"]:
-                change["decision"] = "accept" if answer["behavior"] == "allow" else "decline"
-            try:
-                self.terminal_input(b"1" if answer["behavior"] == "allow" else b"2", dialog=dialog)
-                # 确认只操作原弹窗，不再发送原消息，也不伪造模型已经切换成功。
-                self.answered_dialog = request_id
-            finally:
-                if self.answered_dialog == request_id:
-                    self.poll(force=True)
-            return
-        if request["tool_name"] == "AskUserQuestion":
-            values = answer.get("updatedInput", {}).get("answers", {})
-            if len(request["input"].get("questions", [])) != 1:
-                raise RuntimeError("多问题面板请在原版 Claude CLI 中回答")
-            text = next(iter(values.values()), "")
-            self.rpc({"op": "reply", "short": self.short, "text": text})
-        else:
-            self.terminal_input(b"1" if answer.get("behavior") == "allow" else b"\x1b")
-        emit({"type": "control_cancel_request", "request_id": request_id})
-
-    def answer_plan(self, request_id, dialog, answer):
-        # 用户要求网页处理计划审批（交互见 native_plan_dialog）：只使用原生对话框列出的编号，不发送 Esc、不猜未知选项。
-        # 修改意见是单行输入框，换行会提前提交，故合并为单行后再输入。
-        options = {option["index"]: option for option in dialog.get("options", [])}
-        if answer.get("behavior") == "allow":
-            option = options.get(answer.get("option"))
-            if not option or option["action"] != "approve":
-                raise NativeError("EINVAL", "请选择原生审批框中的批准方式")
-            keys = [str(option["index"]).encode()]
-        elif answer.get("behavior") == "deny":
-            option = next((item for item in options.values() if item["action"] == "feedback"), None)
-            feedback = " ".join(str(answer.get("feedback") or "").split())
-            if option is None:
-                raise NativeError("EUNSUPPORTED", "当前原生审批框不支持从网页提交修改意见，请在 Claude CLI 中处理")
-            if not feedback or len(feedback) > 4000:
-                raise NativeError("EINVAL", "请填写修改意见（不超过 4000 字）")
-            keys = [str(option["index"]).encode(), feedback.encode(), b"\r"]
-        else:
-            raise NativeError("EINVAL", "请选择批准方式或填写修改意见")
-        try:
-            self.terminal_input(keys, dialog=dialog)
-            self.answered_dialog = request_id
-        finally:
-            if self.answered_dialog == request_id:
-                self.poll(force=True)
-
-    def answer_rewind(self, request_id, dialog, answer):
-        # 用户要求网页只能关闭原版终端的回退菜单：等同在终端取消，不回退任何内容；确认回退只能在终端操作。
-        # 2.1.323 实测：选消息页按 Esc 关闭整个菜单；确认页选 “Never mind” 或按 Esc 都只退回选消息页。
-        # 因此确认页先选 “Never mind”，重新读取画面确认已回到选消息页后再按 Esc；每次发送前 verify_dialog 都核对画面。
-        if answer.get("behavior") != "deny":
-            raise NativeError("EUNSUPPORTED", "网页只能关闭终端回退菜单，确认回退请在原版 Claude CLI 中操作")
-        sent = False
-        try:
-            if dialog.get("step") == "confirm":
-                option = next((item for item in dialog.get("options", [])
-                               if item["label"] == REWIND_CANCEL_OPTION), None)
-                if option is None:
-                    raise NativeError("EUNSUPPORTED", "回退确认页没有取消选项，请在原版 Claude CLI 中处理")
-                self.terminal_input(str(option["index"]).encode(), dialog=dialog)
-                self.answered_dialog, sent = request_id, True
-                listing = self.wait_rewind_list()
-                if listing is None:
-                    return
-                try:
-                    self.terminal_input(b"\x1b", dialog=listing)
-                    self.answered_dialog = listing["id"]
-                except NativeError:
-                    # 已退回选消息页；画面再次变化（如终端有人在操作）时不追加按键，网页按最新画面显示。
-                    pass
-                return
-            self.terminal_input(b"\x1b", dialog=dialog)
-            self.answered_dialog, sent = request_id, True
-        finally:
-            if sent:
-                self.poll(force=True)
-
-    def wait_rewind_list(self):
-        # 只等 2 秒让回退菜单回到选消息页；等不到（菜单已关闭、画面变化或读取失败）就不再发送按键。
-        deadline = time.monotonic() + 2
-        while True:
-            try:
-                screen = self.read_terminal_screen()
-            except NativeError:
-                screen = []
-            current = native_dialog(self.lookup() or {}, screen, self.native_id, self.root)
-            if current and current["kind"] == "rewind" and current.get("step") == "select" and current["remoteSupported"]:
-                return current
-            if time.monotonic() >= deadline:
-                return None
-            time.sleep(0.2)
 
     def retain_web_images(self, row, intent=None):
         # 用户要求已受理网页图片在历史/重连仍完整：优先保留原输入，其次读取该 client 专属原图，不以原生附件转录数量为准。
@@ -3899,6 +1813,9 @@ class NativeSession:
                 interruption = native_tool_interruption(row, self.all_messages)
                 if interruption:
                     row["nativeToolInterruption"] = interruption
+                sdk_interruption = native_sdk_interruption(row, self.all_messages)
+                if sdk_interruption:
+                    row["nativeSdkInterruption"] = sdk_interruption
                 native_editable = row.get("type") == "user" and real_user(row)
                 if row.get("type") == "attachment":
                     attachment = row.get("attachment", {})
@@ -3967,7 +1884,7 @@ class NativeSession:
                 row["nativeOffset"] = position
                 self.all_messages.append({key: row[key] for key in
                                       ("type", "uuid", "parentUuid", "interruptedMessageId", "nativeToolInterruption",
-                                       "toolDenialKind", "sourceToolAssistantUUID", "timestamp", "message", "subtype", "isMeta",
+                                       "nativeSdkInterruption", "toolDenialKind", "sourceToolAssistantUUID", "timestamp", "message", "subtype", "isMeta",
                                        "isCompactSummary", "isVisibleInTranscriptOnly",
                                        "isApiErrorMessage", "isUnmetered", "apiBlockIndex", "durationMs",
                                        "requestedModel", "effort", "filename", "remote_upload",
@@ -4095,209 +2012,309 @@ class NativeSession:
         self.preview_context_cache = (key, result)
         return result
 
-    def stream_preview(self, chunk):
-        self.screen.feed(chunk)
-        self.preview_dirty = True
-        self.flush_preview()
 
-    def flush_preview(self):
-        if not self.preview_dirty or self.job.get("tempo") != "active" or time.monotonic() - self.preview_at < 0.12:
+class SdkReader(NativeSession):
+    """Claude Agent SDK（stream-json）传输的历史读取器。
+
+    只做两件事：把原生 JSONL 规范化成网页历史，以及维护 /goal、/compact 这类需要原生记录佐证的状态。
+    不连接原生后台、不读取终端画面、不控制 CLI；执行状态、审批、问答和消息回执由 Rust 对端的
+    stream-json 连接提供，对端会用实时状态覆盖本读取器快照里的 native_status / requests。
+    """
+
+    def __init__(self, cli, native_id):
+        super().__init__(cli, native_id)
+        # 对端报告“压缩结束”后等待原生 compact_boundary 记录的起点；超时仍无终态证据则标记待核对。
+        self.compaction_ended_at = None
+
+
+    def read_messages(self):
+        super().read_messages()
+        waiting = [intent for intent in self.pending if intent.get("_nativeUuid")]
+        if not waiting:
             return
-        context = self.preview_context()
-        if context is None:
+        # 对端以原生用户消息 UUID 发送；记录出现同一 UUID 就是精确确认，不依赖正文逐字相同
+        # （Skill 展开、命令改写后正文可能不同）。关联方式与按正文关联一致，只是身份更强。
+        rows = {row.get("uuid"): row for row in self.all_messages if row.get("uuid")}
+        for intent in waiting:
+            row = rows.get(intent["_nativeUuid"])
+            if row is None:
+                continue
+            self.clients[row["uuid"]] = intent["clientUserMessageId"]
+            self.pending.remove(intent)
+            self.retain_web_images(row, intent)
+
+    def expire_compaction(self):
+        if self.compaction_ended_at is None or self.compaction_screen_active:
             return
-        self.preview_dirty = False
-        user, basis, known, prompt, occurrences, tools_pending = context
-        if self.preview_user != user["uuid"] or self.preview_basis != basis:
-            self.preview_user = user["uuid"]
-            self.preview_basis = basis
-            self.preview = self.preview_emitted = ""
-        if native_turn_finished(self.messages) or tools_pending:
+        event = self.compaction_events.get(self.compaction_event_id)
+        if not event or event.get("status") != "inProgress":
+            self.compaction_ended_at = None
             return
-        lines = self.screen.text()
-        region = terminal_reply_region(lines, prompt, occurrences)
-        body = []
-        last_line = max((index for index, line in enumerate(region) if line.strip()), default=-1)
-        for index, line in enumerate(region):
-            # 用户要求执行进度不能混入回复正文；CLI 的耗时后缀同属状态行，
-            # 必须在追加预览前截断，否则后续真实回复会被“仅接受前缀增长”的保护拒绝。
-            if re.match(r"^[✻✽✶✢·*]\s|^[─╌]{8}|^\s*⎿|^\s*ctrl\+", line) \
-                    or terminal_progress_line(line, partial=index == last_line):
-                break
-            body.append(line)
-        text = "\n".join(body).strip()
-        # 64 KiB 与服务端临时预览限额一致，过大的终端片段由正式原生历史完整展示。
-        if not text or len(text.encode("utf-8")) > 64 * 1024 or re.match(r"^[A-Z][A-Za-z0-9_]+\(", text):
+        if time.monotonic() - self.compaction_ended_at < 5:
             return
-        compact_text = preview_text_key(text)
-        if not compact_text or compact_text in prompt \
-                or any(value and (compact_text in value or compact_text.startswith(value)) for value in known):
-            return
-        previous = preview_text_key(self.preview)
-        if previous and (not compact_text.startswith(previous) or compact_text == previous):
-            return
-        self.preview = text
-        if self.preview and self.preview != self.preview_emitted:
-            self.preview_emitted = self.preview
-            self.preview_at = time.monotonic()
-            emit({"type": "shared_preview", "native_user_id": user["uuid"],
-                  "preview_basis": basis, "text": self.preview})
+        # 压缩已结束但原生记录里没有终态证据：保留同一行待核对，不无限显示“压缩中”或猜测成功。
+        self.compaction_ended_at = None
+        event["status"] = "unknown"
+        self.compaction["state"] = "unknown"
+        for command in self.native_commands:
+            if command["name"] == "compact" and command["state"] == "running":
+                command["state"] = "unknown"
 
     def poll(self, force=False):
         if not self.initialized or not self.native_id:
             return
-        live = self.lookup()
-        if live:
-            self.bind(live)
-        elif self.short:
-            path = self.root / "jobs" / self.short / "state.json"
-            if path.exists():
-                self.job = native_activity(self.root, {**self.job, "short": self.short}, self.native_id)
-        self.observe_control_screen()
         self.read_messages()
-        job = self.job
-        self.retry_permission_mode(live)
-        # 正常连接与只读发现共用完成状态判断，done 不能因旧 tempo 继续显示执行中。
-        status = NativeDiscovery.status(job, self.messages)
-        # /compact 是本地原生命令，daemon 可能仍报 idle；只在原生画面明确显示压缩时补充执行状态。
-        if self.compaction.get("state") == "running" and status.get("sessionStatus") != "waiting":
+        self.expire_compaction()
+        status = NativeDiscovery.status({}, self.messages)
+        # /compact 是本地原生命令；对端报告压缩进行中时补充执行状态。
+        if self.compaction.get("state") == "running":
             status.update(tempo="active", state="compacting")
-        # 后台任务属于会话进程：会话不在线时一定已结束；在线时按原生底栏汇报，画面不可读则不报告。
-        status["sessionAlive"] = bool(live and not live.get("outcome"))
-        if status["sessionAlive"]:
-            background = self.background_summary(self.screen.text())
-            if background is not None:
-                status["background"] = background
-        withdrawn = self.withdrawn_prompt(status)
-        if withdrawn:
-            status["withdrawnPrompt"] = withdrawn
-        self.observe_dialog(job)
+        status["sessionAlive"] = False
         self.requests = {}
-        question = native_question_request(job, self.native_id)
-        if question:
-            self.requests = self.question_requests(question)
-        elif self.dialog:
-            self.requests[self.dialog["id"]] = {"subtype": "native_dialog", "dialog": self.dialog}
-        elif status.get("tempo") == "blocked" and job.get("needs") != "dialog open":
-            uses = {}
-            for row in self.messages:
-                content = row.get("message", {}).get("content", [])
-                if not isinstance(content, list):
-                    continue
-                for part in content:
-                    if part.get("type") == "tool_use":
-                        uses[part["id"]] = part
-                    if part.get("type") == "tool_result":
-                        uses.pop(part.get("tool_use_id"), None)
-            for tool_id, tool in list(uses.items())[-1:]:
-                request_id = f"native-{tool_id}"
-                self.requests[request_id] = {"subtype": "can_use_tool", "tool_name": tool["name"],
-                                             "input": tool.get("input", {}),
-                                             "decision_reason": job.get("needs", "")}
         context = self.context_configuration()
         preview = self.preview_context()
         updated_at = native_history_updated_at(self.all_messages or self.messages)
         signature = (self.log_identity, self.log_mtime, self.log_offset, json.dumps(status, sort_keys=True),
                      json.dumps(self.pending, sort_keys=True), json.dumps(context, sort_keys=True),
-                     json.dumps(self.requests, sort_keys=True), updated_at,
-                     json.dumps(self.control_projection(), sort_keys=True))
+                     updated_at, json.dumps(self.control_projection(), sort_keys=True))
         if force or signature != self.signature:
             self.signature = signature
-            # 用户要求重启恢复不能把历史 Claude 会话排到活跃 Codex 会话前面；
-            # shared_snapshot 必须携带原生日志最后活动时间，不能让服务端回退到 now_ms()。
-            emit({"type": "shared_snapshot", "native_id": self.native_id, "job_id": self.short,
+            emit({"type": "shared_snapshot", "native_id": self.native_id, "job_id": "",
                   "native_status": status, "messages": self.messages,
                   "history_head": self.history.current_head(),
                   "retired_usage": self.retired_usage,
-                  "clients": self.clients, "pending": self.pending, "requests": self.requests,
+                  "clients": self.clients, "pending": self.pending, "requests": {},
                   "preview_basis": preview[1] if preview else None,
                   "updated_at": updated_at or None,
                   "context_configuration": context, "native_control": self.control_projection()})
-        # 120ms 节流内到达的最后一段必须补发；复用现有 250ms 轮询，不新增线程或读取。
-        # 先发布正式快照，让接收端建立同一轮次/正文基线，再补充仍有效的临时预览。
-        self.flush_preview()
+
+    def sdk_prepare(self, request):
+        """登记一条即将写入 CLI 的网页消息；图片落盘为 @路径，与原有上传目录和权限保持一致。"""
+        client_id, content, native_uuid = request["client_id"], request["content"], request["uuid"]
+        if not isinstance(content, list) or str(uuid.UUID(native_uuid)) != native_uuid:
+            raise NativeError("EINVAL", "Claude 消息格式无效")
+        if any(part.get("type") == "image" for part in content) and not re.fullmatch(r"[A-Za-z0-9_-]{1,120}", client_id):
+            raise NativeError("EINVAL", "Claude 消息标识无效，图片未保存")
+        self.read_messages()
+        text = self.prepare_text(content, client_id)
+        intent = {"id": client_id, "clientUserMessageId": client_id,
+                  "text": "\n".join(p.get("text", "") for p in content if p.get("type") == "text"),
+                  "content": content, "_nativeText": text, "_nativeUuid": native_uuid,
+                  "_after": len(self.messages), "_afterOffset": self.log_offset,
+                  "deliveryConfirmed": False}
+        self.pending.append(intent)
+        # 先报告派发意图，断线后可按原生记录核对，不能盲目重发。
+        emit({"type": "shared_delivery_intent", "intent": intent})
+        return {"text": text}
+
+    def sdk_delivered(self, request):
+        for intent in self.pending:
+            if intent.get("_nativeUuid") == request.get("uuid"):
+                intent["deliveryConfirmed"] = True
+        self.poll(force=True)
+        return {}
+
+    def sdk_abandon(self, request):
+        self.pending = [intent for intent in self.pending if intent.get("_nativeUuid") != request.get("uuid")]
+        self.poll(force=True)
+        return {}
+
+    def sdk_command(self, request):
+        """登记 /goal、/compact 命令；对端随后把同一段斜杠文本写入 CLI。"""
+        name, argument = request.get("name"), (request.get("argument") or "").strip()
+        if name not in ("goal", "compact") or not self.native_capabilities.get(name):
+            raise NativeError("EUNSUPPORTED", "当前 Claude CLI 未提供此原生命令")
+        if name == "goal" and (not argument or len(argument.encode("utf-16-le")) // 2 > 4000):
+            raise NativeError("EINVAL", "Claude 目标需要 1–4000 个字符")
+        if name == "compact" and not self.native_id:
+            raise NativeError("EINVAL", "请先创建会话并产生对话，再压缩上下文")
+        self.read_messages()
+        expected = request.get("expectedGoal")
+        if expected is not None and (not self.goal or any(
+                self.goal.get(key) != expected.get(key) for key in ("nativeId", "objective", "status"))):
+            raise NativeError("EBUSY", "原生目标已变化，请重新读取后操作")
+        if any(command["name"] == name and command["state"] in ("pending", "running", "stopping", "unknown")
+               for command in self.native_commands):
+            raise NativeError("EBUSY", "上一条同类原生命令尚未确认，请先核对状态")
+        command = {"id": request["id"], "name": name, "argument": argument,
+                   "state": "pending", "issuedAt": int(time.time() * 1000),
+                   "baseline": self.goal_revision if name == "goal" else self.compaction.get("itemId"),
+                   "beforeOutput": ""}
+        # 只保留每类最近一次操作；已接收操作重连后仅核对，绝不重新发送。
+        self.native_commands = [value for value in self.native_commands if value["name"] != name] + [command]
+        if name == "compact":
+            self.compaction_event_id = ""
+            self.compaction = {"state": "pending", "itemId": command["id"]}
+        emit({"type": "shared_native_command_intent", "native_control": self.control_projection()})
+        return {"nativeCommand": {key: command[key] for key in ("id", "name", "state")},
+                "nativeControl": self.control_projection()}
+
+    def sdk_command_result(self, request):
+        command = next((value for value in self.native_commands if value["id"] == request.get("id")), None)
+        if command is None:
+            return {}
+        if request.get("state") == "failed":
+            command["state"] = "failed"
+            if command["name"] == "compact":
+                self.compaction = {"state": "idle", "itemId": command["id"]}
+        elif request.get("state") == "unknown":
+            command["state"] = "unknown"
+            if command["name"] == "compact":
+                self.compaction["state"] = "unknown"
+                event = self.compaction_events.get(self.compaction_event_id)
+                if event and event.get("status") == "inProgress":
+                    event["status"] = "unknown"
+        self.poll(force=True)
+        return {}
+
+    def sdk_compacting(self, active):
+        if active and not self.compaction_screen_active:
+            self.compaction = {**self.compaction, "state": "running"}
+            command = next((value for value in self.native_commands if value["name"] == "compact"
+                            and value["state"] in ("pending", "running", "unknown")), None)
+            previous = self.compaction_events.get(self.compaction_event_id)
+            identity = command["id"] if command else previous["id"] if previous and previous.get("status") == "unknown" else str(uuid.uuid4())
+            self.compaction_event_id = identity
+            self.record_compaction_event(identity, "inProgress")
+            for value in self.native_commands:
+                if value["name"] == "compact" and value["state"] in ("pending", "unknown"):
+                    value["state"] = "running"
+        if self.compaction_screen_active and not active:
+            event = self.compaction_events.get(self.compaction_event_id)
+            if event and event.get("phase") == "stopping":
+                self.record_compaction_event(event["id"], "interrupted")
+                self.compaction = {"state": "idle", "itemId": event["id"]}
+            for value in self.native_commands:
+                if value["name"] == "compact" and value["state"] == "stopping":
+                    value.update(state="completed", message="压缩已停止")
+                    self.record_compaction_event(value["id"], "interrupted")
+                    self.compaction = {"state": "idle", "itemId": value["id"]}
+            self.compaction_ended_at = time.monotonic()
+        self.compaction_screen_active = active
+
+    def sdk_compact_failed(self, message):
+        text = str(message or "")
+        for command in self.native_commands:
+            if command["name"] != "compact" or command["state"] not in ("pending", "running"):
+                continue
+            if re.search(r"Nothing to compact|Not enough messages|Conversation too short", text, re.I):
+                command.update(state="completed", message="当前历史无需压缩")
+                self.record_compaction_event(command["id"], "completed", outcome="noop")
+            else:
+                command.update(state="failed", message="原生压缩未完成，请在 CLI 中核对错误")
+                self.record_compaction_event(command["id"], "failed")
+            self.compaction_event_id = command["id"]
+            self.compaction = {"state": "idle", "itemId": command["id"]}
+            self.compaction_ended_at = None
+
+    def sdk_signal(self, request):
+        if "compacting" in request:
+            self.sdk_compacting(bool(request["compacting"]))
+        if request.get("compact_failed") is not None:
+            self.sdk_compact_failed(request["compact_failed"])
+        if request.get("stopping") and self.compaction.get("state") == "running":
+            event = self.compaction_events.get(self.compaction_event_id)
+            if event and event.get("status") == "inProgress":
+                event["phase"] = "stopping"
+            for command in self.native_commands:
+                if command["name"] == "compact" and command["state"] == "running":
+                    command["state"] = "stopping"
+        self.poll(force=True)
+        return {}
+
+    def sdk_edit_prepare(self, request):
+        """编辑历史消息的预检：只读取记录并校验目标、分支、文字和原图，不修改任何内容。"""
+        self.delivery_started = False
+        self.read_messages()
+        target = next((row for row in self.messages if row.get("uuid") == request.get("native_user_id")
+                       and row.get("nativeEditable") is True), None)
+        if target is None or request.get("history_head") != self.history.current_head():
+            raise NativeError("ESTALE", "原生历史已变化，请重新打开要编辑的消息")
+        prompt = request.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip() or len(prompt.encode()) > 128 * 1024:
+            raise NativeError("EINVAL", "修改后的消息不能为空或超过 128 KiB")
+        content = self.edit_content(target, prompt)
+        if self.compaction.get("state") == "running":
+            raise NativeError("EBUSY", "请等待压缩结束后再编辑历史消息")
+        last_seen = next((row["uuid"] for row in reversed(self.messages)
+                          if row.get("type") == "user" and not row.get("isMeta")), None)
+        cwd = self.session_cwd or ""
+        if not isinstance(cwd, str) or not cwd.startswith("/") or not Path(cwd).is_dir():
+            raise NativeError("ESESSION", "找不到原生会话的项目目录，未修改历史")
+        return {"content": content, "target": target["uuid"], "last_seen": last_seen, "cwd": cwd}
+
+    def sdk_rewind(self, request):
+        """回退到目标消息之前。调用前对端必须已让自己的 CLI 退出，使回退进程独占这份记录。
+
+        明确拒绝抛 NativeError（记录未修改）；已发出回退请求却失去答复抛 RuntimeError（结果未知）。
+        """
+        target, last_seen, cwd = request["target"], request["last_seen"], request["cwd"]
+        with self.edit_lock():
+            self.read_messages()
+            if request.get("history_head") != self.history.current_head():
+                raise NativeError("ESTALE", "原生历史已变化，未提交编辑")
+            if self.session_holders():
+                raise NativeError("ESESSIONOPEN", "原生会话仍在其他 CLI 中打开，未修改历史")
+            self.run_rewind(target, last_seen, cwd)
+            # 回退已被原生确认；修改后的消息尚未发送，后续失败按“未发送”报告。
+            self.delivery_started = False
+            self.read_messages()
+            if any(row.get("uuid") == target for row in self.messages):
+                self.history.cut_before = target
+                self.messages = self.history.select(self.all_messages)
+            self.preview = self.preview_emitted = self.preview_user = self.preview_basis = ""
+            self.preview_context_cache = self.preview_prompt_cache = None
+        self.poll(force=True)
+        return {"rewound": True}
+
+    def sdk_configured_mode(self, request):
+        # “沿用实例配置”的权限：按实例 settings.json 的 defaultMode 解析成具体模式名，由对端交给 CLI。
+        return {"mode": self.configured_permission_mode()}
+
+    def initialize(self, request):
+        self.model = request.get("model", "")
+        self.effort = request.get("effort", "")
+        self.permission_mode = request.get("permission_mode")
+        self.permission_catalog = request["catalog"].get("permissionModes", [])
+        self.setting_catalog = request["catalog"].get("models", [])
+        self.restore_settings(request.get("native_control") or {})
+        self.clients = request.get("clients", {})
+        self.pending = request.get("pending", [])
+        self.native_commands = (request.get("native_control") or {}).get("commands", [])
+        previous_compaction = (request.get("native_control") or {}).get("compaction") or {}
+        if previous_compaction.get("state") in ("pending", "running", "unknown"):
+            self.compaction = {**previous_compaction, "state": "unknown"}
+        self.restore_compaction_events(request.get("native_control") or {})
+        commands = {command.get("name") for command in request["catalog"].get("commands", [])}
+        self.native_capabilities = {name: name in commands for name in ("goal", "compact")}
+        self.initialized = True
+        return {**request["catalog"], "contextConfiguration": self.context_configuration()}
 
     def control(self, request):
         subtype = request.get("subtype")
         if subtype == "initialize":
-            self.model = request.get("model", "")
-            self.effort = request.get("effort", "")
-            self.permission_mode = request.get("permission_mode")
-            self.permission_catalog = request["catalog"].get("permissionModes", [])
-            self.setting_catalog = request["catalog"].get("models", [])
-            self.restore_settings(request.get("native_control") or {})
-            self.restore_question_reply(request.get("native_control") or {})
-            self.clients = request.get("clients", {})
-            self.pending = request.get("pending", [])
-            self.native_commands = (request.get("native_control") or {}).get("commands", [])
-            previous_compaction = (request.get("native_control") or {}).get("compaction") or {}
-            if previous_compaction.get("state") in ("pending", "running", "unknown"):
-                self.compaction = {**previous_compaction, "state": "unknown"}
-            self.restore_compaction_events(request.get("native_control") or {})
-            commands = {command.get("name") for command in request["catalog"].get("commands", [])}
-            self.native_capabilities = {name: name in commands for name in ("goal", "compact")}
-            self.initialized = True
-            return {**request["catalog"], "contextConfiguration": self.context_configuration()}
-        if subtype == "shared_send":
-            return self.send(request)
-        if subtype == "shared_shutdown":
-            return self.shutdown()
-        if subtype == "shared_edit_message":
-            return self.edit_message(request)
-        if subtype == "shared_native_command":
-            return self.native_command(request)
+            return self.initialize(request)
         if subtype == "shared_sync":
             self.poll(force=True)
-        elif subtype == "set_model":
-            self.change_setting("model", request.get("model", ""))
-        elif subtype == "set_permission_mode":
-            return self.change_permission_mode(request.get("mode"))
-        elif subtype == "apply_flag_settings":
-            self.change_setting("effort", request.get("settings", {}).get("effortLevel") or "")
-        elif subtype == "interrupt":
-            self.terminal_input(b"\x1b")
-            if self.compaction.get("state") == "running":
-                event = self.compaction_events.get(self.compaction_event_id)
-                if event and event.get("status") == "inProgress":
-                    event["phase"] = "stopping"
-                for command in self.native_commands:
-                    if command["name"] == "compact" and command["state"] == "running":
-                        command["state"] = "stopping"
-        elif subtype == "shared_answer":
-            self.answer({"response": request["response"]})
-        else:
-            raise RuntimeError("此原生 Claude 控制操作尚未适配")
-        return {"nativeSettings": self.settings_projection()}
+            return {}
+        handler = {"sdk_prepare": self.sdk_prepare, "sdk_configured_mode": self.sdk_configured_mode,
+                   "sdk_edit_prepare": self.sdk_edit_prepare, "sdk_rewind": self.sdk_rewind, "sdk_delivered": self.sdk_delivered,
+                   "sdk_abandon": self.sdk_abandon, "sdk_command": self.sdk_command,
+                   "sdk_command_result": self.sdk_command_result, "sdk_signal": self.sdk_signal}.get(subtype)
+        if handler is None:
+            raise NativeError("EUNSUPPORTED", "此原生 Claude 控制操作尚未适配")
+        return handler(request)
 
 
 def main():
     arguments = argparse.ArgumentParser()
     arguments.add_argument("--cli", required=True)
     arguments.add_argument("--native-id", default="")
-    arguments.add_argument("--job-id", default="")
-    arguments.add_argument("--autocompact", default=None)
     arguments.add_argument("--discover", action="store_true")
-    arguments.add_argument("--cleanup", action="store_true")
     options = arguments.parse_args()
-    native = NativeDiscovery() if options.discover else NativeSession(options.cli, options.native_id, options.job_id)
-    if not options.discover:
-        window = options.autocompact
-        if window is not None and window != "auto" and not (
-                window.isdigit() and 100000 <= int(window) <= 1000000):
-            raise RuntimeError("自动压缩窗口参数无效")
-        native.auto_compact_window = window
-    if options.cleanup:
-        # 启动补偿只检查保存的同一原生身份，不 initialize、不恢复会话、不发送模型消息。
-        if (options.discover or not re.fullmatch(r"[0-9a-f]{8}", options.job_id)
-                or str(uuid.UUID(options.native_id)) != options.native_id):
-            raise RuntimeError("Claude 回收目标身份无效")
-        try:
-            with contextlib.redirect_stdout(sys.stderr):
-                result = native.shutdown()
-        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
-            result = {"stopped": False, "reason": "cleanup_failed"}
-        emit(result)
-        return
+    # 用户要求改用 Claude Agent SDK 对接：这里只有两种只读角色——发现（列出原生会话、读历史、核对持有者）
+    # 和单个会话的历史读取器；不连接原生后台、不读取终端画面、不控制 CLI。执行、审批、问答由 Rust 对端的 stream-json 连接负责。
+    native = NativeDiscovery() if options.discover else SdkReader(options.cli, options.native_id)
     incoming = queue.Queue()
     native.incoming = incoming
 
@@ -4320,25 +2337,16 @@ def main():
         except queue.Empty:
             continue
         if line is None:
-            # 网页断线仍保留会话；计划退出由 shared_shutdown 回收，异常断线留给下次启动补偿。
+            # 对端关闭连接：读取器随之退出，没有需要保留的后台会话。
             return
-        if isinstance(line, dict):
-            native.stream_preview(line["_stream"])
-            continue
         frame = json.loads(line)
-        if frame["type"] == "control_response":
-            try:
-                native.answer(frame)
-            except (OSError, ValueError, RuntimeError) as failure:
-                emit({"type": "shared_error", "message": str(failure)})
-            continue
         request_id = frame["request_id"]
         try:
             value = native.control(frame["request"])
             response = {"subtype": "success", "request_id": request_id, "response": value}
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as failure:
-            # 用户要求接收确认不能倒退为未发送；shared_send 里的后续状态查询也可能返回 NativeError。
-            # 只有发送函数明确保留“尚未准入”标记才可判为未投递，已开始或已接收后的错误只能待核对。
+            # 用户要求接收确认不能倒退为未发送；只有发送函数明确保留“尚未准入”标记才可判为未投递，
+            # 已开始或已接收后的错误只能待核对。
             not_sent = not native.delivery_started if frame["request"].get("subtype") in ("shared_send", "shared_native_command", "shared_edit_message") \
                 else isinstance(failure, NativeError)
             response = {"subtype": "error", "request_id": request_id, "error": str(failure),

@@ -79,8 +79,9 @@ export function threadForkAllowed(id = selectedId) {
     && relatedSessionView?.threadId !== id;
 }
 export function threadOwnedElsewhere(id = selectedId) {
-  return !!id && thread?.id === id && thread.backend !== "claude"
-    && thread.externalWriter === true;
+  // 用户要求 Claude 与 Codex 一样：会话被别的应用（终端里的 claude、旧版 Elves 的后台任务等）持有时，
+  // 输入区原位提示“已在另一个应用中打开”；占用由服务端核对原生进程登记后给出，网页不自行判断。
+  return !!id && thread?.id === id && thread.externalWriter === true;
 }
 export function threadReadOnly(id = selectedId) {
   return !!session?.readOnly || !!id && (

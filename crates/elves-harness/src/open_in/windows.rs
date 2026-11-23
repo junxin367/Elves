@@ -471,7 +471,7 @@ fn command(
             command.arg("-NoExit");
         }
         "wsl" => {
-            // 用户要求恢复当前 WSL 对话：发行版、用户、Linux 目录、CLI 和 attach/resume ID 均取自服务端保存的同一会话。
+            // 用户要求恢复当前 WSL 对话：发行版、用户、Linux 目录、CLI 和 resume 的原生会话 ID 均取自服务端保存的同一会话。
             // 登录环境保留该 WSL 用户的 TZ；固定 exec "$@" 只转发独立参数，不拼接用户目录或会话内容。
             let session = application
                 .wsl_session
@@ -692,7 +692,7 @@ mod tests {
             user: "junes".into(),
             linux_cwd: "/mnt/e/项目".into(),
             executable: "/home/junes/.local/bin/claude".into(),
-            arguments: vec!["attach".into(), "job-fixture".into()],
+            arguments: vec!["--resume".into(), "native-id".into()],
             window_title: "WSL · fixture [native-id]".into(),
         });
         for root in [
@@ -715,8 +715,8 @@ mod tests {
                     "exec \"$@\"",
                     "--",
                     "/home/junes/.local/bin/claude",
-                    "attach",
-                    "job-fixture"
+                    "--resume",
+                    "native-id"
                 ]
             );
         }

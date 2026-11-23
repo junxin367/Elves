@@ -62,6 +62,33 @@ pub(super) struct WslSession {
     pub window_title: String,
 }
 
+/// 会话此刻由谁持有，决定“在 WSL 打开”能否直接进行。
+///
+/// 用户要求：别的应用已持有时不能抢占；由 Elves 自己持有时先弹窗询问是否关闭当前会话占用，
+/// 确认后同步关闭 Elves 的占用再打开 WSL 里的 CLI 会话；Elves 自己的会话正在执行时不能关闭。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Occupancy {
+    /// 没有进程持有，可直接打开。
+    Free,
+    /// Elves 自己的 CLI 持有且空闲：用户确认后关闭这份占用再打开。
+    HarnessIdle,
+    /// Elves 自己的 CLI 正在执行、等待审批问答或有后台任务：不能关闭。
+    HarnessBusy,
+    /// 别的应用（终端、旧版 Elves 的后台任务等）持有：不能抢占。
+    External,
+}
+
+impl Occupancy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Free => "free",
+            Self::HarnessIdle => "harnessIdle",
+            Self::HarnessBusy => "harnessBusy",
+            Self::External => "external",
+        }
+    }
+}
+
 struct LaunchOutcome {
     foreground: bool,
     warning: Option<String>,
@@ -73,12 +100,14 @@ fn identity(payload: &Value, opening: bool) -> Result<Value, ApiError> {
         .ok_or_else(|| ApiError::new(400, "打开工作区参数无效"))?;
     // 用户要求正文文件复用 Open in；只允许会话/项目身份、文件引用路径和固定应用 ID，不能传 cwd、程序或命令参数。
     if object.keys().any(|key| {
-        !matches!(key.as_str(), "threadId" | "projectId" | "path") && !(opening && key == "target")
+        !matches!(key.as_str(), "threadId" | "projectId" | "path")
+            && !(opening && matches!(key.as_str(), "target" | "releaseHarness"))
     }) {
         return Err(ApiError::new(400, "只能通过会话或项目标识打开工作区"));
     }
     let mut context = object.clone();
     context.remove("target");
+    context.remove("releaseHarness");
     requested_file(payload)?;
     super::workspace_identity(&Value::Object(context))
 }
@@ -195,7 +224,7 @@ async fn wsl_session(
     state: &WebState,
     identity: &Value,
     metadata: &Value,
-) -> Result<Option<WslSession>, ApiError> {
+) -> Result<Option<(WslSession, Occupancy)>, ApiError> {
     let Some(thread_id) = identity["threadId"].as_str() else {
         return Ok(None);
     };
@@ -213,7 +242,7 @@ async fn wsl_session(
         .open_in_session(thread_id)
         .await
         .map_err(|error| ApiError::new(409, &format!("无法确认 WSL 会话：{error}")))?;
-    if let Some(session) = &session
+    if let Some((session, _)) = &session
         && (metadata["instanceId"] != session.instance_id
             || metadata["wslDistribution"] != session.distribution
             || metadata["wslUser"] != session.user
@@ -242,7 +271,10 @@ pub(super) async fn targets(
     let (root, metadata) = super::workspace_file_context(&state, &identity, &authorization).await?;
     let file = resolve_file(&root, &metadata, &payload, &authorization).await?;
     let include_default_app = cfg!(windows) && identity["threadId"].is_string() && file.is_some();
-    let wsl_session = wsl_session(&state, &identity, &metadata).await?;
+    let (wsl_session, occupancy) = match wsl_session(&state, &identity, &metadata).await? {
+        Some((session, occupancy)) => (Some(session), Some(occupancy)),
+        None => (None, None),
+    };
     let result = tokio::task::spawn_blocking(move || {
         let mut targets: Vec<_> = applications(&root, wsl_session.as_ref())
             .into_iter()
@@ -251,6 +283,12 @@ pub(super) async fn targets(
                     json!({"target": app.target, "label": app.label, "available": true});
                 if let Some(icon) = application_icon(&app) {
                     value["icon"] = json!(icon);
+                }
+                if app.target == "wsl"
+                    && let Some(occupancy) = occupancy
+                {
+                    // 网页据此决定直接打开、先弹窗确认关闭 Elves 的占用，还是提示已被其他应用占用；启动时服务端会再次核对。
+                    value["occupancy"] = json!(occupancy.as_str());
                 }
                 value
             })
@@ -356,7 +394,52 @@ pub(super) async fn dispatch(
         // 文件关联由 Windows 在打开原文件时决定，不探测其他应用，也不涉及 WSL 会话恢复。
         (root, None)
     } else {
-        let wsl_session = wsl_session(&state, &identity, &metadata).await?;
+        let (wsl_session, occupancy) = match wsl_session(&state, &identity, &metadata).await? {
+            Some((session, occupancy)) => (Some(session), Some(occupancy)),
+            None => (None, None),
+        };
+        let mut release = false;
+        if target == "wsl"
+            && let Some(occupancy) = occupancy
+        {
+            // 用户要求：已被其他应用打开的会话不能抢占；Elves 自己占用时必须先经用户确认再关闭，旧网页不带确认也不会被静默释放。
+            match occupancy {
+                Occupancy::External => {
+                    return Err(ApiError::new(
+                        409,
+                        "该会话已在另一个应用中打开，请先在那边关闭会话",
+                    ));
+                }
+                Occupancy::HarnessBusy => {
+                    return Err(ApiError::new(
+                        409,
+                        "会话正在执行任务，无法关闭占用。请先停止任务或等待完成后再打开 WSL",
+                    ));
+                }
+                Occupancy::HarnessIdle if payload["releaseHarness"] != true => {
+                    return Err(ApiError::new(
+                        409,
+                        "该会话正由 Elves 占用，请确认关闭占用后再打开 WSL",
+                    ));
+                }
+                Occupancy::HarnessIdle => release = true,
+                Occupancy::Free => {}
+            }
+        }
+        if release {
+            // 先复核授权，再同步关闭 Elves 对会话的占用；关闭失败时不启动 WSL，会话保持原样。
+            authorization
+                .prepare_dispatch()
+                .await
+                .map_err(super::authorization_error)?;
+            let thread_id = identity["threadId"].as_str().expect("validated thread");
+            state
+                .controller
+                .claude
+                .release_for_terminal(thread_id)
+                .await
+                .map_err(|error| ApiError::new(409, &format!("无法关闭会话占用：{error}")))?;
+        }
         let target = target.to_owned();
         tokio::task::spawn_blocking(move || {
             let application = applications(&root, wsl_session.as_ref())

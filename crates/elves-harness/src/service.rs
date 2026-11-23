@@ -368,8 +368,6 @@ async fn retire_obsolete_service(directory: &Path) -> anyhow::Result<()> {
     }
     #[cfg(windows)]
     {
-        // 旧服务没有受控退出接口；先保存受管身份，下次启动补偿，不能把强制终止当作已回收。
-        super::claude::remember_shutdown(directory, "legacy_service_upgrade")?;
         anyhow::ensure!(
             crate::windows_integration::terminate_process(endpoint.process_id),
             "旧版Harness 后台仍在运行，请退出 Elves 后重试"
@@ -501,11 +499,6 @@ async fn request(endpoint: &Endpoint, action: &str, payload: &Value) -> anyhow::
 
 pub async fn prepare_shutdown_status(reason: &str) -> anyhow::Result<Value> {
     let directory = crate::paths::default_app_state_dir();
-    // 安装 handoff 不登记 Claude 回收意图；新 Harness 会按 native job 重新 attach。
-    // 普通退出仍保留原有回收记录，空闲会话可安全停止，未知状态继续补偿。
-    if reason != "installer" {
-        super::claude::remember_shutdown(&directory, reason)?;
-    }
     // 用户要求（2026-11-21）：安装程序自己关闭 Elves，不要求用户先退出。端点缺失或失效时没有可询问的
     // Harness，剩余进程（含无响应的旧客户端、独立代理）只列进日志，由安装器 StopElves 结束；新版执行中的
     // Codex 在私有服务里，不随这些进程结束。

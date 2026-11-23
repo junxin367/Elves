@@ -947,7 +947,6 @@ impl Claude {
         response["deliveryState"] = json!(if deferred { "queued" } else { "accepted" });
         response["executionTransport"] = json!("claude-wsl-shared");
         response["nativeId"] = json!(c.native_id);
-        response["nativeJobId"] = json!(c.native_job_id);
         Ok(response)
     }
 
@@ -1022,9 +1021,6 @@ impl Claude {
             );
             // 自动续发也逐次核对原设备授权；退出、只读或撤销后不能继续派发。
             if auth.check().await.is_err() {
-                continue;
-            }
-            if self.cleanup_store.cancel(&id).is_err() {
                 continue;
             }
             let _ = self

@@ -2807,12 +2807,6 @@ async fn prepare_controller_shutdown(reason: &str) -> Value {
             );
         }
     }
-    if controller.claude.record_clean_exit().is_err() {
-        let _ = crate::diagnostic_log::append_diagnostic_log(
-            "claude.cleanup_exit_journal_failed",
-            json!({"pendingStartupCheck":true}),
-        );
-    }
     controller.shutdown_complete.store(true, Ordering::Release);
     let mut response = json!({"status":"stopped","cleanup":controller.claude.cleanup_report()});
     if plan.keeps_server() {

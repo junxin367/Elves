@@ -46,6 +46,24 @@ Harness 优先使用 Elves 自己拉起的 Codex app-server（私有服务）：
 
 Harness 接上同一代次的私有服务后，对执行中或有后台终端的会话执行 `thread/resume`，恢复流式事件。后台终端只能按命令条目的开始与结束事件跟踪，交接时随服务代次写入 Harness 状态，新连接用会话历史核对是否已结束。当前 Codex 协议不会向新连接补发待处理的审批或用户输入请求，所以等待中的轮次退出后会留在服务里继续等待，重新打开 Elves 后只能停止这一轮再重新发送。
 
+## Claude 执行引擎
+
+Claude 会话通过 Claude Agent SDK 使用的 stream-json 控制协议驱动所选 WSL 发行版里的原版 CLI：`claude --print --input-format stream-json --output-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio`，不使用 `--bg` 后台会话，也不识别终端画面。执行状态（`session_state_changed`）、审批与问答与计划确认（`can_use_tool`）、消息回执（`command_lifecycle`）、模型、思考深度、权限模式、打断和历史回退都来自 CLI 的结构化帧或控制请求。不使用 bare、替代系统提示词或跳过审批参数；CLI 经目标 WSL 用户的登录 shell 启动，继承该用户的时区。
+
+三个部分各司其职，代码在 `crates/elves-harness/src/claude_sdk/` 和 `claude_shared.py`：
+
+| 部分 | 位置 | 职责 |
+| --- | --- | --- |
+| 对端 `peer.rs`、状态机 `state.rs` | Harness（Windows） | 对上层说与原共享连接端相同的帧协议，所以队列、视图和历史投影不变；状态机把 CLI 帧折算成执行状态、待处理请求和回执阶段，不含 I/O |
+| 宿主 `host.py` | 所选 WSL | `setsid` 脱离启动它的连接端，持有 CLI，通过 unix 套接字只接受一个连接；Harness 退出、被终止或安装升级时执行中的任务继续，等待审批或问答时保留未答复的请求，重新连接时补发初始化、状态、后台任务和未答复请求；无人连接且没有任何工作时 3 秒后收尾，只剩等待审批时最长保留 12 小时；对连接只限制发送方向的等待（60 秒），读取不设超时，Harness 因用户迟迟不批准或任务长时间无输出而没有写入时不会被当成断线 |
+| 读取器 `claude_shared.py` | 所选 WSL | 两种只读角色：单个会话的历史读取器（规范化原生 JSONL 为网页历史、按用户消息 UUID 精确关联网页消息身份、目标与压缩记录，并执行历史回退）；发现读取器（列出原生会话、读历史和子代理、核对哪些进程持有某个会话）。不连接后台、不控制 CLI |
+
+空闲会话不启动 CLI：只启动读取器显示历史，下一次发送再用 `--resume` 接续同一个原生会话；空闲 10 分钟后对端让 CLI 退出以释放内存。Harness 重启后，退出前仍在执行或等待的会话用 `host_attach` 接回宿主，没有宿主就保持空闲。完全访问（`bypassPermissions`）必须在 CLI 启动时声明，所以只在会话空闲时通过重启 CLI 切换。
+
+同一个原生会话同一时间只允许一个进程写入。发送、编辑历史、压缩、设置目标派发前和启动 CLI 前，发现读取器核对 `~/.claude/sessions/<pid>.json` 的进程登记：会话 ID 相同、进程存活且启动标识与 `/proc` 一致的进程算持有者，按命令行里的宿主、读取器脚本路径排除 Elves 自己的宿主、CLI 和回退用的短进程。别的应用持有时，线程读取返回 `externalWriter` 并置只读，派发被拒绝，网页在输入区原位提示“已在另一个应用中打开”。在 WSL 打开会话时，Open in 返回 `occupancy`，由用户确认后才关闭 Elves 自己的占用（见[Open in 的应用识别与前台显示](product-standards/core/product-behavior.md#open-in-的应用识别与前台显示)）。
+
+新版本不兼容旧版本的 daemon 后台任务，旧版代码（daemon 连接、终端画面识别、迁移与退出回收）已删除：旧任务仍持有会话时按“已在另一个应用中打开”处理，不迁移也不停止。存档里的 `native_job_id`、`remote-claude-cleanup.json` 等旧版字段和文件原样保留，回滚到旧版本时仍由旧版本使用；退出响应和管理状态里的 `cleanup` / `claudeCleanup` 保持原结构并恒为已完成。
+
 ## 数据与兼容
 
 共享设置、历史和授权继续使用既有用户状态目录。已发布协议字段、Cookie、缓存键和 Android 标识按兼容需要保留旧名称；它们不作为新产品名。Windows 安装包含 `elves.exe` 与 `elves-manager.exe`，固定工具只由 Elves 客户端内嵌并按需释放。旧 launcher、注入脚本及任务看板入口删除。

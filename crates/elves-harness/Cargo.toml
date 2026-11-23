@@ -62,3 +62,7 @@ windows = { version = "0.58", features = [
   "Win32_UI_Shell_Common",
   "Win32_UI_WindowsAndMessaging",
 ] }
+
+[dev-dependencies]
+# 对端单元测试用虚拟时间推进回执超时和空闲回收，不依赖真实等待。
+tokio = { workspace = true, features = ["test-util"] }

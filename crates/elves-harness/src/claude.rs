@@ -10,9 +10,9 @@ use anyhow::Context;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
 use tokio::process::Command;
-use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot};
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 
 use super::{ApiError, HarnessAuthorization, HarnessController, now_ms};
 use crate::service_transport::{WriteFrame, guarded_write, spawn_writer};
@@ -36,9 +36,12 @@ mod skills;
 #[path = "claude_tools.rs"]
 mod tools;
 
-#[path = "claude_lifecycle.rs"]
-mod lifecycle;
+// Claude Agent SDK（stream-json）传输：取代 daemon 后台任务与终端画面解析，见模块文档。
+#[path = "claude_sdk/mod.rs"]
+mod sdk;
 
+// 用户要求会话被其他应用持有时，在会话内提示“已在另一个应用中打开”；与 Codex 的占用提示同文案，前端按 externalWriter 展示。
+const HELD_ELSEWHERE: &str = "已在另一个应用中打开";
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(60);
 // 原生 stop 最多 30 秒、退出确认最多 15 秒；预留 5 秒读取状态，与生命周期总预算 55 秒同步。
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(50);
@@ -47,10 +50,6 @@ const MODEL_CATALOG_TTL: Duration = Duration::from_secs(300);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SHARED_FRAME_BYTES: usize = 64 * 1024 * 1024;
-
-pub(super) fn remember_shutdown(directory: &Path, reason: &str) -> anyhow::Result<()> {
-    lifecycle::remember_shutdown(directory, reason)
-}
 
 fn error(code: u16, message: impl Into<String>) -> anyhow::Error {
     ApiError::new(code, message.into()).into()
@@ -75,27 +74,6 @@ pub(super) fn api_error(failure: anyhow::Error) -> anyhow::Error {
         } else {
             error.into()
         }
-    }
-}
-
-fn confirm_native_stop_for_removal(result: &Value) -> anyhow::Result<()> {
-    match result["stopped"].as_bool() {
-        Some(true) => Ok(()),
-        Some(false) => {
-            // 原生明确未停止时按实际原因拒绝移除，不把草稿、后台任务或画面未知误报为执行中。
-            let message = match result["reason"].as_str() {
-                Some("active") => "Claude 会话仍在执行或等待交互，请先停止任务或完成交互再移除",
-                Some("native_draft") => "Claude 终端有未发送的草稿，请先处理草稿再移除会话",
-                Some("background_work") => "Claude 会话仍有后台任务，请等任务结束后再移除",
-                Some("screen_unknown") => "无法确认 Claude 终端的输入状态，请在原生终端核对后重试",
-                Some("identity_unknown" | "identity_changed" | "state_changed") => {
-                    "未能确认 Claude 后台会话仍是原目标且处于空闲，请刷新后重试"
-                }
-                _ => "Claude 原生后台会话未停止，未移除会话",
-            };
-            Err(error(409, message))
-        }
-        None => Err(error(503, "未确认 Claude 原生后台会话已停止，未移除会话")),
     }
 }
 
@@ -165,6 +143,8 @@ struct Conversation {
     turns: Vec<Value>,
     #[serde(default)]
     shared: bool,
+    // 旧版 Elves 的 daemon 后台任务 ID：新版本不读取、不写入也不清除，只让存档原样往返，
+    // 这样回滚到旧版时它仍能找到自己的后台任务；仍在运行的旧任务按“已在另一个应用中打开”处理。
     #[serde(default)]
     native_job_id: String,
     #[serde(default)]
@@ -381,25 +361,6 @@ impl Conversation {
             .is_some_and(|t| t["status"] == "inProgress")
     }
 
-    fn terminal_upstream_failure_can_remove(&self) -> bool {
-        // 用户要求上游服务已返回终态失败后仍可移除会话：只接受明确失败轮次、
-        // 原生进程已确认不存在且没有等待交互；真正执行中或状态未知仍必须保留删除保护。
-        let settled_tempo = matches!(
-            self.native_status["tempo"].as_str(),
-            Some("idle" | "blocked")
-        );
-        let no_pending_interaction = self.native_status["sessionStatus"] != "waiting"
-            && self.native_status["needs"].is_null();
-        self.shared
-            && self.native_status["sessionAlive"] == false
-            && settled_tempo
-            && no_pending_interaction
-            && self
-                .turns
-                .last()
-                .is_some_and(|turn| turn["status"] == "failed" && turn["_nativeDone"] == true)
-    }
-
     fn view(&self) -> Value {
         // 用户要求实例显示名统一简化；wslUser、实例 ID 和实际运行用户保持原用途。
         // 子代理沿用原生身份和只读详情，侧边会话仍独立保持未适配；不能据此开放子代理写操作。
@@ -437,19 +398,13 @@ impl Conversation {
             // 用户要求控制器升级后旧会话自动恢复；网页需要显示恢复中/等待当前轮次/恢复失败状态，
             // 不能让消息只停留在“发送失败”而失去可解释的处理进度。
             "versionRecovery":self.native_control["versionRecovery"],
-            // 原生底栏汇报的后台任务摘要（如 “1 shell”），仅共享会话在线且画面可读时存在，网页负责翻译展示。
+            // CLI 汇报的后台任务摘要（如 “1 shell”），仅会话在线且有后台任务时存在，网页负责翻译展示。
             "backgroundTasks":if self.shared {self.native_status["background"].clone()} else {Value::Null},
-            "nativeId":self.native_id,"nativeJobId":self.native_job_id,
+            "nativeId":self.native_id,
             "wslDistribution":self.config.distribution,
             "instanceId":self.config.instance_id(),
             "instanceLabel":super::instances::label("claude",&self.config.distribution,&self.config.user),
             "wslUser":self.config.user,
-            "cliCommand":if self.shared && !self.native_job_id.is_empty() {
-                format!("wsl.exe --distribution '{}' --user '{}' --exec /bin/bash -lc 'exec \"$@\"' -- '{}' attach {}",
-                    self.config.distribution.replace('\'', "''"),
-                    self.config.user.replace('\'', "''"),
-                    self.config.executable.replace('\'', "''"), self.native_job_id)
-            } else {String::new()},
             "capabilities":capabilities})
     }
 }
@@ -467,7 +422,7 @@ struct Channel {
 
 struct Process {
     // 不让读取任务持有 Process，最后一个调用者释放后关闭 stdin 并回收自己启动的进程。
-    _child: Mutex<Option<tokio::process::Child>>,
+    _child: Mutex<Option<Box<dyn Send>>>,
     writer: mpsc::Sender<WriteFrame>,
     channel: Arc<Channel>,
     initialization: Value,
@@ -547,13 +502,19 @@ pub(super) struct Claude {
     processes: Mutex<HashMap<String, Arc<Process>>>,
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     metadata: Mutex<HashMap<String, (Instant, Value)>>,
+    // SDK 传输用的原生初始化目录（模型、命令等）；按实例和项目目录缓存，避免每个会话启动都拉起一次探测进程。
+    sdk_catalogs: Mutex<HashMap<String, (Instant, Value)>>,
+    // SDK 宿主/读取器脚本在各 WSL 实例里的路径；用来判断哪些 CLI 进程属于本程序，数据目录不变，进程生命周期内只换算一次。
+    sdk_scripts: Mutex<HashMap<String, sdk::Scripts>>,
+    // 测试里假读取器对 holders 请求的回答：每项 {"pid":…,"mine":bool}；传入本程序脚本标记时 mine 项不算外部持有。
+    #[cfg(test)]
+    test_holders: std::sync::Mutex<Vec<Value>>,
+    // 单元测试默认不核对持有者（没有真实 WSL 可问）；核对占用的测试装上假读取器后把它置为 false。
+    #[cfg(test)]
+    test_skip_holders: AtomicBool,
     skill_metadata: Mutex<HashMap<String, (Instant, Value)>>,
     reconnect_enabled: AtomicBool,
     lifecycle_gate: RwLock<()>,
-    cleanup_serial: Mutex<()>,
-    cleanup_store: lifecycle::CleanupStore,
-    startup_cleanup_ready: AtomicBool,
-    startup_cleanup_notify: Notify,
     // 用户要求账号额度按 WSL 实例隔离；只缓存白名单百分比与重置时间，不保存登录凭据。
     subscription_usage_cache: Mutex<HashMap<String, subscription_usage::CachedUsage>>,
     local_usage_cache: Mutex<HashMap<String, subscription_usage::CachedLocalUsage>>,
@@ -608,9 +569,6 @@ impl Claude {
                 turn["error"] = json!({"message":"服务曾重启，请核对历史后继续；未自动重发消息"});
             }
         }
-        let cleanup_store = lifecycle::CleanupStore::new(directory);
-        // 用户要求启动只补偿退出遗漏；仅登记本服务创建的后台身份，不扫描或接管其他终端会话。
-        cleanup_store.begin_runtime(&saved)?;
         Ok(Arc::new(Self {
             directory: directory.to_owned(),
             discovery: Mutex::new(HashMap::new()),
@@ -618,13 +576,15 @@ impl Claude {
             processes: Mutex::new(HashMap::new()),
             locks: Mutex::new(HashMap::new()),
             metadata: Mutex::new(HashMap::new()),
+            sdk_catalogs: Mutex::new(HashMap::new()),
+            sdk_scripts: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            test_holders: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            test_skip_holders: AtomicBool::new(true),
             skill_metadata: Mutex::new(HashMap::new()),
             reconnect_enabled: AtomicBool::new(true),
             lifecycle_gate: RwLock::new(()),
-            cleanup_serial: Mutex::new(()),
-            cleanup_store,
-            startup_cleanup_ready: AtomicBool::new(true),
-            startup_cleanup_notify: Notify::new(),
             subscription_usage_cache: Mutex::new(HashMap::new()),
             local_usage_cache: Mutex::new(HashMap::new()),
             usage_prices: Mutex::new(subscription_usage::PriceCache::default()),
@@ -641,15 +601,11 @@ impl Claude {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        self.startup_cleanup_ready.store(false, Ordering::Release);
         let service = Arc::downgrade(self);
         runtime.spawn(async move {
             let Some(backend) = service.upgrade() else {
                 return;
             };
-            backend.recover_cleanup(true).await;
-            backend.startup_cleanup_ready.store(true, Ordering::Release);
-            backend.startup_cleanup_notify.notify_waiters();
             backend.reconnect();
             drop(backend);
             // 用户改为远程服务调度：750ms 只检查已确认空闲的会话，每次最多投递一条，接收流独立运行。
@@ -660,21 +616,6 @@ impl Claude {
                     break;
                 };
                 service.drain_remote_queues().await;
-            }
-        });
-        let service = Arc::downgrade(self);
-        runtime.spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(15));
-            loop {
-                tick.tick().await;
-                let Some(service) = service.upgrade() else {
-                    break;
-                };
-                service.wait_for_startup_cleanup().await;
-                if service.accepting() {
-                    let _gate = service.lifecycle_gate.read().await;
-                    service.recover_cleanup(false).await;
-                }
             }
         });
     }
@@ -691,7 +632,6 @@ impl Claude {
             let Some(service) = service.upgrade() else {
                 return;
             };
-            service.wait_for_startup_cleanup().await;
             let conversations: Vec<_> = service
                 .saved
                 .lock()
@@ -750,20 +690,18 @@ impl Claude {
 
     pub async fn release(self: &Arc<Self>) -> Value {
         self.set_reconnect_enabled(false);
-        // 退出时先阻止新派发，等已进入的操作完成登记；未确认停止的连接保留，不提前 drain。
+        // 退出时先阻止新派发，等已进入的操作完成登记。SDK 宿主在连接断开后自行判断：
+        // 执行中的任务在 WSL 里继续，空闲的会话随即收尾，所以这里没有需要逐个回收的后台任务。
         let _gate = self.lifecycle_gate.write().await;
-        if self
-            .cleanup_store
-            .schedule(&*self.saved.lock().await, "service_shutdown")
-            .is_err()
-        {
-            return json!({"complete":false,"error":"Claude 待回收记录保存失败，未停止会话"});
-        }
-        let report = self.recover_cleanup(false).await;
         self.discovery.lock().await.clear();
-        // 已停止会话的连接已在回收成功处移除；保留运行中会话的观察和未确认请求，避免丢回执。
         tokio::time::sleep(Duration::from_millis(300)).await;
-        report
+        self.cleanup_report()
+    }
+
+    /// 旧版安装程序和状态读取方仍按 `cleanup.complete` 判断 Claude 是否还有待回收会话，字段保持不变；
+    /// SDK 传输没有需要在退出时回收的后台任务，恒为已完成。
+    pub(crate) fn cleanup_report(&self) -> Value {
+        json!({"complete":true,"pending":[],"lastReport":Value::Null})
     }
 
     async fn shutdown_process(&self, process: &Arc<Process>) -> anyhow::Result<Value> {
@@ -987,10 +925,12 @@ impl Claude {
         )
     }
 
+    /// “在 WSL 打开”所需的终端启动参数，以及会话此刻由谁持有。只读核对，不停止任何进程；
+    /// 真正关闭 Elves 的占用必须由用户确认后经 `release_for_terminal` 完成。
     pub(super) async fn open_in_session(
-        &self,
+        self: &Arc<Self>,
         id: &str,
-    ) -> anyhow::Result<Option<super::open_in::WslSession>> {
+    ) -> anyhow::Result<Option<(super::open_in::WslSession, super::open_in::Occupancy)>> {
         if Self::is_subagent_id(id) {
             return Ok(None);
         }
@@ -1010,23 +950,89 @@ impl Claude {
             .collect();
         // 同一目录可能同时存在多个对话，终端标题绑定原生会话身份，不能激活另一实例/对话的窗口。
         let window_title = format!("WSL · {} [{}]", title, &c.native_id[..8]);
-        // 用户要求终端直接进入同一个对话：已有原生任务时 attach，空闲历史才 resume；不能另起会话或重复继续执行。
-        let arguments = if c.shared && !c.native_job_id.is_empty() {
-            vec!["attach".into(), c.native_job_id]
-        } else if c.active() {
-            return Ok(None);
+        let occupancy = self.occupancy(&c).await?;
+        Ok(Some((
+            super::open_in::WslSession {
+                instance_id: c.config.instance_id(),
+                distribution: c.config.distribution,
+                user: c.config.user,
+                linux_cwd: c.linux_cwd,
+                executable: c.config.executable,
+                // 用户要求终端直接进入同一个对话：Claude 会话不再有可 attach 的后台任务，
+                // 一律用原生会话 ID resume；打开前由用户确认并关闭 Elves 自己的占用，不能两个进程同时写同一份记录。
+                arguments: vec!["--resume".into(), c.native_id],
+                window_title,
+            },
+            occupancy,
+        )))
+    }
+
+    /// 会话此刻由谁持有：别的应用优先于 Elves 自己；Elves 自己的 CLI 区分空闲与不可关闭（执行、等待审批问答、有后台任务）。
+    /// 以原生进程登记为准，不只看内存里的连接：Harness 刚重启、尚未接回宿主时，宿主里的 CLI 仍在执行，不能当作无人持有。
+    async fn occupancy(
+        self: &Arc<Self>,
+        c: &Conversation,
+    ) -> anyhow::Result<super::open_in::Occupancy> {
+        use super::open_in::Occupancy;
+        if !self.external_holders(c).await?.is_empty() {
+            return Ok(Occupancy::External);
+        }
+        if self.holders(c, false).await?.is_empty() {
+            return Ok(Occupancy::Free);
+        }
+        let live = self
+            .processes
+            .lock()
+            .await
+            .get(&c.id)
+            .is_some_and(|process| process.channel.live.load(Ordering::Acquire));
+        let idle = live
+            && c.native_status["sessionAlive"] == true
+            && !c.active()
+            && c.native_status["sessionStatus"] == "idle"
+            && c.native_status["background"].is_null();
+        Ok(if idle {
+            Occupancy::HarnessIdle
         } else {
-            vec!["--resume".into(), c.native_id]
-        };
-        Ok(Some(super::open_in::WslSession {
-            instance_id: c.config.instance_id(),
-            distribution: c.config.distribution,
-            user: c.config.user,
-            linux_cwd: c.linux_cwd,
-            executable: c.config.executable,
-            arguments,
-            window_title,
-        }))
+            Occupancy::HarnessBusy
+        })
+    }
+
+    /// 用户在“关闭当前会话占用”弹窗里确认后，同步关闭 Elves 对会话的占用：只停止自己的 CLI 和宿主，
+    /// 等原生登记清除后才返回，调用方随后再打开 WSL 里的 CLI。执行中、等待审批问答或有后台任务时拒绝，不中断任务。
+    pub(super) async fn release_for_terminal(self: &Arc<Self>, id: &str) -> anyhow::Result<()> {
+        // 与发送、编辑共用会话锁，释放期间不会有新的消息把 CLI 再拉起来。
+        let lock = self.lock(id).await;
+        let _guard = lock.lock().await;
+        let c = self.conversation(id).await?;
+        self.ensure_not_held_elsewhere(&c).await?;
+        let process = self
+            .processes
+            .lock()
+            .await
+            .get(id)
+            .filter(|process| process.channel.live.load(Ordering::Acquire))
+            .cloned();
+        if let Some(process) = process {
+            let result = self.shutdown_process(&process).await?;
+            if result["stopped"] != true {
+                return Err(error(
+                    409,
+                    "会话正在执行任务，无法关闭占用。请先停止任务或等待完成后再打开 WSL",
+                ));
+            }
+        }
+        // 进程退出后原生才清除登记；确认没有任何 CLI（包括刚停止的这一个）仍持有，再让终端接手。
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if self.holders(&c, false).await?.is_empty() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(error(409, "Elves 的会话进程尚未退出，请稍后重试"));
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     }
 
     async fn native_reader(self: &Arc<Self>, config: &WslConfig) -> anyhow::Result<Arc<Process>> {
@@ -1247,14 +1253,8 @@ impl Claude {
                         c.updated_at = at;
                         changed = true;
                     }
-                    for (target, key) in [
-                        (&mut c.model, "model"),
-                        (&mut c.effort, "effort"),
-                        (&mut c.native_job_id, "jobId"),
-                    ] {
-                        if let Some(value) = row[key]
-                            .as_str()
-                            .filter(|value| key == "jobId" || !value.is_empty())
+                    for (target, key) in [(&mut c.model, "model"), (&mut c.effort, "effort")] {
+                        if let Some(value) = row[key].as_str().filter(|value| !value.is_empty())
                             && target.as_str() != value
                         {
                             *target = value.into();
@@ -1289,7 +1289,7 @@ impl Claude {
                 resumed: true,
                 turns: vec![],
                 shared: true,
-                native_job_id: row["jobId"].as_str().unwrap_or("").into(),
+                native_job_id: String::new(),
                 native_status: row["nativeStatus"].clone(),
                 token_usage: Value::Null,
                 native_control: Value::Null,
@@ -1539,6 +1539,18 @@ impl Claude {
         thread["requestsKnown"] = json!(true);
         thread["requestsEpoch"] = json!(self.epoch);
         thread["requestsRevision"] = json!(self.request_revision.load(Ordering::Acquire));
+        // 用户要求参考 Codex：会话被别的应用持有时输入区原位提示“已在另一个应用中打开”，并只读保护所有输入入口；
+        // 草稿和排队消息不清理。核对失败（例如 WSL 暂时不可用）不能挡住历史读取，发送时会再次核对。
+        let held = !self
+            .external_holders(&c)
+            .await
+            .unwrap_or_default()
+            .is_empty();
+        thread["externalWriter"] = json!(held);
+        if held {
+            thread["readOnly"] = json!(true);
+            thread["readOnlyReason"] = json!("请先在那边关闭会话，才能在这里继续。");
+        }
         Ok(json!({"ok":true,"thread":thread,"nativeBridge":"claude"}))
     }
 
@@ -1652,49 +1664,6 @@ impl Claude {
         Ok(conversation.queue_snapshot(&self.epoch))
     }
 
-    async fn spawn(self: &Arc<Self>, c: &Conversation) -> anyhow::Result<Arc<Process>> {
-        if !c.shared {
-            return self.spawn_stdio(c).await;
-        }
-        let probe = Conversation {
-            id: String::new(),
-            shared: false,
-            resumed: false,
-            native_id: uuid::Uuid::new_v4().to_string(),
-            permission_mode: None,
-            ..c.clone()
-        };
-        let mut catalog = self.spawn_stdio(&probe).await?.initialization.clone();
-        catalog["permissionModes"] = json!(super::permissions::claude_modes(&c.config).await);
-        let path = self.directory.join("claude-shared.py");
-        crate::settings::atomic_write(&path, include_bytes!("claude_shared.py"))?;
-        let linux_path = Self::linux_cwd(
-            &c.config,
-            path.to_str().context("Claude 连接端路径编码无效")?,
-        )
-        .await?;
-        let mut command = Self::wsl(&c.config)?;
-        command.args(["--cd", &c.linux_cwd]);
-        Self::wsl_login_exec(&mut command, "python3");
-        command.args(["-u", &linux_path, "--cli", &c.config.executable]);
-        if !c.resumed
-            && let Some(window) = super::instance_settings::claude_auto_compact(
-                &self.directory,
-                &c.config.instance_id(),
-            )?
-        {
-            // 用户要求自动压缩窗口按实例设置；只给后续新建会话传原生 CLI 参数，不重启已有后台。
-            command.args(["--autocompact", &window]);
-        }
-        if c.resumed {
-            command.args(["--native-id", &c.native_id]);
-            if !c.native_job_id.is_empty() {
-                command.args(["--job-id", &c.native_job_id]);
-            }
-        }
-        self.launch(c, command, Some(catalog)).await
-    }
-
     async fn spawn_stdio(self: &Arc<Self>, c: &Conversation) -> anyhow::Result<Arc<Process>> {
         let mut command = Self::wsl(&c.config)?;
         // 用户要求保持原生系统提示、MCP、Skills、Hooks 和权限；不传 bare、替代提示或跳过审批参数。
@@ -1740,6 +1709,127 @@ impl Claude {
         self.launch(c, command, None).await
     }
 
+    /// Claude Agent SDK 传输：由 WSL 内宿主持有的原版 CLI 经 stream-json 控制协议执行，
+    /// 上层沿用共享连接端的帧协议（见 claude_sdk 模块）。
+    ///
+    /// 用户要求改用 Claude Agent SDK 对接，新版本不再有 daemon 后台任务和终端画面识别，也不兼容旧版本遗留的后台任务：
+    /// 旧版 Elves 的后台任务仍持有会话时，按“已在另一个应用中打开”处理，既不迁移也不停止它们。
+    async fn spawn(self: &Arc<Self>, c: &Conversation) -> anyhow::Result<Arc<Process>> {
+        let mut catalog = self.sdk_catalog(c).await?;
+        catalog["permissionModes"] = json!(super::permissions::claude_modes(&c.config).await);
+        let scripts = self.sdk_scripts(&c.config).await?;
+        // 用户要求别的应用持有会话时不能在这里继续：两个 CLI 写同一份记录会损坏历史。
+        // 接回自己宿主里仍在执行的 CLI 不受影响（它们按脚本路径识别为本程序所有）。
+        self.ensure_not_held_elsewhere(c).await?;
+        // 用户要求自动压缩窗口按实例设置，只给尚未创建的新会话传原生 CLI 参数。
+        let auto_compact = if c.resumed {
+            None
+        } else {
+            super::instance_settings::claude_auto_compact(&self.directory, &c.config.instance_id())?
+        };
+        let backend = Arc::new(sdk::WslBackend {
+            config: c.config.clone(),
+            linux_cwd: c.linux_cwd.clone(),
+            scripts,
+            auto_compact,
+        });
+        let (writer, reader) = sdk::connect(backend, &c.native_id, c.resumed);
+        // 重启前仍在执行（或有后台任务）的会话：接回 WSL 内继续运行的宿主；空闲会话不启动 CLI。
+        let attach = c.resumed
+            && (c.active()
+                || matches!(
+                    c.native_status["tempo"].as_str(),
+                    Some("active" | "blocked")
+                )
+                || c.native_status["background"].is_string());
+        self.launch_io(c, writer, reader, None, None, Some(catalog), attach)
+            .await
+    }
+
+    /// 宿主和读取器脚本写入数据目录并换算成该实例里的路径（每个实例只换算一次，脚本内容随程序版本固定）。
+    async fn sdk_scripts(&self, config: &WslConfig) -> anyhow::Result<sdk::Scripts> {
+        let key = config.instance_id();
+        if let Some(scripts) = self.sdk_scripts.lock().await.get(&key) {
+            return Ok(scripts.clone());
+        }
+        let scripts = sdk::install_scripts(&self.directory, config).await?;
+        self.sdk_scripts.lock().await.insert(key, scripts.clone());
+        Ok(scripts)
+    }
+
+    /// 别的进程（用户终端里的 claude、旧版 Elves 的后台任务、其他应用的 SDK 宿主等）是否持有这个原生会话。
+    /// 只读核对 CLI 的进程登记，不恢复会话、不抢占、不停止对方；本程序自己的宿主和 CLI 不算在内。
+    async fn external_holders(self: &Arc<Self>, c: &Conversation) -> anyhow::Result<Vec<Value>> {
+        self.holders(c, true).await
+    }
+
+    /// 登记为这个原生会话的全部 CLI 进程；`exclude_own` 为真时去掉 Elves 自己的宿主、CLI 和它们的子进程。
+    async fn holders(
+        self: &Arc<Self>,
+        c: &Conversation,
+        exclude_own: bool,
+    ) -> anyhow::Result<Vec<Value>> {
+        if c.deleted || uuid::Uuid::parse_str(&c.native_id).is_err() || !c.resumed {
+            return Ok(Vec::new());
+        }
+        #[cfg(test)]
+        if self.test_skip_holders.load(Ordering::Relaxed) {
+            return Ok(Vec::new());
+        }
+        let own = if exclude_own {
+            let scripts = self.sdk_scripts(&c.config).await?;
+            vec![scripts.host, scripts.reader]
+        } else {
+            Vec::new()
+        };
+        let reader = self.native_reader(&c.config).await?;
+        let result = reader
+            .control(
+                json!({"subtype":"holders","native_id":c.native_id,"own":own}),
+                None,
+            )
+            .await?;
+        Ok(result["holders"].as_array().cloned().unwrap_or_default())
+    }
+
+    async fn ensure_not_held_elsewhere(self: &Arc<Self>, c: &Conversation) -> anyhow::Result<()> {
+        let holders = self
+            .external_holders(c)
+            .await
+            .context("无法确认会话是否已在另一个应用中打开")?;
+        if holders.is_empty() {
+            return Ok(());
+        }
+        Err(error(409, HELD_ELSEWHERE))
+    }
+
+    /// 模型目录、命令目录仍由同一 WSL 的原生 CLI 初始化响应提供（探测进程不恢复会话、不发送模型消息）；
+    /// 同一实例和项目目录五分钟内共用一次探测结果，与模型目录缓存期限一致。
+    async fn sdk_catalog(self: &Arc<Self>, c: &Conversation) -> anyhow::Result<Value> {
+        let key = format!("{}\n{}", c.config.instance_id(), c.linux_cwd);
+        let gate = self.lock(&format!("sdk-catalog:{key}")).await;
+        let _serial = gate.lock().await;
+        if let Some((at, catalog)) = self.sdk_catalogs.lock().await.get(&key)
+            && at.elapsed() < MODEL_CATALOG_TTL
+        {
+            return Ok(catalog.clone());
+        }
+        let probe = Conversation {
+            id: String::new(),
+            shared: false,
+            resumed: false,
+            native_id: uuid::Uuid::new_v4().to_string(),
+            permission_mode: None,
+            ..c.clone()
+        };
+        let catalog = self.spawn_stdio(&probe).await?.initialization.clone();
+        self.sdk_catalogs
+            .lock()
+            .await
+            .insert(key, (Instant::now(), catalog.clone()));
+        Ok(catalog)
+    }
+
     async fn launch(
         self: &Arc<Self>,
         c: &Conversation,
@@ -1750,25 +1840,39 @@ impl Claude {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if shared_catalog.is_some() {
-            // 共享 Claude 会话属于可交接的 native job：升级时不随 Harness 进程退出，
-            // 新版本通过已保存 nativeId/nativeJobId 重新 attach；普通 stdio 会话仍沿用原有回收语义。
-            command.kill_on_drop(false);
-            #[cfg(windows)]
-            command.creation_flags(
-                crate::windows_integration::CREATE_NO_WINDOW
-                    | crate::windows_integration::CREATE_BREAKAWAY_FROM_JOB,
-            );
-        }
+        // 发现读取器和初始化探测进程都只属于本次 Harness 运行：继续使用 wsl() 的隐藏窗口和随 Harness 回收设置，
+        // 不再像旧版共享会话那样脱离作业对象；执行中的 Claude 任务由 WSL 内的宿主保留，与这里无关。
         let mut child = command
             .spawn()
             .context("无法启动指定 WSL 中的 Claude CLI")?;
-        let (writer, _) = spawn_writer(
-            child.stdin.take().context("Claude stdin 不可用")?,
-            WRITE_TIMEOUT,
-        );
+        let stdin = child.stdin.take().context("Claude stdin 不可用")?;
         let stdout = child.stdout.take().context("Claude stdout 不可用")?;
-        let stderr = child.stderr.take().context("Claude stderr 不可用")?;
+        let stderr: Box<dyn AsyncRead + Send + Unpin> =
+            Box::new(child.stderr.take().context("Claude stderr 不可用")?);
+        self.launch_io(
+            c,
+            stdin,
+            stdout,
+            Some(stderr),
+            Some(Box::new(child)),
+            shared_catalog,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn launch_io(
+        self: &Arc<Self>,
+        c: &Conversation,
+        stdin: impl AsyncWrite + Send + Unpin + 'static,
+        stdout: impl AsyncRead + Send + Unpin + 'static,
+        stderr: Option<Box<dyn AsyncRead + Send + Unpin>>,
+        guard: Option<Box<dyn Send>>,
+        shared_catalog: Option<Value>,
+        attach: bool,
+    ) -> anyhow::Result<Arc<Process>> {
+        let (writer, _) = spawn_writer(stdin, WRITE_TIMEOUT);
         let channel = Arc::new(Channel {
             live: AtomicBool::new(true),
             generation: uuid::Uuid::new_v4().to_string(),
@@ -1783,19 +1887,20 @@ impl Claude {
         };
         let weak = Arc::downgrade(self);
         let id = c.id.clone();
-        let errors = Arc::new(Mutex::new(String::new()));
-        let error_output = errors.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                // stderr 只用于本次启动失败说明，不写包含用户配置或凭据的诊断日志。
-                let mut output = error_output.lock().await;
-                if output.len() < 8192 {
-                    output.push_str(&line);
-                    output.push('\n');
+        if let Some(stderr) = stderr {
+            let errors = Arc::new(Mutex::new(String::new()));
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    // stderr 只用于本次启动失败说明，不写包含用户配置或凭据的诊断日志。
+                    let mut output = errors.lock().await;
+                    if output.len() < 8192 {
+                        output.push_str(&line);
+                        output.push('\n');
+                    }
                 }
-            }
-        });
+            });
+        }
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
             let mut line = Vec::new();
@@ -1883,7 +1988,7 @@ impl Claude {
             }
         });
         let mut process = Process {
-            _child: Mutex::new(Some(child)),
+            _child: Mutex::new(guard),
             writer,
             channel,
             initialization: Value::Null,
@@ -1894,7 +1999,7 @@ impl Claude {
                 let mut pending = c.queued_messages.clone();
                 pending.extend(c.remote_queue.native_intents());
                 json!({"subtype":"initialize","catalog":catalog,"model":c.model,"effort":c.effort,
-                    "permission_mode":c.permission_mode,
+                    "permission_mode":c.permission_mode,"attach":attach,
                     "clients":c.native_clients,"pending":pending,"native_control":c.native_control})
             } else {json!({"subtype":"initialize"})}, None)
             .await?;
@@ -2142,7 +2247,6 @@ impl Claude {
         cwd: &str,
         authorization: &HarnessAuthorization,
     ) -> anyhow::Result<Value> {
-        self.wait_for_startup_cleanup().await;
         let _lifecycle = self.lifecycle_gate.read().await;
         anyhow::ensure!(
             self.accepting(),
@@ -2297,13 +2401,11 @@ impl Claude {
         payload: &Value,
         authorization: &HarnessAuthorization,
     ) -> anyhow::Result<Value> {
-        self.wait_for_startup_cleanup().await;
         let _lifecycle = self.lifecycle_gate.read().await;
         anyhow::ensure!(self.accepting(), "远程服务正在关闭，Claude 操作尚未派发");
         let id = payload["threadId"]
             .as_str()
             .context("缺少 Claude 会话 ID")?;
-        self.cleanup_store.cancel(id)?;
         let lock = self.lock(id).await;
         let _guard = lock.lock().await;
         let mut c = self.conversation(id).await?;
@@ -2312,6 +2414,13 @@ impl Claude {
             .is_some_and(|backend| backend != "claude")
         {
             return Err(error(409, "已创建的 Claude 会话不能切换后端"));
+        }
+        // 用户要求别的应用持有会话时不能继续写入；这些动作都会向同一份原生记录追加内容。
+        if matches!(
+            action,
+            "send" | "editMessage" | "compact" | "setGoal" | "updateGoal"
+        ) {
+            self.ensure_not_held_elsewhere(&c).await?;
         }
         match action {
             "editMessage" => {
@@ -2490,26 +2599,6 @@ impl Claude {
                     return Err(error(409, "请先停止 Claude 当前任务后再删除会话"));
                 }
                 authorization.check().await?;
-                if action == "deleteThread" && c.shared && c.resumed && !c.native_job_id.is_empty()
-                {
-                    let live_process = self
-                        .processes
-                        .lock()
-                        .await
-                        .get(id)
-                        .is_some_and(|process| process.channel.live.load(Ordering::Acquire));
-                    if live_process || !c.terminal_upstream_failure_can_remove() {
-                        let process = match self.processes.lock().await.get(id).cloned() {
-                            Some(process) => process,
-                            None => {
-                                let process = self.spawn(&c).await?;
-                                process
-                            }
-                        };
-                        let result = self.shutdown_process(&process).await?;
-                        confirm_native_stop_for_removal(&result)?;
-                    }
-                }
                 self.change(|saved| {
                     let c = saved
                         .conversations
@@ -2574,10 +2663,8 @@ impl Claude {
         mode: &str,
         authorization: &HarnessAuthorization,
     ) -> anyhow::Result<Value> {
-        self.wait_for_startup_cleanup().await;
         let _lifecycle = self.lifecycle_gate.read().await;
         anyhow::ensure!(self.accepting(), "远程服务正在关闭，Claude 权限尚未修改");
-        self.cleanup_store.cancel(id)?;
         let lock = self.lock(id).await;
         let _guard = lock.lock().await;
         let mut c = self.conversation(id).await?;
@@ -2981,11 +3068,8 @@ impl Claude {
         let native_id = frame["native_id"]
             .as_str()
             .context("共享会话缺少原生身份")?;
-        let job_id = frame["job_id"].as_str().context("共享会话缺少后台 ID")?;
         anyhow::ensure!(
-            uuid::Uuid::parse_str(native_id).is_ok()
-                && (job_id.is_empty()
-                    || job_id.len() == 8 && job_id.bytes().all(|byte| byte.is_ascii_hexdigit())),
+            uuid::Uuid::parse_str(native_id).is_ok(),
             "Claude 原生会话身份无效"
         );
         let update = self
@@ -3013,7 +3097,6 @@ impl Claude {
                 }
                 let previous_queue = c.queue_snapshot(&self.epoch);
                 c.native_id = native_id.into();
-                c.native_job_id = job_id.into();
                 c.native_status = frame["native_status"].clone();
                 let usage_changed = c.token_usage != usage;
                 c.token_usage = usage.clone();
@@ -3988,6 +4071,12 @@ fn native_interruption(row: &Value) -> Option<(&str, &str)> {
         .filter(|id| !id.trim().is_empty())
         .or_else(|| {
             row["nativeToolInterruption"]["responseId"]
+                .as_str()
+                .filter(|id| !id.trim().is_empty())
+        })
+        // SDK 传输用 interrupt 中止回复时，读取器核对原生元数据（见 claude_shared.py native_sdk_interruption）后给出的证据。
+        .or_else(|| {
+            row["nativeSdkInterruption"]["responseId"]
                 .as_str()
                 .filter(|id| !id.trim().is_empty())
         })?;
@@ -4982,55 +5071,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn claude_removal_distinguishes_native_block_reasons_from_missing_stop_confirmation() {
-        assert!(confirm_native_stop_for_removal(&json!({"stopped":true})).is_ok());
-        for (reason, context) in [
-            ("active", "仍在执行或等待交互"),
-            ("native_draft", "未发送的草稿"),
-            ("background_work", "仍有后台任务"),
-            ("screen_unknown", "无法确认 Claude 终端的输入状态"),
-            ("identity_unknown", "仍是原目标"),
-            ("state_changed", "仍是原目标"),
-            ("unrecognized", "未移除会话"),
-        ] {
-            let failure =
-                confirm_native_stop_for_removal(&json!({"stopped":false,"reason":reason}))
-                    .unwrap_err();
-            let failure = failure.downcast_ref::<ApiError>().unwrap();
-            assert_eq!(failure.code, 409);
-            assert!(failure.message.contains(context));
-            assert!(!failure.outcome_unknown);
-        }
-        let failure =
-            confirm_native_stop_for_removal(&json!({"reason":"native_draft"})).unwrap_err();
-        assert_eq!(failure.downcast_ref::<ApiError>().unwrap().code, 503);
-    }
-
-    #[test]
-    fn terminal_upstream_failure_allows_removal_without_a_live_native_process() {
-        let (_directory, _service, mut conversation) = fixture();
-        conversation.shared = true;
-        conversation.native_job_id = "1234abcd".into();
-        conversation.native_status =
-            json!({"tempo":"blocked","sessionAlive":false,"sessionStatus":null});
-        conversation.turns[0]["status"] = json!("failed");
-        conversation.turns[0]["_nativeDone"] = json!(true);
-        assert!(conversation.terminal_upstream_failure_can_remove());
-
-        conversation.native_status["sessionAlive"] = json!(true);
-        assert!(!conversation.terminal_upstream_failure_can_remove());
-        conversation.native_status["sessionAlive"] = json!(false);
-        conversation.turns[0]["status"] = json!("inProgress");
-        assert!(!conversation.terminal_upstream_failure_can_remove());
-        conversation.turns[0]["status"] = json!("failed");
-        conversation.native_status["tempo"] = json!("unknown");
-        assert!(!conversation.terminal_upstream_failure_can_remove());
-        conversation.native_status["tempo"] = json!("blocked");
-        conversation.native_status["needs"] = json!({"kind":"clarification"});
-        assert!(!conversation.terminal_upstream_failure_can_remove());
-    }
-
-    #[test]
     fn configured_and_saved_wsl_environments_share_the_same_validation_rules() {
         assert!(WslConfig::default().validate().is_ok());
         // 只验证内存配置；不启动任何真实发行版或程序。
@@ -5204,54 +5244,262 @@ mod tests {
         );
     }
 
+    /// 假的在线进程：记录收到的控制请求，按子类型返回预设答复；用来验证“只读描述”不会停止任何进程。
+    async fn scripted_process(
+        service: &Arc<Claude>,
+        id: &str,
+        answers: Value,
+    ) -> Arc<Mutex<Vec<Value>>> {
+        let channel = Arc::new(Channel {
+            live: AtomicBool::new(true),
+            generation: "scripted-process".into(),
+            pending: Mutex::new(HashMap::new()),
+        });
+        let (input, output) = tokio::io::duplex(64 * 1024);
+        let (writer, _) = spawn_writer(input, WRITE_TIMEOUT);
+        let process = Arc::new(Process {
+            _child: Mutex::new(None),
+            writer,
+            channel: channel.clone(),
+            shared: true,
+            initialization: json!({}),
+        });
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let record = calls.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(output).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let frame: Value = serde_json::from_str(&line).unwrap();
+                let request = frame["request"].clone();
+                record.lock().await.push(request.clone());
+                let answer = request["subtype"]
+                    .as_str()
+                    .and_then(|subtype| answers.get(subtype))
+                    .cloned()
+                    .unwrap_or_else(|| panic!("测试进程收到未预期的请求：{request}"));
+                if let Some(sender) = channel
+                    .pending
+                    .lock()
+                    .await
+                    .remove(frame["request_id"].as_str().unwrap())
+                {
+                    let _ = sender.send(Ok(answer));
+                }
+            }
+        });
+        service.processes.lock().await.insert(id.into(), process);
+        calls
+    }
+
     #[tokio::test]
-    async fn open_in_wsl_session_attaches_current_job_or_resumes_exact_idle_history() {
+    async fn open_in_wsl_session_resumes_exact_history_and_reports_who_holds_it() {
+        use super::super::open_in::Occupancy;
         let (_directory, service, mut c) = fixture();
         c.shared = true;
-        c.native_job_id = "native-job-fixture".into();
-        c.native_status = json!({"tempo":"active"});
         service
             .saved
             .lock()
             .await
             .conversations
             .insert(c.id.clone(), c.clone());
-        let session = service.open_in_session(&c.id).await.unwrap().unwrap();
+        let _calls = discovery_fixture(&service, json!([]), json!({})).await;
+
+        // 没有任何进程持有：直接可打开；Claude 会话不再有可 attach 的后台任务，一律按原生会话 ID resume。
+        let (session, occupancy) = service.open_in_session(&c.id).await.unwrap().unwrap();
         assert_eq!(session.instance_id, c.config.instance_id());
         assert_eq!(session.distribution, c.config.distribution);
         assert_eq!(session.user, c.config.user);
         assert_eq!(session.executable, c.config.executable);
         assert_eq!(session.linux_cwd, c.linux_cwd);
-        assert_eq!(session.arguments, ["attach", "native-job-fixture"]);
-        assert!(session.window_title.contains(&c.native_id[..8]));
-
-        c.native_job_id.clear();
-        service
-            .saved
-            .lock()
-            .await
-            .conversations
-            .insert(c.id.clone(), c.clone());
-        assert!(
-            service.open_in_session(&c.id).await.unwrap().is_none(),
-            "仍在执行却没有原生任务身份时不得另起对话"
-        );
-        c.native_status = json!({"tempo":"idle"});
-        for turn in &mut c.turns {
-            turn["status"] = json!("completed");
-        }
-        service
-            .saved
-            .lock()
-            .await
-            .conversations
-            .insert(c.id.clone(), c.clone());
-        let session = service.open_in_session(&c.id).await.unwrap().unwrap();
         assert_eq!(session.arguments, ["--resume", c.native_id.as_str()]);
+        assert!(session.window_title.contains(&c.native_id[..8]));
+        assert_eq!(occupancy, Occupancy::Free);
+
+        // Elves 自己的 CLI 持有（原生登记里有 Elves 自己的进程）：空闲可经确认后关闭，
+        // 执行中、等待审批问答和有后台任务都不能关闭；以登记为准，不只看内存里的连接。
+        let process_calls = scripted_process(&service, &c.id, json!({})).await;
+        let mine = vec![json!({"pid":7,"mine":true})];
+        let states = [
+            (
+                json!({"tempo":"idle","sessionAlive":true,"sessionStatus":"idle"}),
+                &mine,
+                Occupancy::HarnessIdle,
+            ),
+            (
+                json!({"tempo":"active","sessionAlive":true,"sessionStatus":"busy"}),
+                &mine,
+                Occupancy::HarnessBusy,
+            ),
+            (
+                json!({"tempo":"blocked","sessionAlive":true,"sessionStatus":"waiting","needs":"permission prompt"}),
+                &mine,
+                Occupancy::HarnessBusy,
+            ),
+            (
+                json!({"tempo":"idle","sessionAlive":true,"sessionStatus":"idle","background":"1 shell"}),
+                &mine,
+                Occupancy::HarnessBusy,
+            ),
+            // CLI 刚退出、原生登记还没清除：不能当作无人持有，也不能让用户确认关闭一个不存在的占用。
+            (
+                json!({"tempo":"idle","sessionAlive":false}),
+                &mine,
+                Occupancy::HarnessBusy,
+            ),
+            // CLI 已因空闲回收退出且登记已清除：没有可关闭的占用。
+            (
+                json!({"tempo":"idle","sessionAlive":false}),
+                &vec![],
+                Occupancy::Free,
+            ),
+        ];
+        for (status, holders, expected) in states {
+            c.native_status = status.clone();
+            service
+                .saved
+                .lock()
+                .await
+                .conversations
+                .insert(c.id.clone(), c.clone());
+            *service.test_holders.lock().unwrap() = holders.clone();
+            let (_, occupancy) = service.open_in_session(&c.id).await.unwrap().unwrap();
+            assert_eq!(occupancy, expected, "{status}");
+        }
         assert!(
-            service.processes.lock().await.is_empty(),
-            "准备打开入口不能启动模型或创建对话进程"
+            process_calls.lock().await.is_empty(),
+            "准备打开入口只读核对，不能停止或控制 Elves 自己的进程"
         );
+
+        // Harness 刚重启、还没接回宿主：宿主里的 CLI 仍在执行（原生登记里还有 Elves 自己的进程），
+        // 不能当作无人持有，也不能由这里关闭。
+        service.processes.lock().await.remove(&c.id);
+        *service.test_holders.lock().unwrap() = mine.clone();
+        c.native_status = json!({"tempo":"idle"});
+        service
+            .saved
+            .lock()
+            .await
+            .conversations
+            .insert(c.id.clone(), c.clone());
+        let (_, occupancy) = service.open_in_session(&c.id).await.unwrap().unwrap();
+        assert_eq!(occupancy, Occupancy::HarnessBusy);
+        let process_calls = scripted_process(&service, &c.id, json!({})).await;
+
+        // 别的应用持有时优先报告，即使 Elves 的 CLI 也在。
+        c.native_status = json!({"tempo":"idle","sessionAlive":true,"sessionStatus":"idle"});
+        service
+            .saved
+            .lock()
+            .await
+            .conversations
+            .insert(c.id.clone(), c.clone());
+        *service.test_holders.lock().unwrap() = vec![json!({"pid":4242,"mine":false})];
+        let (_, occupancy) = service.open_in_session(&c.id).await.unwrap().unwrap();
+        assert_eq!(occupancy, Occupancy::External);
+        assert!(process_calls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn thread_read_marks_a_session_held_by_another_app_read_only_and_send_is_refused() {
+        let (_directory, service, mut c) = fixture();
+        c.shared = true;
+        c.native_status = json!({"tempo":"idle"});
+        service
+            .saved
+            .lock()
+            .await
+            .conversations
+            .insert(c.id.clone(), c.clone());
+        let _calls = discovery_fixture(&service, json!([]), json!({})).await;
+
+        let free = service.detail(&c.id).await.unwrap();
+        assert_eq!(free["thread"]["externalWriter"], false);
+        assert_ne!(free["thread"]["readOnly"], true);
+
+        // 本程序自己的宿主/CLI（mine）不算外部持有；终端里的 claude 才算。
+        *service.test_holders.lock().unwrap() = vec![json!({"pid":7,"mine":true})];
+        assert_eq!(
+            service.detail(&c.id).await.unwrap()["thread"]["externalWriter"],
+            false
+        );
+        *service.test_holders.lock().unwrap() = vec![json!({"pid":4242,"mine":false})];
+        let held = service.detail(&c.id).await.unwrap();
+        assert_eq!(held["thread"]["externalWriter"], true);
+        assert_eq!(held["thread"]["readOnly"], true);
+        assert_eq!(
+            held["thread"]["readOnlyReason"],
+            "请先在那边关闭会话，才能在这里继续。"
+        );
+
+        // 服务端同样拒绝写入：不能只靠网页隐藏输入框。发送、编辑、压缩和目标动作派发前都走这一道核对，
+        // 实际派发路径在真实 WSL 联调中验证。
+        let failure = service
+            .ensure_not_held_elsewhere(&service.conversation(&c.id).await.unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            failure.downcast_ref::<ApiError>().unwrap().message,
+            "已在另一个应用中打开"
+        );
+
+        // 终端关闭后，重新读取即恢复可写，草稿和队列没有被清理。
+        service.test_holders.lock().unwrap().clear();
+        let released = service.detail(&c.id).await.unwrap();
+        assert_eq!(released["thread"]["externalWriter"], false);
+        assert_ne!(released["thread"]["readOnly"], true);
+    }
+
+    #[tokio::test]
+    async fn release_for_terminal_stops_only_an_idle_cli_and_waits_for_the_registration_to_clear() {
+        let (_directory, service, mut c) = fixture();
+        c.shared = true;
+        c.native_status = json!({"tempo":"idle","sessionAlive":true,"sessionStatus":"idle"});
+        service
+            .saved
+            .lock()
+            .await
+            .conversations
+            .insert(c.id.clone(), c.clone());
+        let _calls = discovery_fixture(&service, json!([]), json!({})).await;
+
+        // 执行中：拒绝关闭，不中断任务，也不等待登记。
+        let busy = scripted_process(
+            &service,
+            &c.id,
+            json!({"shared_shutdown":{"stopped":false,"reason":"active"}}),
+        )
+        .await;
+        let failure = service.release_for_terminal(&c.id).await.unwrap_err();
+        assert_eq!(failure.downcast_ref::<ApiError>().unwrap().code, 409);
+        assert!(failure.to_string().contains("无法关闭占用"));
+        assert_eq!(busy.lock().await.len(), 1);
+
+        // 别的应用持有：不抢占，也不停止 Elves 自己的进程。
+        let idle =
+            scripted_process(&service, &c.id, json!({"shared_shutdown":{"stopped":true}})).await;
+        *service.test_holders.lock().unwrap() = vec![json!({"pid":4242,"mine":false})];
+        let failure = service.release_for_terminal(&c.id).await.unwrap_err();
+        assert_eq!(
+            failure.downcast_ref::<ApiError>().unwrap().message,
+            "已在另一个应用中打开"
+        );
+        assert!(idle.lock().await.is_empty());
+
+        // 空闲：停止自己的 CLI；原生登记在进程退出后才清除，必须等它清除才算关闭完成。
+        *service.test_holders.lock().unwrap() = vec![json!({"pid":7,"mine":true})];
+        let clear = service.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            clear.test_holders.lock().unwrap().clear();
+        });
+        let started = Instant::now();
+        service.release_for_terminal(&c.id).await.unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_millis(400),
+            "登记仍在时不能提前返回，否则终端会和即将退出的 CLI 同时持有会话"
+        );
+        assert_eq!(idle.lock().await.len(), 1);
+        assert_eq!(idle.lock().await[0]["subtype"], "shared_shutdown");
     }
 
     async fn discovery_fixture(
@@ -5283,13 +5531,35 @@ mod tests {
         });
         let calls = Arc::new(Mutex::new(Vec::new()));
         let record = calls.clone();
+        let weak = Arc::downgrade(service);
+        service.test_skip_holders.store(false, Ordering::Relaxed);
+        service.sdk_scripts.lock().await.insert(
+            WslConfig::default().instance_id(),
+            sdk::Scripts {
+                host: "/fixture/claude-sdk-host.py".into(),
+                reader: "/fixture/claude-shared.py".into(),
+            },
+        );
         tokio::spawn(async move {
             let mut lines = BufReader::new(output).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let frame: Value = serde_json::from_str(&line).unwrap();
                 let request = &frame["request"];
-                record.lock().await.push(request.clone());
+                if request["subtype"] != "holders" {
+                    record.lock().await.push(request.clone());
+                }
                 let response = match request["subtype"].as_str() {
+                    Some("holders") => {
+                        let own = request["own"].as_array().is_some_and(|own| !own.is_empty());
+                        let holders: Vec<Value> = weak
+                            .upgrade()
+                            .map(|service| service.test_holders.lock().unwrap().clone())
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|holder| !(own && holder["mine"] == true))
+                            .collect();
+                        Ok(json!({"holders":holders}))
+                    }
                     Some("discover") => Ok(json!({"sessions":rows})),
                     Some("read_history") => snapshot
                         .clone()
@@ -5727,7 +5997,10 @@ mod tests {
         let id = sidebar["recent"][0]["id"].as_str().unwrap();
         let detail = service.detail(id).await.unwrap();
         assert_eq!(detail["thread"]["nativeId"], native);
-        assert_eq!(detail["thread"]["nativeJobId"], "");
+        assert!(
+            detail["thread"].get("nativeJobId").is_none(),
+            "没有可 attach 的后台任务，不再向网页提供后台任务 ID"
+        );
         assert_eq!(
             detail["thread"]["tokenUsage"]["modelContextWindow"],
             1000000
@@ -7527,6 +7800,30 @@ mod tests {
     }
 
     #[test]
+    fn sdk_interrupt_marker_ends_the_turn_instead_of_starting_a_new_one() {
+        // SDK 传输用 interrupt 中止回复后，CLI 写入的标记行经读取器核对原生元数据后带 nativeSdkInterruption。
+        let frame = json!({"native_status":{"tempo":"idle"},"clients":{},"messages":[
+            {"type":"user","uuid":"prompt","timestampMs":10,"message":{"content":"SLOW"}},
+            {"type":"assistant","uuid":"partial","message":{"id":"response-one","model":"real-model",
+                "content":[{"type":"text","text":"slow-0"}]}},
+            {"type":"user","uuid":"marker","parentUuid":"partial","timestampMs":20,
+                "nativeSdkInterruption":{"responseId":"response-one","source":"sdk-interrupt"},
+                "message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}},
+            {"type":"system","subtype":"turn_duration","timestampMs":30}
+        ]});
+        let turns = project_shared_history(&frame, "connection");
+        assert_eq!(turns.len(), 1, "中断标记不能变成新的一轮");
+        assert_eq!(turns[0]["status"], "interrupted");
+        assert_eq!(turns[0]["nativeInterruption"]["source"], "claude");
+        // 没有读取器证据的同样文字仍是普通用户消息。
+        let literal = json!({"native_status":{"tempo":"idle"},"clients":{},"messages":[
+            {"type":"user","uuid":"prompt","message":{"content":"SLOW"}},
+            {"type":"user","uuid":"typed","message":{"content":[{"type":"text","text":"[Request interrupted by user]"}]}}
+        ]});
+        assert_eq!(project_shared_history(&literal, "connection").len(), 2);
+    }
+
+    #[test]
     fn shared_native_interruption_targets_response_without_stopping_a_new_question() {
         let frame = json!({"native_status":{"tempo":"active"},"clients":{},"messages":[
             {"type":"user","uuid":"first","message":{"content":"旧问题"}},
@@ -7909,7 +8206,10 @@ mod tests {
         assert_eq!(view["capabilities"]["queueSendNow"], false);
         assert_eq!(view["capabilities"]["remoteQueue"], true);
         assert_eq!(view["queuedMessages"][0]["id"], "next");
-        assert!(view["cliCommand"].as_str().unwrap().contains(" attach "));
+        assert!(
+            view.get("cliCommand").is_none() && view.get("nativeJobId").is_none(),
+            "没有可 attach 的后台任务，网页不再收到终端连接命令"
+        );
         assert_eq!(view["nativeId"], c.native_id);
         c.native_status = json!({"tempo":"blocked"});
         c.turns[0]["status"] = json!("completed");

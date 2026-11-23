@@ -2,10 +2,12 @@
 import { button, element } from "../../ui/dom.js";
 import { icon } from "../../ui/icons.js";
 import { notice } from "../../ui/notice.js";
+import { confirmAction } from "../../ui/dialog.js";
 import { activePopup, closePopup, openPopup, renderPopup } from "../../ui/popup.js";
 import { creating, nativeConnectionVersion, pageLeaving, selectedId, session, sidebar, thread } from "../../core/state.js";
 import { randomId } from "../../core/util.js";
 import { validateRemoteReceipt } from "../../channels.js";
+import { reloadThread } from "../../core/actions.js";
 import { api } from "../api.js";
 import { privateInputScope, threadReadOnly } from "./capabilities.js";
 import { relatedSessionView } from "./related-state.js";
@@ -78,10 +80,13 @@ function normalizeTargets(result, context) {
       && (target.target !== "wsl" || context?.wslInstance === true)
       && target.available === true && typeof target.label === "string" && target.label.length <= 80
       && target.label.trim() && !seen.has(target.target) && seen.add(target.target))
-    .map(({ target, label, icon }) => {
+    .map(({ target, label, icon, occupancy }) => {
       const installedIcon = typeof icon === "string" && icon.length <= 200000
         && /^data:image\/png;base64,[A-Za-z0-9+/]+={0,2}$/.test(icon) ? icon : null;
-      return { target, label, ...(installedIcon ? { icon: installedIcon } : {}) };
+      // 仅 WSL 项带会话占用状态：服务端启动时会再次核对，这里只决定直接打开、先确认还是直接提示。
+      const held = target === "wsl" && ["free", "harnessIdle", "harnessBusy", "external"].includes(occupancy)
+        ? occupancy : null;
+      return { target, label, ...(installedIcon ? { icon: installedIcon } : {}), ...(held ? { occupancy: held } : {}) };
     });
   return { root: result.root, targets };
 }
@@ -96,11 +101,46 @@ function preferredTarget(context, result) {
   return result.targets.find(target => target.target === preferred) || result.targets[0] || null;
 }
 
+// 用户要求：在 WSL 打开 Claude 会话时，别的应用已持有就在页面内提示“已在另一个应用中打开”；
+// Elves 自己持有且空闲时，弹窗询问是否关闭当前会话占用，确认后才同步关闭再打开 WSL 里的 CLI 会话；
+// Elves 自己正在执行任务时不能关闭。返回 null 表示不继续，"release" 表示用户已确认关闭 Elves 的占用。
+async function wslOpenDecision(chosen) {
+  switch (chosen.occupancy) {
+    case "external":
+      notice("该会话已在另一个应用中打开，请先在那边关闭会话。", true);
+      return null;
+    case "harnessBusy":
+      notice("会话正在执行任务，无法关闭占用。请先停止任务或等待完成后再打开 WSL。", true);
+      return null;
+    case "harnessIdle":
+      return await confirmAction("在 WSL 中打开",
+        "Elves 正在占用这个会话。继续会先关闭 Elves 对它的占用，再在 WSL 中打开同一个会话；之后要回到 Elves 继续，需要先在 WSL 里关闭该会话。",
+        "关闭占用并打开") ? "release" : null;
+    default:
+      return "open";
+  }
+}
+
+// WSL 里的 CLI 启动并登记需要一到两秒；稍后重新读取会话，让“已在另一个应用中打开”提示及时出现，用户不必手动重试。
+function recheckOwnershipAfterTerminalOpen(threadId) {
+  for (const delay of [2500, 7000])
+    setTimeout(() => {
+      if (!pageLeaving && selectedId === threadId) void reloadThread().catch(() => {});
+    }, delay);
+}
+
 const workspaceOpenRequests = new Set();
 async function performWorkspaceOpenIn(context, chosen, owns) {
   const key = JSON.stringify([context.scope, context.threadId, context.path || ""]);
   if (!owns(context) || workspaceOpenRequests.has(key)) return null;
   workspaceOpenRequests.add(key);
+  let releaseHarness = false;
+  if (chosen.target === "wsl") {
+    // 弹窗期间会话或授权可能已变化；确认后重新核对身份，不能把旧点击派发给新会话。
+    const decision = await wslOpenDecision(chosen).catch(() => null);
+    if (!decision || !owns(context)) { workspaceOpenRequests.delete(key); return null; }
+    releaseHarness = decision === "release";
+  }
   let dispatching = false, timer = null, operationKey = null;
   try {
     const controller = new AbortController();
@@ -120,7 +160,8 @@ async function performWorkspaceOpenIn(context, chosen, owns) {
     if (!owns(context)) return null;
     dispatching = true;
     const response = await api("/api/workspace/open-in",
-      { threadId: context.threadId, target: chosen.target, ...(context.path ? { path: context.path } : {}) },
+      { threadId: context.threadId, target: chosen.target, ...(context.path ? { path: context.path } : {}),
+        ...(releaseHarness ? { releaseHarness: true } : {}) },
       requestId, controller.signal);
     const receipt = validateRemoteReceipt(response, requestId);
     if (receipt.state === "failed") {
@@ -142,6 +183,7 @@ async function performWorkspaceOpenIn(context, chosen, owns) {
     }
     // 启动成功但未确认前台时保留成功回执，只提示在任务栏查看，不能再次启动。
     if (typeof opened.warning === "string" && opened.warning.trim()) notice(opened.warning);
+    if (chosen.target === "wsl") recheckOwnershipAfterTerminalOpen(context.threadId);
     return opened;
   } catch (error) {
     if (!owns(context)) return null;

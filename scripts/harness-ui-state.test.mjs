@@ -4342,6 +4342,86 @@ test("Open in 的 Git Bash 和 WSL 使用安装程序图标，无效图片回退
   }
 });
 
+test("WSL 项只接收服务端给出的会话占用状态，其他应用不带该字段", () => {
+  const context = rawVm.createContext({ input: {} });
+  rawVm.runInContext(
+    workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("const applicationIds ="),
+      workspaceOpenInSource.indexOf("const applicationPaths ="))
+      + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function normalizeTargets("),
+        workspaceOpenInSource.indexOf("function preferenceKey(")), context);
+  const read = targets => context.normalizeTargets({ ok: true, root: "E:\\项目", targets }, { wslInstance: true }).targets;
+  for (const occupancy of ["free", "harnessIdle", "harnessBusy", "external"])
+    assert.equal(read([{ target: "wsl", label: "WSL", available: true, occupancy }])[0].occupancy, occupancy);
+  assert.equal(read([{ target: "wsl", label: "WSL", available: true, occupancy: "伪造" }])[0].occupancy, undefined,
+    "未知状态不能进入点击逻辑");
+  assert.equal(read([{ target: "vscode", label: "VS Code", available: true, occupancy: "external" }])[0].occupancy,
+    undefined, "占用状态只属于 WSL 项");
+});
+
+test("在 WSL 打开：别的应用持有直接提示，Elves 空闲持有先确认再关闭，执行中不能关闭", async () => {
+  const calls = [], notices = [], confirms = [], reloads = [], timers = [];
+  let answer = true;
+  const context = rawVm.createContext({
+    notice: (message, error) => notices.push([message, !!error]),
+    confirmAction: async (...args) => { confirms.push(args); return answer; },
+    api: async (path, body, requestId) => {
+      calls.push({ path, body, requestId });
+      return { state: "completed", result: { target: body.target, root: "E:\\项目", foreground: true } };
+    },
+    validateRemoteReceipt: response => response,
+    randomId: () => "request-1",
+    sessionStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+    localStorage: { getItem: () => null, setItem() {} },
+    reloadThread: async () => { reloads.push(selectedId); },
+    setTimeout: (callback, delay) => { timers.push({ callback, delay }); return timers.length; },
+    clearTimeout() {}, AbortController, Error, Number, JSON, Set, Promise,
+    pageLeaving: false, selectedId: "thread-1"
+  });
+  const selectedId = "thread-1";
+  rawVm.runInContext(
+    workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function preferenceKey("),
+      workspaceOpenInSource.indexOf("export function mountWorkspaceOpenIn("))
+      + "\nglobalThis.perform = performWorkspaceOpenIn;", context);
+  const scope = "scope", target = occupancy => ({ target: "wsl", label: "WSL", ...(occupancy ? { occupancy } : {}) });
+  const open = (chosen, extra = {}) => context.perform(
+    { scope, threadId: "thread-1", key: "k", ...extra }, chosen, () => true);
+
+  assert.equal(await open(target("external")), null);
+  assert.match(notices.at(-1)[0], /已在另一个应用中打开/);
+  assert.equal(notices.at(-1)[1], true);
+  assert.equal(await open(target("harnessBusy")), null);
+  assert.match(notices.at(-1)[0], /无法关闭占用/);
+  assert.equal(calls.length, 0, "被其他应用持有或正在执行时不向服务端发起打开请求");
+  assert.equal(confirms.length, 0, "这两种情况不弹确认框");
+
+  answer = false;
+  assert.equal(await open(target("harnessIdle")), null);
+  assert.equal(confirms.length, 1);
+  assert.equal(confirms[0][0], "在 WSL 中打开");
+  assert.match(confirms[0][1], /关闭 Elves 对它的占用/);
+  assert.equal(confirms[0][2], "关闭占用并打开");
+  assert.equal(calls.length, 0, "取消后不关闭占用，也不打开 WSL");
+
+  answer = true;
+  const opened = await open(target("harnessIdle"));
+  assert.equal(opened.target, "wsl");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].body.releaseHarness, true, "只有用户确认后才请求服务端关闭 Elves 的占用");
+  assert.equal(calls[0].body.target, "wsl");
+  const rechecks = timers.filter(timer => timer.delay !== 45000);
+  assert.deepEqual(rechecks.map(timer => timer.delay), [2500, 7000], "打开后稍后重新读取会话，及时显示占用提示");
+  for (const timer of rechecks) timer.callback();
+  await Promise.resolve();
+  assert.deepEqual(reloads, ["thread-1", "thread-1"]);
+
+  const before = confirms.length;
+  await open(target("free"));
+  await open(target(null));
+  await open({ target: "vscode", label: "VS Code" });
+  assert.equal(confirms.length, before, "没有占用或其他应用不弹确认框");
+  assert.ok(calls.slice(1).every(call => call.body.releaseHarness === undefined), "无占用时不请求关闭");
+});
+
 test("远程 PC、手机、PWA 和 Android 移除宿主机应用入口，伪造原生桥或缺少本机身份也不开放", () => {
   for (const fixture of [
     { label: "PC 网页", width: 1440 },
@@ -10327,7 +10407,9 @@ test("其他 Codex 持有时原编辑器隐藏，提示仅提供重试且保留�
   h.context.thread = { id: "another", backend: "codex", externalWriter: true, readOnly: true };
   assert.equal(h.context.threadOwnedElsewhere(), false, "其他会话的状态不能隐藏当前编辑器");
   h.context.thread = { id: "owned", backend: "claude", externalWriter: true };
-  assert.equal(h.context.threadOwnedElsewhere(), false, "本功能只处理 Codex 的原生 writer");
+  assert.equal(h.context.threadOwnedElsewhere(), true, "Claude 会话被别的应用持有时同样原位提示");
+  h.context.thread = { id: "owned", backend: "claude", externalWriter: false };
+  assert.equal(h.context.threadOwnedElsewhere(), false, "服务端未报告占用时不显示提示");
 });
 
 test("外部占用仅限制当前会话，新建及侧栏菜单仍遵守设备只读和离线限制", () => {
