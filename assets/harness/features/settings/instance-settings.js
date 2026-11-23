@@ -332,8 +332,8 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
       }, "icon-button instance-settings-search-clear");
       clear.append(icon("close")); clear.hidden = search.value.length === 0;
       searchControl.append(search, clear); content.append(searchControl);
-      // 用户要求 MCP 列表去掉“所选实例的 MCP”分组标题，保留列表卡片和搜索入口。
-      const card = section(content, name === "mcp" ? "" : `所选实例的 ${sections[name]}`);
+      // 用户要求 Skills 与 MCP 搜索框上下间距统一；两页共用无重复分组标题的列表布局。
+      const card = section(content, ["skills", "mcp"].includes(name) ? "" : `所选实例的 ${sections[name]}`);
       const list = element("div", "instance-settings-inventory-list");
       card.append(list);
       const renderRows = () => {
@@ -359,7 +359,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
       content.append(element("p", "appearance-hint", inventory.error || `所选实例尚未返回${sections[name]}。`));
       return;
     }
-    const card = section(content, name === "mcp" ? "" : `所选实例的 ${sections[name]}`);
+    const card = section(content, ["skills", "mcp"].includes(name) ? "" : `所选实例的 ${sections[name]}`);
     appendInventoryRows(card, rows);
   }
   function appendInventoryRows(card, rows) {

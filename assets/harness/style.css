@@ -2018,6 +2018,7 @@ body{font-weight:var(--ui-font-weight,400)}
   .permission-instance-target .instruction-path{flex:1 1 100%;text-align:left;white-space:normal}
 }
 .permission-settings-status{min-height:1.5em;white-space:pre-wrap}
+.permission-settings-status:empty{display:none}
 .permission-settings-actions{justify-content:flex-end;margin-top:14px}
 /* 用户确认的实例设置沿用 222px 单层导航、分组卡片和原有品牌 SVG；设备显示与原生配置分开，
  * 761px 起选择器最长 360px，手机仍限制在行宽内；与设置页 760px 断点和现有卡片边距同步。 */
