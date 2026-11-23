@@ -551,6 +551,65 @@ mod tests {
         assert_eq!(remote_session["transport"], "remote");
         assert_eq!(remote_session["capabilities"]["management"], false);
         assert_eq!(remote_session["capabilities"]["workspaceOpenIn"], false);
+        // 用户要求“关闭其他占用”在本机客户端、网页、PWA、手机和 Android 上一样可用：两种设备都声明该能力，
+        // 直接请求也按同一规则校验和路由，不再按设备类型拒绝（与上面的宿主机启动能力相反，不能把它改回本机专属）。
+        assert_eq!(
+            local_session["capabilities"]["releaseExternalHolders"],
+            true
+        );
+        assert_eq!(
+            remote_session["capabilities"]["releaseExternalHolders"],
+            true
+        );
+        for (label, url, cookie) in [
+            ("local", &local_url, &local_cookie),
+            ("remote", &remote_url, &remote_cookie),
+        ] {
+            // 只接受会话标识：多余字段、缺少标识都在进入引擎前被拒绝。
+            for body in [
+                json!({}),
+                json!({"threadId":"claude-unknown","pid":1}),
+                json!({"threadId":"../etc"}),
+            ] {
+                let response = client
+                    .post(format!("{url}/api/action/releaseExternalHolders"))
+                    .header("Origin", url)
+                    .header("Cookie", cookie)
+                    .header("Idempotency-Key", format!("{label}-release-invalid"))
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), 400, "{label} {body}");
+            }
+            // 合法请求会进入各自引擎：不存在的 Claude 会话由 Claude 引擎报告，非 Claude 会话明确拒绝，
+            // 都不会被白名单、授权或 Codex 路径悄悄吞掉。
+            for (thread, message) in [
+                (
+                    "claude-00000000-0000-4000-8000-000000000000",
+                    "Claude 会话不存在或已删除",
+                ),
+                (
+                    "019a0000-0000-7000-8000-000000000000",
+                    "仅 Claude 会话支持关闭其他占用",
+                ),
+            ] {
+                let routed: Value = client
+                    .post(format!("{url}/api/action/releaseExternalHolders"))
+                    .header("Origin", url)
+                    .header("Cookie", cookie)
+                    .header("Idempotency-Key", format!("{label}-release-{thread}"))
+                    .json(&json!({"threadId":thread}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                assert_eq!(routed["state"], "failed", "{label} {thread}");
+                assert_eq!(routed["result"]["message"], message, "{label} {thread}");
+            }
+        }
         // 用户要求远程 PC、手机和 Android 均无宿主机启动能力；伪造原生标记与旧缓存直接请求也不能绕过。
         for path in ["/api/workspace/open-in-targets", "/api/workspace/open-in"] {
             for user_agent in [

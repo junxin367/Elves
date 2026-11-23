@@ -90,7 +90,24 @@ export function threadReadOnly(id = selectedId) {
     || relatedSessionView?.threadId === id && relatedSessionView.kind === "subagent"
   );
 }
+// 用户要求会话被其他应用占用只限制输入，不影响 Open in 和“关闭其他占用”：占用时服务端会把会话标为只读，
+// 这里去掉“因占用而只读”这一个原因；设备只读授权、子代理等其他只读原因仍然生效。
+export function threadReadOnlyApartFromOwnership(id = selectedId) {
+  if (!threadOwnedElsewhere(id)) return threadReadOnly(id);
+  return !!session?.readOnly || thread?.viewKind === "subagent"
+    || normalizeRelatedView(relatedThreadViews.get(id), id)?.kind === "subagent"
+    || relatedSessionView?.threadId === id && relatedSessionView.kind === "subagent";
+}
+// 用户要求在“已在另一个应用中打开”提示旁提供“关闭其他占用”，并且 Elves 本机客户端、网页、PWA、手机和 Android 一样显示，
+// 不做设备特殊处理：条件只有服务端声明能力（让内置旧网页包连到旧后台时不显示会 404 的按钮）、会话带有服务端核对出的
+// 外部持有者清单（只有 Claude 会话提供，Codex 的占用提示仍只有重试）、设备不是只读授权。
+export function threadReleasableElsewhere(id = selectedId) {
+  return threadOwnedElsewhere(id) && session?.capabilities?.releaseExternalHolders === true
+    && Array.isArray(thread?.externalHolders) && !threadReadOnlyApartFromOwnership(id);
+}
 export function threadActionReadOnly(action, id = selectedId) {
+  // “关闭其他占用”本身就是占用提示上的操作：会话因被占用而只读时仍要能提交，其他只读原因照旧拒绝。
+  if (action === "releaseExternalHolders") return threadReadOnlyApartFromOwnership(id);
   if (!threadReadOnly(id)) return false;
   // 用户要求过期侧边阅读后可确认已读；三个操作入口共用此判断，设备只读授权和子代理仍禁止提交。
   return !(action === "markRead" && !session?.readOnly && thread?.id === id

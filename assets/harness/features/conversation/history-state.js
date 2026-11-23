@@ -20,6 +20,7 @@ export const renderedItems = new Map(), renderedTurns = new Map();
 export let sessionPlan = null;
 export function setSessionPlan(value) { return sessionPlan = value; }
 const turnPlanExpansion = new Map();
+const turnPlanNodes = new Map();
 export function updateScrollControl() {
   const messages = $("#messages"), control = $("#scroll-to-bottom");
   if (!messages || !control) return;
@@ -74,21 +75,37 @@ export function renderTurnPlanTitle(plan) {
 export function renderTurnPlan(plan, turnId, expansionId = turnId) {
   if (!Array.isArray(plan) || !plan.length) return null;
   const key = `${selectedId || ""}:${expansionId || turnId || ""}`;
-  const block = element("details", "turn-plan-block");
+  const existing = turnPlanNodes.get(key);
+  const block = existing?.block || element("details", "turn-plan-block");
   block.open = turnPlanExpansion.get(key) !== false;
-  const title = element("summary", "turn-plan-title",
-    renderTurnPlanTitle(plan).textContent);
+  const title = existing?.title || element("summary", "turn-plan-title");
+  title.textContent = renderTurnPlanTitle(plan).textContent;
   title.title = "展开或收起任务清单";
   const chevron = icon("chevron");
   chevron.classList.add("turn-plan-chevron");
   title.append(chevron);
-  const list = element("ul", "turn-plan");
-  for (const step of plan)
-    list.append(element("li", step.status,
-      `${step.status === "completed" ? "✓" : step.status === "inProgress" ? "◌" : "○"} ${step.step}`));
-  block.append(title, list);
-  block.addEventListener("toggle", () => turnPlanExpansion.set(key, block.open));
-  // 用户要求恢复原有阅读行为：任务更新或历史重绘不得自动改变会话消息区的滚动位置。
+  const list = existing?.list || element("ul", "turn-plan");
+  // 用户要求任务更新时保留清单自身的滚动位置；只替换条目，不重建滚动容器。
+  const scrollTop = list.scrollTop;
+  list.replaceChildren(...plan.map(step => element("li", step.status,
+    `${step.status === "completed" ? "✓" : step.status === "inProgress" ? "◌" : "○"} ${step.step}`)));
+  list.scrollTop = scrollTop;
+  const scrollToLatest = () => {
+    if (block.open && list.isConnected) list.scrollTop = list.scrollHeight;
+  };
+  if (!existing) {
+    block.append(title, list);
+    block.addEventListener("toggle", () => {
+      turnPlanExpansion.set(key, block.open);
+      // 用户要求展开任务列表时默认显示底部最新任务；保持展开期间的后续更新位置不变。
+      scrollToLatest();
+    });
+    turnPlanNodes.set(key, { block, title, list });
+    if (block.open) {
+      if (typeof requestAnimationFrame === "function") requestAnimationFrame(scrollToLatest);
+      else if (typeof queueMicrotask === "function") queueMicrotask(scrollToLatest);
+    }
+  }
   return block;
 }
 export function legacySentDisplayTurn(turn) {

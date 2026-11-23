@@ -214,16 +214,20 @@ pub(super) fn notification_turn(
     )
 }
 
-/// 终端本地斜杠命令（claudeLocalCommand）与原生系统提示（claudeNotice：离开期间回顾、原生提示、
-/// 阻止继续或出错的 Stop Hook）投影为会话事件行；识别规则见连接端 native_local_command / native_system_notice。
+/// 本地斜杠命令（claudeLocalCommand：终端执行，或经 SDK 执行时带 via=sdk）与原生系统提示（claudeNotice：
+/// 离开期间回顾、原生提示、阻止继续或出错的 Stop Hook）投影为会话事件行；识别规则见连接端
+/// native_local_command / native_system_notice。
 pub(super) fn event_item(row: &Value) -> Option<Value> {
     let uuid = row["uuid"].as_str()?;
     let command = &row["nativeLocalCommand"];
     if command.is_object() {
-        return Some(
-            json!({"id":uuid,"type":"claudeLocalCommand","source":"claude",
-            "name":command["name"],"args":command["args"],"output":null,"completedAtMs":row["timestampMs"]}),
-        );
+        let mut item = json!({"id":uuid,"type":"claudeLocalCommand","source":"claude",
+            "name":command["name"],"args":command["args"],"output":null,"completedAtMs":row["timestampMs"]});
+        // 经 SDK（网页等客户端）执行的命令不是在终端里执行的：带上 via，网页据此显示“执行了”而不是“终端执行了”。
+        if command["via"] == "sdk" {
+            item["via"] = json!("sdk");
+        }
+        return Some(item);
     }
     let notice = &row["nativeSystemNotice"];
     notice.is_object().then(|| {

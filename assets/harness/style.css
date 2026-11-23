@@ -292,14 +292,16 @@ html{scrollbar-color:var(--muted) transparent}
 .thread-ownership-copy>span{font-size:.85714rem;color:var(--muted)}
 #thread-ownership-icon{display:flex;flex-shrink:0}
 #thread-ownership-icon>.ui-icon{width:18px;height:18px}
-.thread-ownership-actions{display:flex;flex-shrink:0;align-items:center;border-inline-start:1px solid var(--line);padding-inline-start:12px}
+.thread-ownership-actions{display:flex;flex-shrink:0;align-items:center;gap:8px;border-inline-start:1px solid var(--line);padding-inline-start:12px}
 .thread-ownership-actions>.text-button{min-width:64px;min-height:32px;font-size:.85714rem;white-space:nowrap}
+/* 用户要求“关闭其他占用”并排在重试右侧：会结束别的应用的进程，用危险语义色；进入“关闭中…”时保持原宽度（6 个汉字 + 左右各 9px 内边距）。 */
+.thread-ownership-actions>.text-button.danger-text{color:var(--danger);min-width:calc(6em + 18px)}
 .composer-anchor:has(.thread-ownership-banner:not([hidden]))>.composer-metrics{display:none}
 @media(max-width:760px){.thread-ownership-banner{gap:8px;padding:12px;border-radius:20px}.thread-ownership-actions{padding-inline-start:8px}.thread-ownership-actions>.text-button{min-width:56px}}
 /* 用户确认额度放在输入框下方现有空位：20px 高度复用 .composer-area 已有的至少 20px 下边距。
  * 绝对定位不参与布局，禁止为额度增加 margin/padding/行高或移动输入框；右侧保持原内侧对齐。 */
-/* 用户确认两个额度的分隔圆点两侧各由 10px 收至 5px；单项名称与百分比仍保持下方 5px 间距。
- * 用户要求前缀改为“剩余”后与 5h 同样保持 5px：取消原额外 5px 外边距，不改变底行高度或右侧对齐。 */
+/* 用户要求额度底栏只显示“5h xx%  7d xx%”：去掉“剩余”前缀和中间圆点，单项名称与百分比保持 5px 间距，
+ * 不改变底行高度或右侧对齐。 */
 .composer-anchor>.claude-usage{position:absolute;top:100%;right:12px;display:flex;align-items:center;justify-content:flex-end;gap:5px;max-width:calc(100% - 24px);height:20px;min-height:0;margin:0;padding:0 2px;border:0;border-radius:0;background:transparent;color:var(--text);font:inherit;font-size:calc(var(--font-size)*.785714);font-variant-numeric:tabular-nums;line-height:20px;white-space:nowrap;cursor:pointer}
 .composer-anchor>.claude-usage:is(:hover,:active,[aria-expanded=true]){background:transparent}
 /* 用户确认“48tk/s 本轮 20步 1m 总 5m”放在输入框外侧左下方，与右侧额度共用既有 20px 空位。
@@ -329,7 +331,6 @@ html[data-workspace-side-panel=true] .composer-anchor>.composer-metrics,
 }
 .claude-usage-window{display:inline-flex;gap:5px}
 .claude-usage-percent{font-weight:400}
-.claude-usage-dot{color:var(--muted)}
 .claude-usage-tooltip.ui-popup{display:block;gap:0;padding:14px;border-color:var(--menu-divider,var(--line));border-radius:10px;background:var(--control-bg,var(--side));color:var(--text);font-size:12px;line-height:1.5;overflow:auto}
 /* 用户要求账号邮箱默认脱敏、眼睛紧跟账号；订阅等级固定在行右侧，过长邮箱省略，title 只包含当前显示版本。 */
 .claude-usage-title{display:flex;align-items:center;gap:8px;margin-bottom:12px;font-size:13px;font-weight:600;white-space:nowrap}
@@ -940,8 +941,9 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .turn-plan-block>summary:hover{color:var(--text)}
 .turn-plan-chevron{width:14px;height:14px;transition:transform var(--duration-control)}
 .turn-plan-block[open] .turn-plan-chevron{transform:rotate(180deg)}
-/* 用户要求任务列表较长时限制明细区高度并内部滚动；短列表保持原有自然高度，标题行始终可见。 */
-.turn-plan-block>.turn-plan{max-height:min(25dvh,200px);overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin}
+/* 用户要求任务列表明细固定最多 120px；隐藏滚动条但保留滚轮、触控板和触摸滚动，标题行始终可见。 */
+.turn-plan-block>.turn-plan{max-height:120px;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:none;-ms-overflow-style:none}
+.turn-plan-block>.turn-plan::-webkit-scrollbar{display:none}
 .send-button[data-action=stop] .ui-icon{width:18px;height:18px}
 /* 240% 背景从 150% 移至 -50%，亮带仍从左向右扫过，重置时两端都是 muted 底色。 */
 @keyframes working-shimmer{from{background-position:150% 0}to{background-position:-50% 0}}
@@ -1893,9 +1895,10 @@ body{font-weight:var(--ui-font-weight,400)}
 .session-instance-row .appearance-environment-copy{flex:1}
 .session-instance-row .appearance-notification-switch{flex-shrink:0}
 .session-instance-path{overflow-wrap:anywhere;word-break:break-word}
-.instruction-selectors{display:flex;flex-wrap:wrap;gap:12px}
-.instruction-selectors>label{display:flex;flex:1 1 180px;flex-direction:column;gap:6px;min-width:0;font-size:.85714rem}
-.instruction-selectors .select-trigger{width:100%;max-width:100%;padding:8px}
+.instruction-selectors{display:flex;align-items:flex-end;gap:12px;min-width:0}
+.instruction-selector-field{display:flex;flex:0 1 200px;flex-direction:column;gap:6px;min-width:0;font-size:.85714rem}
+.instruction-selector-field .select-trigger{width:100%;max-width:100%;padding:8px}
+.instruction-selectors>.instruction-path{flex:1 1 auto;min-width:0;margin:0 0 4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .instruction-path{user-select:text}
 .instruction-content{display:block;width:100%;height:45dvh;min-height:180px;resize:vertical;font-size:var(--code-font-size,12px);line-height:1.7;tab-size:2}
 /* 用户要求自定义指令编辑区尽量填满当前设置页的剩余高度；标题、实例选择、状态和操作栏保留固定空间，
@@ -1909,12 +1912,21 @@ body{font-weight:var(--ui-font-weight,400)}
   flex:1 1 0;height:auto;min-height:220px;resize:none;overflow:auto
 }
 #appearance-instructions-page .appearance-instructions-card>.appearance-action-buttons{flex-shrink:0}
+#appearance-instructions-page .instruction-footer{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-shrink:0;margin-top:16px}
+#appearance-instructions-page .instruction-save-hint{flex:1 1 auto;min-width:0;margin:0}
+#appearance-instructions-page .instruction-footer>.appearance-action-buttons{flex-shrink:0;margin:0}
 /* 正常读取后隐藏空状态，避免为已移除的提示保留一行。 */
 #instruction-status:empty{display:none}
 /* 手机和 PC 的固定菜单均不拦截页面点击，菜单自身仍可交互；手机普通页面点击隐藏由菜单模块处理，侧边会话除外。 */
 .session-related-menu-layer.session-menu-pinned{pointer-events:none}
 .session-menu-pinned>.session-related-menu{pointer-events:auto}
 @media(max-width:760px){
+  .instruction-selectors{align-items:stretch;flex-wrap:wrap}
+  .instruction-selector-field{flex:1 1 100%}
+  .instruction-selectors>.instruction-path{flex:1 1 100%;margin:0;white-space:normal}
+  #appearance-instructions-page .instruction-footer{align-items:flex-start;flex-wrap:wrap}
+  #appearance-instructions-page .instruction-save-hint{flex-basis:100%}
+  #appearance-instructions-page .instruction-footer>.appearance-action-buttons{margin-left:auto}
   .appearance-number>input{width:82px}
   .appearance-environment{align-items:flex-start;flex-direction:column;gap:6px}
   .appearance-section-heading{align-items:flex-start;flex-direction:column}
@@ -1984,7 +1996,11 @@ body{font-weight:var(--ui-font-weight,400)}
 .session-instance-group{overflow:hidden;border:1px solid var(--line);border-radius:16px;background:color-mix(in srgb,var(--composer-bg) 68%,var(--bg))}
 .session-instance-group>h4{margin:0;padding:14px 16px;border-bottom:1px solid var(--line)}
 .session-instance-group>.appearance-notification-row{margin:0;border-radius:0;padding:12px 16px}
-.instance-permissions-card{padding:0 16px 14px}
+/* 权限字段已经复用通用 .appearance-field 的左右 16px 内边距，卡片不能再次叠加水平留白；
+ * 状态文字和操作按钮单独保留同样的 16px 对齐，保持卡片内各区域一致。 */
+.instance-permissions-card{padding:0 0 14px}
+.instance-permissions-card>.permission-settings-status,
+.instance-permissions-card>.permission-settings-actions{margin-inline:16px}
 .permission-instance-field{gap:14px}
 .permission-instance-target{display:flex;align-items:center;justify-content:flex-end;gap:12px;flex:0 1 65%;min-width:0}
 .permission-instance-slot{flex:0 0 200px;min-width:0}

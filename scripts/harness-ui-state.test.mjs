@@ -2376,10 +2376,13 @@ test("Claude 额度详情仅点击开关，悬停和聚焦不展开，数据失�
   context.syncClaudeUsage();
   requests[0].resolve({ ok: true, backend: "claude", instanceId: "claude:wsl:a", usage: usage() });
   await new Promise(resolve => setImmediate(resolve));
-  assert.match(trigger.attributes["aria-label"], /5 小时剩余 76%.*7 天剩余 48%/);
-  assert.equal(trigger.children[0].textContent, "剩余");
-  assert.equal(trigger.children[1].children[1].textContent, "76%");
-  assert.equal(trigger.children[3].children[1].textContent, "48%");
+  assert.match(trigger.attributes["aria-label"], /5h 76%.*7d 48%/);
+  assert.doesNotMatch(trigger.attributes["aria-label"], /剩余/);
+  assert.equal(trigger.children.length, 2);
+  assert.equal(trigger.children[0].children[0].textContent, "5h");
+  assert.equal(trigger.children[0].children[1].textContent, "76%");
+  assert.equal(trigger.children[1].children[0].textContent, "7d");
+  assert.equal(trigger.children[1].children[1].textContent, "48%");
   trigger.onpointerenter?.({ pointerType: "touch" });
   assert.equal(nodes.length, 0);
   trigger.onpointerenter?.({ pointerType: "mouse" });
@@ -2412,7 +2415,7 @@ test("Claude 额度详情仅点击开关，悬停和聚焦不展开，数据失�
   assert.equal(context.claudeUsageState.tip, null);
 });
 
-test("Claude 额度弹层的重置时间使用目标 WSL 时区，不退回浏览器本地时区", async () => {
+test("Claude 额度弹层同时显示目标 WSL 与 Harness 当前环境时区", async () => {
   const h = claudeUsageHarness(), value = h.usage();
   value.timeZone = "America/Los_Angeles";
   h.context.mountClaudeUsage(); h.context.syncClaudeUsage();
@@ -2421,11 +2424,15 @@ test("Claude 额度弹层的重置时间使用目标 WSL 时区，不退回浏�
   h.trigger.onclick();
   for (const section of h.nodes[0].children.slice(1, 3)) {
     const reset = section.children[2].children[1];
+    assert.match(reset.title, /^(?:\d+天)?(?:\d+小时)?\d+分钟\n/);
     assert.match(reset.title, /America\/Los_Angeles/);
+    assert.match(reset.title, /\n/);
+    assert.doesNotMatch(reset.title, /(?:WSL|当前环境)：/);
     assert.match(reset.title, /\d{4}\/\d{2}\/\d{2}/, "hover 必须显示完整年月日");
     assert.match(reset.title, /\d{2}:\d{2}/, "5 小时和 7 天窗口都必须显示具体时分");
     assert.match(reset.attributes["aria-label"], /重置时间：/);
   }
+  assert.match(h.nodes[0].children[1].children[2].children[1].title, /^2小时18分钟\n/);
 
   const invalidHarness = claudeUsageHarness(), invalid = invalidHarness.usage();
   invalid.timeZone = "PST8PDT";
@@ -4441,7 +4448,7 @@ test("远程 PC、手机、PWA 和 Android 移除宿主机应用入口，伪造�
       window: fixture.native ? { __TAURI__: { core: { invoke() { requests.push("native"); } } } } : {},
       innerWidth: fixture.width, navigator: { standalone: fixture.standalone },
       isAndroidContainer: () => fixture.android, relatedSessionView: null, workspaceSidePanel: false,
-      threadReadOnly: () => false, privateInputScope: value => value?.device.id,
+      threadReadOnlyApartFromOwnership: () => false, privateInputScope: value => value?.device.id,
       currentFileBrowserThreadId: () => item.id, localFileReference,
       copyText: path => copied.push(path), openLocalFileInBrowser: path => browsers.push(path),
       api: (...args) => { requests.push(args); } });
@@ -4475,7 +4482,7 @@ test("Open in 按执行实例显示 WSL，Windows 挂载目录保留 WSL 身份�
     selectedId: "main", nativeConnectionVersion: 1, session: { transport: "desktop", capabilities: { workspaceOpenIn: true } },
     thread: { id: "main", instanceId: "claude:wsl:fixture", wslDistribution: "claude-test",
       wslUser: "junes", cwd: "E:\\code" },
-    threadReadOnly: () => false, relatedSessionView: null, workspaceSidePanel: false,
+    threadReadOnlyApartFromOwnership: () => false, relatedSessionView: null, workspaceSidePanel: false,
     privateInputScope: () => "scope",
   });
   rawVm.runInContext(workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function workspaceOpenInAvailable("),
@@ -4529,7 +4536,7 @@ test("会话右键打开方式按该行读取并启动，切换当前聊天不�
   const context = rawVm.createContext({ nativeConnectionVersion: 1, pageLeaving: false,
     selectedId: "another-session", sidebar: { recent: [item] },
     session: { transport: "desktop", device: { id: "device", createdAtMs: 1 }, capabilities: { workspaceOpenIn: true } },
-    privateInputScope: value => JSON.stringify(value.device), threadReadOnly: () => false,
+    privateInputScope: value => JSON.stringify(value.device), threadReadOnlyApartFromOwnership: () => false,
     sessionStorage: copied, localStorage: preferences, randomId: () => "fixture-request",
     AbortController, setTimeout, clearTimeout, notice() {},
     api: async (path, payload, idempotency) => {
@@ -4566,7 +4573,7 @@ test("会话右键打开方式在异步准备后复核授权、入口身份、�
     let available = true, writes = 0;
     const context = rawVm.createContext({ nativeConnectionVersion: 1, pageLeaving: false,
       sidebar: { recent: [item] }, session: { transport: "desktop", device: { id: "device" }, capabilities: { workspaceOpenIn: true } },
-      privateInputScope: value => value.device.id, threadReadOnly: () => false,
+      privateInputScope: value => value.device.id, threadReadOnlyApartFromOwnership: () => false,
       notice() {}, performWorkspaceOpenIn: async () => { ++writes; },
       api: async () => ({ ok: true, root: item.cwd, targets: [
         { target: "powershell", label: "PowerShell", available: true }
@@ -4603,7 +4610,7 @@ test("正文文件打开方式在 VS Code 后显示 Default app，携带所点�
   const item = { id: "main", cwd: "E:\\repo\\packages\\client", instanceId: "codex:local" };
   const context = rawVm.createContext({ nativeConnectionVersion: 1, pageLeaving: false,
     session: { transport: "desktop", device: { id: "device" }, capabilities: { workspaceOpenIn: true } },
-    privateInputScope: value => value.device.id, threadReadOnly: () => false,
+    privateInputScope: value => value.device.id, threadReadOnlyApartFromOwnership: () => false,
     element: (_tag, className) => ({ className, setAttribute() {} }),
     AbortController, setTimeout, clearTimeout, notice() {}, sessionStorage: disk, localStorage: preferences,
     randomId: () => "file-request", validateRemoteReceipt: value => value,
@@ -4642,7 +4649,7 @@ test("正文不同文件的打开回执分别保留，结果未知不自动重�
   let sequence = 0;
   const context = rawVm.createContext({ nativeConnectionVersion: 1, pageLeaving: false,
     session: { transport: "desktop", device: { id: "device" }, capabilities: { workspaceOpenIn: true } },
-    privateInputScope: value => value.device.id, threadReadOnly: () => false,
+    privateInputScope: value => value.device.id, threadReadOnlyApartFromOwnership: () => false,
     AbortController, setTimeout, clearTimeout, notice: value => notices.push(value), sessionStorage: disk,
     localStorage: storage(), randomId: () => `file-request-${++sequence}`, validateRemoteReceipt: value => value,
     api: async (path, payload, requestId) => {
@@ -8548,6 +8555,9 @@ test("Claude 自动续跑提示使用中文，recap 沿用原生前缀，未知�
   const event = item => ({ ...context.claudeEventText(item) });
   assert.deepEqual(event({ type: "claudeLocalCommand", name: "/resume", args: "", output: "已在后台运行" }),
     { label: "终端执行了 /resume", description: "已在后台运行" });
+  assert.deepEqual(event({ type: "claudeLocalCommand", name: "/context", args: "", via: "sdk", output: "## Context Usage" }),
+    { label: "执行了 /context", description: "## Context Usage" }, "经 SDK 执行的命令不是在终端里执行的");
+  assert.equal(event({ type: "claudeLocalCommand", name: "/usage", args: "", via: "sdk", output: null }).label, "执行了 /usage");
   assert.equal(event({ type: "claudeLocalCommand", name: "/skills", output: null }).description, "尚未收到命令输出。");
   assert.equal(event({ type: "claudeLocalCommand", name: "/skills", output: "" }).description, "命令没有输出。");
   assert.equal(event({ type: "claudeNotice", kind: "awaySummary", text: "已问候" }).label, "※ recap: 已问候");
@@ -8893,6 +8903,76 @@ test("当前主会话收到问答立即显示未读提醒，处理完成后恢�
   assert.equal(syncs, 2, "包括已读刷新在内的侧栏渲染同步侧边状态");
   assert.equal(h.context.selectedId, h.regular.id);
   assert.deepEqual(h.selected, []);
+});
+
+// 选中会话的行状态以侧栏条目为准：thread.priority 只是上一次读取会话详情时的快照（Codex 会话详情带它，Claude 没有）。
+function selectedRowStates(h, id) {
+  return h.root.querySelectorAll(".thread-row").filter(node => node.dataset.threadId === id)
+    .map(row => row.querySelector(".thread-state")?.className.split(/\s+/).find(name => ["active", "unread", "waiting", "error"].includes(name)) || "none");
+}
+function loadSidebarStateSources(h) {
+  vm.runInContext([
+    sourceSection("function forEachSidebarThread(", "function applySidebarThreadTitle("),
+    sourceSection("function markSidebarThreadReadLocally(", "function sidebarAttentionState("),
+  ].join("\n"), h.context);
+}
+
+test("从其他会话点进未读会话：已读回执成功后选中会话的蓝点立即消失，不被会话详情里旧的 priority 留住", () => {
+  const h = recentSidebarHarness();
+  loadSidebarStateSources(h);
+  const target = h.unread;
+  // 进入目标会话时读取到的详情仍带着当时的 priority（未读），之后侧栏条目才被已读回执清除。
+  h.context.selectedId = target.id;
+  h.context.thread = { id: target.id, hasUnreadTurn: true, requests: [],
+    priority: { attentionState: "unread", active: false, eligible: true } };
+  h.context.renderSidebar();
+  assert.deepEqual(selectedRowStates(h, target.id).filter(state => state !== "unread"), [], "提交已读前仍显示蓝点");
+  assert.ok(selectedRowStates(h, target.id).length > 0);
+  h.context.markSidebarThreadReadLocally(target.id);
+  h.context.thread.hasUnreadTurn = false;
+  h.context.renderSidebar();
+  assert.deepEqual(selectedRowStates(h, target.id).filter(state => state !== "none"), [],
+    "已读回执成功后，选中会话不能再显示蓝点；以前要切换到别的会话才会消失");
+  // 切换到其他会话后同样没有蓝点（旧行为：此时才消失）。
+  h.context.selectedId = h.regular.id; h.context.thread = { id: h.regular.id, requests: [] };
+  h.context.renderSidebar();
+  assert.deepEqual(selectedRowStates(h, target.id).filter(state => state !== "none"), []);
+});
+
+test("当前会话执行时留在原会话：完成后不残留旧的执行圈，已读确认后也不残留蓝点", () => {
+  const h = recentSidebarHarness();
+  loadSidebarStateSources(h);
+  const id = h.running.id;
+  // 执行期间读取到的会话详情：priority 是执行中的旧快照，之后只靠事件更新侧栏条目。
+  h.context.selectedId = id;
+  h.context.thread = { id, requests: [], status: { type: "active" },
+    priority: { attentionState: "active", active: true, eligible: true } };
+  h.context.renderSidebar();
+  assert.deepEqual(selectedRowStates(h, id).filter(state => state !== "active"), [], "执行中显示执行圈");
+  // 真实协议顺序：先 readState 变为未读，再 idle，最后 turn/completed；正在查看且跟随底部，所以 unread=false。
+  h.context.applySidebarThreadReadState(id, { firstUnread: { type: "turn", turnId: "turn-1" }, revision: "r1" });
+  h.context.applySidebarThreadOutcome(id, { id: "turn-1", status: "completed" }, { unread: false });
+  h.context.renderSidebar();
+  assert.deepEqual(selectedRowStates(h, id).filter(state => state === "active"), [],
+    "完成后选中会话不能还停在执行圈，不能等会话详情重新读取才恢复");
+  // 已读确认成功后：蓝点消失，即使此时会话详情里还是读取时的旧快照。
+  h.context.markSidebarThreadReadLocally(id);
+  h.context.renderSidebar();
+  assert.deepEqual(selectedRowStates(h, id).filter(state => state !== "none"), [], "已读确认后没有蓝点也没有执行圈");
+});
+
+test("选中会话读取详情后收到新一轮开始事件，行上立即显示执行圈，不等待下一次读取", () => {
+  const h = recentSidebarHarness();
+  loadSidebarStateSources(h);
+  const id = h.regular.id;
+  h.context.selectedId = id;
+  h.context.thread = { id, requests: [], priority: { attentionState: "idle", active: false, eligible: true } };
+  h.context.renderSidebar();
+  assert.deepEqual(selectedRowStates(h, id), ["none", "none"].slice(0, selectedRowStates(h, id).length));
+  h.context.applySidebarThreadStarted(id, { id: "turn-2", status: { type: "active" } });
+  h.context.renderSidebar();
+  assert.ok(selectedRowStates(h, id).length > 0);
+  assert.deepEqual(selectedRowStates(h, id).filter(state => state !== "active"), []);
 });
 
 test("异常会话使用 warning 图标并保持危险红色，不被通用 muted 规则覆盖", async () => {
@@ -10340,19 +10420,33 @@ test("后台事件不会重建历史请求或整页刷新；前台后可以正�
   await read;
 });
 
-function threadOwnershipHarness() {
-  const focusCalls = [], notices = [], reads = [];
-  let resolveRead, rejectRead;
+function threadOwnershipHarness({ claude = false, remote = false, legacyServer = false } = {}) {
+  const focusCalls = [], notices = [], reads = [], confirms = [], calls = [];
+  let resolveRead, rejectRead, resolveApi, rejectApi, confirmAnswer = true;
   const makeNode = () => ({ hidden: false, disabled: false, textContent: "", attributes: {},
     classList: { toggle() {}, remove() {} }, setAttribute(key, value) { this.attributes[key] = value; } });
   const nodes = new Map([".workspace", "#composer", "#thread-ownership", "#thread-ownership-retry",
-    "#side-thread-expired", "#open-sidebar", "#connection-state", "#open-session-tools",
+    "#thread-ownership-release", "#side-thread-expired", "#open-sidebar", "#connection-state", "#open-session-tools",
     "#related-session-back", "#pending-area", "#prompt"].map(key => [key, makeNode()]));
   const draft = { text: "保留未发送草稿", attachments: [{ name: "kept.png" }] };
   const queue = [{ id: "queued", text: "保留排队消息" }];
   const context = {
     selectedId: "owned", selectionToken: "selection-a", nativeConnectionVersion: 4, scope: "device-a",
-    session: { readOnly: false }, thread: { id: "owned", backend: "codex", externalWriter: true, readOnly: true },
+    // remote 只改变传输类型：用户要求网页、手机和 Android 与本机客户端一样提供“关闭其他占用”；
+    // legacyServer 模拟尚未声明该能力的旧后台（如 Android 内置网页比服务端新）。
+    session: { readOnly: false, transport: remote ? "remote" : "desktop",
+      capabilities: legacyServer ? {} : { releaseExternalHolders: true } },
+    thread: claude
+      ? { id: "owned", backend: "claude", externalWriter: true, readOnly: true,
+        externalHolders: [{ pid: 4242, kind: "interactive", entrypoint: "cli" },
+          { pid: 4300, kind: "bg", entrypoint: "cli" }] }
+      : { id: "owned", backend: "codex", externalWriter: true, readOnly: true },
+    confirmAction: async (...args) => { confirms.push(args); return confirmAnswer; },
+    api: (path, body, id) => {
+      calls.push({ path, body, id });
+      return new Promise((resolve, reject) => { resolveApi = resolve; rejectApi = reject; });
+    },
+    randomId: () => "request-1", validateRemoteReceipt: value => value,
     relatedSessionView: null, relatedThreadViews: new Map(), relatedBackPending: false,
     connected: true, pageLeaving: false, document: { hidden: false }, expired: false,
     threadOwnershipRetry: null, draft, queue,
@@ -10377,10 +10471,12 @@ function threadOwnershipHarness() {
     sourceSection("function currentThreadOwnershipRetry(", "function syncPendingFeedbackTimer(")
   ].join("\n"), context);
   context.syncRelatedSessionLayout(); context.renderThreadOwnership();
-  return { context, nodes, focusCalls, notices, reads, draft, queue,
+  return { context, nodes, focusCalls, notices, reads, draft, queue, confirms, calls,
+    answer(value) { confirmAnswer = value; },
+    respond(value) { resolveApi(value); }, fail(error) { rejectApi(error); },
     resolve() { resolveRead(); }, reject(error) { rejectRead(error); },
     release() {
-      context.thread = { ...context.thread, externalWriter: false, readOnly: false };
+      context.thread = { ...context.thread, externalWriter: false, readOnly: false, externalHolders: undefined };
       nodes.get("#prompt").disabled = false;
       context.syncRelatedSessionLayout();
     }
@@ -10403,6 +10499,9 @@ test("其他 Codex 持有时原编辑器隐藏，提示仅提供重试且保留�
   assert.match(banner, /<strong>已在另一个应用中打开<\/strong>/);
   assert.match(banner, /请先在那边关闭会话，才能在这里继续。/);
   assert.match(banner, /thread-ownership-retry/);
+  assert.ok(banner.indexOf("thread-ownership-retry") < banner.indexOf("thread-ownership-release"),
+    "“关闭其他占用”排在重试按钮右侧");
+  assert.match(banner, /id="thread-ownership-release"[^>]*hidden>关闭其他占用</, "默认隐藏，由服务端能力决定是否显示");
   assert.doesNotMatch(banner, /fork|分叉/);
   h.context.thread = { id: "another", backend: "codex", externalWriter: true, readOnly: true };
   assert.equal(h.context.threadOwnedElsewhere(), false, "其他会话的状态不能隐藏当前编辑器");
@@ -10452,6 +10551,180 @@ test("确认外部锁释放后恢复原编辑器，手动重试可继续原草�
   assert.equal(h.nodes.get("#prompt").value, h.draft.text);
   assert.equal(h.context.queue, h.queue);
   assert.deepEqual(h.focusCalls.map(options => options.preventScroll), [true]);
+});
+
+test("Claude 会话在本机客户端、网页、手机和 Android 上都提供“关闭其他占用”，Codex 和旧后台只有重试", () => {
+  const claude = threadOwnershipHarness({ claude: true }).nodes;
+  const release = claude.get("#thread-ownership-release");
+  assert.equal(release.hidden, false);
+  assert.equal(release.textContent, "关闭其他占用");
+  assert.equal(claude.get("#thread-ownership-retry").hidden, false);
+  assert.equal(threadOwnershipHarness().nodes.get("#thread-ownership-release").hidden, true, "Codex 的占用提示仍只有重试");
+  const remote = threadOwnershipHarness({ claude: true, remote: true }).nodes;
+  assert.equal(remote.get("#thread-ownership-release").hidden, false, "远程网页、手机和 Android 与本机客户端一样显示");
+  assert.equal(remote.get("#thread-ownership-release").textContent, "关闭其他占用");
+  assert.equal(threadOwnershipHarness({ claude: true, legacyServer: true }).nodes.get("#thread-ownership-release").hidden, true,
+    "旧后台没有声明该能力，不显示一个会 404 的按钮");
+  const readOnly = threadOwnershipHarness({ claude: true });
+  readOnly.context.session.readOnly = true; readOnly.context.renderThreadOwnership();
+  assert.equal(readOnly.nodes.get("#thread-ownership-release").hidden, true, "设备只读授权时不能结束别的进程");
+});
+
+test("远程网页、手机和 Android 点“关闭其他占用”与本机客户端提交同一个请求并恢复输入", async () => {
+  const h = threadOwnershipHarness({ claude: true, remote: true });
+  const pending = h.context.releaseThreadHolders();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.confirms.length, 1, "同样先弹出危险确认");
+  assert.equal(h.confirms[0][3], true);
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls[0].path, "/api/action/releaseExternalHolders");
+  assert.deepEqual({ ...h.calls[0].body }, { threadId: "owned" });
+  h.respond({ requestId: "request-1", state: "completed", result: { ok: true, released: 1 } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(h.reads, ["owned"]);
+  h.release(); h.resolve(); await pending;
+  assert.equal(h.nodes.get("#composer").hidden, false);
+  assert.equal(h.notices.at(-1).message, "已关闭其他占用，可以继续使用这个会话。");
+});
+
+test("关闭其他占用：弹窗写明占用进程，确认后由服务端结束并恢复编辑器，期间不重复提交", async () => {
+  const h = threadOwnershipHarness({ claude: true }), release = h.nodes.get("#thread-ownership-release");
+  const pending = h.context.releaseThreadHolders();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.confirms.length, 1);
+  const [title, message, action, danger] = h.confirms[0];
+  assert.equal(title, "关闭其他占用"); assert.equal(action, "关闭其他占用");
+  assert.equal(danger, true, "结束别的应用的进程必须使用危险确认");
+  assert.match(message, /2 个进程/);
+  assert.match(message, /终端里打开的 claude（PID 4242）/);
+  assert.match(message, /后台任务（旧版 Elves 或 claude --bg 启动，PID 4300）/);
+  assert.match(message, /正在执行的任务会被中断/);
+  assert.match(message, /Elves 自己的会话进程不受影响/);
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls[0].path, "/api/action/releaseExternalHolders");
+  assert.deepEqual(Object.keys(h.calls[0].body), ["threadId"], "只提交会话标识，要结束哪些进程由服务端核对");
+  assert.equal(h.calls[0].body.threadId, "owned"); assert.equal(h.calls[0].id, "request-1");
+  // 处理中：两个按钮都禁用，只有发起的按钮显示处理中，保留原宽度由样式负责。
+  assert.equal(release.disabled, true); assert.equal(release.textContent, "关闭中…");
+  assert.equal(release.attributes["aria-busy"], "true");
+  const retry = h.nodes.get("#thread-ownership-retry");
+  assert.equal(retry.disabled, true); assert.equal(retry.textContent, "重试");
+  await h.context.releaseThreadHolders(); await h.context.retryThreadOwnership();
+  assert.equal(h.calls.length, 1, "进行中再次点击不重复提交");
+  assert.deepEqual(h.reads, []);
+  h.respond({ requestId: "request-1", state: "completed", result: { ok: true, released: 2 } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(h.reads, ["owned"], "服务端确认后重新读取会话，由服务端判定是否仍被占用");
+  h.release(); h.resolve(); await pending;
+  assert.equal(h.nodes.get("#composer").hidden, false);
+  assert.equal(h.nodes.get("#thread-ownership").hidden, true);
+  assert.equal(h.notices.at(-1).message, "已关闭其他占用，可以继续使用这个会话。");
+  assert.equal(h.notices.at(-1).error, undefined);
+  assert.equal(h.nodes.get("#prompt").value, h.draft.text, "草稿原样保留");
+  assert.equal(h.context.queue, h.queue);
+  assert.deepEqual(h.focusCalls.map(options => options.preventScroll), [true]);
+  assert.equal(release.disabled, false); assert.equal(release.attributes["aria-busy"], "false");
+});
+
+test("取消关闭其他占用不发请求，会话仍被占用时给出提示并保留输入", async () => {
+  const h = threadOwnershipHarness({ claude: true });
+  h.answer(false);
+  await h.context.releaseThreadHolders();
+  assert.equal(h.confirms.length, 1); assert.deepEqual(h.calls, []); assert.deepEqual(h.notices, []);
+  assert.equal(h.nodes.get("#thread-ownership-release").disabled, false);
+  h.answer(true);
+  const pending = h.context.releaseThreadHolders();
+  await new Promise(resolve => setImmediate(resolve));
+  h.respond({ requestId: "request-1", state: "completed", result: { ok: true, released: 1 } });
+  await new Promise(resolve => setImmediate(resolve));
+  h.resolve(); await pending;
+  assert.match(h.notices.at(-1).message, /仍被占用/); assert.equal(h.notices.at(-1).error, true);
+  assert.equal(h.nodes.get("#composer").hidden, true);
+  assert.equal(h.nodes.get("#prompt").value, h.draft.text);
+  assert.deepEqual(h.focusCalls, []);
+});
+
+test("服务端拒绝关闭其他占用时说明原因、重新读取实际占用并保留提示和输入", async () => {
+  const h = threadOwnershipHarness({ claude: true });
+  const pending = h.context.releaseThreadHolders();
+  await new Promise(resolve => setImmediate(resolve));
+  h.respond({ requestId: "request-1", state: "failed", result: { ok: false, code: 409,
+    message: "仍有 1 个进程没有退出，未能关闭其他占用" } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(h.reads, ["owned"], "失败时可能已有部分进程退出，重新读取让提示反映实际占用");
+  h.resolve(); await pending;
+  assert.deepEqual(h.notices, [{ message: "关闭其他占用失败：仍有 1 个进程没有退出，未能关闭其他占用", error: true }]);
+  assert.equal(h.nodes.get("#composer").hidden, true);
+  assert.equal(h.nodes.get("#prompt").value, h.draft.text);
+  assert.equal(h.nodes.get("#thread-ownership-release").disabled, false);
+  assert.equal(h.nodes.get("#thread-ownership-release").textContent, "关闭其他占用");
+});
+
+test("关闭其他占用成功后重新读取会话失败时，不报成关闭失败", async () => {
+  const h = threadOwnershipHarness({ claude: true }), pending = h.context.releaseThreadHolders();
+  await new Promise(resolve => setImmediate(resolve));
+  h.respond({ requestId: "request-1", state: "completed", result: { ok: true, released: 2 } });
+  await new Promise(resolve => setImmediate(resolve));
+  h.reject(new Error("网络中断")); await pending;
+  assert.deepEqual(h.notices, [{ message: "已关闭其他占用，但重新读取会话失败：网络中断，请点“重试”核对。", error: true }]);
+  assert.equal(h.nodes.get("#thread-ownership-release").disabled, false);
+  assert.equal(h.nodes.get("#thread-ownership-release").textContent, "关闭其他占用");
+});
+
+test("确认弹窗期间切换会话或连接后，旧确认不会结束别的会话的占用", async () => {
+  for (const change of ["selectedId", "selectionToken", "scope", "nativeConnectionVersion"]) {
+    const h = threadOwnershipHarness({ claude: true }), pending = h.context.releaseThreadHolders();
+    h.context[change] = change === "nativeConnectionVersion" ? 5 : "changed";
+    await pending;
+    assert.deepEqual(h.calls, [], change);
+    assert.equal(h.nodes.get("#thread-ownership-release").textContent, "关闭其他占用", change);
+  }
+});
+
+test("会话被其他应用占用时只限制输入：关闭其他占用可提交，设备只读和子代理仍拒绝", () => {
+  const context = vm.createContext({
+    selectedId: "owned", session: { readOnly: false }, thread: { id: "owned", externalWriter: true, readOnly: true },
+    relatedSessionView: null, relatedThreadViews: new Map(), normalizeRelatedView: value => value || null
+  });
+  vm.runInContext(sourceSection("function threadOwnedElsewhere(", "function threadReadOnlyMessage("), context);
+  assert.equal(context.threadActionReadOnly("send"), true, "占用中仍不能发送");
+  assert.equal(context.threadActionReadOnly("releaseExternalHolders"), false);
+  assert.equal(context.threadReadOnlyApartFromOwnership(), false);
+  context.session.readOnly = true;
+  assert.equal(context.threadActionReadOnly("releaseExternalHolders"), true, "设备只读授权不能结束别的进程");
+  context.session.readOnly = false;
+  context.thread = { id: "owned", externalWriter: true, readOnly: true, viewKind: "subagent" };
+  assert.equal(context.threadActionReadOnly("releaseExternalHolders"), true);
+  context.thread = { id: "owned", externalWriter: false, readOnly: true };
+  assert.equal(context.threadReadOnlyApartFromOwnership(), true, "并非因占用而只读时不放行");
+});
+
+test("Open in 不因会话被其他应用占用而隐藏，设备只读和子代理仍隐藏", () => {
+  const item = { id: "main", instanceId: "claude:wsl:fixture", wslDistribution: "claude-test", wslUser: "junes", cwd: "E:\\code" };
+  const context = rawVm.createContext({
+    window: { __TAURI__: { core: { invoke() {} } } }, pageLeaving: false, creating: false,
+    selectedId: "main", nativeConnectionVersion: 1,
+    session: { transport: "desktop", readOnly: false, capabilities: { workspaceOpenIn: true } },
+    thread: { ...item, externalWriter: true, readOnly: true },
+    sidebar: { recent: [item], pinnedThreads: [], projects: [] },
+    relatedSessionView: null, relatedThreadViews: new Map(), normalizeRelatedView: value => value || null,
+    workspaceSidePanel: false, privateInputScope: () => "scope"
+  });
+  rawVm.runInContext(
+    sourceSection("function threadOwnedElsewhere(", "function threadReadOnlyMessage(").replace(/^export /gm, "")
+    + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function workspaceOpenInAvailable("),
+      workspaceOpenInSource.indexOf("export function applicationIcon(")).replace(/^export /gm, "")
+    + workspaceOpenInSource.slice(workspaceOpenInSource.indexOf("function sidebarOpenInContext("))
+      .replace(/^export /gm, ""), context);
+  assert.equal(context.threadReadOnly(), true, "占用时会话本身仍是只读");
+  assert.equal(context.clientOpenInContext()?.wslInstance, true, "顶部 Open in 入口保留");
+  assert.ok(context.threadOpenInMenu(item), "会话右键菜单里的打开方式保留");
+  context.session.readOnly = true;
+  assert.equal(context.clientOpenInContext(), null, "设备只读授权时仍不提供");
+  context.session.readOnly = false; context.thread.viewKind = "subagent";
+  assert.equal(context.clientOpenInContext(), null, "子代理阅读页仍不提供");
+  context.thread = { ...item, externalWriter: false, readOnly: true };
+  assert.equal(context.clientOpenInContext(), null, "并非因占用而只读的会话仍不提供");
 });
 
 test("占用检查失败保留提示与输入，离线不发起重试", async () => {

@@ -1849,6 +1849,10 @@ impl HarnessController {
         let thread_id_owned = payload["threadId"].as_str().map(str::to_owned);
         let thread_id = thread_id_owned.as_deref();
         let claude_thread = thread_id.is_some_and(claude::Claude::owns_id);
+        if action == "releaseExternalHolders" && !claude_thread {
+            // 只有 Claude 会话能核对并关闭别的进程的持有；Codex 的占用提示仍只提供重试。
+            return Err(ApiError::new(409, "仅 Claude 会话支持关闭其他占用").into());
+        }
         let requested_owned = payload["backend"].as_str().map(str::to_owned);
         let requested = requested_owned.as_deref();
         if requested.is_some_and(|backend| !instances::TYPES.iter().any(|kind| kind.id == backend))
@@ -4110,6 +4114,9 @@ async fn session(
     response["capabilities"]["desktopCodexImageInput"] =
         json!(state.desktop && device.key_id == desktop::DEVICE_KEY_ID && native_write_available);
     response["capabilities"]["sideIdleRelease"] = json!(true);
+    // 用户要求各端都提供“关闭其他占用”，不再区分设备；仍声明为能力，是为了让内置旧网页包（如 Android 先于服务端升级）
+    // 连到不认识该动作的旧后台时不显示按钮。单独赋值：上面的 json! 已接近宏递归上限，再加一项无法编译。
+    response["capabilities"]["releaseExternalHolders"] = json!(true);
     response["transport"] = json!(if state.desktop { "desktop" } else { "remote" });
     // 代理设置和会话管理已迁移到独立管理器；Harness 不再声明管理页面或管理 API 能力。
     response["capabilities"]["management"] = json!(false);
@@ -5249,6 +5256,7 @@ async fn action(
             | "pinProject"
             | "pinThread"
             | "deleteThread"
+            | "releaseExternalHolders"
             | "sort"
             | "rename"
             | "approve"
@@ -5263,6 +5271,19 @@ async fn action(
     }
     if action.ends_with("ScheduledTask") && !state.desktop {
         return Err(ApiError::new(403, "定时任务仅可在 Elves 本机工作区使用"));
+    }
+    if action == "releaseExternalHolders" {
+        // 用户要求“关闭其他占用”在 Elves 本机客户端、网页、PWA、手机和 Android 上一样可用，不做设备特殊处理；
+        // 只读访问已在上方统一拒绝。只接受会话标识；要结束哪些进程由服务端重新核对，页面不能指定。
+        if payload.as_object().is_none_or(|object| {
+            object.len() != 1
+                || object
+                    .get("threadId")
+                    .and_then(notification_thread_id)
+                    .is_none()
+        }) {
+            return Err(ApiError::new(400, "关闭其他占用只接受会话标识"));
+        }
     }
     if matches!(action.as_str(), "approve" | "answer") && !state.settings.allow_approvals {
         return Err(ApiError::new(403, "远程审批与询问回答已关闭，请在桌面处理"));

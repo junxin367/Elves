@@ -167,6 +167,11 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     if (!options.some(option => option.value === value))
       options = [...options, { value, label: `${value}（当前配置）`, disabled: true }];
     const control = selectControl(`settings-${name}-${key}`, label, options, value);
+    // 用户要求设置页的模型菜单统一沿用“会话命名”：可搜索，并使用搜索 Select 的宽菜单。
+    if (key === "model") {
+      control.selectSearchable = true;
+      control.selectSearchPlaceholder = "搜索模型";
+    }
     control.settingsUnsupported = unsupported;
     const owner = record, ownerId = selected;
     control.onchange = () => {

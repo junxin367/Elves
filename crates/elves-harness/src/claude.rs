@@ -1541,15 +1541,25 @@ impl Claude {
         thread["requestsRevision"] = json!(self.request_revision.load(Ordering::Acquire));
         // 用户要求参考 Codex：会话被别的应用持有时输入区原位提示“已在另一个应用中打开”，并只读保护所有输入入口；
         // 草稿和排队消息不清理。核对失败（例如 WSL 暂时不可用）不能挡住历史读取，发送时会再次核对。
-        let held = !self
-            .external_holders(&c)
-            .await
-            .unwrap_or_default()
-            .is_empty();
+        let holders = self.external_holders(&c).await.unwrap_or_default();
+        let held = !holders.is_empty();
         thread["externalWriter"] = json!(held);
         if held {
             thread["readOnly"] = json!(true);
             thread["readOnlyReason"] = json!("请先在那边关闭会话，才能在这里继续。");
+            // 用户要求在提示旁提供“关闭其他占用”，并让人知道是什么在占用：只给进程类型和 PID，
+            // 不含命令行、工作目录或环境；网页据此在确认弹窗里说明，也以该字段判断本会话支持关闭。
+            thread["externalHolders"] = json!(
+                holders
+                    .iter()
+                    .take(8)
+                    .map(|holder| json!({
+                        "pid": holder["pid"],
+                        "kind": holder["kind"],
+                        "entrypoint": holder["entrypoint"],
+                    }))
+                    .collect::<Vec<_>>()
+            );
         }
         Ok(json!({"ok":true,"thread":thread,"nativeBridge":"claude"}))
     }
@@ -1790,6 +1800,51 @@ impl Claude {
             )
             .await?;
         Ok(result["holders"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// 用户在会话提示“已在另一个应用中打开”旁确认“关闭其他占用”后，结束别的进程对这个会话的持有：
+    /// 用户终端里的 claude、旧版 Elves 的后台任务、其他应用的 SDK 宿主等。持有者由 WSL 读取器重新枚举，
+    /// 不信任页面给出的任何进程信息；Elves 自己的宿主和 CLI 不受影响，仍在执行的任务照常继续。
+    /// 用户要求本机客户端、网页、PWA、手机和 Android 一样可用，这里不按设备区分；只读访问由 HTTP 入口统一拒绝。
+    async fn release_external_holders(
+        self: &Arc<Self>,
+        c: &Conversation,
+        authorization: &HarnessAuthorization,
+    ) -> anyhow::Result<Value> {
+        if c.deleted || uuid::Uuid::parse_str(&c.native_id).is_err() || !c.resumed {
+            return Ok(json!({"ok":true,"threadId":c.id,"released":0}));
+        }
+        let scripts = self.sdk_scripts(&c.config).await?;
+        let reader = self.native_reader(&c.config).await?;
+        let result = reader
+            .control(
+                json!({"subtype":"release_holders","native_id":c.native_id,
+                    "own":[scripts.host,scripts.reader]}),
+                Some(authorization),
+            )
+            .await?;
+        let released = result["released"].as_array().map_or(0, Vec::len);
+        let remaining = result["remaining"].as_array().map_or(0, Vec::len);
+        let stop_failed = result["stopFailed"].as_array().map_or(0, Vec::len);
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "claude.holders.release",
+            json!({"native_id":c.native_id.chars().take(8).collect::<String>(),
+                "released":released,"remaining":remaining,"stopFailed":stop_failed}),
+        );
+        if remaining > 0 {
+            return Err(error(
+                409,
+                format!(
+                    "仍有 {remaining} 个进程没有退出，未能关闭其他占用{}",
+                    if stop_failed > 0 {
+                        "（其中旧版后台任务未能通过 claude stop 停止）"
+                    } else {
+                        ""
+                    }
+                ),
+            ));
+        }
+        Ok(json!({"ok":true,"threadId":c.id,"released":released}))
     }
 
     async fn ensure_not_held_elsewhere(self: &Arc<Self>, c: &Conversation) -> anyhow::Result<()> {
@@ -2593,6 +2648,8 @@ impl Claude {
                 // 停止回执只确认请求已接受；等待原轮次的 result，避免迟到结果结束下一轮。
                 Ok(json!({"ok":true,"threadId":id}))
             }
+            // 与发送、编辑共用上面取得的会话锁，关闭期间不会有新的写入同时进行。
+            "releaseExternalHolders" => self.release_external_holders(&c, authorization).await,
             "approve" | "answer" => self.respond(id, payload, authorization).await,
             "markRead" | "pinThread" | "rename" | "deleteThread" => {
                 if action == "deleteThread" && c.active() {
@@ -5450,6 +5507,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thread_read_lists_who_holds_the_session_without_leaking_process_details() {
+        let (_directory, service, mut c) = fixture();
+        c.shared = true;
+        c.native_status = json!({"tempo":"idle"});
+        service
+            .saved
+            .lock()
+            .await
+            .conversations
+            .insert(c.id.clone(), c.clone());
+        let _calls = discovery_fixture(&service, json!([]), json!({})).await;
+
+        assert!(
+            service.detail(&c.id).await.unwrap()["thread"]
+                .get("externalHolders")
+                .is_none(),
+            "没有外部持有者时不带该字段，网页据此不显示“关闭其他占用”"
+        );
+        // 用户要求让人知道是什么在占用：只给进程类型和 PID，命令行、目录、环境等不外传；最多列八项。
+        *service.test_holders.lock().unwrap() = (0..10)
+            .map(|index| {
+                json!({"pid":4000 + index,"mine":false,"kind":"bg","entrypoint":"cli",
+                "started":"123","job":"c729d632","cwd":"/secret/project"})
+            })
+            .collect();
+        let held = service.detail(&c.id).await.unwrap();
+        let listed = held["thread"]["externalHolders"].as_array().unwrap();
+        assert_eq!(listed.len(), 8);
+        assert_eq!(
+            listed[0],
+            json!({"pid":4000,"kind":"bg","entrypoint":"cli"}),
+            "只暴露 pid、kind、entrypoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_external_holders_stops_only_foreign_processes_for_every_device_kind() {
+        let (_directory, service, mut c) = fixture();
+        c.shared = true;
+        c.native_status = json!({"tempo":"idle"});
+        service
+            .saved
+            .lock()
+            .await
+            .conversations
+            .insert(c.id.clone(), c.clone());
+        let calls = discovery_fixture(&service, json!([]), json!({})).await;
+        let (_authorization_directory, remote) = crate::tests::service_dispatch_fixture().await;
+
+        // 本程序自己的宿主/CLI（mine）不受影响，终端里的 claude 被结束。
+        // 用户要求网页、手机和 Android 与本机客户端一样可用：先用远程设备授权执行，不能被设备类型拒绝。
+        *service.test_holders.lock().unwrap() = vec![
+            json!({"pid":7,"mine":true}),
+            json!({"pid":4242,"mine":false,"kind":"interactive","entrypoint":"cli"}),
+        ];
+        let released = service
+            .command("releaseExternalHolders", &json!({"threadId":c.id}), &remote)
+            .await
+            .unwrap();
+        assert_eq!(released["ok"], true);
+        assert_eq!(released["released"], 1);
+        {
+            let calls = calls.lock().await;
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0]["subtype"], "release_holders");
+            assert_eq!(calls[0]["native_id"], c.native_id);
+            // 读取器用这两个脚本路径识别并跳过 Elves 自己的进程。
+            assert_eq!(
+                calls[0]["own"],
+                json!(["/fixture/claude-sdk-host.py", "/fixture/claude-shared.py"])
+            );
+        }
+        assert_eq!(
+            *service.test_holders.lock().unwrap(),
+            vec![json!({"pid":7,"mine":true})]
+        );
+        assert_eq!(
+            service.detail(&c.id).await.unwrap()["thread"]["externalWriter"],
+            false,
+            "关闭后重新读取即恢复可写"
+        );
+
+        // 没有外部持有者时重复点击也没有副作用；本机客户端同样可以执行。
+        // desktop_authorization 会清空设备表，所以必须在远程授权用完之后再创建。
+        let desktop = crate::tests::desktop_authorization(remote.clone()).await;
+        let again = service
+            .command(
+                "releaseExternalHolders",
+                &json!({"threadId":c.id}),
+                &desktop,
+            )
+            .await
+            .unwrap();
+        assert_eq!(again["released"], 0);
+        assert_eq!(service.test_holders.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn release_external_holders_reports_stubborn_processes_to_remote_and_local_devices() {
+        let (_directory, service, mut c) = fixture();
+        c.shared = true;
+        c.native_status = json!({"tempo":"idle"});
+        service
+            .saved
+            .lock()
+            .await
+            .conversations
+            .insert(c.id.clone(), c.clone());
+        let calls = discovery_fixture(&service, json!([]), json!({})).await;
+        let (_authorization_directory, remote) = crate::tests::service_dispatch_fixture().await;
+
+        // 进程不肯退出：不报告成功，说明还剩几个，网页保留占用提示；远程设备和本机客户端得到同样的结果，
+        // 读取器都收到了请求（不再按设备类型拒绝）。desktop_authorization 会清空设备表使远程授权失效，
+        // 所以先用远程授权，再创建本机授权。
+        *service.test_holders.lock().unwrap() =
+            vec![json!({"pid":4242,"mine":false,"stubborn":true})];
+        let failure = service
+            .command("releaseExternalHolders", &json!({"threadId":c.id}), &remote)
+            .await
+            .unwrap_err();
+        let failure = failure.downcast_ref::<ApiError>().unwrap();
+        assert_eq!(failure.code, 409);
+        assert_eq!(failure.message, "仍有 1 个进程没有退出，未能关闭其他占用");
+        assert_eq!(
+            service.detail(&c.id).await.unwrap()["thread"]["externalWriter"],
+            true
+        );
+        let desktop = crate::tests::desktop_authorization(remote.clone()).await;
+        let failure = service
+            .command(
+                "releaseExternalHolders",
+                &json!({"threadId":c.id}),
+                &desktop,
+            )
+            .await
+            .unwrap_err();
+        let failure = failure.downcast_ref::<ApiError>().unwrap();
+        assert_eq!(failure.code, 409);
+        assert_eq!(failure.message, "仍有 1 个进程没有退出，未能关闭其他占用");
+        assert_eq!(calls.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
     async fn release_for_terminal_stops_only_an_idle_cli_and_waits_for_the_registration_to_clear() {
         let (_directory, service, mut c) = fixture();
         c.shared = true;
@@ -5559,6 +5759,26 @@ mod tests {
                             .filter(|holder| !(own && holder["mine"] == true))
                             .collect();
                         Ok(json!({"holders":holders}))
+                    }
+                    Some("release_holders") => {
+                        // 假读取器的“关闭其他占用”：结束所有不属于本程序的持有者；标记 stubborn 的不肯退出，留在 remaining 里。
+                        let service = weak.upgrade().unwrap();
+                        let mut holders = service.test_holders.lock().unwrap();
+                        let (kept, released): (Vec<Value>, Vec<Value>) =
+                            holders.drain(..).partition(|holder| {
+                                holder["mine"] == true || holder["stubborn"] == true
+                            });
+                        let remaining: Vec<Value> = kept
+                            .iter()
+                            .filter(|holder| holder["mine"] != true)
+                            .cloned()
+                            .collect();
+                        *holders = kept;
+                        Ok(json!({
+                            "released": released.iter().map(|holder| holder["pid"].clone()).collect::<Vec<_>>(),
+                            "remaining": remaining,
+                            "stopFailed": []
+                        }))
                     }
                     Some("discover") => Ok(json!({"sessions":rows})),
                     Some("read_history") => snapshot
@@ -8064,6 +8284,47 @@ mod tests {
             (turns[1]["status"].clone(), turns[1]["durationMs"].clone()),
             (json!("completed"), json!(5))
         );
+    }
+
+    #[test]
+    fn shared_sdk_local_commands_are_events_and_setting_records_stay_hidden() {
+        // 用户反馈：SDK 写入的 /model、/compact 记录直接显示成带标签的用户气泡。读取器按 SDK 来源标注后，
+        // 投影里只剩 /context 这类有输出的命令事件行（via=sdk），/model、/compact 及其输出不制造任何条目。
+        let frame = json!({"native_status":{"tempo":"idle"},"clients":{},"messages":[
+            {"type":"user","uuid":"u1","nativeEditable":true,"message":{"content":"你好"}},
+            {"type":"assistant","uuid":"a1","message":{"id":"m1","content":[{"type":"text","text":"你好！"}]}},
+            {"type":"system","subtype":"turn_duration","uuid":"d1","durationMs":5},
+            {"type":"user","uuid":"model","nativeSettingCommand":{"name":"model","value":"haiku"},
+                "message":{"content":"<command-name>/model</command-name>"}},
+            {"type":"user","uuid":"model-out","nativeSettingOutput":{"name":"model","value":"haiku","commandId":"model"},
+                "message":{"content":"<local-command-stdout>Set model to `haiku (claude-haiku-5-5)`</local-command-stdout>"}},
+            {"type":"user","uuid":"compact","nativeControlCommand":{"name":"compact","value":""},
+                "message":{"content":"<command-name>/compact</command-name>"}},
+            {"type":"user","uuid":"compact-out","nativeControlOutput":{"name":"compact","value":""},
+                "message":{"content":"<local-command-stdout>Compacted </local-command-stdout>"}},
+            {"type":"user","uuid":"ctx","nativeLocalCommand":{"name":"/context","args":"","via":"sdk"},
+                "message":{"content":"<command-name>/context</command-name>"}},
+            {"type":"system","subtype":"local_command","uuid":"ctx-out",
+                "nativeLocalOutput":{"commandId":"ctx","stream":"stdout","text":"## Context Usage"}}
+        ]});
+        let turns = project_shared_history(&frame, "connection");
+        let items: Vec<&Value> = turns
+            .iter()
+            .flat_map(|turn| turn["items"].as_array().into_iter().flatten())
+            .collect();
+        let text = serde_json::to_string(&items).unwrap();
+        assert!(
+            !text.contains("command-name") && !text.contains("local-command-stdout"),
+            "命令标签不能出现在任何条目里：{text}"
+        );
+        let commands: Vec<_> = items
+            .iter()
+            .filter(|item| item["type"] == "claudeLocalCommand")
+            .collect();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0]["name"], "/context");
+        assert_eq!(commands[0]["via"], "sdk");
+        assert_eq!(commands[0]["output"], "## Context Usage");
     }
 
     #[test]

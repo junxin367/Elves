@@ -407,7 +407,7 @@ pub(super) async fn dispatch(
                 Occupancy::External => {
                     return Err(ApiError::new(
                         409,
-                        "该会话已在另一个应用中打开，请先在那边关闭会话",
+                        "该会话已在另一个应用中打开，请先在那边关闭会话，或在会话输入区点“关闭其他占用”",
                     ));
                 }
                 Occupancy::HarnessBusy => {

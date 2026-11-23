@@ -340,8 +340,6 @@ export function mountSettingsPage(screen, { onBack, fromLogin = false }) {
     <section id="appearance-general-page" class="appearance-body appearance-settings-page">
     <!-- 用户确认“个人 → 会话”改为“常规”；Claude 专属选项移入所选实例，不再混在设备显示偏好中。 -->
     <h3 class="appearance-panel-title">常规</h3>
-    <p class="appearance-hint">同一 Harness的各客户端共用以下设置。</p>
-    <p id="appearance-shared-settings-status" class="appearance-hint" role="status" aria-live="polite"></p>
     <section class="appearance-section"><h4>会话显示</h4><div class="appearance-card">
     <label class="appearance-field appearance-width-field"><span class="appearance-field-copy"><span>会话正文宽度上限</span><small>默认 950px，仅在右侧可用空间不足时自动收窄。</small></span><span class="appearance-number"><input id="appearance-conversation-width" type="number" min="${conversationWidthMin}" max="${conversationWidthMax}" step="10" value="${appearance.conversationWidth}" aria-label="会话正文宽度上限"><span>px</span></span></label>
     <div class="appearance-field appearance-thread-limit-field"><span>每个项目显示会话数</span><div id="appearance-project-thread-limit-slot"></div></div>
@@ -370,14 +368,12 @@ export function mountSettingsPage(screen, { onBack, fromLogin = false }) {
     <section id="appearance-instructions-page" class="appearance-body appearance-settings-page" hidden>
     <h3 class="appearance-panel-title">自定义指令</h3>
     <div class="appearance-card appearance-instructions-card">
-    <!-- 用户要求只选择实例并编辑用户级全局指令，不再提供类型、环境、作用范围和项目选择。 -->
-    <div class="instruction-selectors"><label>会话实例<div id="instruction-instance-slot"></div></label></div>
-    <p id="instruction-path" class="appearance-hint instruction-path"></p>
+    <!-- 用户要求只选择实例并编辑用户级全局指令；菜单仅由 Select 本体触发，路径与 Select 同行显示在右侧。 -->
+    <div class="instruction-selectors"><div class="instruction-selector-field"><span>会话实例</span><div id="instruction-instance-slot"></div></div><p id="instruction-path" class="appearance-hint instruction-path"></p></div>
     <textarea id="instruction-content" class="instruction-content" aria-label="自定义指令内容" spellcheck="false" disabled></textarea>
     <p id="instruction-status" class="appearance-hint" role="status"></p>
-    <p class="appearance-hint">保存至所选实例的用户级全局指令文件，重新加载后生效。</p>
-    <!-- 用户要求取消设置的通用完成栏；需要版本核对的指令仍在本页显式保存。 -->
-    <div class="appearance-action-buttons"><button id="instruction-reload" type="button">重新读取</button><button id="instruction-save" type="button" class="primary" disabled>保存指令</button></div>
+    <!-- 用户要求说明与操作按钮同一行，说明在左、按钮在右；需要版本核对的指令仍在本页显式保存。 -->
+    <div class="instruction-footer"><p class="appearance-hint instruction-save-hint">保存至所选实例的用户级全局指令文件，重新加载后生效。</p><div class="appearance-action-buttons"><button id="instruction-reload" type="button">重新读取</button><button id="instruction-save" type="button" class="primary" disabled>保存指令</button></div></div>
     </div></section>
     <section id="appearance-customization-page" class="appearance-body appearance-settings-page" hidden>
     <header class="appearance-panel-heading"><h3 class="appearance-panel-title">外观</h3><button type="button" id="appearance-reset">恢复默认外观</button></header>
@@ -912,8 +908,6 @@ export function mountSettingsPage(screen, { onBack, fromLogin = false }) {
     setSelectValue(find("#appearance-project-thread-limit"), String(appearance.projectThreadLimit));
     find("#appearance-project-thread-limit").disabled = !connected || !sharedSettingsWritable(session);
     find("#appearance-conversation-width").disabled = !connected || !sharedSettingsWritable(session);
-    find("#appearance-shared-settings-status").textContent = sharedSettingsState.saving ? "正在同步到所有客户端…"
-      : sharedSettingsState.error || (!sharedSettingsState.ready ? "正在读取服务端共享设置…" : session?.readOnly ? "共享设置为只读。" : "");
     const hasBackground = !!remoteBackground.dataUrl;
     backgroundAction.disabled = remoteBackgroundBusy;
     backgroundAction.replaceChildren(icon(hasBackground ? "trash" : "image"),

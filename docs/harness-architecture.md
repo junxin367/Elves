@@ -60,7 +60,9 @@ Claude 会话通过 Claude Agent SDK 使用的 stream-json 控制协议驱动所
 
 空闲会话不启动 CLI：只启动读取器显示历史，下一次发送再用 `--resume` 接续同一个原生会话；空闲 10 分钟后对端让 CLI 退出以释放内存。Harness 重启后，退出前仍在执行或等待的会话用 `host_attach` 接回宿主，没有宿主就保持空闲。完全访问（`bypassPermissions`）必须在 CLI 启动时声明，所以只在会话空闲时通过重启 CLI 切换。
 
-同一个原生会话同一时间只允许一个进程写入。发送、编辑历史、压缩、设置目标派发前和启动 CLI 前，发现读取器核对 `~/.claude/sessions/<pid>.json` 的进程登记：会话 ID 相同、进程存活且启动标识与 `/proc` 一致的进程算持有者，按命令行里的宿主、读取器脚本路径排除 Elves 自己的宿主、CLI 和回退用的短进程。别的应用持有时，线程读取返回 `externalWriter` 并置只读，派发被拒绝，网页在输入区原位提示“已在另一个应用中打开”。在 WSL 打开会话时，Open in 返回 `occupancy`，由用户确认后才关闭 Elves 自己的占用（见[Open in 的应用识别与前台显示](product-standards/core/product-behavior.md#open-in-的应用识别与前台显示)）。
+同一个原生会话同一时间只允许一个进程写入。发送、编辑历史、压缩、设置目标派发前和启动 CLI 前，发现读取器核对 `~/.claude/sessions/<pid>.json` 的进程登记：会话 ID 相同、进程存活且启动标识与 `/proc` 一致的进程算持有者，按命令行里的宿主、读取器脚本路径排除 Elves 自己的宿主、CLI 和回退用的短进程。别的应用持有时，线程读取返回 `externalWriter` 并置只读，派发被拒绝，网页在输入区原位提示“已在另一个应用中打开”。在 WSL 打开会话时，Open in 返回 `occupancy`，由用户确认后才关闭 Elves 自己的占用（见[Open in 的应用识别与前台显示](product-standards/core/product-behavior.md#open-in-的应用识别与前台显示)）。被占用的会话仍显示 Open in 入口，占用只让输入只读。
+
+用户在占用提示上确认“关闭其他占用”后，任一端（本机客户端、网页、PWA、手机、Android，不区分设备，只读访问除外）提交 `releaseExternalHolders`（只接受会话标识，非 Claude 会话返回 409），Claude 服务经发现读取器发 `release_holders`：读取器重新枚举持有者，登记为 `kind=bg` 且带任务 ID 的旧版后台任务先执行原生 `claude stop <任务 ID>`（真实 CLI 验证：只结束进程会被守护进程约 15 秒内重新拉起），其余持有者 SIGTERM，5 秒后仍不退出才 SIGKILL；每次发信号前核对 `/proc` 启动标识，僵尸进程不算持有，Elves 自己的宿主和读取器按脚本路径排除。线程读取在被占用时带 `externalHolders`（只含 PID、类型和入口，最多八项），网页以它判断是否提供该按钮并在确认框里说明占用者；会话能力 `releaseExternalHolders` 对所有设备声明为真。
 
 新版本不兼容旧版本的 daemon 后台任务，旧版代码（daemon 连接、终端画面识别、迁移与退出回收）已删除：旧任务仍持有会话时按“已在另一个应用中打开”处理，不迁移也不停止。存档里的 `native_job_id`、`remote-claude-cleanup.json` 等旧版字段和文件原样保留，回滚到旧版本时仍由旧版本使用；退出响应和管理状态里的 `cleanup` / `claudeCleanup` 保持原结构并恒为已完成。
 

@@ -103,6 +103,18 @@ function claudeUsageResetText(resetAt, now = Date.now()) {
   return minutes >= 1440 ? `${Math.floor(minutes / 1440)}天后`
     : minutes >= 60 ? `${Math.floor(minutes / 60)}小时后` : `${Math.max(1, minutes)}分钟后`;
 }
+function claudeUsageResetCountdownText(resetAt, now = Date.now()) {
+  if (resetAt == null) return "时间未知";
+  const totalMinutes = Math.max(1, Math.ceil(Math.max(0, resetAt - now) / 60000));
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  const parts = [];
+  if (days) parts.push(`${days}天`);
+  if (days || hours) parts.push(`${hours}小时`);
+  parts.push(`${minutes}分钟`);
+  return parts.join("");
+}
 function claudeUsageTimeZone(value) {
   const timeZone = typeof value?.timeZone === "string" ? value.timeZone.trim() : "";
   if (!timeZone || timeZone.length > 128 || !/^[A-Za-z0-9._+-]+(?:\/[A-Za-z0-9._+-]+)*$/u.test(timeZone)
@@ -114,18 +126,29 @@ function claudeUsageTimeZone(value) {
     return "";
   }
 }
+function claudeUsageEnvironmentTimeZone() {
+  try {
+    return claudeUsageTimeZone({ timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone });
+  } catch {
+    return "";
+  }
+}
 function claudeUsageResetTitle(value, resetAt) {
   if (resetAt == null) return "";
-  const timeZone = claudeUsageTimeZone(value);
-  if (!timeZone) return "";
+  const wslTimeZone = claudeUsageTimeZone(value);
+  if (!wslTimeZone) return "";
   try {
-    // 用户要求两个额度窗口的 hover 同时显示完整日期和具体时分；使用 24 小时制，不显示秒。
-    const formatted = new Intl.DateTimeFormat("zh-CN", {
+    const format = timeZone => new Intl.DateTimeFormat("zh-CN", {
       year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit",
       hour12: false, timeZone, timeZoneName: "short"
     }).format(new Date(resetAt));
-    // 用户要求网页账号弹层与原生 Claude 使用同一目标 WSL 时区；明确显示 IANA 名称，避免浏览器本地时区误读。
-    return `${formatted}（${timeZone}）`;
+    // 用户要求保留 WSL 原始时区，同时补充转换到打开 Harness 的当前环境时区；两者都使用 24 小时制且不显示秒。
+    const wslFormatted = format(wslTimeZone);
+    const environmentTimeZone = claudeUsageEnvironmentTimeZone();
+    const environment = environmentTimeZone
+      ? `\n${format(environmentTimeZone)}（${environmentTimeZone}）` : "";
+    // 用户要求 hover 在两个绝对时间上方补充精确到小时和分钟的重置倒计时。
+    return `${claudeUsageResetCountdownText(resetAt)}\n${wslFormatted}（${wslTimeZone}）${environment}`;
   } catch {
     return "";
   }
@@ -368,9 +391,9 @@ function renderClaudeUsage() {
     ...windows.map(window => [window.key, window.remaining])]);
   if (trigger.dataset.usage !== signature) {
     trigger.dataset.usage = signature;
-    const nodes = [element("span", "", "剩余")];
-    for (const [index, window] of windows.entries()) {
-      if (index) nodes.push(element("span", "claude-usage-dot", "·"));
+    // 用户要求底部额度按“5h xx%  7d xx%”紧凑展示，去掉“剩余”前缀和窗口之间的圆点分隔符。
+    const nodes = [];
+    for (const window of windows) {
       const row = element("span", "claude-usage-window");
       row.append(element("span", "", window.short), element("span", "claude-usage-percent", `${window.remaining}%`));
       nodes.push(row);
@@ -378,7 +401,7 @@ function renderClaudeUsage() {
     trigger.replaceChildren(...nodes);
     const account = claudeUsageAccount(claudeUsageState.value);
     // 用户要求默认脱敏同时覆盖底部按钮的读屏文本，不能只在弹层视觉上隐藏完整邮箱。
-    trigger.setAttribute("aria-label", `Claude ${account ? `登录账号 ${claudeUsageMaskAccount(account)}，` : "账号信息，"}${isDefault ? "真实额度读取中，当前按满额显示，" : ""}${windows.map(window => `${window.label}剩余 ${window.remaining}%`).join("，")}，查看重置时间`);
+    trigger.setAttribute("aria-label", `Claude ${account ? `登录账号 ${claudeUsageMaskAccount(account)}，` : "账号信息，"}${isDefault ? "真实额度读取中，当前按满额显示，" : ""}${windows.map(window => `${window.short} ${window.remaining}%`).join("，")}，查看重置时间`);
   }
   renderClaudeUsageTip(windows);
   fitComposerMetrics();

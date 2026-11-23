@@ -9,7 +9,7 @@ import { randomId } from "../../core/util.js";
 import { validateRemoteReceipt } from "../../channels.js";
 import { reloadThread } from "../../core/actions.js";
 import { api } from "../api.js";
-import { privateInputScope, threadReadOnly } from "./capabilities.js";
+import { privateInputScope, threadReadOnlyApartFromOwnership } from "./capabilities.js";
 import { relatedSessionView } from "./related-state.js";
 import { workspaceSidePanel } from "./side-panel.js";
 
@@ -32,8 +32,9 @@ function workspaceOpenInAvailable() {
 
 export function clientOpenInContext() {
   // 顶部入口另要求 Windows 独立客户端；关联阅读页及无会话页面不新增入口。
+  // 用户要求会话被其他应用占用并不影响 Open in：占用只让输入区只读，这里不能因此隐藏入口（WSL 项在点击时再按占用状态处理）。
   if (typeof window.__TAURI__?.core?.invoke !== "function" || pageLeaving || creating || !selectedId
-      || thread?.id !== selectedId || !workspaceOpenInAvailable() || threadReadOnly()
+      || thread?.id !== selectedId || !workspaceOpenInAvailable() || threadReadOnlyApartFromOwnership()
       || relatedSessionView || workspaceSidePanel) return null;
   const scope = privateInputScope(session);
   if (!scope) return null;
@@ -107,7 +108,7 @@ function preferredTarget(context, result) {
 async function wslOpenDecision(chosen) {
   switch (chosen.occupancy) {
     case "external":
-      notice("该会话已在另一个应用中打开，请先在那边关闭会话。", true);
+      notice("该会话已在另一个应用中打开，请先在那边关闭会话，或在输入区点“关闭其他占用”。", true);
       return null;
     case "harnessBusy":
       notice("会话正在执行任务，无法关闭占用。请先停止任务或等待完成后再打开 WSL。", true);
@@ -351,8 +352,9 @@ export function mountWorkspaceOpenIn({ anchor, beforeOpen = () => {} }) {
 }
 
 function sidebarOpenInContext(item) {
+  // 与顶部入口一致：被其他应用占用的会话，右键菜单里的“打开方式”同样保留。
   if (pageLeaving || !item?.id || !workspaceOpenInAvailable()
-      || threadReadOnly(item.id)) return null;
+      || threadReadOnlyApartFromOwnership(item.id)) return null;
   const scope = privateInputScope(session);
   if (!scope) return null;
   const wslInstance = typeof item.instanceId === "string" && item.instanceId.includes(":wsl:")

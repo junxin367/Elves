@@ -5,6 +5,7 @@ import {
   composerAttachmentsPayload, composerCanAddImages, composerCanAddLocalInputs, composerHasAttachments,
   composerLocalInputsPayload, composerLocalInputsSupported, setComposerAttachmentsDisabled
 } from "../../attachments.js";
+import { validateRemoteReceipt } from "../../channels.js";
 import { recordDiagnostic } from "../../diagnostics.js";
 import { recoveryStorageMessage } from "../../recovery-store.js";
 import { confirmAction } from "../../ui/dialog.js";
@@ -86,7 +87,8 @@ import { editingQueuedMessage, queueVersion, queuedEditActions } from "../queue/
 import { claudeCommandSupported } from "../session/action-capabilities.js";
 import {
   activeBackend, backendCapability, claudeNativeQueue, isActiveThread, isClaude, privateInputScope,
-  queueCapability, serviceSideThread, temporarySideThread, threadOwnedElsewhere, threadReadOnly, threadReadOnlyMessage
+  queueCapability, serviceSideThread, temporarySideThread, threadOwnedElsewhere, threadReadOnly, threadReadOnlyMessage,
+  threadReleasableElsewhere
 } from "../session/capabilities.js";
 import { recordRuntimeDiagnostic, stream } from "../session/connection-state.js";
 import {
@@ -114,10 +116,18 @@ function currentThreadOwnershipRetry(record = threadOwnershipRetry) {
 function renderThreadOwnership() {
   const retry = $("#thread-ownership-retry");
   if (!retry) return;
-  const checking = currentThreadOwnershipRetry();
-  retry.disabled = !connected || checking;
-  retry.textContent = checking ? "重试中…" : "重试";
-  retry.setAttribute("aria-busy", String(checking));
+  // 重试与“关闭其他占用”共用一个进行中记录：任一操作进行时两个按钮都禁用，只有发起的那个显示处理中状态。
+  const working = currentThreadOwnershipRetry();
+  const releasing = working && threadOwnershipRetry?.action === "release";
+  retry.disabled = !connected || working;
+  retry.textContent = working && !releasing ? "重试中…" : "重试";
+  retry.setAttribute("aria-busy", String(working && !releasing));
+  const release = $("#thread-ownership-release");
+  if (!release) return;
+  release.hidden = !threadReleasableElsewhere();
+  release.disabled = !connected || working;
+  release.textContent = releasing ? "关闭中…" : "关闭其他占用";
+  release.setAttribute("aria-busy", String(releasing));
 }
 export async function retryThreadOwnership() {
   if (!threadOwnedElsewhere() || !connected || currentThreadOwnershipRetry()) return;
@@ -134,6 +144,66 @@ export async function retryThreadOwnership() {
   } catch (error) {
     if (currentThreadOwnershipRetry(record)) notice(
       `检查会话占用失败：${error.message}`, true);
+  } finally {
+    if (threadOwnershipRetry === record) {
+      setThreadOwnershipRetry(null);
+      renderThreadOwnership();
+    }
+  }
+}
+
+// 用户要求提示里能看出是什么在占用：只按服务端核对出的进程类型和 PID 描述，不含命令行、目录或环境。
+function externalHolderLabel(holder) {
+  const entrypoint = typeof holder?.entrypoint === "string" ? holder.entrypoint : "";
+  const background = holder?.kind === "bg";
+  const what = background ? "后台任务"
+    : entrypoint.startsWith("sdk") ? "其他应用里的 Claude 会话"
+    : holder?.kind === "interactive" && entrypoint === "cli" ? "终端里打开的 claude"
+    : "其他 Claude 进程";
+  const detail = [background ? "旧版 Elves 或 claude --bg 启动" : "",
+    Number.isSafeInteger(holder?.pid) && holder.pid > 0 ? `PID ${holder.pid}` : ""].filter(Boolean).join("，");
+  return detail ? `${what}（${detail}）` : what;
+}
+export async function releaseThreadHolders() {
+  if (!threadReleasableElsewhere() || !connected || currentThreadOwnershipRetry()) return;
+  const record = { threadId: selectedId, selectionToken, scope: privateInputScope(session),
+    connectionVersion: nativeConnectionVersion, action: "release" };
+  const holders = thread.externalHolders.map(externalHolderLabel);
+  const scope = holders.length ? ` ${holders.length} 个进程：${holders.join("、")}` : "其他进程";
+  // 用户要求关闭其他占用前必须确认：它会结束别的应用的进程，弹窗写明影响范围；Elves 自己的会话进程不受影响。
+  if (!await confirmAction("关闭其他占用",
+      `将结束正在使用这个会话的${scope}。它们正在执行的任务会被中断，未保存的内容可能丢失；`
+      + "Elves 自己的会话进程不受影响。结束后可在这里继续使用该会话。",
+      "关闭其他占用", true)) return;
+  // 弹窗期间会话、授权或连接可能已变化；确认后重新核对，不能把旧确认用于另一个会话。
+  if (!currentThreadOwnershipRetry(record) || !threadReleasableElsewhere() || currentThreadOwnershipRetry()) return;
+  setThreadOwnershipRetry(record);
+  renderThreadOwnership();
+  try {
+    const requestId = randomId();
+    const receipt = validateRemoteReceipt(
+      await api("/api/action/releaseExternalHolders", { threadId: record.threadId }, requestId), requestId);
+    if (receipt.state === "failed")
+      throw Object.assign(new Error(receipt.result?.message || "无法关闭其他占用"), { code: receipt.result?.code || 422 });
+    if (receipt.state !== "completed") throw new Error("未能确认关闭结果，请点“重试”核对当前占用");
+    try { await reloadThread(); }
+    catch (error) {
+      // 进程已经关闭，只是重新读取失败：不能报成“关闭失败”，让用户重试核对即可。
+      if (currentThreadOwnershipRetry(record)) notice(`已关闭其他占用，但重新读取会话失败：${error.message}，请点“重试”核对。`, true);
+      return;
+    }
+    if (currentThreadOwnershipRetry(record)) {
+      if (threadOwnedElsewhere()) notice("已结束其他进程，但这个会话仍被占用，请点“重试”再核对。", true);
+      else {
+        notice("已关闭其他占用，可以继续使用这个会话。");
+        if (!document.hidden && !threadReadOnly() && !$("#composer")?.hidden && !$("#prompt")?.disabled)
+          $("#prompt")?.focus({ preventScroll: true });
+      }
+    }
+  } catch (error) {
+    if (currentThreadOwnershipRetry(record)) notice(`关闭其他占用失败：${error.message}`, true);
+    // 失败时可能已有部分进程退出，重新读取一次让提示反映实际占用；读取失败不覆盖上面的原因。
+    if (currentThreadOwnershipRetry(record)) void reloadThread().catch(() => {});
   } finally {
     if (threadOwnershipRetry === record) {
       setThreadOwnershipRetry(null);

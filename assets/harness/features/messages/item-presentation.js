@@ -34,7 +34,9 @@ function claudeEventText(item) {
   if (item.type === "claudeLocalCommand") {
     const command = [item.name, item.args].filter(value => typeof value === "string" && value.trim()).join(" ");
     const output = typeof item.output === "string" ? item.output.trim() : "";
-    return { label: `终端执行了 ${clip(command, 80) || "本地命令"}`,
+    // 用户要求命令记录不显示成带标签的用户气泡：终端里执行的写“终端执行了”，网页等 SDK 客户端发起的（via=sdk）
+    // 不是在终端执行的，只写“执行了”。/model、/compact 另有专门展示，不会进入这里。
+    return { label: `${item.via === "sdk" ? "执行了" : "终端执行了"} ${clip(command, 80) || "本地命令"}`,
       description: output || (typeof item.output === "string" ? "命令没有输出。" : "尚未收到命令输出。") };
   }
   const text = typeof item.text === "string" ? item.text.trim() : "";

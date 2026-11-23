@@ -29,7 +29,7 @@ import { mountScheduledTasksPage } from "./scheduled-tasks.js";
 import { setApprovalSignature } from "./approval-state.js";
 import { fitClaudeUsageTip, mountClaudeUsage, resetClaudeUsage } from "./composer/claude-usage.js";
 import { closeSkillMenu, fitApprovalArea, fitComposerMenu, renderModelMenu } from "./composer/composer-menus.js";
-import { mountComposerScroll, retryThreadOwnership, sendMessage, stopGeneration } from "./composer/composer.js";
+import { mountComposerScroll, releaseThreadHolders, retryThreadOwnership, sendMessage, stopGeneration } from "./composer/composer.js";
 import { creationInstanceId, creationProject } from "./composer/creation-state.js";
 import { clearPrivateInputs } from "./composer/draft-restore.js";
 import { rememberDraft } from "./composer/drafts.js";
@@ -118,7 +118,7 @@ export function shell() {
     <main class="conversation">
       <header class="conversation-header"><button id="open-sidebar" class="icon-button" type="button" aria-label="打开侧边栏" aria-controls="session-sidebar"></button><div class="thread-heading"><div class="thread-title-line"><span id="thread-backend-icon" class="thread-backend-icon" aria-hidden="true" hidden></span><strong id="thread-title">会话</strong><span id="thread-state" class="thread-state-header" role="img" hidden></span></div><span id="thread-path" class="muted"></span></div><button id="connection-state" class="connection-state pending" type="button" aria-live="polite" title="${connectionRttDescription}" aria-label="连接中…。${connectionRttDescription}">连接中…</button><button id="open-session-tools" class="icon-button session-tools-trigger" type="button" title="会话菜单" aria-label="会话菜单" aria-haspopup="menu" aria-expanded="false"></button><span id="related-session-model" class="related-session-model muted" hidden></span><button id="related-session-back" class="text-button" type="button" aria-label="返回主会话" hidden>返回</button></header>
       <div class="messages-shell"><div id="messages" class="messages" role="log" aria-label="会话消息"></div><button id="scroll-to-bottom" class="scroll-to-bottom" type="button" aria-label="跳转到最新消息" hidden></button></div>
-      <div class="composer-area"><div class="composer-context"><div id="queued-area" hidden></div><div id="goal-area" hidden></div></div><div id="pending-area"></div><div id="project-select-slot" hidden></div><div class="composer-anchor"><div id="approval-area" class="approval-area" aria-live="polite"></div><div id="side-thread-expired" class="side-thread-expired-banner" role="status" hidden><strong>侧边会话已过期</strong><span>该会话已结束，当前仅可查看已保留的消息。</span></div><div id="thread-ownership" class="thread-ownership-banner" role="status" aria-live="polite" hidden><span id="thread-ownership-icon" aria-hidden="true"></span><div class="thread-ownership-copy"><strong>已在另一个应用中打开</strong><span>请先在那边关闭会话，才能在这里继续。</span></div><div class="thread-ownership-actions"><button id="thread-ownership-retry" class="text-button" type="button" aria-busy="false">重试</button></div></div><form id="composer" class="composer">
+      <div class="composer-area"><div class="composer-context"><div id="queued-area" hidden></div><div id="goal-area" hidden></div></div><div id="pending-area"></div><div id="project-select-slot" hidden></div><div class="composer-anchor"><div id="approval-area" class="approval-area" aria-live="polite"></div><div id="side-thread-expired" class="side-thread-expired-banner" role="status" hidden><strong>侧边会话已过期</strong><span>该会话已结束，当前仅可查看已保留的消息。</span></div><div id="thread-ownership" class="thread-ownership-banner" role="status" aria-live="polite" hidden><span id="thread-ownership-icon" aria-hidden="true"></span><div class="thread-ownership-copy"><strong>已在另一个应用中打开</strong><span>请先在那边关闭会话，才能在这里继续。</span></div><div class="thread-ownership-actions"><button id="thread-ownership-retry" class="text-button" type="button" aria-busy="false">重试</button><button id="thread-ownership-release" class="text-button danger-text" type="button" aria-busy="false" hidden>关闭其他占用</button></div></div><form id="composer" class="composer">
         <div class="composer-input"><div class="composer-input-content">
         <div id="prompt" class="prompt-editor" contenteditable="true" role="textbox" aria-multiline="true" data-placeholder="给 Codex 发送消息，输入 / 选择命令或 Skill…" aria-label="消息输入" aria-autocomplete="list" aria-controls="skill-menu" aria-expanded="false" spellcheck="true"></div>
         </div></div>
@@ -128,10 +128,12 @@ export function shell() {
       </form><span id="session-metrics" class="composer-metrics" tabindex="0" aria-label="会话 Token 统计" hidden></span><button id="claude-usage" class="claude-usage" type="button" aria-label="查看 Claude 账号信息" aria-controls="claude-usage-tooltip" aria-expanded="false" hidden></button></div></div>
     </main>
   </div>`;
-  // 用户要求参考 Codex 的占用提示，只提供重试，不提供“创建聊天分叉”。
+  // 用户要求参考 Codex 的占用提示，只提供重试，不提供“创建聊天分叉”；Claude 会话在各端另有“关闭其他占用”。
   // 标题使用“已在另一个应用中打开”，明确会话当前已被占用，而非提示执行打开操作。
   $("#thread-ownership-icon").append(icon("lock"));
   $("#thread-ownership-retry").onclick = () => void retryThreadOwnership();
+  // 用户要求在重试按钮右侧提供“关闭其他占用”，让用户不必知道是哪个应用占用也能继续；Claude 会话在本机客户端、网页、手机和 Android 都显示（见 threadReleasableElsewhere）。
+  $("#thread-ownership-release").onclick = () => void releaseThreadHolders();
   configurePromptEditor($("#prompt"));
   mountContextUsage();
   mountClaudeUsage();

@@ -269,9 +269,13 @@ export function renderSidebar() {
   syncSideThreadUnread();
   const root = $("#sidebar-content");
   if (!root || !sidebar) return;
-  // 用户要求当前主会话收到审批或问答立即提醒；正文里的新请求优先于尚未刷新的目录快照。
+  // 用户要求当前主会话收到审批或问答立即提醒；正文里的新请求优先于尚未刷新的目录快照，所以选中会话只借用 thread.requests。
+  // 执行与未读必须以侧栏条目为准：它随 turn/started、turn/completed、readState 事件和已读回执实时更新，
+  // 而 thread.priority 只是上一次读取会话详情时的快照，不会跟着更新。用户要求进入会话后蓝点立即消失、
+  // 当前会话执行完成不留蓝点；以前这里用 thread.priority 覆盖，已读回执成功后选中会话的蓝点（或执行圈）
+  // 会一直停在旧快照上，直到切换到别的会话才消失。Codex 会话详情带 priority，Claude 没有，所以只有 Codex 复现。
   const attentionFor = item => sidebarAttentionState(item.id === thread?.id && Array.isArray(thread.requests)
-    ? { ...item, requests: thread.requests, priority: thread.priority || item.priority } : item);
+    ? { ...item, requests: thread.requests } : item);
   restoreSidebarPreferences();
   filterDeletedSidebar(sidebar);
   filterSideThreadSidebar(sidebar);

@@ -1,7 +1,8 @@
 """Claude 会话的 WSL 读取端：单个会话的历史读取器与只读原生发现；不运行模型、不连接 CLI、不修改 CLI、设置或权限。
 
 用户要求改用 Claude Agent SDK 对接后，执行、审批、问答和消息回执由 Rust 对端经 stream-json 控制协议完成，
-这里不再有 daemon 后台任务和终端画面识别。"""
+这里不再有 daemon 后台任务和终端画面识别。唯一会结束进程的入口是用户在会话里确认“关闭其他占用”后的
+release_holders，它只结束登记为该会话且不属于本程序的 CLI 进程。"""
 import argparse
 import base64
 import contextlib
@@ -14,6 +15,7 @@ import os
 from pathlib import Path
 import queue
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -150,10 +152,22 @@ def native_tool_interruption(row, previous):
 
 
 def native_setting_source(row):
-    origin = row.get("origin")
-    return (row.get("type") == "user" and row.get("entrypoint") == "cli"
-            and (origin is None or isinstance(origin, dict) and origin.get("kind") != "human")
-            and row.get("promptSource") != "typed" and row.get("turnOrigin") != "human")
+    """原生 CLI 自己写入的控制记录（本地斜杠命令及其输出）的来源核对；用户输入或引用的同样标签不属于此类。
+
+    终端（entrypoint=cli）：没有真人输入属性（origin=human、promptSource=typed、turnOrigin=human）。
+    SDK（stream-json，entrypoint=sdk-cli）：网页等 SDK 客户端提交的提示带 promptSource、permissionMode（2.1.330 起
+    还有 turnOrigin；2.1.329 没有 turnOrigin），自定义命令和技能的命令行只带 turnOrigin；CLI 自己写的本地命令记录
+    （caveat、命令行、输出行）一项都没有。所以三项中任一存在即视为用户输入（2.1.329、2.1.330 在本机真实会话中核对）。
+    用户要求 Claude 实例不把 /model、/compact 这类命令记录显示成带标签的用户气泡；SDK 记录以前只认终端，
+    所以直接露出了 <command-name> 等标签。用户手写或引用的同样标签带有上面的属性，仍按用户正文保留。"""
+    if row.get("type") != "user":
+        return False
+    origin, entrypoint = row.get("origin"), row.get("entrypoint")
+    if entrypoint == "cli":
+        return ((origin is None or isinstance(origin, dict) and origin.get("kind") != "human")
+                and row.get("promptSource") != "typed" and row.get("turnOrigin") != "human")
+    return (isinstance(entrypoint, str) and entrypoint.startswith("sdk") and origin is None
+            and not any(key in row for key in ("promptSource", "turnOrigin", "permissionMode")))
 
 
 def native_setting_command(row):
@@ -315,17 +329,24 @@ def native_local_command(row, parent=None):
     if row.get("type") == "system":
         content = row.get("content") if row.get("subtype") == "local_command" else None
     elif native_setting_source(row) and isinstance(row.get("message"), dict):
-        caveat = parent.get("message", {}).get("content") if isinstance(parent, dict) else None
-        if not (isinstance(caveat, str) and caveat.lstrip().startswith("<local-command-caveat>")
-                and parent.get("isMeta") is True and parent.get("promptId") == row.get("promptId") is not None):
-            return None
+        # SDK 记录的来源已由 native_setting_source 按“没有任何提示属性”核对（用户提示带 promptSource、turnOrigin 或 permissionMode），
+        # 不再依赖 caveat 父节点；终端记录的属性不足以区分用户输入，仍要求同一 promptId 的 caveat 父节点。
+        if row.get("entrypoint") == "cli":
+            caveat = parent.get("message", {}).get("content") if isinstance(parent, dict) else None
+            if not (isinstance(caveat, str) and caveat.lstrip().startswith("<local-command-caveat>")
+                    and parent.get("isMeta") is True and parent.get("promptId") == row.get("promptId") is not None):
+                return None
         content = row["message"].get("content")
     else:
         return None
     match = _LOCAL_COMMAND.fullmatch(content) if isinstance(content, str) else None
     if not match or match[1] in ("model", "effort", "goal", "compact"):
         return None
-    return {"name": "/" + match[1], "args": (match[2] or "").strip()[:400]}
+    command = {"name": "/" + match[1], "args": (match[2] or "").strip()[:400]}
+    if str(row.get("entrypoint") or "").startswith("sdk"):
+        # 网页等 SDK 客户端发起的命令不是在终端执行的；网页据此显示“执行了”而不是“终端执行了”。
+        command["via"] = "sdk"
+    return command
 
 
 def native_local_output(row, parent=None):
@@ -474,8 +495,21 @@ def native_tool_result(row, root=None):
     return {"toolUseId": calls[0], **value} if value else None
 
 
+def native_sdk_local_record(row):
+    """SDK 传输下 CLI 写入的本地命令行或输出行（只凭行自身核对，与按父链核对的 native_local_command 互补）。
+
+    会话列表标题、最近时间等读取原始行的位置没有父链可查，也要避免把 /context、/model 这类命令行当成用户的第一条消息。"""
+    if not str(row.get("entrypoint") or "").startswith("sdk") or not native_setting_source(row):
+        return False
+    message = row.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    return isinstance(content, str) and bool(_LOCAL_COMMAND.fullmatch(content) or _LOCAL_OUTPUT.fullmatch(content))
+
+
 def real_user(row):
     if any(row.get(key) is True for key in ("isMeta", "isSidechain", "isCompactSummary", "isVisibleInTranscriptOnly")):
+        return False
+    if native_sdk_local_record(row):
         return False
     command = row.get("nativeControlCommand") or native_control_command(row)
     if command:
@@ -884,6 +918,14 @@ def native_process_start(pid):
         return None
 
 
+def native_process_zombie(pid):
+    """已退出但尚未被父进程回收的进程（Z）或已死亡的进程（X）：它不再持有会话，只剩一个等待回收的进程表项。"""
+    try:
+        return (Path("/proc") / str(pid) / "stat").read_text().rsplit(") ", 1)[1].split()[0] in ("Z", "X")
+    except (OSError, IndexError):
+        return False
+
+
 def native_owned_by(pid, markers):
     """进程自身或最多六层父进程的命令行参数恰为某个标记（本程序的宿主/读取器脚本路径）时视为本程序所有。"""
     markers = {marker for marker in markers if isinstance(marker, str) and marker}
@@ -905,7 +947,8 @@ def native_owned_by(pid, markers):
 def native_session_holders(root, native_id, own=()):
     """仍在运行并登记为该原生会话的 CLI 进程：用户终端里的 claude、旧版 Elves 的后台任务、其他应用的 SDK 宿主等。
 
-    用户要求别的应用持有会话时网页只读，所以这里只枚举，不抢占、不停止对方。
+    用户要求别的应用持有会话时网页只读，所以这里只枚举，不抢占、不停止对方；用户在会话里明确点“关闭其他占用”时，
+    才由 release_native_holders 结束这里列出的进程（返回的 started 是核对身份用的进程启动标识，job 是旧版后台任务 ID）。
     `own` 是本程序宿主和读取器脚本的 WSL 路径；属于它们（含子进程）的 CLI 是本程序自己持有的，不算在内。
     登记文件在进程退出后会被清理，残留文件靠 PID 存活和启动标识核对，防止复用 PID 造成永久误报。
     """
@@ -930,17 +973,88 @@ def native_session_holders(root, native_id, own=()):
                 pass
         elif record.get("procStart") is not None and str(record["procStart"]) != started:
             continue
+        elif native_process_zombie(pid):
+            continue
         if native_owned_by(pid, own):
             continue
+        job = str(record.get("jobId") or record.get("parkedJobId") or "")
         holders.append({"pid": pid, "entrypoint": str(record.get("entrypoint") or "")[:40],
-                        "kind": str(record.get("kind") or "")[:40]})
+                        "kind": str(record.get("kind") or "")[:40], "started": started,
+                        # 只接受原生后台任务的 8 位十六进制短 ID，登记里的其他内容不会变成 claude stop 的参数。
+                        "job": job if re.fullmatch(r"[0-9a-f]{8}", job) else ""})
     return sorted(holders, key=lambda holder: holder["pid"])
 
 
+# 用户要求会话提示“已在另一个应用中打开”旁提供“关闭其他占用”：SIGTERM 让 CLI 自己清理登记并恢复终端，
+# 超时仍不退出才 SIGKILL；claude stop 通常一秒内返回，上限 20 秒，保证两个任务加上等待仍在对端 60 秒回执期限内。
+RELEASE_TERM_WAIT = 5.0
+RELEASE_KILL_WAIT = 3.0
+RELEASE_STOP_TIMEOUT = 20
+
+
+def native_holder_alive(holder):
+    """持有者仍是枚举时的那个进程：启动标识一致才算，PID 被别的进程复用或进程已退出都不算。"""
+    started = native_process_start(holder["pid"])
+    return started is not None and started == holder["started"] and not native_process_zombie(holder["pid"])
+
+
+def release_native_holders(root, native_id, own=(), cli=None):
+    """结束仍持有该原生会话、且不属于本程序的 CLI 进程：用户终端里的 claude、旧版 Elves 的后台任务、其他应用的 SDK 宿主等。
+
+    只在用户于会话里确认“关闭其他占用”后调用；本程序自己的宿主和读取器（`own`）不会被结束。
+    旧版 Elves 的后台任务由 claude 守护进程监管，只结束进程会在十几秒内被重新拉起（真实 CLI 2.1.329 验证），
+    所以先用原生 `claude stop <任务ID>` 让守护进程把任务标为已停止；其余持有者发信号。
+    每次发信号前都核对进程启动标识，登记过期或 PID 已被复用时不会误伤别的进程。
+    返回 {"released": 已结束的 PID, "remaining": 结束后仍持有会话的进程（含新出现的）, "stopFailed": 停止失败的后台任务 ID}。
+    """
+    holders = [holder for holder in native_session_holders(root, native_id, own) if holder["started"] is not None]
+
+    def waiting(targets, seconds):
+        end = time.monotonic() + seconds
+        targets = [holder for holder in targets if native_holder_alive(holder)]
+        while targets and time.monotonic() < end:
+            time.sleep(0.1)
+            targets = [holder for holder in targets if native_holder_alive(holder)]
+        return targets
+
+    def signaling(targets, number):
+        for holder in targets:
+            if not native_holder_alive(holder):
+                continue
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(holder["pid"], number)
+
+    stop_failed = []
+    jobs = sorted({holder["job"] for holder in holders if holder["job"]})
+    for job in jobs if cli else []:
+        try:
+            stopped = subprocess.run([cli, "stop", job], stdin=subprocess.DEVNULL, capture_output=True,
+                                     timeout=RELEASE_STOP_TIMEOUT).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            stopped = False
+        if not stopped:
+            stop_failed.append(job)
+    if jobs and cli:
+        # 只等后台任务的持有者退出；终端里的 claude 等其他持有者不必陪着等。
+        waiting([holder for holder in holders if holder["job"]], RELEASE_TERM_WAIT)
+    alive = [holder for holder in holders if native_holder_alive(holder)]
+    signaling(alive, signal.SIGTERM)
+    alive = waiting(alive, RELEASE_TERM_WAIT)
+    signaling(alive, signal.SIGKILL)
+    waiting(alive, RELEASE_KILL_WAIT)
+    remaining = native_session_holders(root, native_id, own)
+    present = {holder["pid"] for holder in remaining}
+    return {"released": [holder["pid"] for holder in holders if holder["pid"] not in present],
+            "remaining": remaining, "stopFailed": stop_failed}
+
+
 class NativeDiscovery:
-    """只读原生目录；不调用 CLI、守护进程或模型，也不使用网页登记文件作为发现来源。"""
-    def __init__(self, root=None):
+    """只读原生目录；发现与读取不调用 CLI、守护进程或模型，也不使用网页登记文件作为发现来源。
+    只有用户确认“关闭其他占用”的 release_holders 会结束别的进程（旧版后台任务经原生 claude stop）。"""
+    def __init__(self, root=None, cli=None):
         self.root = Path(root or os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")).resolve()
+        # 仅“关闭其他占用”停止旧版后台任务时用到 claude stop；其余发现与读取仍不调用 CLI。
+        self.cli = cli
         self.logs, self.readers, self.rows = {}, {}, {}
         self.scanned_at = None
         self.bytes_read = 0
@@ -1060,6 +1174,13 @@ class NativeDiscovery:
             if not isinstance(own, list) or len(own) > 8:
                 raise RuntimeError("本程序脚本标记无效")
             return {"holders": native_session_holders(self.root, native, own)}
+        if subtype == "release_holders":
+            # 用户在会话里确认“关闭其他占用”后才会收到；持有者由这里重新枚举，不信任调用方给出的 PID。
+            native = str(uuid.UUID(request["native_id"]))
+            own = request.get("own", [])
+            if not isinstance(own, list) or len(own) > 8:
+                raise RuntimeError("本程序脚本标记无效")
+            return release_native_holders(self.root, native, own, self.cli)
         if subtype not in ("read_history", "read_subagents", "read_subagent"):
             raise RuntimeError("只读发现连接不接受执行操作")
         native = str(uuid.UUID(request["native_id"]))
@@ -2313,8 +2434,9 @@ def main():
     arguments.add_argument("--discover", action="store_true")
     options = arguments.parse_args()
     # 用户要求改用 Claude Agent SDK 对接：这里只有两种只读角色——发现（列出原生会话、读历史、核对持有者）
-    # 和单个会话的历史读取器；不连接原生后台、不读取终端画面、不控制 CLI。执行、审批、问答由 Rust 对端的 stream-json 连接负责。
-    native = NativeDiscovery() if options.discover else SdkReader(options.cli, options.native_id)
+    # 和单个会话的历史读取器；不连接原生后台、不读取终端画面、不控制 CLI（只有用户确认“关闭其他占用”才会结束别的进程）。
+    # 执行、审批、问答由 Rust 对端的 stream-json 连接负责。
+    native = NativeDiscovery(cli=options.cli) if options.discover else SdkReader(options.cli, options.native_id)
     incoming = queue.Queue()
     native.incoming = incoming
 

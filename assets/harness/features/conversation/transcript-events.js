@@ -6,7 +6,7 @@ import { messageImageMediaReads } from "../messages/media-state.js";
 
 export const transcriptEvents = new Map();
 // Claude 事件行（Rust claude_tools.rs 生成）：claudeTaskNotification 为后台命令、监控事件、后台子代理通知开启的
-// 自动续跑轮次起点；claudeLocalCommand 为终端执行的本地斜杠命令；claudeNotice 为离开期间回顾、原生提示与 Stop Hook。
+// 自动续跑轮次起点；claudeLocalCommand 为终端或经 SDK 执行的本地斜杠命令（via=sdk）；claudeNotice 为离开期间回顾、原生提示与 Stop Hook。
 export const transcriptEventTypes = new Set(["modelChanged", "modelRerouted", "contextCompaction",
   "claudeTaskNotification", "claudeLocalCommand", "claudeNotice"]);
 export function replaceTranscriptEvents(entries, readVersion = null) {
