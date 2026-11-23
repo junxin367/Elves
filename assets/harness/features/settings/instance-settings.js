@@ -75,11 +75,14 @@ function switchControl(label, value) {
 }
 function section(parent, label, backend = null) {
   const node = element("section", "appearance-section");
-  const heading = element("h4", "instance-settings-section-heading");
-  if (backend) heading.append(brand(backend));
-  heading.append(document.createTextNode(label));
+  if (label) {
+    const heading = element("h4", "instance-settings-section-heading");
+    if (backend) heading.append(brand(backend));
+    heading.append(document.createTextNode(label));
+    node.append(heading);
+  }
   const card = element("div", "appearance-card");
-  node.append(heading, card); parent.append(node);
+  node.append(card); parent.append(node);
   return card;
 }
 // 用户要求默认状态统一口径；实例原生配置的空值称“使用原生默认”，模型能力的默认值单独注明来源。
@@ -329,7 +332,8 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
       }, "icon-button instance-settings-search-clear");
       clear.append(icon("close")); clear.hidden = search.value.length === 0;
       searchControl.append(search, clear); content.append(searchControl);
-      const card = section(content, `所选实例的 ${sections[name]}`);
+      // 用户要求 MCP 列表去掉“所选实例的 MCP”分组标题，保留列表卡片和搜索入口。
+      const card = section(content, name === "mcp" ? "" : `所选实例的 ${sections[name]}`);
       const list = element("div", "instance-settings-inventory-list");
       card.append(list);
       const renderRows = () => {
@@ -355,7 +359,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
       content.append(element("p", "appearance-hint", inventory.error || `所选实例尚未返回${sections[name]}。`));
       return;
     }
-    const card = section(content, `所选实例的 ${sections[name]}`);
+    const card = section(content, name === "mcp" ? "" : `所选实例的 ${sections[name]}`);
     appendInventoryRows(card, rows);
   }
   function appendInventoryRows(card, rows) {
@@ -363,11 +367,9 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
       const row = element("div", "appearance-field");
       const codexMcp = name === "mcp" && record.backend === "codex";
       const inherited = value.enabled == null && (value.canToggle === true || Object.hasOwn(value, "enabled"));
-      // 用户要求 Codex MCP 读取后显示开/关；原生缺省值只用于展示，不能在读取时写成显式配置或当作连接状态。
+      // 用户要求 Codex MCP 保留原生默认值语义；默认值只决定开关初始位置，不额外展示“已开启/已关闭”文字。
       const enabled = codexMcp && inherited ? value.defaultEnabled : value.enabled;
-      const state = typeof enabled === "boolean" ? enabled ? "已开启" : "已关闭" : "使用原生默认";
-      // 用户要求参考 Codex App：MCP 列表只保留传输类型等必要信息，状态统一放在右侧文字和开关中，
-      // 不在每行重复显示“使用原生默认（已开启）”或“切换后保存所选状态”。
+      // 用户要求 MCP 列表右侧只保留开关，不重复显示“已开启/已关闭”状态文案。
       const description = value.description || value.transport || "";
       row.append(fieldCopy(value.name || value.id || value.path, description));
       if (value.canToggle === true) {
@@ -378,13 +380,10 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
             void save({ [name === "skills" ? "skill" : "server"]: { id: value.id, enabled: control.checked } });
         };
         controls.add(control); inventoryControls.add(control);
-        if (codexMcp) {
-          const group = element("span", "instance-mcp-toggle-state");
-          group.append(element("span", "muted", state), control); row.append(group);
-        } else row.append(control);
+        row.append(control);
       } else if (value.readOnlyReason) {
         row.append(element("span", "muted", value.readOnlyReason));
-      } else if (typeof value.enabled === "boolean") {
+      } else if (typeof value.enabled === "boolean" && name !== "mcp") {
         row.append(element("span", "muted", value.enabled ? "已开启" : "已关闭"));
       } else if (inherited) {
         row.append(element("span", "muted", "使用原生默认"));

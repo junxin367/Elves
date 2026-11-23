@@ -130,11 +130,9 @@ export function mountInstancePermissions({
           { value: "read-only", label: "只读" }, { value: "workspace-write", label: "工作区写入" },
           { value: "danger-full-access", label: "完全访问权限" }],
         record.permissionProfile ? "__profile__" : record.draft.sandboxMode, !!record.permissionProfile);
-        const hint = element("p", "appearance-hint",
-          record.permissionProfile
-            ? "当前访问范围包含本界面不支持的配置，请在原生 config.toml 中调整。"
-            : "沙盒控制可访问范围，批准策略控制是否请求批准；“完全访问权限”与“从不请求批准”分别设置。");
-        fields.append(hint);
+        if (record.permissionProfile)
+          fields.append(element("p", "appearance-hint",
+            "当前访问范围包含本界面不支持的配置，请在原生 config.toml 中调整。"));
       } else {
         const modes = permissionOptions("claude", record.supportedModes).filter(option => option.value !== "configured");
         addField("默认权限模式", "permissionMode", [defaults, ...modes], record.draft.permissionMode,

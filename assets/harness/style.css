@@ -1895,7 +1895,8 @@ body{font-weight:var(--ui-font-weight,400)}
 .session-instance-row .appearance-environment-copy{flex:1}
 .session-instance-row .appearance-notification-switch{flex-shrink:0}
 .session-instance-path{overflow-wrap:anywhere;word-break:break-word}
-.instruction-selectors{display:flex;align-items:flex-end;gap:12px;min-width:0}
+/* 用户要求自定义指令的实例 Select 与下方编辑区保留清晰间隔，不改变编辑区高度和卡片剩余空间分配。 */
+.instruction-selectors{display:flex;align-items:flex-end;gap:12px;min-width:0;margin-bottom:12px}
 .instruction-selector-field{display:flex;flex:0 1 200px;flex-direction:column;gap:6px;min-width:0;font-size:.85714rem}
 .instruction-selector-field .select-trigger{width:100%;max-width:100%;padding:8px}
 .instruction-selectors>.instruction-path{flex:1 1 auto;min-width:0;margin:0 0 4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -2029,8 +2030,6 @@ body{font-weight:var(--ui-font-weight,400)}
 .instance-settings-content .appearance-section{margin-bottom:14px}
 .instance-settings-content .appearance-section:not(:first-child){margin-top:26px}
 .instance-settings-content .appearance-notification-switch:indeterminate::after{transform:translateX(6px);opacity:.5}
-/* 用户要求 Codex MCP 明确显示开关状态；文字与开关同组，手机端也保持同排，长服务名沿用左侧说明换行。 */
-.instance-mcp-toggle-state{display:inline-flex;align-items:center;flex-shrink:0;gap:.5em;white-space:nowrap}
 /* 用户要求 Skills 与 MCP 搜索框统一为 240px；窄屏按剩余空间收缩，输入有内容时显示清除按钮。 */
 .appearance-screen .instance-settings-search-control{position:relative;display:block;width:240px;max-width:100%;margin:0 0 12px auto}
 .appearance-screen .instance-settings-search-control>.instance-settings-search{display:block;width:100%;padding-right:40px}
