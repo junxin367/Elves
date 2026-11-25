@@ -35,6 +35,9 @@ ACTIVITY_WINDOW = 5.0
 # 只剩未回答的审批/问答且无人连接时，最长保留多久；用户长时间不回来就收尾，不无限占用进程。
 BLOCKED_LIMIT = 12 * 3600
 STOP_TIMEOUT = 30.0
+# SIGTERM 之后再给 CLI 这么久自己退出，仍不退才强制结束；Harness 等宿主收尾最多 40 秒（peer.rs 的 GRACEFUL_EXIT），
+# STOP_TIMEOUT + KILL_GRACE 必须小于它，否则 Harness 还没等到 CLI 退出就放弃了。
+KILL_GRACE = 5.0
 # 宿主向 Harness 写数据最多等待多久：Harness 不再读取时据此丢弃连接，不让 CLI 的输出一直被卡住。
 # 只限制发送方向；读取方向不能有超时（见 limit_sending）。
 CLIENT_SEND_TIMEOUT = 60.0
@@ -132,6 +135,13 @@ class Host:
         if not self.stopping:
             self.stopping = True
             self.stop_at = time.monotonic()
+        self.close_cli_input()
+
+    def kill(self):
+        """强制收尾：CLI 不响应停止请求时用。不再等它自己收尾，supervise 立刻 SIGTERM，KILL_GRACE 后补 SIGKILL。"""
+        deadline = time.monotonic() - STOP_TIMEOUT
+        self.stop_at = deadline if self.stop_at is None else min(self.stop_at, deadline)
+        self.stopping = True
         self.close_cli_input()
 
     def pump_stdout(self):
@@ -279,6 +289,9 @@ class Host:
                     if kind == "host_stop":
                         self.stop()
                         continue
+                    if kind == "host_kill":
+                        self.kill()
+                        continue
                     if isinstance(kind, str) and kind.startswith("host_"):
                         continue
                     if kind == "control_response":
@@ -320,7 +333,10 @@ class Host:
                     time.sleep(0.3)
                 return
             if self.stopping:
-                if time.monotonic() - self.stop_at > STOP_TIMEOUT and self.cli is not None:
+                waited = time.monotonic() - self.stop_at
+                if waited > STOP_TIMEOUT + KILL_GRACE and self.cli is not None:
+                    self.cli.kill()
+                elif waited > STOP_TIMEOUT and self.cli is not None:
                     self.cli.terminate()
                 continue
             if self.client is not None:

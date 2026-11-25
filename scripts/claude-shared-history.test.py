@@ -13,6 +13,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import MagicMock, patch
@@ -165,6 +166,56 @@ class SharedQueueHistoryTests(unittest.TestCase):
             self.assertEqual(frame["native_status"]["tempo"], "idle")
             self.assertEqual(frame["requests"], {})
 
+
+    def test_large_snapshots_are_spaced_by_their_cost_and_small_ones_are_not(self):
+        # 用户要求缩短操作等待：含全部历史的快照越大，相邻两份之间隔得越久；变化不丢，间隔结束后补发最新状态。
+        native = SdkReader("unused", "test-session")
+        native.initialized = True
+        native.read_messages = lambda: None
+        native.context_configuration = lambda: {}
+        clock = [100.0]
+        cost = [0.001]
+        emitted = []
+
+        def fake_emit(frame):
+            emitted.append(frame["pending"][0]["id"])
+            clock[0] += cost[0]
+
+        def change(label):
+            native.pending = [{"id": label}]
+            native.poll()
+
+        with patch.object(time, "monotonic", lambda: clock[0]), patch.dict(namespace, {"emit": fake_emit}):
+            change("small-1")
+            change("small-2")
+            self.assertEqual(emitted, ["small-1", "small-2"], "小会话每次变化都发出，不限制")
+            cost[0] = 0.5
+            change("big-1")
+            change("big-2")
+            self.assertEqual(emitted[-1], "big-1", "间隔内的变化先不发")
+            clock[0] += 3.9
+            native.poll()
+            self.assertEqual(emitted[-1], "big-1", "0.5 秒的快照要隔 4 秒")
+            clock[0] += 0.2
+            native.poll()
+            self.assertEqual(emitted[-1], "big-2", "间隔结束后补发最新状态，变化没有丢")
+            count = len(emitted)
+            native.poll()
+            self.assertEqual(len(emitted), count, "没有新变化不重复发")
+            change("big-3")
+            native.poll(force=True)
+            self.assertEqual(emitted[-1], "big-3", "回执等需要立即可见的发送不受限")
+            cost[0] = 100.0
+            change("huge")
+            clock[0] += 1
+            native.poll(force=True)
+            native.pending = [{"id": "after-huge"}]
+            clock[0] += native.SNAPSHOT_MAX_INTERVAL - 0.1
+            native.poll()
+            self.assertNotEqual(emitted[-1], "after-huge", "间隔上限之内仍在限制")
+            clock[0] += 0.2
+            native.poll()
+            self.assertEqual(emitted[-1], "after-huge", "间隔最多 5 秒")
 
     def test_history_replacement_with_same_length_reloads_native_records(self):
         native = self.read([{"type": "user", "uuid": "user-one", "message": {"content": "first"}}])
@@ -660,6 +711,75 @@ class SharedQueueHistoryTests(unittest.TestCase):
              "entrypoint": "cli", "message": {"role": "user", "content": [
                  {"type": "text", "text": "[Request interrupted by user for tool use]"}]}},
         ]
+
+    def sdk_stop_rows(self):
+        # 用户本机真实会话（Claude Code 2.1.330，sdk-cli）里“停止”后的记录形态：提示 → 思考 → Bash 调用 → 工具结果 →
+        # 三条附件 → 中断标记，标记的父节点是最后一条附件；附件不进入历史。
+        web = {"entrypoint": "sdk-cli", "permissionMode": "default", "promptSource": "web", "turnOrigin": "sdk",
+               "turnAttributionKey": "key"}
+        return [
+            {"type": "user", "uuid": "u-prompt", "parentUuid": None, "promptId": "p-stop", **web,
+             "message": {"role": "user", "content": [{"type": "text", "text": "继续"}]}},
+            {"type": "attachment", "uuid": "att-0", "parentUuid": "u-prompt", "entrypoint": "sdk-cli",
+             "attachment": {"type": "environment"}},
+            {"type": "assistant", "uuid": "a-think", "parentUuid": "att-0", "entrypoint": "sdk-cli",
+             "message": {"id": "msg_1", "role": "assistant", "content": [{"type": "thinking", "thinking": "想一下"}]}},
+            {"type": "assistant", "uuid": "a-tool", "parentUuid": "a-think", "entrypoint": "sdk-cli",
+             "message": {"id": "msg_1", "role": "assistant", "content": [
+                 {"type": "tool_use", "id": "tool-1", "name": "Bash", "input": {"command": "echo hi"}}]}},
+            {"type": "user", "uuid": "u-result", "parentUuid": "a-tool", "promptId": "p-stop", "entrypoint": "sdk-cli",
+             "sourceToolAssistantUUID": "a-tool",
+             "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tool-1", "content": "hi"}]}},
+            {"type": "attachment", "uuid": "att-1", "parentUuid": "u-result", "entrypoint": "sdk-cli",
+             "attachment": {"type": "prompt_snapshot"}},
+            {"type": "attachment", "uuid": "att-2", "parentUuid": "att-1", "entrypoint": "sdk-cli",
+             "attachment": {"type": "deferred_tools_delta"}},
+            {"type": "attachment", "uuid": "att-3", "parentUuid": "att-2", "entrypoint": "sdk-cli",
+             "attachment": {"type": "mcp_instructions_delta"}},
+            {"type": "user", "uuid": "u-marker", "parentUuid": "att-3", "promptId": "p-stop", "entrypoint": "sdk-cli",
+             "userType": "external", "dataFlowOn": True,
+             "message": {"role": "user", "content": [{"type": "text", "text": "[Request interrupted by user]"}]}},
+        ]
+
+    def test_sdk_stop_with_attachments_between_the_tool_result_and_the_marker_is_not_a_user_message(self):
+        marker = "[Request interrupted by user]"
+        rows = self.sdk_stop_rows()
+        native = self.read(rows, pending_text=marker)
+        control = native.messages[-1]
+        self.assertEqual(control["uuid"], "u-marker")
+        self.assertEqual(control["nativeSdkInterruption"], {"responseId": "u-result", "source": "sdk-interrupt"})
+        self.assertFalse(namespace["real_user"](control), "停止标记不能成为用户气泡")
+        self.assertFalse(control["nativeEditable"])
+        self.assertTrue(namespace["native_turn_finished"](native.messages))
+        self.assertFalse(any(row["uuid"].startswith("att-") for row in native.messages), "附件仍不进入历史")
+        self.assertEqual(native.clients, {})
+        self.assertEqual(len(native.pending), 1, "标记不能消耗用户待确认的同文消息")
+        # 用户自己发送同样文字：新提示带真人输入属性、有自己的 promptId，仍是普通用户消息。
+        typed = {"type": "user", "uuid": "u-typed", "parentUuid": "u-marker", "promptId": "p-new", "entrypoint": "sdk-cli",
+                 "permissionMode": "default", "promptSource": "web", "turnOrigin": "sdk",
+                 "message": {"role": "user", "content": [{"type": "text", "text": marker}]}}
+        with_typed = self.read(rows + [typed], pending_text=marker)
+        self.assertTrue(namespace["real_user"](with_typed.messages[-1]))
+        self.assertEqual(with_typed.clients, {"u-typed": "web-client"})
+
+    def test_stop_marker_survives_the_link_limit_for_attachments_that_were_already_evicted(self):
+        # 父子关系只保留最近 ROW_LINK_LIMIT 条；超出后链找不到了，标记仍按 promptId 归到该提示，不会露成气泡。
+        rows = self.sdk_stop_rows()
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        log = Path(folder.name) / "native.jsonl"
+        log.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
+        native = SdkReader("unused", "test-session")
+        native.log_path = log
+        original = namespace["ROW_LINK_LIMIT"]
+        namespace["ROW_LINK_LIMIT"] = 1
+        try:
+            native.read_messages()
+        finally:
+            namespace["ROW_LINK_LIMIT"] = original
+        control = native.messages[-1]
+        self.assertEqual(control["nativeSdkInterruption"]["source"], "sdk-interrupt")
+        self.assertFalse(namespace["real_user"](control))
 
     def test_native_tool_interruption_uses_denial_ancestry_without_rewriting_history_or_consuming_input(self):
         marker = "[Request interrupted by user for tool use]"
@@ -1522,10 +1642,31 @@ class SdkInterruptionTests(unittest.TestCase):
     def test_markers_without_the_native_evidence_are_not_recognised(self):
         recognise = namespace["native_sdk_interruption"]
         self.assertIsNone(recognise(self.marker(entrypoint="cli"), self.rows()), "终端传输沿用原有规则")
+        self.assertIsNone(recognise(self.marker(entrypoint="other"), self.rows()), "入口不明的记录不认")
         self.assertIsNone(recognise(self.marker(promptId="unknown"), self.rows()))
-        self.assertIsNone(recognise(self.marker(parentUuid="missing"), self.rows()))
         quoted = {"content": [{"type": "text", "text": "请解释 " + self.MARKER}]}
         self.assertIsNone(recognise(self.marker(message=quoted), self.rows()))
+
+    def test_a_broken_parent_chain_still_belongs_to_the_prompt_it_shares_a_prompt_id_with(self):
+        # 父节点链断了（被跳过的记录已超出保留上限等）不影响判定：promptId 已证明它属于该提示，
+        # 被中断的位置取同一提示里最近的一行；没有共用 promptId 的仍不认（上一条用例）。
+        evidence = namespace["native_sdk_interruption"](self.marker(parentUuid="missing"), self.rows())
+        self.assertEqual(evidence, {"responseId": "u1", "source": "sdk-interrupt"})
+
+    def test_marker_whose_parent_is_a_skipped_attachment_walks_up_to_the_real_message(self):
+        # CLI 2.1.330：工具结果与中断标记之间写了 attachment，标记的父节点是附件，而附件不进入历史。
+        recognise = namespace["native_sdk_interruption"]
+        links = {"att-1": "a1", "att-2": "att-1"}
+        evidence = recognise(self.marker(parentUuid="att-2"), self.rows(), links)
+        self.assertEqual(evidence["responseId"], "msg_1", "穿过两条附件找到助手回复")
+        # 没有父子关系记录时只能退到同一提示最近的一行，结果不同，说明上面确实是沿父链找到的。
+        self.assertEqual(recognise(self.marker(parentUuid="att-2"), self.rows())["responseId"], "u1")
+
+    def test_desktop_app_markers_are_recognised_and_other_hosts_are_not(self):
+        recognise = namespace["native_sdk_interruption"]
+        self.assertIsNotNone(recognise(self.marker(entrypoint="claude-desktop"), self.rows()))
+        for entrypoint in ("claude-vscode", "mcp", "", None, 7):
+            self.assertIsNone(recognise(self.marker(entrypoint=entrypoint), self.rows()), repr(entrypoint))
 
 
 class SessionHoldersTests(unittest.TestCase):
@@ -1827,6 +1968,75 @@ class SdkHostConnectionTests(unittest.TestCase):
         self.assertIs(host.client, server)
         client.sendall(b'{"type":"user","message":"still attached"}\n')
         self.assertIn(b"still attached", host.cli.stdout.readline())
+
+
+    def test_host_kill_ends_a_cli_that_ignores_stdin_close_and_sigterm(self):
+        """CLI 不响应停止请求（用户点停止没有任何回执）时，Harness 发 host_kill：宿主先 SIGTERM，再补 SIGKILL。
+
+        只关闭标准输入或只发 SIGTERM 对这样的 CLI 无效；host_stop 的收尾时限是 30 秒，强制结束不能再等。"""
+        scope = self.load_host()
+        scope["STOP_TIMEOUT"] = 0.4  # 生产值 30 秒；缩短只为测试不空等
+        scope["KILL_GRACE"] = 0.4
+        host = scope["Host"]("00000000-0000-4000-8000-000000000000", {})
+        stubborn = ("import signal, sys, time\n"
+                    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                    "print('ready', flush=True)\n"
+                    "time.sleep(60)\n")
+        host.cli = subprocess.Popen([sys.executable, "-c", stubborn], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        self.addCleanup(host.cli.wait)
+        self.addCleanup(host.cli.kill)
+        self.assertEqual(host.cli.stdout.readline().strip(), b"ready")
+        server, client = socket.socketpair(socket.AF_UNIX)
+        self.addCleanup(client.close)
+        host.attach(server)
+        reader = client.makefile("rb")
+        self.assertEqual(json.loads(reader.readline())["type"], "host_hello")
+        supervisor = threading.Thread(target=host.supervise, daemon=True)
+        supervisor.start()
+
+        started = time.monotonic()
+        client.sendall(b'{"type":"host_kill"}\n')
+        # 先 SIGTERM（被忽略），KILL_GRACE 之后 SIGKILL；返回码 -9 说明确实是强制结束。
+        self.assertEqual(host.cli.wait(timeout=5), -9)
+        self.assertLess(time.monotonic() - started, 3, "强制结束不能等满 STOP_TIMEOUT")
+        exit_frame = json.loads(reader.readline())
+        self.assertEqual(exit_frame["type"], "host_exit", "宿主要把 CLI 退出报告给 Harness，对端据此确认已退出")
+        supervisor.join(timeout=3)
+        self.assertFalse(supervisor.is_alive())
+
+
+    def test_host_stop_keeps_the_connection_until_the_cli_has_really_exited(self):
+        """Harness 发 host_stop 后要一直保持连接，直到宿主报告 CLI 退出：编辑历史消息据此确认 CLI 真正退净，
+        再让读取器核对持有者。带多个 MCP 服务的实例收尾要数秒，提前认定退出会被“仍在其他 CLI 中打开”拒绝。"""
+        scope = self.load_host()
+        host = scope["Host"]("00000000-0000-4000-8000-000000000001", {})
+        # 标准输入关闭后再收尾 0.8 秒才退出的 CLI。
+        slow = "import sys, time\nprint('ready', flush=True)\nsys.stdin.read()\ntime.sleep(0.8)\n"
+        host.cli = subprocess.Popen([sys.executable, "-c", slow], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        self.addCleanup(host.cli.wait)
+        self.addCleanup(host.cli.kill)
+        self.assertEqual(host.cli.stdout.readline().strip(), b"ready")
+        server, client = socket.socketpair(socket.AF_UNIX)
+        self.addCleanup(client.close)
+        host.attach(server)
+        reader = client.makefile("rb")
+        self.assertEqual(json.loads(reader.readline())["type"], "host_hello")
+        supervisor = threading.Thread(target=host.supervise, daemon=True)
+        supervisor.start()
+
+        started = time.monotonic()
+        client.sendall(b'{"type":"host_stop"}\n')
+        # 写端保持打开：CLI 收尾期间不会有任何退出报告。
+        client.settimeout(0.4)
+        with self.assertRaises(socket.timeout):
+            client.recv(1)
+        client.settimeout(None)
+        exit_frame = json.loads(reader.readline())
+        self.assertEqual(exit_frame["type"], "host_exit")
+        self.assertEqual(exit_frame["code"], 0)
+        self.assertGreaterEqual(time.monotonic() - started, 0.7, "CLI 退出之后才报告")
+        supervisor.join(timeout=3)
+        self.assertFalse(supervisor.is_alive())
 
 
 if __name__ == "__main__":

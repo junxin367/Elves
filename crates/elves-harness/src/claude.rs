@@ -40,6 +40,11 @@ mod tools;
 #[path = "claude_sdk/mod.rs"]
 mod sdk;
 
+// 会话存档的分文件持久化与改动追踪，见模块文档。
+#[path = "claude_store.rs"]
+mod store;
+use store::{Conversations, Turns};
+
 // 用户要求会话被其他应用持有时，在会话内提示“已在另一个应用中打开”；与 Codex 的占用提示同文案，前端按 externalWriter 展示。
 const HELD_ELSEWHERE: &str = "已在另一个应用中打开";
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -53,6 +58,15 @@ const MAX_SHARED_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 fn error(code: u16, message: impl Into<String>) -> anyhow::Error {
     ApiError::new(code, message.into()).into()
+}
+
+/// 写诊断日志。单元测试不写用户真实的诊断日志：此前测试曾把伪造的宿主失败、占用释放和存档损坏记录
+/// 写进真实日志，排查线上问题时会被误当成真实事件。
+pub(super) fn diagnose_event(event: &str, detail: Value) {
+    if cfg!(test) {
+        return;
+    }
+    let _ = crate::diagnostic_log::append_diagnostic_log(event, detail);
 }
 
 fn dispatched_unknown(mut failure: ApiError) -> ApiError {
@@ -140,9 +154,12 @@ struct Conversation {
     unread: bool,
     deleted: bool,
     resumed: bool,
-    turns: Vec<Value>,
+    turns: Turns,
     #[serde(default)]
     shared: bool,
+    // 最后一轮的状态；共享会话的正文移到侧文件后，独立服务判断“是否仍有执行中会话”只能读主存档里的这个字段。
+    #[serde(default)]
+    last_turn_status: String,
     // 旧版 Elves 的 daemon 后台任务 ID：新版本不读取、不写入也不清除，只让存档原样往返，
     // 这样回滚到旧版时它仍能找到自己的后台任务；仍在运行的旧任务按“已在另一个应用中打开”处理。
     #[serde(default)]
@@ -345,6 +362,15 @@ impl Conversation {
             .is_some_and(|turn| turn["status"] == "inProgress")
     }
 
+    /// 共享会话此刻没有任何执行，也没有等待用户的请求：此后不会再出现新的原生接收记录。
+    /// 与编辑历史的准入判断一致（见 enqueue_shared_input）。
+    fn natively_idle(&self) -> bool {
+        self.shared
+            && !self.active()
+            && self.native_status["tempo"] == "idle"
+            && self.native_status["needs"].is_null()
+    }
+
     fn active(&self) -> bool {
         // 原版已回复的澄清也可能标为 blocked；只按生成活动或未完成轮次显示执行中，保留真正的工具等待。
         if self.shared {
@@ -411,7 +437,7 @@ impl Conversation {
 
 #[derive(Default, Clone, Serialize, Deserialize)]
 struct Saved {
-    conversations: BTreeMap<String, Conversation>,
+    conversations: Conversations,
 }
 
 struct Channel {
@@ -504,6 +530,8 @@ pub(super) struct Claude {
     metadata: Mutex<HashMap<String, (Instant, Value)>>,
     // SDK 传输用的原生初始化目录（模型、命令等）；按实例和项目目录缓存，避免每个会话启动都拉起一次探测进程。
     sdk_catalogs: Mutex<HashMap<String, (Instant, Value)>>,
+    // 正在后台重新探测的目录键，避免同一目录同时起多个探测进程。
+    sdk_catalog_refreshing: Mutex<std::collections::HashSet<String>>,
     // SDK 宿主/读取器脚本在各 WSL 实例里的路径；用来判断哪些 CLI 进程属于本程序，数据目录不变，进程生命周期内只换算一次。
     sdk_scripts: Mutex<HashMap<String, sdk::Scripts>>,
     // 测试里假读取器对 holders 请求的回答：每项 {"pid":…,"mine":bool}；传入本程序脚本标记时 mine 项不算外部持有。
@@ -524,6 +552,38 @@ pub(super) struct Claude {
     controller: OnceLock<Weak<HarnessController>>,
     epoch: String,
     request_revision: AtomicU64,
+    // 自身的弱引用：合并落盘任务只持弱引用，服务释放后不再续命。
+    weak: Weak<Self>,
+    // 所有存档文件的单一写入任务，保证写入顺序与序列化顺序一致。
+    writer: store::Writer,
+    flush_scheduled: AtomicBool,
+    // 最近一次合并落盘的耗时（毫秒），用来按存档体量放宽下一次的间隔。
+    flush_cost_ms: AtomicU64,
+}
+
+// 用户要求缩短操作等待：来自原生快照的内容（正文、状态、用量）可由原生日志重建，不必每次快照都写盘；
+// 合并为最短 2 秒一次，并按上次落盘耗时的 8 倍放宽（磁盘忙或正文很大时写盘占用不超过约 1/9），上限 30 秒。
+const LAZY_FLUSH_MIN: Duration = Duration::from_secs(2);
+const LAZY_FLUSH_MAX: Duration = Duration::from_secs(30);
+
+/// 模型目录探测结果的使用方式：从未探测过要同步探测；未过期直接用；过期的先用并在后台更新。
+#[derive(Debug, PartialEq, Eq)]
+enum CatalogPlan {
+    Probe,
+    Serve,
+    ServeAndRefresh,
+}
+
+fn catalog_plan(age: Option<Duration>) -> CatalogPlan {
+    match age {
+        None => CatalogPlan::Probe,
+        Some(age) if age < MODEL_CATALOG_TTL => CatalogPlan::Serve,
+        Some(_) => CatalogPlan::ServeAndRefresh,
+    }
+}
+
+fn lazy_flush_delay(last_cost_ms: u64) -> Duration {
+    Duration::from_millis(last_cost_ms.saturating_mul(8)).clamp(LAZY_FLUSH_MIN, LAZY_FLUSH_MAX)
 }
 
 impl Claude {
@@ -536,8 +596,11 @@ impl Claude {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Saved::default(),
             Err(e) => return Err(e.into()),
         };
+        // 共享会话的正文在侧文件里；旧布局（正文内联在主存档）读完归一化后一次性迁移。
+        let legacy_layout = saved.conversations.load_turns(directory);
         // 服务重启后不自动重发、续跑或批准；原生历史仍由 Claude 的 --resume 读取。
-        for conversation in saved.conversations.values_mut() {
+        // 归一化每次加载都会重复且幂等，不记入改动，避免启动后第一次落盘就重写全部正文。
+        for conversation in saved.conversations.values_mut_untracked() {
             anyhow::ensure!(
                 conversation.backend == "claude" && Self::owns_id(&conversation.id),
                 "Claude 会话类型或身份无效，未改写记录"
@@ -550,7 +613,7 @@ impl Claude {
             );
             if conversation.shared {
                 // 兼容旧版曾被其他状态写入带入的临时记录，升级后只从原生日志恢复正文。
-                for turn in &mut conversation.turns {
+                for turn in conversation.turns.untracked() {
                     if let Some(items) = turn["items"].as_array_mut() {
                         items.retain(|item| {
                             item["_nativePreview"] != true
@@ -562,14 +625,25 @@ impl Claude {
                 }
             }
             if !conversation.shared
-                && let Some(turn) = conversation.turns.last_mut()
+                && let Some(turn) = conversation.turns.untracked().last_mut()
                 && turn["status"] == "inProgress"
             {
                 turn["status"] = json!("interrupted");
                 turn["error"] = json!({"message":"服务曾重启，请核对历史后继续；未自动重发消息"});
             }
         }
-        Ok(Arc::new(Self {
+        if legacy_layout && let Err(failure) = store::migrate_legacy_layout(directory, &mut saved) {
+            // 迁移失败不阻止启动：内存状态完整，下一次落盘会重试迁移。
+            diagnose_event(
+                "claude.store.migrate-failed",
+                json!({"error":failure.to_string()}),
+            );
+        }
+        Ok(Arc::new_cyclic(|weak| Self {
+            weak: weak.clone(),
+            writer: store::Writer::default(),
+            flush_scheduled: AtomicBool::new(false),
+            flush_cost_ms: AtomicU64::new(0),
             directory: directory.to_owned(),
             discovery: Mutex::new(HashMap::new()),
             saved: Mutex::new(saved),
@@ -577,6 +651,7 @@ impl Claude {
             locks: Mutex::new(HashMap::new()),
             metadata: Mutex::new(HashMap::new()),
             sdk_catalogs: Mutex::new(HashMap::new()),
+            sdk_catalog_refreshing: Mutex::new(std::collections::HashSet::new()),
             sdk_scripts: Mutex::new(HashMap::new()),
             #[cfg(test)]
             test_holders: std::sync::Mutex::new(Vec::new()),
@@ -694,6 +769,8 @@ impl Claude {
         // 执行中的任务在 WSL 里继续，空闲的会话随即收尾，所以这里没有需要逐个回收的后台任务。
         let _gate = self.lifecycle_gate.write().await;
         self.discovery.lock().await.clear();
+        // 退出前把合并落盘中尚未写出的内容写完；这部分可由原生日志重建，失败只记日志不阻止退出。
+        self.flush_or_retry_later().await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         self.cleanup_report()
     }
@@ -866,25 +943,140 @@ impl Claude {
             .clone()
     }
 
-    fn persist(&self, saved: &Saved) -> anyhow::Result<()> {
-        let bytes = serde_json::to_vec(saved)?;
-        anyhow::ensure!(
-            bytes.len() <= 64 * 1024 * 1024,
-            "Claude 会话记录已达 64 MiB，未截断历史"
-        );
-        crate::settings::atomic_write(&self.directory.join("remote-claude-sessions.json"), &bytes)
-    }
-
+    /// 持久修改：返回成功即表示本次触碰的会话已写入磁盘；写入失败时内存回到修改前，调用方看到错误。
+    /// 用户要求缩短操作等待：只序列化并写入有改动的文件（主存档 + 本次触碰且正文有变的会话正文），
+    /// 不再克隆与重写整份存档；其他会话尚未合并落盘的正文留给 `flush`，不拖慢这次操作。
     async fn change<T>(
         &self,
         change: impl FnOnce(&mut Saved) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
         let mut saved = self.saved.lock().await;
-        let mut next = saved.clone();
-        let result = change(&mut next)?;
-        self.persist(&next)?;
-        *saved = next;
-        Ok(result)
+        saved.conversations.begin();
+        let value = match change(&mut saved) {
+            Ok(value) => value,
+            Err(failure) => {
+                saved.conversations.rollback();
+                return Err(failure);
+            }
+        };
+        match self.write_locked(&mut saved).await {
+            Ok(()) => {
+                saved.conversations.commit();
+                Ok(value)
+            }
+            Err((failure, marks)) => {
+                saved.conversations.rollback();
+                if let Some(marks) = marks {
+                    // 文件可能已部分写入：回滚后仍把它们标为落盘状态未知，下次一定重写。
+                    saved.finish(&marks, false);
+                }
+                Err(failure)
+            }
+        }
+    }
+
+    /// 已持有 `saved` 锁、没有回滚需求的调用方（旧版逐帧写入）使用；失败只把落盘状态标为未知并返回错误。
+    async fn persist_locked(&self, saved: &mut Saved) -> anyhow::Result<()> {
+        match self.write_locked(saved).await {
+            Ok(()) => Ok(()),
+            Err((failure, marks)) => {
+                if let Some(marks) = marks {
+                    saved.finish(&marks, false);
+                }
+                Err(failure)
+            }
+        }
+    }
+
+    /// 写出当前持久修改触碰的会话。调用时必须持有 `saved` 锁，并等写入完成才返回。
+    async fn write_locked(
+        &self,
+        saved: &mut Saved,
+    ) -> Result<(), (anyhow::Error, Option<store::Marks>)> {
+        let touched = saved.conversations.touched_ids();
+        let prepared = saved
+            .prepare(&self.directory, Some(&touched))
+            .map_err(|failure| (failure, None))?;
+        let Some(prepared) = prepared else {
+            return Ok(());
+        };
+        let outcome = match self.writer.submit(prepared.files).await {
+            Ok(outcome) => outcome,
+            Err(_) => Err(anyhow::anyhow!("Claude 会话存档写入任务已退出")),
+        };
+        match outcome {
+            Ok(()) => {
+                saved.finish(&prepared.marks, true);
+                Ok(())
+            }
+            Err(failure) => Err((failure, Some(prepared.marks))),
+        }
+    }
+
+    /// 只改内存、合并落盘：用于来自原生快照的内容（正文、状态、用量），它们可由原生日志重建。
+    /// 闭包必须先完成所有可能失败的步骤再修改状态——这里没有回滚副本，失败不会撤销已做的修改。
+    async fn change_lazy<T>(
+        &self,
+        change: impl FnOnce(&mut Saved) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let value = change(&mut *self.saved.lock().await)?;
+        self.schedule_flush();
+        Ok(value)
+    }
+
+    /// 立即落盘；失败不影响调用方（内存状态完整），记日志并交给合并落盘任务重试。
+    async fn flush_or_retry_later(&self) {
+        if let Err(failure) = self.flush().await {
+            diagnose_event(
+                "claude.store.flush-failed",
+                json!({"error":failure.to_string()}),
+            );
+            self.schedule_flush();
+        }
+    }
+
+    fn schedule_flush(&self) {
+        if self.flush_scheduled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.flush_scheduled.store(false, Ordering::Release);
+            return;
+        };
+        let weak = self.weak.clone();
+        let delay = lazy_flush_delay(self.flush_cost_ms.load(Ordering::Relaxed));
+        runtime.spawn(async move {
+            tokio::time::sleep(delay).await;
+            let Some(service) = weak.upgrade() else {
+                return;
+            };
+            // 先放开标志再落盘：落盘期间到达的新改动会重新排下一次。
+            service.flush_scheduled.store(false, Ordering::Release);
+            service.flush_or_retry_later().await;
+        });
+    }
+
+    /// 立即写出全部尚未落盘的改动（合并落盘任务、服务退出和测试共用）。
+    pub(super) async fn flush(&self) -> anyhow::Result<()> {
+        let started = Instant::now();
+        let (receiver, marks) = {
+            let mut saved = self.saved.lock().await;
+            let Some(prepared) = saved.prepare(&self.directory, None)? else {
+                return Ok(());
+            };
+            // 在锁内提交写入顺序，锁外等待完成；等待期间其他请求照常读写。
+            (self.writer.submit(prepared.files), prepared.marks)
+        };
+        let outcome = match receiver.await {
+            Ok(outcome) => outcome,
+            Err(_) => Err(anyhow::anyhow!("Claude 会话存档写入任务已退出")),
+        };
+        self.saved.lock().await.finish(&marks, outcome.is_ok());
+        self.flush_cost_ms.store(
+            started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+        outcome
     }
 
     fn publish(&self, event: Value) {
@@ -1078,7 +1270,8 @@ impl Claude {
             unread: false,
             deleted: false,
             resumed: false,
-            turns: vec![],
+            turns: Turns::default(),
+            last_turn_status: String::new(),
             shared: true,
             native_job_id: String::new(),
             native_status: Value::Null,
@@ -1190,9 +1383,11 @@ impl Claude {
             .filter(|(_, process)| process.channel.live.load(Ordering::Acquire))
             .map(|(id, _)| id.clone())
             .collect();
+        // 发现结果可由原生会话列表重建，所以只改内存并合并落盘；同一显式 WSL 每十秒才发现一次，
+        // 未变化的会话不记入改动，避免每次发现都重写存档。确有变化时统一 `touch`。
         let mut saved = self.saved.lock().await;
-        let mut next = saved.clone();
         let mut changed = false;
+        let mut inserted = false;
         for row in rows {
             let Some(native) = row["nativeId"]
                 .as_str()
@@ -1209,14 +1404,22 @@ impl Claude {
                 .filter(|title| !title.is_empty())
                 .unwrap_or("Claude 会话");
             // 发行版+Linux 用户+原生 UUID 是登记键；删除墓碑也参与去重，不能靠再次扫描复活旧会话。
-            let existing = next.conversations.values_mut().find(|c| {
-                c.native_id == native
-                    && c.config
-                        .distribution
-                        .eq_ignore_ascii_case(&config.distribution)
-                    && c.config.user == config.user
-            });
-            if let Some(c) = existing {
+            let existing = saved
+                .conversations
+                .iter()
+                .find(|(_, c)| {
+                    c.native_id == native
+                        && c.config
+                            .distribution
+                            .eq_ignore_ascii_case(&config.distribution)
+                        && c.config.user == config.user
+                })
+                .map(|(existing_key, _)| existing_key.clone());
+            if let Some(existing_key) = existing {
+                let c = saved
+                    .conversations
+                    .get_mut_silent(&existing_key)
+                    .expect("刚在会话表中找到的键");
                 if c.deleted {
                     continue;
                 }
@@ -1287,7 +1490,8 @@ impl Claude {
                 unread: false,
                 deleted: false,
                 resumed: true,
-                turns: vec![],
+                turns: Turns::default(),
+                last_turn_status: String::new(),
                 shared: true,
                 native_job_id: String::new(),
                 native_status: row["nativeStatus"].clone(),
@@ -1302,25 +1506,27 @@ impl Claude {
                 native_history_head: String::new(),
                 spent_requests: BTreeMap::new(),
             };
-            next.conversations.insert(c.id.clone(), c);
+            saved.conversations.insert(c.id.clone(), c);
             changed = true;
+            inserted = true;
         }
         if changed {
-            self.persist(&next)?;
-            *saved = next;
+            saved.conversations.touch();
+            drop(saved);
+            if inserted {
+                // 新会话的网页 ID 是随机生成的，崩溃后重新发现会换一个 ID，已打开的页面和书签会失效，所以立即落盘；
+                // 只更新已有会话的标题、状态等仍合并落盘。
+                self.flush_or_retry_later().await;
+            } else {
+                self.schedule_flush();
+            }
         }
         Ok(())
     }
 
-    async fn sync_discovered(
-        self: &Arc<Self>,
-        id: &str,
-        authorization: Option<&HarnessAuthorization>,
-    ) -> anyhow::Result<()> {
-        let lock = self.lock(id).await;
-        let _guard = lock.lock().await;
-        let c = self.conversation(id).await?;
-        let pending_control = c.native_control["commands"]
+    /// 会话有尚未确认的原生命令（目标、压缩）：读取时需要补读原生记录来核对。
+    fn has_pending_native_control(c: &Conversation) -> bool {
+        c.native_control["commands"]
             .as_array()
             .is_some_and(|commands| {
                 commands.iter().any(|command| {
@@ -1329,7 +1535,43 @@ impl Claude {
                         Some("pending" | "running" | "unknown")
                     )
                 })
-            });
+            })
+    }
+
+    /// 读取前是否需要补读原生历史：只有发现项或有待确认原生命令、且本程序没有接入这个会话时才需要。
+    async fn needs_discovery_sync(&self, id: &str) -> anyhow::Result<bool> {
+        let wanted = {
+            let saved = self.saved.lock().await;
+            let c = saved
+                .conversations
+                .get(id)
+                .filter(|c| !c.deleted)
+                .ok_or_else(|| error(404, "Claude 会话不存在或已删除"))?;
+            c.discovered || Self::has_pending_native_control(c)
+        };
+        Ok(wanted
+            && !self
+                .processes
+                .lock()
+                .await
+                .get(id)
+                .is_some_and(|p| p.channel.live.load(Ordering::Acquire)))
+    }
+
+    async fn sync_discovered(
+        self: &Arc<Self>,
+        id: &str,
+        authorization: Option<&HarnessAuthorization>,
+    ) -> anyhow::Result<()> {
+        // 用户要求缩短操作等待：多数读取（会话已由本程序接入，或本来就不是发现项）不需要补读，
+        // 不能为了做这个判断而排在可能持续数十秒的发送、停止之后；确实要补读时才取会话锁并重新判断。
+        if !self.needs_discovery_sync(id).await? {
+            return Ok(());
+        }
+        let lock = self.lock(id).await;
+        let _guard = lock.lock().await;
+        let c = self.conversation(id).await?;
+        let pending_control = Self::has_pending_native_control(&c);
         if (!c.discovered && !pending_control)
             || self
                 .processes
@@ -1400,27 +1642,30 @@ impl Claude {
         {
             return Ok(());
         }
-        let mut saved = self.saved.lock().await;
-        let unchanged = saved
-            .conversations
-            .get(&observed.id)
-            .is_some_and(|current| {
-                !current.deleted
-                    && current.unread
-                    && current.native_id == observed.native_id
-                    && current.config == observed.config
-                    && current.updated_at == observed.updated_at
-                    && current.turns == observed.turns
-            });
-        // 只确认本次读取所见的内容；较早失败不能消除读取期间新到达回复的未读标记。
-        if !unchanged {
+        let acknowledged = self
+            .change(|saved| {
+                let unchanged = saved
+                    .conversations
+                    .get(&observed.id)
+                    .is_some_and(|current| {
+                        !current.deleted
+                            && current.unread
+                            && current.native_id == observed.native_id
+                            && current.config == observed.config
+                            && current.updated_at == observed.updated_at
+                            && current.turns == observed.turns
+                    });
+                // 只确认本次读取所见的内容；较早失败不能消除读取期间新到达回复的未读标记。
+                if !unchanged {
+                    return Ok(false);
+                }
+                saved.conversations.get_mut(&observed.id).unwrap().unread = false;
+                Ok(true)
+            })
+            .await?;
+        if !acknowledged {
             return Ok(());
         }
-        let mut next = saved.clone();
-        next.conversations.get_mut(&observed.id).unwrap().unread = false;
-        self.persist(&next)?;
-        *saved = next;
-        drop(saved);
         self.publish(json!({"method":"remote/sidebarChanged","params":{"threadId":observed.id}}));
         Ok(())
     }
@@ -1607,14 +1852,14 @@ impl Claude {
         let mut saved = self.saved.lock().await;
         let c = saved
             .conversations
-            .get_mut(id)
+            .get_mut_silent(id)
             .filter(|c| !c.deleted && c.native_id == backfill.1)
             .ok_or_else(|| error(404, "Claude 会话不存在"))?;
         // 补读期间原生快照或另一页可能已补齐数字，不能让较早的只读结果覆盖新统计。
         if c.turns.iter().all(|turn| turn["_metricsVersion"] == 2) {
             return Ok(c.metrics());
         }
-        for turn in &mut c.turns {
+        for turn in c.turns.untracked() {
             if let Some(requests) = turn["id"].as_str().and_then(|id| by_id.get(id)) {
                 turn["_metricsRequests"] = requests.clone();
             }
@@ -1826,7 +2071,7 @@ impl Claude {
         let released = result["released"].as_array().map_or(0, Vec::len);
         let remaining = result["remaining"].as_array().map_or(0, Vec::len);
         let stop_failed = result["stopFailed"].as_array().map_or(0, Vec::len);
-        let _ = crate::diagnostic_log::append_diagnostic_log(
+        diagnose_event(
             "claude.holders.release",
             json!({"native_id":c.native_id.chars().take(8).collect::<String>(),
                 "released":released,"remaining":remaining,"stopFailed":stop_failed}),
@@ -1858,17 +2103,35 @@ impl Claude {
         Err(error(409, HELD_ELSEWHERE))
     }
 
-    /// 模型目录、命令目录仍由同一 WSL 的原生 CLI 初始化响应提供（探测进程不恢复会话、不发送模型消息）；
-    /// 同一实例和项目目录五分钟内共用一次探测结果，与模型目录缓存期限一致。
+    /// 模型目录、命令目录仍由同一 WSL 的原生 CLI 初始化响应提供（探测进程不恢复会话、不发送模型消息）。
+    /// 同一实例和项目目录五分钟内共用一次探测结果；用户要求缩短操作等待：过期的结果先继续使用并在后台重新探测，
+    /// 发送和重连不再为了更新目录多等一次完整的 CLI 启动（实测冷启动一次 6–29 秒）。只有从未探测过才同步等待。
     async fn sdk_catalog(self: &Arc<Self>, c: &Conversation) -> anyhow::Result<Value> {
         let key = format!("{}\n{}", c.config.instance_id(), c.linux_cwd);
+        let cached = self.sdk_catalogs.lock().await.get(&key).cloned();
+        match catalog_plan(cached.as_ref().map(|(at, _)| at.elapsed())) {
+            CatalogPlan::Serve => return Ok(cached.unwrap().1),
+            CatalogPlan::ServeAndRefresh => {
+                self.refresh_sdk_catalog_in_background(c, key);
+                return Ok(cached.unwrap().1);
+            }
+            CatalogPlan::Probe => {}
+        }
         let gate = self.lock(&format!("sdk-catalog:{key}")).await;
         let _serial = gate.lock().await;
-        if let Some((at, catalog)) = self.sdk_catalogs.lock().await.get(&key)
-            && at.elapsed() < MODEL_CATALOG_TTL
-        {
+        // 等锁期间别的调用可能已经探测完成。
+        if let Some((_, catalog)) = self.sdk_catalogs.lock().await.get(&key) {
             return Ok(catalog.clone());
         }
+        let catalog = self.probe_sdk_catalog(c).await?;
+        self.sdk_catalogs
+            .lock()
+            .await
+            .insert(key, (Instant::now(), catalog.clone()));
+        Ok(catalog)
+    }
+
+    async fn probe_sdk_catalog(self: &Arc<Self>, c: &Conversation) -> anyhow::Result<Value> {
         let probe = Conversation {
             id: String::new(),
             shared: false,
@@ -1877,12 +2140,34 @@ impl Claude {
             permission_mode: None,
             ..c.clone()
         };
-        let catalog = self.spawn_stdio(&probe).await?.initialization.clone();
-        self.sdk_catalogs
-            .lock()
-            .await
-            .insert(key, (Instant::now(), catalog.clone()));
-        Ok(catalog)
+        Ok(self.spawn_stdio(&probe).await?.initialization.clone())
+    }
+
+    /// 后台重新探测过期的目录；同一目录同时只探测一次，失败保留旧结果，下次使用时再试。
+    fn refresh_sdk_catalog_in_background(self: &Arc<Self>, c: &Conversation, key: String) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let (service, conversation) = (self.clone(), c.clone());
+        runtime.spawn(async move {
+            if !service
+                .sdk_catalog_refreshing
+                .lock()
+                .await
+                .insert(key.clone())
+            {
+                return;
+            }
+            let probed = service.probe_sdk_catalog(&conversation).await;
+            service.sdk_catalog_refreshing.lock().await.remove(&key);
+            if let Ok(catalog) = probed {
+                service
+                    .sdk_catalogs
+                    .lock()
+                    .await
+                    .insert(key, (Instant::now(), catalog));
+            }
+        });
     }
 
     async fn launch(
@@ -2127,7 +2412,8 @@ impl Claude {
             unread: false,
             deleted: false,
             resumed: false,
-            turns: vec![],
+            turns: Turns::default(),
+            last_turn_status: String::new(),
             shared: false,
             native_job_id: String::new(),
             native_status: Value::Null,
@@ -2389,7 +2675,8 @@ impl Claude {
             unread: false,
             deleted: false,
             resumed: false,
-            turns: vec![],
+            turns: Turns::default(),
+            last_turn_status: String::new(),
             // 用户要求继续共用原版 CLI 会话；待发送消息先由远程服务保存，实际投递时才进入原生会话。
             shared: true,
             native_job_id: String::new(),
@@ -2461,15 +2748,25 @@ impl Claude {
         let id = payload["threadId"]
             .as_str()
             .context("缺少 Claude 会话 ID")?;
-        let lock = self.lock(id).await;
-        let _guard = lock.lock().await;
-        let mut c = self.conversation(id).await?;
         if payload
             .get("backend")
             .is_some_and(|backend| backend != "claude")
         {
+            // 只读校验放在取会话锁之前，排队等锁不能改变它的结果。
+            self.conversation_exists(id).await?;
             return Err(error(409, "已创建的 Claude 会话不能切换后端"));
         }
+        // 用户要求缩短操作等待：已读、置顶、重命名只改会话记录，由 `change` 保证原子，
+        // 不取会话锁；否则会排在可能持续数十秒的发送冷启动之后（实测已读最长等了 43 秒）。
+        if matches!(action, "markRead" | "pinThread" | "rename") {
+            self.conversation_exists(id).await?;
+            return self
+                .change_metadata(action, id, payload, authorization)
+                .await;
+        }
+        let lock = self.lock(id).await;
+        let _guard = lock.lock().await;
+        let mut c = self.conversation(id).await?;
         // 用户要求别的应用持有会话时不能继续写入；这些动作都会向同一份原生记录追加内容。
         if matches!(
             action,
@@ -2605,6 +2902,10 @@ impl Claude {
                 self.edit_remote_queue(id, action, payload, authorization)
                     .await
             }
+            "warmSession" => {
+                authorization.check().await?;
+                self.warm_session(id, &c, authorization).await
+            }
             "stop" => {
                 authorization.check().await?;
                 self.change(|saved| {
@@ -2626,6 +2927,7 @@ impl Claude {
                 {
                     return self.queue(id).await;
                 }
+                let mut forced = false;
                 if let Some(process) = self.processes.lock().await.get(id).cloned() {
                     self.change(|saved| {
                         if let Some(turn) = saved
@@ -2639,14 +2941,17 @@ impl Claude {
                         Ok(())
                     })
                     .await?;
-                    process
+                    let reply = process
                         .control(json!({"subtype":"interrupt"}), Some(authorization))
                         .await?;
+                    // 原生 CLI 一直没有响应停止请求时，对端已强制结束它的进程（见 peer.rs 的 interrupt）；
+                    // 带回给网页，让用户知道这次停止是强制的，而不是静默成功。
+                    forced = reply["forced"] == true;
                 } else {
                     self.finish(id, None, true, None).await?;
                 }
                 // 停止回执只确认请求已接受；等待原轮次的 result，避免迟到结果结束下一轮。
-                Ok(json!({"ok":true,"threadId":id}))
+                Ok(json!({"ok":true,"threadId":id,"forced":forced}))
             }
             // 与发送、编辑共用上面取得的会话锁，关闭期间不会有新的写入同时进行。
             "releaseExternalHolders" => self.release_external_holders(&c, authorization).await,
@@ -2655,51 +2960,120 @@ impl Claude {
                 if action == "deleteThread" && c.active() {
                     return Err(error(409, "请先停止 Claude 当前任务后再删除会话"));
                 }
-                authorization.check().await?;
-                self.change(|saved| {
-                    let c = saved
-                        .conversations
-                        .get_mut(id)
-                        .context("Claude 会话不存在")?;
-                    match action {
-                        "markRead" => c.unread = false,
-                        "pinThread" => c.pinned = payload["pinned"] == true,
-                        "rename" => {
-                            if let Some(expected) = payload["expectedName"].as_str()
-                                && c.title != expected
-                            {
-                                return Err(error(409, "会话名称已变化，已丢弃自动命名结果"));
-                            }
-                            let title = payload["title"].as_str().unwrap_or("").trim();
-                            if title.is_empty() || title.chars().count() > 200 {
-                                return Err(error(400, "标题需为 1–200 个字符"));
-                            }
-                            c.title = title.into();
-                        }
-                        "deleteThread" => {
-                            c.deleted = true;
-                            c.turns.clear();
-                        }
-                        _ => unreachable!(),
-                    }
-                    Ok(())
-                })
-                .await?;
-                if action == "deleteThread" {
-                    self.processes.lock().await.remove(id);
-                    self.requests.lock().await.remove(id);
-                    self.publish(json!({"method":"thread/deleted","params":{"threadId":id}}));
-                } else {
-                    self.publish(
-                        json!({"method":"remote/sidebarChanged","params":{"threadId":id}}),
-                    );
-                }
-                Ok(
-                    json!({"ok":true,"threadId":id,"deleted":action=="deleteThread","status":"local_deleted"}),
-                )
+                self.change_metadata(action, id, payload, authorization)
+                    .await
             }
             _ => Err(error(409, "此功能尚未适配 Claude 会话")),
         }
+    }
+
+    /// 用户要求缩短首条消息的等待（CLI 冷启动实测 6–29 秒）：网页输入框开始输入时提前启动 CLI。
+    /// 只对已有原生会话、当前空闲、没有被别的应用持有的共享会话生效；任何一项不满足、或启动失败都静默跳过，
+    /// 不报错也不影响之后的发送（发送时会照常启动并再次核对占用）。预热的 CLI 没有被使用时 2 分钟收回。
+    async fn warm_session(
+        self: &Arc<Self>,
+        id: &str,
+        c: &Conversation,
+        authorization: &HarnessAuthorization,
+    ) -> anyhow::Result<Value> {
+        let skipped = |reason: &str| json!({"ok":true,"threadId":id,"warm":false,"reason":reason});
+        if !c.shared || !c.resumed || c.deleted || c.active() {
+            return Ok(skipped("not-idle"));
+        }
+        // 核对不了占用（WSL 暂时不可用）和确实被占用一样跳过，不去抢别的应用正在使用的会话。
+        match self.external_holders(c).await {
+            Ok(holders) if holders.is_empty() => {}
+            Ok(_) => return Ok(skipped("held-elsewhere")),
+            Err(_) => return Ok(skipped("unavailable")),
+        }
+        let existing = self
+            .processes
+            .lock()
+            .await
+            .get(id)
+            .filter(|process| process.channel.live.load(Ordering::Acquire))
+            .cloned();
+        let process = match existing {
+            Some(process) => process,
+            None => {
+                let Ok(process) = self.spawn(c).await else {
+                    return Ok(skipped("unavailable"));
+                };
+                self.processes
+                    .lock()
+                    .await
+                    .insert(id.into(), process.clone());
+                process
+            }
+        };
+        match process
+            .control(json!({"subtype":"shared_warm"}), Some(authorization))
+            .await
+        {
+            Ok(reply) => Ok(json!({"ok":true,"threadId":id,"warm":reply["warm"] == true})),
+            Err(_) => Ok(skipped("unavailable")),
+        }
+    }
+
+    async fn conversation_exists(&self, id: &str) -> anyhow::Result<()> {
+        self.saved
+            .lock()
+            .await
+            .conversations
+            .get(id)
+            .filter(|c| !c.deleted)
+            .map(|_| ())
+            .ok_or_else(|| error(404, "Claude 会话不存在或已删除"))
+    }
+
+    /// 已读、置顶、重命名、删除：只修改会话记录。已读等三项不取会话锁（见 `command`），删除仍在会话锁内。
+    async fn change_metadata(
+        &self,
+        action: &str,
+        id: &str,
+        payload: &Value,
+        authorization: &HarnessAuthorization,
+    ) -> anyhow::Result<Value> {
+        authorization.check().await?;
+        self.change(|saved| {
+            let c = saved
+                .conversations
+                .get_mut(id)
+                .context("Claude 会话不存在")?;
+            match action {
+                "markRead" => c.unread = false,
+                "pinThread" => c.pinned = payload["pinned"] == true,
+                "rename" => {
+                    if let Some(expected) = payload["expectedName"].as_str()
+                        && c.title != expected
+                    {
+                        return Err(error(409, "会话名称已变化，已丢弃自动命名结果"));
+                    }
+                    let title = payload["title"].as_str().unwrap_or("").trim();
+                    if title.is_empty() || title.chars().count() > 200 {
+                        return Err(error(400, "标题需为 1–200 个字符"));
+                    }
+                    c.title = title.into();
+                }
+                "deleteThread" => {
+                    c.deleted = true;
+                    c.turns.clear();
+                }
+                _ => unreachable!(),
+            }
+            Ok(())
+        })
+        .await?;
+        if action == "deleteThread" {
+            self.processes.lock().await.remove(id);
+            self.requests.lock().await.remove(id);
+            self.publish(json!({"method":"thread/deleted","params":{"threadId":id}}));
+        } else {
+            self.publish(json!({"method":"remote/sidebarChanged","params":{"threadId":id}}));
+        }
+        Ok(
+            json!({"ok":true,"threadId":id,"deleted":action=="deleteThread","status":"local_deleted"}),
+        )
     }
 
     pub async fn permission_selection(
@@ -3073,7 +3447,7 @@ impl Claude {
             c.token_usage = usage.clone();
         }
         if frame["type"] != "stream_event" {
-            self.persist(&saved)?;
+            self.persist_locked(&mut saved).await?;
         }
         drop(saved);
         for item in changed {
@@ -3129,13 +3503,20 @@ impl Claude {
             uuid::Uuid::parse_str(native_id).is_ok(),
             "Claude 原生会话身份无效"
         );
+        // 用户要求缩短操作等待：先在持锁之外完成会话无关的解析与投影（实测 19 MB 历史约 0.3 秒），
+        // 持锁期间只做与当前会话状态相关的合并，其他请求不再排在整段投影之后。
+        let native_clients: BTreeMap<String, String> =
+            serde_json::from_value(frame["clients"].clone())?;
+        let mut projected = project_shared_history(frame, generation);
+        subagents::decorate_turns(id, &mut projected);
         let update = self
-            .change(|saved| {
+            .change_lazy(|saved| {
                 let c = saved
                     .conversations
                     .get_mut(id)
                     .context("Claude 会话不存在")?;
                 anyhow::ensure!(c.shared && !c.deleted, "会话不使用共享传输");
+                let spent_before = c.spent_requests.clone();
                 // 用户要求没有后台 job 也可读原生历史；UUID 必须始终是原会话，不能伪造 job 或换 UUID 掩盖恢复失败。
                 anyhow::ensure!(
                     !c.resumed || c.native_id == native_id,
@@ -3157,7 +3538,7 @@ impl Claude {
                 c.native_status = frame["native_status"].clone();
                 let usage_changed = c.token_usage != usage;
                 c.token_usage = usage.clone();
-                c.native_clients = serde_json::from_value(frame["clients"].clone())?;
+                c.native_clients = native_clients;
                 let pending = frame["pending"].as_array().cloned().unwrap_or_default();
                 c.remote_queue.reconcile(&c.native_clients, &pending);
                 let accepted: Vec<_> = pending
@@ -3169,8 +3550,6 @@ impl Claude {
                 }
                 c.queued_messages = accepted;
                 c.resumed = true;
-                let mut projected = project_shared_history(frame, generation);
-                subagents::decorate_turns(id, &mut projected);
                 restore_shared_images(&c.turns, &mut projected);
                 let reverted = frame.get("history_head").is_some()
                     && c.turns.iter().any(|old| {
@@ -3273,7 +3652,9 @@ impl Claude {
                 } else {
                     Vec::new()
                 };
-                c.turns = projected;
+                if history_changed {
+                    c.turns.set(projected);
+                }
                 // 用户要求正文不反复出现/隐藏：元数据快照沿用同一预览，正式正文或轮次变化时一次性退役。
                 if c.live_preview.as_ref().is_some_and(|preview| {
                     !c.turns.last().is_some_and(|turn| preview.matches(turn))
@@ -3286,36 +3667,45 @@ impl Claude {
                 let changed = history_changed
                     || previous_view != view
                     || previous_queue != c.queue_snapshot(&self.epoch);
-                for (key, value) in c.queue_snapshot(&self.epoch).as_object().unwrap() {
-                    if key != "ok" && key != "threadId" {
-                        view[key] = value.clone();
+                // 没有变化时不整理发布内容：最近 20 轮的展示副本、全部轮次 ID 和计划都要遍历正文。
+                let update = changed.then(|| {
+                    for (key, value) in c.queue_snapshot(&self.epoch).as_object().unwrap() {
+                        if key != "ok" && key != "threadId" {
+                            view[key] = value.clone();
+                        }
                     }
-                }
+                    (
+                        view,
+                        c.turns
+                            .iter()
+                            .rev()
+                            .take(20)
+                            .map(|turn| c.displayed_turn(turn))
+                            .collect::<Vec<_>>(),
+                        c.turns
+                            .iter()
+                            .map(|turn| turn["id"].clone())
+                            .collect::<Vec<_>>(),
+                        tools::session_plan(&c.turns),
+                    )
+                });
+                // 回退分支已消耗的用量只能在回退发生时由旧正文算出；写盘前崩溃可能让旧正文先于账本被替换，
+                // 所以账本变化时不等合并落盘（用户要求回退不能被当成消费撤销）。
+                let ledger_changed = c.spent_requests != spent_before;
                 Ok((
-                    view,
-                    c.turns
-                        .iter()
-                        .rev()
-                        .take(20)
-                        .map(|turn| c.displayed_turn(turn))
-                        .collect::<Vec<_>>(),
-                    c.turns
-                        .iter()
-                        .map(|turn| turn["id"].clone())
-                        .collect::<Vec<_>>(),
-                    tools::session_plan(&c.turns),
+                    update,
                     completed,
                     usage_changed,
-                    changed,
                     reverted,
                     naming_activity,
+                    ledger_changed,
                 ))
             })
             .await?;
-        let (
-            thread, turns, turn_ids, session_plan, completed, usage_changed, changed, reverted,
-            naming_activity,
-        ) = update;
+        let (update, completed, usage_changed, reverted, naming_activity, ledger_changed) = update;
+        if reverted || ledger_changed {
+            self.flush_or_retry_later().await;
+        }
         if !naming_activity.is_empty()
             && let Some(controller) = self.controller.get().and_then(Weak::upgrade)
         {
@@ -3341,7 +3731,7 @@ impl Claude {
             // 显式原生回退沿用已有缓存失效事件；已确认消息的防丢逻辑不能把被回退的旧分支补回来。
             self.publish(json!({"method":"remote/threadReverted","params":{"threadId":id}}));
         }
-        if changed {
+        if let Some((thread, turns, turn_ids, session_plan)) = update {
             self.publish(json!({"method":"claude/history/updated","params":{
                 "threadId":id,"thread":thread,"turns":turns,"turnIds":turn_ids,
                 "sessionPlan":session_plan,"completed":completed}}));
@@ -3369,9 +3759,10 @@ impl Claude {
             return Ok(());
         }
         let mut saved = self.saved.lock().await;
+        // 终端预览只属于当前连接的内存视图（`live_preview` 不序列化），不记入改动，避免每个预览帧都触发落盘。
         let Some(c) = saved
             .conversations
-            .get_mut(id)
+            .get_mut_silent(id)
             .filter(|c| c.shared && !c.deleted)
         else {
             return Ok(());
@@ -5248,7 +5639,9 @@ mod tests {
             spent_requests: BTreeMap::new(),
             turns: vec![
                 json!({"id":"turn-1","_process":"new-process","status":"inProgress","items":[]}),
-            ],
+            ]
+            .into(),
+            last_turn_status: String::new(),
         };
         (directory, service, c)
     }
@@ -5261,7 +5654,8 @@ mod tests {
                 json!({"id":format!("turn-{index}"),
             "_nativeUserId":format!("native-{index}"),"status":"completed","items":[]})
             })
-            .collect();
+            .collect::<Vec<_>>()
+            .into();
         c.turns[0]["plan"] = json!([{"step":"跨页任务","status":"pending"}]);
         service
             .saved
@@ -6980,15 +7374,26 @@ mod tests {
             &std::fs::read(directory.path().join("remote-claude-sessions.json")).unwrap(),
         )
         .unwrap();
+        // 共享会话的正文在侧文件里，主存档只留空数组。
+        assert_eq!(stored["conversations"][&c.id]["turns"], json!([]));
+        let turns: Value = serde_json::from_slice(
+            &std::fs::read(
+                directory
+                    .path()
+                    .join("claude-session-turns")
+                    .join(format!("{}.json", c.id)),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(
-            stored["conversations"][&c.id]["turns"][0]["items"]
-                .as_array()
-                .unwrap()
-                .len(),
+            turns[0]["items"].as_array().unwrap().len(),
             1,
             "其他设置落盘也不能把终端预览保存为正式历史"
         );
+        // 旧版的主存档把正文内联；同时覆盖旧布局读取与迁移。
         let mut legacy = stored;
+        legacy["conversations"][&c.id]["turns"] = turns;
         legacy["conversations"][&c.id]["turns"][0]["items"]
             .as_array_mut()
             .unwrap()
@@ -7144,6 +7549,8 @@ mod tests {
             !std::iter::from_fn(|| events.try_recv().ok())
                 .any(|event| event["method"] == "thread/tokenUsage/updated")
         );
+        // 快照内容合并落盘；服务正常退出时 `release` 会先写完，这里用 flush 代表同一步。
+        service.flush().await.unwrap();
         let restored = Claude::new(directory.path()).unwrap();
         assert_eq!(
             restored.conversation(&c.id).await.unwrap().view()["tokenUsage"],
@@ -7909,7 +8316,7 @@ mod tests {
             {"type":"assistant","message":{"id":"reply","content":[{"type":"text","text":"done"}]}},
             {"type":"system","subtype":"turn_duration","timestampMs":2000}
         ]});
-        c.turns = project_shared_history(&frame, "connection");
+        c.turns = project_shared_history(&frame, "connection").into();
         c.turns[0]["_stopRequested"] = json!(true);
         c.turns[0]["status"] = json!("interrupted");
         service
@@ -8374,7 +8781,8 @@ mod tests {
                 {"type":"system","subtype":"turn_duration"}
             ]}),
             "generation",
-        );
+        )
+        .into();
         assert_eq!(c.view()["capabilities"]["messageEdit"], true);
         assert_eq!(c.view()["messageEditReady"], true);
         for turn in &c.turns {
@@ -8489,5 +8897,592 @@ mod tests {
         assert_eq!(restored.native_id, c.native_id);
         assert_eq!(restored.queued_messages, c.queued_messages);
         assert_eq!(restored.turns[0]["status"], "inProgress");
+    }
+
+    // ---- 会话存档分文件持久化（见 claude_store.rs） ----
+
+    fn turns_file(directory: &Path, c: &Conversation) -> PathBuf {
+        directory
+            .join("claude-session-turns")
+            .join(format!("{}.json", c.id))
+    }
+
+    fn shared_pair(c: &Conversation) -> (Conversation, Conversation) {
+        let mut a = c.clone();
+        a.shared = true;
+        a.turns = vec![json!({"id":"turn-a","status":"completed","items":[]})].into();
+        let mut b = a.clone();
+        b.id = format!("claude-{}", uuid::Uuid::new_v4());
+        b.native_id = uuid::Uuid::new_v4().to_string();
+        (a, b)
+    }
+
+    #[tokio::test]
+    async fn durable_change_does_not_rewrite_other_conversations_turns() {
+        let (directory, service, c) = fixture();
+        let (a, b) = shared_pair(&c);
+        service
+            .change(|saved| {
+                saved.conversations.insert(a.id.clone(), a.clone());
+                saved.conversations.insert(b.id.clone(), b.clone());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(turns_file(directory.path(), &a).exists());
+        assert!(turns_file(directory.path(), &b).exists());
+
+        // 删掉 B 的侧文件：之后若被重写就会重新出现，借此确认没有整份重写。
+        std::fs::remove_file(turns_file(directory.path(), &b)).unwrap();
+        service
+            .change(|saved| {
+                saved.conversations.get_mut(&a.id).unwrap().pinned = true;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(
+            !turns_file(directory.path(), &b).exists(),
+            "只改 A 的元数据，不能重写 B 的正文"
+        );
+
+        service
+            .change(|saved| {
+                saved.conversations.get_mut(&a.id).unwrap().turns[0]["status"] = json!("failed");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let stored: Vec<Value> =
+            serde_json::from_slice(&std::fs::read(turns_file(directory.path(), &a)).unwrap())
+                .unwrap();
+        assert_eq!(stored[0]["status"], "failed", "正文有变才重写该会话的正文");
+        assert!(!turns_file(directory.path(), &b).exists());
+    }
+
+    #[tokio::test]
+    async fn failed_durable_write_rolls_back_memory_and_reports_the_error() {
+        let (directory, service, c) = fixture();
+        let (a, _) = shared_pair(&c);
+        service
+            .change(|saved| {
+                saved.conversations.insert(a.id.clone(), a.clone());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        // 把主存档的临时文件位置占成目录，写入必然失败。
+        let blocker = directory.path().join("remote-claude-sessions.json.tmp");
+        std::fs::create_dir(&blocker).unwrap();
+        let failure = service
+            .change(|saved| {
+                let c = saved.conversations.get_mut(&a.id).unwrap();
+                c.pinned = true;
+                c.turns[0]["status"] = json!("failed");
+                saved
+                    .conversations
+                    .insert(format!("claude-{}", uuid::Uuid::new_v4()), a.clone());
+                Ok(())
+            })
+            .await;
+        assert!(failure.is_err(), "写盘失败必须让调用方看到错误");
+        let current = service.conversation(&a.id).await.unwrap();
+        assert!(!current.pinned, "写盘失败后内存回到修改前");
+        assert_eq!(current.turns[0]["status"], "completed");
+        assert_eq!(service.saved.lock().await.conversations.len(), 1);
+
+        std::fs::remove_dir(&blocker).unwrap();
+        service
+            .change(|saved| {
+                saved.conversations.get_mut(&a.id).unwrap().pinned = true;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        service.flush().await.unwrap();
+        let restored = Claude::new(directory.path()).unwrap();
+        let restored = restored.conversation(&a.id).await.unwrap();
+        assert!(restored.pinned);
+        assert_eq!(
+            restored.turns[0]["status"], "completed",
+            "失败的那次修改没有留在磁盘上"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_change_closure_leaves_state_untouched() {
+        let (_directory, service, c) = fixture();
+        let (a, _) = shared_pair(&c);
+        service
+            .change(|saved| {
+                saved.conversations.insert(a.id.clone(), a.clone());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let failure = service
+            .change(|saved| -> anyhow::Result<()> {
+                saved.conversations.get_mut(&a.id).unwrap().title = "半途修改".into();
+                anyhow::bail!("闭包失败")
+            })
+            .await;
+        assert!(failure.is_err());
+        assert_eq!(service.conversation(&a.id).await.unwrap().title, a.title);
+    }
+
+    #[tokio::test]
+    async fn lazy_changes_wait_for_flush_and_flush_is_idempotent() {
+        let (directory, service, c) = fixture();
+        let (a, _) = shared_pair(&c);
+        service
+            .change(|saved| {
+                saved.conversations.insert(a.id.clone(), a.clone());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        service
+            .change_lazy(|saved| {
+                saved
+                    .conversations
+                    .get_mut(&a.id)
+                    .unwrap()
+                    .turns
+                    .set(vec![json!({"id":"turn-a","status":"failed","items":[]})]);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let on_disk = || -> Vec<Value> {
+            serde_json::from_slice(&std::fs::read(turns_file(directory.path(), &a)).unwrap())
+                .unwrap()
+        };
+        assert_eq!(
+            on_disk()[0]["status"],
+            "completed",
+            "延后落盘在合并间隔内不写盘"
+        );
+        service.flush().await.unwrap();
+        assert_eq!(on_disk()[0]["status"], "failed");
+        std::fs::remove_file(turns_file(directory.path(), &a)).unwrap();
+        service.flush().await.unwrap();
+        assert!(
+            !turns_file(directory.path(), &a).exists(),
+            "已经落盘的内容不能再重复写"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lazy_changes_are_written_by_the_background_flush() {
+        let (directory, service, c) = fixture();
+        let (a, _) = shared_pair(&c);
+        service
+            .change(|saved| {
+                saved.conversations.insert(a.id.clone(), a.clone());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            service
+                .change_lazy(|saved| {
+                    saved
+                        .conversations
+                        .get_mut(&a.id)
+                        .unwrap()
+                        .turns
+                        .set(vec![json!({"id":"turn-a","status":"failed","items":[]})]);
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(LAZY_FLUSH_MIN + Duration::from_millis(100)).await;
+        let read = || -> Vec<Value> {
+            serde_json::from_slice(&std::fs::read(turns_file(directory.path(), &a)).unwrap())
+                .unwrap()
+        };
+        // 写入在阻塞线程里完成：让出调度直到后台落盘任务写出文件。
+        for _ in 0..500 {
+            if read()[0]["status"] == "failed" {
+                break;
+            }
+            tokio::task::yield_now().await;
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            read()[0]["status"],
+            "failed",
+            "合并落盘任务应在间隔后写出快照内容"
+        );
+    }
+
+    #[test]
+    fn lazy_flush_interval_grows_with_the_cost_of_the_last_flush() {
+        assert_eq!(lazy_flush_delay(0), Duration::from_secs(2));
+        assert_eq!(lazy_flush_delay(100), Duration::from_secs(2));
+        assert_eq!(lazy_flush_delay(1_000), Duration::from_secs(8));
+        assert_eq!(
+            lazy_flush_delay(10_000),
+            Duration::from_secs(30),
+            "上限 30 秒"
+        );
+        assert_eq!(lazy_flush_delay(u64::MAX), Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn release_writes_pending_lazy_changes() {
+        let (directory, service, c) = fixture();
+        let (a, _) = shared_pair(&c);
+        service
+            .change(|saved| {
+                saved.conversations.insert(a.id.clone(), a.clone());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        service
+            .change_lazy(|saved| {
+                saved.conversations.get_mut(&a.id).unwrap().unread = true;
+                saved
+                    .conversations
+                    .get_mut(&a.id)
+                    .unwrap()
+                    .turns
+                    .set(vec![json!({"id":"turn-a","status":"failed","items":[]})]);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        service.release().await;
+        let restored = Claude::new(directory.path()).unwrap();
+        let restored = restored.conversation(&a.id).await.unwrap();
+        assert!(restored.unread);
+        assert_eq!(restored.turns[0]["status"], "failed");
+    }
+
+    #[tokio::test]
+    async fn unchanged_discovery_does_not_rewrite_the_archive_but_new_sessions_persist_at_once() {
+        let (directory, service, _) = fixture();
+        let config = WslConfig::default();
+        let sidebar = json!({"recent":[],"pinnedThreads":[],"projects":[]});
+        let native = uuid::Uuid::new_v4().to_string();
+        let rows = vec![
+            json!({"nativeId":native,"cwd":"/mnt/e/shared","title":"原生历史",
+            "createdAt":1000,"updatedAt":2000,"model":"test-model","effort":"low",
+            "nativeStatus":{"tempo":"idle"}}),
+        ];
+        let main = directory.path().join("remote-claude-sessions.json");
+
+        service
+            .register_native_sessions(&config, &rows, &sidebar)
+            .await
+            .unwrap();
+        assert!(
+            main.exists(),
+            "新发现的会话要立即落盘：网页 ID 随机生成，崩溃后重新发现会换 ID"
+        );
+        std::fs::remove_file(&main).unwrap();
+        service
+            .register_native_sessions(&config, &rows, &sidebar)
+            .await
+            .unwrap();
+        service.flush().await.unwrap();
+        assert!(!main.exists(), "没有变化的发现不能重写存档");
+
+        let mut changed = rows.clone();
+        changed[0]["nativeStatus"] = json!({"tempo":"active"});
+        service
+            .register_native_sessions(&config, &changed, &sidebar)
+            .await
+            .unwrap();
+        assert!(!main.exists(), "已有会话的状态更新只合并落盘，不立即写");
+        service.flush().await.unwrap();
+        assert!(main.exists());
+    }
+
+    #[tokio::test]
+    async fn mark_read_writes_the_archive_without_rewriting_unrelated_turns() {
+        let (directory, service, c) = fixture();
+        let (mut a, b) = shared_pair(&c);
+        a.unread = true;
+        service
+            .change(|saved| {
+                saved.conversations.insert(a.id.clone(), a.clone());
+                saved.conversations.insert(b.id.clone(), b.clone());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        std::fs::remove_file(turns_file(directory.path(), &b)).unwrap();
+        let observed = service.conversation(&a.id).await.unwrap();
+        service
+            .clear_missing_history_unread(
+                &observed,
+                &error(
+                    503,
+                    "Claude 控制请求失败：指定 WSL 内没有该原生会话的有效历史",
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!service.conversation(&a.id).await.unwrap().unread);
+        assert!(
+            !turns_file(directory.path(), &b).exists(),
+            "已读确认只写主存档，不重写其他会话的正文"
+        );
+        let restored = Claude::new(directory.path()).unwrap();
+        assert!(
+            !restored.conversation(&a.id).await.unwrap().unread,
+            "已读确认写盘后重启仍保持已读"
+        );
+    }
+
+    /// 模拟长操作持有会话锁时，被测调用必须在期限内完成，不能排在它之后。
+    async fn within<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(10), future)
+            .await
+            .expect("不能排在持有会话锁的长操作之后")
+    }
+
+    #[tokio::test]
+    async fn metadata_actions_and_reads_do_not_wait_for_a_long_session_operation() {
+        let (_directory, service, c) = fixture();
+        let (_auth_directory, auth) = crate::tests::service_dispatch_fixture().await;
+        let (mut a, _) = shared_pair(&c);
+        a.unread = true;
+        service
+            .change(|saved| {
+                saved.conversations.insert(a.id.clone(), a.clone());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        // 模拟一次持续数十秒的发送冷启动：会话锁一直被占着。
+        let lock = service.lock(&a.id).await;
+        let _long_running = lock.lock().await;
+        within(service.command("markRead", &json!({"threadId":a.id}), &auth))
+            .await
+            .unwrap();
+        within(service.command("pinThread", &json!({"threadId":a.id,"pinned":true}), &auth))
+            .await
+            .unwrap();
+        within(service.command("rename", &json!({"threadId":a.id,"title":"新标题"}), &auth))
+            .await
+            .unwrap();
+        // 已由本程序接入、不需要补读原生历史的会话，读取同样不取会话锁。
+        within(service.detail(&a.id)).await.unwrap();
+        within(service.history(&json!({"threadId":a.id})))
+            .await
+            .unwrap();
+        let current = service.conversation(&a.id).await.unwrap();
+        assert!(!current.unread && current.pinned);
+        assert_eq!(current.title, "新标题");
+        // 删除仍与其他会话操作串行：会话锁被占用时必须等待。
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(300),
+                service.command("deleteThread", &json!({"threadId":a.id}), &auth),
+            )
+            .await
+            .is_err(),
+            "删除要等会话锁，避免与进行中的发送或停止交错"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_actions_keep_their_error_semantics_without_the_session_lock() {
+        let (_directory, service, c) = fixture();
+        let (_auth_directory, auth) = crate::tests::service_dispatch_fixture().await;
+        let (a, _) = shared_pair(&c);
+        service
+            .change(|saved| {
+                saved.conversations.insert(a.id.clone(), a.clone());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let missing = service
+            .command(
+                "pinThread",
+                &json!({"threadId":format!("claude-{}",uuid::Uuid::new_v4()),"pinned":true}),
+                &auth,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(missing.downcast_ref::<ApiError>().unwrap().code, 404);
+        let wrong_backend = service
+            .command(
+                "markRead",
+                &json!({"threadId":a.id,"backend":"codex"}),
+                &auth,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(wrong_backend.downcast_ref::<ApiError>().unwrap().code, 409);
+        let stale_name = service
+            .command(
+                "rename",
+                &json!({"threadId":a.id,"title":"自动命名","expectedName":"不是当前名称"}),
+                &auth,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(stale_name.downcast_ref::<ApiError>().unwrap().code, 409);
+        assert_eq!(service.conversation(&a.id).await.unwrap().title, a.title);
+        let empty = service
+            .command("rename", &json!({"threadId":a.id,"title":"  "}), &auth)
+            .await
+            .unwrap_err();
+        assert_eq!(empty.downcast_ref::<ApiError>().unwrap().code, 400);
+    }
+
+    #[test]
+    fn stale_model_catalogs_are_served_while_refreshing_in_the_background() {
+        assert_eq!(
+            catalog_plan(None),
+            CatalogPlan::Probe,
+            "从未探测过才同步等待"
+        );
+        assert_eq!(
+            catalog_plan(Some(Duration::from_secs(1))),
+            CatalogPlan::Serve
+        );
+        assert_eq!(
+            catalog_plan(Some(MODEL_CATALOG_TTL - Duration::from_millis(1))),
+            CatalogPlan::Serve
+        );
+        assert_eq!(
+            catalog_plan(Some(MODEL_CATALOG_TTL)),
+            CatalogPlan::ServeAndRefresh,
+            "过期后继续使用旧目录，发送不为更新目录多等一次 CLI 启动"
+        );
+        assert_eq!(
+            catalog_plan(Some(Duration::from_secs(24 * 3600))),
+            CatalogPlan::ServeAndRefresh
+        );
+    }
+
+    /// 一个假的已连接进程：收到控制请求就按 `reply` 应答，并记下收到的请求。
+    async fn fake_process(
+        service: &Arc<Claude>,
+        id: &str,
+        reply: Value,
+    ) -> Arc<std::sync::Mutex<Vec<Value>>> {
+        let (writer_end, host_end) = tokio::io::duplex(1 << 16);
+        let (writer, _) = spawn_writer(writer_end, WRITE_TIMEOUT);
+        let channel = Arc::new(Channel {
+            live: AtomicBool::new(true),
+            generation: "fake".into(),
+            pending: Mutex::new(HashMap::new()),
+        });
+        let process = Arc::new(Process {
+            _child: Mutex::new(None),
+            writer,
+            channel: channel.clone(),
+            shared: true,
+            initialization: json!({}),
+        });
+        service.processes.lock().await.insert(id.into(), process);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(host_end).lines();
+            while let Ok(Some(text)) = lines.next_line().await {
+                let frame: Value = serde_json::from_str(&text).unwrap();
+                log.lock().unwrap().push(frame["request"].clone());
+                if let Some(sender) = channel
+                    .pending
+                    .lock()
+                    .await
+                    .remove(frame["request_id"].as_str().unwrap())
+                {
+                    let _ = sender.send(Ok(reply.clone()));
+                }
+            }
+        });
+        seen
+    }
+
+    #[tokio::test]
+    async fn warming_asks_the_connected_process_to_start_its_cli_only_for_idle_resumed_sessions() {
+        let (_directory, service, c) = fixture();
+        let (_auth_directory, auth) = crate::tests::service_dispatch_fixture().await;
+        let (mut idle, _) = shared_pair(&c);
+        idle.native_status = json!({"tempo":"idle"});
+        let mut busy = idle.clone();
+        busy.id = format!("claude-{}", uuid::Uuid::new_v4());
+        busy.native_id = uuid::Uuid::new_v4().to_string();
+        busy.native_status = json!({"tempo":"active"});
+        let mut unresumed = idle.clone();
+        unresumed.id = format!("claude-{}", uuid::Uuid::new_v4());
+        unresumed.native_id = uuid::Uuid::new_v4().to_string();
+        unresumed.resumed = false;
+        let mut legacy = idle.clone();
+        legacy.id = format!("claude-{}", uuid::Uuid::new_v4());
+        legacy.native_id = uuid::Uuid::new_v4().to_string();
+        legacy.shared = false;
+        service
+            .change(|saved| {
+                for conversation in [&idle, &busy, &unresumed, &legacy] {
+                    saved
+                        .conversations
+                        .insert(conversation.id.clone(), conversation.clone());
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let seen = fake_process(&service, &idle.id, json!({"warm":true})).await;
+        let reply = service
+            .command("warmSession", &json!({"threadId":idle.id}), &auth)
+            .await
+            .unwrap();
+        assert_eq!(reply["ok"], true);
+        assert_eq!(reply["warm"], true);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![json!({"subtype":"shared_warm"})]
+        );
+
+        // 执行中、没有原生会话、旧版非共享会话：静默跳过，不向任何进程发请求，也不尝试启动。
+        for skipped in [&busy, &unresumed, &legacy] {
+            let others = fake_process(&service, &skipped.id, json!({"warm":true})).await;
+            let reply = service
+                .command("warmSession", &json!({"threadId":skipped.id}), &auth)
+                .await
+                .unwrap();
+            assert_eq!(reply["warm"], false);
+            assert_eq!(reply["reason"], "not-idle");
+            assert!(others.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn warming_does_not_take_over_a_session_held_by_another_application() {
+        let (_directory, service, c) = fixture();
+        let (_auth_directory, auth) = crate::tests::service_dispatch_fixture().await;
+        let (mut idle, _) = shared_pair(&c);
+        idle.native_status = json!({"tempo":"idle"});
+        service
+            .change(|saved| {
+                saved.conversations.insert(idle.id.clone(), idle.clone());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        // 假读取器报告别的应用持有这个原生会话：预热静默跳过，也不向本程序的进程发请求。
+        let _reader = discovery_fixture(&service, json!([]), json!({})).await;
+        *service.test_holders.lock().unwrap() = vec![json!({"pid":4242,"mine":false})];
+        let seen = fake_process(&service, &idle.id, json!({"warm":true})).await;
+        let reply = service
+            .command("warmSession", &json!({"threadId":idle.id}), &auth)
+            .await
+            .unwrap();
+        assert_eq!(reply["ok"], true);
+        assert_eq!(reply["warm"], false);
+        assert_eq!(reply["reason"], "held-elsewhere");
+        assert!(seen.lock().unwrap().is_empty());
     }
 }

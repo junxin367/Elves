@@ -4,6 +4,9 @@ import { clearComposerAttachments, composerAttachmentsLoading, setComposerAttach
 import { permissionModeKnown } from "../../permissions.js";
 import { recoveryStorageMessage } from "../../recovery-store.js";
 import { $ } from "../../ui/dom.js";
+// 历史编辑失败的提示走 notice：漏掉这个导入时，页面里 id="notice" 的元素会变成同名全局变量，
+// 调用只会报“notice is not a function”，并让失败回执卡在“正在确认送达”。
+import { notice } from "../../ui/notice.js";
 import { selectedId, session, setBusy } from "../../core/state.js";
 import { recoveryStore, transcriptCache } from "../../core/stores.js";
 import {

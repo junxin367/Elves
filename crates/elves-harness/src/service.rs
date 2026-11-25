@@ -194,10 +194,16 @@ fn claude_execution_active(directory: &Path) -> bool {
         .any(|conversation| {
             let native = &conversation["nativeStatus"];
             let tempo = native["tempo"].as_str().unwrap_or_default();
-            let last_status = conversation["turns"]
-                .as_array()
-                .and_then(|turns| turns.last())
-                .and_then(|turn| turn["status"].as_str());
+            // 共享会话的正文已移到侧文件，主存档只保留 `lastTurnStatus`；旧存档仍内联正文，按旧方式读取。
+            let last_status = conversation["lastTurnStatus"]
+                .as_str()
+                .filter(|status| !status.is_empty())
+                .or_else(|| {
+                    conversation["turns"]
+                        .as_array()
+                        .and_then(|turns| turns.last())
+                        .and_then(|turn| turn["status"].as_str())
+                });
             // 与 Claude 会话的 active() 规则一致：只把当前原生活动或明确等待交互视为执行中，
             // 不能用历史 turn 的 unknown/pending 反推仍在执行，否则旧会话会永久阻塞安装。
             if tempo == "active" || native["sessionStatus"] == "waiting" {
@@ -879,6 +885,33 @@ mod tests {
         )
         .unwrap();
         assert!(claude_execution_active(directory.path()));
+
+        // 共享会话的正文在侧文件里，主存档只有 `lastTurnStatus`：读它判断阻塞中的会话是否仍在执行。
+        for (last_turn_status, expected) in
+            [("inProgress", true), ("completed", false), ("", false)]
+        {
+            std::fs::write(
+                &path,
+                serde_json::json!({
+                    "conversations": {
+                        "blocked": {
+                            "shared":true,
+                            "deleted":false,
+                            "nativeStatus":{"tempo":"blocked"},
+                            "lastTurnStatus":last_turn_status,
+                            "turns":[]
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+            assert_eq!(
+                claude_execution_active(directory.path()),
+                expected,
+                "lastTurnStatus={last_turn_status:?}"
+            );
+        }
 
         std::fs::write(
             &path,

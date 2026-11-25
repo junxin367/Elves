@@ -5,8 +5,8 @@ import { receiveDiagnosticRequest } from "../../diagnostics.js";
 import { notice } from "../../ui/notice.js";
 import { receiveConversationNaming } from "../settings/conversation-naming.js";
 import {
-  loadSidebar, receiveSharedSettings, renderApprovals, renderGoalStatus, requireAuthentication, resolvePending,
-  scheduleMessages, selectThread, updateComposer
+  loadSidebar, receiveSharedSettings, renderApprovals, renderGoalStatus, renderSidebar, requireAuthentication,
+  resolvePending, scheduleMessages, selectThread, updateComposer
 } from "../../core/actions.js";
 import {
   connected, nativeConnectionVersion, selectedId, session, setNativeConnectionVersion, setThread,

@@ -11,7 +11,7 @@
 //! 下次发送用 `--resume` 接上同一个原生会话。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -32,8 +32,27 @@ const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(25);
 const PREVIEW_INTERVAL: Duration = Duration::from_millis(120);
 const SNAPSHOT_COALESCE: Duration = Duration::from_millis(25);
-/// 宿主优雅收尾最长 30 秒（host.py 的 STOP_TIMEOUT），这里多留余量。
+/// 用户要求缩短首条消息的等待：网页输入框开始输入时提前启动 CLI（`shared_warm`）。预热的 CLI 只占用资源、
+/// 还没有真实使用，所以空闲 2 分钟没有发送消息就收回；一旦写入过用户消息，恢复正常的空闲回收时间。
+const WARM_IDLE_STOP: Duration = Duration::from_secs(120);
+/// 用户要求缩短操作等待：下游（解析、投影、合并）处理一份共享快照的耗时与体量近似成正比
+/// （实测含 19 MB 历史的会话约 1 秒，并持有会话状态锁的一部分时间）。大会话的相邻两份快照至少隔开
+/// `体量 × 每字节纳秒数`，期间的变化合并为一份最新的；小会话的间隔小于合并等待，不受影响。
+/// 需要立即可见的回执走 `emit_now`，不受此限制。
+const SNAPSHOT_NANOS_PER_BYTE: u64 = 50;
+const SNAPSHOT_MAX_SPACING: Duration = Duration::from_secs(3);
+
+fn snapshot_spacing(bytes: usize) -> Duration {
+    Duration::from_nanos((bytes as u64).saturating_mul(SNAPSHOT_NANOS_PER_BYTE))
+        .min(SNAPSHOT_MAX_SPACING)
+}
+/// 宿主收尾最长 35 秒（host.py：STOP_TIMEOUT 30 秒后 SIGTERM，再等 KILL_GRACE 5 秒后强制结束），这里多留余量。
 const GRACEFUL_EXIT: Duration = Duration::from_secs(40);
+/// 停止请求发出后最多等多久：CLI 通常几毫秒内回执并转为空闲；超过它既没有回执、会话也没有空闲，
+/// 就按“CLI 没有响应”处理，强制结束会话进程，让停止有确定的结果。
+const INTERRUPT_WAIT: Duration = Duration::from_secs(8);
+/// 强制结束 CLI 后等它退出的上限：宿主先 SIGTERM，再过 KILL_GRACE（5 秒）补 SIGKILL，这里多留余量。
+const FORCED_EXIT: Duration = Duration::from_secs(15);
 
 pub(in crate::claude) struct Io {
     pub(in crate::claude) writer: Box<dyn AsyncWrite + Send + Unpin>,
@@ -149,6 +168,8 @@ struct Inner {
     selection: StdMutex<(String, String)>,
     state: StdMutex<PeerState>,
     cli: Mutex<Option<Cli>>,
+    /// 停止 CLI 与启动 CLI 互斥：停止要等 CLI 真正退出才算完成，期间不能有人去启动（连上还没退净的宿主）。
+    lifecycle: Mutex<()>,
     cli_generation: AtomicU64,
     cli_pending: CliWaiters,
     /// 等待 `command_lifecycle: queued` 的消息，键是写入 CLI 的用户消息 UUID。
@@ -158,6 +179,10 @@ struct Inner {
     reader: Mutex<Option<ReaderConn>>,
     reader_pending: ReaderWaiters,
     reader_frame: StdMutex<Option<Value>>,
+    /// 当前 CLI 由预热启动且还没有写入过用户消息：空闲回收按 `WARM_IDLE_STOP`。
+    warm_only: AtomicBool,
+    /// 最近一份读取器快照的原始字节数，用来估算下游处理成本。
+    reader_bytes: AtomicUsize,
     reader_rev: AtomicU64,
     state_rev: AtomicU64,
     emitted: StdMutex<(u64, u64)>,
@@ -172,13 +197,15 @@ struct Inner {
     closed: AtomicBool,
     activity: StdMutex<tokio::time::Instant>,
     exited: Notify,
+    /// 对端状态有变化（等会话空闲等场合使用）；与只唤醒发送循环的 `dirty` 分开，可有多个等待者。
+    changed: Notify,
     exit_detail: StdMutex<String>,
 }
 
 /// 失败点的诊断记录：只含事件名、原生会话 ID 前缀和简短原因，不含消息正文、配置内容和 CLI 的 stderr。
 /// 真实 WSL 联调时曾因为宿主丢帧白等 60 秒而没有任何线索，所以对端失败点都留一条记录。
 fn diagnose(event: &str, native_id: &str, detail: Value) {
-    let _ = crate::diagnostic_log::append_diagnostic_log(
+    super::super::diagnose_event(
         &format!("claude.sdk.{event}"),
         json!({"native_id": native_id.chars().take(8).collect::<String>(), "detail": detail}),
     );
@@ -215,6 +242,7 @@ pub(super) fn start(
         state: StdMutex::new(PeerState::new(Vec::new())),
         spec,
         cli: Mutex::new(None),
+        lifecycle: Mutex::new(()),
         cli_generation: AtomicU64::new(0),
         cli_pending: StdMutex::new(HashMap::new()),
         acks: StdMutex::new(HashMap::new()),
@@ -223,6 +251,8 @@ pub(super) fn start(
         reader: Mutex::new(None),
         reader_pending: StdMutex::new(HashMap::new()),
         reader_frame: StdMutex::new(None),
+        warm_only: AtomicBool::new(false),
+        reader_bytes: AtomicUsize::new(0),
         reader_rev: AtomicU64::new(0),
         state_rev: AtomicU64::new(0),
         emitted: StdMutex::new((u64::MAX, u64::MAX)),
@@ -236,6 +266,7 @@ pub(super) fn start(
         closed: AtomicBool::new(false),
         activity: StdMutex::new(tokio::time::Instant::now()),
         exited: Notify::new(),
+        changed: Notify::new(),
         exit_detail: StdMutex::new(String::new()),
     });
     tokio::spawn(write_host(receiver, host_writer));
@@ -327,6 +358,18 @@ impl Inner {
     fn bump(&self) {
         self.state_rev.fetch_add(1, Ordering::AcqRel);
         self.dirty.notify_one();
+        self.changed.notify_waiters();
+    }
+
+    /// 等到会话不再忙（CLI 自己报告空闲，或进程已退出）。
+    async fn wait_idle(&self) {
+        loop {
+            let notified = self.changed.notified();
+            if !self.state(|state| state.busy()) {
+                return;
+            }
+            notified.await;
+        }
     }
 
     fn state<R>(&self, change: impl FnOnce(&mut PeerState) -> R) -> R {
@@ -343,6 +386,7 @@ impl Inner {
         match request["subtype"].as_str().unwrap_or("") {
             "initialize" => self.initialize(request).await,
             "shared_sync" => self.sync().await,
+            "shared_warm" => self.warm().await,
             "shared_send" => self.send(request).await,
             "shared_native_command" => self.native_command(request).await,
             "shared_answer" => self.answer(request).await,
@@ -389,6 +433,17 @@ impl Inner {
         let _ = self.out.send(frame);
     }
 
+    /// 提前启动 CLI。只有 CLI 原本没有运行时才算预热；已经在运行的 CLI 保持原来的空闲回收时间。
+    async fn warm(self: &Arc<Self>) -> Reply {
+        let was_alive = self.alive();
+        self.ensure_cli(false).await?;
+        if !was_alive {
+            self.warm_only.store(true, Ordering::Release);
+        }
+        self.touch_activity();
+        Ok(json!({"warm":!was_alive}))
+    }
+
     async fn sync(self: &Arc<Self>) -> Reply {
         self.reader_control(json!({"subtype":"shared_sync"}))
             .await
@@ -429,6 +484,8 @@ impl Inner {
 
     /// 确保与 CLI 的通道可用；返回是否已连上 CLI。`attach_only` 时只接入已有宿主。
     async fn ensure_cli(self: &Arc<Self>, attach_only: bool) -> Result<bool, PeerError> {
+        // 正在停止的 CLI 还没退净时不能去连它的宿主；等停止完成，启动期间也不让空闲回收等停止插进来。
+        let _lifecycle = self.lifecycle.lock().await;
         let mut guard = self.cli.lock().await;
         if let Some(cli) = guard.as_ref()
             && self.alive()
@@ -597,25 +654,42 @@ impl Inner {
         }
     }
 
-    /// 向 CLI 发控制请求并等待它的回执；返回回执里的 `response`。
-    async fn cli_control(
+    /// 把控制请求写给 CLI 并登记等待回执；返回请求标识与回执通道。写入失败时没有登记任何东西。
+    /// 调用者用完必须从 `cli_pending` 里移除这个标识（`cli_control` 已代劳）。
+    async fn begin_cli_control(
         &self,
         subtype: &str,
         mut fields: Value,
-        timeout: Duration,
-    ) -> Result<Value, String> {
+    ) -> Result<(String, oneshot::Receiver<Result<Value, String>>), PeerError> {
         let id = uuid::Uuid::new_v4().to_string();
         let (sender, receiver) = oneshot::channel();
         lock(&self.cli_pending).insert(id.clone(), sender);
         fields["subtype"] = json!(subtype);
         let frame = json!({"type":"control_request","request_id":id,"request":fields});
-        let outcome = match self.send_cli(&frame).await {
-            Err(failure) => Err(failure.message),
-            Ok(()) => match tokio::time::timeout(timeout, receiver).await {
-                Ok(Ok(result)) => result,
-                Ok(Err(_)) => Err("Claude 控制请求已派发，连接已关闭".to_owned()),
-                Err(_) => Err("Claude 控制请求已派发，回执等待超时".to_owned()),
-            },
+        match self.send_cli(&frame).await {
+            Ok(()) => Ok((id, receiver)),
+            Err(failure) => {
+                lock(&self.cli_pending).remove(&id);
+                Err(failure)
+            }
+        }
+    }
+
+    /// 向 CLI 发控制请求并等待它的回执；返回回执里的 `response`。
+    async fn cli_control(
+        &self,
+        subtype: &str,
+        fields: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        let (id, receiver) = self
+            .begin_cli_control(subtype, fields)
+            .await
+            .map_err(|failure| failure.message)?;
+        let outcome = match tokio::time::timeout(timeout, receiver).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err("Claude 控制请求已派发，连接已关闭".to_owned()),
+            Err(_) => Err("Claude 控制请求已派发，回执等待超时".to_owned()),
         };
         lock(&self.cli_pending).remove(&id);
         outcome
@@ -761,17 +835,31 @@ impl Inner {
         self.bump();
     }
 
-    /// 请求宿主优雅收尾（CLI 完成手头的一轮后自行退出）并等它退出。
+    /// 请求宿主优雅收尾（CLI 完成手头的一轮后自行退出），并等 CLI 真正退出。
     async fn stop_cli(&self) {
+        self.end_cli("host_stop", GRACEFUL_EXIT).await;
+    }
+
+    /// CLI 不响应停止请求时强制结束：宿主先 SIGTERM 让它清理，再补 SIGKILL，并等它真正退出。
+    async fn kill_cli(&self) {
+        self.end_cli("host_kill", FORCED_EXIT).await;
+    }
+
+    /// 向宿主发 `command`（host_stop 或 host_kill）并等 CLI 退出，最多等 `limit`。
+    ///
+    /// 写端要保持打开，直到宿主报告 CLI 已退出（host_exit）：先关写端，宿主会立刻放开这条连接，连接端随之退出，
+    /// 这里就会在 CLI 还在收尾（关闭 MCP 服务、写会话记录）时以为它已经退出。用户的实例带着多个 MCP 服务，
+    /// CLI 收尾要好几秒，编辑历史消息因此在回退前误报“原生会话仍在其他 CLI 中打开”（2026-11-25 实际发生）。
+    async fn end_cli(&self, command: &str, limit: Duration) {
+        let _lifecycle = self.lifecycle.lock().await;
         let cli = self.cli.lock().await.take();
         let Some(cli) = cli else {
             return;
         };
         let _ = cli.writer.send(Line {
-            bytes: b"{\"type\":\"host_stop\"}\n".to_vec(),
+            bytes: format!("{{\"type\":\"{command}\"}}\n").into_bytes(),
             done: None,
         });
-        drop(cli.writer);
         let wait = async {
             loop {
                 let notified = self.exited.notified();
@@ -781,7 +869,7 @@ impl Inner {
                 notified.await;
             }
         };
-        if tokio::time::timeout(GRACEFUL_EXIT, wait).await.is_err() {
+        if tokio::time::timeout(limit, wait).await.is_err() {
             drop(cli.guard);
         }
     }
@@ -945,6 +1033,8 @@ impl Inner {
     /// 写入一条用户消息并等待 CLI 的 queued 回执。写入失败且明确未发出才算未投递；
     /// 已写入但没有回执只能算结果未知，保留意图供核对，绝不自动重发。
     async fn deliver(&self, uuid: &str, frame: &Value) -> Result<(), PeerError> {
+        // 写入用户消息就不再是单纯的预热：恢复正常的空闲回收时间。
+        self.warm_only.store(false, Ordering::Release);
         let (sender, receiver) = oneshot::channel();
         lock(&self.acks).insert(uuid.to_owned(), sender);
         if let Err(failure) = self.send_cli(frame).await {
@@ -1107,6 +1197,11 @@ impl Inner {
         Ok(json!({"nativeSettings":self.settings_projection()}))
     }
 
+    /// 停止当前执行。用户要求停止必须有确定的结果：不能再像 2026-11-25 那样等满 60 秒、
+    /// 最后留下“送达状态未知”（那次 CLI 已在原生记录里写下中断标记，控制请求却一直没有回执）。
+    ///
+    /// 发出 `interrupt` 后，CLI 回执、或会话转为空闲（CLI 自己报告，或进程已退出）任一出现就算停止成功；
+    /// 等满 `INTERRUPT_WAIT` 仍两者皆无，说明 CLI 没有响应，强制结束会话进程（下次发送会用 --resume 接上）。
     async fn interrupt(self: &Arc<Self>) -> Reply {
         if !self.alive() {
             return Ok(json!({"nativeSettings":self.settings_projection()}));
@@ -1117,10 +1212,37 @@ impl Inner {
                 .reader_control(json!({"subtype":"sdk_signal","stopping":true}))
                 .await;
         }
-        self.cli_control("interrupt", json!({}), CLI_CONTROL_TIMEOUT)
-            .await
-            .map_err(|message| PeerError::plain(message, false))?;
-        Ok(json!({"nativeSettings":self.settings_projection()}))
+        // 写入失败说明停止请求明确没有送达，原样报告；已写入才进入下面的等待。
+        let (id, receiver) = self.begin_cli_control("interrupt", json!({})).await?;
+        let outcome = tokio::select! {
+            response = receiver => Some(response),
+            () = self.wait_idle() => None,
+            () = tokio::time::sleep(INTERRUPT_WAIT) => {
+                // 等待的最后一刻再看一眼，避免回执与超时恰好同时到达时误杀。
+                if self.state(|state| state.busy()) { Some(Ok(Err("Claude 没有响应停止请求".to_owned()))) } else { None }
+            }
+        };
+        lock(&self.cli_pending).remove(&id);
+        let settled = match outcome {
+            None | Some(Ok(Ok(_))) => true,
+            // 连接关闭：进程已经退出，执行随之结束。
+            Some(Err(_)) => !self.alive() || !self.state(|state| state.busy()),
+            // CLI 明确拒绝，或等满仍没有回执：都不能让用户一直等下去。
+            Some(Ok(Err(_))) => !self.state(|state| state.busy()),
+        };
+        if settled {
+            return Ok(json!({"nativeSettings":self.settings_projection()}));
+        }
+        diagnose("interrupt_unresponsive", &self.spec.native_id, json!({}));
+        self.kill_cli().await;
+        if self.alive() {
+            return Err(PeerError::new(
+                "ESESSION",
+                "Claude 没有响应停止请求，强制结束进程也未成功，请稍后重试",
+                false,
+            ));
+        }
+        Ok(json!({"nativeSettings":self.settings_projection(),"forced":true}))
     }
 
     async fn set_model(self: &Arc<Self>, request: &Value) -> Reply {
@@ -1376,6 +1498,9 @@ async fn read_reader(inner: Arc<Inner>, reader: Box<dyn AsyncRead + Send + Unpin
     let mut line = Vec::new();
     while let Some(parsed) = read_json_line(&mut reader, &mut line).await {
         if let Some(frame) = parsed {
+            if frame["type"] == "shared_snapshot" {
+                inner.reader_bytes.store(line.len(), Ordering::Release);
+            }
             inner.on_reader_frame(frame).await;
         }
     }
@@ -1406,6 +1531,8 @@ async fn emit_loop(inner: Arc<Inner>) {
         if inner.out.send(frame).is_err() {
             return;
         }
+        // 放宽下一份的最短间隔；其间的变化已经通过 dirty 通知记下，间隔结束后合并发出最新状态。
+        tokio::time::sleep(snapshot_spacing(inner.reader_bytes.load(Ordering::Acquire))).await;
     }
 }
 
@@ -1452,7 +1579,12 @@ async fn idle_loop(inner: Arc<Inner>) {
             continue;
         }
         let idle_for = lock(&inner.activity).elapsed();
-        if idle_for >= inner.spec.idle_stop {
+        let limit = if inner.warm_only.load(Ordering::Acquire) {
+            WARM_IDLE_STOP.min(inner.spec.idle_stop)
+        } else {
+            inner.spec.idle_stop
+        };
+        if idle_for >= limit {
             // 空闲会话不长期占用一个 CLI 进程；下次发送用 --resume 接上同一个原生会话。
             inner.stop_cli().await;
         }
@@ -1473,6 +1605,11 @@ mod tests {
         cli: StdMutex<Vec<Value>>,
         reader: StdMutex<Vec<Value>>,
         specs: StdMutex<Vec<CliSpec>>,
+        /// 假 CLI 收到 host_stop / host_kill 的时刻，以及它真正退出（连接关闭）的时刻。
+        stop_seen_at: StdMutex<Option<tokio::time::Instant>>,
+        exited_at: StdMutex<Option<tokio::time::Instant>>,
+        /// 假读取器收到 sdk_rewind 的时刻。
+        rewound_at: StdMutex<Option<tokio::time::Instant>>,
     }
 
     struct Fake {
@@ -1484,6 +1621,8 @@ mod tests {
         refuse: bool,
         /// 宿主连接端在发出 host_hello 之前收到的内容会被丢弃（重现真实 WSL 联调中的缺陷）。
         lossy_hello: bool,
+        /// 收到 host_stop / host_kill 后 CLI 还要收尾多久才真正退出（带多个 MCP 服务的实例要数秒）。
+        stop_delay: Duration,
     }
 
     fn line(frame: &Value) -> Vec<u8> {
@@ -1527,6 +1666,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn snapshot_spacing_grows_with_frame_size_and_is_capped() {
+        // 小会话的间隔不超过合并等待，行为不变。
+        assert!(snapshot_spacing(0) <= SNAPSHOT_COALESCE);
+        assert!(snapshot_spacing(400_000) <= SNAPSHOT_COALESCE);
+        // 实测 19 MB 历史的下游处理约 1 秒，相邻两份快照至少隔开这么久。
+        let large = snapshot_spacing(19 * 1024 * 1024);
+        assert!(
+            large > Duration::from_millis(900) && large < Duration::from_millis(1100),
+            "{large:?}"
+        );
+        assert_eq!(snapshot_spacing(usize::MAX), SNAPSHOT_MAX_SPACING);
+        assert!(
+            SNAPSHOT_MAX_SPACING <= Duration::from_secs(5),
+            "再大也不能让状态更新迟到太久"
+        );
+    }
+
     fn snapshot() -> Value {
         json!({"type":"shared_snapshot","native_id":NATIVE,"job_id":"","native_status":{"tempo":"idle"},
             "messages":[],"history_head":"h","retired_usage":[],"clients":{},"pending":[],"requests":{},
@@ -1550,8 +1707,12 @@ mod tests {
                 });
             }
             let (script, log) = (self.cli.clone(), self.log.clone());
-            let (attach_only, host_exists, lossy) =
-                (spec.attach_only, self.host_exists, self.lossy_hello);
+            let (attach_only, host_exists, lossy, stop_delay) = (
+                spec.attach_only,
+                self.host_exists,
+                self.lossy_hello,
+                self.stop_delay,
+            );
             tokio::spawn(async move {
                 if lossy {
                     // 重现真实宿主连接端的缺陷：host_hello 之前收到的内容会被丢掉（曾让 initialize 无人应答）。
@@ -1570,11 +1731,31 @@ mod tests {
                 let hello = json!({"type":"host_hello","pid":1,"state":"idle"});
                 let _ = cli_out.write_all(&line(&hello)).await;
                 let mut lines = BufReader::new(cli_in).lines();
-                while let Ok(Some(text)) = lines.next_line().await {
+                // CLI 收尾结束的信号：真实宿主在 CLI 收尾期间保持连接，收尾结束才报告退出并断开。
+                let (finished, mut cli_gone) = oneshot::channel::<()>();
+                let mut finished = Some(finished);
+                loop {
+                    let next = tokio::select! {
+                        next = lines.next_line() => next,
+                        _ = &mut cli_gone => break,
+                    };
+                    // 对端关闭写端：真实的连接端会立刻放开这条连接（即使 CLI 还在收尾），这里同样立刻断开。
+                    let Ok(Some(text)) = next else {
+                        break;
+                    };
                     let frame: Value = serde_json::from_str(&text).unwrap();
                     lock(&log.cli).push(frame.clone());
-                    if frame["type"] == "host_stop" {
-                        break;
+                    if frame["type"] == "host_stop" || frame["type"] == "host_kill" {
+                        *lock(&log.stop_seen_at) = Some(tokio::time::Instant::now());
+                        if let Some(finished) = finished.take() {
+                            let log = log.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(stop_delay).await;
+                                *lock(&log.exited_at) = Some(tokio::time::Instant::now());
+                                let _ = finished.send(());
+                            });
+                        }
+                        continue;
                     }
                     for out in script(&frame) {
                         let _ = cli_out.write_all(&line(&out)).await;
@@ -1630,7 +1811,10 @@ mod tests {
                                 "last_seen":"last-1","cwd":"/work"}),
                         )),
                         "sdk_rewind" if request["target"] == "refuse" => out.push(failure(id, "refused")),
-                        "sdk_rewind" => out.push(success(id, json!({"rewound":true}))),
+                        "sdk_rewind" => {
+                            *lock(&log.rewound_at) = Some(tokio::time::Instant::now());
+                            out.push(success(id, json!({"rewound":true})));
+                        }
                         _ => out.push(success(id, json!({}))),
                     }
                     for frame in out {
@@ -1672,6 +1856,24 @@ mod tests {
             lossy_hello: bool,
             idle_stop: Duration,
         ) -> Self {
+            Self::build_slow(
+                cli,
+                host_exists,
+                refuse,
+                lossy_hello,
+                Duration::ZERO,
+                idle_stop,
+            )
+        }
+
+        fn build_slow(
+            cli: Script,
+            host_exists: bool,
+            refuse: bool,
+            lossy_hello: bool,
+            stop_delay: Duration,
+            idle_stop: Duration,
+        ) -> Self {
             let log = Arc::new(Log::default());
             let backend = Arc::new(Fake {
                 log: log.clone(),
@@ -1679,6 +1881,7 @@ mod tests {
                 host_exists,
                 refuse,
                 lossy_hello,
+                stop_delay,
             });
             let (writer, reader) = super::super::connect_with(backend, NATIVE, false, idle_stop);
             let frames = Arc::new(StdMutex::new(Vec::new()));
@@ -1923,6 +2126,104 @@ mod tests {
             !reader.contains(&"sdk_prepare".to_owned()),
             "没连上 CLI 就不登记派发意图"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn warming_starts_the_cli_without_sending_and_a_later_send_reuses_it() {
+        let mut upper = Upper::standard();
+        upper.initialize(json!({})).await;
+        assert!(lock(&upper.log.specs).is_empty(), "初始化不启动 CLI");
+        let reply = upper.call(json!({"subtype":"shared_warm"})).await;
+        assert_eq!(reply["subtype"], "success", "{reply}");
+        assert_eq!(reply["response"]["warm"], true);
+        assert_eq!(lock(&upper.log.specs).len(), 1, "预热启动了一个 CLI");
+        assert!(
+            !upper.cli_log().iter().any(|frame| frame["type"] == "user"),
+            "预热不能向 CLI 写任何用户消息"
+        );
+        assert_eq!(
+            upper.call(send_request("client-1", "hi")).await["subtype"],
+            "success"
+        );
+        assert_eq!(
+            lock(&upper.log.specs).len(),
+            1,
+            "发送复用预热好的 CLI，不再启动第二个"
+        );
+        // 已经运行的 CLI 再预热：没有新启动，也不算预热。
+        let again = upper.call(json!({"subtype":"shared_warm"})).await;
+        assert_eq!(again["response"]["warm"], false);
+        assert_eq!(lock(&upper.log.specs).len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_warmed_cli_that_is_never_used_is_reclaimed_early() {
+        let mut upper = Upper::standard();
+        upper.initialize(json!({})).await;
+        upper.call(json!({"subtype":"shared_warm"})).await;
+        tokio::time::sleep(WARM_IDLE_STOP - Duration::from_secs(40)).await;
+        assert!(lock(&upper.log.stop_seen_at).is_none(), "预热期限内不回收");
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        assert!(
+            lock(&upper.log.stop_seen_at).is_some(),
+            "预热后一直没有发送消息，2 分钟左右就收回，不占用 10 分钟"
+        );
+    }
+
+    /// 收到用户消息后立即回答完并回到空闲，空闲回收才会计时。
+    fn answering_cli(frame: &Value) -> Vec<Value> {
+        let mut out = standard_cli(frame);
+        if frame["type"] == "user" {
+            out.push(json!({"type":"system","subtype":"session_state_changed","state":"idle"}));
+        }
+        out
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sending_after_warming_restores_the_normal_idle_time() {
+        let mut upper = Upper::start(Arc::new(answering_cli), false, Duration::from_secs(600));
+        upper.initialize(json!({})).await;
+        upper.call(json!({"subtype":"shared_warm"})).await;
+        assert_eq!(
+            upper.call(send_request("client-1", "hi")).await["subtype"],
+            "success"
+        );
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        assert!(
+            lock(&upper.log.stop_seen_at).is_none(),
+            "发送过消息的 CLI 按正常的 10 分钟回收，不能被预热的短期限收走"
+        );
+        tokio::time::sleep(Duration::from_secs(400)).await;
+        assert!(lock(&upper.log.stop_seen_at).is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn warming_a_running_cli_does_not_shorten_its_idle_time() {
+        let mut upper = Upper::start(Arc::new(answering_cli), false, Duration::from_secs(600));
+        upper.initialize(json!({})).await;
+        upper.call(send_request("client-1", "hi")).await;
+        upper.call(json!({"subtype":"shared_warm"})).await;
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        assert!(lock(&upper.log.stop_seen_at).is_none());
+        tokio::time::sleep(Duration::from_secs(400)).await;
+        assert!(
+            lock(&upper.log.stop_seen_at).is_some(),
+            "已经在运行的 CLI 仍按原来的 10 分钟回收"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn warming_reports_a_cli_that_cannot_start() {
+        let mut upper = Upper::start_with(
+            Arc::new(standard_cli),
+            false,
+            true,
+            Duration::from_secs(600),
+        );
+        upper.initialize(json!({})).await;
+        let reply = upper.call(json!({"subtype":"shared_warm"})).await;
+        assert_eq!(reply["subtype"], "error", "{reply}");
+        assert_eq!(reply["not_sent"], true);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2380,6 +2681,163 @@ mod tests {
             !lock(&log.cli)
                 .iter()
                 .any(|frame| frame["type"] == "host_stop")
+        );
+    }
+
+    /// 带多个 MCP 服务的实例，CLI 收到停止后还要收尾数秒（2026-11-25 用户实机：编辑历史消息报“原生会话仍在其他 CLI 中打开”）。
+    /// 回退前必须等 CLI 真正退出，否则读取器核对持有者时仍会看到它的登记。
+    #[tokio::test(start_paused = true)]
+    async fn editing_waits_until_the_cli_has_really_exited_before_rewinding() {
+        let mut upper = Upper::build_slow(
+            Arc::new(finishing_cli),
+            false,
+            false,
+            false,
+            Duration::from_secs(7),
+            Duration::from_secs(600),
+        );
+        upper.initialize(json!({})).await;
+        assert_eq!(
+            upper.call(send_request("client-1", "first")).await["subtype"],
+            "success"
+        );
+        upper
+            .wait_for(|f| f["type"] == "shared_snapshot" && f["native_status"]["tempo"] == "idle")
+            .await;
+
+        let response = upper.call(edit_request("改后的内容")).await;
+        assert_eq!(response["subtype"], "success", "{response}");
+        let stop_seen = lock(&upper.log.stop_seen_at).expect("CLI 应收到停止请求");
+        let exited = lock(&upper.log.exited_at).expect("CLI 应已退出");
+        let rewound = lock(&upper.log.rewound_at).expect("应已请求回退");
+        assert!(
+            exited - stop_seen >= Duration::from_secs(7),
+            "假 CLI 收尾 7 秒"
+        );
+        assert!(
+            rewound >= exited,
+            "必须等 CLI 真正退出才能回退：退出 {exited:?}，回退 {rewound:?}"
+        );
+    }
+
+    /// CLI 一直不响应停止请求（既不回执也不转为空闲）：不能让用户等 60 秒后落到“未知”，
+    /// 要限时强制结束进程，并明确告知这是强制停止。
+    #[tokio::test(start_paused = true)]
+    async fn an_unresponsive_cli_is_force_stopped_with_a_definite_result() {
+        let silent: Script = Arc::new(|frame| {
+            if frame["type"] == "control_request" && frame["request"]["subtype"] == "interrupt" {
+                return vec![];
+            }
+            standard_cli(frame)
+        });
+        let mut upper = Upper::start(silent, false, Duration::from_secs(600));
+        upper.initialize(json!({})).await;
+        assert_eq!(
+            upper.call(send_request("client-1", "work")).await["subtype"],
+            "success"
+        );
+        let started = tokio::time::Instant::now();
+        let response = upper.call(json!({"subtype":"interrupt"})).await;
+        let took = started.elapsed();
+        assert_eq!(response["subtype"], "success", "{response}");
+        assert_eq!(response["response"]["forced"], true);
+        assert!(
+            took >= INTERRUPT_WAIT && took < INTERRUPT_WAIT + FORCED_EXIT,
+            "等满 INTERRUPT_WAIT 才强制，且在 FORCED_EXIT 内完成：{took:?}"
+        );
+        assert!(
+            upper
+                .cli_log()
+                .iter()
+                .any(|frame| frame["type"] == "host_kill"),
+            "必须向宿主发出强制结束"
+        );
+        // 进程已结束：会话回到空闲，下一次发送用 --resume 接上原会话。
+        upper
+            .wait_for(|f| f["type"] == "shared_snapshot" && f["native_status"]["tempo"] == "idle")
+            .await;
+        assert_eq!(
+            upper.call(send_request("client-2", "again")).await["subtype"],
+            "success"
+        );
+        let specs = lock(&upper.log.specs).clone();
+        assert_eq!(specs.len(), 2);
+        assert!(specs[1].resumed);
+    }
+
+    /// CLI 明确拒绝停止请求且仍在执行：同样要强制结束，而不是只给一个错误提示让用户无计可施。
+    #[tokio::test(start_paused = true)]
+    async fn a_cli_that_refuses_to_interrupt_is_force_stopped() {
+        let refusing: Script = Arc::new(|frame| {
+            if frame["type"] == "control_request" && frame["request"]["subtype"] == "interrupt" {
+                return vec![failure(&frame["request_id"], "cannot interrupt")];
+            }
+            standard_cli(frame)
+        });
+        let mut upper = Upper::start(refusing, false, Duration::from_secs(600));
+        upper.initialize(json!({})).await;
+        assert_eq!(
+            upper.call(send_request("client-1", "work")).await["subtype"],
+            "success"
+        );
+        let response = upper.call(json!({"subtype":"interrupt"})).await;
+        assert_eq!(response["subtype"], "success", "{response}");
+        assert_eq!(response["response"]["forced"], true);
+        assert!(
+            upper
+                .cli_log()
+                .iter()
+                .any(|frame| frame["type"] == "host_kill")
+        );
+    }
+
+    /// 回执没有到达、但 CLI 已自行报告空闲：停止已经生效，直接成功，不强制结束。
+    #[tokio::test(start_paused = true)]
+    async fn an_interrupt_is_done_once_the_session_reports_idle_even_without_a_receipt() {
+        let idle_only: Script = Arc::new(|frame| {
+            if frame["type"] == "control_request" && frame["request"]["subtype"] == "interrupt" {
+                return vec![
+                    json!({"type":"system","subtype":"session_state_changed","state":"idle"}),
+                ];
+            }
+            standard_cli(frame)
+        });
+        let mut upper = Upper::start(idle_only, false, Duration::from_secs(600));
+        upper.initialize(json!({})).await;
+        assert_eq!(
+            upper.call(send_request("client-1", "work")).await["subtype"],
+            "success"
+        );
+        let started = tokio::time::Instant::now();
+        let response = upper.call(json!({"subtype":"interrupt"})).await;
+        assert_eq!(response["subtype"], "success", "{response}");
+        assert!(response["response"]["forced"].is_null(), "{response}");
+        assert!(started.elapsed() < INTERRUPT_WAIT);
+        assert!(
+            !upper
+                .cli_log()
+                .iter()
+                .any(|frame| frame["type"] == "host_kill")
+        );
+    }
+
+    /// 正常情况：CLI 立即回执，会话稍后才转为空闲；停止成功，不强制结束。
+    #[tokio::test(start_paused = true)]
+    async fn an_acknowledged_interrupt_does_not_kill_the_cli() {
+        let mut upper = Upper::standard();
+        upper.initialize(json!({})).await;
+        assert_eq!(
+            upper.call(send_request("client-1", "work")).await["subtype"],
+            "success"
+        );
+        let response = upper.call(json!({"subtype":"interrupt"})).await;
+        assert_eq!(response["subtype"], "success", "{response}");
+        assert!(response["response"]["forced"].is_null(), "{response}");
+        assert!(
+            !upper
+                .cli_log()
+                .iter()
+                .any(|frame| frame["type"] == "host_kill" || frame["type"] == "host_stop")
         );
     }
 }

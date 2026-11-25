@@ -46,6 +46,7 @@ import { resizeEditorInput } from "./composer/prompt-editor.js";
 import { activatePromptOptimization, openPromptOptimizationSettings } from "./composer/prompt-optimization.js";
 import { removeAdjacentPromptToken, selectSkill } from "./composer/selected-skills.js";
 import { moveSlashIndex, skillIndex } from "./composer/skill-catalog.js";
+import { warmSessionOnInput } from "./composer/warm.js";
 import {
   handlePromptInput, renderSkillMenu, selectCompactCommand, selectForkCommand, selectPromptOptimizationCommand, slashMenuEntries, updateSkillMenu
 } from "./composer/skills.js";
@@ -589,9 +590,13 @@ export function shell() {
     $("#prompt").setRangeText(text, $("#prompt").selectionStart, $("#prompt").selectionEnd, "end");
     handlePromptInput(event, { preserveCanonical: true });
   };
-  $("#prompt").oninput = event => handlePromptInput(event, {
-    preserveCanonical: ["insertParagraph", "insertLineBreak"].includes(event.inputType)
-  });
+  $("#prompt").oninput = event => {
+    handlePromptInput(event, {
+      preserveCanonical: ["insertParagraph", "insertLineBreak"].includes(event.inputType)
+    });
+    // 用户要求缩短首条消息的等待：开始输入时提前启动 Claude CLI（见 composer/warm.js）。
+    warmSessionOnInput();
+  };
   $("#prompt").oncompositionstart = () => $("#prompt").editHistory?.startComposition();
   $("#prompt").oncompositionend = event => {
     $("#prompt").editHistory?.endComposition();

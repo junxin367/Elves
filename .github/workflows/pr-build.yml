@@ -118,7 +118,7 @@ jobs:
           cargo test -p elves-harness --lib -- --test-threads=1
 
       - name: Harness 回归与证据校验测试
-        run: node --test scripts/harness-e2e-evidence.test.mjs scripts/harness-e2e-environment.test.mjs scripts/harness-e2e-receipt-driver.test.mjs scripts/harness-ui-state.test.mjs scripts/workspace-tabs.test.mjs scripts/windows-remote-titlebar.test.mjs scripts/windows-remote-cache.test.mjs
+        run: node --test scripts/harness-e2e-evidence.test.mjs scripts/harness-e2e-environment.test.mjs scripts/harness-e2e-receipt-driver.test.mjs scripts/harness-ui-state.test.mjs scripts/workspace-tabs.test.mjs scripts/harness-undeclared-names.test.mjs scripts/windows-remote-titlebar.test.mjs scripts/windows-remote-cache.test.mjs
 
       - name: Build release binaries
         # 用户要求统一客户端入口，安装包仅交付内置 Harness 的 Elves 客户端。

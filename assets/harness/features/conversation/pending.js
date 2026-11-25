@@ -15,7 +15,7 @@ import {
   recoveryGeneration, setRecoveryScope, smallInputStorageRecord, snapshotDraft, submittedDrafts
 } from "../composer/drafts.js";
 import { selectCreatedThread } from "../composer/new-chat-settings.js";
-import { confirmPendingSend, pending, pendingTimer, setPendingTimer } from "./pending-state.js";
+import { confirmPendingSend, pending, pendingTimer, sendNotDelivered, setPendingTimer } from "./pending-state.js";
 import { savePending } from "./pending-store.js";
 import { applyGoalComposerReceipt, updateGoalComposerPending } from "../goal/composer-submission.js";
 import { goalComposerAction, goalReceiptOutcome, goalSubmissionState, goalVersion } from "../goal/state.js";
@@ -245,9 +245,16 @@ export async function resolvePending() {
       if (!stillCurrent()) return;
       if (confirmed) receipt = { state: "completed", result: confirmed };
       else if (receipt.state === "unknown") {
-        if (typeof (receipt.result?.clientUserMessageId ?? current.payload?.clientUserMessageId) === "string") retry(5000);
-        else notice("回执缺少客户端消息标识，无法自动核对。请在会话中确认后再解除锁定。", true);
-        updateComposer(); return;
+        // 服务端已按原生证据结案为“没有送达”：与明确失败同样处理，恢复输入并解除锁定，不重发。
+        const abandoned = await sendNotDelivered(current).catch(() => false);
+        if (!stillCurrent()) return;
+        if (abandoned) receipt = { state: "failed", result: { ok: false, notSent: true, code: "not-delivered",
+          message: "消息没有送达，内容已保留，可以恢复后重新发送。" } };
+        else {
+          if (typeof (receipt.result?.clientUserMessageId ?? current.payload?.clientUserMessageId) === "string") retry(5000);
+          else notice("回执缺少客户端消息标识，无法自动核对。请在会话中确认后再解除锁定。", true);
+          updateComposer(); return;
+        }
       }
     }
     if (receipt.state === "pending") { retry(2000); return; }
@@ -408,7 +415,19 @@ export async function resolvePending() {
             selectedId === current.payload.threadId && current.selectionToken === selectionToken);
           updateComposer();
           if (selectedId === current.payload.threadId) await reloadThread();
-        } else if (stillCurrent()) retry(5000);
+        } else if (stillCurrent()) {
+          // 回执已丢失时同样只认服务端按原生证据的结案；否则继续只读核对。
+          if (await sendNotDelivered(current).catch(() => false) && stillCurrent()) {
+            try { await recoverFailedInput(current); }
+            catch (failure) {
+              notice(failure.message || "输入恢复失败，原请求回执已保留，请勿重新发送。", true);
+              retry(5000); updateComposer(); return;
+            }
+            if (!stillCurrent()) return;
+            savePending(null);
+            notice("消息没有送达，内容已保留，可以恢复后重新发送。", true);
+          } else retry(5000);
+        }
       }
       else notice("未找到上一条消息的回执。不会自动重发；请先检查会话。", true);
       updateComposer();

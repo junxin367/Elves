@@ -32,7 +32,7 @@ cargo check --workspace
 ```powershell
 cargo test --workspace --exclude elves-harness
 cargo test -p elves-harness --lib -- --test-threads=1
-node --test scripts/harness-ui-state.test.mjs scripts/harness-e2e-evidence.test.mjs scripts/harness-e2e-environment.test.mjs scripts/harness-e2e-receipt-driver.test.mjs scripts/workspace-tabs.test.mjs scripts/windows-remote-cache.test.mjs scripts/windows-remote-titlebar.test.mjs
+node --test scripts/harness-ui-state.test.mjs scripts/harness-e2e-evidence.test.mjs scripts/harness-e2e-environment.test.mjs scripts/harness-e2e-receipt-driver.test.mjs scripts/workspace-tabs.test.mjs scripts/harness-undeclared-names.test.mjs scripts/windows-remote-cache.test.mjs scripts/windows-remote-titlebar.test.mjs
 .\scripts\build-windows-installer.ps1
 ```
 

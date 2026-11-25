@@ -4,6 +4,7 @@ import { notice } from "../../ui/notice.js";
 import { updateComposer } from "../../core/actions.js";
 import { selectedId, session, turns } from "../../core/state.js";
 import { api } from "../api.js";
+import { claudeThreadId } from "../session/capabilities.js";
 
 export let pendingTimer = null;
 export function setPendingTimer(value) { return pendingTimer = value; }
@@ -75,4 +76,17 @@ export async function confirmPendingSend(current, result = {}) {
   const request = { current, promise }; pendingSendRequest = request;
   try { return await promise; }
   finally { if (pendingSendRequest === request) pendingSendRequest = null; }
+}
+// Claude 服务端按原生证据判定这条消息没有送达（会话已空闲，且始终没有接收记录）。
+// 用户要求 Harness 自己判定送达结果，不再让用户去原生客户端核对（2026-11-25）：调用方据此恢复输入并解除锁定，
+// 绝不自动重发。只认服务端对同一线程、同一消息标识的明确答复；原生记录晚到时服务端会改回已接收，见 queue_send_state。
+export async function sendNotDelivered(current) {
+  const threadId = current.payload?.threadId, clientId = current.payload?.clientUserMessageId;
+  if (current.action !== "send" && current.action !== "editMessage" || typeof threadId !== "string"
+      || typeof clientId !== "string" || !claudeThreadId(threadId)
+      || session?.capabilities?.queueSendRecovery !== true
+      || current.deviceId && current.deviceId !== session?.device.id) return false;
+  const state = await api("/api/read/sendState", { threadId, clientUserMessageId: clientId });
+  return state?.threadId === threadId && state.clientUserMessageId === clientId
+    && state.deliveryState === "notDelivered" && state.confirmed !== true;
 }

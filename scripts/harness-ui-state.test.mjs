@@ -17959,3 +17959,147 @@ test("分支回执串会话时保留原请求，不导航、不重新创建", as
     await new Promise(setImmediate);
   }
 });
+
+// 用户要求（2026-11-25）：Claude 消息的送达结果由 Harness 自己判定，不再让用户“查回执”或“已人工确认”。
+function claudeSendReceiptHarness() {
+  const h = queuedReceiptHarness(), { context } = h, recovered = [];
+  const threadId = "claude-11111111-1111-4111-8111-111111111111";
+  Object.assign(context, {
+    claudeGiveUpDelayMs: 180000, pendingSendRequest: null, sending: null,
+    session: { ...context.session, capabilities: { queueSendRecovery: true } },
+    selectedId: threadId,
+  });
+  vm.runInContext([
+    sourceSection("function acceptedSendItem(", "async function confirmPendingSend("),
+    sourceSection("async function confirmPendingSend(", "async function sendNotDelivered("),
+    sourceSection("async function sendNotDelivered("),
+  ].join("\n"), context);
+  context.recoverFailedInput = async record => { recovered.push(record); };
+  const pendingSend = (action = "send", id = threadId, age = 60000) => ({
+    id: "send-receipt-1", action, deviceId: "device-a", time: Date.now() - age, selectionToken: "selected-a",
+    payload: { threadId: id, clientUserMessageId: "client-1", prompt: "原文" },
+    draft: { text: "原文", skills: [], attachments: [], goalMode: null },
+  });
+  const settle = async () => { for (let index = 0; index < 8; index += 1) await new Promise(resolve => setImmediate(resolve)); };
+  const answer = (index, value) => h.requests[index].resolve(value);
+  return { ...h, threadId, recovered, pendingSend, settle, answer };
+}
+
+test("Claude 回执未知后服务端判定未送达：自动恢复输入并解除锁定，不重发也不要求人工核对", async () => {
+  for (const action of ["send", "editMessage"]) {
+    const h = claudeSendReceiptHarness(), { context } = h;
+    context.pending = h.pendingSend(action);
+    const resolving = context.resolvePending();
+    h.answer(0, { requestId: "send-receipt-1", state: "unknown", result: { message: "送达状态未知" } });
+    await h.settle();
+    assert.equal(h.requests[0].path, "/api/receipts/send-receipt-1");
+    assert.equal(h.requests[1].path, "/api/read/sendState");
+    h.answer(1, { threadId: h.threadId, clientUserMessageId: "client-1", confirmed: false, deliveryState: "unknown" });
+    await h.settle();
+    assert.equal(h.requests[2].path, "/api/read/sendState", "确认未命中后再读一次服务端的结案判定");
+    h.answer(2, { threadId: h.threadId, clientUserMessageId: "client-1", confirmed: false, deliveryState: "notDelivered" });
+    await resolving;
+    assert.equal(h.recovered.length, 1, `${action}：输入必须恢复`);
+    assert.equal(context.pending, null, `${action}：锁定必须解除`);
+    assert.match(h.notices.at(-1).message, /消息没有送达/);
+    assert.equal(h.notices.at(-1).error, true);
+    assert.ok(!h.requests.some(request => request.path.startsWith("/api/action/")), "绝不自动重发");
+    assert.equal(h.timers.size, 0, "已结案，不再轮询");
+  }
+});
+
+test("Claude 回执未知但服务端仍未结案：继续只读核对，输入保持锁定", async () => {
+  const h = claudeSendReceiptHarness(), { context } = h;
+  context.pending = h.pendingSend();
+  const resolving = context.resolvePending();
+  h.answer(0, { requestId: "send-receipt-1", state: "unknown", result: {} });
+  await h.settle();
+  h.answer(1, { threadId: h.threadId, clientUserMessageId: "client-1", confirmed: false, deliveryState: "unknown" });
+  await h.settle();
+  // 服务端答复的线程或消息标识不匹配时，不能当作结案。
+  h.answer(2, { threadId: "claude-other", clientUserMessageId: "client-1", confirmed: false, deliveryState: "notDelivered" });
+  await resolving;
+  assert.equal(h.recovered.length, 0);
+  assert.equal(context.pending.id, "send-receipt-1");
+  assert.deepEqual([...h.timers.values()].map(timer => timer.delay), [5000], "5 秒后继续核对");
+});
+
+test("Claude 消息待确认横幅不再提供查回执/已人工确认，3 分钟仍无结论才可放弃等待", () => {
+  const h = claudeSendReceiptHarness(), { context } = h;
+  context.pending = h.pendingSend("send", h.threadId, 6000);
+  context.renderPending();
+  assert.match(h.area.children[0].text, /正在确认消息送达，确认后会自动更新/);
+  assert.deepEqual(h.area.children[0].children, [], "自动结案期间没有任何需要用户处理的按钮");
+
+  h.area.children.length = 0;
+  context.pending.time -= 175000;
+  context.renderPending();
+  assert.deepEqual(h.area.children[0].children.map(node => node.label), ["放弃等待"]);
+
+  // 历史编辑同样；非 Claude 会话保持原有的人工核对入口。
+  h.area.children.length = 0;
+  context.pending = h.pendingSend("editMessage", h.threadId, 6000);
+  context.renderPending();
+  assert.deepEqual(h.area.children[0].children, []);
+  h.area.children.length = 0;
+  context.pending = h.pendingSend("send", "codex-thread", 6000);
+  context.renderPending();
+  assert.deepEqual(h.area.children[0].children.map(node => node.label), ["查回执", "已人工确认"]);
+});
+
+function warmHarness(overrides = {}) {
+  const calls = [];
+  const context = nodeVm.createContext({
+    Date, Map, selectedId: "claude-thread", session: { capabilities: { warmSession: true } },
+    connected: true, creating: false, busy: false, thread: { id: "claude-thread", status: { type: "idle" } },
+    isClaude: () => true, threadReadOnly: () => false, isActiveThread: () => false,
+    $: () => ({ text: "写一半的消息" }), promptDomText: node => node.text,
+    mutate: async (action, payload) => { calls.push({ action, payload }); },
+    ...overrides
+  });
+  nodeVm.runInContext(sourceSection("const warmedAt = new Map()"), context);
+  return { calls, context };
+}
+
+test("输入时提前启动 Claude CLI：同一会话 90 秒最多提交一次，输入持续时在收回前续期", () => {
+  const h = warmHarness();
+  const realNow = Date.now;
+  let now = 1_000_000;
+  h.context.Date = { now: () => now };
+  try {
+    h.context.warmSessionOnInput();
+    h.context.warmSessionOnInput();
+    assert.deepEqual(JSON.parse(JSON.stringify(h.calls)), [{ action: "warmSession", payload: { threadId: "claude-thread" } }]);
+    now += 89_000; h.context.warmSessionOnInput();
+    assert.equal(h.calls.length, 1, "90 秒内不重复提交，不是每个按键一次请求");
+    now += 2_000; h.context.warmSessionOnInput();
+    assert.equal(h.calls.length, 2, "服务端 2 分钟收回未使用的预热 CLI，输入持续时续一次");
+  } finally { Date.now = realNow; }
+});
+
+test("输入时提前启动 Claude CLI：只在可写、空闲、有文字且服务端声明能力时提交", () => {
+  const cases = {
+    "没有声明能力的旧服务端": { session: { capabilities: {} } },
+    "未连接": { connected: false },
+    "新建会话": { creating: true },
+    "正在发送": { busy: true },
+    "不是 Claude 会话": { isClaude: () => false },
+    "会话详情尚未载入": { thread: { id: "other" } },
+    "只读（设备只读或被别的应用占用）": { threadReadOnly: () => true },
+    "会话正在执行": { isActiveThread: () => true },
+    "编辑框没有文字": { promptDomText: () => "   \n" },
+    "没有选中会话": { selectedId: null }
+  };
+  for (const [name, overrides] of Object.entries(cases)) {
+    const h = warmHarness(overrides);
+    h.context.warmSessionOnInput();
+    assert.equal(h.calls.length, 0, name);
+  }
+});
+
+test("输入时提前启动 Claude CLI：请求失败静默，不提示也不影响输入", async () => {
+  const h = warmHarness({ mutate: async () => { throw new Error("服务端暂时不可用"); } });
+  h.context.warmSessionOnInput();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(nodeVm.runInContext("warmedAt.size", h.context), 1, "失败后仍按间隔限频，不会被每个按键重试");
+});

@@ -85,16 +85,45 @@ def native_interruption(row):
 
 SDK_INTERRUPTION_TEXTS = ("[Request interrupted by user]", "[Request interrupted by user for tool use]")
 
+# 不进入历史的记录（附件等）的父子关系最多保留这么多条；它们只夹在相邻几条消息之间，保留最近的就够用。
+ROW_LINK_LIMIT = 4096
 
-def native_sdk_interruption(row, previous):
-    """Claude Agent SDK（stream-json）传输下，用 interrupt 控制请求中止回复时 CLI 写入的中断标记（2.1.329 实测）。
+# 除 sdk-* 之外，本机真实会话里确实出现过中断标记的非终端入口：Claude 桌面应用（2.1.321 的记录，与 SDK 同样没有
+# interruptedMessageId）。入口不明的记录不认，没有实测依据的入口（如编辑器扩展）不在此列。
+INTERRUPTION_HOSTS = ("claude-desktop",)
 
-    这行没有 interruptedMessageId，entrypoint 是 sdk-cli，不带真人输入才有的 promptSource / turnOrigin /
-    turnAttributionKey / permissionMode，并且与被中断的那条提示共用同一个 promptId。用户要求只修正经原生元数据
-    确认的中断，所以这几条同时满足才认；用户自己输入同样文字的消息是一条新提示，带有这些属性，不会被吞掉。"""
+
+def native_message_ancestor(row, previous, links):
+    """沿 parentUuid 向上找到最近一条进入历史的消息。
+
+    CLI 2.1.330 起，工具结果与后面的记录之间会写入 attachment（prompt_snapshot、deferred_tools_delta 等）；
+    它们不进入历史，所以中断标记的父节点可能是这样一条附件（用户本机真实会话里就是三条附件）。
+    `links` 记着被跳过记录的父节点（uuid → parentUuid），顺着它们继续向上找。"""
+    parent_id = row.get("parentUuid")
+    for _ in range(64):
+        if not isinstance(parent_id, str) or not parent_id:
+            return None
+        found = next((value for value in reversed(previous) if value.get("uuid") == parent_id), None)
+        if found is not None:
+            return found
+        parent_id = (links or {}).get(parent_id)
+    return None
+
+
+def native_sdk_interruption(row, previous, links=None):
+    """非终端入口（Claude Agent SDK 的 stream-json、桌面应用）用 interrupt 控制请求中止回复时 CLI 写入的中断标记。
+
+    这行没有 interruptedMessageId，entrypoint 是 sdk-*（2.1.329、2.1.330 实测）或 INTERRUPTION_HOSTS 里的入口，
+    不带真人输入才有的 promptSource / turnOrigin / turnAttributionKey / permissionMode，并且与被中断的那条提示共用
+    同一个 promptId。用户要求只修正经原生元数据确认的中断，所以这几条同时满足才认；用户自己输入同样文字的消息是一条
+    新提示，带有这些属性并有自己的 promptId，不会被吞掉。
+    父节点沿父子链穿过附件去找（见 native_message_ancestor）；链断了也不影响判定，因为 promptId 已经证明它属于该提示，
+    此时以同一提示里最近的一行作为被中断的位置。"""
     message = row.get("message")
     content = message.get("content") if isinstance(message, dict) else None
-    if (row.get("type") != "user" or not str(row.get("entrypoint") or "").startswith("sdk")
+    entrypoint = row.get("entrypoint")
+    if (row.get("type") != "user" or not isinstance(entrypoint, str)
+            or not (entrypoint.startswith("sdk") or entrypoint in INTERRUPTION_HOSTS)
             or not isinstance(content, list) or len(content) != 1 or not isinstance(content[0], dict)
             or content[0].get("type") != "text" or content[0].get("text") not in SDK_INTERRUPTION_TEXTS):
         return None
@@ -102,19 +131,21 @@ def native_sdk_interruption(row, previous):
                                   "interruptedMessageId")):
         return None
     prompt = row.get("promptId")
-    if not isinstance(prompt, str) or not prompt.strip() or not any(value.get("promptId") == prompt for value in previous):
+    if not isinstance(prompt, str) or not prompt.strip():
         return None
-    parent = next((value for value in reversed(previous) if value.get("uuid") == row.get("parentUuid")), None)
-    if not parent:
+    in_prompt = next((value for value in reversed(previous) if value.get("promptId") == prompt), None)
+    if in_prompt is None:
         return None
+    parent = native_message_ancestor(row, previous, links) or in_prompt
     response = parent.get("message", {}).get("id") if parent.get("type") == "assistant" else None
     return {"responseId": response if isinstance(response, str) and response.strip() else parent["uuid"],
             "source": "sdk-interrupt"}
 
 
-def native_tool_interruption(row, previous):
+def native_tool_interruption(row, previous, links=None):
     # 2.1.325 实际历史中，工具拒绝后的中断没有 interruptedMessageId。
     # 用户要求历史也显示“已停止”：必须核对同一 promptId、拒绝结果父节点及原始工具调用，不能只按英文隐藏。
+    # 父节点穿过附件去找（见 native_message_ancestor）：新版本在拒绝结果和中断标记之间也会写附件。
     message = row.get("message")
     content = message.get("content") if isinstance(message, dict) else None
     if (row.get("type") != "user" or row.get("entrypoint") != "cli"
@@ -125,7 +156,7 @@ def native_tool_interruption(row, previous):
     prompt = row.get("promptId")
     if not isinstance(prompt, str) or not prompt.strip():
         return None
-    parent = next((value for value in reversed(previous) if value.get("uuid") == row.get("parentUuid")), None)
+    parent = native_message_ancestor(row, previous, links)
     if (not parent or parent.get("type") != "user" or parent.get("promptId") != prompt
             or parent.get("toolDenialKind") != "user-rejected"):
         return None
@@ -985,6 +1016,9 @@ def native_session_holders(root, native_id, own=()):
     return sorted(holders, key=lambda holder: holder["pid"])
 
 
+# 回退前等持有者退出的最长时间，见 NativeSession.wait_for_no_holders。
+HOLDER_RELEASE_WAIT = 5.0
+
 # 用户要求会话提示“已在另一个应用中打开”旁提供“关闭其他占用”：SIGTERM 让 CLI 自己清理登记并恢复终端，
 # 超时仍不退出才 SIGKILL；claude stop 通常一秒内返回，上限 20 秒，保证两个任务加上等待仍在对端 60 秒回执期限内。
 RELEASE_TERM_WAIT = 5.0
@@ -1255,6 +1289,8 @@ class NativeSession:
         self.effort = ""
         self.messages = []
         self.all_messages = []
+        # 不进入历史的记录（附件等）的 uuid → parentUuid，给中断标记穿过它们找父节点用；上限见 ROW_LINK_LIMIT。
+        self.row_links = {}
         self.history = NativeHistory()
         self.retired_usage = []
         self.image_inputs = {}
@@ -1671,6 +1707,18 @@ class NativeSession:
         # 两个进程不能同时写同一份原生记录：交接前后确认没有任何 CLI 进程（后台或终端）打开该会话。
         return [holder["pid"] for holder in native_session_holders(self.root, self.native_id)]
 
+    def wait_for_no_holders(self, seconds=HOLDER_RELEASE_WAIT):
+        """等仍持有该会话的 CLI 退出，最多 seconds 秒；返回此时还在持有的进程（空表示可以继续）。
+
+        对端已确认自己的 CLI 退出后才会回退，这里只兜底 CLI 刚退出、登记文件和进程表项还没清理完的短暂间隙；
+        别的应用（终端里的 claude 等）持有时不会在几秒内消失，等满时限后照常拒绝，不改写历史。"""
+        end = time.monotonic() + seconds
+        holders = self.session_holders()
+        while holders and time.monotonic() < end:
+            time.sleep(0.1)
+            holders = self.session_holders()
+        return holders
+
 
     def scheduled_prompt(self, row):
         fire = self.scheduled_fires.get(row.get("parentUuid")) if row.get("type") == "user" else None
@@ -1858,6 +1906,7 @@ class NativeSession:
                 or self.log_mtime is not None and stat.st_size == self.log_offset
                 and stat.st_mtime_ns != self.log_mtime):
             self.messages, self.all_messages, self.log_offset, self.seen = [], [], 0, set()
+            self.row_links = {}
             self.history = NativeHistory()
             self.scheduled_fires = {}
             self.retired_usage = []
@@ -1901,6 +1950,9 @@ class NativeSession:
                     continue
                 if row["uuid"] in self.seen:
                     continue
+                self.row_links[row["uuid"]] = row.get("parentUuid")
+                if len(self.row_links) > ROW_LINK_LIMIT:
+                    self.row_links.pop(next(iter(self.row_links)))
                 self.observe_control_record(row)
                 if row.get("type") == "user" and row.get("permissionMode") in (
                         "default", "manual", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"):
@@ -1931,10 +1983,10 @@ class NativeSession:
                 task_notification = native_task_notification(row) or self.scheduled_prompt(row)
                 if task_notification:
                     row["nativeTaskNotification"] = task_notification
-                interruption = native_tool_interruption(row, self.all_messages)
+                interruption = native_tool_interruption(row, self.all_messages, self.row_links)
                 if interruption:
                     row["nativeToolInterruption"] = interruption
-                sdk_interruption = native_sdk_interruption(row, self.all_messages)
+                sdk_interruption = native_sdk_interruption(row, self.all_messages, self.row_links)
                 if sdk_interruption:
                     row["nativeSdkInterruption"] = sdk_interruption
                 native_editable = row.get("type") == "user" and real_user(row)
@@ -2142,10 +2194,19 @@ class SdkReader(NativeSession):
     stream-json 连接提供，对端会用实时状态覆盖本读取器快照里的 native_status / requests。
     """
 
+    # 用户要求缩短操作等待：每份快照都带全部历史（实测 19 MB 的会话序列化约 0.1 秒，传输、解析和投影合计约 1 秒），
+    # 活跃回合里每 0.25 秒一份会把对端和服务占满。按上次发出一份所花时间的 8 倍放宽最短间隔（上限 5 秒）；
+    # 耗时不到 0.02 秒（约 1 MB 以内）的会话不限制，行为不变。间隔内的变化不丢：签名不更新，
+    # 间隔结束后的下一次轮询发出最新状态。force（回执、命令结果等需要立即可见的场合）不受限。
+    SNAPSHOT_FREE_COST = 0.02
+    SNAPSHOT_COST_FACTOR = 8
+    SNAPSHOT_MAX_INTERVAL = 5.0
+
     def __init__(self, cli, native_id):
         super().__init__(cli, native_id)
         # 对端报告“压缩结束”后等待原生 compact_boundary 记录的起点；超时仍无终态证据则标记待核对。
         self.compaction_ended_at = None
+        self.next_snapshot_at = 0.0
 
 
     def read_messages(self):
@@ -2199,7 +2260,10 @@ class SdkReader(NativeSession):
                      json.dumps(self.pending, sort_keys=True), json.dumps(context, sort_keys=True),
                      updated_at, json.dumps(self.control_projection(), sort_keys=True))
         if force or signature != self.signature:
+            if not force and time.monotonic() < self.next_snapshot_at:
+                return
             self.signature = signature
+            started = time.monotonic()
             emit({"type": "shared_snapshot", "native_id": self.native_id, "job_id": "",
                   "native_status": status, "messages": self.messages,
                   "history_head": self.history.current_head(),
@@ -2208,6 +2272,9 @@ class SdkReader(NativeSession):
                   "preview_basis": preview[1] if preview else None,
                   "updated_at": updated_at or None,
                   "context_configuration": context, "native_control": self.control_projection()})
+            cost = time.monotonic() - started
+            self.next_snapshot_at = 0.0 if cost < self.SNAPSHOT_FREE_COST else \
+                time.monotonic() + min(cost * self.SNAPSHOT_COST_FACTOR, self.SNAPSHOT_MAX_INTERVAL)
 
     def sdk_prepare(self, request):
         """登记一条即将写入 CLI 的网页消息；图片落盘为 @路径，与原有上传目录和权限保持一致。"""
@@ -2374,7 +2441,7 @@ class SdkReader(NativeSession):
             self.read_messages()
             if request.get("history_head") != self.history.current_head():
                 raise NativeError("ESTALE", "原生历史已变化，未提交编辑")
-            if self.session_holders():
+            if self.wait_for_no_holders():
                 raise NativeError("ESESSIONOPEN", "原生会话仍在其他 CLI 中打开，未修改历史")
             self.run_rewind(target, last_seen, cwd)
             # 回退已被原生确认；修改后的消息尚未发送，后续失败按“未发送”报告。

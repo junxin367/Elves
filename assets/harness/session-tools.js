@@ -383,6 +383,9 @@ export function mountSessionTools(options) {
         openTab({ kind: "file", path, line, sourceThreadId: item.threadId });
     }, () => {
       if (ownsTab() && desktop() && context.active === key) hidePanel();
+    }, threadId => {
+      // 隐藏标签的 iframe 也会确认已读，只要标签还保留就同步外层菜单和侧栏。
+      if (retainsTab()) options.onSideThreadRead?.(threadId);
     })
       : item.kind === "side-creation" ? mountWorkspaceSideCreation(view)
       : item.kind === "changes" || item.kind === "change"
@@ -549,7 +552,7 @@ function mountWorkspaceSideCreation(workspace) {
 }
 
 function mountWorkspaceSideThread(workspace, item, createSideThread, updateThreadState, openMediaPreview, openFile,
-  requestHidePanel) {
+  requestHidePanel, onThreadRead) {
   // 每个侧边会话/子智能体使用独立页面上下文，隔离输入、选中会话、滚动和实时连接，不能借用主聊天的全局发送状态。
   // 子智能体沿用原生读取返回的只读身份，不创建会话副本或开放发送。
   // 专用入口仅允许同源嵌入，不修改普通首页的禁止嵌入策略；关闭标签只卸载页面，不关闭服务端会话。
@@ -585,9 +588,10 @@ function mountWorkspaceSideThread(workspace, item, createSideThread, updateThrea
       transferFocus();
     }
     // 路径最多 32768 字符，与本模块其他文件路径字段的上限一致；行号只接受正整数。
+    // 此函数在模块层，拿不到 mountSessionTools 的 options；已读回调由调用处作为参数传入。
     else if (event.data?.type === "codex-elves-side-thread-read"
         && item.kind === "side" && event.data.threadId === item.threadId)
-      options.onSideThreadRead?.(item.threadId);
+      onThreadRead?.(item.threadId);
     else if (visible && event.data?.type === "codex-elves-workspace-open-file"
         && event.data.threadId === item.threadId && typeof event.data.path === "string"
         && event.data.path.trim() && event.data.path.length <= 32768 && !event.data.path.includes("\0")

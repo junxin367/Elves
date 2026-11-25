@@ -7,7 +7,8 @@ const source = await readFile(new URL("../assets/harness/session-tools.js", impo
 const wrapper = source.slice(source.indexOf("export function mountSessionTools("),
   source.indexOf("function mountSessionToolPages(")).replace(/^export /gm, "");
 
-function harness({ desktop = true, android = false, sidePanel = false, parentWindow, createSideThread, openImagePreview, openVideoPreview } = {}) {
+function harness({ desktop = true, android = false, sidePanel = false, parentWindow, createSideThread, openImagePreview, openVideoPreview,
+  onSideThreadRead } = {}) {
   const renderers = [], disk = new Map(), observers = [], messageListeners = new Set();
   const documentListeners = new Map();
   const document = { activeElement: null, hidden: false, querySelector: () => null,
@@ -118,7 +119,7 @@ function harness({ desktop = true, android = false, sidePanel = false, parentWin
   context.window.parent = parentWindow || context.window;
   vm.runInContext(wrapper, context);
   const api = context.mountSessionTools({ workspace, trigger, getContext: () => state, sidePanel,
-    createSideThread, openImagePreview, openVideoPreview });
+    createSideThread, openImagePreview, openVideoPreview, onSideThreadRead });
   const dock = workspace.children.at(-1), [separator, toolbar, views, empty] = dock.children;
   const tablist = toolbar.children[0], toggle = header.children[1];
   const visibleTabs = () => tablist.children.filter(tab => !tab.hidden);
@@ -624,6 +625,30 @@ test("侧边未读蓝点替换原图标，隐藏标签和切换主会话保持�
   assert.match(css, /\.workspace-reader-tab-icon\.unread::before\{[^}]*width:6px;[^}]*height:6px;[^}]*background:#3076df/);
   h.api.dispose();
   assert.equal(h.messageListeners.size, 0);
+});
+
+test("侧边 iframe 的已读确认转交给外层，只认自身 iframe 与线程，隐藏标签继续转交，释放后不再转交", () => {
+  // 回归：已读回调曾直接引用 mountSessionTools 的 options，而侧边标签的挂载函数在模块层，监听里抛 ReferenceError。
+  const read = [];
+  const h = harness({ onSideThreadRead: threadId => read.push(threadId) });
+  h.api.openSideThread({ id: "side-a", title: "侧边 A", hasUnreadTurn: true });
+  h.api.openSideThread({ id: "side-b", title: "侧边 B" });
+  const frame = h.views.children[0].children[0];
+  frame.contentWindow = { postMessage() {} };
+  const event = { source: frame.contentWindow, origin: "http://127.0.0.1:45222",
+    data: { type: "codex-elves-side-thread-read", threadId: "side-a" } };
+  h.message({ ...event, source: {} });
+  h.message({ ...event, origin: "https://other.example" });
+  h.message({ ...event, data: { ...event.data, threadId: "side-b" } });
+  assert.deepEqual(read, [], "来源窗口、来源地址和线程任一不符都不转交");
+  h.message(event);
+  assert.deepEqual(read, ["side-a"]);
+  h.state.threadId = "thread-b"; h.api.updateContext();
+  h.message(event);
+  assert.deepEqual(read, ["side-a", "side-a"], "切换主会话后 iframe 仍保留，已读确认继续同步外层");
+  h.api.dispose();
+  h.message(event);
+  assert.deepEqual(read, ["side-a", "side-a"], "释放后监听已移除");
 });
 
 test("侧边初次打开已有审批或问答时直接显示未读蓝点，普通文件标签保持图标", () => {

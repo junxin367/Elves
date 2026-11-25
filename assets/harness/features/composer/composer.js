@@ -34,7 +34,7 @@ import { refitComposerMenus } from "./composer-menus.js";
 import {
   codexCreationDefaultsState, creationInstanceId, creationProject, syncNewChatProjectPicker
 } from "./creation-state.js";
-import { clearSubmittedDraft, restoreDraft } from "./draft-restore.js";
+import { clearSubmittedDraft, recoverFailedInput, restoreDraft } from "./draft-restore.js";
 import {
   draftKey, failedInputRecoveries, inputDraftEmpty, newDraftKey, persistInputDraft,
   recoveryGeneration, snapshotDraft, storeDraft, submittedDrafts
@@ -59,7 +59,7 @@ import { loadInstancePermissionCatalog, updateComposerPermissions } from "./perm
 import { composerPrompt, effortLabels, resizeComposerInput } from "./prompt-editor.js";
 import { updatePromptOptimization } from "./prompt-optimization.js";
 import {
-  clearPendingFeedbackTimer, composerDiagnosticState, pendingFeedbackDelay, pendingFeedbackReady,
+  claudeGiveUpDelayMs, clearPendingFeedbackTimer, composerDiagnosticState, pendingFeedbackDelay, pendingFeedbackReady,
   prepareClaudeProjectCreation, queuedEditHasOriginalImages, sending, setComposerDiagnosticState,
   setPendingFeedbackTimer, setSending, setThreadOwnershipRetry, threadOwnershipRetry
 } from "./send-state.js";
@@ -86,7 +86,7 @@ import { finishSendDisplay, rememberSendDisplay } from "../queue/sent-display.js
 import { editingQueuedMessage, queueVersion, queuedEditActions } from "../queue/state.js";
 import { claudeCommandSupported } from "../session/action-capabilities.js";
 import {
-  activeBackend, backendCapability, claudeNativeQueue, isActiveThread, isClaude, privateInputScope,
+  activeBackend, backendCapability, claudeNativeQueue, claudeThreadId, isActiveThread, isClaude, privateInputScope,
   queueCapability, serviceSideThread, temporarySideThread, threadOwnedElsewhere, threadReadOnly, threadReadOnlyMessage,
   threadReleasableElsewhere
 } from "../session/capabilities.js";
@@ -469,7 +469,12 @@ export function updateComposer({ followEnd = false } = {}) {
     const unavailable = pending.invalid || (pending.deviceId && pending.deviceId !== session.device.id);
     const pendingGoal = goalComposerAction(pending.action, pending.payload);
     const pendingQueueItem = ["steerQueued", "removeQueued"].includes(pending.action);
+    // 用户要求（2026-11-25）：Claude 会话的发送/历史编辑由 Harness 自己判定送达结果，不再让用户“查回执”或“已人工确认”；
+    // 页面自动轮询，服务端按原生记录结案（见 pending.js 的 resolvePending 与 claude_queue.rs 的 abandon_stale）。
+    const claudeMessage = !unavailable && ["send", "editMessage"].includes(pending.action)
+      && claudeThreadId(pending.payload?.threadId);
     const box = element("div", "pending-banner", unavailable ? "回执损坏或属于旧授权。请检查原生会话后人工解除锁定，不会自动重发。"
+      : claudeMessage ? "正在确认消息送达，确认后会自动更新，无需操作。"
       : pending.action === "reorderQueued" ? "正在确认队列排序结果。"
       : pending.action === "forkThread" ? "正在确认新聊天分支创建结果；不会重复创建。"
       : pendingGoal ? "正在确认目标提交结果。"
@@ -480,7 +485,7 @@ export function updateComposer({ followEnd = false } = {}) {
       : queuedEditActions.has(pending.action) ? "正在确认队列编辑结果。" : "正在确认消息送达结果。");
     if (!unavailable && queuedEditActions.has(pending.action))
       renderQueuedEditRecoveryControls(box, pending.payload.threadId, pending.payload.editId);
-    else if (!unavailable) box.append(button("查回执", pendingGoal ? "查询原目标提交回执，不会再次提交"
+    else if (!unavailable && !claudeMessage) box.append(button("查回执", pendingGoal ? "查询原目标提交回执，不会再次提交"
       : pendingQueueItem ? "只查询原队列操作回执，不会重复引导或删除"
       : pending.action === "forkThread" ? "查询原分支回执，不会重复创建" : "查询此消息的送达回执", () => void resolvePending(), "text-button"));
     const createdGoalThreadId = pendingGoal && goalRecordThreadId(pending);
@@ -489,11 +494,23 @@ export function updateComposer({ followEnd = false } = {}) {
         () => void selectThread(createdGoalThreadId, { closeSidebar: false }), "text-button"));
     if (pendingGoal && !unavailable) box.append(button("已人工核对", "在本机核对后解除目标提交锁定",
       () => void manuallyResolveGoalComposer(pending), "text-button"));
-    else if (!queuedEditActions.has(pending.action) && !pendingQueueItem) box.append(button("已人工确认", "确认检查会话后解除锁定", async () => {
+    else if (!queuedEditActions.has(pending.action) && !pendingQueueItem && !claudeMessage) box.append(button("已人工确认", "确认检查会话后解除锁定", async () => {
       const current = pending;
       if (await confirmAction("解除发送锁定", "请先检查本机或网页会话。解除锁定不会重发，但再次发送可能重复执行；仅在已核对结果后继续。", "已核对，解除锁定", true)
           && pending === current) { savePending(null); updateComposer(); }
     }, "text-button"));
+    // Claude 的自动结案仍无结论（例如会话一直处于执行中）超过 3 分钟，才提供放弃等待；
+    // 放弃时把输入恢复到输入框，不重发，也不要求用户去原生客户端核对。
+    if (claudeMessage && Number.isFinite(pending.time) && Date.now() - pending.time >= claudeGiveUpDelayMs)
+      box.append(button("放弃等待", "放弃等待并把输入恢复到输入框，不会重发；若消息其实已送达，再次发送会重复", async () => {
+        const current = pending;
+        if (!await confirmAction("放弃等待送达结果", "等待较久仍无法确认这条消息是否送达。放弃后内容会恢复到输入框，不会自动重发；"
+            + "如果它其实已经送达，再次发送会重复。", "放弃并恢复输入", true) || pending !== current) return;
+        try { await recoverFailedInput(current); }
+        catch (error) { notice(error.message || "输入恢复失败，原请求回执已保留，请勿重新发送。", true); return; }
+        if (pending === current) savePending(null);
+        updateComposer();
+      }, "text-button"));
     $("#pending-area").append(box);
   }
   renderFailedInputRecovery($("#pending-area"));
@@ -730,12 +747,15 @@ export async function stopGeneration() {
   // 压缩的实时状态可能先于线程 active 到达；与按钮共用已确认压缩判断，点击后才真正派发停止。
   if (stopping || busy || threadReadOnly() || !connected || !selectedId
       || !isActiveThread() && !compactionInProgress()) return;
-  const id = selectedId, version = selectionVersion;
+  const id = selectedId, version = selectionVersion, claude = isClaude();
   setStopping(true); updateComposer();
   try {
     const result = await mutate("stop", { threadId: id });
+    // Claude 的停止只中断当前执行，没有后台终端清理；原生 CLI 一直不响应停止请求时服务端会强制结束它的进程，
+    // 必须明确告诉用户（不能静默成功），后续发送会自动重新接上原会话。
     notice(result?.cleanupPending ? result.message || "会话已停止，后台终端清理尚未确认"
-      : "已请求停止并清理此会话的后台终端");
+      : result?.forced ? "Claude 没有响应停止请求，已强制结束它的进程；会话已保留，可以继续发送。"
+      : claude ? "已停止" : "已请求停止并清理此会话的后台终端");
     if (version === selectionVersion && selectedId === id) await reloadThread();
   } catch (error) { notice(error.message, true); }
   finally { setStopping(false); updateComposer(); }

@@ -2558,6 +2558,14 @@ impl HarnessController {
                             },
                         );
                         json!({"ok":false,"outcomeUnknown":true,"message":message})
+                    } else if action == "stop" {
+                        // 停止可以重复提交，没有重复执行的风险：如实说明没有得到确认并允许再点一次。
+                        // 不能沿用“请查看原生会话”——那是让用户替 Harness 去原生客户端核对结果。
+                        let detail = error
+                            .downcast_ref::<ApiError>()
+                            .map(|error| format!("（{}）", error.message))
+                            .unwrap_or_default();
+                        json!({"message":format!("停止请求没有得到确认{detail}，可以再点一次停止")})
                     } else {
                         json!({"message":"送达状态未知，请查看原生会话，不要重复发送"})
                     });
@@ -4117,6 +4125,9 @@ async fn session(
     // 用户要求各端都提供“关闭其他占用”，不再区分设备；仍声明为能力，是为了让内置旧网页包（如 Android 先于服务端升级）
     // 连到不认识该动作的旧后台时不显示按钮。单独赋值：上面的 json! 已接近宏递归上限，再加一项无法编译。
     response["capabilities"]["releaseExternalHolders"] = json!(true);
+    // 用户要求缩短首条消息的等待：输入框开始输入时提前启动 Claude CLI。声明为能力，是为了让内置旧网页包
+    // 连到不认识该动作的旧后台时不发起请求；同样单独赋值，避开上面 json! 的宏递归上限。
+    response["capabilities"]["warmSession"] = json!(true);
     response["transport"] = json!(if state.desktop { "desktop" } else { "remote" });
     // 代理设置和会话管理已迁移到独立管理器；Harness 不再声明管理页面或管理 API 能力。
     response["capabilities"]["management"] = json!(false);
@@ -5257,6 +5268,7 @@ async fn action(
             | "pinThread"
             | "deleteThread"
             | "releaseExternalHolders"
+            | "warmSession"
             | "sort"
             | "rename"
             | "approve"

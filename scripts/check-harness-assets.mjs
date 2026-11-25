@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { dirname, posix, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { listHarnessUiResources, harnessResourceContentTypes, separatelyServedResources } from "./harness-resources.mjs";
+import { findUndeclaredNames, loadTypeScript } from "./harness-undeclared-names.mjs";
 
 const root = resolve(import.meta.dirname, "..");
 const assetRoot = resolve(root, "assets/harness");
@@ -149,6 +150,20 @@ if (linkCheck.status !== 0) {
   }
 }
 
+// 链接检查只核对“导入了但对方没导出”；用了却没导入的名字要到运行时才暴露，页面里有同名 id 的元素时还会被浏览器
+// 变成同名全局变量，表现为“notice is not a function”。因此再用 TypeScript 的名称解析核对一遍（约 3 秒，不含 vendor）。
+// TypeScript 随管理端前端安装；没有安装时跳过并提示，不让检查因缺依赖而失败。
+{
+  const ts = loadTypeScript(resolve(root, "apps/elves-management/package.json"));
+  if (!ts) console.warn("未找到 TypeScript，已跳过网页模块的未声明名字检查（先在 apps/elves-management 执行 npm ci）。");
+  else {
+    const checked = new Map([...sources].filter(([file]) => !file.startsWith("vendor/"))
+      .map(([file, text]) => [resolve(assetRoot, file), text]));
+    for (const finding of findUndeclaredNames(ts, checked))
+      errors.push(`${finding.file.includes(":") ? finding.file : relative(root, finding.file)}:${finding.line}: 使用了没有导入也没有声明的名字 ${finding.name}`);
+  }
+}
+
 // 入口的静态依赖须全部在 index.html 中预加载，避免首屏逐层发现模块；动态导入的可选模块不预加载。
 const html = await readFile(resolve(assetRoot, "index.html"), "utf8");
 const scripts = new Set([...html.matchAll(/<script type="module" src="\/([^"]+)"><\/script>/g)].map(match => match[1]));
@@ -186,5 +201,5 @@ if (errors.length) {
   console.error(errors.join("\n\n"));
   process.exitCode = 1;
 } else {
-  console.log(`Harness 资源检查通过：${resources.length} 个网页资源，${jsFiles.length} 个 JS 文件语法、import 与导出链接、分层、无循环依赖与预加载均有效。`);
+  console.log(`Harness 资源检查通过：${resources.length} 个网页资源，${jsFiles.length} 个 JS 文件语法、import 与导出链接、未声明名字、分层、无循环依赖与预加载均有效。`);
 }

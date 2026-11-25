@@ -10,6 +10,9 @@ export function setSending(value) { return sending = value; }
 export let composerDiagnosticState = "";
 export function setComposerDiagnosticState(value) { return composerDiagnosticState = value; }
 const pendingFeedbackDelayMs = 5000;
+// 用户要求 Claude 消息的送达结果由 Harness 自己判定（服务端 UNKNOWN_ABANDON_MS 45 秒 / SENDING_ABANDON_MS 120 秒结案）；
+// 超过此时间仍无结论才给出“放弃等待”。必须大于服务端最长结案时限，否则会抢在自动结案之前打扰用户。
+export const claudeGiveUpDelayMs = 180000;
 let pendingFeedbackTimer = null;
 export function setPendingFeedbackTimer(value) { return pendingFeedbackTimer = value; }
 export function pendingFeedbackDelay(record) {
