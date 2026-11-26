@@ -4002,6 +4002,11 @@ function sessionFilterPopupHarness({ enabled = ["codex:local", "claude:wsl:a", "
     }
     append(...children) { for (const child of children) { child.parentElement = this; this.children.push(child); } }
     prepend(...children) { for (const child of children) child.parentElement = this; this.children.unshift(...children); }
+    insertBefore(child, before) {
+      const index = this.children.indexOf(before);
+      assert.ok(index >= 0, "搜索框插入点必须仍属于当前菜单");
+      child.parentElement = this; this.children.splice(index, 0, child);
+    }
     replaceChildren(...children) {
       for (const child of this.children) child.parentElement = null;
       this.children = []; this.append(...children);
@@ -4025,6 +4030,7 @@ function sessionFilterPopupHarness({ enabled = ["codex:local", "claude:wsl:a", "
       const visit = node => { for (const child of node.children) { descendants.push(child); visit(child); } };
       visit(this);
       return descendants.filter(node => selector.split(",").some(part => {
+        if (part.startsWith(".") && !node.className.split(" ").includes(part.slice(1))) return false;
         if (part.startsWith("button") && node.tag !== "button") return false;
         if (part.includes(":not(:disabled)") && node.disabled) return false;
         const checked = part.match(/\[(aria-selected|aria-checked)="true"\]/);
@@ -4103,6 +4109,20 @@ test("二级菜单支持键盘进入返回，父菜单刷新保留子弹层且�
   popup.submenu.list.querySelector("button").click();
   assert.deepEqual(copied, ["id"]);
   assert.equal(h.context.activePopup, null);
+});
+
+test("空子菜单使用公共说明内容且保留键盘返回入口", () => {
+  const h = sessionFilterPopupHarness();
+  h.trigger.menuOptions = [{ value: "empty", label: "空目录", submenu: [] }];
+  h.context.openPopup(h.trigger);
+  h.click("empty");
+  const popup = h.context.activePopup, submenu = popup.submenu;
+  assert.equal(submenu.list.querySelectorAll("button").length, 0);
+  assert.equal(submenu.list.children[0].textContent, "暂无可用选项");
+  assert.ok(submenu.list.children[0].className.split(" ").includes("menu-description"));
+  submenu.node.onkeydown({ key: "ArrowLeft", preventDefault() {}, stopPropagation() {} });
+  assert.equal(popup.submenu, null);
+  assert.equal(h.context.document.activeElement.dataset.value, "empty");
 });
 
 test("异步子菜单关闭后取消读取，迟到应用列表不能污染新菜单", async () => {
@@ -4231,13 +4251,13 @@ test("优先事项菜单连续切换置顶并显示用户指定的√，不关�
   const checked = popup.list.querySelector("button");
   assert.equal(h.context.activePopup, popup);
   assert.equal(checked.getAttribute("aria-checked"), "true");
-  assert.equal(checked.children.find(node => node.className === "choice-check").textContent, "√");
+  assert.equal(checked.children.find(node => node.className.split(" ").includes("choice-check")).textContent, "√");
   before.click();
   assert.equal(selected, true, "重绘前选项的迟到点击不重复切换");
   checked.click();
   assert.equal(selected, false);
   assert.equal(popup.list.querySelector("button").getAttribute("aria-checked"), "false");
-  assert.equal(popup.list.querySelector("button").children.find(node => node.className === "choice-check").textContent, "");
+  assert.equal(popup.list.querySelector("button").children.find(node => node.className.split(" ").includes("choice-check")).textContent, "");
 });
 
 test("只有一个已开启实例时点击关闭菜单，多个实例时留到点击或聚焦外部再关闭", () => {
@@ -5572,7 +5592,107 @@ test("Codex 权限只展示 App 四项，旧只读归类展示但不修改已保
   assert.equal(h.button.popupNotePosition, "bottom");
 });
 
-test("弹层帮助与说明移动到列表上方且只出现一次", () => {
+test("菜单搜索默认关闭，自动在第九个候选出现且保持到本次展开结束", () => {
+  const h = sessionFilterPopupHarness();
+  const choices = Array.from({ length: 9 }, (_, index) => ({
+    value: String(index), label: `候选 ${index}`, action() {}
+  }));
+  h.trigger.menuOptions = choices;
+  h.context.openPopup(h.trigger);
+  assert.equal(h.context.activePopup.input, null, "未配置搜索时，条目再多也不能自动开启");
+  h.context.closePopup();
+  Object.assign(h.trigger, {
+    searchMode: "auto", popupNote: "顶部说明", popupNotePosition: "top",
+    menuOptions: [...choices.slice(0, 8), { label: "当前值占位", disabled: true }, { label: "底部操作", footer: true, action() {} }]
+  });
+  h.context.openPopup(h.trigger);
+  const popup = h.context.activePopup;
+  assert.equal(popup.input, null, "八个候选加占位、底部操作不越过门槛");
+  h.trigger.menuOptions.push(choices[8]);
+  h.context.renderPopup();
+  const input = popup.input;
+  assert.ok(input);
+  assert.equal(popup.node.children[0], input, "异步加入搜索仍放在顶部说明之前");
+  input.value = "候选 1"; input.oninput({ isComposing: false });
+  assert.equal(popup.choices.filter(option => !option.footer).length, 1);
+  assert.equal(popup.input, input, "筛选后只有一个结果仍保留搜索");
+  h.trigger.menuOptions = choices.slice(0, 1);
+  h.context.renderPopup();
+  assert.equal(popup.input, input, "目录刷新减少候选也不能移除已出现的搜索");
+  input.value = ""; input.oninput({ isComposing: false });
+  assert.equal(popup.input, input, "清空查询后仍保留到关闭");
+  h.context.closePopup();
+  h.context.openPopup(h.trigger);
+  assert.equal(h.context.activePopup.input, null, "重新打开时按最新数量判断");
+});
+
+test("显示模式保留空目录的自定义输入，关闭模式清除隐藏查询并恢复选项焦点", () => {
+  const h = sessionFilterPopupHarness(), commits = [];
+  Object.assign(h.trigger, { searchMode: "on", selectOptions: [], value: "",
+    selectCustomOption: value => value ? { value, label: value } : null });
+  h.context.commitSelection = (_trigger, value) => commits.push(value);
+  h.context.openPopup(h.trigger);
+  const input = h.context.activePopup.input;
+  assert.ok(input, "显示模式不受空目录影响");
+  input.value = "custom-model"; input.oninput({ isComposing: false });
+  h.context.activePopup.list.querySelector("button").click();
+  assert.deepEqual(commits, ["custom-model"]);
+
+  h.trigger.selectOptions = [{ value: "one", label: "第一个" }, { value: "two", label: "第二个" }];
+  h.context.openPopup(h.trigger);
+  const popup = h.context.activePopup;
+  const previousInput = popup.input;
+  popup.input.value = "第一个"; popup.input.oninput({ isComposing: false }); popup.input.focus();
+  h.trigger.searchMode = "off"; h.context.renderPopup();
+  assert.equal(popup.input, null);
+  assert.equal(popup.query, "");
+  assert.equal(popup.choices.length, 2);
+  assert.ok(popup.list.contains(h.context.document.activeElement));
+  h.trigger.searchMode = "on"; h.context.renderPopup();
+  previousInput.value = "迟到查询"; previousInput.oninput({ isComposing: false });
+  assert.equal(popup.query, "", "同一弹层关闭再启用搜索后，旧输入节点不能污染新查询");
+  assert.equal(popup.input.value, "");
+});
+
+test("公共菜单搜索等待输入法完成、去重组合事件且旧输入不能污染新菜单", () => {
+  const h = sessionFilterPopupHarness();
+  h.trigger.searchMode = "on";
+  h.open();
+  const oldPopup = h.context.activePopup, input = oldPopup.input;
+  const render = h.context.renderPopup;
+  let renders = 0;
+  h.context.renderPopup = () => { renders++; render(); };
+  input.value = "中文";
+  input.oninput({ isComposing: true });
+  assert.equal(oldPopup.query, "");
+  assert.equal(renders, 0);
+  input.oncompositionend();
+  input.oninput({ isComposing: false });
+  assert.equal(oldPopup.query, "中文");
+  assert.equal(renders, 1, "组合结束和随后的 input 只提交一次查询");
+  const another = h.element("button");
+  another.menuOptions = [{ label: "另一个菜单", action() {} }];
+  h.context.openPopup(another);
+  const current = h.context.activePopup;
+  input.value = "迟到输入"; input.oninput({ isComposing: false });
+  assert.equal(h.context.activePopup, current);
+  assert.equal(current.query, "");
+});
+
+test("公共菜单重绘保留有效焦点和列表阅读位置", () => {
+  const h = sessionFilterPopupHarness();
+  h.open();
+  const popup = h.context.activePopup;
+  popup.list.scrollTop = 120;
+  h.find("claude:wsl:a").focus();
+  h.context.renderPopup();
+  assert.equal(h.context.activePopup, popup);
+  assert.equal(popup.list.scrollTop, 120);
+  assert.equal(h.context.document.activeElement.dataset.value, "claude:wsl:a");
+  assert.ok(popup.list.contains(h.context.document.activeElement));
+});
+
+test("弹层标题与顶部帮助同行，说明位置及帮助唯一性保持不变", () => {
   const h = sessionFilterPopupHarness();
   Object.assign(h.trigger, {
     popupTitle: "标题", popupHelp: { label: "了解更多", href: "https://example.com" },
@@ -5580,37 +5700,67 @@ test("弹层帮助与说明移动到列表上方且只出现一次", () => {
   });
   h.open();
   const children = h.context.activePopup.node.children;
-  assert.deepEqual(children.map(node => node.className), ["popup-title", "popup-help", "popup-note", "popup-list"]);
-  assert.equal(children.filter(node => node.className === "popup-help").length, 1);
-  assert.equal(children.filter(node => node.className === "popup-note").length, 1);
+  const popupKind = node => node.className.split(" ").find(name => name.startsWith("popup-"));
+  assert.deepEqual(children.map(popupKind), ["popup-header", "popup-note", "popup-list"]);
+  assert.deepEqual(children[0].children.map(popupKind), ["popup-title", "popup-help"]);
+  assert.equal(h.context.activePopup.node.querySelectorAll(".popup-help").length, 1);
+  assert.equal(children.filter(node => popupKind(node) === "popup-note").length, 1);
   const bottom = sessionFilterPopupHarness();
   Object.assign(bottom.trigger, { popupTitle: "标题", popupNote: "底部说明",
     popupHelp: { label: "了解更多", href: "https://example.com" } });
   bottom.open();
-  assert.deepEqual(bottom.context.activePopup.node.children.map(node => node.className),
+  assert.deepEqual(bottom.context.activePopup.node.children.map(popupKind),
     ["popup-title", "popup-list", "popup-note", "popup-help"], "未启用顶部定位的普通弹层保持原布局");
 });
 
-test("会话权限菜单文字继承当前设置字号，顶部信息与链接使用下边界", async () => {
+test("菜单字号从界面设置统一取整，外观变化后重新定位已打开菜单", () => {
+  const values = new Map();
+  let refits = 0;
+  const context = vm.createContext({
+    document: { documentElement: { dataset: {}, style: { setProperty: (key, value) => values.set(key, value) } } },
+    appearance: { theme: "dark", colors: { dark: { background: "#222" } }, fontSize: 14,
+      uiFont: "系统", uiFontWeight: 500, codeFont: "等宽", codeFontWeight: 400, codeFontSize: 12, conversationWidth: 950 },
+    appearanceTransition: null, appearanceButtonColor: () => null, appearanceThemeColors: () => ({}),
+    fontStack: value => value, defaultUiFont: "", defaultCodeFont: "", currentFileReadingFontSize: () => 12,
+    $: () => null, syncRemoteBackground() {}, localAppearance: () => ({}),
+    resizeComposerInput() {}, resizeEditorInput() {}, editingMessage: null,
+    refitComposerMenus: () => { refits++; },
+  });
+  vm.runInContext(sourceSection("function applyAppearance(", "function settleAppearanceTransition("), context);
+  for (const [base, main, detail, search] of [
+    [10, 9, 8, 9], [11, 10, 9, 9], [12, 11, 9, 10], [13, 12, 10, 11],
+    [14, 13, 11, 12], [15, 14, 12, 13], [16, 15, 13, 14], [17, 16, 13, 15],
+    [18, 17, 14, 15], [19, 18, 15, 16], [20, 19, 16, 17],
+  ]) {
+    context.appearance.fontSize = base;
+    context.applyAppearance();
+    assert.equal(values.get("--font-size"), `${base}px`);
+    assert.equal(values.get("--menu-font-size"), `${main}px`);
+    assert.equal(values.get("--menu-description-font-size"), `${detail}px`);
+    assert.equal(values.get("--menu-search-font-size"), `${search}px`);
+    assert.equal(values.get("--ui-font-weight"), "500");
+  }
+  assert.equal(refits, 11);
+});
+
+test("权限菜单复用公共字号和选中规则，保留顶部说明边界与外部入口", async () => {
   const css = await readFile(new URL("../assets/harness/style.css", import.meta.url), "utf8");
   assert.match(css, /\.permission-button>\.ui-icon:last-child\{display:none\}/);
-  const start = css.indexOf(".composer-permissions-popup{"), end = css.indexOf(".composer-add-popup", start);
+  const start = css.indexOf(".composer-permissions-popup .popup-title"), end = css.indexOf(".composer-add-popup", start);
   const block = css.slice(start, end);
   assert.ok(start >= 0 && end > start);
-  assert.match(block, /^\.composer-permissions-popup\{font-size:var\(--font-size\)\}/);
+  assert.doesNotMatch(block, /font-size:|width:20px|aria-selected=true/);
+  assert.match(css, /\.menu-item\{[^}]*font-size:var\(--menu-font-size\)/);
+  assert.match(css, /\.menu-description\{[^}]*font-size:var\(--menu-description-font-size\)/);
+  assert.match(css, /\.menu-search\{[^}]*font-size:var\(--menu-search-font-size\)/);
+  assert.match(css, /\.ui-menu \.menu-icon\{[^}]*width:1em;height:1em/);
   // 同一条样式规则可能由多个后端的选择器共用，选择器后面接“{”或“,”都算命中。
   const rule = selector => {
     const from = [block.indexOf(`${selector}{`), block.indexOf(`${selector},`)].find(index => index >= 0) ?? -1;
     assert.ok(from >= 0, `缺少 ${selector}`);
     return block.slice(from, block.indexOf("}", from));
   };
-  for (const selector of [
-    ".composer-permissions-popup .popup-title", ".composer-permissions-popup .popup-option",
-    ".composer-permissions-popup .popup-option-label small", ".composer-permissions-popup .popup-note",
-    ".composer-codex-permissions-popup .popup-help",
-  ]) assert.match(rule(selector), /font-size:inherit/);
-  assert.match(rule(".composer-codex-permissions-popup .popup-help"), /border-top:0/);
-  assert.match(rule(".composer-codex-permissions-popup .popup-help"), /border-bottom:1px solid/);
+  assert.match(css, /\.popup-header\{[^}]*border-bottom:1px solid/);
   for (const backend of ["claude", "antigravity"]) {
     assert.match(rule(`.composer-${backend}-permissions-popup .popup-note`), /border-top:0/);
     assert.match(rule(`.composer-${backend}-permissions-popup .popup-note`), /border-bottom:1px solid/);
@@ -15713,14 +15863,17 @@ function claudeAliasModelMenuHarness() {
     contains(value) { return !!value && (this === value || this.children.some(node => node.contains(value))); }
     querySelectorAll(selector) {
       return this.children.flatMap(node => [
-        ...(selector === "button" ? node.tag === "button" : node.className.split(" ").includes(selector.slice(1))) ? [node] : [],
+        ...(selector === "button" ? node.tag === "button" : selector.startsWith("#") ? node.id === selector.slice(1)
+          : node.className.split(" ").includes(selector.slice(1))) ? [node] : [],
         ...node.querySelectorAll(selector),
       ]);
     }
     querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
-    focus() {}
+    focus() { context.document.activeElement = this; }
+    setSelectionRange(start, end) { this.selectionStart = start; this.selectionEnd = end; }
   }
-  const menu = new MenuNode("div"), prompt = new MenuNode("input");
+  const menu = new MenuNode("div"), prompt = new MenuNode("input"), trigger = new MenuNode("button");
+  trigger.searchMode = "auto";
   const context = vm.createContext({ nativeConnectionVersion: 1,
     models: [
       { model: "opus", resolvedModel: "claude-opus-5-5", displayName: "Opus 5.5",
@@ -15742,13 +15895,42 @@ function claudeAliasModelMenuHarness() {
     element: (tag, className, text) => new MenuNode(tag, className, text),
     button: (text, _label, action, className) => Object.assign(new MenuNode("button", className, text), { onclick: action }),
     $: (selector, root) => root ? root.querySelector(selector)
-      : selector === "#model-settings" ? menu : selector === "#prompt" ? prompt : null,
+      : selector === "#model-settings" ? menu : selector === "#prompt" ? prompt
+        : selector === "#model-button" ? trigger : menu.querySelector(selector),
     updateComposer() {}, fitComposerMenu() {}, closeComposerMenus() { menu.hidden = true; },
   });
   vm.runInContext(((sourceSection("function rememberedN") + "\n" + sourceSection("function rememberNewChatMode")) + (sourceSection("function defaultMode") + "\n" + sourceSection("function currentMode") + "\n" + (sourceSection("function modelFo") + "\n" + sourceSection("function claudePendingSetting(")) + "\n" + sourceSection("async function t")) + sourceSection("function renderModelMenu(", "function fitComposerMenu(")), context);
   const choices = group => menu.querySelector(`.${group}`).children.filter(node => node.tag === "button");
-  return { context, menu, choices };
+  return { context, menu, trigger, choices };
 }
+
+test("模型搜索共用三档策略，隐藏模型与思考深度不计数且关闭后重新判断", () => {
+  const h = claudeAliasModelMenuHarness(), c = h.context;
+  const entries = Array.from({ length: 10 }, (_, index) => ({
+    model: `model-${index}`, displayName: `模型 ${index}`,
+    supportedReasoningEfforts: ["low", "medium", "high", "xhigh"].map(reasoningEffort => ({ reasoningEffort })),
+    hiddenByInstance: index >= 8
+  }));
+  c.models = entries;
+  c.renderModelMenu();
+  assert.equal(h.menu.querySelector("#model-search"), null, "只计算八个可见模型，不加隐藏模型或思考深度");
+  c.models[8].hiddenByInstance = false;
+  c.renderModelMenu();
+  assert.ok(h.menu.querySelector("#model-search"));
+  c.modelQuery = "model-0"; c.renderModelMenu();
+  assert.ok(h.menu.querySelector("#model-search"), "过滤后仍保留搜索");
+  c.models = entries.slice(0, 1);
+  c.modelQuery = ""; c.renderModelMenu();
+  assert.ok(h.menu.querySelector("#model-search"), "同次展开清空查询及缩小目录均不隐藏");
+  vm.runInContext(sourceSection("function closeModelMenu(", "function closeComposerMenus("), c);
+  c.closeModelMenu(); h.menu.hidden = false; c.renderModelMenu();
+  assert.equal(h.menu.querySelector("#model-search"), null);
+  h.trigger.searchMode = "on"; c.models = []; c.renderModelMenu();
+  assert.ok(h.menu.querySelector("#model-search"));
+  h.trigger.searchMode = "off"; c.modelQuery = "不能隐藏残留的筛选"; c.renderModelMenu();
+  assert.equal(h.menu.querySelector("#model-search"), null);
+  assert.equal(c.modelQuery, "");
+});
 
 function codexDefaultModelHarness(disk = storage()) {
   const h = claudeAliasModelMenuHarness(), { context } = h;
@@ -17494,7 +17676,7 @@ test("Claude 斜杠菜单复用 Skill 列表与压缩目标底栏，支持搜索
   c.renderSkillMenu();
   assert.equal(h.menu.hidden, false);
   assert.equal(h.menu.children[0].children.length, 2);
-  assert.equal(h.menu.children[1].className, "skill-menu-footer");
+  assert.ok(h.menu.children[1].className.split(" ").includes("skill-menu-footer"));
   assert.equal(h.menu.children[1].children.length, 3);
   assert.deepEqual(Array.from(c.slashMenuEntries(), entry => entry.type), ["skill", "skill", "compact", "goal", "promptOptimize"]);
   c.moveSlashIndex(c.slashMenuEntries(), 1);
@@ -17514,6 +17696,23 @@ test("Claude 斜杠菜单复用 Skill 列表与压缩目标底栏，支持搜索
   h.prompt.value = "/"; h.prompt.selectionStart = h.prompt.selectionEnd = 1; c.skillChoices = [];
   c.renderSkillMenu("Skill 暂不可用");
   assert.equal(h.menu.children[1].children.length, 3, "Skill 读取失败不能隐藏压缩、目标和提示词优化");
+});
+
+test("Slash 后台重绘分别保留 Skill 和底部命令的滚动位置", () => {
+  const h = claudeSlashMenuHarness(), c = h.context;
+  c.skillChoices = [h.skill("review")];
+  c.renderSkillMenu();
+  h.menu.children[0].scrollTop = 80;
+  h.menu.children[1].scrollTop = 120;
+  const focused = c.document.activeElement;
+  c.renderSkillMenu();
+  assert.equal(h.menu.children[0].scrollTop, 80);
+  assert.equal(h.menu.children[1].scrollTop, 120);
+  assert.equal(c.document.activeElement, focused, "重绘不能抢编辑器焦点");
+  h.prompt.value = "/goal"; h.prompt.selectionStart = h.prompt.selectionEnd = 5;
+  c.renderSkillMenu();
+  assert.equal(h.menu.children[0].scrollTop, 0);
+  assert.equal(h.menu.children[1].scrollTop, 0, "更改查询后从新结果顶部开始");
 });
 
 test("斜杠菜单提供提示词优化，支持搜索并保留命令外输入", () => {

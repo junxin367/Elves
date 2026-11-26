@@ -12,4 +12,6 @@
 | `clients/` | [手机网页、PWA 与 Android](clients/mobile-web-pwa-android.md) | 手机接入、整页操作、平台差异与连接排查 |
 | `frontend/` | [工作区前端架构与公共组件](frontend/workspace-architecture-and-components.md) | 前端分层、Select 与弹层复用、资源登记及检查入口 |
 
+菜单组件直达：[统一菜单组件规范](core/product-behavior.md#统一菜单组件) · [搜索框显示规则](core/product-behavior.md#菜单搜索框) · [组件接口与复用约定](frontend/workspace-architecture-and-components.md#菜单内容组件)。产品规则维护在主规范，技术专题只维护接口与实现约束。
+
 **维护口径：** Elves 已确认的产品规则和例外以 `core/product-behavior.md` 为准；专题文档保留操作步骤、模块细节和实现约束，遇到已有通用条款时链接到所属章节。专题文档或 [历史验收记录](../validation/) 与主规范不一致时，不用旧记录推定现行行为，也不把尚未验收的源码描述成已上线。

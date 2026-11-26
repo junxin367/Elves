@@ -137,6 +137,10 @@ export function mountScheduledTasksPage(root) {
 
   const modelSelect = selectControl("scheduled-model", "选择请求模型", [], "",
     "scheduled-select", selected => [element("span", "select-label", selected?.label || "先选择实例")]);
+  // 任务模型与聊天、设置模型使用同一自动搜索门槛，实例与思考深度仍默认关闭。
+  modelSelect.searchMode = "auto";
+  modelSelect.selectSearchPlaceholder = "搜索模型";
+  modelSelect.selectSearchLabel = "搜索请求模型";
   modelSelect.selectAllowEmpty = true;
   modelSelect.disabled = true;
 

@@ -35,6 +35,8 @@ export function createSelectComponent({ element, icon, button, togglePopup, open
     node.id = id;
     node.setAttribute("aria-haspopup", "listbox");
     node.setAttribute("aria-expanded", "false");
+    // 搜索默认关闭，只有业务显式指定 auto/on 才开启，不能因普通 Select 的条目变多而自动增加。
+    node.searchMode = "off";
     node.renderSelectValue = renderValue;
     setSelectOptions(node, options, value);
     node.onkeydown = event => {

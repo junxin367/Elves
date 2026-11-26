@@ -127,8 +127,8 @@ export function shell() {
         <div id="prompt" class="prompt-editor" contenteditable="true" role="textbox" aria-multiline="true" data-placeholder="给 Codex 发送消息，输入 / 选择命令或 Skill…" aria-label="消息输入" aria-autocomplete="list" aria-controls="skill-menu" aria-expanded="false" spellcheck="true"></div>
         </div></div>
         <div class="composer-toolbar"><div class="composer-controls"><button id="composer-add" class="icon-button composer-add-button" type="button" aria-label="添加图片、压缩上下文或设置目标" aria-haspopup="menu" aria-expanded="false"></button><button id="prompt-optimize" class="icon-button prompt-optimize-button" type="button" aria-label="优化提示词" aria-busy="false" disabled>✨</button><button id="context-info" class="context-info muted" type="button" aria-label="查看上下文用量" aria-controls="context-usage-tooltip" aria-expanded="false"></button><button id="fast-button" class="icon-button fast-button" type="button" aria-label="开启本会话 Fast" aria-pressed="false" aria-busy="false" disabled hidden><span class="fast-bolt" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h8l-1 8 11-12h-8V2Z"/></svg></span></button><button id="model-button" class="text-button model-button" type="button" aria-label="选择模型与思考深度" aria-haspopup="menu" aria-controls="model-settings" aria-expanded="false">正在读取模型…</button></div><div class="composer-send"><span id="send-status" class="composer-send-status" role="status" aria-live="polite"></span><button id="send" class="send-button" type="submit" aria-label="发送消息"></button></div></div>
-        <div id="model-settings" class="composer-popover" role="menu" aria-label="模型与思考深度" hidden></div>
-        <div id="skill-menu" class="composer-popover skill-menu" role="listbox" aria-label="命令与 Skill" hidden></div>
+        <div id="model-settings" class="composer-popover ui-menu" role="menu" aria-label="模型与思考深度" hidden></div>
+        <div id="skill-menu" class="composer-popover ui-menu skill-menu" role="listbox" aria-label="命令与 Skill" hidden></div>
       </form><span id="session-metrics" class="composer-metrics" tabindex="0" aria-label="会话 Token 统计" hidden></span><button id="claude-usage" class="claude-usage" type="button" aria-label="查看 Claude 账号信息" aria-controls="claude-usage-tooltip" aria-expanded="false" hidden></button></div></div>
     </main>
   </div>`;
@@ -249,8 +249,8 @@ export function shell() {
   $("#sidebar-search-toggle").append(icon("search"));
   const projectSelect = selectControl("project-select", "新会话项目", [], "", "new-chat-project-select", selected =>
     [...(selected?.value ? [icon("folder")] : []), element("span", "select-label", selected?.label || "不在项目中工作")]);
-  projectSelect.selectSearchable = true;
-  // 用户要求 PC 点击“选择项目”后可直接输入；Android 和触屏移动网页保留原焦点行为，窄 PC 窗口仍支持搜索聚焦。
+  projectSelect.searchMode = "auto";
+  // 用户要求项目搜索按数量自动显示；PC 在打开时有搜索框才直接聚焦，少量选项与触屏继续聚焦选项。
   projectSelect.selectFocusSearch = () => !isAndroidContainer()
     && (isElvesClient() || matchMedia("(hover: hover) and (pointer: fine)").matches);
   projectSelect.popupClassName = "project-picker-popup";
@@ -619,6 +619,8 @@ export function shell() {
   $("#prompt").onblur = event => { if (!event.relatedTarget?.closest("#skill-menu")) closeSkillMenu(); };
   $("#prompt").onclick = () => void updateSkillMenu();
   $("#project-select").onchange = changeCreationProject;
+  // 复合模型菜单也显式使用公共搜索参数，不能由渲染器默认给其他菜单开启搜索。
+  $("#model-button").searchMode = "auto";
   $("#model-button").onclick = async () => {
     if (threadReadOnly()) return;
     const opening = $("#model-settings").hidden;

@@ -152,6 +152,10 @@ export function applyAppearance(save = false) {
     // 所有入口、侧边页面及管理页继承同一套派生色；每次完整写入，不能残留上一主题的强调色或主按钮色。
     ...appearanceThemeColors(appearance.theme, palette),
     "font-size": `${appearance.fontSize}px`,
+    // 用户要求以界面字号分别按 92.86% / 78.57% / 85.71% 四舍五入；所有菜单共享整数结果，不能嵌套再缩放。
+    "menu-font-size": `${Math.round(appearance.fontSize * .9286)}px`,
+    "menu-description-font-size": `${Math.round(appearance.fontSize * .7857)}px`,
+    "menu-search-font-size": `${Math.round(appearance.fontSize * .8571)}px`,
     "ui-font-family": fontStack(appearance.uiFont, defaultUiFont),
     "code-font-family": fontStack(appearance.codeFont, defaultCodeFont),
     "ui-font-weight": String(appearance.uiFontWeight), "code-font-weight": String(appearance.codeFontWeight),

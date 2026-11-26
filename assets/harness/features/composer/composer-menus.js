@@ -1,6 +1,7 @@
 // 输入区浮层：模型菜单渲染与新会话所选模型的记忆、浮层与审批区的视口适配，以及统一收起输入区菜单；模型菜单搜索词在 options-state.js。
 
-import { $, button, element } from "../../ui/dom.js";
+import { $ } from "../../ui/dom.js";
+import { createMenuEmpty, createMenuGroup, createMenuItem, createMenuSearch, shouldShowMenuSearch } from "../../ui/menu-parts.js";
 import { activePopup, fitPopup } from "../../ui/popup.js";
 import { menuHorizontalLeft } from "../../ui/position.js";
 import { updateComposer } from "../../core/actions.js";
@@ -22,7 +23,8 @@ export function closeSkillMenu() {
   $("#prompt")?.removeAttribute("aria-activedescendant");
 }
 export function closeModelMenu() {
-  const menu = $("#model-settings"); if (menu) menu.hidden = true;
+  const menu = $("#model-settings");
+  if (menu) { menu.hidden = true; menu.menuSearchVisible = false; }
   $("#model-button")?.setAttribute("aria-expanded", "false");
 }
 export function closeComposerMenus({ keepContextUsage = false } = {}) {
@@ -39,24 +41,24 @@ export function renderModelMenu() {
   const effortScroll = $(".effort-options", menu)?.scrollTop || 0;
   const searchFocused = document.activeElement === $("#model-search");
   const searchSelection = searchFocused ? [document.activeElement.selectionStart, document.activeElement.selectionEnd] : null;
+  // 模型入口明确使用自动模式：只统计未隐藏的完整模型候选，不计思考深度或当前值提示占位。
+  const availableModels = models.filter(model => model.hiddenByInstance !== true);
+  menu.menuSearchVisible = shouldShowMenuSearch($("#model-button")?.searchMode, availableModels.length, menu.menuSearchVisible);
+  if (!menu.menuSearchVisible && modelQuery) setModelQuery("");
   menu.replaceChildren();
-  if (models.length > 8 || modelQuery || searchFocused) {
-    const input = element("input", "model-search");
-    input.id = "model-search"; input.type = "search"; input.value = modelQuery;
-    input.placeholder = "搜索模型"; input.setAttribute("aria-label", "搜索模型"); input.autocomplete = "off";
-    input.oninput = event => { if (!event.isComposing) { setModelQuery(input.value); renderModelMenu(); } };
-    input.oncompositionend = () => { setModelQuery(input.value); renderModelMenu(); };
+  if (menu.menuSearchVisible) {
+    const input = createMenuSearch({ id: "model-search", className: "model-search",
+      label: "搜索模型", value: modelQuery, onQuery(value) {
+        if ($("#model-search") !== input) return;
+        setModelQuery(value); renderModelMenu();
+      } });
     menu.append(input);
   }
   const choice = (text, checked, action, description, key = text) => {
-    const node = button("", text, action, "model-option");
+    const node = createMenuItem({ label: text, description, selected: checked, action,
+      role: "menuitemradio", className: "model-option", labelClassName: "model-option-label" });
     node.dataset.choiceKey = key;
     node.title = text;
-    node.setAttribute("role", "menuitemradio"); node.setAttribute("aria-checked", String(checked));
-    const labels = element("span", "model-option-label");
-    labels.append(element("span", "", text));
-    if (description) labels.append(element("small", "muted", description));
-    node.append(labels, element("span", "choice-check", checked ? "✓" : ""));
     return node;
   };
   const applyModelMenuChoice = () => {
@@ -66,11 +68,12 @@ export function renderModelMenu() {
     closeComposerMenus();
     $("#prompt").focus();
   };
-  const group = element("div", "model-options"); group.setAttribute("role", "group"); group.setAttribute("aria-label", "模型");
+  // 用户要求共用菜单项，但模型与思考深度的选择、独立滚动和焦点恢复仍归本模块管理。
+  const group = createMenuGroup("模型", "model-options");
   const modelId = currentModelId(), matchedModel = currentModel(), selectedReasoning = currentEffort();
   // 用户要求 Claude 可按实例隐藏模型；完整目录保留用于当前模型和能力判断，仅过滤可重新选择的条目。
-  const visibleModels = models.filter(model => model.hiddenByInstance !== true
-    && `${model.displayName || ""} ${model.model}`.toLowerCase().includes(modelQuery.trim().toLowerCase()));
+  const visibleModels = availableModels.filter(model =>
+    `${model.displayName || ""} ${model.model}`.toLowerCase().includes(modelQuery.trim().toLowerCase()));
   for (const model of visibleModels) group.append(choice(model.displayName || model.model, matchedModel === model, () => {
     if (currentModel() !== model) {
       // 用户要求切换模型不丢弃思考深度，Claude 和 Codex 的已有及新建会话共用此规则。
@@ -89,12 +92,12 @@ export function renderModelMenu() {
       `model:${modelId}`);
     current.disabled = true; group.prepend(current);
   }
-  if (!group.children.length) group.append(element("p", "popover-empty muted",
+  if (!group.children.length) group.append(createMenuEmpty(
     models.length && models.every(model => model.hiddenByInstance === true)
       ? "当前实例的模型均已隐藏，可在会话实例设置中恢复显示"
-      : models.length ? "没有匹配的模型，请修改搜索条件" : "暂无可选模型，请稍后重试"));
+      : models.length ? "没有匹配的模型，请修改搜索条件" : "暂无可选模型，请稍后重试", "popover-empty"));
   menu.append(group);
-  const efforts = element("div", "effort-options"); efforts.setAttribute("role", "group"); efforts.setAttribute("aria-label", "思考深度");
+  const efforts = createMenuGroup("思考深度", "effort-options");
   const supportedEfforts = (currentModel()?.supportedReasoningEfforts || []).filter(effort => effort.reasoningEffort !== "minimal");
   for (const effort of supportedEfforts) {
     efforts.append(choice(effortLabels[effort.reasoningEffort] || effort.reasoningEffort,
@@ -105,16 +108,18 @@ export function renderModelMenu() {
         applyModelMenuChoice();
       }, null, `effort:${effort.reasoningEffort}`));
   }
-  if (!efforts.children.length) efforts.append(element("p", "popover-empty muted", "此模型暂无可选思考深度"));
+  if (!efforts.children.length) efforts.append(createMenuEmpty("此模型暂无可选思考深度", "popover-empty"));
   menu.append(efforts);
   fitComposerMenu(menu);
   group.scrollTop = modelScroll; efforts.scrollTop = effortScroll;
   if (searchFocused && $("#model-search")) {
     $("#model-search").focus({ preventScroll: true });
     $("#model-search").setSelectionRange(...searchSelection);
-  } else if (focusIndex >= 0) {
+  } else if (focusIndex >= 0 || searchFocused) {
     const buttons = [...menu.querySelectorAll("button")];
-    (buttons.find(node => node.dataset.choiceKey === focusKey) || buttons[focusIndex])?.focus({ preventScroll: true });
+    (buttons.find(node => node.dataset.choiceKey === focusKey && !node.disabled)
+      || (buttons[focusIndex]?.disabled ? null : buttons[focusIndex])
+      || buttons.find(node => !node.disabled))?.focus({ preventScroll: true });
   }
 }
 export function fitComposerMenu(menu) {

@@ -390,7 +390,7 @@ html{scrollbar-color:var(--muted) transparent}
 .workspace{--sidebar-layout-width:280px;--content-half-width:min(calc(var(--conversation-max-width,950px)/2),max(0px,calc((100% - 48px)/2)));--content-padding-start:max(24px,calc(100% - 50vw - var(--content-half-width)));--content-padding-end:max(24px,calc(100% - 2 * var(--content-half-width) - var(--content-padding-start)));display:grid;grid-template-columns:var(--sidebar-layout-width) minmax(0,1fr);height:100dvh;overflow:hidden}.sidebar{background:var(--side);border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0;padding:16px 10px 10px}.sidebar-header{display:flex;align-items:center;justify-content:space-between;padding:3px 9px 18px;font-size:1.14286rem}.sidebar-header strong{font-weight:600}.new-chat{text-align:left;border:0;font-weight:500;margin-bottom:12px}.search{width:100%;background:transparent;border-color:var(--line);font-size:0.85714rem}.sidebar-controls{display:flex;gap:6px;margin:12px 0 4px}.sidebar-controls select{padding:4px 6px;border:0;background:transparent;color:var(--muted);font-size:0.78571rem;flex:1}.sidebar-content{overflow:auto;min-height:0;flex:1;scrollbar-width:thin}.section-label{font-size:0.78571rem;color:var(--muted);padding:18px 10px 7px;display:flex;justify-content:space-between;align-items:center}.pin-sort{font-size:0.71429rem;padding:2px;border:0;background:transparent}.thread-row{display:flex;align-items:center;border-radius:7px;min-width:0;margin:1px 0}.thread-link{display:flex;gap:8px;align-items:center;flex:1;min-width:0;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;border:0;padding:9px;font-size:0.85714rem}.thread-dot{color:var(--muted);flex-shrink:0}.thread-dot.active{color:var(--green);animation:pulse 1.5s infinite}.thread-dot.unread{color:var(--accent-indicator)}.pin-button{border:0;padding:6px;font-size:0.85714rem;color:var(--muted);flex-shrink:0;opacity:.3}.thread-row:hover .pin-button,.project-header:hover .pin-button,.pin-button:focus{opacity:1}.project-header{display:flex;align-items:center;margin-top:6px}.project-title{flex:1;min-width:0;border:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:500;text-align:left;padding:9px 7px;font-size:0.85714rem}.project-group>.thread-row{margin-left:12px}.empty-project{display:block;color:var(--muted);padding:7px 24px;font-size:0.78571rem}.sidebar-footer{display:flex;align-items:center;justify-content:space-between;padding:12px 6px 3px;font-size:0.78571rem;border-top:1px solid var(--line)}#device-name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.load-more{display:block;border:0;margin:14px auto;font-size:0.85714rem;color:var(--muted)}.sidebar-content .load-more:not(.project-load-more){margin:10px auto}
 .conversation{display:flex;flex-direction:column;min-width:0;min-height:0}.conversation-header{height:auto;min-height:52px;flex-shrink:0;padding:6px 24px;display:flex;gap:12px;align-items:center;border-bottom:1px solid var(--line)}.thread-heading{min-width:0;flex:1;display:flex;flex-direction:column;gap:5px}.thread-heading strong{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:1rem;font-weight:600}.thread-heading>span{font-size:0.71429rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.connection-state{font-size:0.71429rem;color:var(--danger);white-space:nowrap}.connection-state.online{color:var(--green)}.messages{overflow:auto;flex:1;min-height:0;padding:26px var(--content-padding-end) 26px var(--content-padding-start);scroll-behavior:auto;scrollbar-width:thin}.welcome{margin:22vh auto;text-align:center;color:var(--muted)}.welcome h1{color:var(--text);font-size:2rem;font-weight:500}.welcome small{font-size:0.85714rem}.empty-conversation{text-align:center;color:var(--muted);padding:12vh 16px}.turn{padding-bottom:24px}.message{padding:6px 0 20px}.user-message{display:flex;justify-content:flex-end}.user-bubble{max-width:85%;background:var(--user-message-bg);color:var(--user-message-text);border-radius:18px;padding:12px 18px;white-space:pre-wrap;line-height:1.8;overflow-wrap:anywhere}.agent-message{font-size:1rem;line-height:1.9;overflow-wrap:anywhere}.agent-message.commentary{color:var(--text-secondary);font-size:0.92857rem;padding-bottom:8px}.markdown p{margin:0 0 14px}.markdown h1,.markdown h2,.markdown h3{line-height:1.5;margin:22px 0 12px;font-size:1.35714rem}.markdown h1{font-size:1.71429rem}.markdown h3{font-size:1.14286rem}.markdown ul,.markdown ol{padding-left:24px;margin:8px 0 16px}.markdown li{padding:2px 0}.markdown blockquote{margin:14px 0;padding:4px 14px;border-left:3px solid var(--line);color:var(--muted)}.markdown a{color:var(--accent-text);text-decoration:underline;text-underline-offset:3px}.markdown code{font-family:"JetBrains Mono",Consolas,monospace;font-size:.88em;background:var(--code);padding:2px 5px;border-radius:4px}.markdown hr{border:0;border-top:1px solid var(--line);margin:20px 0}.code-block{border:1px solid var(--line);border-radius:10px;background:var(--code);overflow:hidden;margin:16px 0}.code-header{display:flex;justify-content:space-between;align-items:center;padding:7px 14px;border-bottom:1px solid var(--line);font-size:0.78571rem;color:var(--muted)}.copy-code{border:0;padding:2px 5px;font-size:0.78571rem}.code-block pre{margin:0;padding:16px;overflow:auto;line-height:1.65}.code-block pre code{background:none;padding:0}.table-scroll{overflow:auto;margin:16px 0}.markdown table{border-collapse:collapse;min-width:60%;font-size:0.85714rem}.markdown th,.markdown td{border:1px solid var(--line);padding:7px 12px;text-align:left}.markdown th{background:var(--side)}
 .tool-item{color:var(--muted);font-size:0.85714rem;margin:4px 0 12px;border:1px solid transparent;border-radius:8px}.tool-item[open]{border-color:var(--line);background:var(--side)}.tool-item summary{display:flex;gap:8px;align-items:center;cursor:pointer;list-style:none;padding:9px 10px}.tool-item summary strong{font-weight:500;white-space:nowrap}.tool-description{font-family:Consolas,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0;font-size:0.78571rem}.tool-state{font-size:0.78571rem}.tool-item.failed{color:var(--danger)}.tool-output{white-space:pre-wrap;overflow:auto;overflow-wrap:anywhere;max-height:360px;padding:10px 14px;margin:0;font:.78571rem/1.75 Consolas,monospace}.turn-error{color:var(--danger);padding:10px 0}.turn-error-title{display:block;font-weight:600}.turn-error-message{margin:4px 0 0}.turn-error-detail{display:block;margin-top:4px;color:var(--muted);white-space:pre-wrap;overflow-wrap:anywhere}.turn-end{display:block;text-align:right}
-.composer-area{padding:14px var(--content-padding-end) max(12px,env(safe-area-inset-bottom)) var(--content-padding-start);flex-shrink:0}.composer{border:1px solid var(--line);border-radius:24px;background:var(--side);padding:12px 15px;box-shadow:0 2px 8px #00000004}.composer .prompt-editor{font-size:var(--font-size);width:100%;height:100px;min-height:100px;max-height:var(--prompt-editor-max-height);overflow-y:hidden;background:transparent;border:0;padding:0;line-height:1.7;white-space:pre-wrap;overflow-wrap:anywhere;caret-color:var(--text)}.composer .prompt-editor:focus{outline:0}.prompt-editor:empty::before,.prompt-editor.goal-only::after{content:attr(data-placeholder);color:var(--muted);pointer-events:none}.prompt-editor[aria-disabled=true]{opacity:.45;cursor:not-allowed}.inline-skill,.inline-goal,.inline-scheduled{display:inline-flex;align-items:baseline;gap:3px;max-width:100%;margin-right:.3em;color:var(--skill);font-weight:500;line-height:inherit;vertical-align:baseline;white-space:nowrap}.inline-skill-icon{display:inline-flex;align-self:center;width:14px;height:14px;align-items:center;justify-content:center;flex-shrink:0}.inline-skill-icon svg{width:100%;height:100%}.inline-skill-name{min-width:0;overflow:hidden;text-overflow:ellipsis}.composer-toolbar{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:6px}.composer-toolbar>.muted{font-size:0.71429rem}.composer-toolbar>div{display:flex;align-items:center;gap:7px}.send-button{width:34px;height:34px;padding:0;border-radius:50%;font-size:22px}.stop-button{font-size:0.78571rem}.composer-toolbar .text-button{font-size:0.71429rem}.composer-note{display:block;text-align:center;font-size:0.71429rem;color:var(--muted);margin-top:9px}#model-settings{padding-top:10px;display:flex;gap:8px}#model-settings[hidden]{display:none}#model-settings select{font-size:0.78571rem;max-width:70%}#project-select{width:100%;margin-bottom:12px;font-size:0.85714rem}.approval-area{max-height:35vh;overflow:auto;padding:0 var(--content-padding-end) 0 var(--content-padding-start)}.approval-card{border:1px solid #d4b773;border-radius:12px;background:var(--side);padding:16px;margin-bottom:8px;font-size:0.85714rem}.approval-description{white-space:pre-wrap;overflow-wrap:anywhere;max-height:130px;overflow:auto;font:.78571rem/1.6 Consolas,monospace}.approval-actions{display:flex;flex-wrap:wrap;gap:8px}.approval-actions button{font-size:0.78571rem}.question-label{display:flex;flex-direction:column;gap:8px;margin:12px 0;line-height:1.7}.question-options{display:flex;flex-wrap:wrap;gap:5px}.question-options button{font-size:0.78571rem}.pending-banner{font-size:0.78571rem;color:#926300;margin-bottom:9px;line-height:1.8}#notice{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);z-index:100;background:var(--notice-bg);color:var(--notice-text);padding:12px 20px;border-radius:12px;max-width:calc(100% - 30px);font-size:0.85714rem;opacity:0;pointer-events:none;transition:opacity .2s}#notice.visible{opacity:1}#notice.error{background:#912018}#open-sidebar,#close-sidebar,.sidebar-backdrop{display:none}[hidden]{display:none!important}@keyframes pulse{50%{opacity:.4}}
+.composer-area{padding:14px var(--content-padding-end) max(12px,env(safe-area-inset-bottom)) var(--content-padding-start);flex-shrink:0}.composer{border:1px solid var(--line);border-radius:24px;background:var(--side);padding:12px 15px;box-shadow:0 2px 8px #00000004}.composer .prompt-editor{font-size:var(--font-size);width:100%;height:100px;min-height:100px;max-height:var(--prompt-editor-max-height);overflow-y:hidden;background:transparent;border:0;padding:0;line-height:1.7;white-space:pre-wrap;overflow-wrap:anywhere;caret-color:var(--text)}.composer .prompt-editor:focus{outline:0}.prompt-editor:empty::before,.prompt-editor.goal-only::after{content:attr(data-placeholder);color:var(--muted);pointer-events:none}.prompt-editor[aria-disabled=true]{opacity:.45;cursor:not-allowed}.inline-skill,.inline-goal,.inline-scheduled{display:inline-flex;align-items:baseline;gap:3px;max-width:100%;margin-right:.3em;color:var(--skill);font-weight:500;line-height:inherit;vertical-align:baseline;white-space:nowrap}.inline-skill-icon{display:inline-flex;align-self:center;width:14px;height:14px;align-items:center;justify-content:center;flex-shrink:0}.inline-skill-icon svg{width:100%;height:100%}.inline-skill-name{min-width:0;overflow:hidden;text-overflow:ellipsis}.composer-toolbar{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:6px}.composer-toolbar>.muted{font-size:0.71429rem}.composer-toolbar>div{display:flex;align-items:center;gap:7px}.send-button{width:34px;height:34px;padding:0;border-radius:50%;font-size:22px}.stop-button{font-size:0.78571rem}.composer-toolbar .text-button{font-size:0.71429rem}.composer-note{display:block;text-align:center;font-size:0.71429rem;color:var(--muted);margin-top:9px}#model-settings[hidden]{display:none}#project-select{width:100%;margin-bottom:12px;font-size:0.85714rem}.approval-area{max-height:35vh;overflow:auto;padding:0 var(--content-padding-end) 0 var(--content-padding-start)}.approval-card{border:1px solid #d4b773;border-radius:12px;background:var(--side);padding:16px;margin-bottom:8px;font-size:0.85714rem}.approval-description{white-space:pre-wrap;overflow-wrap:anywhere;max-height:130px;overflow:auto;font:.78571rem/1.6 Consolas,monospace}.approval-actions{display:flex;flex-wrap:wrap;gap:8px}.approval-actions button{font-size:0.78571rem}.question-label{display:flex;flex-direction:column;gap:8px;margin:12px 0;line-height:1.7}.question-options{display:flex;flex-wrap:wrap;gap:5px}.question-options button{font-size:0.78571rem}.pending-banner{font-size:0.78571rem;color:#926300;margin-bottom:9px;line-height:1.8}#notice{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);z-index:100;background:var(--notice-bg);color:var(--notice-text);padding:12px 20px;border-radius:12px;max-width:calc(100% - 30px);font-size:0.85714rem;opacity:0;pointer-events:none;transition:opacity .2s}#notice.visible{opacity:1}#notice.error{background:#912018}#open-sidebar,#close-sidebar,.sidebar-backdrop{display:none}[hidden]{display:none!important}@keyframes pulse{50%{opacity:.4}}
 @media(prefers-color-scheme:dark){:root{--bg:#171717;--side:#202020;--text:#ededed;--muted:#a0a0a0;--line:#343434;--hover:#303030;--code:#222;--accent:#eee;--on-accent:#171717;--danger:#ff9c97;--green:#77c7a0;--skill:#75b7ef}.approval-card{border-color:#615031}}
 @media(min-width:761px){.workspace.sidebar-collapsed{--sidebar-layout-width:0px}.workspace.sidebar-collapsed .sidebar{visibility:hidden;overflow:hidden;border-right:0;padding-right:0;padding-left:0;pointer-events:none}#close-sidebar,.workspace.sidebar-collapsed #open-sidebar{display:grid;min-width:32px;min-height:32px;place-items:center;padding:0}}
 @media(max-width:760px){.workspace{grid-template-columns:minmax(0,1fr)}.sidebar{position:fixed;left:0;top:0;bottom:0;width:80vw;z-index:20;transform:translateX(-100%);transition:transform .15s}.sidebar-open .sidebar{transform:translateX(0)}.sidebar-open .sidebar-backdrop{display:block;position:fixed;inset:0;background:#0007;z-index:19}.messages{padding:22px 18px}.conversation-header{padding:3px 12px;min-height:48px;gap:8px}.thread-heading strong{font-size:0.85714rem}.thread-heading>span{font-size:0.64286rem}.connection-state{font-size:0.64286rem;max-width:80px;white-space:normal;text-align:right}.composer-area{padding:10px 12px max(10px,env(safe-area-inset-bottom))}.approval-area{padding:0 12px}.user-bubble{max-width:95%;font-size:0.92857rem}.agent-message{font-size:0.92857rem}.composer-note{font-size:0.64286rem}.pin-button{opacity:.7}#open-sidebar,#close-sidebar{display:block}.welcome{margin:16vh auto}.welcome h1{font-size:1.71429rem}.sidebar-footer{padding-bottom:max(6px,env(safe-area-inset-bottom))}}
@@ -585,42 +585,21 @@ html[data-workspace-side-panel=true] .composer-anchor>.composer-metrics,
 .composer-toolbar .model-button:is(:focus-visible,[aria-expanded=true]){background:var(--composer-hover,var(--hover))}
 @media(hover:hover) and (pointer:fine){.composer-toolbar .model-button:hover:not(:disabled){background:var(--composer-hover,var(--hover))}}
 .composer-toolbar>.composer-send{flex-shrink:0}
-.composer-popover{position:absolute;bottom:calc(100% + 10px);left:0;width:min(380px,100%);max-height:52dvh;overflow:auto;background:var(--bg);border:1px solid var(--line);border-radius:14px;padding:8px;box-shadow:0 12px 35px #0002;z-index:30;scrollbar-width:thin}
-#model-settings{position:fixed;inset:auto;display:flex;flex-direction:column;gap:0;max-width:calc(100vw - 16px);padding:8px;overflow:hidden}
+.composer-popover{position:absolute;bottom:calc(100% + 10px);left:0;width:min(380px,100%);max-height:52dvh;overflow:auto;scrollbar-width:thin}
+#model-settings{position:fixed;inset:auto;display:flex;flex-direction:column;gap:0;max-width:calc(100vw - 16px);overflow:hidden}
 .popover-title{padding:8px 10px;font-size:calc(var(--font-size)*.8);color:var(--muted);font-weight:500}
 .model-options,.effort-options{display:grid;grid-template-columns:minmax(0,1fr);grid-auto-rows:max-content;align-content:start;gap:0;min-width:0}
 /* 模型与推理等级仍用 1px 分隔，仅深色通过派生的重边框色提高辨识度，浅色沿用原线色。 */
-.model-options{border-bottom:1px solid var(--menu-divider,var(--line));padding-bottom:5px;flex:1 1 auto;min-height:0;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin}
-.effort-options{flex-shrink:0;min-height:0;padding-top:5px;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin}
-.model-search{flex-shrink:0;width:calc(100% - 8px);margin:0 4px 6px;padding:6px 8px;font-size:.85714rem}
-.model-option{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;min-width:0;min-height:32px;border:0;text-align:left;padding:5px 10px;font-size:calc(var(--font-size)*.9);line-height:1.4}
-.model-option-label{display:grid;grid-template-columns:minmax(0,1fr);gap:4px;min-width:0;overflow-wrap:anywhere}
+.model-options{border-bottom:1px solid var(--menu-divider,var(--line));padding-bottom:var(--menu-padding);flex:1 1 auto;min-height:0;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin}
+.effort-options{flex-shrink:0;min-height:0;padding-top:var(--menu-padding);overflow:auto;overscroll-behavior:contain;scrollbar-width:thin}
 .model-option-label>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.model-option-label small{font-size:calc(var(--font-size)*.75);line-height:1.6}
-.choice-check{flex-shrink:0;color:var(--text);margin-left:8px}
-@media(max-width:760px),(pointer:coarse){
-  #model-settings .model-options{padding-bottom:3px}
-  #model-settings .effort-options{padding-top:3px}
-  #model-settings .model-option{min-height:28px;padding:4px 10px}
-  #model-settings .model-option-label{gap:2px}
-  #model-settings .choice-check{margin-left:0}
-}
-.popover-empty{padding:8px 10px;font-size:calc(var(--font-size)*.85);line-height:1.7}
 .skill-menu{display:flex;flex-direction:column;overflow:hidden}
 .skill-options{flex:1 1 auto;min-height:0;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin}
-.skill-menu-footer{flex-shrink:0;border-top:1px solid var(--line);margin-top:4px;padding-top:4px}
-.skill-option{display:flex;flex-direction:column;justify-content:center;align-items:flex-start;gap:2px;min-width:0;min-height:var(--control-menu-height);border:0;text-align:left;width:100%;padding:6px 10px;font-size:calc(var(--font-size)*.9);line-height:1.4}
-.skill-option.active{background:var(--hover)}
-.skill-option:disabled{opacity:.48;cursor:default}
-.skill-option strong{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500}
-.skill-option small{display:block;max-width:100%;font-size:calc(var(--font-size)*.75);line-height:1.6;white-space:nowrap;text-overflow:ellipsis;overflow:hidden}
-.slash-command-option{display:grid;grid-template-columns:20px minmax(0,1fr);align-items:center;gap:9px;min-height:36px;padding:5px 10px}
+/* 用户要求大字号及低视口不能截断选项；底部命令分组空间不足时独立滚动，编辑器仍持有焦点。 */
+.skill-menu-footer{flex:0 1 auto;min-height:0;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin;border-top:1px solid var(--menu-divider,var(--line));margin-top:var(--menu-padding);padding-top:var(--menu-padding)}
+.skill-option .menu-item-name{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 /* 用户要求未选中的 / 命令图标与命令标题保持正文前景色；仅说明文字使用 muted，彩色提示词优化图标继续由 Emoji 自己着色。 */
-.slash-command-option .slash-command-icon{width:18px;height:18px;display:grid;place-items:center;color:var(--text)}
-.slash-command-icon svg{width:18px;height:18px}
-.slash-command-copy{display:flex;align-items:baseline;gap:7px;min-width:0}
-.slash-command-copy strong{flex-shrink:0}
-.slash-command-usage{white-space:nowrap}
+.slash-command-option .slash-command-icon{color:var(--text)}
 .appearance-heading{display:flex;align-items:center;justify-content:space-between;min-height:32px;gap:12px}
 .appearance-heading h2{font-size:calc(var(--font-size)*1.2);line-height:32px;margin:0}
 .appearance-heading .icon-button{width:var(--control-icon-size);height:var(--control-icon-size)}
@@ -679,8 +658,7 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .sidebar-type-popup .popup-option:is([data-value=claude],[data-value^="claude:"])>.ui-icon{color:#d97757}
 .sidebar-type-popup .popup-option:is([data-value=antigravity],[data-value^="antigravity:"])>.ui-icon{color:#3186ff}
 .sidebar-type-popup .popup-option:is([data-value=codex],[data-value^="codex:"])>.ui-icon{color:var(--text);color:light-dark(var(--text),#fff)}
-/* 用户要求实例多选：预留 16px 勾选区，连续选择时文字位置不因勾选出现或消失而跳动。 */
-.sidebar-type-popup .choice-check{width:16px;text-align:center}
+/* 用户要求实例多选连续操作；勾选区由公共 menu-check 保留 1em 占位，不因选中与否跳动。 */
 .sidebar-view-toggle:hover,.sidebar-search-toggle:hover{color:var(--text)}
 .sidebar-search-toggle[aria-pressed=true]{color:#3076df}
 .sidebar-action{display:flex;flex-shrink:0;margin-bottom:0}
@@ -778,52 +756,63 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 #appearance-button{font-weight:500}
 .ui-popup{position:fixed;inset:auto;margin:0;display:flex;flex-direction:column;max-width:calc(100vw - 16px);max-height:var(--popup-max-height);min-width:0;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:var(--radius-popup);padding:4px;box-shadow:0 8px 28px #0002;z-index:var(--layer-menu);overflow:hidden;animation:popup-appear var(--duration-popup) ease-out}
 .ui-popup[popover]:not(:popover-open){display:none}
+/* 用户确认九类弹出菜单共用尺寸和字号；常驻分组菜单、额度、用量及取色器不接入 ui-menu。
+ * 默认字号对应界面 14px；实际整数结果由 appearance/apply.js 按 92.86% / 78.57% / 85.71% 四舍五入写入。
+ * 菜单行沿用 --control-menu-height：桌面 36px，触屏及窄屏 44px；大字号与多行说明允许自然增高。 */
+:root{--menu-font-size:13px;--menu-description-font-size:11px;--menu-search-font-size:12px;--menu-padding:4px;--menu-item-padding-block:8px;--menu-item-padding-inline:12px;--menu-item-gap:8px;--menu-label-gap:4px;--menu-shadow:0 8px 28px #0002}
+.ui-menu{padding:var(--menu-padding);background:var(--control-bg,var(--side));color:var(--text);border:1px solid var(--line);border-radius:var(--radius-popup);box-shadow:var(--menu-shadow);font-family:var(--ui-font-family);font-size:var(--menu-font-size);font-weight:var(--ui-font-weight,400);line-height:1.4;z-index:var(--layer-menu)}
+.menu-group{min-width:0}
+.menu-item{display:flex;align-items:center;gap:var(--menu-item-gap);width:100%;min-width:0;min-height:var(--control-menu-height);padding:var(--menu-item-padding-block) var(--menu-item-padding-inline);border:0;border-radius:var(--radius-control);background:transparent;color:var(--text);font-family:var(--ui-font-family);font-size:var(--menu-font-size);font-weight:var(--ui-font-weight,400);line-height:1.4;text-align:left;cursor:pointer}
+.menu-item-label{display:flex;flex-direction:column;gap:var(--menu-label-gap);flex:1;min-width:0;overflow-wrap:anywhere}
+.menu-item-name{font-weight:inherit}
+.menu-description{font-size:var(--menu-description-font-size);font-weight:var(--ui-font-weight,400);line-height:1.5;color:var(--muted);overflow-wrap:anywhere}
+/* “＋”压缩、目标保留同行说明；排列由调用方显式选择，不再通过业务选择器另设字号。 */
+.menu-item-label-inline{flex-direction:row;align-items:baseline;gap:var(--menu-item-gap);white-space:nowrap}
+.menu-item-label-inline>.menu-item-name{flex-shrink:0}
+.menu-item-label-inline>.menu-description{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.menu-title{flex-shrink:0;padding:var(--menu-item-padding-block) var(--menu-item-padding-inline);font-size:var(--menu-font-size);font-weight:inherit;line-height:1.4}
+.menu-empty{margin:0;padding:var(--menu-item-padding-block) var(--menu-item-padding-inline)}
+.menu-search{width:calc(100% - 8px);flex-shrink:0;margin:var(--menu-padding);padding:var(--menu-item-padding-block);min-height:32px;border:1px solid var(--line);border-radius:var(--radius-control);background:var(--composer-bg,var(--side));color:var(--text);font-family:var(--ui-font-family);font-size:var(--menu-search-font-size);font-weight:var(--ui-font-weight,400)}
+.menu-search::placeholder{color:var(--muted)}
+.menu-search:focus{outline:1px solid var(--focus-ring);outline-offset:-1px;border-color:transparent}
+/* 图标与所属文字为同一个 1em；只缩放菜单内的图标框，保留品牌图案、彩色 Emoji 和外部入口尺寸。 */
+.ui-menu .menu-icon{display:inline-flex;align-items:center;justify-content:center;flex:0 0 1em;width:1em;height:1em;font-size:inherit;line-height:1}
+.ui-menu .menu-icon>svg,.ui-menu .menu-icon>img,.ui-menu .menu-icon>.ui-icon{width:100%;height:100%;object-fit:contain}
+.menu-check{display:inline-flex;align-items:center;justify-content:center;flex:0 0 1em;width:1em;height:1em;font-size:inherit;line-height:1;color:inherit}
+.menu-submenu-arrow{transform:rotate(-90deg);color:var(--muted)}
+.menu-separator{flex-shrink:0;height:1px;margin:var(--menu-padding) 0;background:var(--menu-divider,var(--line))}
+/* 独立按钮按普通 Button 的 5px 图文间距、左右 10px 内边距整体居中；普通菜单项继续左对齐。 */
+.menu-button{display:inline-flex;align-items:center;justify-content:center;gap:5px;min-height:var(--control-menu-height);padding:5px 10px;border:0;border-radius:var(--radius-control);background:transparent;color:var(--text);font-family:var(--ui-font-family);font-size:var(--menu-font-size);font-weight:var(--ui-font-weight,400);line-height:1.4;text-align:center}
+.menu-help{display:flex;align-items:center;gap:5px;text-decoration:none}
+/* 用户要求菜单键盘焦点保留 1px 内描边；原生 focus-visible 判定不能被全局 pointer 模式的清除规则覆盖。 */
+:root .ui-menu :is(.menu-item,.menu-button,.menu-help,.menu-search):focus-visible{outline:1px solid var(--focus-ring);outline-offset:-1px}
+@media(hover:hover) and (pointer:fine){.menu-item:not(:disabled):hover,.menu-button:not(:disabled):hover,.menu-help:hover{background:var(--hover)}}
+@media(hover:none),(pointer:coarse){.ui-menu .menu-item:hover,.ui-menu .menu-button:hover,.ui-menu .menu-help:hover{background:transparent}}
+/* Slash 的 active 是编辑器键盘活动项；已提交的单选、多选仍仅用勾号，不填色或加粗。 */
+.ui-menu .menu-item.active,.ui-menu .menu-item[aria-expanded=true]{background:var(--hover)}
+.ui-menu .menu-item:disabled,.ui-menu .menu-button:disabled{cursor:not-allowed;opacity:.45}
+.ui-menu .menu-item:disabled:hover,.ui-menu .menu-button:disabled:hover{background:transparent}
+.menu-item-danger,.menu-item-danger>.menu-icon{color:var(--danger)}
 .popup-list{overflow:auto;min-height:0;scrollbar-width:thin;overscroll-behavior:contain}
-.popup-search{width:calc(100% - 8px);flex-shrink:0;margin:4px;padding:8px;font-size:.85714rem;min-height:32px}
-.popup-option{display:flex;align-items:center;gap:8px;width:100%;border:0;border-radius:var(--radius-control);min-height:var(--control-menu-height);padding:8px 12px;text-align:left;font-size:.92857rem;line-height:1.4;cursor:pointer}
-.popup-option-label{display:flex;flex-direction:column;gap:4px;flex:1;min-width:0;overflow-wrap:anywhere}
-.popup-option-label small{font-size:.78571rem;line-height:1.5}
-/* Codex 四项、Claude 五项沿用 App 模式：菜单图标 20px 对齐标题约 21px 的首行行高，当前项勾选。
- * 入口仍为 16px 图标；同步核对下方手机 28×36px 点击区，标题和帮助链接不能占用底部工具栏宽度。 */
-/* 用户要求权限菜单全部文字与当前设置字号一致；标题、说明、选项及链接均继承 --font-size。 */
-.composer-permissions-popup{font-size:var(--font-size)}
-.composer-permissions-popup .popup-title{flex-shrink:0;padding:9px 12px 8px;color:var(--muted);font-size:inherit;line-height:1.5}
-.composer-permissions-popup .popup-option{align-items:flex-start;gap:10px;padding:10px 12px;font-size:inherit}
-.composer-permissions-popup .popup-option>.ui-icon{flex:0 0 20px;width:20px;height:20px;margin-top:1px}
-.composer-permissions-popup .popup-option-label small{text-wrap:pretty;font-size:inherit}
-.composer-permissions-popup .popup-option[aria-selected=true]{background:var(--control-hover,var(--hover))}
+/* 用户要求 Codex 顶部标题和帮助只占一行；窄屏优先保留帮助入口，标题省略但完整文字仍可通过提示读取。 */
+.popup-header{display:flex;align-items:center;gap:var(--menu-item-gap);flex-shrink:0;min-width:0;border-bottom:1px solid var(--menu-divider,var(--line))}
+.popup-header>.popup-title{flex:1;min-width:0;padding-right:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.popup-header>.popup-help{flex-shrink:0;min-height:var(--control-menu-height);padding:var(--menu-item-padding-block) var(--menu-item-padding-inline) var(--menu-item-padding-block) 0;white-space:nowrap}
+/* 用户确认权限菜单按公共主文字/说明/搜索三档计算，图标 1em、选中仅勾选；入口尺寸及权限风险色保留。 */
+.composer-permissions-popup .popup-title{color:var(--muted)}
+.composer-permissions-popup .popup-option-label small{text-wrap:pretty}
 .composer-codex-permissions-popup .popup-option[data-value=full-access]>.ui-icon,.composer-codex-permissions-popup .popup-option[data-value=full-access]>.popup-option-label>span,.composer-claude-permissions-popup .popup-option[data-value=bypassPermissions]>.ui-icon,.composer-claude-permissions-popup .popup-option[data-value=bypassPermissions]>.popup-option-label>span,.composer-antigravity-permissions-popup .popup-option[data-value=bypassPermissions]>.ui-icon,.composer-antigravity-permissions-popup .popup-option[data-value=bypassPermissions]>.popup-option-label>span{color:var(--permission-elevated-color)}
-.composer-permissions-popup .popup-note{flex-shrink:0;margin:4px 8px 0;padding:10px 4px 6px;border-top:1px solid var(--menu-divider,var(--line));color:var(--muted);font-size:inherit;line-height:1.5}
+.composer-permissions-popup .popup-note{flex-shrink:0;margin:var(--menu-padding) 0 0;padding:var(--menu-item-padding-block) var(--menu-item-padding-inline);border-top:1px solid var(--menu-divider,var(--line))}
 .composer-claude-permissions-popup .popup-note,.composer-antigravity-permissions-popup .popup-note{margin:0 8px 4px;border-top:0;border-bottom:1px solid var(--menu-divider,var(--line))}
-.composer-codex-permissions-popup .popup-help{display:flex;flex-shrink:0;align-items:center;gap:6px;margin-top:0;padding:0 12px 10px;border-top:0;border-bottom:1px solid var(--menu-divider,var(--line));color:var(--muted);font-size:inherit;text-decoration:none}
-.composer-codex-permissions-popup .popup-help>.ui-icon{width:13px;height:13px}
-.composer-add-popup .popup-option:is([data-value=compact],[data-value=goal]){font-size:calc(var(--font-size)*.9)}
-.composer-add-popup .popup-option:is([data-value=compact],[data-value=goal])>.ui-icon{width:18px;height:18px;color:var(--muted)}
-.composer-add-popup .popup-option:is([data-value=compact],[data-value=goal]) .popup-option-label{flex-direction:row;align-items:baseline;gap:7px;white-space:nowrap}
-.composer-add-popup .popup-option:is([data-value=compact],[data-value=goal]) .popup-option-label>span{font-weight:500}
-.composer-add-popup .popup-option:is([data-value=compact],[data-value=goal]) .popup-option-label small{font-size:calc(var(--font-size)*.75);line-height:1.6;white-space:nowrap}
-.composer-add-popup .popup-option[data-value=goal] .popup-option-label>span{flex-shrink:0}
-.composer-add-popup .popup-option[data-value=goal] .popup-option-label small{min-width:0;overflow:hidden;text-overflow:ellipsis}
-/* 用户要求所有 Select 选中项只显示右侧勾选，不填色、不加粗；键盘焦点保留轮廓，仅鼠标悬停整项高亮。 */
-.popup-option:focus-visible{outline-offset:-2px}
-@media(hover:hover) and (pointer:fine){.popup-option:not(:disabled):hover{background:var(--hover)}}
-.popup-option:disabled{cursor:not-allowed;opacity:.45}
-.popup-option:disabled:hover{background:transparent}
-.popup-separator{flex-shrink:0;height:1px;margin:4px 0;background:var(--menu-divider,var(--line))}
-.popup-submenu-arrow{flex:0 0 14px;width:14px;height:14px;transform:rotate(-90deg);color:var(--muted)}
+.composer-add-popup .popup-option>.ui-icon{color:var(--muted)}
 .ui-popup.has-submenu{overflow:visible}
 .popup-submenu.ui-popup{animation:none}
-.popup-submenu-back{display:flex;align-items:center;gap:8px;flex-shrink:0;min-height:40px;margin-bottom:4px;padding:7px 8px;border:0;border-radius:0;border-bottom:1px solid var(--menu-divider,var(--line));text-align:left;font-size:inherit}
+.popup-submenu-back{display:flex;flex-shrink:0;width:100%;margin-bottom:var(--menu-padding);border-radius:0;border-bottom:1px solid var(--menu-divider,var(--line))}
 .popup-submenu-back[hidden]{display:none}
-/* 用户要求会话右键菜单参考 Codex：224px 主菜单配图标列、两处分组线及子菜单箭头，字号跟随当前外观。
- * 224px 在 features/sidebar/list.js 中设置；手机继续沿用通用菜单的 44px 最小触摸行高。 */
-.thread-row-popup.ui-popup{padding:5px;border-color:var(--menu-divider,var(--line));border-radius:10px;background:var(--control-bg,var(--side));font-size:var(--font-size);box-shadow:0 12px 32px #0003}
-.thread-row-popup .popup-option{gap:9px;padding:7px 9px;font-size:inherit}
-.thread-row-popup .popup-option>.ui-icon{flex:0 0 16px;width:16px;height:16px;color:var(--muted)}
-.thread-row-popup .popup-option[aria-expanded=true]{background:var(--control-hover,var(--hover))}
+/* 会话右键保留 list.js 的 224px 宽、分组与子菜单；文字、图标、容器和行尺寸统一由公共菜单处理。 */
+.thread-row-popup .popup-option>.ui-icon{color:var(--muted)}
 .thread-row-popup .popup-option-label>span{white-space:nowrap}
 .thread-row-popup .popup-option-danger,.thread-row-popup .popup-option-danger>.ui-icon{color:var(--danger)}
-@media(hover:hover) and (pointer:fine){.thread-row-popup .popup-option:not(:disabled):hover{background:var(--control-hover,var(--hover))}}
 #project-select{font-size:.92857rem}
 /* 用户要求新建项目栏更矮：默认约 37px = 30px 选择按钮 + 上下各 3px + 顶边框 1px；
    手机断点同步使用 30px 最小按钮高度，大字号仍允许内容自然撑高，不压缩文字。 */
@@ -866,19 +855,12 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 /* 用户指定 Codex 白色结形标识；深色主题使用纯白，浅色沿用文字色以免不可见，旧浏览器仍可继承主题文字色。 */
 .new-chat-backend>.backend-icon-codex,.backend-picker-popup .popup-option[data-value=codex]>.ui-icon,.thread-link>.codex-session-icon,.thread-label-line>.codex-session-icon,.thread-backend-icon[data-backend=codex]{color:var(--text);color:light-dark(var(--text),#fff)}
 /* 会话类型和项目选择器共用通用 Select 的勾选、鼠标悬停与键盘轮廓，不再单独定义选中填色。 */
-/* 用户要求会话类型菜单沿用项目菜单的间距与圆角；桌面 38px/7px，手机 36px/4px 在下方断点同步。 */
-.project-picker-popup,.backend-picker-popup{border-radius:16px;padding:6px}
-.project-picker-popup .popup-search{width:calc(100% - 8px);min-height:36px;margin:2px 4px 6px;border-radius:9px}
+/* 项目与实例列表接入公共菜单；保留项目搜索、固定底部入口和各自宽度，不再使用专用行高与圆角。 */
 .project-picker-popup .popup-list{scrollbar-width:thin}
 .project-picker-popup .popup-list.has-footer{display:flex;flex-direction:column;overflow:hidden}
 .project-picker-popup .popup-options{overflow:auto;min-height:0;scrollbar-width:thin;overscroll-behavior:contain}
-.project-picker-popup .popup-option,.backend-picker-popup .popup-option{min-height:38px;padding:7px 9px}
 .project-picker-popup .popup-option-footer{flex-shrink:0;margin-top:4px;border-top:1px solid var(--line)}
 .project-picker-popup .popup-option>.ui-icon{color:var(--muted)}
-.project-picker-popup .popup-option-label,.backend-picker-popup .popup-option-label{flex-direction:row;align-items:baseline;gap:5px;white-space:nowrap}
-.project-picker-popup .popup-option-label>span,.backend-picker-popup .popup-option-label>span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 auto}
-.project-picker-popup .popup-option-label small,.backend-picker-popup .popup-option-label small{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 auto}
-.project-picker-popup .choice-check,.backend-picker-popup .choice-check{width:16px;flex-shrink:0;text-align:center}
 .appearance-heading{flex-shrink:0}
 .appearance-body{overflow:auto;min-height:0;padding:0 2px;scrollbar-width:thin}
 .appearance-body>p{font-size:.85714rem;line-height:1.5;margin:4px 0 10px}
@@ -961,7 +943,7 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
   .thread-state.active{animation:thread-spin 1s linear infinite!important}
 }
 @media(max-width:760px){#open-sidebar{display:grid;place-items:center;min-width:36px;min-height:36px;padding:0}#close-sidebar{display:grid;place-items:center;min-width:32px;min-height:32px;padding:0}.composer-toolbar .model-button{min-height:36px}.send-button{width:36px;height:36px}.context-info{font-size:calc(var(--font-size)*.72)}}
-@media(hover:none),(max-width:760px){.row-menu-button{opacity:1}.popup-option{min-height:44px}.copy-code{min-height:32px;padding:4px 10px}}
+@media(hover:none),(max-width:760px){.row-menu-button{opacity:1}.copy-code{min-height:32px;padding:4px 10px}}
 @media(hover:none),(pointer:coarse),(max-width:760px){
   .thread-row{grid-template-columns:minmax(0,1fr) 42px}
   /* 右键与长按菜单仍依赖按钮尺寸定位，隐藏时必须保留布局。 */
@@ -972,8 +954,6 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
   .appearance-width-field>span:first-child{min-width:0;flex-shrink:1;line-height:1.5}
   #project-select.new-chat-project-select{max-width:100%;min-height:30px}
   .project-picker-popup,.backend-picker-popup{max-width:calc(100vw - 16px)}
-  /* 用户要求手机项目列表更紧凑：行高由 44px 降至 36px，上下内边距由 7px 降至 4px；底部选项同步，桌面仍保持 38px。 */
-  .project-picker-popup .popup-option,.backend-picker-popup .popup-option{min-height:36px;padding:4px 9px}
 }
 /* 用户要求颜色值可直接编辑，只有色块按钮打开取色器；两者作为同一组排列，不能嵌套可交互输入框。 */
 /* 窄屏换行时色块和 HEX 保持一组，仍与其他设置控件右对齐。 */
@@ -1613,20 +1593,18 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .workspace-open-in-gitBash{color:#ee7054}
 .workspace-open-in-cmder{color:light-dark(#377332,#a3cda0)}
 .workspace-open-in-rider>span,.workspace-open-in-intellij>span{display:block;width:100%;height:100%;border-radius:2px;background:linear-gradient(135deg,#f2673e,#d94583 55%,#8771e5);color:#fff;font:700 8px/1 "Segoe UI",sans-serif;text-align:center;align-content:center}
-/* 用户确认展开菜单不显示 Open in 描述；178px 菜单、31px 行高、5px 内边距与效果图一致，只放应用项。 */
-.workspace-open-in-menu.ui-popup{width:178px;padding:5px;border-color:var(--menu-divider,var(--line));border-radius:10px;background:var(--control-bg,var(--side));color:var(--text);box-shadow:0 14px 40px #0000004d;animation:none}
-.workspace-open-in-menu .popup-option{height:31px;min-height:31px;gap:8px;padding:0 8px;border-radius:6px;font:12px/18px system-ui,sans-serif}
-.workspace-open-in-menu .workspace-open-in-app-icon>svg,.workspace-open-in-menu .workspace-open-in-app-icon>img{width:16px;height:16px}
+/* 用户确认 Open in 只放应用项、保留 178px 宽与专用定位；行高、字号、图标、内边距改用公共规范，效果图不作为依据。 */
+.workspace-open-in-menu.ui-popup{width:178px;animation:none}
+.ui-menu .workspace-open-in-rider>span,.ui-menu .workspace-open-in-intellij>span{font-size:.5em}
 .workspace-open-in-menu .popup-option-label{overflow:hidden;white-space:nowrap}
 .workspace-open-in-menu .popup-option-label>span{overflow:hidden;text-overflow:ellipsis}
 .workspace.related-session-view .workspace-open-in{display:none!important}
-@media(hover:hover) and (pointer:fine){.workspace-open-in>button:hover:not(:disabled){background:color-mix(in oklab,var(--text) 10%,transparent)}.workspace-open-in-menu .popup-option:hover:not(:disabled){background:var(--control-hover,var(--hover))}}
+@media(hover:hover) and (pointer:fine){.workspace-open-in>button:hover:not(:disabled){background:color-mix(in oklab,var(--text) 10%,transparent)}}
 .session-tools-trigger[aria-expanded=true]{background:var(--hover);color:var(--text)}
 .session-tools-trigger .session-tools-unread-dot{display:none;fill:var(--accent-indicator);stroke:none}
 .session-tools-trigger.has-unread-side-thread .session-tools-lower-left{display:none}
 .session-tools-trigger.has-unread-side-thread .session-tools-unread-dot{display:block}
 .session-tools-menu-dismiss{position:fixed;inset:0;z-index:calc(var(--layer-menu) - 1);background:transparent}
-.session-tools-menu .popup-option{min-height:42px}
 .session-tools-screen{position:fixed;inset:0;z-index:300;display:flex;flex-direction:column;width:100%;height:100dvh;min-width:0;min-height:0;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);background:var(--bg);overflow:hidden;transform:translate3d(100%,0,0);transition:transform .22s ease-out;will-change:transform}
 .session-tools-screen.session-tools-visible{transform:translate3d(0,0,0)}
 /* 用户要求 PC 网页与独立 EXE 的文件/变更在右侧多标签阅读，聊天仍可操作；761px 与工具页的手机断点一致。

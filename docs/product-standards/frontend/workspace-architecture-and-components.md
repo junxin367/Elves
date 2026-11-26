@@ -72,6 +72,7 @@ Elves 与 Harness 共用工作区网页，位于 `assets/harness/`。会话工�
 | --- | --- | --- |
 | `ui/dom.js` | `$`、`element`、`button`、`escape` | DOM 查询与创建 |
 | `ui/icons.js` | `icon` | 内置图标 |
+| `ui/menu-parts.js` | `createMenuSurface`、`createMenuItem`、`createMenuSearch`、`createMenuGroup`、`createMenuDescription`、`createMenuTitle`、`createMenuEmpty`、`createMenuSeparator`、`createMenuButton`、`createMenuHelp`、`shouldShowMenuSearch` | 公共菜单内容及搜索显示判断，不持有业务状态 |
 | `ui/popup.js` | `openPopup`、`togglePopup`、`closePopup`、`renderPopup`、`fitPopup`、`activePopup`、`registerAppMenuCloser`、`registerSelectCommitter` | Select 与按钮菜单共用的弹层宿主：定位、搜索、键盘导航、焦点恢复与 dialog 顶层规则 |
 | `ui/select.js` | `selectControl`、`setSelectValue`、`setSelectOptions`、`commitSelectValue`、`createSelectComponent` | 主题化 Select；页面使用默认实例，`createSelectComponent` 保留依赖注入供测试替换 DOM |
 | `ui/dialog.js` | `confirmAction` | 确认对话框，返回 `Promise<boolean>` 并恢复触发前焦点 |
@@ -81,6 +82,23 @@ Elves 与 Harness 共用工作区网页，位于 `assets/harness/`。会话工�
 | `ui/position.js` | `menuHorizontalLeft` | Select、普通按钮菜单和模型菜单的共享水平对齐；会话主菜单与 Open in 采用[定位例外](../core/product-behavior.md#已有特殊定位规则) |
 
 新增通用组件放在 `ui/`，只依赖 DOM 与其他 `ui/` 模块；需要业务行为时由调用方传入回调或通过注册函数接入。新增工作区下拉表单复用 `selectControl`，通过 `setSelectValue` 和 `setSelectOptions` 同步程序状态，不另建原生下拉或独立弹层。显示及交互见[公共 Select](../core/product-behavior.md#公共-select)。
+
+### 菜单内容组件
+
+菜单的适用范围、字号、尺寸、状态和业务例外统一遵循[统一菜单组件](../core/product-behavior.md#统一菜单组件)。`ui/menu-parts.js` 提供原生 DOM 内容组件，`style.css` 的 `.ui-menu`、`.menu-*` 类提供公共外观；只有显式接入的弹出内容采用这些规则，常驻分组菜单和其他信息浮层不受影响。
+
+- `createMenuSurface` 创建菜单表面；`createMenuGroup`、`createMenuSeparator`、`createMenuTitle`、`createMenuDescription`、`createMenuEmpty` 提供分组和文字结构。
+- `createMenuItem` 接收主文字、说明、`icon` / `renderIcon`、禁用、危险语义、子菜单标记与动作回调。`descriptionPlacement` 默认为 `below`，“＋”压缩与目标显式传 `inline`。`role` 与 `selected` 表达选择语义，勾选保留等宽占位；Slash 传 `showCheck: false`，活动项及 `aria-activedescendant` 仍由编辑器管理。
+- `shouldShowMenuSearch(mode, candidateCount, wasVisible)` 是搜索显示的统一判断入口，参数值和数量规则见[菜单搜索框](../core/product-behavior.md#菜单搜索框)。调用方在触发器上显式设置 `searchMode`，普通 Select 默认 `off`；候选数使用查询过滤之前的列表，本次展开状态由弹层宿主管理。
+- `createMenuSearch` 只提供搜索结构与输入事件，输入法组合完成后通知 `onQuery`，合并组合结束及随后的重复输入事件。Popup 在原列表/说明前动态插入搜索框，模型菜单复用相同显示判断；调用方仍须核对输入节点属于当前菜单，避免旧节点更新新的查询。
+- `createMenuButton` 对独立按钮的图标与文字整体居中；`createMenuHelp` 提供说明字号的帮助链接。菜单图标统一使用 `.menu-icon`，保留 SVG、图片及彩色 Emoji 的原有图案。
+- `features/appearance/apply.js` 的 `applyAppearance` 是字号计算入口，一次写入 `--menu-font-size`、`--menu-description-font-size`、`--menu-search-font-size`。内容组件只引用计算结果，外观更新沿用现有菜单重定位和各页面同步机制。
+
+`ui/popup.js` 管理弹层生命周期、宿主、键盘与焦点、主列表及子列表，保留 `selectOptions`、`menuOptions` 和专用定位回调。标题、帮助同时存在且设置 `popupHelpAfterTitle` 时，共用单行 `.popup-header`；其他帮助与说明位置按原配置排列。搜索框显隐与弹层宽度分开处理：未指定 `popupWidth` 时，声明 `auto` / `on` 的菜单沿用搜索菜单宽度，避免自动显隐导致宽度跳动。`ui/select.js` 负责选项、值和有效用户变更的单次 `change`；`ui/position.js` 提供通用水平定位。列表重绘按稳定标识恢复有效焦点，并保留选项区阅读位置。
+
+模型菜单继续由 `features/composer/composer-menus.js` 管理搜索条件、模型和思考深度的选择、两组滚动及选择后返回编辑器；Slash 由 `features/composer/skills.js` 管理过滤、键盘活动项、原生命令和 Skill 插入。Slash 的 Skill 列表与底部命令分组分别保留滚动位置，空间不足时命令分组可滚动，不能截断最后的选项。
+
+业务模块提供真实数据、可用状态及回调，并校验会话、实例、授权和异步请求归属。公共内容组件不导入业务模块，不提交会话请求，也不替代原有失效检查。维护时运行下方[检查清单](#检查清单)，并在实际页面核对主规范中的字号、状态、焦点、滚动及定位要求；浏览器视口模拟不等同于 Windows 或 Android 实机验收。
 
 ## 网页资源登记
 

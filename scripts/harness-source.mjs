@@ -94,6 +94,14 @@ export async function loadHarnessAppSource(root = defaultRoot) {
       reloadScheduledMessages: async () => {},
     })) if (!Object.hasOwn(context, name)) context[name] = value;
     const missing = name => !Object.hasOwn(context, name) && new RegExp(`\\b${name}\\(`).test(code);
+    // 菜单渲染片段复用真实公共内容组件；显式注入的用例桩优先，DOM/图标依赖沿用当前 VM 的提供者。
+    const menuParts = ["createMenuSurface", "createMenuDescription", "createMenuTitle", "createMenuEmpty",
+      "createMenuGroup", "createMenuSeparator", "createMenuItem", "createMenuSearch", "createMenuButton", "createMenuHelp",
+      "shouldShowMenuSearch"];
+    if (menuParts.some(missing)) {
+      const implementations = runInContext(`(() => {\n${moduleText("ui/menu-parts.js")}\nreturn { ${menuParts.join(", ")} };\n})()`, context);
+      for (const name of menuParts) if (!Object.hasOwn(context, name)) context[name] = implementations[name];
+    }
     const definitions = [];
     if (missing("localAppearance")) definitions.push(section("function localAppearance(", "function legacySharedAppearance("));
     if (missing("formatDuration")) definitions.push(section("function formatDuration("));

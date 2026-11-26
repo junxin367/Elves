@@ -1,7 +1,8 @@
 // 斜杠命令与 Skill：命令菜单渲染与更新、Skill 目录的读取与刷新调度、选择压缩命令及输入事件处理；目录状态与缓存判断在 skill-catalog.js，选择 Skill 在 selected-skills.js。
 
-import { $, button, element } from "../../ui/dom.js";
+import { $ } from "../../ui/dom.js";
 import { icon } from "../../ui/icons.js";
+import { createMenuEmpty, createMenuGroup, createMenuItem } from "../../ui/menu-parts.js";
 import { closePopup } from "../../ui/popup.js";
 import { closeComposerMenus, loadModels, scheduleMessages, updateComposer } from "../../core/actions.js";
 import {
@@ -93,10 +94,12 @@ export function renderSkillMenu(message) {
   $("#prompt").setAttribute("aria-expanded", "true");
   const queryChanged = menu.dataset.query !== query.query;
   const scrollTop = queryChanged ? 0 : $(".skill-options", menu)?.scrollTop || 0;
+  // 大字号、软键盘压缩空间时命令分组可独立滚动；后台重绘也须保留该区域的阅读位置。
+  const commandScrollTop = queryChanged ? 0 : $(".skill-menu-footer", menu)?.scrollTop || 0;
   const previousActive = $("#prompt").getAttribute("aria-activedescendant");
   menu.dataset.query = query.query;
   menu.replaceChildren();
-  const list = element("div", "skill-options");
+  const list = createMenuGroup("", "skill-options");
   menu.append(list);
   const entries = slashMenuEntries(query);
   normalizeSlashIndex(entries);
@@ -110,42 +113,43 @@ export function renderSkillMenu(message) {
       const label = fork ? "分支到新聊天" : optimize ? "提示词优化" : goal ? "目标" : "压缩";
       const reason = goal ? goalComposerReason() : "";
       const action = fork ? selectForkCommand : optimize ? selectPromptOptimizationCommand : goal ? () => selectGoalCommand() : selectCompactCommand;
-      const node = button("", reason || label, action,
-        `skill-option slash-command-option${index === active ? " active" : ""}${goal ? " slash-goal-option" : ""}`);
-      node.id = `skill-option-${index}`; node.disabled = !entry.enabled;
-      node.setAttribute("role", "option"); node.setAttribute("aria-selected", String(index === active));
-      const copy = element("span", "slash-command-copy");
-      copy.append(element("strong", "", label));
       const description = fork ? "在当前工作区继续最新会话历史"
         : optimize ? "使用已配置的模型改写当前输入"
         : goal ? reason || "设置要持续追求的目标" : compactUsageDescription(usage);
-      if (description) copy.append(element("small", "muted slash-command-usage", description));
-      const commandIcon = fork ? icon("fork") : optimize ? promptOptimizationCommandIcon() : goal ? goalComposerIcon() : compactCommandIcon();
-      node.append(commandIcon, copy);
+      const node = createMenuItem({
+        label, accessibleLabel: reason || label, description, action, disabled: !entry.enabled,
+        role: "option", selected: index === active, showCheck: false, labelTag: "strong",
+        labelClassName: "slash-command-copy", descriptionClassName: "slash-command-usage",
+        renderIcon: () => fork ? icon("fork") : optimize ? promptOptimizationCommandIcon() : goal ? goalComposerIcon() : compactCommandIcon(),
+        className: `skill-option slash-command-option${index === active ? " active" : ""}${goal ? " slash-goal-option" : ""}`
+      });
+      node.id = `skill-option-${index}`;
+      // 用户要求 Slash 复用菜单视觉时仍由编辑器持有焦点，不能通过菜单按钮抢走光标。
       node.onmousedown = event => event.preventDefault();
       root.append(node);
       return;
     }
     const skill = entry.skill;
     const label = skillVisibleName(skill);
-    const node = button("", skill.argumentHint ? `${label} ${skill.argumentHint}` : label,
-      () => selectSkill(skill), `skill-option${index === active ? " active" : ""}`);
-    node.id = `skill-option-${index}`; node.setAttribute("role", "option"); node.setAttribute("aria-selected", String(index === skillIndex));
-    const description = element("small", "muted", skill.description);
-    description.title = skill.description || "";
-    node.append(element("strong", "", label), description);
+    const node = createMenuItem({ label, accessibleLabel: skill.argumentHint ? `${label} ${skill.argumentHint}` : label,
+      description: skill.description, action: () => selectSkill(skill), role: "option",
+      selected: index === skillIndex, showCheck: false, labelTag: "strong",
+      className: `skill-option${index === active ? " active" : ""}` });
+    node.id = `skill-option-${index}`;
     node.onmousedown = event => event.preventDefault();
     root.append(node);
   };
-  if (message || !skills.length && !commands.length) list.append(element("p", "popover-empty muted", message || "没有匹配的可用 Skill"));
+  if (message || !skills.length && !commands.length) list.append(createMenuEmpty(message || "没有匹配的可用 Skill", "popover-empty"));
   for (const entry of skills) appendOption(entry, entries.indexOf(entry), list);
   if (commands.length) {
-    const footer = element("div", "skill-menu-footer");
+    const footer = createMenuGroup("", "skill-menu-footer");
     for (const command of commands) appendOption(command, entries.indexOf(command), footer);
     menu.append(footer);
   }
   fitComposerMenu(menu);
   list.scrollTop = scrollTop;
+  const commandGroup = $(".skill-menu-footer", menu);
+  if (commandGroup) commandGroup.scrollTop = commandScrollTop;
   if (active >= 0) {
     $("#prompt").setAttribute("aria-activedescendant", `skill-option-${active}`);
     if (queryChanged || previousActive !== `skill-option-${active}`)

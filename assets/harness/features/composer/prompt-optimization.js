@@ -155,7 +155,8 @@ export async function openPromptOptimizationSettings() {
     if (selected && !options.some(option => option.value === selected)) options.unshift({ value: selected, label: selected });
     if (!options.length) options.push({ value: "", label: "选择模型或输入名称" });
     modelControl = selectControl("prompt-optimization-model", "优化模型", options, selected);
-    modelControl.selectSearchable = true;
+    // 用户要求“显示”不受候选数量限制；此输入同时用于手填模型，不能在目录很少或为空时隐藏。
+    modelControl.searchMode = "on";
     modelControl.selectSearchPlaceholder = "搜索或输入模型名称";
     modelControl.selectSearchLabel = "搜索或输入优化模型";
     modelControl.selectCustomOption = value => {

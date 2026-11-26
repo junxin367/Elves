@@ -51,7 +51,7 @@ export function mountConversationNaming(page) {
       return [glyph, element("span", "select-label", option?.label || "请选择命名实例"), icon("chevron")];
     });
   const models = selectControl("conversation-naming-model", namingLabels.model, [], "", "instance-settings-select");
-  models.selectSearchable = true; models.selectSearchPlaceholder = "搜索命名模型";
+  models.searchMode = "auto"; models.selectSearchPlaceholder = "搜索命名模型";
   const numberControl = (label, min, max) => {
     const input = element("input"); input.type = "number"; input.min = String(min);
     input.max = String(max); input.step = "1"; input.setAttribute("aria-label", label); return input;

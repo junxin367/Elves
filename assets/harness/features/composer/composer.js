@@ -350,10 +350,11 @@ export function updateComposer({ followEnd = false } = {}) {
       action: openScheduledMessagePicker
     }] : []),
     { value: "compact", label: "压缩", icon: "compactContext",
-      description: compactUsageDescription(usage),
+      // 用户要求“＋”中的压缩与目标保留同行说明，其字号和图标仍由公共菜单统一计算。
+      description: compactUsageDescription(usage), descriptionPlacement: "inline",
       disabled: !compactCommandAvailable(), action: compactContext },
     { value: "goal", label: "目标", icon: "target",
-      description: goalComposerReason() || "设置要持续追求的目标",
+      description: goalComposerReason() || "设置要持续追求的目标", descriptionPlacement: "inline",
       disabled: !!goalComposerReason(), action: () => selectGoalCommand(null) },
     ...(composerLocalInputsSupported() ? [{
       value: "files", label: "文件和文件夹", icon: "folderClosed",
