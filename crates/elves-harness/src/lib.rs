@@ -1116,13 +1116,10 @@ impl HarnessController {
         tokio::task::JoinHandle<()>,
         tokio::task::JoinHandle<()>,
     )> {
-        settings.validate()?;
-        if !desktop {
-            anyhow::ensure!(
-                settings.port != self.desktop_port.load(Ordering::Acquire)
-                    && settings.port != crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
-                "远程会话不能占用 Harness 本机入口或 Elves 本地代理端口"
-            );
+        if desktop {
+            settings.validate_endpoint()?;
+        } else {
+            settings.validate_for_desktop_port(self.desktop_port.load(Ordering::Acquire))?;
         }
         let listener = std::net::TcpListener::bind((settings.bind_host.as_str(), settings.port))
             .context("远程访问端口无法监听，请检查端口是否占用")?;

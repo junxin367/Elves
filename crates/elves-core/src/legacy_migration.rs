@@ -311,6 +311,18 @@ fn migrate_desktop_scope(
     target: &Path,
     migrations_dir: &Path,
 ) -> anyhow::Result<ScopeReport> {
+    migrate_desktop_scope_with_webview_copier(candidates, target, migrations_dir, copy_webview_dir)
+}
+
+fn migrate_desktop_scope_with_webview_copier<F>(
+    candidates: &[PathBuf],
+    target: &Path,
+    migrations_dir: &Path,
+    webview_copier: F,
+) -> anyhow::Result<ScopeReport>
+where
+    F: FnOnce(&Path, &Path, &Path, &mut CopyStats) -> anyhow::Result<()>,
+{
     let marker = migrations_dir.join(DESKTOP_MIGRATION_MARKER);
     if marker.is_file() {
         return Ok(ScopeReport {
@@ -359,21 +371,24 @@ fn migrate_desktop_scope(
     }
 
     // 2. WebView2 配置文件（webview/）：若新版目录已有独立 webview，不混入旧配置以免损坏 LevelDB/IndexedDB。
+    // 若新版尚无 webview，先完整复制到同级暂存目录 webview.migrating，无文件失败时再原子重命名落位；
+    // 防止中途复制失败留下残缺 webview/ 目录，导致下次重试被误判为“已存在”而永久跳过。
     let source_webview = source.join(DESKTOP_WEBVIEW_DIR);
     let target_webview = target.join(DESKTOP_WEBVIEW_DIR);
+    let staging_webview = target.join("webview.migrating");
     if is_regular_dir(&source_webview) {
         if target_webview.exists() {
             stats
                 .notes
                 .push("新版 webview 目录已存在，保留现有登录与界面状态，未混入旧版缓存".into());
         } else {
-            copy_webview_dir(&source_webview, &target_webview, Path::new("webview"), &mut stats)?;
-            if stats.skipped_locked_files > 0 {
-                stats.notes.push(
-                    "旧版程序仍在运行，已跳过被占用的 WebView2 文件；如需完整迁移可退出旧程序后清理新版 desktop 目录再安装"
-                        .into(),
-                );
-            }
+            migrate_webview_atomically(
+                &source_webview,
+                &staging_webview,
+                &target_webview,
+                &mut stats,
+                webview_copier,
+            )?;
         }
     }
 
@@ -413,6 +428,75 @@ fn migrate_desktop_scope(
         failed_files: stats.failed_files,
         notes: stats.notes,
     })
+}
+
+fn migrate_webview_atomically<F>(
+    source_webview: &Path,
+    staging_webview: &Path,
+    target_webview: &Path,
+    stats: &mut CopyStats,
+    copier: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(&Path, &Path, &Path, &mut CopyStats) -> anyhow::Result<()>,
+{
+    remove_path_if_exists(staging_webview)
+        .with_context(|| format!("清理上次残余 WebView 暂存目录失败：{}", staging_webview.display()))?;
+
+    let mut webview_stats = CopyStats::default();
+    if let Err(error) = copier(
+        source_webview,
+        staging_webview,
+        Path::new(DESKTOP_WEBVIEW_DIR),
+        &mut webview_stats,
+    ) {
+        let _ = remove_path_if_exists(staging_webview);
+        return Err(error);
+    }
+
+    let had_failures = !webview_stats.failed_files.is_empty();
+    let skipped_locked = webview_stats.skipped_locked_files;
+    stats.copied_files += webview_stats.copied_files;
+    stats.skipped_existing_files += webview_stats.skipped_existing_files;
+    stats.skipped_locked_files += skipped_locked;
+    stats.failed_files.extend(webview_stats.failed_files);
+    stats.notes.extend(webview_stats.notes);
+
+    if had_failures {
+        let _ = remove_path_if_exists(staging_webview);
+        stats
+            .notes
+            .push("旧版 WebView2 迁移存在失败文件，已清理暂存目录以保留下次重试能力".into());
+        return Ok(());
+    }
+
+    if staging_webview.symlink_metadata().is_ok() {
+        if let Err(error) = fs::rename(staging_webview, target_webview) {
+            let _ = remove_path_if_exists(staging_webview);
+            record_failure(stats, DESKTOP_WEBVIEW_DIR, &format!("暂存目录落位失败：{error}"));
+            return Ok(());
+        }
+    }
+
+    if skipped_locked > 0 {
+        stats.notes.push(format!(
+            "旧版 WebView2 存在 {skipped_locked} 个被占用文件已跳过；如旧版程序当时仍在运行，不影响本次安装与旧版继续使用"
+        ));
+    }
+    Ok(())
+}
+
+fn remove_path_if_exists(path: &Path) -> io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
 }
 
 fn migrate_cli_scope(
@@ -1189,5 +1273,77 @@ mod tests {
             active_code.contains("--migrate-legacy-data"),
             "Elves.nsi 安装阶段必须触发旧版数据识别与同步（--migrate-legacy-data）"
         );
+    }
+
+    #[test]
+    fn desktop_webview_partial_failure_cleans_staging_and_retries_cleanly() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy_desktop = temp.path().join("LocalAppData").join("com.codexelves.remote");
+        let target_desktop = temp.path().join(".elves").join("desktop");
+        let migrations_dir = temp.path().join(".elves").join("migrations");
+
+        fs::create_dir_all(legacy_desktop.join("webview/EBWebView/Default/Local Storage")).unwrap();
+        fs::write(legacy_desktop.join("settings.json"), r#"{"window":{"width":1280}}"#).unwrap();
+        fs::write(
+            legacy_desktop.join("webview/EBWebView/Default/Local Storage/data.ldb"),
+            "storage-data",
+        )
+        .unwrap();
+        fs::write(
+            legacy_desktop.join("webview/EBWebView/Default/Preferences"),
+            "prefs-data",
+        )
+        .unwrap();
+
+        let candidates = vec![legacy_desktop.clone()];
+
+        // 第一次迁移模拟 WebView 复制半途出现失败文件：暂存目录中已写入部分文件并记录失败。
+        let first = migrate_desktop_scope_with_webview_copier(
+            &candidates,
+            &target_desktop,
+            &migrations_dir,
+            |_source, staging, _relative, stats| {
+                fs::create_dir_all(staging.join("EBWebView/Default")).unwrap();
+                fs::write(staging.join("EBWebView/Default/Preferences"), "prefs-data").unwrap();
+                stats.copied_files += 1;
+                record_failure(stats, "webview/EBWebView/Default/Local Storage/data.ldb", "模拟 I/O 失败");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(first.outcome, ScopeOutcome::Partial);
+        assert_eq!(first.failed_files.len(), 1);
+        assert!(
+            !target_desktop.join("webview").exists(),
+            "WebView 迁移失败时不得生成残缺的目标 webview 目录"
+        );
+        assert!(
+            !target_desktop.join("webview.migrating").exists(),
+            "WebView 迁移失败后必须清理暂存目录"
+        );
+        assert!(
+            !migrations_dir.join(DESKTOP_MIGRATION_MARKER).exists(),
+            "存在失败文件时不得写入桌面迁移完成标记"
+        );
+
+        // 第二次重试使用真实复制器，应当完整补齐全部 WebView 文件并落完成标记。
+        let retry = migrate_desktop_scope(&candidates, &target_desktop, &migrations_dir).unwrap();
+        assert_eq!(retry.outcome, ScopeOutcome::Migrated);
+        assert!(retry.failed_files.is_empty());
+        assert_eq!(
+            fs::read_to_string(
+                target_desktop.join("webview/EBWebView/Default/Local Storage/data.ldb")
+            )
+            .unwrap(),
+            "storage-data"
+        );
+        assert_eq!(
+            fs::read_to_string(target_desktop.join("webview/EBWebView/Default/Preferences"))
+                .unwrap(),
+            "prefs-data"
+        );
+        assert!(!target_desktop.join("webview.migrating").exists());
+        assert!(migrations_dir.join(DESKTOP_MIGRATION_MARKER).is_file());
     }
 }

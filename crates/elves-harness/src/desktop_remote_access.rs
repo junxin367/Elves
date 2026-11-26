@@ -5,6 +5,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::sync::atomic::Ordering;
 
 use anyhow::Context;
 use axum::Json;
@@ -81,7 +82,14 @@ async fn save_settings(state: &WebState, payload: Value) -> anyhow::Result<Value
         .context("缺少远程会话设置")?;
     let next: RemoteAccessSettings =
         serde_json::from_value(settings_value).context("远程会话设置格式无效")?;
-    next.validate()?;
+    // 保存前同时校验默认保留端口（45221/45223）及当前运行的本机桌面入口端口。
+    let desktop_port = state.controller.desktop_port.load(Ordering::Acquire);
+    let effective_desktop_port = if desktop_port == 0 {
+        crate::settings::DEFAULT_DESKTOP_PORT
+    } else {
+        desktop_port
+    };
+    next.validate_for_desktop_port(effective_desktop_port)?;
     let apply = payload
         .get("apply")
         .and_then(Value::as_bool)

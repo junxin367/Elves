@@ -73,6 +73,10 @@ export function remoteAccessValidation(settings) {
   if (!Number.isInteger(settings.port) || settings.port < 1 || settings.port > 65535) {
     return "端口必须在 1–65535 之间。";
   }
+  // 禁止远程会话占用本地代理端口（45221）或 Elves 本机入口端口（45223），与后端 settings.rs 保持一致。
+  if (settings.port === 45221 || settings.port === 45223) {
+    return "端口 45221（本地代理）与 45223（Elves 本机入口）为保留端口，请使用其他端口。";
+  }
   if (settings.deviceSessionHours !== 0
     && (!Number.isInteger(settings.deviceSessionHours) || settings.deviceSessionHours < 1 || settings.deviceSessionHours > 720)) {
     return "设备授权有效期必须在 1–720 小时之间。";

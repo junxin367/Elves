@@ -828,6 +828,35 @@ mod tests {
             .unwrap();
         assert_eq!(status_body["status"], "ok");
         assert_eq!(status_body["settings"]["deviceSessionHours"], 24);
+        for reserved in [
+            crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+            crate::settings::DEFAULT_DESKTOP_PORT,
+        ] {
+            let rejected: Value = client
+                .post(format!("{local_url}/api/desktop/remote-access/saveSettings"))
+                .header("Origin", &local_url)
+                .header("Cookie", &local_cookie)
+                .json(&json!({
+                    "apply": false,
+                    "settings": {
+                        "enabled": false,
+                        "ngrokEnabled": false,
+                        "bindHost": "127.0.0.1",
+                        "port": reserved,
+                        "zrokSetupValue": "",
+                        "deviceSessionHours": 0,
+                        "readOnly": false,
+                        "allowApprovals": true
+                    }
+                }))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(rejected["status"], "failed", "reserved port {reserved}");
+        }
         let local_manifest: Value = client
             .get(format!("{local_url}/app-resources.json"))
             .send()

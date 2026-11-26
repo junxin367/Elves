@@ -257,6 +257,8 @@ test("远程会话原生页面校验回环地址、端口、授权有效期与 F
   assert.equal(rawVm.runInContext('remoteAccessValidation({ enabled: true, bindHost: "127.0.0.1", port: 45222, deviceSessionHours: 0 })', context), null);
   assert.equal(rawVm.runInContext('remoteAccessValidation({ enabled: true, bindHost: "0.0.0.0", port: 45222, deviceSessionHours: 0 })', context), "远程会话网页仅允许监听本机回环地址。");
   assert.equal(rawVm.runInContext('remoteAccessValidation({ enabled: true, bindHost: "127.0.0.1", port: 70000, deviceSessionHours: 0 })', context), "端口必须在 1–65535 之间。");
+  assert.equal(rawVm.runInContext('remoteAccessValidation({ enabled: true, bindHost: "127.0.0.1", port: 45221, deviceSessionHours: 0 })', context), "端口 45221（本地代理）与 45223（Elves 本机入口）为保留端口，请使用其他端口。");
+  assert.equal(rawVm.runInContext('remoteAccessValidation({ enabled: false, bindHost: "127.0.0.1", port: 45223, deviceSessionHours: 0 })', context), "端口 45221（本地代理）与 45223（Elves 本机入口）为保留端口，请使用其他端口。");
   assert.equal(rawVm.runInContext('remoteAccessValidation({ enabled: true, bindHost: "127.0.0.1", port: 45222, deviceSessionHours: 999 })', context), "设备授权有效期必须在 1–720 小时之间。");
 });
 

@@ -208,7 +208,6 @@ export function App() {
 
   const revision = useRef("");
   const persisted = useRef<BackendSettings>(defaultSettings);
-  const latestSubmitted = useRef<BackendSettings>(defaultSettings);
   const queue = useRef<Promise<unknown>>(Promise.resolve());
   const generation = useRef(0);
   const detailGeneration = useRef(0);
@@ -301,7 +300,6 @@ export function App() {
     const next = normalizeSettings(result.settings);
     persisted.current = next;
     if (generation.current === editVersion) {
-      latestSubmitted.current = next;
       draft.current = next;
       localEdits.current = false;
       setForm(next);
@@ -394,23 +392,30 @@ export function App() {
     return result;
   };
 
-  async function save(value: BackendSettings, silent = false) {
+  async function save(
+    value: BackendSettings,
+    silent = false,
+    explicitPatch?: Partial<BackendSettings>,
+  ) {
     const editVersion = generation.current;
-    // 以最新已提交快照（latestSubmitted）计算补丁，避免快速连续点击同一开关时
-    // 第二次改动与尚未落盘的 persisted 相同而被误判为空补丁吞掉。
-    const base = latestSubmitted.current;
-    const patch = Object.fromEntries(
-      Object.entries(value).filter(
-        ([key, entry]) =>
-          JSON.stringify(entry) !== JSON.stringify(base[key as keyof BackendSettings]),
-      ),
-    ) as Partial<BackendSettings>;
-    const proxyChanged = PROXY_AFFECTING_KEYS.some((key) => Object.hasOwn(patch, key));
-    latestSubmitted.current = { ...base, ...patch };
+    // 在队列真正执行时基于最新已落盘快照 persisted.current 计算或合并补丁，
+    // 避免快速连续保存（A 后接 B）时因 A 失败重置乐观基准导致前序修改丢失或互相覆盖。
+    const snapshot = explicitPatch ? null : { ...value };
+    const fixedPatch = explicitPatch ? { ...explicitPatch } : null;
 
     return enqueue(async () => {
       try {
-        const next = { ...persisted.current, ...patch };
+        const base = persisted.current;
+        const patch = fixedPatch
+          ? fixedPatch
+          : (Object.fromEntries(
+              Object.entries(snapshot!).filter(
+                ([key, entry]) =>
+                  JSON.stringify(entry) !== JSON.stringify(base[key as keyof BackendSettings]),
+              ),
+            ) as Partial<BackendSettings>);
+        const proxyChanged = PROXY_AFFECTING_KEYS.some((key) => Object.hasOwn(patch, key));
+        const next = { ...base, ...patch };
         const result = await call<SettingsResult>("save_settings", { settings: next }, true);
         if (alive.current) {
           acceptSettings(result, editVersion);
@@ -420,7 +425,6 @@ export function App() {
           if (!silent) showNotice("设置保存", result.message, false);
         }
       } catch (failure) {
-        latestSubmitted.current = persisted.current;
         if (alive.current && generation.current === editVersion) {
           draft.current = persisted.current;
           localEdits.current = false;
@@ -476,9 +480,9 @@ export function App() {
   }
 
   const actions: Actions = {
-    saveSettingsValue: async (value, silent, requireSuccess) => {
+    saveSettingsValue: async (value, silent, requireSuccess, patch) => {
       try {
-        await save(value, silent);
+        await save(value, silent, patch);
       } catch (failure) {
         showNotice("设置保存", failure, true);
         if (requireSuccess) throw failure;
@@ -723,21 +727,23 @@ export function App() {
   }, [page, initialized]);
 
   const canLaunchProxyFromTopbar = Boolean(
-    proxyStatus && proxyStatus.enabled && !proxyStatus.listening,
+    proxyStatus && !proxyStatus.settingsError && proxyStatus.enabled && !proxyStatus.listening,
   );
   const proxyStatusLabel = launchingProxy
     ? "代理启动中…"
     : !proxyStatus
       ? ""
-      : proxyStatus.listening
-        ? proxyStatus.lanListening
-          ? `代理运行中（局域网）· ${proxyStatus.port}`
-          : `代理运行中 · ${proxyStatus.port}`
-        : proxyStatus.enabled
-          ? proxyStatus.startupEnabled
-            ? "代理未运行（点击启动）"
-            : "代理已关闭随 Elves 启动"
-          : "当前渠道未启用代理";
+      : proxyStatus.settingsError
+        ? "设置读取失败"
+        : proxyStatus.listening
+          ? proxyStatus.lanListening
+            ? `代理运行中（局域网）· ${proxyStatus.port}`
+            : `代理运行中 · ${proxyStatus.port}`
+          : proxyStatus.enabled
+            ? proxyStatus.startupEnabled
+              ? "代理未运行（点击启动）"
+              : "代理已关闭随 Elves 启动"
+            : "当前渠道未启用代理";
 
   return (
     <div className={`shell ${theme} ${standaloneManager ? "manager-shell" : ""}`}>
@@ -799,7 +805,7 @@ export function App() {
                 </button>
               ) : (
                 <span
-                  className={`manager-proxy-status ${proxyStatus.listening ? "running" : ""}`}
+                  className={`manager-proxy-status ${proxyStatus.settingsError ? "failed" : proxyStatus.listening ? "running" : ""}`}
                   data-tooltip={proxyStatus.message || undefined}
                 >
                   <span className="proxy-status-dot" aria-hidden="true" />

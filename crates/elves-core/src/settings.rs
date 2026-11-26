@@ -7,6 +7,8 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 use toml_edit::{DocumentMut, Item};
 
+pub const DEFAULT_DESKTOP_PORT: u16 = 45223;
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct HarnessSettings {
@@ -17,7 +19,7 @@ pub struct HarnessSettings {
 impl Default for HarnessSettings {
     fn default() -> Self {
         Self {
-            desktop_port: 45223,
+            desktop_port: DEFAULT_DESKTOP_PORT,
         }
     }
 }
@@ -784,7 +786,9 @@ impl Default for RemoteAccessSettings {
 }
 
 impl RemoteAccessSettings {
-    pub fn validate(&self) -> anyhow::Result<()> {
+    /// 仅校验监听地址、端口范围与授权有效期，不限制本机桌面入口保留端口；
+    /// 供 `start_desktop(45223)` 启动本机工作区监听时使用。
+    pub fn validate_endpoint(&self) -> anyhow::Result<()> {
         let address: std::net::IpAddr = self
             .bind_host
             .parse()
@@ -799,6 +803,25 @@ impl RemoteAccessSettings {
             "远程会话网页仅允许监听本机回环地址"
         );
         Ok(())
+    }
+
+    /// 校验远程会话网页配置，额外禁止占用本地代理端口（45221）和 Elves 本机入口端口（默认 45223）。
+    pub fn validate_for_desktop_port(&self, desktop_port: u16) -> anyhow::Result<()> {
+        self.validate_endpoint()?;
+        // 禁止远程会话保存为本地代理端口（45221）或 Harness 本机入口端口（45223 / desktop_port），
+        // 避免脏配置写入 settings.json 后在启动监听时冲突失败。
+        anyhow::ensure!(
+            self.port != crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT
+                && self.port != DEFAULT_DESKTOP_PORT
+                && self.port != desktop_port,
+            "远程会话不能占用本地代理端口（45221）或 Elves 本机入口端口（{}）",
+            desktop_port
+        );
+        Ok(())
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.validate_for_desktop_port(DEFAULT_DESKTOP_PORT)
     }
 }
 
@@ -1205,7 +1228,9 @@ impl SettingsStore {
         let mut settings = normalize_settings_config_sections(settings.clone());
         settings.codex_home_path = normalize_codex_home_path(&settings.codex_home_path);
         validate_relay_model_mapping_save_constraints(&settings)?;
-        settings.remote_access.validate()?;
+        settings
+            .remote_access
+            .validate_for_desktop_port(settings.harness.desktop_port)?;
         let bytes = serde_json::to_vec_pretty(&settings)?;
         atomic_write(&self.path, &bytes)
     }
@@ -1234,7 +1259,9 @@ impl SettingsStore {
                 .context("更新后的设置格式无效，未写入配置文件")?,
         );
         validate_relay_model_mapping_save_constraints(&settings)?;
-        settings.remote_access.validate()?;
+        settings
+            .remote_access
+            .validate_for_desktop_port(settings.harness.desktop_port)?;
         raw.insert(
             "relayCommonConfigContents".to_string(),
             Value::String(settings.relay_common_config_contents.clone()),
@@ -1789,6 +1816,53 @@ mod tests {
 
         settings.bind_host = "0.0.0.0".into();
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn remote_access_rejects_reserved_proxy_and_desktop_ports() {
+        for reserved in [
+            crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+            DEFAULT_DESKTOP_PORT,
+        ] {
+            let settings = RemoteAccessSettings {
+                enabled: false,
+                port: reserved,
+                ..RemoteAccessSettings::default()
+            };
+            assert!(
+                settings.validate().is_err(),
+                "reserved port {reserved} should be rejected even before enabling"
+            );
+        }
+
+        // 本机入口自身启动使用 validate_endpoint，允许监听 45223。
+        let desktop = RemoteAccessSettings {
+            enabled: true,
+            port: DEFAULT_DESKTOP_PORT,
+            ..RemoteAccessSettings::default()
+        };
+        assert!(desktop.validate_endpoint().is_ok());
+
+        // 自定义 desktop_port 同样不允许被远程网页配置占用。
+        let custom_conflict = RemoteAccessSettings {
+            enabled: true,
+            port: 46000,
+            ..RemoteAccessSettings::default()
+        };
+        assert!(custom_conflict.validate_for_desktop_port(46000).is_err());
+        assert!(custom_conflict.validate_for_desktop_port(45223).is_ok());
+
+        // SettingsStore::save 与 update 均在写入前拦截保留端口。
+        let directory = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(directory.path().join("settings.json"));
+        let mut invalid = BackendSettings::default();
+        invalid.remote_access.port = crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT;
+        assert!(store.save(&invalid).is_err());
+        assert!(
+            store
+                .update(json!({ "remoteAccess": { "port": DEFAULT_DESKTOP_PORT } }))
+                .is_err()
+        );
     }
 
     #[test]

@@ -325,6 +325,7 @@ export type LocalProxyStatusResult = CommandResult<{
   logPath: string;
   latestRequestAtMs?: number | null;
   recentCount: number;
+  settingsError?: string | null;
 }>;
 
 export type LocalProxyRequestOutcome = "succeeded" | "failed" | "incomplete";
@@ -477,7 +478,12 @@ export function isBrowserPreview(): boolean { return new URLSearchParams(window.
 
 export type Actions = {
 
-  saveSettingsValue: (settings: BackendSettings, silent?: boolean, requireSuccess?: boolean) => Promise<void>;
+  saveSettingsValue: (
+    settings: BackendSettings,
+    silent?: boolean,
+    requireSuccess?: boolean,
+    patch?: Partial<BackendSettings>,
+  ) => Promise<void>;
 
   refreshRelayFiles: () => Promise<RelayFilesResult | null>;
 
@@ -594,7 +600,7 @@ export function LocalProxyScreen({
   const toggleProxyOption = (patch: Partial<BackendSettings>) => {
     const next = { ...form, ...patch };
     onFormChange(next);
-    void actions.saveSettingsValue(next, false);
+    void actions.saveSettingsValue(next, false, false, patch);
   };
   const visibleEntries = useMemo(
     () => filteredEntries.slice((page - 1) * LOCAL_PROXY_LOG_PAGE_SIZE, page * LOCAL_PROXY_LOG_PAGE_SIZE),
@@ -700,7 +706,7 @@ export function LocalProxyScreen({
                       </div>
                     )
                   ) : null}
-                  {status && status.enabled && !status.listening && status.message ? (
+                  {status && (status.settingsError || (status.enabled && !status.listening)) && status.message ? (
                     <small className="proxy-status-reason" title={status.message}>
                       {status.message}
                     </small>
@@ -2275,7 +2281,7 @@ function CompactionSettingsPanel({
   const save = (patch: Partial<BackendSettings>) => {
     const next = { ...form, ...patch };
     onFormChange(next);
-    void actions.saveSettingsValue(next, false);
+    void actions.saveSettingsValue(next, false, false, patch);
   };
   const saveRetainTokens = () => {
     const parsed = Number.parseInt(retainTokensInput, 10);
@@ -5528,12 +5534,14 @@ export function statusLabel(status: string) {
 
 export function localProxyState(status: LocalProxyStatusResult | null) {
   if (!status) return "unknown";
+  if (status.settingsError) return "failed";
   if (!status.enabled) return "disabled";
   if (status.startupEnabled === false && !status.listening) return "disabled";
   return status.listening ? "running" : "failed";
 }
 
 export function localProxyStateLabel(status: LocalProxyStatusResult | null) {
+  if (status?.settingsError) return "设置读取失败";
   const state = localProxyState(status);
   if (state === "running") return "代理运行中";
   if (status?.enabled && status.startupEnabled === false && !status.listening) return "已关闭随 Elves 启动";

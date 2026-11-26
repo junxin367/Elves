@@ -249,6 +249,8 @@ pub struct LocalProxyStatusPayload {
     pub log_path: String,
     pub latest_request_at_ms: Option<u64>,
     pub recent_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settings_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1049,6 +1051,33 @@ fn saved_codex_home_dir() -> PathBuf {
     elves_core::codex_home::codex_home_dir_for_settings(&settings)
 }
 
+fn build_local_proxy_status_message(
+    settings_load_error: Option<&str>,
+    enabled: bool,
+    startup_enabled: bool,
+    listening: bool,
+    lan_listening: bool,
+    startup_error: Option<&str>,
+) -> String {
+    // 读取设置失败时必须优先展示真实错误，禁止被回退默认配置的 `!enabled` 分支掩盖为“未启用本地代理”。
+    if let Some(error) = settings_load_error {
+        return format!("无法读取代理设置（当前显示默认状态）：{error}");
+    }
+    if !enabled {
+        "当前供应商未启用本地代理。".to_string()
+    } else if lan_listening {
+        "本地代理正在通过局域网监听。".to_string()
+    } else if listening {
+        "本地代理正在监听。".to_string()
+    } else if !startup_enabled {
+        "本地代理已启用，但已关闭随 Elves 启动。".to_string()
+    } else {
+        startup_error
+            .unwrap_or("本地代理已启用，但当前未监听端口。")
+            .to_string()
+    }
+}
+
 pub async fn local_proxy_status() -> CommandResult<LocalProxyStatusPayload> {
     let (settings, settings_load_error) = match SettingsStore::default().load() {
         Ok(settings) => (settings, None),
@@ -1102,19 +1131,14 @@ pub async fn local_proxy_status() -> CommandResult<LocalProxyStatusPayload> {
     };
     // 内置后台启动失败时展示实际原因，不能只沿用旧 launcher 的泛化监听提示。
     let startup_error = elves_core::local_proxy_service::last_error();
-    let message = if !enabled {
-        "当前供应商未启用本地代理。"
-    } else if enabled && lan_listening {
-        "本地代理正在通过局域网监听。"
-    } else if enabled && listening {
-        "本地代理正在监听。"
-    } else if !startup_enabled {
-        "本地代理已启用，但已关闭随 Elves 启动。"
-    } else {
-        startup_error
-            .as_deref()
-            .unwrap_or("本地代理已启用，但当前未监听端口。")
-    };
+    let message = build_local_proxy_status_message(
+        settings_load_error.as_deref(),
+        enabled,
+        startup_enabled,
+        listening,
+        lan_listening,
+        startup_error.as_deref(),
+    );
     let _ = elves_core::diagnostic_log::append_diagnostic_log(
         "manager.local_proxy_status",
         json!({
@@ -1154,8 +1178,9 @@ pub async fn local_proxy_status() -> CommandResult<LocalProxyStatusPayload> {
             .to_string(),
         latest_request_at_ms,
         recent_count,
+        settings_error: settings_load_error,
     };
-    ok(message, payload)
+    ok(&message, payload)
 }
 
 pub async fn read_local_proxy_logs(
@@ -1716,4 +1741,31 @@ fn sync_active_responses_websocket_after_probe(
     let relay = settings.active_relay_profile();
     let home = elves_core::codex_home::codex_home_dir_for_settings(&settings);
     sync_relay_websocket_to_home(&home, &settings, &relay)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_local_proxy_status_message;
+
+    #[test]
+    fn local_proxy_status_message_prioritizes_settings_load_error_over_disabled() {
+        let message = build_local_proxy_status_message(
+            Some("settings.json 解析失败"),
+            false,
+            false,
+            false,
+            false,
+            None,
+        );
+        assert!(
+            message.contains("无法读取代理设置"),
+            "读取设置失败时必须优先提示真实错误，实际为：{message}"
+        );
+        assert!(message.contains("settings.json 解析失败"));
+        assert!(!message.contains("未启用本地代理"));
+
+        let normal_disabled =
+            build_local_proxy_status_message(None, false, true, false, false, None);
+        assert_eq!(normal_disabled, "当前供应商未启用本地代理。");
+    }
 }
