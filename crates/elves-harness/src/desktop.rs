@@ -708,6 +708,126 @@ mod tests {
                 "{command}"
             );
         }
+        // 用户要求远程会话配置保留在 Elves 本机 Harness 中；网页、PWA、Android 必须一律拒绝。
+        let local_session: Value = client
+            .get(format!("{local_url}/api/session"))
+            .header("Cookie", &local_cookie)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let remote_session: Value = client
+            .get(format!("{remote_url}/api/session"))
+            .header("Cookie", &remote_cookie)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(local_session["capabilities"]["desktopRemoteAccess"], true);
+        assert_eq!(local_session["capabilities"]["management"], false);
+        assert_eq!(remote_session["capabilities"]["desktopRemoteAccess"], false);
+        assert_eq!(remote_session["capabilities"]["management"], false);
+        for action in [
+            "status",
+            "credentials",
+            "generateKey",
+            "setKey",
+            "saveSettings",
+            "openFrpDirectory",
+        ] {
+            let denied = client
+                .post(format!("{remote_url}/api/desktop/remote-access/{action}"))
+                .header("Origin", &remote_url)
+                .header("Cookie", &remote_cookie)
+                .header("User-Agent", "Elves")
+                .header("X-Elves-Client", "desktop")
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(denied.status(), 403, "remote {action}");
+        }
+        assert_eq!(
+            client
+                .post(format!("{local_url}/api/desktop/remote-access/status"))
+                .header("Origin", &local_url)
+                .header("Cookie", &remote_cookie)
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+        let generated: Value = client
+            .post(format!("{local_url}/api/desktop/remote-access/generateKey"))
+            .header("Origin", &local_url)
+            .header("Cookie", &local_cookie)
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(generated["status"], "ok");
+        assert!(generated["key"].as_str().is_some_and(|key| key.len() >= 16));
+        let credentials: Value = client
+            .post(format!("{local_url}/api/desktop/remote-access/credentials"))
+            .header("Origin", &local_url)
+            .header("Cookie", &local_cookie)
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(credentials["status"], "ok");
+        assert_eq!(credentials["accessKeyConfigured"], true);
+        let saved: Value = client
+            .post(format!("{local_url}/api/desktop/remote-access/saveSettings"))
+            .header("Origin", &local_url)
+            .header("Cookie", &local_cookie)
+            .json(&json!({
+                "apply": false,
+                "settings": {
+                    "enabled": false,
+                    "ngrokEnabled": false,
+                    "bindHost": "127.0.0.1",
+                    "port": 45222,
+                    "zrokSetupValue": "demo-token",
+                    "deviceSessionHours": 24,
+                    "readOnly": false,
+                    "allowApprovals": true
+                }
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(saved["status"], "ok");
+        assert_eq!(saved["settings"]["deviceSessionHours"], 24);
+        assert_eq!(saved["settings"]["zrokSetupValue"], "demo-token");
+        let status_body: Value = client
+            .post(format!("{local_url}/api/desktop/remote-access/status"))
+            .header("Origin", &local_url)
+            .header("Cookie", &local_cookie)
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(status_body["status"], "ok");
+        assert_eq!(status_body["settings"]["deviceSessionHours"], 24);
         let local_manifest: Value = client
             .get(format!("{local_url}/app-resources.json"))
             .send()

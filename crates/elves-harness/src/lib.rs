@@ -68,6 +68,7 @@ mod conversation_naming;
 mod credentials;
 mod desktop;
 mod desktop_images;
+mod desktop_remote_access;
 mod diagnostics;
 mod document_preview;
 pub(crate) mod execution;
@@ -1207,6 +1208,10 @@ impl HarnessController {
         Ok((handle, server, pump))
     }
 
+    fn settings_store(&self) -> SettingsStore {
+        SettingsStore::new(self.state_dir.join("settings.json"))
+    }
+
     async fn admin_status(&self, settings: &RemoteAccessSettings) -> Value {
         let live = self.live.lock().await;
         let error = live.error.clone();
@@ -1234,7 +1239,7 @@ impl HarnessController {
     pub async fn admin(self: &Arc<Self>, action: &str, payload: Value) -> anyhow::Result<Value> {
         if self.closing.load(Ordering::Acquire) {
             anyhow::ensure!(action == "status", "远程后台正在关闭，管理操作尚未执行");
-            let settings = SettingsStore::default().load()?.remote_access;
+            let settings = self.settings_store().load()?.remote_access;
             return Ok(self.admin_status(&settings).await);
         }
         match action {
@@ -1250,25 +1255,25 @@ impl HarnessController {
                 self.primary_command(action, payload).await
             }
             "status" | "apply" => {
-                let settings = SettingsStore::default().load()?.remote_access;
+                let settings = self.settings_store().load()?.remote_access;
                 self.reconcile(settings.clone()).await;
                 Ok(self.admin_status(&settings).await)
             }
             "downloadZrok" => {
-                let settings = SettingsStore::default().load()?.remote_access;
+                let settings = self.settings_store().load()?.remote_access;
                 self.reconcile(settings.clone()).await;
                 self.live.lock().await.zrok.begin_download().await?;
                 Ok(self.admin_status(&settings).await)
             }
             "registerZrok" => {
                 let email = payload["email"].as_str().context("缺少注册邮箱")?;
-                let settings = SettingsStore::default().load()?.remote_access;
+                let settings = self.settings_store().load()?.remote_access;
                 self.reconcile(settings).await;
                 self.live.lock().await.zrok.register(email).await
             }
             "startZrok" => {
                 let _operation = self.primary.try_operation()?;
-                let settings = SettingsStore::default().load()?.remote_access;
+                let settings = self.settings_store().load()?.remote_access;
                 self.reconcile(settings.clone()).await;
                 anyhow::ensure!(
                     settings.enabled && self.running.load(Ordering::SeqCst),
@@ -1291,7 +1296,7 @@ impl HarnessController {
                 Ok(self.admin_status(&settings).await)
             }
             "saveNgrok" => {
-                let settings = SettingsStore::default().load()?.remote_access;
+                let settings = self.settings_store().load()?.remote_access;
                 self.reconcile(settings.clone()).await;
                 anyhow::ensure!(settings.ngrok_enabled, "请先启用 ngrok 第二线路");
                 anyhow::ensure!(self.running.load(Ordering::SeqCst), "请先启用远程会话网页");
@@ -1304,7 +1309,7 @@ impl HarnessController {
                     .await
             }
             "testZrok" => {
-                let settings = SettingsStore::default().load()?.remote_access;
+                let settings = self.settings_store().load()?.remote_access;
                 self.reconcile(settings).await;
                 self.live.lock().await.zrok.check().await
             }
@@ -3248,13 +3253,25 @@ fn scoped_router(
             router.route(path, get(static_web_asset))
         });
     let static_routes = if desktop {
-        static_routes.route(
-            "/api/desktop/input-files",
-            // 用户要求只在本机取消文件容量限制：流式附件独立于通用 JSON 操作，远程入口不注册。
-            post(input_files::desktop_upload).layer(DefaultBodyLimit::disable()),
-        )
-        .route("/api/desktop/input-files/{batch}/{index}/image", get(desktop_images::preview))
-        .route("/api/desktop/input-files/{batch}/{index}/image/thumbnail", get(desktop_images::thumbnail))
+        static_routes
+            .route(
+                "/api/desktop/input-files",
+                // 用户要求只在本机取消文件容量限制：流式附件独立于通用 JSON 操作，远程入口不注册。
+                post(input_files::desktop_upload).layer(DefaultBodyLimit::disable()),
+            )
+            .route(
+                "/api/desktop/input-files/{batch}/{index}/image",
+                get(desktop_images::preview),
+            )
+            .route(
+                "/api/desktop/input-files/{batch}/{index}/image/thumbnail",
+                get(desktop_images::thumbnail),
+            )
+            .route(
+                "/api/desktop/remote-access/{action}",
+                // 用户要求远程会话配置保留在 Elves 本机 Harness 中；该路由仅在本机桌面入口注册，远程网页与 Android 不可访问。
+                post(desktop_remote_access::handle),
+            )
     } else {
         static_routes
     };
@@ -3565,6 +3582,9 @@ async fn access_boundary_response(
         Some("独立预览仅可在 Elves 本机客户端使用")
     } else if path == "/api/desktop/input-files" || path.starts_with("/api/desktop/input-files/") {
         Some("本机附件暂存仅可在 Elves 独立客户端使用")
+    } else if path == "/api/desktop/remote-access" || path.starts_with("/api/desktop/remote-access/")
+    {
+        Some("远程会话管理仅可在 Elves 本机客户端使用")
     } else {
         None
     };
@@ -4183,6 +4203,9 @@ async fn session(
     response["transport"] = json!(if state.desktop { "desktop" } else { "remote" });
     // 代理设置和会话管理已迁移到独立管理器；Harness 不再声明管理页面或管理 API 能力。
     response["capabilities"]["management"] = json!(false);
+    // 用户要求远程会话配置保留在 Elves 本机 Harness 中；仅本机桌面入口声明此能力，远程网页与 Android 始终为 false。
+    response["capabilities"]["desktopRemoteAccess"] =
+        json!(state.desktop && device.key_id == desktop::DEVICE_KEY_ID);
     Ok(Json(response))
 }
 

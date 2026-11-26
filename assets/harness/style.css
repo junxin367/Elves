@@ -82,8 +82,8 @@ html.theme-transition{
 .main-navigation-button .ui-icon{width:20px;height:20px}
 .main-navigation-button:hover,.main-navigation-button:focus-visible{background:var(--hover);color:var(--text)}
 .main-navigation-button.selected{background:var(--hover);color:var(--text)}
-/* 用户要求会话、定时任务和设置页共享主导航右侧内容列；固定到第 1 行第 2 列，避免页面落入被外层裁剪的隐式网格行。手机隐藏主导航后改回第 1 列。 */
-.remote-shell>:is(.scheduled-workspace,.appearance-screen){grid-column:2;grid-row:1}
+/* 用户要求会话、定时任务、远程会话和设置页共享主导航右侧内容列；固定到第 1 行第 2 列，避免页面落入被外层裁剪的隐式网格行。手机隐藏主导航后改回第 1 列。 */
+.remote-shell>:is(.scheduled-workspace,.remote-access-workspace,.appearance-screen){grid-column:2;grid-row:1}
 .scheduled-workspace{display:flex;flex-direction:column;min-width:0;min-height:0;overflow:auto;padding:28px clamp(20px,4vw,56px) 40px;background:var(--bg);color:var(--text)}
 .scheduled-heading{display:flex;align-items:center;justify-content:space-between;gap:16px;width:min(100%,1000px);margin:0 auto 24px}
 .scheduled-title{display:flex;align-items:center;gap:10px;min-width:0}
@@ -132,13 +132,133 @@ html.theme-transition{
   .scheduled-editor-grid{grid-template-columns:1fr}
   .scheduled-field-wide{grid-column:auto}
 }
+/* 用户要求远程会话保留在 Elves 本机 Harness 主导航：使用 1000px 居中单卡分区，完整继承工作区当前主题色、字体与按钮色，
+   FRP 服务端口与公网映射端口固定 80px 并隐藏上下箭头，主链路操作提示位于按钮左侧且不加外框。 */
+.remote-access-workspace{display:flex;flex-direction:column;min-width:0;min-height:0;overflow:auto;padding:28px clamp(20px,4vw,56px) 40px;background:var(--bg);color:var(--text)}
+.remote-access-heading{display:flex;align-items:center;justify-content:space-between;gap:16px;width:min(100%,1000px);margin:0 auto 24px}
+.remote-access-title{display:flex;align-items:center;gap:10px;min-width:0}
+.remote-access-title h1{margin:0;font-size:1.5rem;line-height:1.3}
+.remote-access-panel{width:min(100%,1000px);margin-inline:auto;border:1px solid var(--line);border-radius:12px;background:var(--appearance-card-bg,var(--side));--surface-button-bg:var(--button-card-bg,var(--button-bg));--surface-button-text:var(--button-card-text,var(--button-text));--surface-button-hover:var(--button-card-hover,var(--button-hover));--surface-button-active:var(--button-card-active,var(--button-active));--surface-button-outline:var(--button-card-outline,var(--button-outline,transparent))}
+.remote-access-section{padding:22px 24px}
+.remote-access-section+.remote-access-section{border-top:1px solid var(--line)}
+.remote-panel-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:14px}
+.remote-panel-head-copy{display:flex;flex-direction:column;gap:4px;min-width:0;flex:1}
+.remote-panel-head-copy h2{margin:0;font-size:1.05rem;font-weight:600;line-height:1.35}
+.remote-panel-desc{margin:0;color:var(--muted);font-size:.82rem;line-height:1.55}
+.remote-panel-head-actions{display:flex;align-items:center;gap:12px;flex-shrink:0;flex-wrap:wrap}
+.remote-switch-label{display:inline-flex;align-items:center;gap:8px;font-size:.82rem;color:var(--text);cursor:pointer;user-select:none;white-space:nowrap}
+.remote-switch-text{color:var(--muted)}
+.remote-action-button,.remote-secondary-button{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:36px;min-height:36px;padding:0 14px;border-radius:var(--radius-control);font-size:.85714rem;font-weight:500;white-space:nowrap;cursor:pointer}
+.remote-secondary-button{border:1px solid var(--line);background:var(--control-bg,var(--bg));color:var(--text)}
+.remote-secondary-button:hover:not(:disabled){background:var(--hover)}
+.remote-secondary-button:disabled,.remote-action-button:disabled{opacity:.5;cursor:not-allowed}
+.remote-secondary-button .ui-icon,.remote-device-revoke .ui-icon{width:15px;height:15px}
+.remote-input{width:100%;height:36px;min-height:36px;padding:0 10px;border:1px solid var(--line);border-radius:var(--radius-control);background:var(--composer-bg,var(--bg));color:var(--text);font-size:.85714rem;line-height:1.4}
+.remote-input:focus-visible{outline:2px solid var(--focus-ring);outline-offset:-1px}
+.remote-input:disabled{opacity:.6;cursor:not-allowed}
+.remote-input[aria-invalid=true]{border-color:var(--danger)}
+.remote-access-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px 18px;margin-top:14px}
+.remote-access-fields-top{grid-template-columns:repeat(3,minmax(0,1fr));margin-top:10px}
+.remote-access-fields-flush{margin-top:0}
+.remote-field{display:flex;flex-direction:column;gap:6px;min-width:0}
+.remote-field>label,.remote-access-expiry-heading>label,.remote-heading-inline>label{font-size:.82rem;font-weight:600;color:var(--text)}
+.remote-field small{font-size:.78rem;color:var(--muted);line-height:1.6}
+.remote-access-service-fields>.remote-field>label,.remote-access-expiry-heading{min-height:20px}
+.remote-access-service-fields>.remote-field>label{display:flex;align-items:center}
+.remote-access-expiry-heading{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.remote-access-field-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0;min-height:20px;flex-wrap:wrap}
+.remote-heading-inline{display:inline-flex;align-items:center;gap:10px;flex-shrink:0}
+.remote-external-link{display:inline-flex;align-items:center;gap:4px;color:var(--accent-text);font-size:.78rem;text-decoration:none}
+.remote-external-link:hover{text-decoration:underline}
+.remote-external-link .ui-icon{width:13px;height:13px}
+.remote-access-wide{grid-column:1/-1}
+.remote-access-input-row{display:flex;align-items:center;gap:10px;min-width:0}
+.remote-access-input-row>.remote-input{flex:1;min-width:0}
+.remote-access-input-row>button{flex-shrink:0}
+.remote-access-key-input{position:relative;display:flex;align-items:center;flex:1;min-width:0}
+.remote-access-key-input input{padding-right:68px}
+.remote-access-key-input input::-ms-reveal{display:none}
+.remote-access-public-input input{padding-right:38px}
+.remote-access-key-actions{position:absolute;right:4px;top:50%;transform:translateY(-50%);display:flex;align-items:center;gap:2px}
+.remote-key-action{width:28px;height:28px;min-width:28px;min-height:28px;border-radius:6px;color:var(--muted);background:transparent}
+.remote-key-action .ui-icon{width:15px;height:15px}
+.remote-key-action:hover:not(:disabled){background:var(--hover);color:var(--text)}
+.remote-key-action:disabled{opacity:.4;cursor:not-allowed}
+.remote-public-title-row{display:flex;align-items:center;gap:18px;min-width:0;flex-wrap:wrap}
+.remote-public-title-row>h2{flex-shrink:0}
+.remote-primary-breadcrumbs{display:inline-flex;align-items:center;gap:12px}
+.remote-primary-crumb{display:inline-flex;align-items:center;gap:4px}
+.remote-primary-crumb>span[aria-hidden=true]{color:var(--muted);font-size:.82rem}
+.remote-primary-tab{display:inline-flex;align-items:center;gap:5px;border:0;border-bottom:2px solid transparent;border-radius:0;background:transparent;padding:4px 1px 6px;color:var(--muted);font-size:.92857rem;cursor:pointer}
+.remote-primary-tab[aria-selected=true]{color:var(--text);font-weight:600;border-bottom-color:var(--accent-solid,var(--text))}
+.remote-primary-tab:disabled{cursor:wait;opacity:.5}
+.remote-primary-label{padding:2px 6px;border:1px solid transparent;border-radius:999px;font-size:.68rem;font-weight:600;line-height:1.2;white-space:nowrap}
+.remote-primary-label-zrok{border-color:color-mix(in srgb,var(--green) 35%,transparent);background:color-mix(in srgb,var(--green) 12%,transparent);color:var(--green)}
+.remote-primary-label-frp{border-color:rgba(217,119,6,.32);background:rgba(217,119,6,.12);color:#d97706}
+.remote-current-primary-label{font-size:.78rem;color:var(--muted);white-space:nowrap}
+.remote-status-badge{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;font-size:.78rem;font-weight:500;border:1px solid var(--line);background:var(--bg);color:var(--muted);line-height:1.4;white-space:nowrap}
+.remote-status-badge.connected{border-color:color-mix(in srgb,var(--green) 40%,transparent);background:color-mix(in srgb,var(--green) 10%,transparent);color:var(--green)}
+.remote-status-badge.connecting{border-color:rgba(217,119,6,.38);background:rgba(217,119,6,.1);color:#d97706}
+.remote-status-badge.error{border-color:color-mix(in srgb,var(--danger) 42%,transparent);background:color-mix(in srgb,var(--danger) 10%,transparent);color:var(--danger)}
+.remote-status-dot{width:7px;height:7px;border-radius:999px;background:currentColor}
+.remote-frp-fields{display:grid;grid-template-columns:minmax(180px,1fr) minmax(180px,1fr) 80px 80px;gap:14px 18px}
+.remote-frp-port{width:80px}
+.remote-frp-port input[type=number]{appearance:textfield;-moz-appearance:textfield}
+.remote-frp-port input[type=number]::-webkit-inner-spin-button,.remote-frp-port input[type=number]::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
+.remote-primary-actions{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:16px}
+.remote-primary-actions>p{flex:1;min-width:0;margin:0;font-size:.78rem;line-height:1.7;overflow-wrap:anywhere}
+.remote-primary-buttons{display:flex;align-items:center;gap:8px;flex-shrink:0;flex-wrap:wrap}
+.remote-primary-feedback{color:var(--accent-text)}
+.remote-primary-feedback.warning{color:#c0841a}
+.remote-primary-feedback.error{color:var(--danger)}
+.remote-frp-download{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 8px;flex:1;min-width:0;max-width:360px;margin-left:auto;font-size:.78rem;color:var(--muted)}
+.remote-frp-download>span{overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
+.remote-frp-download-track,.zrok-download-track{position:relative;height:5px;overflow:hidden;border-radius:999px;background:var(--hover)}
+.remote-frp-download-track{grid-column:1/-1}
+.zrok-download-progress{display:flex;flex:0 1 260px;align-items:center;justify-content:flex-end;gap:8px;min-width:180px}
+.zrok-download-progress span{flex:0 0 auto;color:var(--muted);font-size:.78rem}
+.zrok-download-track{flex:1;min-width:72px}
+.remote-frp-download-fill,.zrok-download-fill{height:100%;border-radius:inherit;background:var(--accent-solid,var(--text));transition:width 180ms ease}
+.remote-frp-download-fill.indeterminate,.zrok-download-fill.indeterminate{position:absolute;width:38%;animation:remote-download-slide 1.1s ease-in-out infinite}
+@keyframes remote-download-slide{from{transform:translateX(-110%)}to{transform:translateX(300%)}}
+@media(prefers-reduced-motion:reduce){.remote-frp-download-fill,.zrok-download-fill{transition:none}.remote-frp-download-fill.indeterminate,.zrok-download-fill.indeterminate{animation:none}}
+.zrok-setup-row{flex-wrap:nowrap}
+.zrok-setup-row.with-fixed-name>input:first-child{flex:1 1 58%}
+.zrok-setup-row.with-fixed-name>input:nth-child(2){flex:1 1 42%}
+.remote-ngrok-block{margin-top:18px;padding-top:16px;border-top:1px dashed var(--line)}
+.remote-section-subtitle{font-size:.9rem;font-weight:600;color:var(--text)}
+.remote-ngrok-body{display:flex;flex-direction:column;gap:6px;margin-top:4px}
+.remote-access-hint{margin:4px 0 0;color:var(--muted);font-size:.78rem;line-height:1.7}
+.remote-access-error{margin:0 0 10px;color:var(--danger);font-size:.82rem;line-height:1.6}
+.remote-access-inline-error{color:var(--danger)!important}
+.remote-access-devices{margin-top:16px}
+.remote-access-device{display:flex;gap:12px;align-items:center;border-top:1px solid var(--line);padding:12px 0}
+.remote-access-device>.ui-icon{width:18px;height:18px;flex-shrink:0;color:var(--muted)}
+.remote-access-device-info{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px;font-size:.85714rem}
+.remote-access-device-info small{color:var(--muted);font-size:.78rem}
+.remote-device-revoke{display:inline-flex;align-items:center;gap:5px;color:var(--danger);font-size:.82rem}
+.remote-access-message{width:min(100%,1000px);margin:12px auto 0;color:var(--muted);font-size:.82rem;line-height:1.6}
+@media(max-width:900px){
+  .remote-access-fields,.remote-access-fields-top{grid-template-columns:minmax(0,1fr)}
+  .remote-frp-fields{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .remote-frp-port{width:100%}
+  .remote-primary-actions{flex-direction:column;align-items:stretch}
+  .remote-primary-buttons{justify-content:flex-end}
+}
+@media(max-width:760px){
+  .remote-access-workspace{padding:20px 16px 32px}
+  .remote-access-section{padding:18px 16px}
+  .remote-panel-head{flex-direction:column}
+  .zrok-setup-row,.remote-access-public-row{flex-wrap:wrap}
+  .remote-access-public-row .remote-access-public-input{flex-basis:100%}
+}
 .remote-shell:has(>.workspace.related-session-view:not([hidden])){grid-template-columns:minmax(0,1fr)}
 .remote-shell:has(>.workspace.related-session-view:not([hidden]))>.main-navigation{display:none}
 @media(max-width:760px){.remote-shell:not([data-mobile-navigation=true])>.workspace>.sidebar{left:52px;width:min(80vw,calc(100vw - 52px))}.remote-shell:not([data-mobile-navigation=true])>.workspace>.sidebar-backdrop{left:52px}.main-navigation{padding-top:max(12px,env(safe-area-inset-top))}}
 /* 用户要求手机不出现主导航：会话区用满宽度，抽屉和遮罩从屏幕左缘开始；窄 PC 客户端仍保留原生主导航。 */
 .remote-shell[data-mobile-navigation=true]{--main-nav-width:0px;grid-template-columns:minmax(0,1fr)}
 .remote-shell[data-mobile-navigation=true]>.main-navigation{display:none}
-.remote-shell[data-mobile-navigation=true]>:is(.scheduled-workspace,.appearance-screen){grid-column:1}
+.remote-shell[data-mobile-navigation=true]>:is(.scheduled-workspace,.remote-access-workspace,.appearance-screen){grid-column:1}
 .remote-shell[data-mobile-navigation=true]>.workspace>.sidebar,.remote-shell[data-mobile-navigation=true]>.workspace>.sidebar-backdrop{left:0}
 .workspace.related-session-view{--sidebar-layout-width:0px;grid-template-columns:minmax(0,1fr)}
 .workspace.related-session-view>.sidebar,.workspace.related-session-view>.sidebar-backdrop{display:none!important}

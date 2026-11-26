@@ -1,4 +1,5 @@
-// Harness 只保留会话执行和定时任务；代理设置、会话管理由独立代理管理器承载。
+// 用户要求远程会话保留在 Elves 本机 Harness 中：主导航固定为会话、定时任务、远程会话；
+// 代理设置、会话管理仍由独立代理管理器承载；网页、PWA、Android 仅显示会话。
 // 切页保留当前会话、草稿、侧边标签及阅读位置。
 import { button, element } from "../ui/dom.js";
 import { icon } from "../ui/icons.js";
@@ -8,7 +9,8 @@ import { isAndroidContainer } from "../platform.js";
 
 export const mainNavigationItems = Object.freeze([
   { id: "conversation", label: "会话", icon: "chat" },
-  { id: "scheduled", label: "定时任务", icon: "recent" }
+  { id: "scheduled", label: "定时任务", icon: "recent" },
+  { id: "remoteAccess", label: "远程会话", icon: "globe" }
 ]);
 
 export function isElvesClient() {
@@ -24,7 +26,7 @@ export function disposeMainNavigation() {
   chooseNavigation = null;
 }
 
-export function mountMainNavigation({ workspace, openSettings, openScheduledTasks, logout }) {
+export function mountMainNavigation({ workspace, openSettings, openScheduledTasks, openRemoteAccess, logout }) {
   disposeMainNavigation();
   const shell = element("div", "remote-shell");
   const navigation = element("nav", "main-navigation");
@@ -38,13 +40,21 @@ export function mountMainNavigation({ workspace, openSettings, openScheduledTask
   const scheduledPage = element("main", "scheduled-workspace");
   scheduledPage.id = "scheduled-workspace";
   scheduledPage.hidden = true;
+  const remoteAccessPage = element("main", "remote-access-workspace");
+  remoteAccessPage.id = "remote-access-workspace";
+  remoteAccessPage.hidden = true;
   const settingsPage = element("main", "appearance-screen");
   settingsPage.id = "settings-workspace";
   settingsPage.hidden = true;
   let current = "conversation", savedPosition = null;
-  let settingsFrom = "conversation", disposeSettings = null, disposeScheduled = null;
-  const items = mainNavigationItems.filter(item =>
-    item.id === "conversation" || isElvesClient() && session?.transport === "desktop");
+  let settingsFrom = "conversation", disposeSettings = null, disposeScheduled = null, disposeRemoteAccess = null;
+  const desktopHost = isElvesClient() && session?.transport === "desktop";
+  const items = mainNavigationItems.filter(item => {
+    if (item.id === "conversation") return true;
+    if (!desktopHost) return false;
+    if (item.id === "remoteAccess") return session?.capabilities?.desktopRemoteAccess !== false;
+    return true;
+  });
   const controls = new Map();
   const canChoose = id => id === "conversation" || id === "settings" || items.some(item => item.id === id);
   const choose = id => {
@@ -60,6 +70,10 @@ export function mountMainNavigation({ workspace, openSettings, openScheduledTask
       disposeScheduled?.();
       disposeScheduled = null;
     }
+    if (current === "remoteAccess") {
+      disposeRemoteAccess?.();
+      disposeRemoteAccess = null;
+    }
     if (current === "conversation") {
       const messages = workspace.querySelector("#messages");
       savedPosition = messages ? { node: messages, top: messages.scrollTop } : null;
@@ -74,9 +88,10 @@ export function mountMainNavigation({ workspace, openSettings, openScheduledTask
     // 隐藏而不销毁会话 DOM，实时消息和会话操作继续使用原来的实例与授权。
     workspace.hidden = current !== "conversation";
     workspace.inert = workspace.hidden;
-    // 设置与定时任务占同一内容列并共享选中状态；只隐藏页面，不用弹窗锁住主导航。
+    // 设置、定时任务与远程会话占同一内容列并共享选中状态；只隐藏页面，不用弹窗锁住主导航。
     settingsPage.hidden = current !== "settings";
     scheduledPage.hidden = current !== "scheduled";
+    remoteAccessPage.hidden = current !== "remoteAccess";
     if (current === "conversation") {
       if (savedPosition?.node.isConnected) savedPosition.node.scrollTop = savedPosition.top;
       requestAnimationFrame(() => {
@@ -94,13 +109,16 @@ export function mountMainNavigation({ workspace, openSettings, openScheduledTask
     } else if (current === "scheduled") {
       scheduledPage.setAttribute("aria-label", "定时任务");
       disposeScheduled = openScheduledTasks?.(scheduledPage) || null;
+    } else if (current === "remoteAccess") {
+      remoteAccessPage.setAttribute("aria-label", "远程会话");
+      disposeRemoteAccess = openRemoteAccess?.(remoteAccessPage) || null;
     }
   };
   for (const item of items) {
     const control = button("", item.label, () => choose(item.id), "main-navigation-button");
     control.dataset.page = item.id;
     control.setAttribute("aria-controls", item.id === "conversation" ? "session-sidebar"
-      : scheduledPage.id);
+      : item.id === "scheduled" ? scheduledPage.id : remoteAccessPage.id);
     control.append(icon(item.icon));
     if (item.id === current) {
       control.classList.add("selected");
@@ -170,12 +188,13 @@ export function mountMainNavigation({ workspace, openSettings, openScheduledTask
   chooseNavigation = choose;
   navigation.append(pages, settingsArea);
   workspace.before(shell);
-  shell.append(navigation, workspace, scheduledPage, settingsPage);
+  shell.append(navigation, workspace, scheduledPage, remoteAccessPage, settingsPage);
   disposeNavigation = () => {
     mobileMedia.removeEventListener("change", syncMobileNavigation);
     footer.remove();
     disposeSettings?.();
     disposeScheduled?.();
+    disposeRemoteAccess?.();
   };
-  return { choose, shell, settingsPage };
+  return { choose, shell, settingsPage, scheduledPage, remoteAccessPage };
 }

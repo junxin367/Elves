@@ -15,7 +15,7 @@ import { defaultSharedSettings } from "../assets/harness/features/settings/share
 import { messageActionState, renderMessageActions } from "../assets/harness/message-actions.js";
 
 async function navigationFixture(native = false, transport = native ? "desktop" : "remote",
-  { mobile = false, android = false } = {}) {
+  { mobile = false, android = false, desktopRemoteAccess = native && transport === "desktop" } = {}) {
   const source = await loadHarnessAppSource();
   const document = { activeElement: null };
   const node = (tag, className = "") => ({
@@ -58,14 +58,14 @@ async function navigationFixture(native = false, transport = native ? "desktop" 
     change(value) { this.matches = value; for (const callback of listeners) callback(); },
   };
   workspace.draft = "保留当前输入";
-  const opened = [], visibility = [], animation = [], callbacks = { settings: 0, logout: 0, disposed: 0 };
+  const opened = [], visibility = [], animation = [], callbacks = { settings: 0, scheduled: 0, remoteAccess: 0, logout: 0, disposed: 0 };
   const openPage = page => opened.push(page);
   openPage.setVisible = value => visibility.push(value);
   openPage.dispose = () => callbacks.disposed++;
-  const settingViews = [];
+  const settingViews = [], remoteAccessViews = [];
   const context = {
     document,
-    session: { transport, capabilities: { management: true } },
+    session: { transport, capabilities: { management: false, desktopRemoteAccess } },
     workspace, openPage, element: node, icon: name => ({ name }),
     button: (text, label, action, className) => Object.assign(node("button", className), { label, action }),
     closePopup() {}, togglePopup: control => { context.popup = control; }, openPopup() {},
@@ -76,30 +76,49 @@ async function navigationFixture(native = false, transport = native ? "desktop" 
       settingViews.push(record);
       return () => { record.disposed = true; };
     },
+    openScheduledTasks: () => {
+      callbacks.scheduled++;
+      return () => {};
+    },
+    openRemoteAccess: host => {
+      callbacks.remoteAccess++;
+      const record = { host, disposed: false };
+      remoteAccessViews.push(record);
+      return () => { record.disposed = true; };
+    },
     logout: () => callbacks.logout++,
     matchMedia: () => media, isAndroidContainer: () => android,
     ...(native ? { __ELVES_CLIENT__: { open() {} } } : {}),
   };
   rawVm.createContext(context);
   rawVm.runInContext(source.moduleText("features/main-navigation.js")
-    + "\nglobalThis.navigation = mountMainNavigation({ workspace, openPage, openSettings, logout });", context);
+    + "\nglobalThis.navigation = mountMainNavigation({ workspace, openPage, openSettings, openScheduledTasks, openRemoteAccess, logout });", context);
   const [navigation] = context.navigation.shell.children;
   const footer = sidebar.children.find(child => child.className.includes("mobile-sidebar-footer"));
   return { context, workspace, messages, callbacks, opened, visibility, animation, sidebar, sidebarContent, footer, media, listeners,
-    navigation, settingViews, settingsPage: context.navigation.settingsPage, settingsArea: navigation.children[1], buttons: navigation.children[0].children,
+    navigation, settingViews, remoteAccessViews, settingsPage: context.navigation.settingsPage,
+    remoteAccessPage: context.navigation.remoteAccessPage,
+    settingsArea: navigation.children[1], buttons: navigation.children[0].children,
     settings: navigation.children[1].children[0] || footer.children[0].children[0],
     logout: footer?.children[0].children.find(child => child.id === "logout") };
 }
 
 test("统一主导航固定排序，切换后保留当前会话草稿、节点与阅读位置", async () => {
   const fixture = await navigationFixture(true);
-  assert.deepEqual(Array.from(fixture.buttons, button => button.label), ["会话", "定时任务"]);
+  assert.deepEqual(Array.from(fixture.buttons, button => button.label), ["会话", "定时任务", "远程会话"]);
   fixture.buttons[1].action();
   assert.equal(fixture.workspace.hidden, true);
   assert.equal(fixture.workspace.inert, true);
+  assert.equal(fixture.callbacks.scheduled, 1);
+  fixture.buttons[2].action();
+  assert.equal(fixture.remoteAccessPage.hidden, false);
+  assert.equal(fixture.callbacks.remoteAccess, 1);
+  assert.equal(fixture.remoteAccessViews[0].host, fixture.remoteAccessPage);
   fixture.messages.scrollTop = 0;
   fixture.buttons[0].action();
   fixture.animation.forEach(callback => callback());
+  assert.equal(fixture.remoteAccessViews[0].disposed, true);
+  assert.equal(fixture.remoteAccessPage.hidden, true);
   assert.equal(fixture.workspace.hidden, false);
   assert.equal(fixture.workspace.inert, false);
   assert.equal(fixture.workspace.draft, "保留当前输入");
@@ -116,8 +135,13 @@ test("网页和 Android 不提供管理入口，伪造客户端标记也不能�
     assert.deepEqual(Array.from(fixture.buttons, button => button.label), ["会话"]);
     for (const page of ["proxy", "sessions", "remoteAccess"]) fixture.context.navigation.choose(page);
     assert.deepEqual(fixture.opened, []);
+    assert.equal(fixture.callbacks.remoteAccess, 0);
     assert.equal(fixture.workspace.hidden, false);
   }
+  const withoutCapability = await navigationFixture(true, "desktop", { desktopRemoteAccess: false });
+  assert.deepEqual(Array.from(withoutCapability.buttons, button => button.label), ["会话", "定时任务"]);
+  withoutCapability.context.navigation.choose("remoteAccess");
+  assert.equal(withoutCapability.callbacks.remoteAccess, 0);
 });
 
 test("导航底部设置按客户端区分：Windows 直接打开，网页仅有设置和退出", async () => {
@@ -129,7 +153,7 @@ test("导航底部设置按客户端区分：Windows 直接打开，网页仅有
   assert.equal(web.settings.attributes["aria-current"], "page");
   assert.equal(web.settingsPage.hidden, false);
   web.settings.menuOptions[1].action();
-  assert.deepEqual(web.callbacks, { settings: 1, logout: 1, disposed: 0 });
+  assert.deepEqual(web.callbacks, { settings: 1, scheduled: 0, remoteAccess: 0, logout: 1, disposed: 0 });
   const native = await navigationFixture(true);
   native.settings.action();
   assert.equal(native.callbacks.settings, 1);
@@ -213,11 +237,27 @@ test("Windows 窄窗口仍保留 PC 主导航与直接设置入口，不出现�
   const fixture = await navigationFixture(true, "desktop", { mobile: true });
   assert.equal(fixture.context.navigation.shell.dataset.mobileNavigation, "false");
   assert.equal(fixture.footer, undefined);
-  assert.equal(fixture.buttons.length, 2);
+  assert.equal(fixture.buttons.length, 3);
   fixture.settings.action();
   assert.equal(fixture.callbacks.settings, 1);
   assert.equal(fixture.settingsPage.dataset.settingsMobile, "false");
   assert.equal(fixture.context.popup, undefined);
+});
+
+test("远程会话原生页面校验回环地址、端口、授权有效期与 FRP 地址归一化", async () => {
+  const source = await loadHarnessAppSource();
+  const context = rawVm.createContext({ URL });
+  rawVm.runInContext(
+    source.section("const defaultFrpConfig = Object.freeze", "function downloadSize"),
+    context
+  );
+  assert.equal(rawVm.runInContext('normalizeFrpServerAddress("https://frp.example.com:7443/path")', context), "frp.example.com");
+  assert.equal(rawVm.runInContext('frpPublicOrigin({ serverAddr: "https://frp.example.com:7000", remotePort: 8443, publicOrigin: "" })', context), "http://frp.example.com:8443");
+  assert.equal(rawVm.runInContext('frpPublicOrigin({ serverAddr: "frp.example.com", remotePort: 8443, publicOrigin: "https://chat.example.com" })', context), "https://chat.example.com");
+  assert.equal(rawVm.runInContext('remoteAccessValidation({ enabled: true, bindHost: "127.0.0.1", port: 45222, deviceSessionHours: 0 })', context), null);
+  assert.equal(rawVm.runInContext('remoteAccessValidation({ enabled: true, bindHost: "0.0.0.0", port: 45222, deviceSessionHours: 0 })', context), "远程会话网页仅允许监听本机回环地址。");
+  assert.equal(rawVm.runInContext('remoteAccessValidation({ enabled: true, bindHost: "127.0.0.1", port: 70000, deviceSessionHours: 0 })', context), "端口必须在 1–65535 之间。");
+  assert.equal(rawVm.runInContext('remoteAccessValidation({ enabled: true, bindHost: "127.0.0.1", port: 45222, deviceSessionHours: 999 })', context), "设备授权有效期必须在 1–720 小时之间。");
 });
 
 test("独立客户端忽略历史远程登录标记，网页和 Android 保留密码登录要求", async () => {

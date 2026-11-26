@@ -12,7 +12,7 @@ Harness 本机工作区默认只监听 `127.0.0.1:45223`，与网页远程入口
 
 ## 工作区与设置
 
-从左侧[主导航](../core/product-behavior.md#统一左侧主导航)进入会话、代理设置、会话管理或远程会话。底部“设置”直接打开设置页；[设置规范](../core/product-behavior.md#远程设置分类与实例配置)区分本机外观与同一 Harness 共享的设置。
+从左侧[主导航](../core/product-behavior.md#统一左侧主导航)进入会话、定时任务或远程会话；代理设置与会话管理位于独立的“Elves 代理管理器”窗口。底部“设置”直接打开设置页；[设置规范](../core/product-behavior.md#远程设置分类与实例配置)区分本机外观与同一 Harness 共享的设置。
 
 文件、变更和关联会话可在[右侧标签面板](../sessions/workspace-tools-and-side-sessions.md#菜单入口与页面层级)打开；独立会话窗口与文件预览窗口共用主窗口的 WebView2 Environment 和本机授权，关闭窗口只关闭自身。需要启动宿主机应用时使用[本机 Open in](../core/product-behavior.md#open-in-的应用识别与前台显示)。
 

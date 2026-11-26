@@ -29,7 +29,7 @@ Elves 与 Harness 共用工作区网页，位于 `assets/harness/`。会话工�
 | `goal/` | 目标输入 `composer.js` 与提交确认 `composer-submission.js`、目标状态 `status.js`、共享状态 `state.js` |
 | `appearance/` | 外观模型与主题 `theme.js`、外观应用 `apply.js`、设置页面 `dialog.js` |
 | `settings/` | 环境、指令与回顾设置 `remote-settings.js` |
-| 根 | 接口调用 `api.js`、页面骨架 `shell.js` 与共享引用 `shell-state.js`、审批面板 `approvals.js`、审批请求 `approval-requests.js` 与状态 `approval-state.js`、通知 `notifications.js`、Claude 控制提示 `claude-notices.js`、全局输入 `global-input.js`、本机文件 `local-files.js` |
+| 根 | 接口调用 `api.js`、主导航 `main-navigation.js`、定时任务 `scheduled-tasks.js`、远程会话 `remote-access.js`、页面骨架 `shell.js` 与共享引用 `shell-state.js`、审批面板 `approvals.js`、审批请求 `approval-requests.js` 与状态 `approval-state.js`、通知 `notifications.js`、Claude 控制提示 `claude-notices.js`、全局输入 `global-input.js`、本机文件 `local-files.js` |
 
 `node scripts/check-harness-assets.mjs` 检查分层，出现反向依赖（如 `ui/` 引用 `features/`）即失败；同时用 V8 只链接、不执行全部模块，具名导入在目标模块中不存在时报告出错的模块，避免页面上线后整页无法加载。`features/` 之间允许互相引用，但全部静态 `import` 不得成环：检查脚本发现环即失败，并给出一条最短的具体环（如 `a.js → b.js → a.js`）。动态 `import()` 的可选模块不参与求值顺序，不计入。
 

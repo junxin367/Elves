@@ -62,7 +62,7 @@
 - Windows 客户端及共享管理库版本号以根 `Cargo.toml` 的 `workspace.package.version` 为准。Android 版本独立维护于 `apps/elves-android/version.properties`，不随 Windows 版本号同步。普通编译不调整 Android 版本；桌面发版需要同步发布 Android 时，按下方发布规则递增 Android 独立版本和 `versionCode`，并保持现有正式签名证书。
 - 默认本地协议代理端口保持 `45221`。
 - Windows 客户端关闭主窗口时收进托盘，再次启动唤回原窗口，并保持上次窗口大小、位置及显示器。
-- Elves/Harness 本机主导航固定为会话、定时任务；网页、PWA、Android 仅显示会话入口，不开放代理设置、会话管理、供应商/API 配置、本地代理、请求日志或相应管理接口。代理管理器使用独立窗口和 Tauri 命令桥；导航宽 52px，按钮 36px，左右各 8px，设置固定底部。
+- Elves/Harness 本机主导航固定为会话、定时任务、远程会话；网页、PWA、Android 仅显示会话入口，不开放代理设置、会话管理、远程会话配置、供应商/API 配置、本地代理、请求日志或相应管理接口。代理管理器使用独立窗口和 Tauri 命令桥；导航宽 52px，按钮 36px，左右各 8px，设置固定底部。
 - 会话管理只保留浏览、筛选及单个/批量删除，不恢复历史会话修复和上下文压缩入口。
 - 各端设置与退出入口遵循[产品规范的主导航约定](docs/product-standards/core/product-behavior.md#统一左侧主导航)。
 - 快捷入口中文不能乱码；NSIS 编译必须使用 `/INPUTCHARSET UTF8`。

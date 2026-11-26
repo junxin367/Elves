@@ -25,6 +25,7 @@ import { app, connected, creating, nativeConnectionVersion, selectedId, session,
 import { api } from "./api.js";
 import { disposeMainNavigation, isElvesClient, mountMainNavigation } from "./main-navigation.js";
 import { mountSettingsPage } from "./appearance/dialog.js";
+import { mountRemoteAccessPage } from "./remote-access.js";
 import { mountScheduledTasksPage } from "./scheduled-tasks.js";
 import { setApprovalSignature } from "./approval-state.js";
 import { fitClaudeUsageTip, mountClaudeUsage, resetClaudeUsage } from "./composer/claude-usage.js";
@@ -430,6 +431,7 @@ export function shell() {
     workspace,
     openSettings: mountSettingsPage,
     openScheduledTasks: mountScheduledTasksPage,
+    openRemoteAccess: mountRemoteAccessPage,
     logout
   });
   $("#connection-state").onclick = refreshConnectionFromIndicator;
