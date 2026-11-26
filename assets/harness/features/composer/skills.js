@@ -47,11 +47,12 @@ import { goalCommandMatches, selectedGoal } from "../goal/state.js";
 import { editingMessage } from "../messages/message-edit.js";
 import { editingQueuedMessage } from "../queue/state.js";
 import { claudeCommandSupported } from "../session/action-capabilities.js";
-import { backendCapability, isClaude, privateInputScope, temporarySideThread, threadForkAllowed, threadReadOnly } from "../session/capabilities.js";
+import { backendCapability, isAntigravity, isClaude, privateInputScope, temporarySideThread, threadForkAllowed, threadReadOnly } from "../session/capabilities.js";
 import { activeInstanceId } from "../session/instances.js";
 import { cacheDisplayData, currentThreadDisplay, optionalCachedRead, readScope } from "../session/thread-cache.js";
 
 export function compactCommandAvailable() {
+  if (isAntigravity()) return false;
   if (isClaude() && !claudeCommandSupported("compact")) return false;
   return !!session && !creating && !!selectedId && thread?.id === selectedId && !threadReadOnly() && connected
     && !busy && !stopping && !pending && !editingMessage && !editingQueuedMessage && !compactionLocked(selectedId);
@@ -65,12 +66,12 @@ export function forkCommandAvailable(query = slashQuery()) {
 export function slashMenuEntries(query = slashQuery()) {
   if (!query) return [];
   const entries = [];
-  // Claude 沿用原生斜杠调用语义，Skill 位于消息开头；Codex 保留原有内联 Skill 和目标组合。
+  // Claude 与 Antigravity 沿用原生斜杠调用语义，命令位于消息开头；Codex 保留原有内联 Skill 和目标组合。
   const nativeSkillPosition = !selectedGoal && !($("#prompt")?.value || "").slice(0, query.start || 0).trim();
-  if (!isClaude() || nativeSkillPosition) entries.push(...skillChoices.filter(skill => !selectedSkills.some(item => skillIdentity(item) === skillIdentity(skill))
+  if (!isClaude() && !isAntigravity() || nativeSkillPosition) entries.push(...skillChoices.filter(skill => !selectedSkills.some(item => skillIdentity(item) === skillIdentity(skill))
     && [skill.name, skill.displayName, skill.description].some(value => String(value).toLowerCase().includes(query.query)))
     .map(skill => ({ type: "skill", enabled: true, skill })));
-  if (compactCommandMatches(query.query) && (!isClaude() || claudeCommandSupported("compact")))
+  if (compactCommandMatches(query.query) && !isAntigravity() && (!isClaude() || claudeCommandSupported("compact")))
     entries.push({ type: "compact", enabled: compactCommandAvailable() });
   // 用户要求分支紧接“压缩”并与回复菜单同名；保留旧搜索词，不支持的会话不显示禁用占位。
   if (threadForkAllowed() && ["fork", "分支到新聊天", "在新聊天中分支"].some(value => value.includes(query.query)))
@@ -157,11 +158,12 @@ function activeSkillCatalogContext() {
     : creating && backendCapability("projectlessCreation") ? "projectless" : "";
   if (!scope) return null;
   const payload = selectedId ? { threadId: selectedId } : { projectId };
-  if (!isClaude()) return { scope, payload };
+  if (!isClaude() && !isAntigravity()) return { scope, payload };
+  const backend = isAntigravity() ? "antigravity" : "claude";
   const instanceId = activeInstanceId();
-  // 同一项目在不同 WSL 中可加载不同 Skill，不能复用 Codex 或其他实例的目录。
-  return instanceId ? { scope: `claude:${instanceId}:${scope}`,
-    payload: { ...payload, backend: "claude", instanceId } } : null;
+  // 同一项目在不同环境实例中可加载不同命令/Skill，不能复用 Codex 或其他实例的目录。
+  return instanceId ? { scope: `${backend}:${instanceId}:${scope}`,
+    payload: { ...payload, backend, instanceId } } : null;
 }
 export function scheduleCatalogRefresh() {
   stopCatalogRefresh();
@@ -173,10 +175,10 @@ export function scheduleCatalogRefresh() {
       : catalogFresh({ loadedAt: modelsLoadedAt }) ? due(modelsLoadedAt) : time, modelsRetryAt));
   const context = activeSkillCatalogContext(), key = context && skillScopeKey(context.scope);
   const record = key && skillCatalogs.get(key);
-  const claude = context?.payload.backend === "claude";
-  if (context && (record || !claude && globalSkillsLoadedAt) && !skillCatalogRequests.has(key) && skillLoading?.scope !== context.scope) {
+  const isolated = ["claude", "antigravity"].includes(context?.payload.backend);
+  if (context && (record || !isolated && globalSkillsLoadedAt) && !skillCatalogRequests.has(key) && skillLoading?.scope !== context.scope) {
     const stale = !skillCatalogFresh(context.scope);
-    deadlines.push(Math.max(stale ? time : claude ? due(record.loadedAt)
+    deadlines.push(Math.max(stale ? time : isolated ? due(record.loadedAt)
       : Math.min(record ? due(record.loadedAt) : Infinity, due(globalSkillsLoadedAt)),
       skillCatalogRetryAt.get(key) || 0));
   }
@@ -187,7 +189,7 @@ export function refreshCachedCatalogs() {
   if (!session || pageLeaving || document.hidden || navigator.onLine === false) return;
   if (modelsLoadedAt) void loadModels().catch(() => {});
   const context = activeSkillCatalogContext();
-  if (context && (context.payload.backend !== "claude" && globalSkillsLoadedAt
+  if (context && (!["claude", "antigravity"].includes(context.payload.backend) && globalSkillsLoadedAt
       || skillCatalogs.has(skillScopeKey(context.scope))))
     void loadSkillChoices(context.scope, context.payload).catch(() => {});
   scheduleCatalogRefresh();
@@ -196,7 +198,7 @@ function applySkillCatalog(record, scope) {
   if (skillScope === scope && appliedSkillCatalog === record && appliedGlobalSkills === globalSkillChoices) return;
   const previous = skillScope === scope ? slashMenuEntries()[skillIndex] : null;
   const allowedGlobals = new Set(record.globalPaths);
-  setSkillChoices(record.backend === "claude" ? [...record.data]
+  setSkillChoices(["claude", "antigravity"].includes(record.backend) ? [...record.data]
     : [...globalSkillChoices.filter(skill => allowedGlobals.has(skill.path)), ...record.data]);
   if (record.backend === "claude" && isClaude() && modelsScope === modelContextKey() && record.nativeCapabilities) {
     // 同次原生探测也确认压缩/目标能力；历史会话没有完整模型目录时也能打开菜单底部入口。
@@ -213,10 +215,10 @@ function applySkillCatalog(record, scope) {
 }
 async function readSkillCatalog(scope, payload, force) {
   const key = skillScopeKey(scope), owner = privateInputScope(session), revision = skillCatalogRevision;
-  const claude = payload.backend === "claude";
+  const isolatedBackend = ["claude", "antigravity"].includes(payload.backend) ? payload.backend : "";
   const current = () => privateInputScope(session) === owner && revision === skillCatalogRevision;
   if (!force && !skillCatalogUsable(scope) && readScope === owner) {
-    if (!claude && !catalogUsable({ loadedAt: globalSkillsLoadedAt })) {
+    if (!isolatedBackend && !catalogUsable({ loadedAt: globalSkillsLoadedAt })) {
       const global = await optionalCachedRead(readCache.get(owner, "skills", "global"), 50);
       if (current() && catalogUsable(global) && Array.isArray(global.data) && global.data.every(validCachedSkill)) {
         setGlobalSkillChoices(global.data); setGlobalSkillsLoadedAt(global.loadedAt);
@@ -227,9 +229,9 @@ async function readSkillCatalog(scope, payload, force) {
     const cached = await optionalCachedRead(readCache.get(owner, "skills", key), 50);
     if (current() && catalogUsable(cached) && Array.isArray(cached.data) && Array.isArray(cached.globalPaths)
         && cached.data.every(validCachedSkill) && cached.globalPaths.every(path => typeof path === "string")
-        && (claude ? cached.backend === "claude" && cached.instanceId === payload.instanceId
-            && cached.data.every(skill => skill.backend === "claude")
-          : cached.backend !== "claude" && catalogUsable({ loadedAt: globalSkillsLoadedAt }))) {
+        && (isolatedBackend ? cached.backend === isolatedBackend && cached.instanceId === payload.instanceId
+            && cached.data.every(skill => skill.backend === isolatedBackend)
+          : !["claude", "antigravity"].includes(cached.backend) && catalogUsable({ loadedAt: globalSkillsLoadedAt }))) {
       skillCatalogs.set(key, cached);
     }
   }
@@ -241,7 +243,7 @@ async function readSkillCatalog(scope, payload, force) {
     return skillCatalogs.get(key);
   }
   return refreshSkillCatalogRecord(scope, payload, force
-    || !claude && !!globalSkillsLoadedAt && catalogNeedsRefresh({ loadedAt: globalSkillsLoadedAt }));
+    || !isolatedBackend && !!globalSkillsLoadedAt && catalogNeedsRefresh({ loadedAt: globalSkillsLoadedAt }));
 }
 async function refreshSkillCatalogRecord(scope, payload, force) {
   const key = skillScopeKey(scope), owner = privateInputScope(session), revision = skillCatalogRevision;
@@ -253,26 +255,31 @@ async function refreshSkillCatalogRecord(scope, payload, force) {
     if (!Array.isArray(result.data) || !result.data.every(validCachedSkill))
       throw new Error("Skill 列表返回格式无效");
     const claude = payload.backend === "claude";
+    const antigravity = payload.backend === "antigravity";
+    const isolated = claude || antigravity;
     if (claude && (result.backend !== "claude" || result.instanceId !== payload.instanceId
         || result.data.some(skill => skill.backend !== "claude" || skill.command !== skill.name
           || skill.path !== `claude-skill:${skill.command}`)))
       throw new Error("Claude Skill 目录与当前实例不匹配");
+    if (antigravity && (result.backend !== "antigravity" || result.instanceId !== payload.instanceId
+        || result.data.some(skill => skill.backend !== "antigravity" || skill.command !== skill.name)))
+      throw new Error("Antigravity ACP 命令目录与当前实例不匹配");
     const data = result.data;
-    const globals = claude ? [] : data.filter(skill => ["user", "system", "admin"].includes(skill.scope));
+    const globals = isolated ? [] : data.filter(skill => ["user", "system", "admin"].includes(skill.scope));
     const mergedGlobals = new Map((catalogUsable({ loadedAt: globalSkillsLoadedAt })
       ? globalSkillChoices : []).map(skill => [skill.path, skill]));
     for (const skill of globals) mergedGlobals.set(skill.path, skill);
     const nextGlobals = [...mergedGlobals.values()].sort((left, right) => left.name.localeCompare(right.name));
     const loadedAt = Date.now();
     const record = { cwd: result.cwd, loadedAt, epoch: globalSkillEpoch,
-      ...(claude ? { backend: "claude", instanceId: result.instanceId, nativeCapabilities: result.nativeCapabilities } : {}),
+      ...(isolated ? { backend: payload.backend, instanceId: result.instanceId, nativeCapabilities: result.nativeCapabilities } : {}),
       globalPaths: globals.map(skill => skill.path),
-      data: claude ? data : data.filter(skill => !["user", "system", "admin"].includes(skill.scope)) };
-    const resolvedKey = claude && skillCwdKey(result.cwd) ? JSON.stringify(["claude", result.instanceId, skillCwdKey(result.cwd)])
-      : claude ? key
+      data: isolated ? data : data.filter(skill => !["user", "system", "admin"].includes(skill.scope)) };
+    const resolvedKey = isolated && skillCwdKey(result.cwd) ? JSON.stringify([payload.backend, result.instanceId, skillCwdKey(result.cwd)])
+      : isolated ? key
       : skillCwdKey(result.cwd) || key;
     // 完整新目录生成后再替换；刷新过程中保留原列表和已选项。
-    if (!claude) {
+    if (!isolated) {
       setGlobalSkillChoices(nextGlobals); setGlobalSkillsLoadedAt(loadedAt); setGlobalSkillsInvalidated(false);
     }
     skillScopeAliases.set(scope, resolvedKey);
@@ -283,10 +290,10 @@ async function refreshSkillCatalogRecord(scope, payload, force) {
       const oldest = skillCatalogs.keys().next().value;
       skillCatalogs.delete(oldest); skillCatalogRetryAt.delete(oldest); skillCatalogFailures.delete(oldest);
     }
-    if (!claude) cacheDisplayData("skills", "global", { data: globalSkillChoices, loadedAt, epoch: globalSkillEpoch },
+    if (!isolated) cacheDisplayData("skills", "global", { data: globalSkillChoices, loadedAt, epoch: globalSkillEpoch },
       { maxAge: catalogFallbackMs });
     cacheDisplayData("skills", resolvedKey, record, { maxAge: catalogFallbackMs });
-    if (claude && key !== resolvedKey)
+    if (isolated && key !== resolvedKey)
       cacheDisplayData("skills", key, record, { maxAge: catalogFallbackMs });
     const active = activeSkillCatalogContext();
     if (active && skillScopeKey(active.scope) === resolvedKey) {
@@ -320,7 +327,7 @@ export async function loadSkillChoices(scope, payload, { force = false } = {}) {
   const version = setSkillLoadVersion(skillLoadVersion + 1), selection = selectionVersion, owner = privateInputScope(session);
   const loading = setSkillLoading({ scope });
   if (skillScope !== scope) {
-    setSkillChoices(payload.backend === "claude" ? [] : [...globalSkillChoices]); setSkillScope(""); setSkillRenderVersion(skillRenderVersion + 1);
+    setSkillChoices(["claude", "antigravity"].includes(payload.backend) ? [] : [...globalSkillChoices]); setSkillScope(""); setSkillRenderVersion(skillRenderVersion + 1);
     setAppliedSkillCatalog(setAppliedGlobalSkills(null));
   }
   loading.promise = (async () => {
@@ -368,7 +375,8 @@ export async function updateSkillMenu() {
   if (skillCatalogUsable(scope)) {
     applySkillCatalog(skillCatalogs.get(skillScopeKey(scope)), scope);
     renderSkillMenu();
-  } else renderSkillMenu(isClaude() ? "正在读取所选 Claude 实例的 Skill…" : "正在读取本机可用 Skill…");
+  } else renderSkillMenu(isClaude() ? "正在读取所选 Claude 实例的 Skill…"
+    : isAntigravity() ? "正在通过 ACP 读取 Antigravity 可用命令…" : "正在读取本机可用 Skill…");
   const request = loadSkillChoices(scope, payload);
   const version = skillLoadVersion, deviceId = session.device.id;
   try {

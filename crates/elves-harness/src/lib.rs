@@ -59,6 +59,7 @@ use tokio::sync::{Mutex, broadcast};
 use crate::codex_service::{ServiceDispatchGuard, ServiceDispatchPermit};
 use crate::settings::{RemoteAccessSettings, SettingsStore};
 
+mod antigravity;
 mod browser;
 mod channels;
 mod claude;
@@ -491,6 +492,7 @@ pub struct HarnessController {
     test_backend: OnceLock<Arc<dyn TestRemoteBackend>>,
     harness: Arc<codex::CodexHarness>,
     claude: Arc<claude::Claude>,
+    antigravity: Arc<antigravity::Antigravity>,
     permissions: permissions::SessionPermissions,
     shared_settings: shared_settings::SharedSettings,
     scheduled_tasks: Arc<scheduled_tasks::ScheduledTasks>,
@@ -568,6 +570,7 @@ impl HarnessController {
         let primary = primary_route::Primary::new(&state_dir)?;
         let harness = codex::CodexHarness::new(&state_dir)?;
         let claude = claude::Claude::new(&state_dir)?;
+        let antigravity = antigravity::Antigravity::new(&state_dir)?;
         let permissions = permissions::SessionPermissions::open(&state_dir)?;
         // 用户要求 Codex 实例仅保留服务模式；旧设备模式文件不再读取，也不能恢复桌面注入路由。
         harness.enabled.store(true, Ordering::Release);
@@ -576,6 +579,7 @@ impl HarnessController {
             test_backend: OnceLock::new(),
             harness: harness.clone(),
             claude: claude.clone(),
+            antigravity: antigravity.clone(),
             permissions,
             shared_settings: shared_settings::SharedSettings::new(&state_dir),
             scheduled_tasks: Arc::new(scheduled_tasks::ScheduledTasks::new(&state_dir)?),
@@ -629,6 +633,7 @@ impl HarnessController {
         });
         harness.attach(Arc::downgrade(&controller));
         claude.attach(Arc::downgrade(&controller));
+        antigravity.attach(Arc::downgrade(&controller));
         controller
             .conversation_naming
             .attach(Arc::downgrade(&controller));
@@ -1027,6 +1032,7 @@ impl HarnessController {
             if !settings.enabled && !desktop_active {
                 self.harness.stop_preparation().await;
                 self.claude.release().await;
+                self.antigravity.release().await;
             }
             self.prune_stale_public_devices().await;
             return;
@@ -1063,6 +1069,7 @@ impl HarnessController {
             if !desktop_active {
                 self.harness.stop_preparation().await;
                 self.claude.release().await;
+                self.antigravity.release().await;
             }
             self.prune_stale_public_devices().await;
             return;
@@ -1499,12 +1506,14 @@ impl HarnessController {
             if claude::Claude::is_subagent_id(id) {
                 return Err(ApiError::new(403, "子智能体仅支持只读查看").into());
             }
-            let _codex_serial = if !claude::Claude::owns_id(id) {
+            let is_claude = claude::Claude::owns_id(id);
+            let is_antigravity = antigravity::Antigravity::owns_id(id);
+            let _codex_serial = if !is_claude && !is_antigravity {
                 Some(self.harness.thread_lock(id).await.lock_owned().await)
             } else {
                 None
             };
-            if !claude::Claude::owns_id(id) {
+            if !is_claude && !is_antigravity {
                 self.harness.check_deletion_barrier(id).await?;
             }
             // 用户要求侧边继承主会话权限且没有独立切换入口；接口同样禁止保存侧边权限覆盖。
@@ -1515,8 +1524,10 @@ impl HarnessController {
             let context = self
                 .call_backend("workspaceContext", payload.clone(), authorization)
                 .await?;
-            let backend = if claude::Claude::owns_id(id) {
+            let backend = if is_claude {
                 "claude"
+            } else if is_antigravity {
+                "antigravity"
             } else {
                 "codex"
             };
@@ -1528,6 +1539,17 @@ impl HarnessController {
                     .set_permissions(id, mode, authorization)
                     .await
                     .map_err(claude::api_error);
+            }
+            if backend == "antigravity" {
+                return self
+                    .antigravity
+                    .command(
+                        "setPermissions",
+                        &json!({"threadId":id,"permissionMode":mode}),
+                        authorization,
+                    )
+                    .await
+                    .map_err(antigravity::api_error);
             }
             let revision = self
                 .permissions
@@ -1546,6 +1568,7 @@ impl HarnessController {
                 Some(id) if claude::Claude::owns_id(id) => {
                     self.claude.permission_selection(id).await?
                 }
+                Some(id) if antigravity::Antigravity::owns_id(id) => None,
                 Some(id) => self.permissions.get(id).await,
                 None => None,
             } {
@@ -1568,6 +1591,15 @@ impl HarnessController {
                     .is_some_and(claude::Claude::owns_id)
             {
                 "claude"
+            } else if payload["backend"] == "antigravity"
+                || payload["instanceId"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("antigravity:"))
+                || payload["threadId"]
+                    .as_str()
+                    .is_some_and(antigravity::Antigravity::owns_id)
+            {
+                "antigravity"
             } else {
                 "codex"
             };
@@ -1602,13 +1634,18 @@ impl HarnessController {
         }
         let context_thread_id = payload["threadId"]
             .as_str()
-            .filter(|id| action == "thread" && !claude::Claude::owns_id(id))
+            .filter(|id| {
+                action == "thread"
+                    && !claude::Claude::owns_id(id)
+                    && !antigravity::Antigravity::owns_id(id)
+            })
             .map(str::to_owned);
         let codex_creation = matches!(action, "create" | "forkThread")
             && payload["backend"] != "claude"
+            && payload["backend"] != "antigravity"
             && !payload["instanceId"]
                 .as_str()
-                .is_some_and(|id| id.starts_with("claude:"));
+                .is_some_and(|id| id.starts_with("claude:") || id.starts_with("antigravity:"));
         let creation_mode = codex_creation
             .then(|| payload.get("permissionMode").cloned())
             .flatten();
@@ -1617,10 +1654,14 @@ impl HarnessController {
             .unwrap_or("codex:local")
             .to_owned();
         let codex_request = payload["backend"] != "claude"
+            && payload["backend"] != "antigravity"
             && !creation_instance.starts_with("claude:")
+            && !creation_instance.starts_with("antigravity:")
             && !payload["threadId"]
                 .as_str()
-                .is_some_and(claude::Claude::owns_id);
+                .is_some_and(|id| {
+                    claude::Claude::owns_id(id) || antigravity::Antigravity::owns_id(id)
+                });
         if codex_request
             && payload["reasoningEffort"] == "ultra"
             && !instance_settings::ultra_enabled(&self.state_dir, &creation_instance)?
@@ -1734,11 +1775,17 @@ impl HarnessController {
             .filter(|id| notification_thread_id(&json!(id)).is_some())
             .map(str::to_owned);
         let mut enabled_instance_ids = vec!["codex:local".to_owned()];
-        // 目标是 Claude 会话时只补查该会话所属实例，避免诊断入口默认扫描所有 WSL。
+        // 目标是 Claude / Antigravity 会话时只补查该会话所属实例，避免诊断入口默认扫描所有环境。
         if let Some(id) = thread_id
             .as_deref()
             .filter(|id| claude::Claude::owns_id(id))
             && let Ok(instance_id) = self.claude.instance_id(id).await
+        {
+            enabled_instance_ids.push(instance_id);
+        } else if let Some(id) = thread_id
+            .as_deref()
+            .filter(|id| antigravity::Antigravity::owns_id(id))
+            && let Ok(instance_id) = self.antigravity.instance_id(id).await
         {
             enabled_instance_ids.push(instance_id);
         }
@@ -1872,8 +1919,9 @@ impl HarnessController {
         let thread_id_owned = payload["threadId"].as_str().map(str::to_owned);
         let thread_id = thread_id_owned.as_deref();
         let claude_thread = thread_id.is_some_and(claude::Claude::owns_id);
+        let antigravity_thread = thread_id.is_some_and(antigravity::Antigravity::owns_id);
         if action == "releaseExternalHolders" && !claude_thread {
-            // 只有 Claude 会话能核对并关闭别的进程的持有；Codex 的占用提示仍只提供重试。
+            // 只有 Claude 会话能核对并关闭别的进程的持有；Codex 与 Antigravity 的占用提示仍只提供重试。
             return Err(ApiError::new(409, "仅 Claude 会话支持关闭其他占用").into());
         }
         let requested_owned = payload["backend"].as_str().map(str::to_owned);
@@ -1882,21 +1930,33 @@ impl HarnessController {
         {
             return Err(ApiError::new(400, "会话后端无效").into());
         }
-        if requested.is_some_and(|backend| !matches!(backend, "codex" | "claude")) {
+        if requested.is_some_and(|backend| !matches!(backend, "codex" | "claude" | "antigravity"))
+        {
             // 新类型可先注册检测和设置，但必须提供执行适配器后才能派发，不能默认落到 Codex。
             return Err(ApiError::new(409, "该会话类型的执行接入尚未支持").into());
         }
         // 用户要求创建后类型固定；以已保存会话身份路由，不能由页面改写。
         if thread_id.is_some()
-            && requested.is_some_and(|backend| (backend == "claude") != claude_thread)
+            && let Some(backend) = requested
         {
-            return Err(ApiError::new(409, "已创建的会话不能切换 Codex / Claude").into());
+            let expected_backend = if claude_thread {
+                "claude"
+            } else if antigravity_thread {
+                "antigravity"
+            } else {
+                "codex"
+            };
+            if backend != expected_backend {
+                return Err(ApiError::new(409, "已创建的会话不能切换运行类型").into());
+            }
         }
         // 用户要求每个实例独立控制；已有会话的实例来自保存身份，客户端不能通过参数改投另一个环境。
         if let Some(id) = &instance_id {
             let expected = if let Some(thread_id) = thread_id {
                 if claude_thread {
                     self.claude.instance_id(thread_id).await?
+                } else if antigravity_thread {
+                    self.antigravity.instance_id(thread_id).await?
                 } else {
                     "codex:local".into()
                 }
@@ -1912,8 +1972,10 @@ impl HarnessController {
         }
         if desktop_images::has_refs(&payload) {
             // 已解析所属会话及实例后才接收本机图片，不能把引用送到 WSL 或从远程指定本机文件。
-            if authorization.device.key_id != desktop::DEVICE_KEY_ID || claude_thread
-                || requested == Some("claude")
+            if authorization.device.key_id != desktop::DEVICE_KEY_ID
+                || claude_thread
+                || antigravity_thread
+                || matches!(requested, Some("claude" | "antigravity"))
                 || !matches!(action, "send" | "create" | "setGoal" | "editQueued")
             {
                 return Err(ApiError::new(403, "本机原图仅支持 Elves 的本机 Codex 会话").into());
@@ -1946,6 +2008,27 @@ impl HarnessController {
                     ;
                 // Claude 原生 CLI 当前仍通过正文接收目标 WSL 路径；Codex 走下方结构化 mention。
                 input_files::append_paths(&mut payload, target_paths);
+            } else if antigravity_thread || requested == Some("antigravity") {
+                let config = if !antigravity_thread {
+                    match &instance_id {
+                        Some(id) => Some(self.antigravity_instance_config(id).await?),
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+                let target_paths = self
+                    .antigravity
+                    .local_input_paths(thread_id, config, paths)
+                    .await
+                    .map_err(|error| {
+                        ApiError::new(
+                            409,
+                            format!("附件无法映射到目标 Antigravity 环境，消息尚未发送：{error}"),
+                        )
+                    })?;
+                // Antigravity ACP 协议中通过正文携带映射后的文件路径，保持纯 ACP 协议边界。
+                input_files::append_paths(&mut payload, target_paths);
             } else {
                 input_files::replace_paths(&mut payload, paths)?;
             }
@@ -1955,6 +2038,8 @@ impl HarnessController {
             authorization.check().await?;
             let metrics = if claude_thread {
                 self.claude.session_metrics(id).await?
+            } else if antigravity_thread {
+                self.antigravity.session_metrics(id).await?
             } else if let Some(metrics) = self.harness.side_session_metrics(&id).await {
                 metrics
             } else {
@@ -1974,8 +2059,14 @@ impl HarnessController {
                 .unwrap_or(Value::Null)
             };
             let metrics = session_metrics::with_cache_expiry(metrics, id);
-            return Ok(json!({"ok":true,"threadId":id,
-                "backend":if claude_thread {"claude"} else {"codex"},"metrics":metrics}));
+            let backend = if claude_thread {
+                "claude"
+            } else if antigravity_thread {
+                "antigravity"
+            } else {
+                "codex"
+            };
+            return Ok(json!({"ok":true,"threadId":id,"backend":backend,"metrics":metrics}));
         }
         if action == "claudeUsage" {
             // 本地消费扫描只在用户展开额度详情时按需执行，不进入默认额度轮询或消息发送链路。
@@ -2004,6 +2095,33 @@ impl HarnessController {
                 Err(ApiError::new(400, "额度读取仅支持 Claude 实例").into())
             };
         }
+        if action == "antigravityUsage" {
+            let allow_probe = authorization.device.key_id == desktop::DEVICE_KEY_ID
+                || !self
+                    .access_policy
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .read_only;
+            // 用户要求 Antigravity 必须通过官方 CLI 的 ACP 协议获取账号与统计信息，不绕过 CLI。
+            return if antigravity_thread {
+                self.antigravity
+                    .session_account_usage(thread_id.unwrap(), allow_probe)
+                    .await
+                    .map_err(antigravity::api_error)
+            } else if requested == Some("antigravity") {
+                let config = if let Some(id) = &instance_id {
+                    self.antigravity_instance_config(id).await?
+                } else {
+                    self.antigravity_default_config().await?
+                };
+                self.antigravity
+                    .account_usage(config, allow_probe)
+                    .await
+                    .map_err(antigravity::api_error)
+            } else {
+                Err(ApiError::new(400, "Antigravity 账号与统计读取仅支持 Antigravity 实例").into())
+            };
+        }
         if matches!(action, "models" | "skills")
             && (claude_thread || requested == Some("claude"))
             && authorization.device.key_id != desktop::DEVICE_KEY_ID
@@ -2018,6 +2136,132 @@ impl HarnessController {
                 json!({"ok":true,"backend":"claude","readOnly":true,"data":[],
                 "defaultModel":"","defaultReasoningEffort":""}),
             );
+        }
+        if matches!(action, "models" | "skills")
+            && (antigravity_thread || requested == Some("antigravity"))
+            && authorization.device.key_id != desktop::DEVICE_KEY_ID
+            && self
+                .access_policy
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .read_only
+        {
+            // 只读设备不启动新的 ACP 探测进程；与 Claude 保持一致的安全边界。
+            return Ok(json!({
+                "ok": true,
+                "backend": "antigravity",
+                "readOnly": true,
+                "data": [],
+                "defaultModel": "",
+                "defaultReasoningEffort": ""
+            }));
+        }
+        if antigravity_thread {
+            let id = thread_id.unwrap();
+            return execution::Scope::new(
+                self.harness.audit.clone(),
+                action,
+                &payload,
+                Some(authorization),
+            )
+            .recorded(async {
+                execution::transport("antigravity-acp-stdio", action, action == "send");
+                match action {
+                    "thread" => {
+                        self.antigravity
+                            .detail_authorized(id, Some(authorization))
+                            .await
+                    }
+                    "history" => {
+                        self.antigravity
+                            .history_authorized(&payload, Some(authorization))
+                            .await
+                    }
+                    "workspaceContext" => self.antigravity.workspace(id).await,
+                    "models" => {
+                        self.antigravity
+                            .session_models(
+                                id,
+                                payload["includeAvailable"] == true,
+                                payload["forceReload"] == true,
+                            )
+                            .await
+                    }
+                    "skills" => {
+                        self.antigravity
+                            .session_skills(id, payload["forceReload"] == true)
+                            .await
+                    }
+                    "queue" => self.antigravity.queue(id).await,
+                    "queueEdit" => self.antigravity.queue_edit_state(&payload).await,
+                    "sendState" => self.antigravity.queue_send_state(&payload).await,
+                    "relatedThreads" => self.antigravity.related_threads(id).await,
+                    _ => {
+                        self.antigravity
+                            .command(action, &payload, authorization)
+                            .await
+                    }
+                }
+            })
+            .await
+            .map_err(antigravity::api_error);
+        }
+        if requested == Some("antigravity") {
+            let selected_config = if let Some(id) = &instance_id {
+                self.antigravity_instance_config(id).await?
+            } else {
+                self.antigravity_default_config().await?
+            };
+            let cwd =
+                if let Some(project_id) = payload["projectId"].as_str().filter(|s| !s.is_empty()) {
+                    let context = self
+                        .call_codex_backend(
+                            "workspaceContext",
+                            json!({"projectId":project_id}),
+                            authorization,
+                        )
+                        .await?;
+                    let context = native_result(context)?;
+                    anyhow::ensure!(
+                        context["hostId"] == "local" && context["projectId"] == project_id,
+                        "Antigravity 仅支持已确认的本机项目"
+                    );
+                    context["cwd"]
+                        .as_str()
+                        .context("项目工作目录不可用")?
+                        .to_owned()
+                } else {
+                    String::new()
+                };
+            return execution::Scope::new(
+                self.harness.audit.clone(),
+                action,
+                &payload,
+                Some(authorization),
+            )
+            .recorded(async {
+                execution::transport("antigravity-acp-stdio", action, action == "send");
+                match action {
+                    "models" => {
+                        self.antigravity
+                            .models_in(selected_config, &cwd, payload["forceReload"] == true)
+                            .await
+                    }
+                    "skills" => {
+                        self.antigravity
+                            .skills_in(selected_config, &cwd, payload["forceReload"] == true)
+                            .await
+                    }
+                    "create" => {
+                        self.antigravity
+                            .create_in(selected_config, &payload, &cwd, authorization)
+                            .await
+                    }
+                    _ => Err(ApiError::new(400, "此操作需要已创建的 Antigravity 会话").into()),
+                }
+            })
+            .await
+            .map_err(antigravity::api_error);
         }
         if claude_thread {
             let id = thread_id.unwrap();
@@ -2227,6 +2471,21 @@ impl HarnessController {
             self.claude
                 .merge_sidebar_instances(&mut result, Some(ids))
                 .await;
+            // Antigravity 同时支持本机与 WSL 实例；只对已启用实例调用 ACP session/list 发现会话。
+            for id in ids.iter().filter(|id| id.starts_with("antigravity:")) {
+                let outcome = async {
+                    let config = self.antigravity_instance_config(id).await?;
+                    self.antigravity.discover_in(&config, &result).await
+                }
+                .await;
+                if let Err(failure) = outcome {
+                    result["antigravityDiscoveryError"] =
+                        json!(format!("Antigravity 实例发现暂不可用：{failure}"));
+                }
+            }
+            self.antigravity
+                .merge_sidebar_instances(&mut result, Some(ids))
+                .await;
         } else if action == "sidebar" && include_claude {
             // 用户要求默认仅启用 Codex；网页明确关闭 Claude 时不触发 WSL 原生会话发现。
             // 用户要求在正常列表刷新中只读发现指定 WSL 原生会话；不能复制其他服务登记文件或启动/恢复模型来“发现”。
@@ -2253,6 +2512,44 @@ impl HarnessController {
             .find(|instance| instance.id == id && instance.backend == "claude" && instance.ready)
             .ok_or_else(|| ApiError::new(409, "所选 Claude 实例暂不可用或执行接入尚未支持"))?;
         Ok(claude::WslConfig {
+            distribution: instance.distribution,
+            user: instance.user,
+            executable: instance.executable,
+        })
+    }
+
+    async fn antigravity_instance_config(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<antigravity::acp::EnvConfig> {
+        // 新实例只能从服务端检测结果解析；不接受请求携带的发行版、用户或程序路径。
+        let environments = preferences::detect(&self.state_dir, false).await;
+        let instance = instances::catalog(&environments)
+            .into_iter()
+            .find(|instance| {
+                instance.id == id && instance.backend == "antigravity" && instance.ready
+            })
+            .ok_or_else(|| ApiError::new(409, "所选 Antigravity 实例暂不可用或未检测到 agy CLI"))?;
+        Ok(antigravity::acp::EnvConfig {
+            distribution: instance.distribution,
+            user: instance.user,
+            executable: instance.executable,
+        })
+    }
+
+    async fn antigravity_default_config(&self) -> anyhow::Result<antigravity::acp::EnvConfig> {
+        let environments = preferences::detect(&self.state_dir, false).await;
+        let mut candidates: Vec<_> = instances::catalog(&environments)
+            .into_iter()
+            .filter(|instance| instance.backend == "antigravity" && instance.ready)
+            .collect();
+        // 优先使用本机 Antigravity 实例，不存在时回退至已检测就绪的 WSL Antigravity 实例。
+        candidates.sort_by_key(|instance| !instance.distribution.is_empty());
+        let instance = candidates
+            .into_iter()
+            .next()
+            .ok_or_else(|| ApiError::new(409, "未检测到可用的 Antigravity 实例（需要官方 agy CLI）"))?;
+        Ok(antigravity::acp::EnvConfig {
             distribution: instance.distribution,
             user: instance.user,
             executable: instance.executable,
@@ -2429,6 +2726,27 @@ impl HarnessController {
                     priority.promote(id),
                 Some("turn/completed" | "remote/requestsChanged" | "remote/sidebarChanged") =>
                     priority.runtime_changed(),
+                _ => {}
+            }
+        }
+        if source == "antigravity"
+            && let Some(id) = event["params"]["threadId"].as_str()
+            && antigravity::Antigravity::owns_id(id)
+        {
+            let priority = &self.harness.recent_priority;
+            match event["method"].as_str() {
+                Some("thread/deleted") => priority.forget(id),
+                Some("thread/started" | "turn/started") => priority.promote(id),
+                Some("remote/requestsChanged")
+                    if event["params"]["requests"]
+                        .as_array()
+                        .is_some_and(|requests| !requests.is_empty()) =>
+                {
+                    priority.promote(id);
+                }
+                Some("turn/completed" | "remote/requestsChanged" | "remote/sidebarChanged") => {
+                    priority.runtime_changed();
+                }
                 _ => {}
             }
         }
@@ -4186,6 +4504,9 @@ async fn session(
         // 用户要求仅本机开放宿主机应用启动；远程 PC、手机与 Android 不声明此能力。
         "sessionMetrics":true,"workspaceOpenIn":cfg!(windows) && open_in::available(&state, &device),
         "claudeSessions":true,"claudeProjectTrust":true,"claudeSubscriptionUsage":true}});
+    response["antigravityAllowApprovals"] = json!(policy.allow_approvals);
+    response["capabilities"]["antigravitySessions"] = json!(true);
+    response["capabilities"]["antigravityUsage"] = json!(true);
     response["capabilities"]["desktopCodexImageInput"] =
         json!(state.desktop && device.key_id == desktop::DEVICE_KEY_ID && native_write_available);
     response["capabilities"]["sideIdleRelease"] = json!(true);
@@ -4320,10 +4641,10 @@ async fn workspace_file_context(
         .as_str()
         .filter(|cwd| !cwd.is_empty() && cwd.len() <= 32_768 && !cwd.contains('\0'))
         .ok_or_else(|| ApiError::new(404, "当前会话没有可读取的工作目录"))?;
-    // 用户要求 WSL Claude 文件可查看；只将原生会话确认的 Linux 目录映射到其自身发行版，不能放开任意 UNC。
+    // 用户要求 WSL Claude / Antigravity 文件可查看；只将原生会话确认的 Linux 目录映射到其自身发行版，不能放开任意 UNC。
     let distribution = result["wslDistribution"]
         .as_str()
-        .filter(|_| result["backend"] == "claude");
+        .filter(|_| matches!(result["backend"].as_str(), Some("claude" | "antigravity")));
     let path = if cfg!(windows)
         && let Some(distribution) = distribution
     {
@@ -4376,6 +4697,7 @@ async fn read(
             | "newSessionDefaults"
             | "fast"
             | "claudeUsage"
+            | "antigravityUsage"
             | "sessionMetrics"
             | "projectTrust"
             | "skills"
@@ -5077,6 +5399,7 @@ fn validate_delete_thread_payload(payload: &Value) -> Result<(), ApiError> {
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::new(400, "永久删除需要已创建完成的本机会话 ID"))?;
     if !claude::Claude::owns_id(thread_id)
+        && !antigravity::Antigravity::owns_id(thread_id)
         && (thread_id.len() != 36 || uuid::Uuid::parse_str(thread_id).is_err())
     {
         return Err(ApiError::new(400, "永久删除需要已创建完成的本机会话 ID"));

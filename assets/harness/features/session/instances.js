@@ -10,7 +10,11 @@ import { currentThreadDisplay } from "./thread-cache.js";
 export let sessionInstances = [], sessionInstanceRequest = null;
 export function setSessionInstances(value) { return sessionInstances = value; }
 export function setSessionInstanceRequest(value) { return sessionInstanceRequest = value; }
-export let sessionTypes = [{ id: "codex", label: "Codex" }, { id: "claude", label: "Claude" }];
+export let sessionTypes = [
+  { id: "codex", label: "Codex" },
+  { id: "claude", label: "Claude" },
+  { id: "antigravity", label: "Antigravity" }
+];
 export function setSessionTypes(value) { return sessionTypes = value; }
 export function availableSessionInstances() {
   if (sessionInstances.length) return sessionInstances;
@@ -71,7 +75,7 @@ export function newChatBackendOptions() {
   // 用户要求类型与环境实例分别控制；未接通的执行适配器只在设置中展示，不能悄悄改投默认实例。
   return availableSessionInstances().filter(instance => instance.ready && sessionInstanceEnabled(instance.id))
     .map(instance => ({ value: instance.id, backend: instance.backend, label: instance.label,
-      icon: ["codex", "claude"].includes(instance.backend) ? instance.backend : "allSessions" }));
+      icon: ["codex", "claude", "antigravity"].includes(instance.backend) ? instance.backend : "allSessions" }));
 }
 export function threadLocation(value) {
   // 用户要求顶部路径前仅显示非本机实例的实际环境名（如发行版名），不拼接类型、“本机”或“WSL”标签。

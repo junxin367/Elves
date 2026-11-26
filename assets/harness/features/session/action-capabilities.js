@@ -3,7 +3,7 @@
 import { creating, selectedId, thread } from "../../core/state.js";
 import { modelContextKey } from "../composer/model-catalog.js";
 import { modelDefaults, modelsScope } from "../composer/options-state.js";
-import { claudeThreadId, threadReadOnly } from "./capabilities.js";
+import { antigravityThreadId, claudeThreadId, threadReadOnly } from "./capabilities.js";
 import { relatedViewForThread } from "./related.js";
 
 export function claudeCommandSupported(name) {
@@ -14,7 +14,7 @@ export function claudeCommandSupported(name) {
     : !creating && thread?.capabilities?.[name === "goal" ? "goalComposer" : name] === true;
 }
 export function threadSentMessageEditAllowed(id = selectedId) {
-  if (claudeThreadId(id) || thread?.id === id && thread.capabilities?.messageEditHistory === true)
+  if (claudeThreadId(id) || antigravityThreadId(id) || thread?.id === id && thread.capabilities?.messageEditHistory === true)
     return thread?.id === id && thread.capabilities?.messageEdit === true
     && thread.messageEditReady === true && !threadReadOnly(id);
   if (!id) return false;

@@ -18365,3 +18365,101 @@ test("编辑框的定时标记显示“定时发送 · 时间”，按目标标�
   assert.deepEqual(token.children.map(child => child.className), ["inline-skill-icon", "inline-skill-name"]);
   assert.match(token.children[1].textContent, /^定时发送 · 今天 .*05$/);
 });
+
+test("Antigravity 权限模式、会话身份与图标品牌标记符合 ACP 约束", async () => {
+  const { permissionOptions, permissionModeKnown, permissionLabel } = await import("../assets/harness/permissions.js");
+  const modes = permissionOptions("antigravity");
+  assert.deepEqual(modes.map(item => item.value), ["default", "accept-edits", "auto", "plan"]);
+  assert.equal(permissionModeKnown("antigravity", "accept-edits"), true);
+  assert.equal(permissionModeKnown("antigravity", "bypassPermissions"), false);
+  assert.equal(permissionLabel("antigravity", "accept-edits"), "自动编辑");
+  assert.equal(permissionLabel("antigravity", ""), "询问确认");
+
+  const capabilitiesSource = await readFile(new URL("../assets/harness/features/session/capabilities.js", import.meta.url), "utf8");
+  const iconsSource = await readFile(new URL("../assets/harness/ui/icons.js", import.meta.url), "utf8");
+  assert.match(capabilitiesSource, /export function antigravityThreadId\(id\)/);
+  assert.match(capabilitiesSource, /antigravityThreadId\(item\?\.id\) \? "antigravity"/);
+  assert.match(iconsSource, /antigravity:\s*'<path /);
+  assert.match(iconsSource, /\["codex", "claude", "antigravity"\]\.includes\(name\)/);
+});
+
+test("Antigravity 底栏与弹层仅展示 ACP 订阅等级、连接状态与实测 Token，并说明 ACP 协议边界", async () => {
+  const source = await readFile(new URL("../assets/harness/features/composer/claude-usage.js", import.meta.url), "utf8");
+  const trigger = {
+    hidden: true, dataset: {}, attributes: {}, children: [], isConnected: true,
+    replaceChildren(...children) { this.children = children; },
+    setAttribute(k, v) { this.attributes[k] = String(v); },
+    removeAttribute(k) { delete this.attributes[k]; },
+  };
+  const tipNode = {
+    id: "", attributes: {}, children: [],
+    replaceChildren(...children) { this.children = children; },
+    setAttribute(k, v) { this.attributes[k] = String(v); },
+    hasAttribute: () => false, remove() {},
+  };
+  const element = (tag, className = "", text = "") => {
+    const node = { tag, className, textContent: String(text), children: [], attributes: {},
+      append(...children) { this.children.push(...children); },
+      replaceChildren(...children) { this.children = children; },
+      setAttribute(k, v) { this.attributes[k] = String(v); },
+    };
+    return node;
+  };
+  const collectText = node => [node.textContent || "", ...(node.children || []).flatMap(collectText)].filter(Boolean).join(" ");
+  const now = Date.now();
+  const context = rawVm.createContext({
+    Date, Math, Number, Object, Array, Set, Map, JSON, Intl, setTimeout, clearTimeout,
+    AbortController,
+    $: selector => selector === "#claude-usage" ? trigger : null,
+    element, icon: () => element("span", "ui-icon"),
+    closePopup() {}, closeComposerMenus() {}, fitComposerMetrics() {},
+    api: async () => ({ ok: true }),
+    connected: true, creating: true, pageLeaving: false, selectedId: "",
+    session: { device: { id: "dev-1", createdAtMs: 1 }, capabilities: { antigravityUsage: true } },
+    sidebar: null, thread: null, document: { hidden: false, body: { append() {} } },
+    window: { innerWidth: 1200, innerHeight: 800, visualViewport: null },
+    isClaude: () => false, isAntigravity: () => true,
+    privateInputScope: () => "scope-1",
+    activeInstanceId: () => "antigravity:local",
+    sessionInstanceEnabled: () => true,
+    currentThreadDisplay: () => null,
+  });
+  const body = source
+    .replace(/^import[\s\S]*?;\s*$/gm, "")
+    .replace(/\bexport\s+(?=(?:let|const|function)\b)/g, "");
+  rawVm.runInContext(body + "\nthis.setState = s => { claudeUsageState = s; }; this.render = renderClaudeUsage; this.renderTip = renderAntigravityUsageTip;", context);
+  context.fitClaudeUsageTip = () => {};
+  context.setState({
+    key: "k1", backend: "antigravity", owner: "scope-1", checkedAt: now, pending: false,
+    tip: { trigger, node: tipNode },
+    value: {
+      source: "antigravity-acp", observedAtMs: now, authenticated: true, authRequired: false,
+      tierName: "Google AI Pro", agentVersion: "1.5.14", instanceLabel: "Antigravity",
+      sessionTokens: { totalTokens: 15200, inputTokens: 12000, outputTokens: 3200, cachedInputTokens: 4000, sessionCount: 2 }
+    }
+  });
+  context.render();
+  assert.equal(trigger.hidden, false);
+  assert.equal(collectText(trigger), "Google AI Pro");
+  const tipText = collectText(tipNode);
+  assert.match(tipText, /Antigravity/);
+  assert.match(tipText, /Google AI Pro/);
+  assert.match(tipText, /已登录 · v1\.5\.14/);
+  assert.match(tipText, /15\.2k/);
+  assert.match(tipText, /2 个会话/);
+  assert.match(tipText, /官方 ACP 协议暂未提供 5h\/7d 剩余额度百分比/);
+
+  // 未登录实例应提示“未登录”和登录指引
+  context.setState({
+    key: "k2", backend: "antigravity", owner: "scope-1", checkedAt: now, pending: false,
+    tip: { trigger, node: tipNode },
+    value: {
+      source: "antigravity-acp", observedAtMs: now, authenticated: false, authRequired: true,
+      authMessage: "请在该环境中运行 agy acp --login 完成登录", instanceLabel: "Antigravity · claude-us",
+      sessionTokens: { totalTokens: 0, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, sessionCount: 0 }
+    }
+  });
+  context.render();
+  assert.equal(collectText(trigger), "未登录");
+  assert.match(collectText(tipNode), /请在该环境中运行 agy acp --login/);
+});

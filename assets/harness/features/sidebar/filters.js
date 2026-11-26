@@ -33,7 +33,7 @@ function sessionFilterOptions() {
   return [{ value: "all", label: "全部会话", icon: "allSessions" },
     ...availableSessionInstances().filter(instance => sessionInstanceEnabled(instance.id))
       .map(instance => ({ value: instance.id, label: instance.label,
-        icon: ["codex", "claude"].includes(instance.backend) ? instance.backend : "allSessions" }))];
+        icon: ["codex", "claude", "antigravity"].includes(instance.backend) ? instance.backend : "allSessions" }))];
 }
 function toggleSessionFilter(value, preferences = appearance) {
   if (value === "all") { preferences.sessionFilter = "all"; return true; }
@@ -57,7 +57,7 @@ export function renderSessionFilter() {
   const signature = JSON.stringify([filter, options, label, instance?.backend]);
   if (trigger.sessionFilterSignature === signature) return;
   trigger.sessionFilterSignature = signature;
-  trigger.replaceChildren(icon(instance && ["codex", "claude"].includes(instance.backend) ? instance.backend : "allSessions"));
+  trigger.replaceChildren(icon(instance && ["codex", "claude", "antigravity"].includes(instance.backend) ? instance.backend : "allSessions"));
   trigger.dataset.backend = instance?.backend || "all"; trigger.title = label;
   trigger.setAttribute("aria-label", `筛选会话实例：${label}`);
   trigger.value = filter === "all" ? "all" : filter[0];

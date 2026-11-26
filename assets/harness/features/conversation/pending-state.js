@@ -4,7 +4,7 @@ import { notice } from "../../ui/notice.js";
 import { updateComposer } from "../../core/actions.js";
 import { selectedId, session, turns } from "../../core/state.js";
 import { api } from "../api.js";
-import { claudeThreadId } from "../session/capabilities.js";
+import { antigravityThreadId, claudeThreadId } from "../session/capabilities.js";
 
 export let pendingTimer = null;
 export function setPendingTimer(value) { return pendingTimer = value; }
@@ -83,7 +83,7 @@ export async function confirmPendingSend(current, result = {}) {
 export async function sendNotDelivered(current) {
   const threadId = current.payload?.threadId, clientId = current.payload?.clientUserMessageId;
   if (current.action !== "send" && current.action !== "editMessage" || typeof threadId !== "string"
-      || typeof clientId !== "string" || !claudeThreadId(threadId)
+      || typeof clientId !== "string" || !(claudeThreadId(threadId) || antigravityThreadId(threadId))
       || session?.capabilities?.queueSendRecovery !== true
       || current.deviceId && current.deviceId !== session?.device.id) return false;
   const state = await api("/api/read/sendState", { threadId, clientUserMessageId: clientId });

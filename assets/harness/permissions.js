@@ -18,10 +18,17 @@ const claudeModes = [
   { value: "auto", label: "自动", icon: "claudeAuto", description: "由 Claude 处理权限决策" },
   { value: "bypassPermissions", label: "绕过权限", icon: "claudeBypass", description: "接受所有权限请求" }
 ];
+// Antigravity 严格通过官方 ACP session/set_mode 切换权限模式，仅列出 ACP 协议原生支持的四种模式。
+const antigravityModes = [
+  { value: "default", label: "询问确认", icon: "claudeManual", description: "执行敏感操作前请求确认" },
+  { value: "accept-edits", label: "自动编辑", icon: "claudeEdits", description: "自动接受文件修改，命令仍需确认" },
+  { value: "auto", label: "自动执行", icon: "claudeAuto", description: "由 Antigravity 自动执行大部分操作" },
+  { value: "plan", label: "计划模式", icon: "claudePlan", description: "只分析与制定计划，不直接修改文件" }
+];
 
 export function permissionOptions(backend, supportedModes = null) {
-  const options = backend === "claude" ? claudeModes : codexModes;
-  return options.filter(option => !supportedModes || backend !== "claude" && option.value === "configured"
+  const options = backend === "claude" ? claudeModes : backend === "antigravity" ? antigravityModes : codexModes;
+  return options.filter(option => !supportedModes || backend === "codex" && option.value === "configured"
       || supportedModes.includes(option.value)
       || backend === "claude" && option.value === "default" && supportedModes.includes("manual"))
     .map(option => ({ ...option, value: backend === "claude" && option.value === "default"
@@ -31,15 +38,18 @@ export function permissionOptions(backend, supportedModes = null) {
 
 export function permissionModeKnown(backend, mode) {
   return permissionOptions(backend).some(option => option.value === mode)
-    || (backend === "claude" ? ["manual", "configured", "dontAsk"].includes(mode) : mode === "read-only");
+    || (backend === "claude" ? ["manual", "configured", "dontAsk"].includes(mode)
+      : backend === "antigravity" ? mode === "configured"
+      : mode === "read-only");
 }
 
 export function permissionLabel(backend, mode, creating = false) {
   // 旧会话的只读预设仍按原权限执行；与 App 一致归入“请求批准”，只改变展示，不自动迁移权限。
   const value = backend === "claude" ? mode === "manual" ? "default" : mode
+    : backend === "antigravity" ? mode || "default"
     : mode === "read-only" ? "auto" : mode || "configured";
   const option = permissionOptions(backend).find(option => option.value === value);
-  return option?.shortLabel || option?.label || (backend !== "claude" && creating ? "自定义" : "权限");
+  return option?.shortLabel || option?.label || (backend === "codex" && creating ? "自定义" : "权限");
 }
 
 export function mountInstancePermissions({

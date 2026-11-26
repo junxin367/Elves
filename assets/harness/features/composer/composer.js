@@ -47,7 +47,7 @@ import {
 import { claudePendingSetting, syncBackendModels } from "./model-catalog.js";
 import { currentEffort, currentModel, currentModelId, remoteFastKey, updateRemoteFast } from "./model-choice.js";
 import {
-  codexCreationDefaultsKey, loadCodexCreationDefaults, newChatPreferenceScope,
+  codexCreationDefaultsKey, loadCodexCreationDefaults, newAntigravityPermissionMode, newChatPreferenceScope,
   newClaudePermissionMode, newCodexPermissionMode, rememberedNewChatModel,
   rememberedNewChatSettings, selectCreatedThread
 } from "./new-chat-settings.js";
@@ -91,9 +91,9 @@ import { finishSendDisplay, rememberSendDisplay } from "../queue/sent-display.js
 import { editingQueuedMessage, queueVersion, queuedEditActions } from "../queue/state.js";
 import { claudeCommandSupported } from "../session/action-capabilities.js";
 import {
-  activeBackend, backendCapability, claudeNativeQueue, claudeThreadId, isActiveThread, isClaude, privateInputScope,
-  queueCapability, serviceSideThread, temporarySideThread, threadOwnedElsewhere, threadReadOnly, threadReadOnlyMessage,
-  threadReleasableElsewhere
+  activeBackend, antigravityThreadId, backendCapability, claudeNativeQueue, claudeThreadId, isActiveThread,
+  isAntigravity, isClaude, privateInputScope, queueCapability, serviceSideThread, temporarySideThread,
+  threadOwnedElsewhere, threadReadOnly, threadReadOnlyMessage, threadReleasableElsewhere
 } from "../session/capabilities.js";
 import { recordRuntimeDiagnostic, stream } from "../session/connection-state.js";
 import {
@@ -299,12 +299,12 @@ export function updateComposer({ followEnd = false } = {}) {
   // 定时发送只是保存消息、到期才走普通发送：执行中或压缩中都能设置，不受下面的即时发送限制。
   const scheduling = !!selectedScheduledAt && !editing;
   const compactionSendReason = compacting && !goalMode && !editing && !scheduling ? compactionQueueSendReason() : "";
-  const queueOnly = !scheduling && !isClaude() && compacting && !goalMode && !editing && !compactionSendReason;
+  const queueOnly = !scheduling && !isClaude() && !isAntigravity() && compacting && !goalMode && !editing && !compactionSendReason;
   const unsupportedFiles = composerLocalInputsPayload().length > 0
     && session?.capabilities?.localFileInput !== true;
   const inputImages = composerAttachmentsPayload();
   const unsupportedStagedImages = inputImages.some(image => image.staged)
-    && (isClaude() || session?.capabilities?.desktopCodexImageInput !== true);
+    && (isClaude() || isAntigravity() || session?.capabilities?.desktopCodexImageInput !== true);
   const unsupportedImages = unsupportedStagedImages
     || !editing && inputImages.length > 0 && !backendCapability("imageInput")
     || !!editingQueuedMessage?.imageEditing && inputImages.length > 0
@@ -362,8 +362,9 @@ export function updateComposer({ followEnd = false } = {}) {
       action: chooseComposerLocalInputs
     }] : []),
     { value: "images", label: "图片", icon: "image", disabled: deleting || !composerCanAddImages(), action: chooseComposerImages }
-  // 用户要求临时侧边直接移除“目标”按钮，/ 菜单需同步隐藏，不能仅保留禁用项。
+  // 用户要求临时侧边直接移除“目标”按钮，/ 菜单需同步隐藏；Antigravity ACP 不支持手动压缩，隐藏压缩项。
   ].filter(option => (option.value !== "goal" || !temporarySideThread())
+    && (!isAntigravity() || option.value !== "compact")
     && (!isClaude() || !["compact", "goal"].includes(option.value) || claudeCommandSupported(option.value)));
   add.disabled = add.menuOptions.every(option => option.disabled);
   if (activePopup?.trigger === add) renderPopup();
@@ -426,7 +427,8 @@ export function updateComposer({ followEnd = false } = {}) {
   syncRequestedSideInput();
   syncWorkspaceSidePanelState();
   // 外部占用只限制当前会话，仍允许新建其他聊天及使用侧栏菜单。
-  $("#new-chat").disabled = session?.readOnly || threadReadOnly() && !threadOwnedElsewhere() || !connected && !(session?.capabilities?.claudeSessions && stream?.readyState === EventSource.OPEN);
+  $("#new-chat").disabled = session?.readOnly || threadReadOnly() && !threadOwnedElsewhere()
+    || !connected && !((session?.capabilities?.claudeSessions || session?.capabilities?.antigravitySessions) && stream?.readyState === EventSource.OPEN);
   // 用户要求主会话和侧边队列编辑时仍可选择后续模型；执行中选择不写进排队消息，后续新发送才应用。
   $("#model-button").disabled = !sessionTypeEnabled || threadReadOnly() || deleting
     || !!(editingMessage || editingQueuedMessage) && (busy || stopping || !!pending || !connected);
@@ -442,6 +444,7 @@ export function updateComposer({ followEnd = false } = {}) {
     : isClaude() ? active ? claudeNativeQueue()
       ? thread?.capabilities?.remoteQueue === true ? "继续输入，消息会排队等待发送…" : "继续输入，消息会进入 Claude 原生队列…"
       : "Claude 正在执行，可停止后发送新消息…" : "给 Claude 发送消息…"
+    : isAntigravity() ? active ? "继续输入，消息会排队等待发送…" : "给 Antigravity 发送消息，输入 / 选择命令…"
     : active ? serviceSideThread() ? "继续输入，消息会排队等待当前任务完成…" : "补充要求，会使用原生消息队列…"
     : "给 Codex 发送消息，输入 / 选择命令或 Skill…";
   const model = currentModel(), effort = currentEffort();
@@ -489,10 +492,10 @@ export function updateComposer({ followEnd = false } = {}) {
     const unavailable = pending.invalid || (pending.deviceId && pending.deviceId !== session.device.id);
     const pendingGoal = goalComposerAction(pending.action, pending.payload);
     const pendingQueueItem = ["steerQueued", "removeQueued"].includes(pending.action);
-    // 用户要求（2026-11-25）：Claude 会话的发送/历史编辑由 Harness 自己判定送达结果，不再让用户“查回执”或“已人工确认”；
-    // 页面自动轮询，服务端按原生记录结案（见 pending.js 的 resolvePending 与 claude_queue.rs 的 abandon_stale）。
+    // 用户要求（2026-11-25）：Claude 与 Antigravity 会话的发送/历史编辑由 Harness 自己判定送达结果，不再让用户“查回执”或“已人工确认”；
+    // 页面自动轮询，服务端按原生记录结案。
     const claudeMessage = !unavailable && ["send", "editMessage"].includes(pending.action)
-      && claudeThreadId(pending.payload?.threadId);
+      && (claudeThreadId(pending.payload?.threadId) || antigravityThreadId(pending.payload?.threadId));
     const box = element("div", "pending-banner", unavailable ? "回执损坏或属于旧授权。请检查原生会话后人工解除锁定，不会自动重发。"
       : claudeMessage ? "正在确认消息送达，确认后会自动更新，无需操作。"
       : pending.action === "reorderQueued" ? "正在确认队列排序结果。"
@@ -579,7 +582,7 @@ export async function sendMessage() {
   if (remoteFastWriting?.key === remoteFastKey()) { notice("正在保存 Fast 设置，请稍后发送"); return; }
   if ($("#permission-button")?.dataset?.saving === "true") { notice("正在保存权限，请稍后发送"); return; }
   if (composerAttachmentsLoading()) { notice("附件正在读取，请稍后发送"); return; }
-  const nativeCodexDefaults = creating && !isClaude() && session.capabilities?.codexSessionDefaults === true;
+  const nativeCodexDefaults = creating && !isClaude() && !isAntigravity() && session.capabilities?.codexSessionDefaults === true;
   if (nativeCodexDefaults) {
     const key = codexCreationDefaultsKey();
     try {
@@ -639,7 +642,7 @@ export async function sendMessage() {
   const prompt = composerPrompt(draft.text, draft.skills, goalMode);
   const images = composerAttachmentsPayload();
   const files = composerLocalInputsPayload();
-  if (images.some(image => image.staged) && (isClaude() || session.capabilities?.desktopCodexImageInput !== true)) {
+  if (images.some(image => image.staged) && (isClaude() || isAntigravity() || session.capabilities?.desktopCodexImageInput !== true)) {
     notice("草稿中的原图只能在支持原图发送的本机 Codex 会话使用，附件已保留。", true);
     return;
   }
@@ -654,7 +657,7 @@ export async function sendMessage() {
   }
   if (!prompt && !images.length && !files.length) { notice(goalMode ? "请描述目标或添加附件" : "请输入消息或添加附件"); return; }
   if (!creating && (!selectedId || thread?.id !== selectedId)) return;
-  const queueOnly = !scheduledAt && !isClaude() && !creating && !goalMode && compactionLocked();
+  const queueOnly = !scheduledAt && !isClaude() && !isAntigravity() && !creating && !goalMode && compactionLocked();
   if (queueOnly) {
     const reason = compactionQueueSendReason();
     if (reason) { notice(reason, true); return; }
@@ -670,7 +673,7 @@ export async function sendMessage() {
     || (selectedEffort || nativeCodexDefaults || creating && selectedDraftFast ? currentModelId() : ""),
     reasoningEffort = selectedEffort || (rememberedModel || nativeCodexDefaults ? currentEffort() : "");
   // 用户要求 Codex 执行或压缩期间仅保留模型/深度选择，排队消息不携带新设置；停止或完成后的新发送才应用。
-  const modelChoiceApplies = creating || isClaude() || !isActiveThread() && !queueOnly;
+  const modelChoiceApplies = creating || isClaude() || isAntigravity() || !isActiveThread() && !queueOnly;
   const payload = {
     prompt, instanceId: activeInstanceId(), ...(creating ? { projectId: $("#project-select").value, backend: activeBackend() } : {
       threadId: id,
@@ -680,13 +683,14 @@ export async function sendMessage() {
     ...(scheduledAt ? { sendAtMs: scheduledAt, scheduledAtMs: scheduledAt } : {}),
     ...(queueOnly ? { queueOnly: true } : {}),
     ...(modelChoiceApplies && model ? { model } : {}),
-    // 显式草稿优先；Claude 有有效记忆时恢复原选择，否则仍继承实例配置，不能把展示值固化为覆盖。
+    // 显式草稿优先；Claude / Antigravity 有有效记忆时恢复原选择，避免把展示值固化为覆盖。
     ...(creating && session.capabilities?.sessionPermissions === true
-      && (draft.permissionMode || (isClaude() && newClaudePermissionMode()) || $("#permission-button")?.value)
+      && (draft.permissionMode || (isClaude() && newClaudePermissionMode()) || (isAntigravity() && newAntigravityPermissionMode()) || $("#permission-button")?.value)
       ? { permissionMode: draft.permissionMode || (isClaude() ? newClaudePermissionMode() || "configured"
+        : isAntigravity() ? newAntigravityPermissionMode() || "default"
         : nativeCodexDefaults ? newCodexPermissionMode() : $("#permission-button").value) } : {}),
     // 新建只传本次草稿的显式选择；已有会话由原生会话偏好控制，发送不增加额外设置请求。
-    ...(creating && session.capabilities?.fastMode && !isClaude() ? {
+    ...(creating && session.capabilities?.fastMode && !isClaude() && !isAntigravity() ? {
       fastMode: remoteFastState?.key === remoteFastKey() && remoteFastState.supported && selectedDraftFast
     } : {}),
     ...(modelChoiceApplies && reasoningEffort ? { reasoningEffort } : {}),
@@ -785,15 +789,15 @@ export async function stopGeneration() {
   // 压缩的实时状态可能先于线程 active 到达；与按钮共用已确认压缩判断，点击后才真正派发停止。
   if (stopping || busy || threadReadOnly() || !connected || !selectedId
       || !isActiveThread() && !compactionInProgress()) return;
-  const id = selectedId, version = selectionVersion, claude = isClaude();
+  const id = selectedId, version = selectionVersion, claude = isClaude(), antigravity = isAntigravity();
   setStopping(true); updateComposer();
   try {
     const result = await mutate("stop", { threadId: id });
-    // Claude 的停止只中断当前执行，没有后台终端清理；原生 CLI 一直不响应停止请求时服务端会强制结束它的进程，
+    // Claude 与 Antigravity 的停止只中断当前执行，没有后台终端清理；原生 CLI 一直不响应停止请求时服务端会强制结束它的进程，
     // 必须明确告诉用户（不能静默成功），后续发送会自动重新接上原会话。
     notice(result?.cleanupPending ? result.message || "会话已停止，后台终端清理尚未确认"
-      : result?.forced ? "Claude 没有响应停止请求，已强制结束它的进程；会话已保留，可以继续发送。"
-      : claude ? "已停止" : "已请求停止并清理此会话的后台终端");
+      : result?.forced ? `${antigravity ? "Antigravity" : "Claude"} 没有响应停止请求，已强制结束它的进程；会话已保留，可以继续发送。`
+      : claude || antigravity ? "已停止" : "已请求停止并清理此会话的后台终端");
     if (version === selectionVersion && selectedId === id) await reloadThread();
   } catch (error) { notice(error.message, true); }
   finally { setStopping(false); updateComposer(); }

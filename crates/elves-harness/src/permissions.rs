@@ -38,11 +38,14 @@ pub(super) const CLAUDE_MODES: &[&str] = &[
     "dontAsk",
     "auto",
 ];
+// Antigravity 权限模式严格对齐官方 `agy acp` 宣告的可用模式，不虚构未支持项。
+pub(super) const ANTIGRAVITY_MODES: &[&str] = &["default", "accept-edits", "auto", "plan"];
 
 pub(super) fn validate_mode<'a>(backend: &str, value: &'a Value) -> Result<&'a str, ApiError> {
     let modes = match backend {
         "codex" => CODEX_MODES,
         "claude" => CLAUDE_MODES,
+        "antigravity" => ANTIGRAVITY_MODES,
         _ => return Err(ApiError::new(400, "该实例尚不支持权限设置")),
     };
     value
@@ -139,6 +142,12 @@ pub(super) fn config_target(
     let (home, name) = match instance.backend.as_str() {
         "codex" => (&environment.codex_home, "config.toml"),
         "claude" => (&environment.claude_home, "settings.json"),
+        "antigravity" => {
+            return Err(ApiError::new(
+                400,
+                "Antigravity 实例严格通过 ACP 协议管理，不直接读写本地配置文件；请在会话输入区切换权限模式。",
+            ));
+        }
         _ => return Err(ApiError::new(400, "该实例尚不支持权限设置")),
     };
     let root = if environment.distribution.is_empty() {

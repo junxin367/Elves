@@ -28,7 +28,7 @@ import {
   pendingSteer, queueSnapshotIsVersioned, queueVersion, queuedEditActions, queuedEdits,
   setPendingSteer
 } from "../queue/state.js";
-import { claudeThreadId, privateInputScope, threadActionReadOnly } from "../session/capabilities.js";
+import { antigravityThreadId, claudeThreadId, privateInputScope, threadActionReadOnly } from "../session/capabilities.js";
 
 export async function mutate(action, payload, { reliable = false, receiptId = null } = {}) {
   if (payload?.threadId && threadActionReadOnly(action, payload.threadId))
@@ -372,7 +372,7 @@ export async function resolvePending() {
       }
       if (queueAction) {
         // 旧引导可能根本未派发；不能凭 404 判断成功，只在原生历史确认已接收且队列已移除后结束等待。
-        if (claudeThreadId(current.payload.threadId)) {
+        if (claudeThreadId(current.payload.threadId) || antigravityThreadId(current.payload.threadId)) {
           const queue = await api("/api/read/queue", { threadId: current.payload.threadId }).catch(() => null);
           if (!stillCurrent()) return;
           if (queue?.threadId === current.payload.threadId && Array.isArray(queue.queuedMessages)

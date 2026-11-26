@@ -38,6 +38,16 @@ pub(super) const TYPES: &[SessionType] = &[
         wsl_adapter: true,
         instruction_file: "CLAUDE.md",
     },
+    SessionType {
+        id: "antigravity",
+        label: "Antigravity",
+        command: "agy",
+        // 用户要求 Antigravity 同时识别并接入本机与 WSL 实例，且严格通过官方 CLI 的 ACP 协议处理。
+        detect_local: true,
+        local_adapter: true,
+        wsl_adapter: true,
+        instruction_file: "GEMINI.md",
+    },
 ];
 
 #[derive(Clone, Serialize)]
@@ -72,7 +82,7 @@ pub(super) fn label(backend: &str, distribution: &str, user: &str) -> String {
     let mut parts = vec![kind.map_or(backend, |kind| kind.label)];
     if !distribution.is_empty() {
         parts.push(distribution);
-        if backend != "claude" && !user.is_empty() {
+        if !matches!(backend, "claude" | "antigravity") && !user.is_empty() {
             parts.push(user);
         }
     }
@@ -121,9 +131,11 @@ pub(super) fn catalog(environments: &[Environment]) -> Vec<Instance> {
                     .into(),
                     legacy_default: local && kind.id == "codex"
                         || environment.configured && kind.id == "claude",
-                    // 用户要求 Codex 实例仅保留服务模式；接口不能再宣告桌面注入，未接入的实例保持无可用连接方式。
+                    // 用户要求 Codex 实例仅保留服务模式；Antigravity 严格通过官方 ACP 协议接入。
                     connection_modes: if ready && kind.id == "codex" {
                         vec!["service"]
+                    } else if ready && kind.id == "antigravity" {
+                        vec!["acp"]
                     } else if ready {
                         vec!["native"]
                     } else {

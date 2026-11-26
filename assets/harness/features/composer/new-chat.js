@@ -24,7 +24,7 @@ import {
 } from "./skill-catalog.js";
 import { scheduleCatalogRefresh } from "./skills.js";
 import { setSelectedGoal } from "../goal/state.js";
-import { backendAvailable, isClaude } from "../session/capabilities.js";
+import { backendAvailable, isAntigravity, isClaude } from "../session/capabilities.js";
 import { stream } from "../session/connection-state.js";
 import { setConnection } from "../session/connection.js";
 import { availableSessionInstances, newChatBackendOptions, sessionInstanceEnabled } from "../session/instances.js";
@@ -72,7 +72,7 @@ export function resetComposerOptions() {
   setSelectedDraftFast(false);
   setRemoteFastState(null);
   setModelQuery("");
-  setSkillChoices(isClaude() ? [] : [...globalSkillChoices]); setSkillScope(""); setSkillLoading(null); setSkillLoadVersion(skillLoadVersion + 1);
+  setSkillChoices(isClaude() || isAntigravity() ? [] : [...globalSkillChoices]); setSkillScope(""); setSkillLoading(null); setSkillLoadVersion(skillLoadVersion + 1);
   setMessageSkillLoadScope(""); setSkillRenderVersion(skillRenderVersion + 1);
   setAppliedSkillCatalog(setAppliedGlobalSkills(null));
   closeComposerMenus();

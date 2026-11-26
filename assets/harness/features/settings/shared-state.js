@@ -2,7 +2,7 @@
 export function defaultSharedSettings() {
   return {
     conversationWidth: 950, projectThreadLimit: 5,
-    sessionTypes: { codex: true, claude: false }, sessionInstances: null, sessionFilter: "all",
+    sessionTypes: { codex: true, claude: false, antigravity: false }, sessionInstances: null, sessionFilter: "all",
     sidebar: { mode: null, chats: null, projects: null, pinned: null, showPinned: false },
     newChat: {}, notifications: { enabled: false, approval: true, question: true, completed: true, failed: false },
     conversationNaming: { enabled: false, instanceId: "codex:local", model: "", systemPrompt: "",

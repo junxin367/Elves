@@ -26,7 +26,7 @@ import {
 import { readMarkRequests } from "../messages/user-content.js";
 import { clearSentMessageDisplays } from "../queue/sent-display.js";
 import { queuedActionBusy, queuedEditChecks, queuedEdits } from "../queue/state.js";
-import { claudeThreadId } from "../session/capabilities.js";
+import { antigravityThreadId, claudeThreadId } from "../session/capabilities.js";
 import {
   cacheDisplayData, readScope, sidebarSnapshot, threadDisplayKey, threadDisplays
 } from "../session/thread-cache.js";
@@ -116,13 +116,16 @@ export async function deleteSidebarThread(item, { confirmed: alreadyConfirmed = 
   let record = { id: randomId(), deviceId, threadId: item.id, title: item.title || "未命名会话", state: "confirming" };
   threadDeletions.set(key, record);
   try {
-    const claude = claudeThreadId(item.id);
+    const claude = claudeThreadId(item.id), antigravity = antigravityThreadId(item.id);
     // 管理页已经确认当前批次时复用同一删除事务，禁止回到原管理器的桌面删除通道。
-    const confirmed = alreadyConfirmed || await confirmAction(claude ? "移除 Claude 会话" : "删除会话",
+    // Antigravity ACP 协议暂不支持 session/delete，删除只从 Elves 列表移除，保留原生 CLI 历史。
+    const confirmed = alreadyConfirmed || await confirmAction(
+      claude ? "移除 Claude 会话" : antigravity ? "移除 Antigravity 会话" : "删除会话",
       claude ? `将从远程列表移除“${record.title}”。Claude 原生会话历史仍保留，项目文件不受影响。`
+        : antigravity ? `将从列表移除“${record.title}”。因官方 ACP 协议暂不支持原生删除，Antigravity 本地历史仍保留，项目文件不受影响。`
         // 用户要求全部侧边空闲才允许删除；确认文案同时说明自动关闭侧边及执行中限制。
         : `将永久删除“${record.title}”、其会话记录、原生子智能体及持久侧边会话，并关闭所属临时侧边会话，项目文件不受影响。此操作不可恢复。主会话或任一侧边会话执行中的任务需先停止，其他客户端占用的会话需在对应客户端处理。确定删除吗？`,
-      claude ? "移除会话" : "删除会话", true);
+      claude || antigravity ? "移除会话" : "删除会话", true);
     if (!confirmed || session?.device.id !== deviceId || session.readOnly || !connected) return;
     if (threadDeletions.get(key) !== record || threadDeletionConflict(item.id)) return;
     record = { ...record, state: "submitting" };
@@ -133,7 +136,9 @@ export async function deleteSidebarThread(item, { confirmed: alreadyConfirmed = 
       throw Object.assign(new Error(result?.message || "删除结果尚未确认，请核对回执，勿重复删除。"), { outcomeUnknown: true });
     applyThreadDeletion(item.id, deviceId);
     if (session?.device.id === deviceId) {
-      notice(claude ? "已从远程列表移除 Claude 会话" : result.status === "partial" ? result.message || "会话已永久删除，部分列表清理未完成。" : "会话已永久删除",
+      notice(claude ? "已从远程列表移除 Claude 会话"
+        : antigravity ? "已从列表移除 Antigravity 会话（原生历史仍保留）"
+        : result.status === "partial" ? result.message || "会话已永久删除，部分列表清理未完成。" : "会话已永久删除",
         result.status === "partial");
       void loadSidebar(null, { fresh: true }).catch(() => {});
     }

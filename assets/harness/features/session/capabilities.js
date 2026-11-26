@@ -8,27 +8,42 @@ export function claudeThreadId(id) {
   // 子代理 ID 绑定远程主会话及原生 agentId，仍走 Claude 读取路由，不能误投 Codex。
   return typeof id === "string" && /^claude-(?:[0-9a-f-]{36}|agent-[0-9a-f-]{36}-[A-Za-z0-9_-]{1,64})$/i.test(id);
 }
+export function antigravityThreadId(id) {
+  // Antigravity 会话 ID 以 antigravity- 为固定前缀，严格走官方 ACP 后端路由。
+  return typeof id === "string" && /^antigravity-[A-Za-z0-9_-]{1,100}$/i.test(id);
+}
 export function activeBackend() {
   return creating ? creationBackend : conversationBackend(thread || { id: selectedId });
 }
 export function isClaude() { return activeBackend() === "claude"; }
+export function isAntigravity() { return activeBackend() === "antigravity"; }
 export function claudeNativeQueue() { return isClaude() && thread?.capabilities?.queue === true; }
 export function queueCapability(name, id = selectedId) {
-  // Claude 队列能力由当前会话报告；Codex 桌面离线时也必须保留已支持的图片编辑与回执恢复。
-  return claudeThreadId(id) || thread?.id === id && thread?.backend === "claude"
+  // Claude 与 Antigravity 队列能力由当前会话报告；Codex 桌面离线时也必须保留已支持的图片编辑与回执恢复。
+  return claudeThreadId(id) || antigravityThreadId(id)
+      || thread?.id === id && ["claude", "antigravity"].includes(thread?.backend)
     ? thread?.id === id && thread.capabilities?.[name] === true : session?.capabilities?.[name] === true;
 }
 export function backendAvailable(value = session) {
   // 用户要求 Codex 仅使用服务模式；旧桌面连接标记不能让服务离线的实例显示为可发送。
-  return isClaude() ? value?.capabilities?.claudeSessions === true : value?.serviceConnected === true;
+  if (isClaude()) return value?.capabilities?.claudeSessions === true;
+  if (isAntigravity()) return value?.capabilities?.antigravitySessions === true;
+  return value?.serviceConnected === true;
 }
-export function approvalsAllowed() { return isClaude() ? session?.claudeAllowApprovals === true : session?.allowApprovals === true; }
+export function approvalsAllowed() {
+  if (isClaude()) return session?.claudeAllowApprovals === true;
+  if (isAntigravity()) return session?.antigravityAllowApprovals === true;
+  return session?.allowApprovals === true;
+}
 export function backendCapability(name) {
-  return isClaude() && ["imageInput", "projectlessCreation", "sendText"].includes(name)
-    ? session?.capabilities?.claudeSessions === true : session?.capabilities?.[name] === true;
+  if (isClaude() && ["imageInput", "projectlessCreation", "sendText"].includes(name))
+    return session?.capabilities?.claudeSessions === true;
+  if (isAntigravity() && ["imageInput", "projectlessCreation", "sendText"].includes(name))
+    return session?.capabilities?.antigravitySessions === true;
+  return session?.capabilities?.[name] === true;
 }
 export function conversationBackend(item) {
-  return item?.backend || (claudeThreadId(item?.id) ? "claude" : "codex");
+  return item?.backend || (claudeThreadId(item?.id) ? "claude" : antigravityThreadId(item?.id) ? "antigravity" : "codex");
 }
 export function privateInputScope(value) {
   return typeof value?.device?.id === "string"
@@ -54,13 +69,14 @@ export function normalizeRelatedView(value, id = value?.threadId) {
       ...(value.owner === relatedNavigationOwner ? { owner: value.owner } : {}) } : null;
 }
 export function subagentsEnabled() {
-  // Claude 仅在当前后台明确声明读取能力时复用子代理列表/只读详情；侧边会话能力独立处理。
+  // Claude 仅在当前后台明确声明读取能力时复用子代理列表/只读详情；Antigravity ACP 不提供独立子代理会话列表。
   if (isClaude()) return thread?.capabilities?.subagents === true;
+  if (isAntigravity()) return false;
   // 子智能体与侧边会话使用独立能力字段，兼容旧后台并分别约束只读与写入入口。
   return session?.capabilities?.serviceSubagents === true;
 }
 export function sideThreadsEnabled() {
-  if (isClaude()) return false;
+  if (isClaude() || isAntigravity()) return false;
   // 用户选择服务独立管理临时侧边会话；只有新后台声明能力时开放，旧后台仍保持禁用。
   return session?.capabilities?.serviceSideThreads === true;
 }
@@ -72,8 +88,8 @@ export function temporarySideThread() {
   return serviceSideThread() && thread.ephemeral !== false;
 }
 export function threadForkAllowed(id = selectedId) {
-  // 用户要求不支持的侧边直接移除分支入口；能力必须来自当前持久 Codex 主会话。
-  return !!id && !creating && thread?.id === id && !isClaude() && !threadReadOnly(id)
+  // 用户要求不支持的侧边直接移除分支入口；能力必须来自当前持久 Codex 主会话（Antigravity ACP 不支持 session/fork）。
+  return !!id && !creating && thread?.id === id && !isClaude() && !isAntigravity() && !threadReadOnly(id)
     && thread.capabilities?.forkThread === true && thread.ephemeral !== true
     && !["side", "subagent"].includes(thread.viewKind) && !normalizeRelatedView(relatedThreadViews.get(id), id)
     && relatedSessionView?.threadId !== id;

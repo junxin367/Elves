@@ -19,7 +19,7 @@ export function createSelectComponent({ element, icon, button, togglePopup, open
     node.title = `${node.getAttribute("aria-label")}：${label}${selected?.description ? ` · ${selected.description}` : ""}`;
     const content = node.renderSelectValue?.(selected);
     // 用户要求所有会话实例的已选项也显示品牌图标；其他 Select 沿用原排版，自定义渲染保留既有箭头约定。
-    const brand = !Array.isArray(content) && ["codex", "claude"].includes(selected?.icon) ? [icon(selected.icon)] : [];
+    const brand = !Array.isArray(content) && ["codex", "claude", "antigravity"].includes(selected?.icon) ? [icon(selected.icon)] : [];
     node.replaceChildren(...(Array.isArray(content) ? content
       : [...brand, element("span", "select-label", label), icon("chevron")]));
     refreshPopup(node);

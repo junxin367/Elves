@@ -9,8 +9,8 @@ import { busy, connected, creating, selectedId, session, stopping } from "../../
 import { api } from "../api.js";
 import { draftKey, snapshotDraft, storeDraft } from "./drafts.js";
 import {
-  codexCreationDefaults, newClaudePermissionMode, newCodexPermissionMode, rememberNewChatSettings,
-  syncCodexCreationDefaults
+  codexCreationDefaults, newAntigravityPermissionMode, newClaudePermissionMode, newCodexPermissionMode,
+  rememberNewChatSettings, syncCodexCreationDefaults
 } from "./new-chat-settings.js";
 import {
   draftPermissionChoices, instancePermissionCatalogs, instancePermissionReads, permissionSelections,
@@ -19,7 +19,7 @@ import {
 import { pending } from "../conversation/pending-state.js";
 import { editingMessage } from "../messages/message-edit.js";
 import { editingQueuedMessage } from "../queue/state.js";
-import { activeBackend, isActiveThread, isClaude, privateInputScope, threadReadOnly } from "../session/capabilities.js";
+import { activeBackend, isActiveThread, isAntigravity, isClaude, privateInputScope, threadReadOnly } from "../session/capabilities.js";
 import { activeInstanceId, sessionInstanceEnabled } from "../session/instances.js";
 import { relatedSessionView } from "../session/related-state.js";
 import { currentThreadDisplay } from "../session/thread-cache.js";
@@ -67,33 +67,41 @@ export function updateComposerPermissions() {
   if (!creating && display?.permissionMode)
     rememberPermissionSelection(selectedId, display.permissionMode, display.permissionRevision || 0);
   const saved = permissionSelections.get(selectedId);
-  const codex = !isClaude();
+  const antigravity = isAntigravity();
+  const codex = !isClaude() && !antigravity;
   const nativeDefaultsEnabled = codex && creating && session?.capabilities?.codexSessionDefaults === true;
   if (nativeDefaultsEnabled) syncCodexCreationDefaults();
   const choice = creating ? draftPermissionChoices.get(draftKey())
-      ?? (nativeDefaultsEnabled ? newCodexPermissionMode() : !codex ? newClaudePermissionMode() : undefined)
+      ?? (nativeDefaultsEnabled ? newCodexPermissionMode()
+        : antigravity ? newAntigravityPermissionMode()
+        : !codex ? newClaudePermissionMode() : undefined)
     : saved?.scope === privateInputScope(session) ? saved.mode : display?.permissionMode;
-  const mode = choice || (creating && !nativeDefaultsEnabled ? "configured" : "");
+  const mode = choice || (creating && !nativeDefaultsEnabled && !antigravity ? "configured" : "");
   const catalogRecord = instancePermissionCatalogs.get(activeInstanceId());
   const catalog = catalogRecord?.scope === privateInputScope(session) ? catalogRecord : null;
-  // 用户要求 Claude 新建沿用当前实例记住的权限；没有有效记忆时读取实例配置，已有会话仍显示自身权限。
-  const effectiveMode = !codex && (!mode || mode === "configured")
+  // 用户要求 Claude 新建沿用当前实例记住的权限；Antigravity 通过 ACP 固定提供四种模式，默认询问确认。
+  const effectiveMode = antigravity ? (choice || (!creating && display?.permissionMode) || "default")
+    : !codex && (!mode || mode === "configured")
     ? (!creating && display?.nativeSettings?.permissionMode) || catalog?.defaultMode || "" : mode;
-  control.dataset.permissionBackend = codex ? "codex" : "claude";
-  control.popupClassName = `composer-permissions-popup composer-${codex ? "codex" : "claude"}-permissions-popup`;
-  // 两类菜单均以 340px 排列图标、说明和勾选；fitPopup 按视口两侧各 8px 收窄，手机入口仍为 28×36px。
+  control.dataset.permissionBackend = activeBackend();
+  control.popupClassName = `composer-permissions-popup composer-${activeBackend()}-permissions-popup`;
+  // 菜单均以 340px 排列图标、说明和勾选；fitPopup 按视口两侧各 8px 收窄，手机入口仍为 28×36px。
   control.popupWidth = 340;
   // Claude 五行模式连同标题、说明约需 400px；预留到 440px，矮屏仍由 fitPopup 限高并滚动列表。
-  control.popupMaxHeight = codex ? 360 : 440;
-  // 用户要求 Codex 标题后显示“了解更多”；Claude 移除“模式”标题并把说明放到选项上方。
+  control.popupMaxHeight = codex ? 360 : antigravity ? 340 : 440;
+  // 用户要求 Codex 标题后显示“了解更多”；Claude 与 Antigravity 把说明放到选项上方。
   control.popupTitle = codex ? "应如何批准 Codex 操作？" : "";
   control.popupHelp = codex ? { label: "了解更多", href: "https://developers.openai.com/codex/agent-approvals-security" } : null;
   control.popupHelpAfterTitle = codex;
   control.popupNotePosition = codex ? "bottom" : "top";
-  control.popupNote = codex ? "" : "“绕过权限”仅在该实例 CLI 支持且已允许时显示";
-  if (!codex && !catalog && connected && session?.capabilities?.sessionPermissions === true
+  control.popupNote = codex ? ""
+    : antigravity ? "通过官方 ACP 协议为当前会话切换权限模式"
+    : "“绕过权限”仅在该实例 CLI 支持且已允许时显示";
+  if (isClaude() && !catalog && connected && session?.capabilities?.sessionPermissions === true
       && sessionInstanceEnabled(activeInstanceId())) void loadInstancePermissionCatalog(activeInstanceId());
-  let supported = codex ? nativeDefaultsEnabled ? codexCreationDefaults()?.permissionModes || null : null : catalog?.modes || [];
+  let supported = codex ? nativeDefaultsEnabled ? codexCreationDefaults()?.permissionModes || null : null
+    : antigravity ? (!creating && Array.isArray(display?.permissionModes) && display.permissionModes.length ? display.permissionModes : null)
+    : catalog?.modes || [];
   if (isClaude() && !creating && supported) {
     // 共享 CLI 只能切换原生已开放的模式；启动参数或实例全局配置均未允许时不能由网页补开。
     const runtimeModes = Array.isArray(display?.permissionModes) ? display.permissionModes
@@ -106,8 +114,9 @@ export function updateComposerPermissions() {
       || ["default", "manual"].includes(mode) && runtimeModes.some(value => ["default", "manual"].includes(value)));
   }
   const options = permissionOptions(activeBackend(), supported);
-  // 旧只读 Codex 仍按原权限执行；Claude 的 manual/default 只选中同一项，不增加第六种模式。
+  // 旧只读 Codex 仍按原权限执行；Claude 的 manual/default 只选中同一项，Antigravity 默认回退 default。
   const displayMode = codex ? mode === "read-only" ? "auto" : mode || (nativeDefaultsEnabled ? "" : "configured")
+    : antigravity ? (options.find(option => option.value === effectiveMode)?.value || "default")
     : options.find(option => option.value === effectiveMode
       || ["default", "manual"].includes(effectiveMode) && ["default", "manual"].includes(option.value))?.value || "";
   const signature = JSON.stringify([activeBackend(), displayMode, options]);
@@ -135,7 +144,7 @@ export function updateComposerPermissions() {
   const samePermission = nativePermission === desiredPermission
     || ["default", "manual"].includes(nativePermission) && ["default", "manual"].includes(desiredPermission);
   // 用户要求未主动切换时不显示待生效；只有对应切换仍在等待且原生值尚未达到目标才说明。
-  const permissionPending = !codex && !creating && permissionChange?.state === "pending" && !samePermission;
+  const permissionPending = isClaude() && !creating && permissionChange?.state === "pending" && !samePermission;
   const selectedLabel = permissionLabel(activeBackend(), mode || effectiveMode, creating);
   // 精简待生效提示，保留所选权限、当前权限、实际原因及不打断任务的边界。
   const pendingDescription = `已选“${selectedLabel}”，待生效；${nativePermission
@@ -148,10 +157,12 @@ export function updateComposerPermissions() {
     : permissionPending ? pendingDescription
     : queued ? `当前权限：${label}；已有待发消息按原选择执行，仅后续新轮次使用新选择`
     : waiting ? codex ? `当前权限：${label}；仅后续新轮次生效`
+      : antigravity ? `当前权限：${label}；通过 ACP 实时应用`
       : `当前权限：${label}；原生允许时切换，无法安全切换时保存待生效，不中断当前任务`
     : nativeDefaultsEnabled && !mode ? "正在读取 Codex 服务默认权限"
-    : catalog?.error ? `实例权限读取失败：${catalog.error}；点击重新读取`
-    : !codex && !supported.length ? "暂无法确认该 Claude CLI 支持的权限模式，点击重新读取"
+    : isClaude() && catalog?.error ? `实例权限读取失败：${catalog.error}；点击重新读取`
+    : isClaude() && !supported.length ? "暂无法确认该 Claude CLI 支持的权限模式，点击重新读取"
+    : antigravity ? `当前权限：${label}；通过官方 ACP 协议切换`
     : `当前权限：${label}；仅此会话的后续新轮次生效`;
 }
 export async function changeComposerPermissions() {

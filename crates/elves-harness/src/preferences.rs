@@ -96,6 +96,14 @@ fn native_environment() -> Environment {
                     home.join(format!(".local/bin/{}.exe", kind.command)),
                     home.join(format!(".local/bin/{}", kind.command)),
                 ])
+                .chain(if kind.id == "antigravity" && cfg!(windows) {
+                    // 官方 Antigravity Windows CLI 默认安装至 %LOCALAPPDATA%\agy\bin\agy.exe。
+                    directories::BaseDirs::new()
+                        .map(|dirs| vec![dirs.data_local_dir().join("agy/bin/agy.exe")])
+                        .unwrap_or_default()
+                } else {
+                    vec![]
+                })
                 .chain(if kind.id == "codex" {
                     crate::cli_wrapper::default_user_runtime_candidates()
                 } else {
@@ -322,6 +330,11 @@ pub(super) async fn environments(
         .claude
         .add_known_instances(&mut instances)
         .await;
+    state
+        .controller
+        .antigravity
+        .add_known_instances(&mut instances)
+        .await;
     authorization
         .check()
         .await
@@ -483,6 +496,12 @@ fn instruction_target(
     let home = match kind.id {
         "codex" => &environment.codex_home,
         "claude" => &environment.claude_home,
+        "antigravity" => {
+            return Err(ApiError::new(
+                400,
+                "Antigravity 实例严格通过 ACP 协议管理，不直接读写本地指令文件。",
+            ));
+        }
         _ => return Err(ApiError::new(400, "该会话类型尚未支持自定义指令")),
     };
     let display = format!("{}/{name}", home.trim_end_matches(['/', '\\']));

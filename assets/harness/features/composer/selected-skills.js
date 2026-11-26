@@ -12,7 +12,7 @@ import {
 } from "./prompt-editor.js";
 import { selectedSkills, slashQuery } from "./skill-catalog.js";
 import { selectedGoal } from "../goal/state.js";
-import { isClaude } from "../session/capabilities.js";
+import { isAntigravity, isClaude } from "../session/capabilities.js";
 
 export function renderSelectedSkills() {
   const prompt = $("#prompt");
@@ -25,12 +25,13 @@ export function renderSelectedSkills() {
 }
 export function selectSkill(skill) {
   const query = slashQuery();
-  if (isClaude()) {
+  if (isClaude() || isAntigravity()) {
     const prompt = $("#prompt"), command = skill?.command;
+    const expectedBackend = isAntigravity() ? "antigravity" : "claude";
     if (!query || selectedGoal || (prompt.value || "").slice(0, query.start).trim()
-        || skill.backend !== "claude" || typeof command !== "string"
+        || skill.backend !== expectedBackend || typeof command !== "string"
         || !/^[\p{L}\p{N}_.:-]{1,256}$/u.test(command)) return;
-    // Claude 使用原生 /skill-name 参数文本，不构造 Codex 的 $标记、文件路径或额外系统提示。
+    // Claude 与 Antigravity 均使用原生 /command 参数文本，不构造 Codex 的 $标记、文件路径或额外系统提示。
     prompt.setRangeText(`/${command} `, query.start, query.end, "end");
     rememberDraft(); closeComposerMenus(); updateComposer(); prompt.focus();
     return;

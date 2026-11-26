@@ -16,7 +16,7 @@ import {
 } from "./options-state.js";
 import { catalogUsable } from "./skill-catalog.js";
 import { pending } from "../conversation/pending-state.js";
-import { isClaude, privateInputScope, threadReadOnly } from "../session/capabilities.js";
+import { isAntigravity, isClaude, privateInputScope, threadReadOnly } from "../session/capabilities.js";
 import { activeInstanceId, sessionInstanceEnabled } from "../session/instances.js";
 import { currentThreadDisplay } from "../session/thread-cache.js";
 import { threadDeletionLocked } from "../sidebar/deletion-state.js";
@@ -41,8 +41,8 @@ export function currentEffort() {
     // 用户要求深度和模型成对记忆；旧模型失效、能力变化或切换模型后不能套用另一模型的等级。
     if (modelIdentityMatches(model, remembered.model) && (catalog?.supportedReasoningEfforts || [])
         .some(effort => effort.reasoningEffort === remembered.reasoningEffort)) return remembered.reasoningEffort;
-    if (isClaude()) {
-      // 用户要求 Claude 的实例默认深度用于后续新会话；已记住的有效选择优先，默认值也必须受所选模型支持。
+    if (isClaude() || isAntigravity()) {
+      // 用户要求 Claude / Antigravity 的实例默认深度用于后续新会话；已记住的有效选择优先，默认值也必须受所选模型支持。
       if (modelDefaults.reasoningEffort && (catalog?.supportedReasoningEfforts || [])
           .some(effort => effort.reasoningEffort === modelDefaults.reasoningEffort))
         return modelDefaults.reasoningEffort;
@@ -62,7 +62,7 @@ export function remoteFastKey() {
   // 用户要求 Codex 仅使用服务模式；Fast 必须由当前服务明确声明能力，并按会话保存。
   if (!session?.capabilities?.fastMode
       || session.capabilities.serviceFastMode !== true
-      || isClaude() || !currentModelId() || !creating && !selectedId) return "";
+      || isClaude() || isAntigravity() || !currentModelId() || !creating && !selectedId) return "";
   return JSON.stringify([privateInputScope(session), activeInstanceId(), draftKey(), currentModelId(),
     selectionVersion, nativeConnectionVersion]);
 }

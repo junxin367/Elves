@@ -17,7 +17,7 @@ import {
 import { deleteDraft, draftKey, snapshotDraft, storeDraft } from "./drafts.js";
 import { modelForId } from "./model-catalog.js";
 import { instancePermissionCatalogs, modelSettingsVersion } from "./options-state.js";
-import { activeBackend, isClaude, privateInputScope } from "../session/capabilities.js";
+import { activeBackend, isAntigravity, isClaude, privateInputScope } from "../session/capabilities.js";
 import { activeInstanceId } from "../session/instances.js";
 import { sharedSettingsState } from "../settings/shared-state.js";
 
@@ -84,7 +84,7 @@ export function rememberedNewChatSettings() {
   return {};
 }
 export function rememberNewChatSettings(patch) {
-  if (!["codex", "claude"].includes(activeBackend())) return;
+  if (!["codex", "claude", "antigravity"].includes(activeBackend())) return;
   const scope = newChatPreferenceScope();
   if (!scope) return;
   const owner = privateInputScope(session);
@@ -94,7 +94,7 @@ export function rememberNewChatSettings(patch) {
 }
 export function codexCreationDefaultsKey() {
   // 实例模型设置变更后，新建默认值和在途旧读取同时失效，不能继续显示旧模型或已关闭的 Ultra。
-  return creating && session?.capabilities?.codexSessionDefaults === true && !isClaude()
+  return creating && session?.capabilities?.codexSessionDefaults === true && !isClaude() && !isAntigravity()
     ? JSON.stringify([privateInputScope(session), nativeConnectionVersion, creationProject, selectionVersion, modelSettingsVersion]) : "";
 }
 export function codexCreationDefaults() {
@@ -150,4 +150,9 @@ export function newClaudePermissionMode() {
   // 记忆不能越过目标 CLI 能力；只恢复当前菜单实际开放的模式，manual/default 视为同一选择。
   return permissionOptions("claude", catalog.modes).find(option => option.value === remembered
     || ["default", "manual"].includes(remembered) && ["default", "manual"].includes(option.value))?.value || "";
+}
+export function newAntigravityPermissionMode() {
+  if (!creating || !isAntigravity()) return "";
+  const remembered = rememberedNewChatSettings().permissionMode;
+  return permissionOptions("antigravity").find(option => option.value === remembered)?.value || "default";
 }

@@ -24,7 +24,7 @@ export function composerMetricsHasTurn(value) {
   return ["tokensPerSecond", "steps", "turnTokens"].some(key => composerMetricsNumber(value?.[key]));
 }
 export function normalizeComposerMetrics(value, previous = null) {
-  if (!value || !["codex-rollout", "codex-side", "claude-native"].includes(value.source)
+  if (!value || !["codex-rollout", "codex-side", "claude-native", "antigravity-acp"].includes(value.source)
       || typeof value.turnId !== "string" || value.turnId.length > 120) return null;
   const result = { source: value.source, turnId: value.turnId };
   if (value.source === "codex-side" && value.totalIncomplete === true) result.totalIncomplete = true;
@@ -169,7 +169,8 @@ export function composerMetricsContext() {
   const backend = activeBackend();
   // 侧边只承认独立统计源；旧缓存及迟到的主会话统计不能填入侧边底栏。
   const source = thread.viewKind === "side" || thread.serviceSide === true ? "codex-side"
-    : backend === "claude" ? "claude-native" : "codex-rollout";
+    : backend === "claude" ? "claude-native"
+    : backend === "antigravity" ? "antigravity-acp" : "codex-rollout";
   return { key: JSON.stringify([owner, instanceId, selectedId, source, selectionVersion, nativeConnectionVersion]),
     source, payload: { threadId: selectedId, instanceId, backend } };
 }

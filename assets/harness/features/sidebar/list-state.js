@@ -1,7 +1,7 @@
 // 侧栏列表状态：本地已读、未读角标计时、侧栏读取请求与折叠分组。
 
 import { selectedId, session, sidebar } from "../../core/state.js";
-import { claudeThreadId } from "../session/capabilities.js";
+import { antigravityThreadId, claudeThreadId } from "../session/capabilities.js";
 
 export let collapsed = new Set(), search = "";
 export function setSearch(value) { return search = value; }
@@ -29,7 +29,7 @@ export function mergeIncompleteSidebar(previous, current) {
   // 用户要求服务模式与桌面置顶一致：原生置顶已完整时立即接受取消，不能被未完成的最近分页补回。
   const completePins = current.pinnedThreadsComplete === true;
   const pinnedIds = new Set(current.pinnedThreads.map(item => item.id));
-  const mergeRows = (old, fresh) => [...fresh, ...old.filter(item => !freshIds.has(item.id) && !claudeThreadId(item.id))]
+  const mergeRows = (old, fresh) => [...fresh, ...old.filter(item => !freshIds.has(item.id) && !claudeThreadId(item.id) && !antigravityThreadId(item.id))]
     .map(item => item.projectId && !projectIds.has(item.projectId) ? { ...item, projectId: null } : item)
     .map(item => completePins ? { ...item, pinned: pinnedIds.has(item.id) } : item);
   const oldRecent = completePins

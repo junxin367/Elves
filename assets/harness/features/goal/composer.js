@@ -22,7 +22,7 @@ import { editingMessage } from "../messages/message-edit.js";
 import { editingQueuedMessage } from "../queue/state.js";
 import { setSelectedScheduledAt } from "../composer/scheduled-state.js";
 import { claudeCommandSupported } from "../session/action-capabilities.js";
-import { isClaude, temporarySideThread, threadReadOnly, threadReadOnlyMessage } from "../session/capabilities.js";
+import { isAntigravity, isClaude, temporarySideThread, threadReadOnly, threadReadOnlyMessage } from "../session/capabilities.js";
 import { composerScroll } from "../shell-state.js";
 import { threadDeleted, threadDeletionLocked } from "../sidebar/deletion-state.js";
 
@@ -68,10 +68,10 @@ export function goalComposerReason({ submitting = false } = {}) {
   if (!session || !creating && (!selectedId || thread?.id !== selectedId)) return "请先打开会话或新建会话";
   if (threadReadOnly()) return threadReadOnlyMessage();
   if (temporarySideThread()) return "临时侧边会话不创建持续目标，请返回主会话设置";
-  if (!isClaude() && session.capabilities?.goalComposer !== true) return "当前服务尚不支持创建目标，请更新远程服务；目标草稿会保留";
+  if (!isClaude() && !isAntigravity() && session.capabilities?.goalComposer !== true) return "当前服务尚不支持创建目标，请更新远程服务；目标草稿会保留";
   if (editingMessage || editingQueuedMessage) return "请先完成消息或队列编辑";
   if (threadDeletionLocked() || threadDeleted(selectedId)) return "会话正在删除或已删除，请先核对删除结果";
-  if (!isClaude() && submitting && compactionLocked()) return "可继续编辑目标，压缩完成后再创建";
+  if (!isClaude() && !isAntigravity() && submitting && compactionLocked()) return "可继续编辑目标，压缩完成后再创建";
   if (!creating && unfinishedGoal()) return "此会话已有未完成目标，请通过上方目标栏编辑";
   if (!connected) return "连接恢复后可创建目标";
   if (busy || stopping) return "请等待当前提交完成";

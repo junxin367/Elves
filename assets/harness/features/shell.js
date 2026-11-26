@@ -66,7 +66,8 @@ import { createSubagentIcon, subagentName } from "./messages/subagents.js";
 import { markVisibleThreadRead } from "./messages/user-content.js";
 import { setPendingNotificationOpen } from "./notifications.js";
 import {
-  activeBackend, isActiveThread, isClaude, privateInputScope, sideThreadsEnabled, subagentsEnabled, threadReadOnly
+  activeBackend, isActiveThread, isAntigravity, isClaude, privateInputScope, sideThreadsEnabled, subagentsEnabled,
+  threadReadOnly
 } from "./session/capabilities.js";
 import {
   connectionRttDescription, currentChannelMeasurements, loginPageCleanup,
@@ -634,10 +635,10 @@ export function shell() {
       renderModelMenu(); $('#model-settings [aria-checked="true"]:not(:disabled)')?.focus();
     } else menu.replaceChildren();
     // 历史读取只提供当前模型；用户点击后才加载该实例的完整选项，并明确显示加载或失败状态。
-    if (!cached || isClaude()) menu.append(element("p", "popover-empty muted", "正在读取可用模型…"));
+    if (!cached || isClaude() || isAntigravity()) menu.append(element("p", "popover-empty muted", "正在读取可用模型…"));
     fitComposerMenu(menu);
     try {
-      await loadModels(false, { includeAvailable: isClaude() });
+      await loadModels(false, { includeAvailable: isClaude() || isAntigravity() });
       if (!current()) return;
       renderModelMenu();
       if (!cached) $('#model-settings [aria-checked="true"]:not(:disabled)')?.focus();

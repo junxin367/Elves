@@ -2,7 +2,7 @@
 
 import { element } from "../../ui/dom.js";
 import { selectedId, sidebar } from "../../core/state.js";
-import { isClaude, normalizeRelatedView } from "../session/capabilities.js";
+import { isAntigravity, isClaude, normalizeRelatedView } from "../session/capabilities.js";
 import {
   conversationHistoryKey, conversationHistoryPosition, relatedExitTransition, relatedHistoryKey,
   relatedSessionView
@@ -56,11 +56,14 @@ export function syncNewChatHash() {
 }
 export function welcomeNode() {
   const node = element("div", "welcome");
-  // 用户要求说明所选 Claude 实例的职责，不引用默认 WSL 名称，避免与当前选择的实例不一致。
-  node.append(element("h1", "", isClaude() ? "开始 Claude 会话" : "继续本机的工作"),
-    element("p", "", isClaude() ? "选择项目，输入消息开始工作。" : "选择左侧会话，发送会话。"),
-    element("small", "", isClaude()
+  // 用户要求说明所选实例的职责，不引用默认 WSL 名称，避免与当前选择的实例不一致。
+  const claude = isClaude(), antigravity = isAntigravity();
+  node.append(element("h1", "", claude ? "开始 Claude 会话" : antigravity ? "开始 Antigravity 会话" : "继续本机的工作"),
+    element("p", "", claude || antigravity ? "选择项目，输入消息开始工作。" : "选择左侧会话，发送会话。"),
+    element("small", "", claude
       ? "消息、工具和上下文由所选 Claude 实例处理。"
-      : "消息、审批和执行状态与 Codex 桌面共享。"));
+      : antigravity
+        ? "消息、工具和上下文经官方 ACP 协议由所选 Antigravity 实例处理。"
+        : "消息、审批和执行状态与 Codex 桌面共享。"));
   return node;
 }

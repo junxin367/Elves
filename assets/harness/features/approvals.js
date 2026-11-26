@@ -19,7 +19,7 @@ import { syncPendingFeedbackTimer } from "./composer/composer.js";
 import { pendingFeedbackReady } from "./composer/send-state.js";
 import { reconcileChildren } from "./messages/item-presentation.js";
 import { setMarkdown } from "./messages/media.js";
-import { approvalsAllowed, isClaude, threadReadOnly } from "./session/capabilities.js";
+import { approvalsAllowed, isAntigravity, isClaude, threadReadOnly } from "./session/capabilities.js";
 import { syncWorkspaceSidePanelState } from "./session/side-panel.js";
 
 function renderAsyncQuestion(card, request, requestThreadId) {
@@ -170,7 +170,8 @@ export function renderApprovals() {
     } else if (toolApproval) renderMcpToolApproval(card, toolApproval);
     else if (request.method === "item/commandExecution/requestApproval") renderCommandApproval(card, request.params);
     else {
-      card.append(element("strong", "", request.method === "item/tool/requestUserInput" ? `${isClaude() ? "Claude" : "Codex"} 需要你回答` : "等待你的授权"));
+      card.append(element("strong", "", request.method === "item/tool/requestUserInput"
+        ? `${isClaude() ? "Claude" : isAntigravity() ? "Antigravity" : "Codex"} 需要你回答` : "等待你的授权"));
       const description = request.params?.command || request.params?.reason || request.params?.message || request.method;
       card.append(element("pre", "approval-description", typeof description === "string" ? description : JSON.stringify(description, null, 2)));
     }

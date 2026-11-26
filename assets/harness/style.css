@@ -457,6 +457,8 @@ html[data-workspace-side-panel=true] .composer-anchor>.composer-metrics,
 .claude-usage-title-text{min-width:0;flex:0 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 /* 等级通过自动左边距保持在行右侧，不再把紧跟账号的眼睛挤到末尾；320px 弹层和手机字号保持不变。 */
 .claude-usage-subscription{display:inline-block;flex:0 1 auto;min-width:0;max-width:128px;height:20px;margin-left:auto;padding:0 6px;border:1px solid color-mix(in srgb,#ad83e7 45%,transparent);border-radius:6px;background:color-mix(in srgb,#ad83e7 15%,transparent);color:color-mix(in srgb,#ad83e7 65%,var(--text));font-size:11px;font-weight:600;line-height:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.claude-usage-subscription.is-warning{border-color:color-mix(in srgb,var(--danger) 45%,transparent);background:color-mix(in srgb,var(--danger) 14%,transparent);color:var(--danger)}
+.antigravity-usage-note{margin:6px 0 0;color:var(--muted);font-size:11px;line-height:1.45;white-space:normal}
 /* 用户指定眼睛开关紧跟账号文本；使用现有 eye/eyeOff 图标，不增加文字按钮。 */
 .claude-usage-account-toggle{display:inline-grid;place-items:center;flex:0 0 24px;width:24px;height:20px;padding:0;border:0;border-radius:4px;background:transparent;color:var(--muted);cursor:pointer}
 .claude-usage-account-toggle:is(:hover,:active){background:var(--control-hover);color:var(--text)}
@@ -668,9 +670,11 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .sidebar-header-actions>.icon-button>.ui-icon{flex:0 0 16px;width:16px;height:16px}
 .sidebar-header strong{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
 .sidebar-type-filter[data-backend=claude]{color:#d97757}
+.sidebar-type-filter[data-backend=antigravity]{color:#3186ff}
 .sidebar-type-filter[data-backend=codex]{color:var(--text)}
 /* 筛选改为实例 ID 后仍保留用户要求的品牌配色，兼容旧类型值与各实例值。 */
 .sidebar-type-popup .popup-option:is([data-value=claude],[data-value^="claude:"])>.ui-icon{color:#d97757}
+.sidebar-type-popup .popup-option:is([data-value=antigravity],[data-value^="antigravity:"])>.ui-icon{color:#3186ff}
 .sidebar-type-popup .popup-option:is([data-value=codex],[data-value^="codex:"])>.ui-icon{color:var(--text);color:light-dark(var(--text),#fff)}
 /* 用户要求实例多选：预留 16px 勾选区，连续选择时文字位置不因勾选出现或消失而跳动。 */
 .sidebar-type-popup .choice-check{width:16px;text-align:center}
@@ -695,6 +699,7 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 :is(.select-trigger,.popup-option)>.ui-icon[data-backend]{flex:0 0 1em;width:1em;height:1em}
 .select-trigger:has(>.ui-icon[data-backend])>.select-label{flex:1}
 :is(.select-trigger,.popup-option)>.ui-icon[data-backend=claude]{color:#d97757}
+:is(.select-trigger,.popup-option)>.ui-icon[data-backend=antigravity]{color:#3186ff}
 :is(.select-trigger,.popup-option)>.ui-icon[data-backend=codex]{color:var(--text);color:light-dark(var(--text),#fff)}
 .select-label,.thread-label,.project-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .section-label{padding:4px 8px 0;min-height:36px;gap:8px}
@@ -854,6 +859,7 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 /* 用户要求 Claude 保持品牌橙色；菜单需兼容旧值 claude 与 claude:local / claude:wsl:… 实例 ID。
    颜色仅作用于指定位置的图标，不染文字、Codex 或勾选。 */
 .new-chat-backend>.backend-icon-claude,.backend-picker-popup .popup-option:is([data-value=claude],[data-value^="claude:"])>.ui-icon,.thread-link>.claude-session-icon,.thread-label-line>.claude-session-icon,.thread-backend-icon[data-backend=claude]{color:#d97757}
+.new-chat-backend>.backend-icon-antigravity,.backend-picker-popup .popup-option:is([data-value=antigravity],[data-value^="antigravity:"])>.ui-icon,.thread-link>.antigravity-session-icon,.thread-label-line>.antigravity-session-icon,.thread-backend-icon[data-backend=antigravity]{color:#3186ff}
 /* 用户指定 Codex 白色结形标识；深色主题使用纯白，浅色沿用文字色以免不可见，旧浏览器仍可继承主题文字色。 */
 .new-chat-backend>.backend-icon-codex,.backend-picker-popup .popup-option[data-value=codex]>.ui-icon,.thread-link>.codex-session-icon,.thread-label-line>.codex-session-icon,.thread-backend-icon[data-backend=codex]{color:var(--text);color:light-dark(var(--text),#fff)}
 /* 会话类型和项目选择器共用通用 Select 的勾选、鼠标悬停与键盘轮廓，不再单独定义选中填色。 */
@@ -2174,6 +2180,7 @@ body{font-weight:var(--ui-font-weight,400)}
 .instance-settings-target .select-label,.instance-settings-content .select-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .instance-settings-brand{flex:0 0 1.15em;width:1.15em;height:1.15em;color:var(--text)}
 .instance-settings-brand[data-backend=claude]{color:#d97757}
+.instance-settings-brand[data-backend=antigravity]{color:#3186ff}
 .instance-settings-section-heading{display:flex;align-items:center;gap:8px}
 .instance-settings-content .appearance-section{margin-bottom:14px}
 .instance-settings-content .appearance-section:not(:first-child){margin-top:26px}

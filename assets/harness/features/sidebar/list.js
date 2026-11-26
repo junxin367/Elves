@@ -14,7 +14,7 @@ import { newChatProjectOptions } from "../composer/creation-state.js";
 import { changeCreationProject } from "../composer/new-chat.js";
 import { startNewChat } from "../conversation/selection.js";
 import { markVisibleThreadRead } from "../messages/user-content.js";
-import { claudeThreadId, isActiveThread, privateInputScope, threadReadOnly } from "../session/capabilities.js";
+import { antigravityThreadId, claudeThreadId, isActiveThread, privateInputScope, threadReadOnly } from "../session/capabilities.js";
 import { foregroundReadGeneration, initialAuthenticationRequired } from "../session/connection-state.js";
 import { enabledInstanceIds } from "../session/instances.js";
 import { threadOpenInMenu } from "../session/open-in.js";
@@ -341,12 +341,13 @@ export function renderSidebar() {
     } else title.replaceChildren(element("span", "thread-label", item.title));
     if (selectedId === item.id) title.setAttribute("aria-current", "page");
     const attention = attentionFor(item);
-    // 用户要求 Codex 与 Claude 列表均显示对应品牌，置顶不再用通用聊天图标；
+    // 用户要求 Codex、Claude 与 Antigravity 列表均显示对应品牌，置顶不再用通用聊天图标；
     // 最近列表仅在标题行放图标，与项目/置顶列表共用 1em 尺寸、3px 间距和文字居中对齐规则。
-    const backend = item.backend === "claude" || claudeThreadId(item.id) ? "claude" : "codex";
+    const backend = item.backend === "claude" || claudeThreadId(item.id) ? "claude"
+      : item.backend === "antigravity" || antigravityThreadId(item.id) ? "antigravity" : "codex";
     const mark = icon(backend);
     mark.classList.add("session-type-icon", `${backend}-session-icon`);
-    mark.title = backend === "claude" ? "Claude" : "Codex";
+    mark.title = backend === "claude" ? "Claude" : backend === "antigravity" ? "Antigravity" : "Codex";
     titleLine.prepend(mark);
     container.append(title);
     if (attention !== "idle") {

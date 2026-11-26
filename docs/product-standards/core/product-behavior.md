@@ -653,3 +653,12 @@ Elves 重新启动时，退出前仍在执行或等待的会话按保存的原�
 用户要求改用 Claude Agent SDK 对接后，新版本不兼容旧版本的 daemon 后台任务：不识别终端画面、不 attach、不迁移也不停止旧任务，旧版遗留的后台任务仍持有会话时按[会话被其他应用持有](#会话被其他应用持有)处理，旧版本自己的存档字段、清理记录和后台任务原样保留。
 
 Claude 新建及恢复会话都必须使用当前 WSL 用户的有效登录时区：宿主和 CLI 都经目标发行版、用户和 Home 目录的登录 shell 启动（`--exec /bin/bash -lc 'exec "$@"'`），直接继承该用户的有效时区，不读取 Windows 主机时区，不强制重启统一 daemon，不修改系统时区或用户全局 Claude 设置。
+
+### Antigravity ACP 实例
+
+Antigravity 实例同时识别 Windows 本机（`agy.exe`、`%LOCALAPPDATA%\agy\bin\agy.exe`）与已安装 `agy` 的 WSL 发行版环境；在「设置 → 会话实例」中按实例独立启用与停用，默认关闭，启用后可参与侧栏发现、筛选与新建会话。
+
+所有 Antigravity 会话交互、模型与思考深度读取、权限模式切换、命令列表、账号等级与会话发现必须严格经官方 CLI 的 ACP（Agent Client Protocol，`agy acp`）协议完成；不得绕过官方 CLI 直接读写内部数据库、配置文件或提取凭据。
+
+- **已支持能力**：本机与 WSL 实例自动识别；通过 ACP `session/list` 发现历史会话、`session/new` / `session/load` / `session/resume` / `session/prompt` / `session/cancel` 执行对话；流式正文、思考过程、工具调用（命令/文件变更/通用工具）、计划、审批与交互式提问、图片与文件附件；输入区模型、思考深度（`thought_level`）与四种 ACP 权限模式（`default` / `accept-edits` / `auto` / `plan`）；消息排队（入队、引导、编辑、删除、拖动排序）、持续目标（`/goal` 与暂停/继续/编辑/删除）、历史消息重新编辑（经 ACP 新建会话与官方 `_meta.antigravity.systemPrompt.append` 注入保留历史重放）以及底栏 ACP 订阅等级（`_meta.antigravity.tier`）与 ACP 实测会话 Token 统计弹层。
+- **受 ACP 协议限制的能力**：官方 `agy acp` 未提供 5h/7d 剩余额度百分比、重置倒计时与 Google 账号邮箱，弹层如实展示官方订阅等级、CLI 状态、ACP 会话 Token 及协议限制说明；官方 ACP 未提供 `session/delete`、原生 `session/fork`、工作区文件回退、手动 `/compact`、全局权限/指令文件编辑及独立子代理/侧边会话列表，移除会话仅从 Elves 列表移除并保留原生 CLI 历史。
