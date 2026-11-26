@@ -1,5 +1,5 @@
 //! Codex 仅是执行引擎；连接、请求关联和事件接收由 Harness 统一管理。
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -391,10 +391,61 @@ impl Runtime {
         let Some(home) = connection.codex_home.clone() else {
             return Ok(false);
         };
-        let id = id.to_owned();
-        tokio::task::spawn_blocking(move || thread_writer_locked(&home, &id))
+        let lock_id = id.to_owned();
+        let locked = tokio::task::spawn_blocking(move || thread_writer_locked(&home, &lock_id))
             .await
-            .context("检查 Codex 会话占用失败")?
+            .context("检查 Codex 会话占用失败")??;
+        if !locked || connection.transport != ServiceTransport::PrivateServer {
+            return Ok(locked);
+        }
+        // 用户要求重启、升级或重连后，Elves 私有服务保留的会话不能误报为外部占用。
+        // loaded 只证明本连接已应用写入配置；缺少记录时须只读核对当前私有服务的真实归属，
+        // 不能补写 loaded、resume 会话或查询 Codex App，否则会跳过后续配置加载或抢占外部会话。
+        let mut params = json!({"limit":100});
+        let mut cursors = HashSet::new();
+        loop {
+            execution::transport(
+                connection.transport.execution_label(),
+                "thread/loaded/list",
+                false,
+            );
+            let page = connection
+                .request("thread/loaded/list", params.clone(), None)
+                .await
+                .context("核对 Elves 私有服务会话归属失败")?;
+            anyhow::ensure!(
+                connection.alive.load(Ordering::Acquire),
+                "核对会话归属时 Elves 私有服务连接已断开，请重试"
+            );
+            let rows = page["data"]
+                .as_array()
+                .context("Elves 私有服务的已加载会话列表格式无效")?;
+            let mut owned = false;
+            for row in rows {
+                let loaded_id = row
+                    .as_str()
+                    .or_else(|| row["id"].as_str())
+                    .or_else(|| row["threadId"].as_str())
+                    .filter(|id| !id.is_empty())
+                    .context("Elves 私有服务返回了无效的已加载会话 ID")?;
+                owned |= loaded_id == id;
+            }
+            if owned {
+                return Ok(false);
+            }
+            // 只有完整查完仍未找到目标，才能把原生锁判为外部持有；失败或分页异常保留真实错误。
+            let cursor = match page.get("nextCursor") {
+                None | Some(Value::Null) => return Ok(true),
+                Some(Value::String(cursor)) if cursor.is_empty() => return Ok(true),
+                Some(Value::String(cursor)) => cursor,
+                _ => bail!("Elves 私有服务的已加载会话分页游标无效"),
+            };
+            anyhow::ensure!(
+                cursors.insert(cursor.clone()),
+                "Elves 私有服务的已加载会话分页游标重复"
+            );
+            params["cursor"] = json!(cursor);
+        }
     }
 
     pub async fn invalidate_read(&self, scope: &str) {
@@ -653,15 +704,41 @@ mod tests {
     const TEST_ENGINE_SCRIPT: &str = r#"
 const readline = require('readline');
 const input = readline.createInterface({input: process.stdin});
+let loadedPages = {'': {data: [], nextCursor: null}};
+const reads = [];
 input.on('line', line => {
   const request = JSON.parse(line);
-  if (request.id !== undefined) {
-    process.stdout.write(JSON.stringify({id: request.id, result: {userAgent: 'test-engine'}}) + '\n');
+  if (request.id === undefined) return;
+  let result;
+  switch (request.method) {
+    case 'initialize': result = {userAgent: 'test-engine'}; break;
+    case 'test/loadedPages': loadedPages = request.params; result = {}; break;
+    case 'test/reads': result = reads; break;
+    case 'thread/loaded/list': {
+      reads.push(request);
+      const page = loadedPages[request.params.cursor || ''];
+      if (!page || page.error) {
+        process.stdout.write(JSON.stringify({id: request.id,
+          error: page?.error || {code: -32602, message: 'unknown cursor'}}) + '\n');
+        return;
+      }
+      result = page;
+      break;
+    }
+    default:
+      process.stdout.write(JSON.stringify({id: request.id,
+        error: {code: -32601, message: 'unexpected write or read: ' + request.method}}) + '\n');
+      return;
   }
+  process.stdout.write(JSON.stringify({id: request.id, result}) + '\n');
 });
 "#;
 
     async fn runtime_with_transport(transport: ServiceTransport) -> Runtime {
+        runtime_with_home(transport, None).await
+    }
+
+    async fn runtime_with_home(transport: ServiceTransport, codex_home: Option<PathBuf>) -> Runtime {
         let (events, _receiver) = mpsc::channel(8);
         let runtime = Runtime::new(events, Arc::new(execution::Audit::default()));
         let mut command = tokio::process::Command::new("node");
@@ -673,14 +750,134 @@ input.on('line', line => {
             .kill_on_drop(true);
         #[cfg(windows)]
         command.creation_flags(crate::windows_create_hidden_process());
-        let process = RunningService::for_test_with_transport(
+        let mut process = RunningService::for_test_with_transport(
             command.spawn().expect("启动隔离测试引擎失败"),
             transport,
         )
         .expect("构造隔离测试服务失败");
+        process.codex_home = codex_home;
         runtime.install_test_process(process).await;
         runtime.connection().await.expect("隔离测试引擎初始化失败");
         runtime
+    }
+
+    fn hold_writer(home: &Path, id: &str) -> std::fs::File {
+        let locks = home.join("thread-writer-locks");
+        std::fs::create_dir_all(&locks).unwrap();
+        let owner = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(locks.join(format!("{id}.lock")))
+            .unwrap();
+        owner.lock().unwrap();
+        owner
+    }
+
+    #[tokio::test]
+    async fn private_writer_survives_missing_or_old_connection_ownership() {
+        let directory = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let _owner = hold_writer(directory.path(), &id);
+        let runtime = runtime_with_home(
+            ServiceTransport::PrivateServer,
+            Some(directory.path().to_owned()),
+        )
+        .await;
+        runtime
+            .request(
+                "test/loadedPages",
+                json!({"":{"data":[id],"nextCursor":null}}),
+                None,
+            )
+            .await
+            .unwrap();
+        for ownership in [None, Some("previous-connection")] {
+            assert!(
+                !runtime.external_thread_writer(&id, ownership).await.unwrap(),
+                "重启或重连后，私有服务仍持有的会话不能变成外部占用"
+            );
+        }
+        // 已加载列表包含空闲和执行中会话；核对归属无需恢复会话或提前套用写入配置。
+        let reads = runtime.request("test/reads", json!({}), None).await.unwrap();
+        assert_eq!(reads.as_array().unwrap().len(), 2);
+        assert!(thread_writer_locked(directory.path(), &id).unwrap());
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn private_writer_checks_all_pages_and_rechecks_released_ownership() {
+        let directory = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let owner = hold_writer(directory.path(), &id);
+        let runtime = runtime_with_home(
+            ServiceTransport::PrivateServer,
+            Some(directory.path().to_owned()),
+        )
+        .await;
+        let first_page: Vec<_> = (0..100)
+            .map(|_| uuid::Uuid::new_v4().to_string())
+            .collect();
+        runtime
+            .request(
+                "test/loadedPages",
+                json!({
+                    "":{"data":first_page,"nextCursor":"page-2"},
+                    "page-2":{"data":[{"threadId":id}],"nextCursor":null}
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!runtime.external_thread_writer(&id, None).await.unwrap());
+        let reads = runtime.request("test/reads", json!({}), None).await.unwrap();
+        assert_eq!(reads.as_array().unwrap().len(), 2);
+        assert_eq!(reads[1]["params"]["cursor"], "page-2");
+
+        // 原生服务已卸载而锁转交给别的应用时，不得沿用上一次归属结果放行。
+        runtime
+            .request(
+                "test/loadedPages",
+                json!({"":{"data":[],"nextCursor":null}}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(runtime.external_thread_writer(&id, None).await.unwrap());
+        owner.unlock().unwrap();
+        assert!(!runtime.external_thread_writer(&id, None).await.unwrap());
+        let reads = runtime.request("test/reads", json!({}), None).await.unwrap();
+        assert_eq!(reads.as_array().unwrap().len(), 3, "无锁时无需查询原生归属");
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn private_writer_rejects_incomplete_or_failed_ownership_checks() {
+        let directory = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let _owner = hold_writer(directory.path(), &id);
+        let runtime = runtime_with_home(
+            ServiceTransport::PrivateServer,
+            Some(directory.path().to_owned()),
+        )
+        .await;
+        for pages in [
+            json!({"":{"error":{"code":-32000,"message":"native inspection failed"}}}),
+            json!({"":{"data":null,"nextCursor":null}}),
+            json!({"":{"data":[{}],"nextCursor":null}}),
+            json!({"":{"data":[],"nextCursor":42}}),
+            json!({"":{"data":[],"nextCursor":"loop"},"loop":{"data":[],"nextCursor":"loop"}}),
+        ] {
+            runtime
+                .request("test/loadedPages", pages.clone(), None)
+                .await
+                .unwrap();
+            assert!(
+                runtime.external_thread_writer(&id, None).await.is_err(),
+                "归属查询不完整时不能假定锁属于外部或本服务：{pages}"
+            );
+        }
+        runtime.shutdown().await;
     }
 
     #[tokio::test]
