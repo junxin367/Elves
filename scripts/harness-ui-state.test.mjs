@@ -18805,3 +18805,59 @@ test("Antigravity 历史会话在详情尚未加载时也能识别已启用实�
   assert.match(instanceSettingsSource, /\["claude", "antigravity"\]\.includes\(record\.backend\)/);
   assert.match(instanceSettingsSource, /name === "hooks" \? "hook" : "server"/);
 });
+
+test("Token 明细只显示 Token 和费用，不显示单价、公式或介绍", () => {
+  const h = composerMetricsHarness(), c = h.context;
+  const billing = { models: ["model-a"], rows: [
+    { kind: "input", tokens: 18400, costUsd: .0368 },
+    { kind: "output", tokens: 4800, costUsd: .048 },
+    { kind: "cacheRead", tokens: 63200, costUsd: .01264 },
+  ], totalTokens: 86400, totalCostUsd: .09744 };
+  const value = c.normalizeComposerMetrics(h.value({ billing }));
+  const content = c.composerMetricsDetail(value, [["工具耗时", "31.2s"]]);
+  const root = c.element("div", "");
+  content.render(root, false, () => {});
+  assert.match(root.textContent, /model-a类型Token费用 \$/);
+  assert.match(root.textContent, /输入18,4000\.0368输出4,8000\.0480缓存读取63,2000\.0126/);
+  assert.match(root.textContent, /合计86,4000\.0974/);
+  assert.doesNotMatch(root.textContent, /单价|公式|口径|未缓存|其中|每百万|会话累计/);
+});
+
+test("Token 明细保留未知费用，极小非零费用不显示免费，非法快照不能补齐合计", () => {
+  const h = composerMetricsHarness(), c = h.context;
+  const billing = { models: ["model-a"], rows: [
+    { kind: "input", tokens: 10, costUsd: .000001 },
+    { kind: "output", tokens: 5, costUsd: null },
+    { kind: "cacheRead", tokens: 20, costUsd: .00001 },
+  ], totalTokens: 35, totalCostUsd: .000011 };
+  const value = c.normalizeComposerMetrics(h.value({ billing }));
+  assert.equal(value.billing.totalCostUsd, null);
+  const root = c.element("div", "");
+  c.composerMetricsDetail(value, []).render(root, false, () => {});
+  assert.match(root.textContent, /<0\.0001/);
+  assert.match(root.textContent, /输出5—/);
+  assert.match(root.textContent, /合计35—/);
+  const invalid = structuredClone(billing);
+  invalid.rows.push(invalid.rows[0]);
+  assert.equal(c.normalizeComposerMetrics(h.value({ billing: invalid })).billing, null);
+  invalid.rows = [{ kind: "input", tokens: -1, costUsd: 1 }];
+  assert.equal(c.normalizeComposerMetrics(h.value({ billing: invalid })).billing, null);
+  const oldClaude = c.normalizeComposerMetrics(h.value({ source: "claude-native", billing: null,
+    inputTokens: 150, cachedInputTokens: 40, outputTokens: 20, turnTokens: 170 }));
+  const legacyRoot = c.element("div", "");
+  c.composerMetricsDetail(oldClaude, []).render(legacyRoot, false, () => {});
+  assert.doesNotMatch(legacyRoot.textContent, /输入/, "没有缓存写入明细时不能把含写入的 Token 当成普通输入");
+});
+
+test("Token 明细按当前轮次更新，切换会话和等待新轮统计时清理旧浮层", async () => {
+  const h = composerMetricsHarness(), c = h.context, updates = [], cleared = [];
+  c.composerTooltips = { update: (_node, _title, content) => updates.push(content),
+    clearContent: node => cleared.push(node) };
+  c.syncComposerMetrics(); h.complete(); await h.flush();
+  assert.ok(updates.at(-1));
+  c.turns.set("next", { id: "next", items: [] });
+  c.renderComposerMetrics();
+  assert.equal(updates.at(-1), null);
+  c.resetComposerMetrics();
+  assert.equal(cleared.at(-1), h.node);
+});

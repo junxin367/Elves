@@ -90,6 +90,7 @@ mod recent_priority;
 mod scheduled_messages;
 mod scheduled_tasks;
 mod session_metrics;
+mod session_metrics_cost;
 mod shared_settings;
 
 mod service;
@@ -2059,6 +2060,7 @@ impl HarnessController {
                 .unwrap_or(Value::Null)
             };
             let metrics = session_metrics::with_cache_expiry(metrics, id);
+            let metrics = session_metrics_cost::enrich(metrics, &self.state_dir);
             let backend = if claude_thread {
                 "claude"
             } else if antigravity_thread {

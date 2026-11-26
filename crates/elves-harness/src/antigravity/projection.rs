@@ -1275,10 +1275,11 @@ pub(crate) fn compute_session_metrics(
     });
     if let Some(total) = cumulative_total {
         metrics["totalTokens"] = json!(total);
-        metrics["inputTokens"] = json!(total_input);
-        metrics["outputTokens"] = json!(total_output);
-        metrics["cachedInputTokens"] = json!(total_cached);
-        metrics["reasoningTokens"] = json!(total_thought);
+        // 账号页使用会话累计，输入区使用本轮；分开保存，避免修正本轮缓存时改变账号页统计口径。
+        if has_turn_usage {
+            metrics["sessionTokens"] = json!({"inputTokens":total_input,"outputTokens":total_output,
+                "cachedInputTokens":total_cached,"reasoningTokens":total_thought});
+        }
     }
     if let Some(steps) = estimate_turn_steps(turn) {
         metrics["steps"] = json!(steps);
@@ -1307,6 +1308,9 @@ pub(crate) fn compute_session_metrics(
             metrics["turnTokens"] = json!(turn_total);
             metrics["inputTokens"] = json!(turn_in);
             metrics["outputTokens"] = json!(turn_out);
+            // 明细属于当前轮次，不能把整个会话的缓存累计量放入本轮表格。
+            metrics["cachedInputTokens"] = u.get("cachedReadTokens")
+                .or_else(|| u.get("cachedInputTokens")).cloned().unwrap_or(Value::Null);
         }
         if turn_in > 0 && turn_cached > 0 {
             let denom = turn_in.max(turn_cached) as f64;
@@ -1397,6 +1401,12 @@ pub(crate) fn compute_session_metrics(
     } else if let Some(window) = super::local_store::known_antigravity_context_window(fallback_model) {
         metrics["modelContextWindow"] = json!(window);
     }
+    if let Some(usage) = last_usage {
+        // ACP 汇总不能代替逐次调用的模型和上下文；无转录明细时仅展示 Token，不猜测费用。
+        crate::session_metrics_cost::attach(
+            &mut metrics, usage["billingParts"].clone(), usage["billingComplete"] != false,
+        );
+    }
     metrics
 }
 
@@ -1411,10 +1421,11 @@ pub(crate) fn aggregate_instance_acp_tokens(
     let mut thought = 0u64;
     for entry in conversations.values() {
         sessions += 1;
-        input = input.saturating_add(entry["inputTokens"].as_u64().unwrap_or(0));
-        output = output.saturating_add(entry["outputTokens"].as_u64().unwrap_or(0));
-        cached = cached.saturating_add(entry["cachedInputTokens"].as_u64().unwrap_or(0));
-        thought = thought.saturating_add(entry["reasoningTokens"].as_u64().unwrap_or(0));
+        let totals = entry.get("sessionTokens").filter(|value| value.is_object()).unwrap_or(entry);
+        input = input.saturating_add(totals["inputTokens"].as_u64().unwrap_or(0));
+        output = output.saturating_add(totals["outputTokens"].as_u64().unwrap_or(0));
+        cached = cached.saturating_add(totals["cachedInputTokens"].as_u64().unwrap_or(0));
+        thought = thought.saturating_add(totals["reasoningTokens"].as_u64().unwrap_or(0));
     }
     json!({
         "sessions": sessions,
@@ -1424,4 +1435,28 @@ pub(crate) fn aggregate_instance_acp_tokens(
         "cachedInputTokens": cached,
         "reasoningTokens": thought,
     })
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::*;
+
+    #[test]
+    fn session_metrics_antigravity_separates_current_turn_and_session_totals() {
+        let turns = vec![
+            json!({"id":"first","_acpUsage":{"inputTokens":100,"uncachedInputTokens":60,
+                "cachedReadTokens":40,"outputTokens":10,"totalTokens":110}}),
+            json!({"id":"last","_acpUsage":{"inputTokens":200,"uncachedInputTokens":50,
+                "cachedReadTokens":150,"outputTokens":20,"totalTokens":220}}),
+        ];
+        let metrics = compute_session_metrics(&turns, &Value::Null, "model", 1000);
+        assert_eq!(metrics["inputTokens"], 200);
+        assert_eq!(metrics["cachedInputTokens"], 150);
+        assert_eq!(metrics["turnTokens"], 220);
+        assert_eq!(metrics["totalTokens"], 330);
+        let aggregate = aggregate_instance_acp_tokens(&BTreeMap::from([("session".into(), metrics)]));
+        assert_eq!(aggregate["inputTokens"], 300);
+        assert_eq!(aggregate["cachedInputTokens"], 190);
+        assert_eq!(aggregate["totalTokens"], 330);
+    }
 }

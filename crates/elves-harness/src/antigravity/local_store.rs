@@ -447,6 +447,25 @@ pub(crate) fn parse_transcript_jsonl(text: &str) -> LocalTranscript {
                 let prev_out = prev["outputTokens"].as_u64().unwrap_or(0);
                 let prev_thought = prev["thoughtTokens"].as_u64().unwrap_or(0);
                 let prev_total = prev["totalTokens"].as_u64().unwrap_or(0);
+                // 用户要求按实际模型拆分本轮费用；保留每次原生调用，不能用最后一次模型覆盖前面的调用。
+                let mut billing_parts = prev["billingParts"].as_array().cloned().unwrap_or_default();
+                let mut billing_complete = prev["billingComplete"] != false;
+                if billing_parts.len() < crate::session_metrics_cost::MAX_PARTS {
+                    let actual_model = entry["model"].as_str()
+                        .map(|model| split_model_effort(model).0).unwrap_or_default();
+                    let input = entry["input_tokens"].as_u64().zip(entry["cache_read_tokens"].as_u64())
+                        .and_then(|(input, cached)| input.checked_add(cached));
+                    billing_parts.push(crate::session_metrics_cost::responses_part(
+                        &actual_model,
+                        &json!({"inputTokens":input,"outputTokens":entry["output_tokens"],
+                            "cachedInputTokens":entry["cache_read_tokens"],
+                            "reasoningOutputTokens":entry.get("thinking_tokens").or_else(||entry.get("thought_tokens"))}),
+                        true,
+                        &Value::Null,
+                    ));
+                } else {
+                    billing_complete = false;
+                }
                 turn["_acpUsage"] = json!({
                     "steps": prev_steps.saturating_add(1),
                     "inputTokens": prev_in.saturating_add(step_input),
@@ -457,6 +476,8 @@ pub(crate) fn parse_transcript_jsonl(text: &str) -> LocalTranscript {
                     "totalTokens": prev_total.saturating_add(step_total),
                     "lastObservedAtMs": if ts_ms > 0 { json!(ts_ms) } else { prev["lastObservedAtMs"].clone() },
                     "model": if !last_model.is_empty() { json!(last_model) } else { prev["model"].clone() },
+                    "billingParts": billing_parts,
+                    "billingComplete": billing_complete,
                 });
                 let items = turn["items"].as_array_mut().unwrap();
                 if let Some(thought) = thinking {

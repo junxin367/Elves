@@ -538,7 +538,11 @@ impl SideThread {
                     | "fileChange" | "imageGeneration" | "collabAgentToolCall"))
             });
             let observed_at = frame["emittedAtMs"].as_u64().unwrap_or_else(now_ms);
-            self.metrics.observe(id, &params["tokenUsage"], self.metadata["model"].as_str().unwrap_or(""),
+            let mut usage = params["tokenUsage"].clone();
+            if let Some(fields) = usage.as_object_mut() {
+                fields.insert("serviceTier".into(), self.metadata["serviceTier"].clone());
+            }
+            self.metrics.observe(id, &usage, self.metadata["model"].as_str().unwrap_or(""),
                 observed_at, has_model_output);
             return;
         }

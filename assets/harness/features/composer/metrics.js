@@ -23,15 +23,34 @@ function composerMetricsNumber(value) {
 export function composerMetricsHasTurn(value) {
   return ["tokensPerSecond", "steps", "turnTokens"].some(key => composerMetricsNumber(value?.[key]));
 }
+function normalizeComposerBilling(value) {
+  if (!value || !Array.isArray(value.rows) || value.rows.length > 6) return null;
+  const kinds = ["input", "output", "cacheRead", "cacheWrite5m", "cacheWrite1h", "cacheWrite"];
+  const rows = [], seen = new Set();
+  for (const row of value.rows) {
+    if (!kinds.includes(row?.kind) || seen.has(row.kind) || !Number.isSafeInteger(row.tokens) || row.tokens < 0) return null;
+    seen.add(row.kind);
+    rows.push({ kind: row.kind, tokens: row.tokens,
+      costUsd: composerMetricsNumber(row.costUsd) ? row.costUsd : null });
+  }
+  const totalTokens = Number.isSafeInteger(value.totalTokens) && value.totalTokens >= 0 ? value.totalTokens : null;
+  const complete = totalTokens != null && rows.reduce((sum, row) => sum + row.tokens, 0) === totalTokens
+    && rows.every(row => row.costUsd != null);
+  return { models: Array.isArray(value.models) ? [...new Set(value.models.filter(model =>
+    typeof model === "string" && model.trim() && model.length <= 256))].slice(0, 16) : [],
+    rows, totalTokens,
+    totalCostUsd: complete && composerMetricsNumber(value.totalCostUsd) ? value.totalCostUsd : null };
+}
 export function normalizeComposerMetrics(value, previous = null) {
   if (!value || !["codex-rollout", "codex-side", "claude-native", "antigravity-acp"].includes(value.source)
       || typeof value.turnId !== "string" || value.turnId.length > 120) return null;
   const result = { source: value.source, turnId: value.turnId };
   if (value.source === "codex-side" && value.totalIncomplete === true) result.totalIncomplete = true;
-  for (const key of ["inputTokens", "outputTokens", "turnTokens", "steps", "totalTokens", "durationMs", "tokensPerSecond", "firstTokenMs", "cacheExpiresAtMs", "cacheObservedAtMs", "cacheTtlMs"])
+  for (const key of ["inputTokens", "outputTokens", "cachedInputTokens", "turnTokens", "steps", "totalTokens", "durationMs", "tokensPerSecond", "firstTokenMs", "cacheExpiresAtMs", "cacheObservedAtMs", "cacheTtlMs"])
     result[key] = composerMetricsNumber(value[key])
       && (key === "tokensPerSecond" || Number.isSafeInteger(value[key])) ? value[key] : null;
   result.cacheHitRate = composerMetricsNumber(value.cacheHitRate) && value.cacheHitRate <= 1 ? value.cacheHitRate : null;
+  result.billing = normalizeComposerBilling(value.billing);
   result.cacheExpirySource = ["response", "request", "model-default"].includes(value.cacheExpirySource) ? value.cacheExpirySource : null;
   if (Object.hasOwn(value, "cacheRemainingMs")) {
     // 允许最长 24h 的已知 TTL；接收时折算为本机截止时间，避免手机与服务端时钟偏差，存档仅保留截止时间。
@@ -183,7 +202,10 @@ export function resetComposerMetrics() {
   }
   composerMetricsState = null;
   const node = $("#session-metrics");
-  if (node) node.hidden = true;
+  if (node) {
+    node.hidden = true;
+    composerTooltips?.clearContent?.(node);
+  }
 }
 export function fitComposerMetrics() {
   const node = $("#session-metrics");
@@ -255,13 +277,85 @@ function composerMetricsTurnTimings(turn, source) {
     compaction: compactions.size && Number.isSafeInteger(compaction) ? compaction : null,
     compactionObserved: [...compactions.values()].some(entry => entry.evidence === 0) };
 }
+function composerMetricsDetail(metrics, timings) {
+  let billing = metrics.billing;
+  if (!billing) {
+    const rows = [];
+    // 旧服务/缓存缺少缓存拆分时不把含缓存的总输入当成未缓存输入，也不按命中率反推 Token。
+    if (metrics.source !== "claude-native" && Number.isSafeInteger(metrics.inputTokens) && Number.isSafeInteger(metrics.cachedInputTokens)
+        && metrics.cachedInputTokens <= metrics.inputTokens)
+      rows.push({ kind: "input", tokens: metrics.inputTokens - metrics.cachedInputTokens, costUsd: null });
+    if (Number.isSafeInteger(metrics.outputTokens))
+      rows.push({ kind: "output", tokens: metrics.outputTokens, costUsd: null });
+    if (Number.isSafeInteger(metrics.cachedInputTokens) && metrics.cachedInputTokens > 0)
+      rows.push({ kind: "cacheRead", tokens: metrics.cachedInputTokens, costUsd: null });
+    billing = { models: [], rows, totalTokens: metrics.turnTokens, totalCostUsd: null };
+  }
+  if (!billing.rows.length && !timings.length) return null;
+  const titles = { input: "输入", output: "输出", cacheRead: "缓存读取",
+    cacheWrite5m: "缓存写入 5m", cacheWrite1h: "缓存写入 1h", cacheWrite: "缓存写入" };
+  const tokens = value => Number.isSafeInteger(value) && value >= 0 ? value.toLocaleString("en-US") : "—";
+  const cost = value => !composerMetricsNumber(value) ? "—" : value > 0 && value < .0001 ? "<0.0001" : value.toFixed(4);
+  const model = billing.models.join(" · ") || "Token 统计";
+  return {
+    key: JSON.stringify([metrics.turnId, billing, timings]),
+    label: [model, ...billing.rows.map(row => `${titles[row.kind]} ${tokens(row.tokens)} Token，费用 ${cost(row.costUsd)} 美元`)].join("。"),
+    render(node, pinned, close) {
+      // 用户确认简洁效果：只展示模型、Token、费用与关键耗时；不显示单价、公式、图表或口径介绍。
+      const header = element("div", "composer-metrics-detail-header");
+      const title = element("strong", "", model);
+      title.title = model;
+      header.append(title);
+      if (pinned) {
+        const dismiss = element("button", "composer-metrics-detail-close", "×");
+        dismiss.type = "button"; dismiss.setAttribute("aria-label", "关闭 Token 统计");
+        dismiss.addEventListener("click", close); header.append(dismiss);
+      }
+      node.append(header);
+      const body = element("div", "composer-metrics-detail-body");
+      if (billing.rows.length) {
+        const table = element("table", "");
+        table.setAttribute("aria-label", "本轮 Token 和估算费用");
+        const head = element("thead", ""), columns = element("tr", "");
+        for (const label of ["类型", "Token", "费用 $"]) {
+          const cell = element("th", "", label); cell.setAttribute("scope", "col"); columns.append(cell);
+        }
+        head.append(columns); table.append(head);
+        const rows = element("tbody", "");
+        for (const row of billing.rows) {
+          const tr = element("tr", "");
+          tr.append(element("td", "", titles[row.kind]), element("td", "", tokens(row.tokens)),
+            element("td", "", cost(row.costUsd)));
+          rows.append(tr);
+        }
+        table.append(rows);
+        if (Number.isSafeInteger(billing.totalTokens)) {
+          const foot = element("tfoot", ""), total = element("tr", "");
+          total.append(element("td", "", "合计"), element("td", "", tokens(billing.totalTokens)),
+            element("td", "", cost(billing.totalCostUsd)));
+          foot.append(total); table.append(foot);
+        }
+        body.append(table);
+      }
+      if (timings.length) {
+        const grid = element("div", "composer-metrics-detail-timings");
+        for (const [label, value] of timings) {
+          const row = element("div", "");
+          row.append(element("span", "", label), element("b", "", value)); grid.append(row);
+        }
+        body.append(grid);
+      }
+      node.append(body);
+    }
+  };
+}
 export function renderComposerMetrics() {
   const node = $("#session-metrics"), state = composerMetricsState;
   if (state) { clearTimeout(state.cacheTimer); state.cacheTimer = null; }
   if (!node) return;
   const value = state?.value;
   node.hidden = !value;
-  if (!value) return;
+  if (!value) { composerTooltips?.clearContent?.(node); return; }
   const latest = composerMetricsLatestTurn(state);
   // 用户要求新轮次等待统计时保留上一轮完整显示；快照仍保留原 turnId，不能伪造为新轮次实测。
   const sameTurn = !latest || !value.turnId || latest.id === value.turnId;
@@ -313,7 +407,13 @@ export function renderComposerMetrics() {
     node.replaceChildren(...groups);
   }
   // 用户要求工具和压缩耗时只进入当前轮的 Token hover，不改底栏及其他页面；未返回字段整项省略。
-  const details = [];
+  const details = [], timingData = [];
+  const shortDuration = ms => ms < 1000 ? `${ms}ms` : ms < 60_000
+    ? `${Number((ms / 1000).toFixed(2))}s` : formatDuration(ms / 1000);
+  if (sameTurn && composerMetricsNumber(metrics?.firstTokenMs)) timingData.push(["首 Token", shortDuration(metrics.firstTokenMs)]);
+  if (sameTurn && composerMetricsNumber(metrics?.durationMs)) timingData.push(["本轮耗时", formatDuration(metrics.durationMs / 1000)]);
+  if (sameTurn && composerMetricsNumber(metrics?.cacheHitRate)) timingData.push(["缓存命中", `${Number((metrics.cacheHitRate * 100).toFixed(1))}%`]);
+  if (sameTurn && composerMetricsNumber(metrics?.tokensPerSecond)) timingData.push(["输出速度", `${Math.round(metrics.tokensPerSecond)}tk/s`]);
   if (sameTurn && composerMetricsNumber(metrics?.firstTokenMs)) details.push(`首 Token 时间 ${composerMetricsDuration(metrics.firstTokenMs)}`);
   if (sameTurn && composerMetricsNumber(metrics?.durationMs)) details.push(`本轮耗时 ${formatDuration(metrics.durationMs / 1000)}`);
   if (sameTurn && composerMetricsNumber(metrics?.cacheHitRate)) details.push(`缓存命中率 ${Number((metrics.cacheHitRate * 100).toFixed(1))}%`);
@@ -328,15 +428,21 @@ export function renderComposerMetrics() {
     if (state.timings?.tool != null) {
       const basis = value.source === "claude-native" ? "（调用至结果）" : state.timings.toolObserved ? "（按事件计时）" : "";
       details.push(`工具耗时 ${display(state.timings.tool)}${basis}`);
+      timingData.push(["工具耗时", shortDuration(state.timings.tool)]);
     }
-    if (state.timings?.compaction != null)
+    if (state.timings?.compaction != null) {
       details.push(`上下文压缩耗时 ${display(state.timings.compaction)}${state.timings.compactionObserved ? "（按事件计时）" : ""}`);
+      timingData.push(["压缩耗时", shortDuration(state.timings.compaction)]);
+    }
   }
   const description = details.join(" · ");
   // 复用编辑区现有主题提示组件，不再创建一套 hover 配色或监听器。
   node.title = description;
-  node.setAttribute("aria-label", [labels.join("，"), description].filter(Boolean).join("。"));
-  composerTooltips?.update?.(node, description);
+  const content = sameTurn ? composerMetricsDetail(value, timingData) : null;
+  node.setAttribute("role", "button");
+  node.setAttribute("aria-haspopup", "dialog");
+  node.setAttribute("aria-label", [labels.join("，"), content?.label, description].filter(Boolean).join("。"));
+  composerTooltips?.update?.(node, description, content);
   fitComposerMetrics();
   if (connected && cache?.nextUpdateMs) {
     state.cacheTimer = setTimeout(() => {

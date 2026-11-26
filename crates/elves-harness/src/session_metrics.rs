@@ -8,6 +8,7 @@ use std::time::SystemTime;
 
 use elves_core::cache_expiry::{CacheExpiry, SessionCacheExpiry, infer_cache_expiry};
 use serde_json::{Value, json};
+use super::session_metrics_cost as billing;
 
 const SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 // 用户要求统计不能拖慢会话：只定位当前会话文件，首次最多尾读 8 MiB，后续只读追加；不扫描子代理或整个归档。
@@ -118,7 +119,7 @@ fn summary(
         "inputTokens":usage.map(|usage| usage.0),"outputTokens":usage.map(|usage| usage.1),
         "turnTokens":usage.map(|usage| usage.2),"steps":usage.map(|usage| usage.3),
         "durationMs":duration,"tokensPerSecond":speed,"firstTokenMs":first_token,
-        "cacheHitRate":cache_hit_rate})
+        "cacheHitRate":cache_hit_rate,"cachedInputTokens":cached_input})
 }
 
 /// 同一 assistant 的多段内容共用请求身份；重复快照和流式中间值只接替，不累计成多步。
@@ -207,6 +208,10 @@ pub(super) fn observe_claude(turn: &mut Value, frame: &Value) {
     if input.saturating_add(output) > SAFE_INTEGER {
         return;
     }
+    // 同一请求的流式接替不重复计费；低于已确认用量的快照不能回退对应的模型/缓存费用明细。
+    let billing_parts = billing::merge_claude_parts(&current["billingParts"], billing::claude_parts(message));
+    let billing_parts = if billing::parts_total(&billing_parts)
+        .is_some_and(|total| total != input.saturating_add(output)) { Value::Null } else { billing_parts };
     // 用户要求按原生记录倒计时：同一请求的流式接替及历史重读保留首次时间，不用刷新到达时间续期。
     let cache_observed = timestamp(&current["cacheObservedAtMs"])
         .or_else(|| timestamp(&current["observedAtMs"]))
@@ -223,7 +228,8 @@ pub(super) fn observe_claude(turn: &mut Value, frame: &Value) {
     });
     turn["_metricsRequests"][id] = json!({"inputTokens":input,"outputTokens":output,
         "cachedInputTokens":cached_input,"steps":steps,"observedAtMs":frame["timestampMs"],
-        "cacheObservedAtMs":cache_observed,"cacheModel":message["model"],"cacheExpiry":cache_expiry});
+        "cacheObservedAtMs":cache_observed,"cacheModel":message["model"],"cacheExpiry":cache_expiry,
+        "billingParts":billing_parts});
 }
 
 pub(super) fn claude(turns: &[Value]) -> Value {
@@ -262,6 +268,8 @@ pub(super) fn claude(turns: &[Value]) -> Value {
     let mut observed = None;
     let mut cached_input = 0_u64;
     let mut cache_known = true;
+    let mut billing_parts = Vec::new();
+    let mut billing_complete = true;
     for usage in latest
         .into_iter()
         .flat_map(|turn| turn["_metricsRequests"].as_object())
@@ -276,6 +284,13 @@ pub(super) fn claude(turns: &[Value]) -> Value {
             cache_known = false;
         }
         observed = observed.max(timestamp(&usage["observedAtMs"]));
+        if let Some(parts) = usage["billingParts"].as_array()
+            && billing_parts.len() + parts.len() <= billing::MAX_PARTS
+        {
+            billing_parts.extend(parts.iter().cloned());
+        } else {
+            billing_complete = false;
+        }
     }
     let duration = latest.and_then(|turn| {
         count(&turn["durationMs"]).or_else(|| {
@@ -304,6 +319,7 @@ pub(super) fn claude(turns: &[Value]) -> Value {
     if let Some((at, expiry, model)) = latest_cache {
         add_native_cache_expiry(&mut metrics, Some(at), model, expiry);
     }
+    billing::attach(&mut metrics, json!(billing_parts), billing_complete);
     metrics
 }
 
@@ -336,6 +352,8 @@ struct CodexSideRound {
     cached_input: Option<u64>,
     observed_at: u64,
     incomplete: bool,
+    billing_parts: Vec<Value>,
+    billing_incomplete: bool,
 }
 
 impl CodexSideMetrics {
@@ -375,6 +393,11 @@ impl CodexSideMetrics {
             .map(|(total, cached)| total.saturating_add(cached));
         round.observed_at = at;
         round.incomplete |= gap;
+        if round.billing_parts.len() < billing::MAX_PARTS {
+            round.billing_parts.push(billing::responses_part(model, last, true, &usage["serviceTier"]));
+        } else {
+            round.billing_incomplete = true;
+        }
         let previous = self.cache.as_ref().filter(|(_, name, _)| name == model)
             .and_then(|(_, _, expiry)| *expiry);
         let expiry = infer_cache_expiry("responses", model, &Value::Null, last, at, previous);
@@ -409,6 +432,7 @@ impl CodexSideMetrics {
         if let Some((at, model, expiry)) = &self.cache {
             add_native_cache_expiry(&mut metrics, Some(*at), model, *expiry);
         }
+        billing::attach(&mut metrics, json!(round.billing_parts), !round.incomplete && !round.billing_incomplete);
         metrics
     }
 }
@@ -416,6 +440,9 @@ impl CodexSideMetrics {
 #[derive(Clone, Default)]
 struct CodexMetrics {
     model: String,
+    service_tier: Value,
+    billing_parts: Vec<Value>,
+    billing_complete: bool,
     cache_request: Value,
     cache_expiry: Option<CacheExpiry>,
     cache_observed_at: Option<u64>,
@@ -462,6 +489,8 @@ impl CodexMetrics {
                     self.cache_observed_at = None;
                 }
                 self.model = model.to_owned();
+                self.service_tier = payload.get("service_tier").or_else(|| payload.get("serviceTier"))
+                    .cloned().unwrap_or(Value::Null);
                 // 保留原生记录明确提供的保留策略；没有记录时按该模型默认值估算。
                 self.cache_request = json!({});
                 for field in ["prompt_cache_options", "prompt_cache_retention"] {
@@ -491,6 +520,8 @@ impl CodexMetrics {
                     self.cached_input = Some(0);
                     self.tokens = 0;
                     self.steps = 0;
+                    self.billing_parts.clear();
+                    self.billing_complete = true;
                 }
             }
             Some("task_complete" | "task_completed" | "task_aborted" | "turn_aborted") => {
@@ -546,6 +577,13 @@ impl CodexMetrics {
                     self.tokens = self.tokens.saturating_add(tokens);
                     self.steps += 1;
                     self.observed = at;
+                    if self.billing_parts.len() < billing::MAX_PARTS && input.checked_add(output) == Some(tokens) {
+                        self.billing_parts.push(billing::responses_part(
+                            &self.model, last, false, &self.service_tier,
+                        ));
+                    } else {
+                        self.billing_complete = false;
+                    }
                 }
             }
             _ => {}
@@ -585,6 +623,7 @@ impl CodexMetrics {
             &self.model,
             self.cache_expiry,
         );
+        billing::attach(&mut metrics, json!(self.billing_parts), self.billing_complete);
         metrics
     }
 
@@ -996,6 +1035,34 @@ mod tests {
         assert_eq!(value["inputTokens"], 150);
         assert_eq!(value["outputTokens"], 40);
         assert_eq!(value["turnTokens"], 190);
+        let detail = billing::with_prices(value, &Value::Null);
+        assert_eq!(detail["billing"]["rows"][0]["tokens"], 100);
+        assert_eq!(detail["billing"]["rows"][1]["tokens"], 40);
+        assert_eq!(detail["billing"]["rows"][2]["tokens"], 20);
+        assert_eq!(detail["billing"]["rows"][3]["tokens"], 30);
+        assert!(detail["billing"]["totalCostUsd"].is_null());
+    }
+
+    #[test]
+    fn session_metrics_codex_keeps_model_and_tier_for_each_native_call() {
+        let mut parser = CodexMetrics::default();
+        for row in [
+            event("task_started", "2026-11-27T00:00:00Z", json!({"turn_id":"turn"})),
+            json!({"type":"turn_context","payload":{"model":"first-model","service_tier":"priority"}}),
+            usage(200, 200),
+            json!({"type":"turn_context","payload":{"model":"second-model","service_tier":"flex"}}),
+            usage(500, 300),
+            usage(500, 300),
+        ] {
+            parser.consume(&serde_json::to_vec(&row).unwrap());
+        }
+        let value = parser.value();
+        assert_eq!(value["_billingParts"].as_array().unwrap().len(), 2);
+        assert_eq!(value["_billingParts"][0]["model"], "first-model");
+        assert_eq!(value["_billingParts"][0]["serviceTier"], "priority");
+        assert_eq!(value["_billingParts"][1]["model"], "second-model");
+        assert_eq!(value["_billingParts"][1]["serviceTier"], "flex");
+        assert_eq!(billing::parts_total(&value["_billingParts"]), Some(500));
     }
 
     #[test]
