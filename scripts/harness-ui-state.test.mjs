@@ -2316,8 +2316,14 @@ test("Claude 额度区分缺失、真实 0%、非法和过期窗口，秒数与 
   assert.equal(windows.length, 2);
   assert.equal(windows[0].used, 0);
   assert.equal(windows[0].remaining, 100);
-  assert.equal(context.claudeUsageResetText(windows[0].resetAt), "2小时后");
-  assert.equal(context.claudeUsageResetText(windows[1].resetAt), "3天后");
+  assert.equal(context.claudeUsageResetText(windows[0].resetAt), "2h 18m");
+  assert.equal(context.claudeUsageResetText(windows[1].resetAt), "3d 6h");
+  assert.equal(context.claudeUsageResetText(context.Date.now() + (24 + 2) * 3600000), "1d 2h");
+  assert.equal(context.claudeUsageResetText(context.Date.now() + 24 * 3600000), "1d");
+  assert.equal(context.claudeUsageResetText(context.Date.now() + 3 * 3600000 + 5 * 60000), "3h 5m");
+  assert.equal(context.claudeUsageResetText(context.Date.now() + 3 * 3600000), "3h");
+  assert.equal(context.claudeUsageResetText(context.Date.now() + 25 * 60000), "25m");
+  assert.equal(context.claudeUsageResetText(context.Date.now() + 1000), "1m");
   for (const invalid of [-1, 101, NaN, Infinity, true, "24", null]) {
     const value = usage();
     value.fiveHour.usedPercentage = invalid;
@@ -2440,7 +2446,8 @@ test("Claude 额度详情仅点击开关，悬停和聚焦不展开，数据失�
   const first = nodes[0].children[1];
   assert.equal(first.children[0].children[1].textContent, "剩余 76%");
   assert.equal(first.children[1].children[0].style.width, "76%");
-  assert.equal(first.children[2].children[1].textContent, "2小时后");
+  assert.equal(first.children[2].children[1].textContent, "2h 18m");
+  assert.equal(nodes[0].children[2].children[2].children[1].textContent, "3d 6h");
   assert.equal(requests[1].payload.includeLocal, true, "仅打开弹窗时加载本地统计");
   trigger.onpointerleave?.();
   nodes[0].onpointerleave?.();
@@ -2521,7 +2528,7 @@ test("Claude 本地详情独立加载，不替换原生百分比，并按窗口�
     assert.equal(context.claudeUsageCompact(invalid), "—");
   assert.equal(context.claudeUsageCompact(0, true), "$0.00");
   assert.equal(context.claudeUsageCompact(7900000), "7.90M");
-  assert.equal(context.claudeUsageResetText(context.Date.now() + 25 * 60000), "25分钟后");
+  assert.equal(context.claudeUsageResetText(context.Date.now() + 25 * 60000), "25m");
 });
 
 test("Claude 预估总额度按未取整的原生已用比例反推，零值和缺失比例保持未知", () => {

@@ -98,10 +98,21 @@ function claudeUsageMaskAccount(account) {
 }
 function claudeUsageResetText(resetAt, now = Date.now()) {
   if (resetAt == null) return "时间未知";
-  const minutes = Math.ceil(Math.max(0, resetAt - now) / 60000);
-  // 用户要求仅显示最大时间单位，并固定在单行统计的最右侧。
-  return minutes >= 1440 ? `${Math.floor(minutes / 1440)}天后`
-    : minutes >= 60 ? `${Math.floor(minutes / 60)}小时后` : `${Math.max(1, minutes)}分钟后`;
+  const totalMinutes = Math.max(1, Math.ceil(Math.max(0, resetAt - now) / 60000));
+  // 用户要求将 Claude 额度重置倒计时从“x天/小时/分钟后”改为紧凑英文单位并固定在统计行右侧：
+  // 满 1 天显示“xd xh”（如 1d 2h，整天无剩余小时时显示“xd”）；
+  // 满 1 小时显示“xh xm”（如 3h 5m，整小时无剩余分钟时显示“xh”）；不足 1 小时显示“xm”。
+  if (totalMinutes >= 1440) {
+    const days = Math.floor(totalMinutes / 1440);
+    const hours = Math.floor((totalMinutes % 1440) / 60);
+    return hours ? `${days}d ${hours}h` : `${days}d`;
+  }
+  if (totalMinutes >= 60) {
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    return minutes ? `${hours}h ${minutes}m` : `${hours}h`;
+  }
+  return `${totalMinutes}m`;
 }
 function claudeUsageResetCountdownText(resetAt, now = Date.now()) {
   if (resetAt == null) return "时间未知";
