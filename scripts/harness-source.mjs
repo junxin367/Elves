@@ -97,6 +97,22 @@ export async function loadHarnessAppSource(root = defaultRoot) {
     const definitions = [];
     if (missing("localAppearance")) definitions.push(section("function localAppearance(", "function legacySharedAppearance("));
     if (missing("formatDuration")) definitions.push(section("function formatDuration("));
+    // 接入 Antigravity 后，被截取片段会引用下列跨区间辅助函数；默认装入真实实现，用例显式提供的同名桩优先。
+    const define = (name, start, end) => {
+      if (!Object.hasOwn(context, name)) definitions.push(section(start, end));
+    };
+    if (missing("conversationBackend") || missing("antigravityThreadId")) {
+      define("claudeThreadId", "function claudeThreadId(", "function antigravityThreadId(");
+      define("antigravityThreadId", "function antigravityThreadId(", "function activeBackend(");
+    }
+    if (missing("conversationBackend")) define("conversationBackend", "function conversationBackend(", "function privateInputScope(");
+    if (missing("isAntigravity"))
+      definitions.push('function isAntigravity() { return typeof activeBackend === "function" && activeBackend() === "antigravity"; }');
+    if (missing("sidebarSummaryForId")) {
+      if (!Object.hasOwn(context, "sidebar")) context.sidebar = null;
+      definitions.push(section("function sidebarSummaryForId(", "function availableSessionInstances("));
+    }
+    if (!Object.hasOwn(context, "turnPlanNodes") && /\bturnPlanNodes\b/.test(code)) context.turnPlanNodes = new Map();
     for (const [setter, name] of setters) if (missing(setter)) definitions.push(`function ${setter}(value) { return ${name} = value; }`);
     if (missing("closeAppMenus"))
       definitions.push('function closeAppMenus() { if (typeof closeComposerMenus === "function") closeComposerMenus(); }');
