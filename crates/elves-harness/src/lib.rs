@@ -85,6 +85,7 @@ mod preferences;
 mod primary_route;
 mod prompt_optimization;
 mod recent_priority;
+mod scheduled_messages;
 mod scheduled_tasks;
 mod session_metrics;
 mod shared_settings;
@@ -492,6 +493,7 @@ pub struct HarnessController {
     permissions: permissions::SessionPermissions,
     shared_settings: shared_settings::SharedSettings,
     scheduled_tasks: Arc<scheduled_tasks::ScheduledTasks>,
+    scheduled_messages: Arc<scheduled_messages::ScheduledMessages>,
     conversation_naming: Arc<conversation_naming::ConversationNaming>,
     harness_connected: AtomicBool,
     prompt_optimization: Arc<prompt_optimization::RemotePromptOptimization>,
@@ -576,6 +578,7 @@ impl HarnessController {
             permissions,
             shared_settings: shared_settings::SharedSettings::new(&state_dir),
             scheduled_tasks: Arc::new(scheduled_tasks::ScheduledTasks::new(&state_dir)?),
+            scheduled_messages: Arc::new(scheduled_messages::ScheduledMessages::new(&state_dir)?),
             conversation_naming: conversation_naming::ConversationNaming::new(&state_dir)?,
             harness_connected: AtomicBool::new(false),
             prompt_optimization: Arc::new(prompt_optimization::RemotePromptOptimization::default()),
@@ -1409,6 +1412,12 @@ impl HarnessController {
                 .action(self, action, &payload, authorization)
                 .await;
         }
+        if matches!(action, "createScheduledMessage" | "cancelScheduledMessage") {
+            return self
+                .scheduled_messages
+                .action(self, action, &payload, authorization)
+                .await;
+        }
         if action == "clearRecentPriority" {
             let invalid = || ApiError::new(400, "待清除的优先事项标识无效");
             let ids = payload["threadIds"]
@@ -1625,7 +1634,19 @@ impl HarnessController {
             .then(|| json!({"threadId":payload["threadId"],"prompt":payload["prompt"]}));
         let priority = &self.harness.recent_priority;
         let observed_priority = (action == "sidebar").then(|| priority.revision());
+        // 临时侧边关闭即释放内容，和删除会话一样要清掉它的定时消息。
+        let closing_side = (action == "closeSideThread")
+            .then(|| payload["threadId"].as_str().map(str::to_owned))
+            .flatten();
         let mut value = self.call_backend(action, payload, authorization).await?;
+        let removed_thread = if action == "deleteThread" && value["deleted"] == true {
+            value["threadId"].as_str().map(str::to_owned)
+        } else {
+            closing_side.filter(|_| value["ok"] == true)
+        };
+        if let Some(id) = removed_thread {
+            self.scheduled_messages.remove_thread(&id).await;
+        }
         if let Some(observed) = observed_priority
             && value["ok"] == true
             && priority.annotate(&mut value, observed)
@@ -2384,6 +2405,15 @@ impl HarnessController {
     }
 
     fn publish_backend_event(&self, source: &str, mut event: Value) {
+        if event["method"] == "thread/deleted"
+            && let Some(id) = event["params"]["threadId"].as_str()
+        {
+            let scheduled_messages = self.scheduled_messages.clone();
+            let id = id.to_owned();
+            tokio::spawn(async move {
+                scheduled_messages.remove_thread(&id).await;
+            });
+        }
         // Codex 在原生投影接受事件时维护名单；不能在轮询转发历史事件时再次加入已清除项。
         if source == "claude"
             && let Some(id) = event["params"]["threadId"].as_str()
@@ -2658,6 +2688,7 @@ pub fn start_monitor() -> anyhow::Result<HarnessRuntime> {
                 controller.reconcile(settings.remote_access).await;
             }
             controller.scheduled_tasks.tick(&controller).await;
+            controller.scheduled_messages.tick(&controller).await;
             tokio::select! {
                 _ = &mut receiver => break,
                 _ = tokio::time::sleep(Duration::from_secs(2)) => {}
@@ -3347,13 +3378,19 @@ impl IntoResponse for ApiError {
         if self.outcome_unknown {
             payload["outcomeUnknown"] = json!(true);
         }
-        (
+        let mut response = (
             StatusCode::from_u16(self.code).unwrap_or(StatusCode::BAD_REQUEST),
             Json(payload),
         )
-            .into_response()
+            .into_response();
+        response.extensions_mut().insert(RejectReason(self.message));
+        response
     }
 }
+
+// 拒绝原因随响应带给连接诊断：只记状态码时，反复出现的 403 无法区分是地址、来源还是凭证问题。
+#[derive(Clone)]
+struct RejectReason(String);
 
 async fn access_boundary(state: State<WebState>, mut request: Request, next: Next) -> Response {
     // 用户要求将手机恢复日志与电脑接收记录对应；仅观测带合法 diag 的连接路由，鉴权和返回保持原样。
@@ -3364,7 +3401,9 @@ async fn access_boundary(state: State<WebState>, mut request: Request, next: Nex
     let response = access_boundary_response(state, request, next).await;
     if let Some(diagnostic) = &mut diagnostic {
         // 响应头已生成不代表手机已经收全；诊断不得把这一步写成客户端成功。
-        diagnostic.response_headers_ready(response.status());
+        let reason = response.extensions().get::<RejectReason>();
+        diagnostic
+            .response_headers_ready(response.status(), reason.map(|reason| reason.0.as_str()));
     }
     response
 }
@@ -3412,6 +3451,7 @@ impl ConnectionDiagnosticContext {
         started: Instant,
         status: Option<u16>,
         close: Option<(&'static str, Option<u16>)>,
+        reason: Option<&str>,
     ) {
         let mut detail = json!({
             "requestId": self.request_id,
@@ -3424,6 +3464,10 @@ impl ConnectionDiagnosticContext {
         if let Some((reason, code)) = close {
             detail["closeReason"] = json!(reason);
             detail["closeCode"] = json!(code);
+        }
+        // 只记录服务端自己的拒绝说明（固定文案），不含请求的地址、查询串或凭证。
+        if let Some(reason) = reason {
+            detail["reason"] = json!(reason);
         }
         let _ = crate::diagnostic_log::append_diagnostic_log(
             "remote_access.connection_request",
@@ -3448,17 +3492,18 @@ impl ConnectionRequestDiagnostic {
         };
         diagnostic
             .context
-            .record("received", diagnostic.started, None, None);
+            .record("received", diagnostic.started, None, None, None);
         Some(diagnostic)
     }
 
-    fn response_headers_ready(&mut self, status: StatusCode) {
+    fn response_headers_ready(&mut self, status: StatusCode, reason: Option<&str>) {
         self.response_ready = true;
         self.context.record(
             "response_headers_ready",
             self.started,
             Some(status.as_u16()),
             None,
+            reason,
         );
     }
 }
@@ -3467,7 +3512,7 @@ impl Drop for ConnectionRequestDiagnostic {
     fn drop(&mut self) {
         if !self.response_ready {
             self.context
-                .record("request_cancelled", self.started, None, None);
+                .record("request_cancelled", self.started, None, None, None);
         }
     }
 }
@@ -3487,9 +3532,13 @@ impl WebSocketConnectionDiagnostic {
             close_reason: "task_cancelled",
             close_code: None,
         };
-        diagnostic
-            .context
-            .record("websocket_opened", diagnostic.started, Some(101), None);
+        diagnostic.context.record(
+            "websocket_opened",
+            diagnostic.started,
+            Some(101),
+            None,
+            None,
+        );
         diagnostic
     }
 }
@@ -3501,6 +3550,7 @@ impl Drop for WebSocketConnectionDiagnostic {
             self.started,
             Some(101),
             Some((self.close_reason, self.close_code)),
+            None,
         );
     }
 }
@@ -4128,6 +4178,8 @@ async fn session(
     // 用户要求缩短首条消息的等待：输入框开始输入时提前启动 Claude CLI。声明为能力，是为了让内置旧网页包
     // 连到不认识该动作的旧后台时不发起请求；同样单独赋值，避开上面 json! 的宏递归上限。
     response["capabilities"]["warmSession"] = json!(true);
+    // 定时发送同样声明为能力：内置旧网页包不会出现，新网页包连旧后台时也不显示入口、不读取定时消息。
+    response["capabilities"]["scheduledMessages"] = json!(true);
     response["transport"] = json!(if state.desktop { "desktop" } else { "remote" });
     // 代理设置和会话管理已迁移到独立管理器；Harness 不再声明管理页面或管理 API 能力。
     response["capabilities"]["management"] = json!(false);
@@ -4316,6 +4368,7 @@ async fn read(
             | "sidePresence"
             | "harnessDiagnostics"
             | "scheduledTasks"
+            | "scheduledMessages"
     ) {
         return Err(ApiError::new(404, "不支持的读取操作"));
     }
@@ -4333,6 +4386,9 @@ async fn read(
     }
     if action == "sessionMetrics" && notification_thread_id(&payload["threadId"]).is_none() {
         return Err(ApiError::new(400, "会话统计标识无效"));
+    }
+    if action == "scheduledMessages" && notification_thread_id(&payload["threadId"]).is_none() {
+        return Err(ApiError::new(400, "定时消息会话 ID 无效"));
     }
     if matches!(action.as_str(), "queue" | "queueEdit" | "sendState") {
         validate_queued_action_payload(&action, &payload)?;
@@ -4357,6 +4413,20 @@ async fn read(
         let response = tokio::task::spawn_blocking(move || read_json_response(value, gzip))
             .await
             .map_err(|_| ApiError::new(503, "定时任务数据处理暂时失败，请重试读取"))??;
+        authorization.check().await.map_err(authorization_error)?;
+        return Ok(response);
+    }
+    if action == "scheduledMessages" {
+        let thread_id = notification_thread_id(&payload["threadId"]).unwrap();
+        let value = state
+            .controller
+            .scheduled_messages
+            .snapshot(thread_id)
+            .await?;
+        let gzip = accepts_gzip(&headers);
+        let response = tokio::task::spawn_blocking(move || read_json_response(value, gzip))
+            .await
+            .map_err(|_| ApiError::new(503, "定时消息数据处理暂时失败，请重试读取"))??;
         authorization.check().await.map_err(authorization_error)?;
         return Ok(response);
     }
@@ -4696,6 +4766,41 @@ fn validate_compaction_queue_send_payload(action: &str, payload: &Value) -> Resu
     }
     if action != "send" || payload["goalMode"] == true {
         return Err(ApiError::new(400, "排队发送参数仅适用于普通消息"));
+    }
+    Ok(())
+}
+
+fn validate_scheduled_message_payload(payload: &Value) -> Result<(), ApiError> {
+    let object = payload
+        .as_object()
+        .ok_or_else(|| ApiError::new(400, "定时消息参数无效"))?;
+    if object.keys().any(|key| {
+        ![
+            "threadId",
+            "sendAtMs",
+            "scheduledAtMs",
+            "prompt",
+            "clientUserMessageId",
+            "skills",
+            "images",
+            "files",
+            "model",
+            "reasoningEffort",
+            "instanceId",
+            "permissionMode",
+            "goalMode",
+        ]
+        .contains(&key.as_str())
+    }) {
+        return Err(ApiError::new(400, "定时消息包含不支持的字段"));
+    }
+    if payload["goalMode"] == true {
+        return Err(ApiError::new(400, "目标模式不支持定时发送"));
+    }
+    if payload["sendAtMs"].as_u64().is_none()
+        || notification_thread_id(&payload["threadId"]).is_none()
+    {
+        return Err(ApiError::new(400, "定时消息时间或会话 ID 无效"));
     }
     Ok(())
 }
@@ -5278,6 +5383,8 @@ async fn action(
             | "deleteScheduledTask"
             | "toggleScheduledTask"
             | "runScheduledTask"
+            | "createScheduledMessage"
+            | "cancelScheduledMessage"
     ) {
         return Err(ApiError::new(404, "不支持的会话操作"));
     }
@@ -5313,6 +5420,18 @@ async fn action(
     if action == "updateGoal" {
         validate_goal_update_payload(&payload)?;
     }
+    if action == "createScheduledMessage" {
+        validate_scheduled_message_payload(&payload)?;
+    }
+    if action == "cancelScheduledMessage" {
+        if notification_thread_id(&payload["threadId"]).is_none()
+            || payload["messageId"]
+                .as_str()
+                .is_none_or(|id| uuid::Uuid::parse_str(id).is_err())
+        {
+            return Err(ApiError::new(400, "定时消息标识无效"));
+        }
+    }
     if action == "deleteThread" {
         validate_delete_thread_payload(&payload)?;
     }
@@ -5327,22 +5446,28 @@ async fn action(
     ) {
         validate_queued_action_payload(&action, &payload)?;
     }
-    let has_input_images = matches!(action.as_str(), "send" | "create")
-        && (payload["images"]
+    let has_input_images = matches!(
+        action.as_str(),
+        "send" | "create" | "createScheduledMessage"
+    ) && (payload["images"]
+        .as_array()
+        .is_some_and(|images| !images.is_empty())
+        || payload["files"]
             .as_array()
-            .is_some_and(|images| !images.is_empty())
-            || payload["files"]
-                .as_array()
-                .is_some_and(|files| !files.is_empty()));
-    if matches!(action.as_str(), "send" | "create" | "editMessage")
-        && payload["prompt"].as_str().is_none_or(|text| {
-            text.len() > 128 * 1024 || text.trim().is_empty() && !has_input_images
-        })
+            .is_some_and(|files| !files.is_empty()));
+    if matches!(
+        action.as_str(),
+        "send" | "create" | "editMessage" | "createScheduledMessage"
+    ) && payload["prompt"]
+        .as_str()
+        .is_none_or(|text| text.len() > 128 * 1024 || text.trim().is_empty() && !has_input_images)
     {
         return Err(ApiError::new(400, "消息不能为空或超过 128 KiB"));
     }
-    if matches!(action.as_str(), "send" | "create")
-        && payload["goalMode"] != true
+    if matches!(
+        action.as_str(),
+        "send" | "create" | "createScheduledMessage"
+    ) && payload["goalMode"] != true
         && payload.get("skills").is_some_and(|skills| {
             skills.as_array().is_none_or(|skills| {
                 skills.len() > 16
@@ -5359,12 +5484,16 @@ async fn action(
     {
         return Err(ApiError::new(400, "Skill 选择无效，最多选择 16 项"));
     }
-    if matches!(action.as_str(), "send" | "create") && payload["goalMode"] != true {
+    if matches!(
+        action.as_str(),
+        "send" | "create" | "createScheduledMessage"
+    ) && payload["goalMode"] != true
+    {
         validate_input_images(&payload)?;
     }
     if matches!(
         action.as_str(),
-        "send" | "create" | "setGoal" | "editQueued"
+        "send" | "create" | "setGoal" | "editQueued" | "createScheduledMessage"
     ) {
         input_files::validate_for_device(
             &payload,
@@ -5378,8 +5507,14 @@ async fn action(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    if desktop_images::has_refs(&payload) && (!state.desktop || device.key_id != desktop::DEVICE_KEY_ID
-        || !matches!(action.as_str(), "send" | "create" | "setGoal" | "editQueued")) {
+    if desktop_images::has_refs(&payload)
+        && (!state.desktop
+            || device.key_id != desktop::DEVICE_KEY_ID
+            || !matches!(
+                action.as_str(),
+                "send" | "create" | "setGoal" | "editQueued" | "createScheduledMessage"
+            ))
+    {
         return Err(ApiError::new(403, "本机原图仅支持 Elves 的本机 Codex 会话"));
     }
     if action == "optimizePrompt" {
@@ -7395,6 +7530,15 @@ mod tests {
             assert_eq!(response["status"], status);
             assert_eq!(response["method"], "GET");
             assert!(response["durationMs"].as_u64().is_some());
+            // 拒绝时记下服务端自己的说明，便于区分地址、来源和凭证问题；成功响应不带原因。
+            // 400 的握手失败由框架直接拒绝，不经过 ApiError，不要求原因。
+            if status != 400 {
+                assert_eq!(
+                    response["reason"].as_str().is_some(),
+                    status >= 400,
+                    "{response}"
+                );
+            }
         }
         let closed = records
             .iter()

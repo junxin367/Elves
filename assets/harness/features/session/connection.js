@@ -5,11 +5,12 @@ import {
   reconnectChangedAuthorization, renderApprovals, scheduleMessages, syncSharedSettings, updateComposer
 } from "../../core/actions.js";
 import {
-  connected, nativeConnectionVersion, pageLeaving, session, setConnected, setSession, thread
+  connected, nativeConnectionVersion, pageLeaving, selectedId, session, setConnected, setSession, thread
 } from "../../core/state.js";
 import { recoveryStore } from "../../core/stores.js";
 import { api, promoteReadPriority } from "../api.js";
 import { recoveryGeneration } from "../composer/drafts.js";
+import { reloadScheduledMessages } from "../composer/scheduled-message.js";
 import {
   messageSkillLoadScope, setMessageSkillLoadScope, skillLoading, skillScope
 } from "../composer/skill-catalog.js";
@@ -121,6 +122,8 @@ export async function refreshConnectedSession(source = stream) {
   const applied = await syncConnectionState(source);
   if (!applied) return false;
   await refreshAll({ fresh: true });
+  // 断线或后台期间可能错过定时消息的变更事件（发出、失败、取消），恢复时补读当前会话的列表。
+  if (selectedId) void reloadScheduledMessages(selectedId);
   return true;
 }
 export function setConnection(value) {

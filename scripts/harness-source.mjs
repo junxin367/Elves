@@ -86,6 +86,13 @@ export async function loadHarnessAppSource(root = defaultRoot) {
       composerLocalInputsPayload: () => [], composerLocalInputsSupported: () => false,
       composerCanAddLocalInputs: () => false, handleComposerLocalPasteShortcut: () => {}, unsupportedFiles: false,
     })) if (!Object.hasOwn(context, name)) context[name] = value;
+    // 旧的局部函数用例默认没有定时发送：不声明能力、没有选定时间；专门验证定时发送的用例装入真实模块。
+    for (const [name, value] of Object.entries({
+      selectedScheduledAt: null, scheduledAtDrafts: new Map(),
+      setSelectedScheduledAt: next => context.selectedScheduledAt = next,
+      scheduledMessagesSupported: () => false, renderScheduledMessages: () => {},
+      reloadScheduledMessages: async () => {},
+    })) if (!Object.hasOwn(context, name)) context[name] = value;
     const missing = name => !Object.hasOwn(context, name) && new RegExp(`\\b${name}\\(`).test(code);
     const definitions = [];
     if (missing("localAppearance")) definitions.push(section("function localAppearance(", "function legacySharedAppearance("));

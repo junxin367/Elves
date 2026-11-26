@@ -1,8 +1,10 @@
 // 消息输入编辑器：Skill/目标标记、选区与纯文本换算、输入框尺寸；撤销历史与输入框装配在 prompt-edit-history.js，输入区滚动挂载在 composer.js。
 
 import { $, element } from "../../ui/dom.js";
+import { icon } from "../../ui/icons.js";
 import { goalComposerIcon, selectedSkills, setSelectedSkills } from "./skill-catalog.js";
 import { selectedGoal, setSelectedGoal } from "../goal/state.js";
+import { scheduledTimeLabel, selectedScheduledAt, setSelectedScheduledAt } from "./scheduled-state.js";
 
 // 用户要求统一称“思考深度”；设置、输入区、提示词优化与模型切换提示共用此选项名称映射。
 export const effortLabels = { none: "无", minimal: "最低", low: "轻度", medium: "中", high: "高", xhigh: "极高", max: "Max", ultra: "Ultra" };
@@ -17,10 +19,12 @@ export function skillVisibleName(skill) {
     .map(word => word[0].toLocaleUpperCase() + word.slice(1)).join(" ")).join(": ");
 }
 const goalPromptTokenKey = "composer-goal";
+const scheduledPromptTokenKey = "composer-scheduled";
 const promptCanonicalText = new WeakMap();
 function promptTokenKey(node) {
   if (node.nodeType !== Node.ELEMENT_NODE) return null;
   if (node.classList.contains("inline-goal")) return goalPromptTokenKey;
+  if (node.classList.contains("inline-scheduled")) return scheduledPromptTokenKey;
   return node.classList.contains("inline-skill") ? node.dataset.skillKey : null;
 }
 function promptNodeLength(node) {
@@ -77,7 +81,8 @@ export function syncPromptTrailingBreak(prompt) {
     next.dataset.promptTail = "";
     prompt.append(next);
   }
-  prompt.classList.toggle("goal-only", !!prompt.querySelector(".inline-goal")
+  // 只有目标或定时标记、还没有正文时继续显示占位文字。
+  prompt.classList.toggle("goal-only", !!prompt.querySelector(".inline-goal, .inline-scheduled")
     && !promptPlainText(prompt) && !prompt.querySelector(".inline-skill"));
 }
 export function promptBoundaryOffset(prompt, container, boundary) {
@@ -105,7 +110,8 @@ function promptPoint(prompt, target, afterSkills) {
     for (let index = 0; index < parent.childNodes.length; index++) {
       const child = parent.childNodes[index];
       // 目标始终位于正文之前，数值正文位置 0 也落在目标之后。
-      if (child.nodeType === Node.ELEMENT_NODE && child.classList.contains("inline-goal")) continue;
+      if (child.nodeType === Node.ELEMENT_NODE
+          && (child.classList.contains("inline-goal") || child.classList.contains("inline-scheduled"))) continue;
       if (child.nodeType === Node.ELEMENT_NODE && child.classList.contains("inline-skill")) {
         if (remaining === 0 && (afterSkills instanceof Set ? !afterSkills.has(child.dataset.skillKey) : !afterSkills))
           return { node: parent, offset: index };
@@ -189,6 +195,17 @@ function goalToken() {
   node.append(glyph, element("span", "inline-skill-name", "目标"));
   return node;
 }
+// 用户确认编辑框标记为“时钟图标 + 定时发送 · 今天 HH:mm”，渲染方式与“目标”一致（样式在 style.css 同一规则）。
+function scheduledToken(sendAtMs) {
+  const node = element("span", "inline-scheduled"), glyph = icon("recent");
+  const label = `定时发送 · ${scheduledTimeLabel(sendAtMs)}`;
+  node.contentEditable = "false";
+  node.setAttribute("aria-label", label);
+  node.title = `${label}：点击修改时间，删除此标记可取消`;
+  glyph.className = "inline-skill-icon";
+  node.append(glyph, element("span", "inline-skill-name", label));
+  return node;
+}
 export function promptTokenPlacements(prompt = $("#prompt")) {
   const placements = [];
   let offset = 0;
@@ -221,14 +238,15 @@ function appendPromptText(nodes, text) {
     }
   }
 }
-export function writePromptContent(prompt, text, skills = selectedSkills, goalMode = !!selectedGoal) {
+export function writePromptContent(prompt, text, skills = selectedSkills, goalMode = !!selectedGoal,
+  scheduledAt = selectedScheduledAt) {
   prompt.editHistory?.begin("replace");
   const canonicalText = String(text ?? "");
   promptCanonicalText.set(prompt, canonicalText);
   const ordered = skills.map((skill, index) => ({
     skill, index, offset: Math.min(canonicalText.length, Math.max(0, Number.isFinite(skill._offset) ? skill._offset : 0))
   })).sort((left, right) => left.offset - right.offset || left.index - right.index);
-  const nodes = goalMode ? [goalToken()] : [];
+  const nodes = !goalMode && scheduledAt ? [scheduledToken(scheduledAt)] : goalMode ? [goalToken()] : [];
   let cursor = 0;
   for (const entry of ordered) {
     if (entry.offset > cursor) appendPromptText(nodes, canonicalText.slice(cursor, entry.offset));
@@ -244,10 +262,15 @@ export function syncSelectedSkillsFromPrompt(prompt = $("#prompt")) {
   if (!prompt) return;
   // 原生删除、选区替换和输入法结束后，以实际节点为准；不要重绘已被删除的目标。
   const goals = [...prompt.querySelectorAll(".inline-goal")];
+  const schedules = [...prompt.querySelectorAll(".inline-scheduled")];
   if (!goals.length) setSelectedGoal(null);
+  if (!schedules.length) setSelectedScheduledAt(null);
   const goal = selectedGoal ? goals.shift() : null;
+  const schedule = selectedScheduledAt ? schedules.shift() : null;
   for (const duplicate of goals) duplicate.remove();
+  for (const duplicate of schedules) duplicate.remove();
   if (goal && goal !== prompt.firstChild) prompt.prepend(goal);
+  if (schedule && !goal && schedule !== prompt.firstChild) prompt.prepend(schedule);
   const available = new Map(selectedSkills.map(skill => [skillNodeKey(skill), skill]));
   const next = [];
   for (const placement of promptSkillPlacements(prompt)) {
@@ -271,6 +294,8 @@ export function replacePromptRange(prompt, replacement, start, end, selectionMod
   const beforeEnd = exactSelection ? promptTokensBeforeBoundary(prompt, range.endContainer, range.endOffset) : null;
   if (exactSelection && !beforeStart.has(goalPromptTokenKey) && beforeEnd.has(goalPromptTokenKey))
     setSelectedGoal(null);
+  if (exactSelection && !beforeStart.has(scheduledPromptTokenKey) && beforeEnd.has(scheduledPromptTokenKey))
+    setSelectedScheduledAt(null);
   setSelectedSkills(selectedSkills.filter(skill => {
     const key = skillNodeKey(skill);
     return !exactSelection || beforeStart.has(key) || !beforeEnd.has(key);

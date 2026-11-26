@@ -16,7 +16,7 @@ import {
 import {
   attachmentDrafts, deleteDraft, draftKey, draftWrites, drafts, failedInputRecoveries, goalDrafts,
   inputDraftEmpty, matchingDraft, newDraftKey, ordinaryInputRecord, persistInputDraft,
-  persistSmallInputRecoveries, recoveryGeneration, recoveryScope, setRecoveryGeneration,
+  persistSmallInputRecoveries, recoveryGeneration, recoveryScope, scheduledAtDrafts, setRecoveryGeneration,
   setRecoveryScope, skillDrafts, smallInputStorageRecord, snapshotDraft, storeDraft, storedDraft,
   submittedDrafts
 } from "./drafts.js";
@@ -37,6 +37,7 @@ import {
   pending, pendingTimer, setPending, setPendingSendRequest, validSkillSelection
 } from "../conversation/pending-state.js";
 import { assignGoalEditPending, goalComposerRecoveries, setSelectedGoal } from "../goal/state.js";
+import { setSelectedScheduledAt } from "./scheduled-state.js";
 import { editingMessage, setEditingMessage } from "../messages/message-edit.js";
 import { sentMessageDisplays } from "../queue/sent-display.js";
 import { editingQueuedMessage, queuedEdits, setEditingQueuedMessage, validQueuedMessageEdit } from "../queue/state.js";
@@ -60,7 +61,7 @@ export function clearPrivateInputs({ persisted = true } = {}) {
   instancePermissionCatalogs.clear(); instancePermissionReads.clear();
   setSessionInstances([]); setSessionInstanceRequest(null);
   resetRelatedSessions({ persisted: true });
-  drafts.clear(); skillDrafts.clear(); attachmentDrafts.clear(); goalDrafts.clear();
+  drafts.clear(); skillDrafts.clear(); attachmentDrafts.clear(); goalDrafts.clear(); scheduledAtDrafts.clear();
   draftWrites.clear(); failedInputRecoveries.clear(); goalComposerRecoveries.clear();
   queuedEdits.clear(); questionDrafts.clear(); questionReplyReceipts.clear(); questionReceiptChecks.clear(); compactions.clear();
   sentMessageDisplays.clear();
@@ -68,7 +69,7 @@ export function clearPrivateInputs({ persisted = true } = {}) {
   setPending(null); setPendingSendRequest(null); setEditingQueuedMessage(null); setEditingMessage(null);
   if (sending) { setSending(null); setBusy(false); }
   assignGoalEditPending(null);
-  setSelectedSkills([]); setSelectedGoal(null); transcriptCache.clear();
+  setSelectedSkills([]); setSelectedGoal(null); setSelectedScheduledAt(null); transcriptCache.clear();
   void clearReadViews();
   clearTimeout(pendingTimer);
   for (const key of ["codex-elves-pending", "codex-elves-input-owner", "codex-elves-goal-composer-recoveries",
@@ -139,6 +140,8 @@ export async function restorePrivateInputs(value, { expected = null, requestGene
     drafts.set(id, draft.text); skillDrafts.set(id, draft.skills || []);
     attachmentDrafts.set(id, draft.attachments);
     if (draft.goalMode) goalDrafts.set(id, draft.goalMode);
+    if (Number.isSafeInteger(draft.scheduledAtMs) && draft.scheduledAtMs > 0)
+      scheduledAtDrafts.set(id, draft.scheduledAtMs);
     if (id.startsWith("$new:") && typeof draft.permissionMode === "string"
         && (permissionModeKnown("codex", draft.permissionMode) || permissionModeKnown("claude", draft.permissionMode)))
       draftPermissionChoices.set(id, draft.permissionMode);
@@ -186,6 +189,7 @@ export function restoreDraft(key) {
   $("#prompt").value = drafts.get(key) || "";
   setSelectedSkills((skillDrafts.get(key) || []).map(skill => ({ ...skill })));
   setSelectedGoal(goalDrafts.get(key) || null);
+  setSelectedScheduledAt(scheduledAtDrafts.get(key) || null);
   setComposerAttachments(attachmentDrafts.get(key) || []);
   renderSelectedSkills();
 }
@@ -224,6 +228,7 @@ export function clearSubmittedDraft(payload, current = true) {
   const currentDraft = current ? snapshotDraft() : null;
   if (matchingDraft(storedDraft(key), payload)) deleteDraft(key);
   if (currentDraft && matchingDraft(currentDraft, payload)) {
-    $("#prompt").value = ""; setSelectedSkills([]); setSelectedGoal(null); clearComposerAttachments(); renderSelectedSkills();
+    $("#prompt").value = ""; setSelectedSkills([]); setSelectedGoal(null); setSelectedScheduledAt(null);
+    clearComposerAttachments(); renderSelectedSkills();
   }
 }

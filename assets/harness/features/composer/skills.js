@@ -34,7 +34,7 @@ import {
   setGlobalSkillsInvalidated, setGlobalSkillsLoadedAt, setMessageSkillLoadScope,
   setSkillCatalogRevision, setSkillChoices, setSkillIndex, setSkillLoadVersion, setSkillLoading,
   setSkillRenderVersion, setSkillScope, skillCatalogFresh, skillCatalogNeedsRefresh,
-  skillCatalogRequests, skillCatalogRetryAt, skillCatalogRevision, skillCatalogUsable,
+  skillCatalogFailures, skillCatalogRequests, skillCatalogRetryAt, skillCatalogRevision, skillCatalogUsable,
   skillCatalogs, skillChoices, skillCwdKey, skillIndex, skillLoadVersion, skillLoading,
   skillRenderVersion, skillScope, skillScopeAliases, skillScopeKey, slashQuery, stopCatalogRefresh,
   validCachedSkill
@@ -278,9 +278,10 @@ async function refreshSkillCatalogRecord(scope, payload, force) {
     skillScopeAliases.set(scope, resolvedKey);
     skillCatalogs.delete(resolvedKey); skillCatalogs.set(resolvedKey, record);
     skillCatalogRetryAt.delete(key); skillCatalogRetryAt.delete(resolvedKey);
+    skillCatalogFailures.delete(key); skillCatalogFailures.delete(resolvedKey);
     while (skillCatalogs.size > 64) {
       const oldest = skillCatalogs.keys().next().value;
-      skillCatalogs.delete(oldest); skillCatalogRetryAt.delete(oldest);
+      skillCatalogs.delete(oldest); skillCatalogRetryAt.delete(oldest); skillCatalogFailures.delete(oldest);
     }
     if (!claude) cacheDisplayData("skills", "global", { data: globalSkillChoices, loadedAt, epoch: globalSkillEpoch },
       { maxAge: catalogFallbackMs });
@@ -298,7 +299,13 @@ async function refreshSkillCatalogRecord(scope, payload, force) {
   skillCatalogRequests.set(key, request);
   try { return await request; }
   catch (error) {
-    if (current()) skillCatalogRetryAt.set(key, Date.now() + catalogRetryMs);
+    if (current()) {
+      // 连续失败退避：第 n 次失败后等 catalogRetryMs × 2^(n-1)，30 分钟封顶；只影响后台自动刷新，
+      // 用户打开菜单、显式刷新仍立即读取（readSkillCatalog 对显式读取不看 skillCatalogRetryAt）。
+      const failures = Math.min((skillCatalogFailures.get(key) || 0) + 1, 16);
+      skillCatalogFailures.set(key, failures);
+      skillCatalogRetryAt.set(key, Date.now() + Math.min(catalogRetryMs * 2 ** (failures - 1), 30 * 60 * 1000));
+    }
     throw error;
   }
   finally {
@@ -330,7 +337,8 @@ export async function loadSkillChoices(scope, payload, { force = false } = {}) {
   return loading.promise;
 }
 function invalidateSkillCatalogs() {
-  setSkillCatalogRevision(skillCatalogRevision + 1); skillCatalogRequests.clear(); skillCatalogRetryAt.clear();
+  setSkillCatalogRevision(skillCatalogRevision + 1); skillCatalogRequests.clear();
+  skillCatalogRetryAt.clear(); skillCatalogFailures.clear();
   setGlobalSkillEpoch(randomId()); setGlobalSkillsInvalidated(true);
   setSkillLoading(null); setSkillLoadVersion(skillLoadVersion + 1); setMessageSkillLoadScope("");
   if (globalSkillsLoadedAt) cacheDisplayData("skills", "global", {

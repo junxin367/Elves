@@ -537,6 +537,40 @@ def native_sdk_local_record(row):
     return isinstance(content, str) and bool(_LOCAL_COMMAND.fullmatch(content) or _LOCAL_OUTPUT.fullmatch(content))
 
 
+def queued_human_prompt(attachment):
+    """执行中被 CLI 吸收的用户消息（网页“引导”，或排队后提前送入）记为 queued_command 附件。
+
+    返回可直接作为用户消息 content 的正文（字符串或内容块数组）；不是用户消息或没有可显示内容时返回 None。
+    形态随 CLI 版本变化，两种都必须认：
+    - 2.1.330 及以前：prompt 是字符串，以 humanTurn=true 且 origin.kind=human 标明。
+    - 2.1.332 起：prompt 是内容块数组，不再有 humanTurn / origin，改以 hostsOwnTurn=true 标明
+      （没有 origin；若带 origin 则必须是 human）。按 2026-11 实测的原生 JSONL 记录确认。
+    任务通知（commandMode=task-notification）、其他来源、shell 模式，以及缺少人工标记的未知形态都不是用户消息，
+    保持隐藏而不是凭猜测显示；以前这里只认旧形态，新形态整行被丢弃，引导消息从原生历史消失。
+    """
+    if not isinstance(attachment, dict) or attachment.get("type") != "queued_command" \
+            or attachment.get("commandMode") != "prompt":
+        return None
+    origin = attachment.get("origin")
+    human_origin = isinstance(origin, dict) and origin.get("kind") == "human"
+    if attachment.get("humanTurn") is True:
+        if not human_origin:
+            return None
+    elif attachment.get("hostsOwnTurn") is True and attachment.get("humanTurn") is not False:
+        if origin is not None and not human_origin:
+            return None
+    else:
+        return None
+    prompt = attachment.get("prompt")
+    if isinstance(prompt, str):
+        return prompt if prompt.strip() else None
+    if isinstance(prompt, list) and prompt and all(isinstance(part, dict) for part in prompt) \
+            and any(part.get("type") == "image" or part.get("type") == "text"
+                    and isinstance(part.get("text"), str) and bool(part["text"].strip()) for part in prompt):
+        return prompt
+    return None
+
+
 def real_user(row):
     if any(row.get(key) is True for key in ("isMeta", "isSidechain", "isCompactSummary", "isVisibleInTranscriptOnly")):
         return False
@@ -552,10 +586,7 @@ def real_user(row):
             or row.get("nativeSettingCommand") or row.get("nativeSettingOutput"):
         return False
     if row.get("type") == "attachment":
-        attachment = row.get("attachment", {})
-        return (attachment.get("type") == "queued_command" and attachment.get("commandMode") == "prompt"
-                and attachment.get("humanTurn") is True and attachment.get("origin", {}).get("kind") == "human"
-                and bool(attachment.get("prompt", "").strip()))
+        return queued_human_prompt(row.get("attachment")) is not None
     if row.get("type") != "user":
         return False
     message = row.get("message")
@@ -1992,17 +2023,17 @@ class NativeSession:
                 native_editable = row.get("type") == "user" and real_user(row)
                 if row.get("type") == "attachment":
                     attachment = row.get("attachment", {})
+                    absorbed = queued_human_prompt(attachment)
                     if attachment.get("type") == "goal_status":
                         row = {**row, "attachment": {key: attachment[key] for key in
                                ("type", "condition", "met", "sentinel", "reason") if key in attachment}}
-                    elif (attachment.get("type") == "queued_command"
-                            and attachment.get("commandMode") == "prompt"
-                            and attachment.get("humanTurn") is True
-                            and attachment.get("origin", {}).get("kind") == "human"
-                            and isinstance(attachment.get("prompt"), str)):
-                        # 原版执行中吸收用户排队消息时记为附件；它已实际接收，必须关联原消息并清掉排队残留。
-                        row = {**row, "type": "user", "message": {
-                            "role": "user", "content": attachment["prompt"]}}
+                    elif absorbed is not None:
+                        # 原版执行中吸收用户排队/引导消息时记为附件；它已实际接收，必须关联原消息并清掉排队残留。
+                        # 行自己的 uuid 是 CLI 新生成的，网页发送帧的 UUID 只在 source_uuid 里，随行保留供读取器对账；
+                        # 位置就是文件里的吸收点（工具结果之后、下一段回复之前），不能挪到轮次末尾。
+                        row = {**row, "type": "user", "message": {"role": "user", "content": absorbed},
+                               "attachment": {key: attachment[key] for key in
+                                              ("type", "source_uuid", "delivery_id") if key in attachment}}
                     else:
                         image = attachment.get("content", {})
                         if attachment.get("type") != "file" or image.get("type") != "image":
@@ -2217,6 +2248,13 @@ class SdkReader(NativeSession):
         # 对端以原生用户消息 UUID 发送；记录出现同一 UUID 就是精确确认，不依赖正文逐字相同
         # （Skill 展开、命令改写后正文可能不同）。关联方式与按正文关联一致，只是身份更强。
         rows = {row.get("uuid"): row for row in self.all_messages if row.get("uuid")}
+        # 执行中被吸收的引导消息没有以发送帧 UUID 为身份的原生行：CLI 另生成行 uuid，原帧 UUID 只在 source_uuid 里。
+        # 不补这一步，正文被 Skill 展开或命令改写后无法按文本认出，待确认记录会一直残留。
+        for row in self.all_messages:
+            attachment = row.get("attachment")
+            source = attachment.get("source_uuid") if isinstance(attachment, dict) else None
+            if source and row.get("type") == "user" and row.get("uuid"):
+                rows.setdefault(source, row)
         for intent in waiting:
             row = rows.get(intent["_nativeUuid"])
             if row is None:
@@ -2242,7 +2280,7 @@ class SdkReader(NativeSession):
             if command["name"] == "compact" and command["state"] == "running":
                 command["state"] = "unknown"
 
-    def poll(self, force=False):
+    def poll(self, force=False, skip_unchanged=False):
         if not self.initialized or not self.native_id:
             return
         self.read_messages()
@@ -2259,6 +2297,11 @@ class SdkReader(NativeSession):
         signature = (self.log_identity, self.log_mtime, self.log_offset, json.dumps(status, sort_keys=True),
                      json.dumps(self.pending, sort_keys=True), json.dumps(context, sort_keys=True),
                      updated_at, json.dumps(self.control_projection(), sort_keys=True))
+        if skip_unchanged and signature == self.signature:
+            # 用户要求缩短发送前的等待：发送前同步只要求读到最新原生记录，没有变化时上一份快照就是最新的。
+            # 重发整份历史对大会话是一次完整的序列化、传输和解析（实测 8290 条消息、21.6 MiB 的会话仅读取器侧
+            # 强制快照就要 0.17–0.18 秒，其中序列化约 0.13 秒，上层还要解析和投影），白白拖慢每次发送；有变化时仍走下面的强制发出。
+            return
         if force or signature != self.signature:
             if not force and time.monotonic() < self.next_snapshot_at:
                 return
@@ -2483,7 +2526,7 @@ class SdkReader(NativeSession):
         if subtype == "initialize":
             return self.initialize(request)
         if subtype == "shared_sync":
-            self.poll(force=True)
+            self.poll(force=True, skip_unchanged=True)
             return {}
         handler = {"sdk_prepare": self.sdk_prepare, "sdk_configured_mode": self.sdk_configured_mode,
                    "sdk_edit_prepare": self.sdk_edit_prepare, "sdk_rewind": self.sdk_rewind, "sdk_delivered": self.sdk_delivered,

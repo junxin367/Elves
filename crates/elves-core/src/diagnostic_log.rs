@@ -27,7 +27,38 @@ struct DiagnosticRecord {
     detail: Value,
 }
 
+/// 是否是 Cargo 编译出的测试可执行文件：位于 `target/<配置>/deps/`，文件名形如 `<名称>-<16 位十六进制哈希>`。
+/// 只看路径形态，不依赖环境变量（Cargo 运行 `cargo run` 时也会设置同样的变量，无法区分）。
+fn is_cargo_test_executable(path: &std::path::Path) -> bool {
+    let hashed = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.rsplit_once('-'))
+        .is_some_and(|(_, hash)| {
+            hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        });
+    hashed
+        && path
+            .parent()
+            .and_then(|directory| directory.file_name())
+            .is_some_and(|name| name == "deps")
+}
+
+/// 用户要求日志只反映真实运行：单元测试里伪造的发送失败、占用释放、宿主不可用等事件曾大量写进用户真实的
+/// `codex-elves.log`，被当成线上异常（2026-11-25 实测同一份日志里有十余个测试进程的记录）。
+/// 测试可执行文件没有显式指定落点（`set_diagnostic_log_path_for_tests`、`set_app_state_dir_for_tests`、
+/// `ELVES_STATE_DIR`）时不写默认状态目录；需要核对日志内容的测试仍然指向自己的临时文件。
+fn skip_unconfigured_test_write() -> bool {
+    static TEST_EXECUTABLE: OnceLock<bool> = OnceLock::new();
+    let test_executable = *TEST_EXECUTABLE
+        .get_or_init(|| std::env::current_exe().is_ok_and(|path| is_cargo_test_executable(&path)));
+    test_executable && !test_log_path_is_active() && !crate::paths::state_dir_redirected()
+}
+
 pub fn append_diagnostic_log(event: &str, detail: impl Serialize) -> std::io::Result<()> {
+    if skip_unconfigured_test_write() {
+        return Ok(());
+    }
     let path = diagnostic_log_path();
     let detail = serde_json::to_value(detail).unwrap_or_else(|error| {
         json!({
@@ -311,6 +342,57 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_cargo_test_executables_skip_the_default_diagnostic_log() {
+        use std::path::{Path, PathBuf};
+        let build = |directory: &[&str], file: &str| -> PathBuf {
+            directory
+                .iter()
+                .fold(PathBuf::from("target"), |path, part| path.join(part))
+                .join(file)
+        };
+        for (path, expected) in [
+            (
+                build(&["debug", "deps"], "elves_harness-5de0ffce51a6dcf8.exe"),
+                true,
+            ),
+            (
+                build(&["release", "deps"], "protocol_proxy-0123456789abcdef"),
+                true,
+            ),
+            // 正式程序、没有哈希、哈希位数或字符不对、不在 deps 目录下的同名文件都必须照常写日志。
+            (build(&["release"], "elves.exe"), false),
+            (build(&["debug", "deps"], "elves-harness.exe"), false),
+            (
+                build(&["debug", "deps"], "elves_harness-5de0ffce51a6dcf.exe"),
+                false,
+            ),
+            (
+                build(&["debug", "deps"], "elves_harness-5de0ffce51a6dcfg.exe"),
+                false,
+            ),
+            (
+                build(&["debug"], "elves_harness-5de0ffce51a6dcf8.exe"),
+                false,
+            ),
+            (Path::new("Elves").join("elves-0123456789abcdef.exe"), false),
+        ] {
+            assert_eq!(
+                super::is_cargo_test_executable(&path),
+                expected,
+                "{}",
+                path.display()
+            );
+        }
+        // 本测试进程自己必须被识别出来，否则 Cargo 改了产物布局后守卫会悄悄失效，测试又开始写用户真实日志。
+        let current = std::env::current_exe().expect("current test executable");
+        assert!(
+            super::is_cargo_test_executable(&current),
+            "{}",
+            current.display()
+        );
+    }
+
     #[test]
     fn write_log_line_clears_existing_log_when_append_would_exceed_limit() {
         let path = std::env::temp_dir().join(format!(

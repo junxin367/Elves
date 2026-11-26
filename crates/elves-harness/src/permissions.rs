@@ -179,15 +179,33 @@ fn modes_from_help(text: &str) -> Vec<String> {
         .collect()
 }
 
-pub(super) async fn claude_modes(config: &super::claude::WslConfig) -> Vec<String> {
-    let key = format!("{}:{}", config.instance_id(), config.executable);
-    let cache = CLAUDE_MODE_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
-    if let Some((at, modes)) = cache.lock().await.get(&key)
-        && at.elapsed() < Duration::from_secs(60)
-    {
-        return modes.clone();
+/// 权限模式清单在这段时间内直接使用；过期后先继续使用旧清单并在后台重新探测。
+const CLAUDE_MODE_FRESH: Duration = Duration::from_secs(60);
+
+#[derive(Debug, PartialEq)]
+enum ModePlan {
+    /// 清单仍新鲜（含上次探测失败得到的空清单，一分钟内不重复探测）。
+    Serve,
+    /// 清单已过期但曾经探测成功：先用旧清单，后台重新探测。
+    ServeAndRefresh,
+    /// 从未探测，或过期的清单是空的：同步探测。
+    Probe,
+}
+
+/// `cached` 为（清单年龄，清单是否为空）。
+fn mode_plan(cached: Option<(Duration, bool)>) -> ModePlan {
+    match cached {
+        None => ModePlan::Probe,
+        Some((age, _)) if age < CLAUDE_MODE_FRESH => ModePlan::Serve,
+        Some((_, false)) => ModePlan::ServeAndRefresh,
+        Some((_, true)) => ModePlan::Probe,
     }
-    // 只运行 --help，不初始化模型、MCP 或用户会话；按实际实例版本识别 manual / default 等名称。
+}
+static CLAUDE_MODE_REFRESHING: OnceLock<Mutex<std::collections::BTreeSet<String>>> =
+    OnceLock::new();
+
+/// 只运行 --help，不初始化模型、MCP 或用户会话；按实际实例版本识别 manual / default 等名称。
+async fn probe_claude_modes(config: &super::claude::WslConfig) -> Vec<String> {
     let mut command = if config.distribution.is_empty() {
         tokio::process::Command::new(&config.executable)
     } else {
@@ -202,11 +220,52 @@ pub(super) async fn claude_modes(config: &super::claude::WslConfig) -> Vec<Strin
         command
     };
     command.arg("--help");
-    let modes = super::preferences::output(command)
+    super::preferences::output(command)
         .await
         .ok()
         .map(|bytes| modes_from_help(&String::from_utf8_lossy(&bytes)))
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+/// 用户要求继续缩短冷启动：每次启动 CLI 前都要核对权限模式名称，过期的清单以前要同步再跑一次
+/// `wsl.exe … claude --help`（实测约 0.3 秒，且在发送的关键路径上）。已有非空清单时即使过期也先使用，
+/// 同时在后台重新探测；CLI 升级后最多一次沿用旧清单，下一次即为新清单。从未探测成功过才同步等待。
+pub(super) async fn claude_modes(config: &super::claude::WslConfig) -> Vec<String> {
+    let key = format!("{}:{}", config.instance_id(), config.executable);
+    let cache = CLAUDE_MODE_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let cached = cache.lock().await.get(&key).cloned();
+    match mode_plan(
+        cached
+            .as_ref()
+            .map(|(at, modes)| (at.elapsed(), modes.is_empty())),
+    ) {
+        ModePlan::Serve => return cached.unwrap().1,
+        ModePlan::ServeAndRefresh => {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                let (config, key) = (config.clone(), key);
+                runtime.spawn(async move {
+                    let refreshing =
+                        CLAUDE_MODE_REFRESHING.get_or_init(|| Mutex::new(Default::default()));
+                    if !refreshing.lock().await.insert(key.clone()) {
+                        return;
+                    }
+                    let modes = probe_claude_modes(&config).await;
+                    refreshing.lock().await.remove(&key);
+                    // 探测失败得到空清单时保留旧清单，不能让一次失败抹掉已确认的模式名称。
+                    if !modes.is_empty() {
+                        CLAUDE_MODE_CACHE
+                            .get_or_init(|| Mutex::new(BTreeMap::new()))
+                            .lock()
+                            .await
+                            .insert(key, (Instant::now(), modes));
+                    }
+                });
+                return cached.unwrap().1;
+            }
+        }
+        ModePlan::Probe => {}
+    }
+    let modes = probe_claude_modes(config).await;
     cache
         .lock()
         .await
@@ -865,6 +924,30 @@ pub(super) fn apply_codex(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_claude_mode_lists_are_served_while_refreshing_in_the_background() {
+        // 用户要求继续缩短冷启动：启动 CLI 前核对权限模式名称不再因清单过期同步多跑一次 `claude --help`。
+        let fresh = CLAUDE_MODE_FRESH - Duration::from_secs(1);
+        let stale = CLAUDE_MODE_FRESH + Duration::from_secs(1);
+        assert_eq!(mode_plan(None), ModePlan::Probe, "从未探测过只能同步等待");
+        assert_eq!(mode_plan(Some((fresh, false))), ModePlan::Serve);
+        assert_eq!(
+            mode_plan(Some((fresh, true))),
+            ModePlan::Serve,
+            "一分钟内不重复探测失败得到的空清单"
+        );
+        assert_eq!(
+            mode_plan(Some((stale, false))),
+            ModePlan::ServeAndRefresh,
+            "过期的非空清单先用，后台刷新"
+        );
+        assert_eq!(
+            mode_plan(Some((stale, true))),
+            ModePlan::Probe,
+            "过期且为空的清单没有可用内容，需要同步探测"
+        );
+    }
 
     #[test]
     fn global_codex_updates_preserve_comments_and_unrelated_config() {

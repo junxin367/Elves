@@ -22,6 +22,7 @@ import { rememberRemoteFastPreference } from "../composer/model-catalog.js";
 import { rememberPermissionSelection } from "../composer/options-state.js";
 import { sending } from "../composer/send-state.js";
 import { refreshSkillCatalog } from "../composer/skills.js";
+import { reloadScheduledMessages } from "../composer/scheduled-message.js";
 import { receiveCompactionLifecycle, reconcileCompaction } from "./compaction.js";
 import {
   notifiedStatus, scheduleReload, scheduleSidebarRefresh, setNotifiedStatus, setNotifiedTokenUsage,
@@ -138,6 +139,10 @@ export function receive(event) {
   }
   if (event.method === "remote/scheduledTasksChanged") {
     window.dispatchEvent(new Event("codex-elves-scheduled-tasks-changed"));
+    return;
+  }
+  if (event.method === "remote/scheduledMessagesChanged") {
+    if (rawParams.threadId === selectedId) void reloadScheduledMessages(selectedId);
     return;
   }
   if (event.method === "remote/conversationNaming") {

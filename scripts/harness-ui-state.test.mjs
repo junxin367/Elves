@@ -7479,11 +7479,12 @@ test("Codex 执行或压缩期间发送不把新模型冻结进队列，停止�
       creating: false, selectedModel: "gpt-new", selectedEffort: "high",
       rememberedNewChatModel: () => null, isClaude: () => false, isActiveThread: () => active,
       currentModelId: () => "gpt-new", activeInstanceId: () => "codex:local",
-      prompt: "后续消息", id: "thread", goalMode: false, queueOnly,
+      prompt: "后续消息", id: "thread", goalMode: false, queueOnly, scheduledAt: null,
       session: { capabilities: { queueSendRecovery: true } }, randomId: () => "same-message",
       draft: { skills: [] }, images: [], files: []
     });
     nodeVm.runInContext(code, context);
+    assert.equal("sendAtMs" in context.actualPayload, false);
     assert.equal(context.actualPayload.model, active || queueOnly ? undefined : "gpt-new");
     assert.equal(context.actualPayload.reasoningEffort, active || queueOnly ? undefined : "high");
     assert.equal(context.selectedModel, "gpt-new");
@@ -7806,7 +7807,7 @@ function queuedEditFeedbackHarness() {
     sending: null, compacting: false, goalMode: false, editing: true, editingMessage: null, active: false, hasAttachments: false,
     unsupportedImages: false, unsupportedStagedImages: false, unsupportedProjectless: false, goalReason: "", queueOnly: false,
     sessionTypeEnabled: true,
-    compactionSendReason: "", compaction: { state: "idle" }, deleting: false, prompt: h.prompt.value,
+    compactionSendReason: "", compaction: { state: "idle" }, deleting: false, prompt: h.prompt.value, scheduling: false,
     pageLeaving: false, stream: null, composerDiagnosticState: "", creating: false,
     privateInputScope: () => "device-a", recordRuntimeDiagnostic() {},
     isClaude: () => false, serviceSideThread: () => true, temporarySideThread: () => true,
@@ -7892,6 +7893,20 @@ test("已确认压缩先于线程执行状态到达时，空输入显示可用�
   h.context.updateComposer();
   assert.equal(h.send.dataset.action, "send");
   assert.equal(h.send.disabled, true, "压缩结束后恢复空输入的发送禁用状态");
+});
+
+test("设置了定时发送时只有标记仍可停止，有正文可在执行中保存且不受旧会话执行限制", () => {
+  const h = compactionComposerHarness();
+  Object.assign(h.context, { scheduling: true, selectedScheduledAt: 1, scheduledTimeLabel: () => "今天 23:00",
+    compacting: false, compaction: { state: "idle" }, compactionSendReason: "", active: true });
+  h.context.updateComposer();
+  assert.equal(h.send.dataset.action, "stop", "还没有正文时保留停止按钮");
+  assert.equal(h.send.attributes["aria-label"], "停止生成");
+  Object.assign(h.context, { prompt: "晚点发", isClaude: () => true, claudeNativeQueue: () => false, modelsLoadedAt: 1 });
+  h.context.updateComposer();
+  assert.equal(h.send.dataset.action, "send");
+  assert.equal(h.send.disabled, false, "定时发送只是保存，不受执行中旧 Claude 会话限制");
+  assert.equal(h.send.title, "设置定时发送：今天 23:00");
 });
 
 test("未确认或未知压缩保留发送锁定，已确认压缩仍受只读和离线限制", async () => {
@@ -9352,7 +9367,7 @@ function independentPromptOptimizationHarness(backend = "claude") {
   return h;
 }
 
-test("输入区菜单按压缩、目标、文件和文件夹、图片排序，附件入口直接调用选择窗口", async () => {
+test("输入区菜单按定时发送、压缩、目标、文件和文件夹、图片排序，附件入口直接调用选择窗口", async () => {
   const h = independentPromptOptimizationHarness("codex"), c = h.context, selected = [];
   c.session.capabilities.localFileInput = true;
   c.composerLocalInputsSupported = () => true;
@@ -9371,6 +9386,16 @@ test("输入区菜单按压缩、目标、文件和文件夹、图片排序，�
   c.composerLocalInputsSupported = () => false;
   c.updateComposer();
   assert.deepEqual(Array.from(h.add.menuOptions, option => option.label), ["压缩", "目标", "图片"]);
+  // 用户要求“定时发送”放在“压缩”上方；仅服务端声明能力时出现。
+  Object.assign(c, { scheduledMessagesSupported: () => true, creating: false, selectedGoal: null,
+    editingMessage: null, editingQueuedMessage: null, selectedId: "thread-a", connected: true,
+    threadReadOnly: () => false, openScheduledMessagePicker() {}, scheduledTimeLabel: () => "今天 23:00" });
+  c.updateComposer();
+  assert.deepEqual(Array.from(h.add.menuOptions, option => option.label), ["定时发送", "压缩", "目标", "图片"]);
+  assert.equal(h.add.menuOptions[0].disabled, false);
+  c.selectedGoal = "goal";
+  c.updateComposer();
+  assert.equal(h.add.menuOptions[0].disabled, true, "目标模式不支持定时发送");
 });
 
 test("Claude 与 Codex 均显示独立提示词优化，不依赖原生连接并保留恢复、附件和写入限制", async () => {
@@ -12323,6 +12348,7 @@ test("实际offline再online回调立即退役旧显示读取并启动新读，�
     },
     showConnectionRecovery() {},
     DOMException,
+    selectedId: "thread-a", reloadScheduledMessages: async () => {},
   });
   vm.runInContext([
     sourceSection("async function refreshConnectedSession(", "function setConnection("),
@@ -12374,6 +12400,7 @@ function connectionRecoveryHarness() {
     renderConnectionIndicator() {},
     navigator: { onLine: true }, initialAuthenticationRequired: false, connecting: null,
     pending: { id: "original-write", state: "unknown", controller: pendingWrite },
+    scheduledReloads: [], reloadScheduledMessages: async id => { context.scheduledReloads.push(id); },
     drafts: new Map([["main", "保留普通草稿"]]),
     questionDrafts: new Map([["existing-question", "保留未提交回答"]]),
     window: { addEventListener: (name, callback) => listeners.set(name, callback) },
@@ -12730,7 +12757,7 @@ test("准备导航但仍停留原页面时，beforeunload 不关闭实时连接�
 test("发送状态诊断区分未读完整、回执和压缩锁定，只在状态变化时记录计数", () => {
   const events = [], receipt = { id: "original-write" };
   const context = {
-    editingMessage: null, editingQueuedMessage: null, editing: false,
+    editingMessage: null, editingQueuedMessage: null, editing: false, scheduling: false,
     deleting: false, busy: false, stopping: false, compacting: false,
     compactionSendReason: "", compaction: { state: "idle" },
     session: { device: { id: "device-a" } }, connected: true, pageLeaving: false,
@@ -17368,6 +17395,7 @@ function claudeSlashMenuHarness() {
     selectedSkills: [], selectedGoal: null, skillChoices: [], skillIndex: 0, skillScope: "", skillLoadVersion: 0,
     skillRenderVersion: 0, skillLoading: null, appliedSkillCatalog: null, appliedGlobalSkills: null,
     skillCatalogs: new Map(), skillScopeAliases: new Map(), skillCatalogRequests: new Map(), skillCatalogRetryAt: new Map(),
+    skillCatalogFailures: new Map(),
     globalSkillChoices: [{ name: "codex-only", path: "C:/codex/SKILL.md", scope: "user" }],
     globalSkillsLoadedAt: Date.now(), globalSkillsInvalidated: false, globalSkillEpoch: "epoch", skillCatalogRevision: 0,
     catalogCacheMs: 3600000, catalogFallbackMs: 604800000, catalogRefreshAheadMs: 60000, catalogRetryMs: 15000,
@@ -17516,6 +17544,38 @@ test("Claude 无项目 Skill 目录刷新保持同一缓存键", async () => {
   assert.equal(c.skillScopeKey(active.scope), key);
   assert.equal(c.skillCatalogs.size, 1);
   assert.equal(c.skillChoices[0].name, "simplify");
+});
+
+test("Skill 目录读取连续失败时按次数退避重试，成功后归零，用户显式读取不受退避限制", async () => {
+  // 用户要求减少日志里的重复异常：读不到的会话以前每分钟请求一次（实测 2 小时 138 次失败），现在逐次翻倍、30 分钟封顶。
+  const h = claudeSlashMenuHarness(), c = h.context;
+  const active = c.activeSkillCatalogContext();
+  const settle = () => new Promise(setImmediate);
+  const initial = c.loadSkillChoices(active.scope, active.payload);
+  await settle();
+  h.calls[0].resolve(h.response("review")); await initial;
+  // 首次读取成功后缓存键会按实际工作目录别名化，退避记录以此后的键为准。
+  const key = c.skillScopeKey(active.scope);
+  async function failRead() {
+    const started = Date.now(), read = c.loadSkillChoices(active.scope, active.payload, { force: true });
+    await settle();
+    h.calls.at(-1).reject(new Error("thread/read failed"));
+    await assert.rejects(read, /thread\/read failed/);
+    return Math.round((c.skillCatalogRetryAt.get(key) - started) / 1000);
+  }
+  // 本上下文 catalogRetryMs=15000：第 n 次失败后等 15 × 2^(n-1) 秒，1800 秒（30 分钟）封顶。
+  const delays = [];
+  for (let attempt = 0; attempt < 8; attempt++) delays.push(await failRead());
+  assert.deepEqual(delays, [15, 30, 60, 120, 240, 480, 960, 1800]);
+  assert.equal(await failRead(), 1800, "封顶后不再增长");
+  // 退避只约束后台自动刷新；用户显式读取在退避期内仍立即发请求，成功后失败计数与退避时间一并清除。
+  const before = h.calls.length, explicit = c.loadSkillChoices(active.scope, active.payload, { force: true });
+  await settle();
+  assert.equal(h.calls.length, before + 1, "显式读取不看退避时间");
+  h.calls.at(-1).resolve(h.response("review")); await explicit;
+  assert.equal(c.skillCatalogRetryAt.has(key), false);
+  assert.equal(c.skillCatalogFailures.has(key), false);
+  assert.equal(await failRead(), 15, "成功后重新从第一档开始");
 });
 
 test("Claude 压缩命令受理后的正常等待保持静默，空闲超过宽限才提示，执行中排队与原生弹窗不提示", () => {
@@ -18102,4 +18162,157 @@ test("输入时提前启动 Claude CLI：请求失败静默，不提示也不影
   h.context.warmSessionOnInput();
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(nodeVm.runInContext("warmedAt.size", h.context), 1, "失败后仍按间隔限频，不会被每个按键重试");
+});
+
+// 定时发送：整模块装入 vm，DOM 只保留渲染用到的属性。
+function scheduledMessageHarness(overrides = {}) {
+  const nodes = [], notices = [], reads = [], actions = [];
+  const element = (tag, className = "", text = "") => {
+    const node = {
+      tag, className, textContent: text, dataset: {}, children: [], disabled: false, hidden: false,
+      isConnected: true, open: false,
+      classList: { add: (...names) => { node.className = [node.className, ...names].filter(Boolean).join(" "); } },
+      append: (...children) => node.children.push(...children),
+      replaceChildren: (...children) => { node.children = children; },
+      setAttribute(name, value) { node[`attr:${name}`] = value; },
+      addEventListener() {}, focus() {}, showModal() { node.open = true; }, close() { node.open = false; },
+    };
+    nodes.push(node);
+    return node;
+  };
+  const root = element("div");
+  const find = (node, className) => node.className.split(" ").includes(className)
+    ? node : node.children.map(child => find(child, className)).find(Boolean);
+  const context = vm.createContext({
+    selectedId: "thread-a", selectionVersion: 1, connected: true, thread: { id: "thread-a" },
+    session: { capabilities: { scheduledMessages: true } }, selectedGoal: null,
+    $: (selector, base) => base ? find(base, selector.slice(1)) : selector === "#scheduled-area" ? root : null,
+    element, button: (label, ariaLabel, onClick, className) => Object.assign(element("button", className, label), { ariaLabel, onClick }),
+    icon: name => element("span", `ui-icon ${name}`),
+    threadReadOnly: () => false, randomId: () => "request-id",
+    notice: (message, error) => notices.push({ message, error }),
+    api: (url, payload) => {
+      if (url.startsWith("/api/read/")) {
+        return new Promise(resolve => reads.push({ payload, resolve }));
+      }
+      return new Promise(resolve => actions.push({ url, payload, resolve }));
+    },
+    ...overrides,
+  });
+  vm.runInContext([
+    remoteSource.moduleText("features/composer/scheduled-state.js"),
+    remoteSource.moduleText("features/composer/scheduled-message.js"),
+  ].join("\n"), context);
+  const rows = () => root.children;
+  return { context, root, rows, find, nodes, reads, actions, notices };
+}
+const settle = () => new Promise(resolve => setImmediate(resolve));
+const scheduledRow = (id, status, extra = {}) => ({
+  id, threadId: "thread-a", sendAtMs: Date.now() + 60_000, prompt: `消息 ${id}`, status, ...extra,
+});
+
+test("时间弹窗点确定后先画出编辑框标记再记录草稿，首次选择的时间不丢失", () => {
+  let token = false, remembered = "未记录";
+  const state = code => vm.runInContext(code, h.context);
+  const h = scheduledMessageHarness({
+    document: { body: { append() {} } }, queueMicrotask() {}, closeComposerMenus() {}, updateComposer() {},
+    renderSelectedSkills: () => { token = state("selectedScheduledAt") != null; },
+    // 与真实草稿快照一致：先以编辑框实际标记为准，没有定时标记即视为已删除（syncSelectedSkillsFromPrompt）。
+    rememberDraft: () => {
+      if (!token) state("setSelectedScheduledAt(null)");
+      remembered = state("selectedScheduledAt");
+    },
+  });
+  h.context.openScheduledMessagePicker();
+  const dialog = h.nodes.find(node => node.className === "scheduled-send-dialog");
+  const input = h.find(dialog, "scheduled-send-input");
+  assert.equal(dialog.open, true);
+  assert.ok(input.value >= input.min && input.value <= input.max);
+  h.nodes.find(node => node.ariaLabel === "确认定时发送时间").onClick();
+  assert.equal(dialog.open, false);
+  assert.equal(remembered, Date.parse(input.value), "记录进草稿的就是所选时间");
+  assert.equal(state("selectedScheduledAt"), Date.parse(input.value));
+});
+
+test("定时消息列表按状态显示标签和原因，发送中的消息不能取消", async () => {
+  const h = scheduledMessageHarness();
+  const done = h.context.reloadScheduledMessages("thread-a");
+  h.reads[0].resolve({ messages: [
+    scheduledRow("1", "scheduled"), scheduledRow("2", "running"),
+    scheduledRow("3", "error", { lastError: "会话已被其他应用打开" }),
+    scheduledRow("4", "unknown", { lastError: "定时消息发送结果待确认" }),
+  ] });
+  await done;
+  assert.equal(h.root.hidden, false);
+  const label = row => h.find(row, "scheduled-message-status")?.textContent ?? null;
+  assert.deepEqual(h.rows().map(label), [null, "发送中", "发送失败", "结果待确认"]);
+  assert.deepEqual(h.rows().map(row => row.dataset.status), ["scheduled", "running", "error", "unknown"]);
+  assert.deepEqual(h.rows().map(row => h.find(row, "scheduled-message-remove").disabled), [false, true, false, false]);
+  assert.equal(h.find(h.rows()[2], "scheduled-message-reason").textContent, "会话已被其他应用打开");
+  assert.ok(h.rows().every(row => row.className === "scheduled-message"), "行只用基础类名，状态走 data-status，不与原因文字共用样式");
+});
+
+test("定时消息读取进行中又收到变更时补读一次，切走又切回不复用被丢弃的旧读取", async () => {
+  const h = scheduledMessageHarness();
+  const first = h.context.reloadScheduledMessages("thread-a");
+  const again = h.context.reloadScheduledMessages("thread-a");
+  assert.equal(h.reads.length, 1, "同一会话合并进行中的读取");
+  h.reads[0].resolve({ messages: [scheduledRow("1", "scheduled")] });
+  await settle();
+  assert.equal(h.reads.length, 2, "读取期间的变更通知要再读一次");
+  h.reads[1].resolve({ messages: [] });
+  await Promise.all([first, again]);
+  assert.equal(h.root.hidden, true, "以最后一次读取为准");
+
+  const stale = h.context.reloadScheduledMessages("thread-a");
+  h.context.selectionVersion = 2;
+  const fresh = h.context.reloadScheduledMessages("thread-a");
+  assert.equal(h.reads.length, 4, "切换过会话后另起读取");
+  h.reads[2].resolve({ messages: [scheduledRow("old", "scheduled")] });
+  h.reads[3].resolve({ messages: [scheduledRow("new", "scheduled")] });
+  await Promise.all([stale, fresh]);
+  assert.deepEqual(h.rows().map(row => row.dataset.messageId), ["new"]);
+});
+
+test("服务端未声明定时发送能力时不读取，也不打开时间选择", async () => {
+  const h = scheduledMessageHarness({ session: { capabilities: {} } });
+  await h.context.reloadScheduledMessages("thread-a");
+  h.context.openScheduledMessagePicker();
+  assert.equal(h.reads.length, 0);
+  assert.equal(h.notices.length, 0);
+});
+
+test("取消定时消息被服务端拒绝时提示原因", async () => {
+  const h = scheduledMessageHarness();
+  const done = h.context.cancelScheduledMessage({ id: "m-1", threadId: "thread-a" });
+  h.actions[0].resolve({ state: "failed", result: { ok: false, message: "定时消息正在发送，无法取消" } });
+  await settle();
+  h.reads[0].resolve({ messages: [] });
+  await done;
+  assert.equal(h.actions[0].url, "/api/action/cancelScheduledMessage");
+  assert.deepEqual(h.notices, [{ message: "定时消息正在发送，无法取消", error: true }]);
+});
+
+test("编辑框的定时标记显示“定时发送 · 时间”，按目标标记的结构渲染", () => {
+  const made = [];
+  const context = vm.createContext({
+    Intl, Date,
+    element: (tag, className = "", text = "") => {
+      const node = { tag, className, textContent: text, children: [], append: (...children) => node.children.push(...children),
+        setAttribute(name, value) { node[name] = value; } };
+      made.push(node);
+      return node;
+    },
+    icon: () => ({ className: "ui-icon" }),
+  });
+  vm.runInContext([
+    remoteSource.moduleText("features/composer/scheduled-state.js"),
+    remoteSource.section("function scheduledToken(", "function promptTokenPlacements"),
+  ].join("\n"), context);
+  const today = new Date(); today.setHours(23, 5, 0, 0);
+  const token = context.scheduledToken(today.getTime());
+  assert.equal(token.className, "inline-scheduled");
+  assert.equal(token.contentEditable, "false");
+  assert.deepEqual(token.children.map(child => child.className), ["inline-skill-icon", "inline-skill-name"]);
+  assert.match(token.children[1].textContent, /^定时发送 · 今天 .*05$/);
 });

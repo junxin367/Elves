@@ -32,6 +32,8 @@ import { resetComposerOptions } from "../composer/new-chat.js";
 import { fastModeVersion } from "../composer/options-state.js";
 import { renderSelectedSkills } from "../composer/selected-skills.js";
 import { setSelectedSkills } from "../composer/skill-catalog.js";
+import { setSelectedScheduledAt } from "../composer/scheduled-state.js";
+import { reloadScheduledMessages } from "../composer/scheduled-message.js";
 import { compactionVersion, currentCompaction, normalizeCompaction, reconcileCompaction } from "./compaction.js";
 import {
   notifiedStatus, notifiedTokenUsage, setNotifiedTokenUsage, statusVersion, tokenUsageVersion
@@ -203,6 +205,7 @@ export async function selectThread(id, { closeSidebar = true, force = false, rel
   syncRelatedSessionLayout();
   sessionTools?.updateContext();
   restoreDraft(id); resetComposerOptions(); restoreQueuedMessageEdit();
+  void reloadScheduledMessages(id);
   setNotifiedTokenUsage(null); setNotifiedGoal(null);
   setNotifiedQuestions(null);
   const read = setThreadReadVersion(threadReadVersion + 1), usageVersion = tokenUsageVersion, fastReadVersion = fastModeVersion,
@@ -350,7 +353,9 @@ export function showWelcome({ startNew = true, clearHash = false } = {}) {
     }
   }
   sessionTools?.updateContext();
-  $("#prompt").value = ""; setSelectedSkills([]); setSelectedGoal(null); clearComposerAttachments(); resetComposerOptions();
+  $("#prompt").value = ""; setSelectedSkills([]); setSelectedGoal(null); setSelectedScheduledAt(null);
+  clearComposerAttachments(); resetComposerOptions();
+  void reloadScheduledMessages(null);
   $("#thread-title").textContent = "远程会话"; $("#thread-path").textContent = "";
   $("#project-select-slot").hidden = true;
   $("#messages").replaceChildren(welcomeNode());

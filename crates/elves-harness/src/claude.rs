@@ -493,6 +493,10 @@ impl Process {
         let id = uuid::Uuid::new_v4().to_string();
         let (sender, receiver) = oneshot::channel();
         self.channel.pending.lock().await.insert(id.clone(), sender);
+        // 用户要求继续优化发送和冷启动等待：控制请求超过 1 秒才记一行（含请求类型和耗时），
+        // 用真实日志定位发送路径上还有哪一步慢；快的请求不产生任何日志。
+        let started = Instant::now();
+        let subtype = request["subtype"].as_str().unwrap_or("").to_owned();
         let response = async {
             self.write(
                 json!({"type":"control_request","request_id":id,"request":request}),
@@ -510,9 +514,19 @@ impl Process {
         }
         .await;
         self.channel.pending.lock().await.remove(&id);
+        let elapsed = started.elapsed();
+        if elapsed >= SLOW_CONTROL {
+            diagnose_event(
+                "claude.control.slow",
+                json!({"subtype":subtype,"ms":elapsed.as_millis() as u64,"ok":response.is_ok()}),
+            );
+        }
         response
     }
 }
+
+/// 控制请求耗时达到这个值才写诊断日志。
+const SLOW_CONTROL: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
 struct DiscoveryState {
@@ -6819,6 +6833,63 @@ mod tests {
         project_claude_message_timestamps(&mut legacy);
         assert_eq!(legacy["items"][0]["sentAtMs"], 1000);
         assert_eq!(legacy["items"][1]["sentAtMs"], 3000);
+    }
+
+    #[test]
+    fn absorbed_guidance_keeps_the_native_position_and_its_web_identity() {
+        // 用户要求引导消息停在发送时执行到的位置，不能在整轮结束后落到末尾（claude_shared.py queued_human_prompt）：
+        // 读取器把执行中被吸收的引导附件转成用户行，位置在工具结果之后、下一段回复之前，并经 source_uuid 关联网页消息 ID。
+        // 行时间是发送时间（早于它前面那条工具结果），投影按文件顺序而不是时间排序。
+        let turns = project_shared_history(
+            &json!({"native_status":{"tempo":"idle"},
+                "clients":{"first":"web-first","absorbed":"web-guide"},
+                "messages":[
+                {"type":"user","uuid":"first","timestampMs":1000,"nativeEditable":true,
+                    "message":{"content":"开始"}},
+                {"type":"assistant","uuid":"call","timestampMs":2000,"message":{"id":"call-1",
+                    "content":[{"type":"tool_use","id":"tool-1","name":"Bash",
+                        "input":{"command":"sleep 300"}}]}},
+                {"type":"user","uuid":"result","timestampMs":3000,"message":{"content":[
+                    {"type":"tool_result","tool_use_id":"tool-1","content":"done"}]}},
+                {"type":"user","uuid":"absorbed","timestampMs":2500,"nativeEditable":false,
+                    "attachment":{"type":"queued_command","source_uuid":"sent"},
+                    "message":{"role":"user","content":[{"type":"text","text":"后台任务进展如何"}]}},
+                {"type":"assistant","uuid":"reply","timestampMs":3100,"message":{"id":"reply-1",
+                    "content":[{"type":"text","text":"收到"}]}},
+                {"type":"system","subtype":"turn_duration","timestampMs":4000}
+            ]}),
+            "guidance",
+        );
+        assert_eq!(
+            turns.len(),
+            2,
+            "吸收点之前的执行留在原轮次，引导消息开启之后的显示轮次"
+        );
+        assert_eq!(turns[0]["id"], "web-first");
+        assert_eq!(turns[0]["items"].as_array().unwrap().len(), 2);
+        assert!(
+            turns[0]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["type"] != "agentMessage"),
+            "引导之后的回复不能回到引导之前的轮次"
+        );
+        let guided = &turns[1];
+        assert_eq!(
+            guided["id"], "web-guide",
+            "沿用网页发送时的消息 ID，客户端按它接替本地回执"
+        );
+        assert_eq!(guided["_nativeUserId"], "absorbed");
+        assert_eq!(
+            guided["_nativeEditable"], false,
+            "吸收在工具轮次中的引导不是原生回退点"
+        );
+        assert_eq!(guided["items"][0]["type"], "userMessage");
+        assert_eq!(guided["items"][0]["clientId"], "web-guide");
+        assert_eq!(guided["items"][0]["content"][0]["text"], "后台任务进展如何");
+        assert_eq!(guided["items"][1]["type"], "agentMessage");
+        assert_eq!(guided["items"][1]["text"], "收到");
     }
 
     #[test]

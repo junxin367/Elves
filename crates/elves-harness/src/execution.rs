@@ -134,11 +134,49 @@ impl Scope {
             // 每次业务请求保存最终通道；流式轮询不逐次写文件，避免诊断挤占事件处理。
             if scope.metadata["action"] != "events" {
                 scope.audit.record(record.clone());
+                // 失败原因只写本机诊断日志（不进网页可读的审计记录）：没有它，反复失败的读取只能看到次数。
+                if let Some(reason) = failure_summary(&result) {
+                    record["error"] = json!(reason);
+                }
                 let _ =
                     crate::diagnostic_log::append_diagnostic_log("remote_access.execution", record);
             }
             result
         }
+    }
+}
+
+/// 失败或被拒绝时的原因摘要，截断到 240 个字符，避免原生引擎的长错误撑大日志。
+fn failure_summary(result: &anyhow::Result<Value>) -> Option<String> {
+    let text = match result {
+        Err(error) => format!("{error:#}"),
+        Ok(value) if value["ok"] == false => value["message"].as_str()?.to_owned(),
+        Ok(_) => return None,
+    };
+    Some(text.chars().take(240).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_and_rejected_calls_keep_a_bounded_reason_for_the_log() {
+        assert_eq!(
+            failure_summary(&Ok(json!({"ok":true,"message":"正常"}))),
+            None
+        );
+        assert_eq!(
+            failure_summary(&Ok(json!({"ok":false,"message":"会话正忙"}))),
+            Some("会话正忙".into())
+        );
+        let error = anyhow::anyhow!("连接已断开").context("读取技能目录失败");
+        assert_eq!(
+            failure_summary(&Err(error)),
+            Some("读取技能目录失败: 连接已断开".into())
+        );
+        let long = failure_summary(&Err(anyhow::anyhow!("错".repeat(1000)))).unwrap();
+        assert_eq!(long.chars().count(), 240);
     }
 }
 

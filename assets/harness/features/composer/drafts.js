@@ -12,6 +12,7 @@ import { creationBackend, creationInstanceId, creationProject } from "./creation
 import { draftPermissionChoices } from "./options-state.js";
 import { composerPrompt, sameSkills, syncSelectedSkillsFromPrompt } from "./prompt-editor.js";
 import { selectedSkills } from "./skill-catalog.js";
+import { selectedScheduledAt } from "./scheduled-state.js";
 import { validSkillSelection } from "../conversation/pending-state.js";
 import { goalComposerAction, selectedGoal, setSelectedGoal } from "../goal/state.js";
 import { editingQueuedMessage, queuedEdits } from "../queue/state.js";
@@ -22,6 +23,7 @@ export const drafts = new Map();
 export const skillDrafts = new Map();
 export const attachmentDrafts = new Map();
 export const goalDrafts = new Map();
+export const scheduledAtDrafts = new Map();
 export const draftWrites = new Map(), failedInputRecoveries = new Map();
 export let recoveryScope = null, recoveryGeneration = 0, draftStorageError = "";
 export function setRecoveryGeneration(value) { return recoveryGeneration = value; }
@@ -40,6 +42,7 @@ export function snapshotDraft() {
     skills: selectedSkills.map(skill => ({ ...skill })),
     attachments: composerAttachmentSnapshot(),
     goalMode: selectedGoal,
+    scheduledAtMs: selectedScheduledAt,
     ...(draftPermissionChoices.has(draftKey()) ? { permissionMode: draftPermissionChoices.get(draftKey()) } : {})
   };
 }
@@ -50,6 +53,7 @@ export function storedDraft(key) {
     skills: skillDrafts.get(key) || [],
     attachments: attachmentDrafts.get(key) || [],
     goalMode: goalDrafts.get(key) || null,
+    scheduledAtMs: scheduledAtDrafts.get(key) || null,
     ...(draftPermissionChoices.has(key) ? { permissionMode: draftPermissionChoices.get(key) } : {})
   };
 }
@@ -58,18 +62,22 @@ export function storeDraft(key, draft) {
   attachmentDrafts.set(key, draft.attachments || []);
   if (draft.goalMode) goalDrafts.set(key, draft.goalMode);
   else goalDrafts.delete(key);
+  if (Number.isSafeInteger(draft.scheduledAtMs) && draft.scheduledAtMs > 0)
+    scheduledAtDrafts.set(key, draft.scheduledAtMs);
+  else scheduledAtDrafts.delete(key);
   if (key.startsWith("$new:") && typeof draft.permissionMode === "string"
       && (permissionModeKnown("codex", draft.permissionMode) || permissionModeKnown("claude", draft.permissionMode)))
     draftPermissionChoices.set(key, draft.permissionMode);
   void persistInputDraft(key).catch(() => {});
 }
 export function deleteDraft(key) {
-  drafts.delete(key); skillDrafts.delete(key); attachmentDrafts.delete(key); goalDrafts.delete(key);
+  drafts.delete(key); skillDrafts.delete(key); attachmentDrafts.delete(key); goalDrafts.delete(key); scheduledAtDrafts.delete(key);
   draftPermissionChoices.delete(key);
   void persistInputDraft(key, true).catch(() => {});
 }
 export function inputDraftEmpty(draft) {
-  return !draft?.text && !draft?.skills?.length && !draft?.attachments?.length && !draft?.goalMode && !draft?.permissionMode;
+  return !draft?.text && !draft?.skills?.length && !draft?.attachments?.length && !draft?.goalMode
+    && !draft?.scheduledAtMs && !draft?.permissionMode;
 }
 export function persistInputDraft(key, remove = false) {
   if (!recoveryScope || !session) return Promise.resolve();
@@ -131,6 +139,7 @@ export function rememberDraft() {
       || JSON.stringify(image.files || []) !== JSON.stringify(previous.attachments[index]?.files || [])
       || JSON.stringify(image.directories || []) !== JSON.stringify(previous.attachments[index]?.directories || []))
     || (draft.goalMode || null) !== (previous.goalMode || null)
+    || (draft.scheduledAtMs || null) !== (previous.scheduledAtMs || null)
     || (draft.permissionMode || null) !== (previous.permissionMode || null);
   // 切换或卸载时，未编辑的本页旧稿不能覆盖其他页面已经保存的新稿。
   if (!changed) return;
@@ -193,6 +202,7 @@ export function matchingDraft(draft, payload) {
         === JSON.stringify(submitted.skills.map(skill => skill._offset ?? 0))
       && (draft.goalMode || null) === (submitted.goalMode || null))
     && !!draft.goalMode === (payload.goalMode === true)
+    && (draft.scheduledAtMs || null) === (payload.scheduledAtMs || null)
     // 默认或记住的权限由发送阶段补齐；回执仍比较提交时的原草稿，避免误判未修改或清除后来显式选择。
     && (draft.permissionMode || "configured") === ((submitted || payload).permissionMode || "configured")
     && composerPrompt(draft.text, draft.skills, payload.goalMode === true) === payload.prompt

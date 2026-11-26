@@ -20,6 +20,7 @@ import {
 } from "./state.js";
 import { editingMessage } from "../messages/message-edit.js";
 import { editingQueuedMessage } from "../queue/state.js";
+import { setSelectedScheduledAt } from "../composer/scheduled-state.js";
 import { claudeCommandSupported } from "../session/action-capabilities.js";
 import { isClaude, temporarySideThread, threadReadOnly, threadReadOnlyMessage } from "../session/capabilities.js";
 import { composerScroll } from "../shell-state.js";
@@ -91,6 +92,7 @@ export function selectGoalCommand(range = slashQuery()) {
   const prompt = $("#prompt");
   if (range) prompt.setRangeText("", range.start, range.end, "end");
   const selection = promptSelection(prompt);
+  setSelectedScheduledAt(null);
   (selectedGoal || setSelectedGoal(randomId()));
   renderSelectedSkills();
   rememberDraft();

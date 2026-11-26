@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -433,6 +433,21 @@ impl Inner {
         let _ = self.out.send(frame);
     }
 
+    /// 读取器和实时状态都没有变化时，上层手里的就是最新状态，不再复制并重发整份历史。
+    /// 用户要求缩短发送前的等待：`shared_sync` 回执前上层只需看到最新状态，不要求再收一份相同的快照；
+    /// 大会话每多发一份快照都要重新序列化、传输和解析全部历史（实测 8290 条消息、21.6 MiB 的会话
+    /// 仅读取器侧就要 0.17–0.18 秒）。有变化时照常立即发出。
+    fn emit_if_changed(&self) {
+        let signature = (
+            self.reader_rev.load(Ordering::Acquire),
+            self.state_rev.load(Ordering::Acquire),
+        );
+        if *lock(&self.emitted) == signature {
+            return;
+        }
+        self.emit_now();
+    }
+
     /// 提前启动 CLI。只有 CLI 原本没有运行时才算预热；已经在运行的 CLI 保持原来的空闲回收时间。
     async fn warm(self: &Arc<Self>) -> Reply {
         let was_alive = self.alive();
@@ -448,7 +463,7 @@ impl Inner {
         self.reader_control(json!({"subtype":"shared_sync"}))
             .await
             .map_err(reader_error)?;
-        self.emit_now();
+        self.emit_if_changed();
         Ok(json!({"nativeSettings":self.settings_projection()}))
     }
 
@@ -496,9 +511,12 @@ impl Inner {
         guard.take();
         let mut spec = lock(&self.launch).clone();
         spec.attach_only = attach_only;
+        // 用户要求继续优化冷启动：记录每次真实启动各阶段的耗时（只一行日志），下次用真实日志定位等待在哪一段。
+        let started = Instant::now();
         let io = self.backend.spawn_cli(&spec).await.map_err(|failure| {
             PeerError::plain(format!("无法启动指定 WSL 中的 Claude CLI：{failure}"), true)
         })?;
+        let spawned = started.elapsed();
         let generation = self.cli_generation.fetch_add(1, Ordering::AcqRel) + 1;
         let (writer, receiver) = mpsc::unbounded_channel();
         tokio::spawn(write_lines(receiver, io.writer));
@@ -533,6 +551,7 @@ impl Inner {
         })
         .await
         .unwrap_or(false);
+        let attached_at = started.elapsed();
         if !attached {
             if attach_only {
                 self.drop_cli(generation).await;
@@ -565,7 +584,19 @@ impl Inner {
                 true,
             )
         })?;
+        let initialized_at = started.elapsed();
         self.reapply_selection().await;
+        if !attach_only {
+            let ms = |duration: Duration| duration.as_millis() as u64;
+            diagnose(
+                "cli_started",
+                &self.spec.native_id,
+                json!({"spawnMs":ms(spawned),"attachMs":ms(attached_at.saturating_sub(spawned)),
+                    "initializeMs":ms(initialized_at.saturating_sub(attached_at)),
+                    "reapplyMs":ms(started.elapsed().saturating_sub(initialized_at)),
+                    "totalMs":ms(started.elapsed()),"resumed":spec.resumed}),
+            );
+        }
         Ok(true)
     }
 
@@ -1610,6 +1641,8 @@ mod tests {
         exited_at: StdMutex<Option<tokio::time::Instant>>,
         /// 假读取器收到 sdk_rewind 的时刻。
         rewound_at: StdMutex<Option<tokio::time::Instant>>,
+        /// 为真时假读取器在 shared_sync 时不重发快照（真实读取器没有变化时的行为，见 claude_shared.py 的 skip_unchanged）。
+        quiet_sync: StdMutex<bool>,
     }
 
     struct Fake {
@@ -1787,7 +1820,9 @@ mod tests {
                             out.push(success(id, json!({"contextConfiguration":{"source":"fake"}})));
                         }
                         "shared_sync" => {
-                            out.push(snapshot());
+                            if !*lock(&log.quiet_sync) {
+                                out.push(snapshot());
+                            }
                             out.push(success(id, json!({})));
                         }
                         "sdk_prepare" => {
@@ -2318,6 +2353,42 @@ mod tests {
             frames[before + snapshot.unwrap()]["native_status"]["sessionAlive"],
             false
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_sync_does_not_resend_an_unchanged_snapshot_but_still_publishes_changes() {
+        // 用户要求缩短发送前的等待：没有变化时上层手里的快照就是最新的，不再为它复制、序列化并重发整份历史。
+        let mut upper = Upper::standard();
+        upper.initialize(json!({})).await;
+        upper.wait_for(|f| f["type"] == "shared_snapshot").await;
+        let snapshots = |upper: &Upper| {
+            upper
+                .frames()
+                .iter()
+                .filter(|f| f["type"] == "shared_snapshot")
+                .count()
+        };
+        *lock(&upper.log.quiet_sync) = true;
+        let settled = snapshots(&upper);
+        let response = upper.call(json!({"subtype":"shared_sync"})).await;
+        assert_eq!(response["subtype"], "success");
+        assert_eq!(snapshots(&upper), settled, "读取器和实时状态都没变，不重发");
+
+        // 读取器有了新内容（假读取器重发一份快照）：回执之前上层必须已经看到。
+        *lock(&upper.log.quiet_sync) = false;
+        let response = upper.call(json!({"subtype":"shared_sync"})).await;
+        assert_eq!(response["subtype"], "success");
+        let frames = upper.frames();
+        let receipt = frames
+            .iter()
+            .rposition(|f| f["type"] == "control_response")
+            .unwrap();
+        let latest = frames
+            .iter()
+            .rposition(|f| f["type"] == "shared_snapshot")
+            .unwrap();
+        assert!(snapshots(&upper) > settled, "有变化时发出新的快照");
+        assert!(latest < receipt, "回执之前上层必须已经看到最新快照");
     }
 
     #[tokio::test(start_paused = true)]

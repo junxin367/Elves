@@ -64,6 +64,11 @@ import {
   setPendingFeedbackTimer, setSending, setThreadOwnershipRetry, threadOwnershipRetry
 } from "./send-state.js";
 import { selectedSkills } from "./skill-catalog.js";
+import { scheduledTimeLabel, selectedScheduledAt } from "./scheduled-state.js";
+import {
+  openScheduledMessagePicker, reloadScheduledMessages, renderScheduledMessages, scheduledMessagesSupported,
+  submitScheduledMessage
+} from "./scheduled-message.js";
 import { compactCommandAvailable, renderSkillMenu } from "./skills.js";
 import {
   compactContext, compactionInProgress, compactionLocked, compactionQueueSendReason,
@@ -279,6 +284,7 @@ export function updateComposer({ followEnd = false } = {}) {
   resizeComposerInput({ followEnd });
   renderGoalStatus();
   renderQueueArea();
+  renderScheduledMessages();
   updateScrollControl();
   const typedGoal = goalPrefix($("#prompt").value);
   const goalMode = !!selectedGoal || !!typedGoal;
@@ -290,8 +296,10 @@ export function updateComposer({ followEnd = false } = {}) {
   const unsupportedProjectless = creating && !$("#project-select").value && !backendCapability("projectlessCreation");
   const compaction = currentCompaction(), compacting = compactionLocked();
   const editing = !!editingMessage || !!editingQueuedMessage;
-  const compactionSendReason = compacting && !goalMode && !editing ? compactionQueueSendReason() : "";
-  const queueOnly = !isClaude() && compacting && !goalMode && !editing && !compactionSendReason;
+  // 定时发送只是保存消息、到期才走普通发送：执行中或压缩中都能设置，不受下面的即时发送限制。
+  const scheduling = !!selectedScheduledAt && !editing;
+  const compactionSendReason = compacting && !goalMode && !editing && !scheduling ? compactionQueueSendReason() : "";
+  const queueOnly = !scheduling && !isClaude() && compacting && !goalMode && !editing && !compactionSendReason;
   const unsupportedFiles = composerLocalInputsPayload().length > 0
     && session?.capabilities?.localFileInput !== true;
   const inputImages = composerAttachmentsPayload();
@@ -332,8 +340,15 @@ export function updateComposer({ followEnd = false } = {}) {
     || !!editingMessage || editing && !!pending || editingQueuedMessage?.state === "starting" || (!creating && !selectedId));
   const add = $("#composer-add");
   const usage = contextUsage(currentThreadDisplay()?.tokenUsage);
-  // 用户指定左侧“+”菜单从上到下为压缩、目标、文件和文件夹、图片；本机文件入口仍仅在支持原生选择器的独立客户端显示。
+  // 用户指定左侧“+”菜单从上到下为定时发送、压缩、目标、文件和文件夹、图片；本机文件入口仍仅在支持原生选择器的独立客户端显示。
   add.menuOptions = [
+    ...(scheduledMessagesSupported() ? [{
+      value: "scheduled", label: "定时发送", icon: "recent",
+      description: selectedScheduledAt ? scheduledTimeLabel(selectedScheduledAt) : "设置未来 24 小时内的发送时间",
+      disabled: creating || !!selectedGoal || !!editingMessage || !!editingQueuedMessage || threadReadOnly()
+        || !selectedId || !connected,
+      action: openScheduledMessagePicker
+    }] : []),
     { value: "compact", label: "压缩", icon: "compactContext",
       description: compactUsageDescription(usage),
       disabled: !compactCommandAvailable(), action: compactContext },
@@ -358,7 +373,9 @@ export function updateComposer({ followEnd = false } = {}) {
   if ($("#send-status").textContent !== sendingLabel) $("#send-status").textContent = sendingLabel;
   // 用户要求压缩执行中空输入显示停止；有正文或附件时仍可加入原生队列，旧 print 会话保留原停止行为。
   // 用户要求排队取回后沿用普通发送图标和文案；空草稿不能误显示停止当前任务。
-  const action = sending ? "sending" : editingQueuedMessage ? "send" : isClaude() && !claudeNativeQueue() && active && selectedId ? "stop"
+  // 只有定时标记、还没有正文时仍按空输入处理，执行中保留停止按钮。
+  const action = sending ? "sending" : editingQueuedMessage || scheduling && (prompt || hasAttachments) ? "send"
+    : isClaude() && !claudeNativeQueue() && active && selectedId ? "stop"
     : !goalMode && !editing && (active || compactionInProgress(compaction))
       && ((!prompt && !hasAttachments) || pending) && selectedId ? "stop" : "send";
   send.dataset.queuedEditState = editingQueuedMessage?.state || "";
@@ -372,8 +389,11 @@ export function updateComposer({ followEnd = false } = {}) {
     indicator.setAttribute("aria-hidden", "true");
     send.replaceChildren(indicator);
   }
-  send.setAttribute("aria-label", sendingLabel || (goalMode ? "创建目标" : action === "stop" ? stopLabel : queueOnly ? "发送到原生消息队列" : "发送消息"));
-  send.title = sendingLabel || (editingQueuedMessage ? "发送消息" : editingMessage ? "请先完成消息编辑" : goalMode ? goalReason || "创建目标" : action === "stop" ? stopLabel : queueOnly ? "加入原生消息队列，压缩完成后执行" : compactionSendReason || (active ? "发送补充消息" : "发送消息"));
+  send.setAttribute("aria-label", sendingLabel || (goalMode ? "创建目标"
+    : action === "stop" ? stopLabel : scheduling ? "设置定时发送" : queueOnly ? "发送到原生消息队列" : "发送消息"));
+  send.title = sendingLabel || (editingQueuedMessage ? "发送消息" : editingMessage ? "请先完成消息编辑" : goalMode ? goalReason || "创建目标"
+    : action === "stop" ? stopLabel : scheduling ? `设置定时发送：${scheduledTimeLabel(selectedScheduledAt)}`
+    : queueOnly ? "加入原生消息队列，压缩完成后执行" : compactionSendReason || (active ? "发送补充消息" : "发送消息"));
   if (unsupportedStagedImages) send.title = "原图仅支持在具备此能力的 Elves 本机 Codex 会话发送";
   else if (unsupportedImages) send.title = "当前服务版本尚不支持图片发送，请先更新程序";
   if (unsupportedFiles) send.title = "请更新远程服务后发送文件和文件夹";
@@ -388,7 +408,7 @@ export function updateComposer({ followEnd = false } = {}) {
     : action !== "stop" && compactionSendReason ? compaction.deviceId && compaction.deviceId !== session?.device.id ? "compaction-scope"
       : compaction.state === "unknown" ? "compaction-unknown" : compaction.state === "pending" && !compaction.acknowledged && !compaction.nativeConfirmed
         ? "compaction-pending" : "compaction-unsupported"
-    : !connected ? "offline" : isClaude() && !claudeNativeQueue() && active && action !== "stop" ? "claude-running"
+    : !connected ? "offline" : !scheduling && isClaude() && !claudeNativeQueue() && active && action !== "stop" ? "claude-running"
     // 历史会话已保存当前模型时可直接续发；没有完整目录也不能强制用户先打开模型选择器。
     : isClaude() && !modelsLoadedAt && !currentThreadDisplay()?.model && action !== "stop" ? "claude-models" : threadReadOnly() ? "read-only" : unsupportedImages ? "images-unsupported"
     : unsupportedFiles ? "files-unsupported" : unsupportedProjectless ? "project-required" : goalReason ? "goal" : composerAttachmentsLoading() ? "images-loading"
@@ -607,6 +627,15 @@ export async function sendMessage() {
     const reason = goalComposerReason({ submitting: true });
     if (reason) { notice(reason, true); return; }
   }
+  const scheduledAt = Number.isSafeInteger(draft.scheduledAtMs) ? draft.scheduledAtMs : null;
+  if (scheduledAt && (creating || selectedGoal)) {
+    notice("定时发送只支持已有会话，且不能与目标模式同时使用。", true);
+    return;
+  }
+  if (scheduledAt && (scheduledAt <= Date.now() || scheduledAt > Date.now() + 24 * 60 * 60 * 1000)) {
+    notice("定时发送时间已失效，请重新选择未来 24 小时内的时间。", true);
+    return;
+  }
   const prompt = composerPrompt(draft.text, draft.skills, goalMode);
   const images = composerAttachmentsPayload();
   const files = composerLocalInputsPayload();
@@ -625,7 +654,7 @@ export async function sendMessage() {
   }
   if (!prompt && !images.length && !files.length) { notice(goalMode ? "请描述目标或添加附件" : "请输入消息或添加附件"); return; }
   if (!creating && (!selectedId || thread?.id !== selectedId)) return;
-  const queueOnly = !isClaude() && !creating && !goalMode && compactionLocked();
+  const queueOnly = !scheduledAt && !isClaude() && !creating && !goalMode && compactionLocked();
   if (queueOnly) {
     const reason = compactionQueueSendReason();
     if (reason) { notice(reason, true); return; }
@@ -648,6 +677,7 @@ export async function sendMessage() {
       ...(!goalMode && session.capabilities?.queueSendRecovery === true ? { clientUserMessageId: randomId() } : {})
     }),
     ...(goalMode ? { goalMode: true } : {}),
+    ...(scheduledAt ? { sendAtMs: scheduledAt, scheduledAtMs: scheduledAt } : {}),
     ...(queueOnly ? { queueOnly: true } : {}),
     ...(modelChoiceApplies && model ? { model } : {}),
     // 显式草稿优先；Claude 有有效记忆时恢复原选择，否则仍继承实例配置，不能把展示值固化为覆盖。
@@ -671,7 +701,7 @@ export async function sendMessage() {
   submittedDrafts.set(payload, { ...draft, modelChoice: {
     version: modelChoiceVersion, model: selectedModel, effort: selectedEffort
   } });
-  const action = wasCreating ? "create" : goalMode ? "setGoal" : "send";
+  const action = wasCreating ? "create" : goalMode ? "setGoal" : scheduledAt ? "createScheduledMessage" : "send";
   const goalRecord = goalMode ? {
     id: randomId(), action, payload, draft, goalReadVersion: goalVersion,
     deviceId: session.device.id, selectionToken, time: Date.now()
@@ -691,12 +721,20 @@ export async function sendMessage() {
       }
     }
     requestStarted = true;
-    const result = await mutate(action, payload, { reliable: true, receiptId: goalRecord?.id });
+    const result = action === "createScheduledMessage"
+      ? await submitScheduledMessage(payload)
+      : await mutate(action, payload, { reliable: true, receiptId: goalRecord?.id });
     if (!currentAuthorization()) return;
     if (result.permissionWarning) notice(result.permissionWarning, true);
     if (goalMode) {
       await applyGoalComposerReceipt(pending?.id === goalRecord.id ? pending : goalRecord,
         { state: "completed", result }, { allowSelection: true });
+      return;
+    }
+    if (action === "createScheduledMessage") {
+      clearSubmittedDraft(payload, selectionVersion === version);
+      await reloadScheduledMessages(id);
+      notice(`已设置定时发送：${scheduledTimeLabel(scheduledAt)}`);
       return;
     }
     const queued = !wasCreating && applyQueuedSendResult(id, result, queueReadVersion, payload);

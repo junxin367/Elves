@@ -217,6 +217,29 @@ class SharedQueueHistoryTests(unittest.TestCase):
             native.poll()
             self.assertEqual(emitted[-1], "after-huge", "间隔最多 5 秒")
 
+    def test_shared_sync_only_resends_the_snapshot_when_something_changed(self):
+        # 用户要求缩短发送前的等待：发送前同步只要求读到最新原生记录，没有变化时不重发整份历史
+        # （实测 8290 条消息的会话快照约 22 MiB），有变化（含被限频压住的变化）照常立即发出。
+        native = SdkReader("unused", "test-session")
+        native.initialized = True
+        native.read_messages = lambda: None
+        native.context_configuration = lambda: {}
+        emitted = []
+        with patch.dict(namespace, {"emit": lambda frame: emitted.append(frame["pending"])}):
+            native.poll()
+            self.assertEqual(len(emitted), 1, "首个快照照常发出")
+            for _ in range(3):
+                self.assertEqual(native.control({"subtype": "shared_sync"}), {})
+            self.assertEqual(len(emitted), 1, "没有变化时不重发")
+            native.pending = [{"id": "changed"}]
+            native.control({"subtype": "shared_sync"})
+            self.assertEqual(emitted[-1], [{"id": "changed"}])
+            self.assertEqual(len(emitted), 2, "有变化时发出最新状态")
+            native.control({"subtype": "shared_sync"})
+            self.assertEqual(len(emitted), 2, "发出之后再同步又不重复")
+            native.poll(force=True)
+            self.assertEqual(len(emitted), 3, "回执、命令结果等其他强制发出的语义不变")
+
     def test_history_replacement_with_same_length_reloads_native_records(self):
         native = self.read([{"type": "user", "uuid": "user-one", "message": {"content": "first"}}])
         original_size = native.log_path.stat().st_size
@@ -850,6 +873,88 @@ class SharedQueueHistoryTests(unittest.TestCase):
                        {"commandMode": "bash"}]:
             with self.subTest(change=change):
                 native = self.read([self.queued(**change)])
+                self.assertEqual(len(native.pending), 1)
+                self.assertEqual(native.messages, [])
+
+    SENT_UUID = "11111111-2222-4333-8444-555555555555"
+
+    def queued_hosted(self, **changes):
+        # Claude Code 2.1.332 实测形态：中途引导被吸收时 prompt 是内容块数组，
+        # 不再有 humanTurn / origin，改用 hostsOwnTurn；网页发送帧的 UUID 只保留在 source_uuid 里，行自身 uuid 是新的。
+        return {"type": "attachment", "uuid": "absorbed-user", "parentUuid": "tool-result",
+                "timestamp": "2026-11-25T14:20:47.602Z", "renderedRole": "system",
+                "attachment": {"type": "queued_command", "commandMode": "prompt",
+                               "prompt": [{"type": "text", "text": "待接收消息"}],
+                               "source_uuid": self.SENT_UUID, "delivery_id": "delivery-1",
+                               "rowSource": "local", "hostsOwnTurn": True, **changes}}
+
+    def hosted_rows(self, absorbed):
+        return [
+            {"type": "user", "uuid": "first", "message": {"content": "开始"}},
+            {"type": "assistant", "uuid": "tool-call", "parentUuid": "first", "message": {"content": [
+                {"type": "tool_use", "id": "tool-1", "name": "Bash", "input": {"command": "sleep 300"}}]}},
+            {"type": "user", "uuid": "tool-result", "parentUuid": "tool-call", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "tool-1", "content": "done"}]}},
+            absorbed,
+            {"type": "assistant", "uuid": "reply", "parentUuid": "absorbed-user",
+             "message": {"content": [{"type": "text", "text": "收到"}]}},
+        ]
+
+    def test_cli_2_1_332_guidance_keeps_the_place_where_the_cli_injected_it(self):
+        # 用户要求引导消息停在发送时执行到的位置；2.1.332 的记录形态曾被整行丢弃，
+        # 网页只剩本地回执，整轮结束后被排到末尾，排队残留也一直清不掉。
+        native = self.read(self.hosted_rows(self.queued_hosted()))
+        self.assertEqual([row["uuid"] for row in native.messages],
+                         ["first", "tool-call", "tool-result", "absorbed-user", "reply"])
+        absorbed = native.messages[3]
+        self.assertEqual(absorbed["type"], "user")
+        self.assertEqual(absorbed["message"]["content"], [{"type": "text", "text": "待接收消息"}])
+        self.assertFalse(absorbed["nativeEditable"], "吸收在工具轮次中的引导不是原生回退点")
+        self.assertTrue(namespace["real_user"](absorbed))
+        self.assertEqual(native.pending, [])
+        self.assertEqual(native.clients, {"absorbed-user": "web-client"})
+        native.read_messages()
+        self.assertEqual(len(native.messages), 5)
+        self.assertEqual(native.clients, {"absorbed-user": "web-client"})
+
+    def test_absorbed_guidance_is_confirmed_by_the_sent_uuid_even_when_the_text_differs(self):
+        # 对端按发送帧 UUID 登记待确认消息；原生行 uuid 是新生成的，只能靠 source_uuid 精确关联，
+        # 不依赖正文逐字相同（Skill 展开、命令改写后正文会变）。
+        old_shape = {"type": "attachment", "uuid": "absorbed-user", "parentUuid": "tool-result",
+                     "timestamp": "2026-11-11T07:03:46Z", "attachment": {
+                         "type": "queued_command", "commandMode": "prompt", "prompt": "展开后的正文",
+                         "humanTurn": True, "origin": {"kind": "human"},
+                         "source_uuid": self.SENT_UUID, "delivery_id": "delivery-1"}}
+        new_shape = self.queued_hosted(prompt=[{"type": "text", "text": "展开后的正文"}])
+        for label, absorbed in (("旧形态", old_shape), ("新形态", new_shape)):
+            with self.subTest(label):
+                folder = tempfile.TemporaryDirectory()
+                self.addCleanup(folder.cleanup)
+                log = Path(folder.name) / "native.jsonl"
+                log.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n"
+                                       for row in self.hosted_rows(absorbed)), encoding="utf-8")
+                native = SdkReader("unused", "test-session")
+                native.log_path = log
+                native.pending = [{"id": "web-client", "clientUserMessageId": "web-client", "text": "展开前的正文",
+                                   "content": [{"type": "text", "text": "展开前的正文"}],
+                                   "_nativeText": "展开前的正文", "_nativeUuid": self.SENT_UUID,
+                                   "_after": 0, "_afterOffset": 0, "deliveryConfirmed": True}]
+                native.read_messages()
+                self.assertEqual(native.pending, [])
+                self.assertEqual(native.clients, {"absorbed-user": "web-client"})
+
+    def test_hosted_queue_records_that_are_not_human_prompts_stay_hidden(self):
+        # 与旧形态同样保守：任务通知、其他来源、shell 模式、没有可显示内容或缺少人工标记的记录都不能充当用户消息。
+        text = {"type": "text", "text": "待接收消息"}
+        for change in [{"commandMode": "task-notification"}, {"commandMode": "bash"},
+                       {"origin": {"kind": "task-notification"}}, {"origin": {"kind": "agent"}},
+                       {"hostsOwnTurn": False}, {"hostsOwnTurn": None}, {"humanTurn": False},
+                       {"humanTurn": True, "hostsOwnTurn": None},
+                       {"prompt": []}, {"prompt": [{"type": "text", "text": "  "}]},
+                       {"prompt": [{"type": "tool_use", "id": "x", "name": "Bash", "input": {}}]},
+                       {"prompt": None}, {"prompt": [text, "非对象"]}]:
+            with self.subTest(change=change):
+                native = self.read([self.queued_hosted(**change)])
                 self.assertEqual(len(native.pending), 1)
                 self.assertEqual(native.messages, [])
 

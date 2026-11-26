@@ -161,6 +161,12 @@ fn app_state_dir_for_tests() -> Option<PathBuf> {
         .and_then(|path| path.clone())
 }
 
+/// 默认状态目录是否已被显式改向（测试覆盖或 `ELVES_STATE_DIR`）。
+/// 诊断日志用它区分“测试自己指定了落点”和“测试没指定、会落进用户真实目录”。
+pub(crate) fn state_dir_redirected() -> bool {
+    app_state_dir_for_tests().is_some() || std::env::var_os("ELVES_STATE_DIR").is_some()
+}
+
 pub fn set_app_state_dir_for_tests(path: Option<PathBuf>) -> Option<PathBuf> {
     APP_STATE_DIR_FOR_TESTS
         .get_or_init(|| Mutex::new(None))

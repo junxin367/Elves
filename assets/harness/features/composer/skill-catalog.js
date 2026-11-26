@@ -9,6 +9,10 @@ export const catalogRefreshAheadMs = 5 * 60 * 1000, catalogRetryMs = 60 * 1000;
 export const catalogFallbackMs = 7 * 24 * 60 * 60 * 1000;
 export const skillCatalogs = new Map(), skillScopeAliases = new Map(), skillCatalogRequests = new Map();
 export const skillCatalogRetryAt = new Map();
+// 用户要求减少无效请求：目录读取连续失败时按次数退避重试（catalogRetryMs 起逐次翻倍，30 分钟封顶），
+// 成功、用户显式刷新或目录失效后归零。以前固定每分钟重试，会话已读不到时会一直请求服务端并在日志里留下失败记录
+// （2026-11-25 实测同一会话 2 小时失败 138 次）。同步核对：skills.js 的失败、成功、失效三处。
+export const skillCatalogFailures = new Map();
 export let globalSkillChoices = [], globalSkillsLoadedAt = 0;
 export function setGlobalSkillChoices(value) { return globalSkillChoices = value; }
 export function setGlobalSkillsLoadedAt(value) { return globalSkillsLoadedAt = value; }
