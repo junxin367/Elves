@@ -680,7 +680,12 @@ impl Claude {
                 {
                     failure
                 } else {
-                    error(503, "暂时无法核对 Claude 当前执行状态，本次消息尚未投递")
+                    // 提示里带上 Claude 连接端给出的实际原因（例如历史读取器启动失败），不能只说“无法核对”。
+                    let notice = "暂时无法核对 Claude 当前执行状态，本次消息尚未投递";
+                    match failure.to_string().strip_prefix("Claude 控制请求失败：") {
+                        Some(reason) => error(503, format!("{notice}（{reason}）")),
+                        None => error(503, notice),
+                    }
                 }
             })?;
         authorization.check().await?;
@@ -1459,7 +1464,12 @@ mod tests {
                         .remove(frame["request_id"].as_str().unwrap())
                     {
                         let response = if matches!(next, Some(Reply::SyncRejected)) {
-                            Err(ApiError::new(503, "状态查询失败").after_admission().into())
+                            // 与真实读取链路一致：保留原因并标记结果未知。发送前的查询失败仍须按未投递处理。
+                            Err(dispatched_unknown(ApiError::new(
+                                503,
+                                "Claude 控制请求失败：状态查询失败",
+                            ))
+                            .into())
                         } else {
                             Ok(json!({}))
                         };
@@ -2558,6 +2568,10 @@ mod tests {
             if expected == "failed" {
                 let failure = result.unwrap_err();
                 assert!(!failure.downcast_ref::<ApiError>().unwrap().outcome_unknown);
+                assert_eq!(
+                    failure.to_string(),
+                    "暂时无法核对 Claude 当前执行状态，本次消息尚未投递（状态查询失败）"
+                );
                 assert!(
                     service.queue(&c.id).await.unwrap()["queuedMessages"]
                         .as_array()

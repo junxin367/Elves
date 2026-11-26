@@ -136,6 +136,8 @@ struct ReaderConn {
     writer: mpsc::UnboundedSender<Line>,
     #[allow(dead_code)]
     guard: Box<dyn Send>,
+    /// 第几次启动的读取器：旧读取器迟到的结束通知不能摘掉后来重新启动的那个。
+    generation: u64,
 }
 
 type CliWaiters = StdMutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>;
@@ -177,6 +179,9 @@ struct Inner {
     link: StdMutex<Link>,
     link_changed: Notify,
     reader: Mutex<Option<ReaderConn>>,
+    /// 同一时间只重新启动一个读取器。
+    reader_restart: Mutex<()>,
+    reader_generation: AtomicU64,
     reader_pending: ReaderWaiters,
     reader_frame: StdMutex<Option<Value>>,
     /// 当前 CLI 由预热启动且还没有写入过用户消息：空闲回收按 `WARM_IDLE_STOP`。
@@ -249,6 +254,8 @@ pub(super) fn start(
         link: StdMutex::new(Link::Gone),
         link_changed: Notify::new(),
         reader: Mutex::new(None),
+        reader_restart: Mutex::new(()),
+        reader_generation: AtomicU64::new(0),
         reader_pending: StdMutex::new(HashMap::new()),
         reader_frame: StdMutex::new(None),
         warm_only: AtomicBool::new(false),
@@ -450,6 +457,8 @@ impl Inner {
 
     /// 提前启动 CLI。只有 CLI 原本没有运行时才算预热；已经在运行的 CLI 保持原来的空闲回收时间。
     async fn warm(self: &Arc<Self>) -> Reply {
+        // 读取器已退出时（例如重启过 WSL），开始输入就重新启动它，网页内容随即补齐，不用等到发送。
+        self.ensure_reader().await.map_err(reader_error)?;
         let was_alive = self.alive();
         self.ensure_cli(false).await?;
         if !was_alive {
@@ -830,7 +839,8 @@ impl Inner {
                 }
             };
             // 压缩信号只影响“压缩中/失败”的显示；终态仍以原生记录里的 compact_boundary 为准。
-            let _ = self.reader_control(request).await;
+            // 这里在读取 CLI 输出的流程里，不能为它等待读取器重新启动。
+            let _ = self.reader_request(request).await;
         }
         if seen.preview {
             self.preview_dirty.notify_one();
@@ -922,19 +932,21 @@ impl Inner {
             })?;
         let (writer, receiver) = mpsc::unbounded_channel();
         tokio::spawn(write_lines(receiver, io.writer));
+        let generation = self.reader_generation.fetch_add(1, Ordering::AcqRel) + 1;
         *guard = Some(ReaderConn {
             writer,
             guard: io.guard,
+            generation,
         });
         if let Some(stderr) = io.stderr {
             tokio::spawn(drain_stderr(stderr));
         }
-        tokio::spawn(read_reader(self.clone(), io.reader));
+        tokio::spawn(read_reader(self.clone(), generation, io.reader));
         drop(guard);
         // 读取器直接使用上层的初始化请求（目录、网页消息身份、待确认列表、原生控制状态）。
         let mut init = lock(&self.initialize_request).clone();
         init["subtype"] = json!("initialize");
-        let response = self.reader_control(init).await.map_err(|failure| {
+        let response = self.reader_request(init).await.map_err(|failure| {
             PeerError::plain(
                 format!("Claude 历史读取器初始化失败：{}", failure.message),
                 true,
@@ -943,7 +955,43 @@ impl Inner {
         Ok(response["contextConfiguration"].clone())
     }
 
-    async fn reader_control(&self, request: Value) -> Result<Value, ReaderFailure> {
+    /// 读取器进程可能被外部结束（例如用户重启 WSL），而它只在建立连接时启动过一次：缺失时在使用前
+    /// 按最新状态重新启动，不能让这条连接从此无法发送。CLI 连接、执行中的任务和待处理审批不受影响。
+    async fn ensure_reader(self: &Arc<Self>) -> Result<(), ReaderFailure> {
+        // 启动和初始化完成之前，后来的请求在这里等待，不能抢在初始化请求之前写给新读取器。
+        let _restart = self.reader_restart.lock().await;
+        if self.reader.lock().await.is_some()
+            || self.closed.load(Ordering::Acquire)
+            || lock(&self.initialize_request).is_null()
+        {
+            return Ok(());
+        }
+        let started = Instant::now();
+        if let Err(failure) = self.start_reader().await {
+            // 初始化失败的读取器不能留着当作可用：未初始化时它对同步请求直接答成功，却不读任何记录。
+            self.reader.lock().await.take();
+            diagnose(
+                "reader_restart_failed",
+                &self.spec.native_id,
+                json!({"error":failure.message}),
+            );
+            return Err(ReaderFailure::local(&failure.message, true));
+        }
+        diagnose(
+            "reader_restarted",
+            &self.spec.native_id,
+            json!({"ms":started.elapsed().as_millis() as u64}),
+        );
+        Ok(())
+    }
+
+    async fn reader_control(self: &Arc<Self>, request: Value) -> Result<Value, ReaderFailure> {
+        self.ensure_reader().await?;
+        self.reader_request(request).await
+    }
+
+    /// 只写给当前读取器，不触发重新启动：用于初始化本身，以及不应为它等待读取器启动的显示信号。
+    async fn reader_request(&self, request: Value) -> Result<Value, ReaderFailure> {
         let id = uuid::Uuid::new_v4().to_string();
         let (sender, receiver) = oneshot::channel();
         lock(&self.reader_pending).insert(id.clone(), sender);
@@ -993,23 +1041,60 @@ impl Inner {
                 }
             }
             Some("shared_snapshot") => {
+                self.remember_reader_state(&frame);
                 *lock(&self.reader_frame) = Some(frame);
                 self.reader_rev.fetch_add(1, Ordering::AcqRel);
                 self.dirty.notify_one();
             }
             // 派发意图与命令意图必须在对应写入之前到达上层，用于重启后核对而不是盲目重发。
-            Some("shared_delivery_intent" | "shared_native_command_intent") => {
+            Some("shared_delivery_intent") => {
+                if let Some(pending) = lock(&self.initialize_request)
+                    .get_mut("pending")
+                    .and_then(Value::as_array_mut)
+                {
+                    pending.push(frame["intent"].clone());
+                }
+                let _ = self.out.send(frame);
+            }
+            Some("shared_native_command_intent") => {
+                self.remember_reader_state(&frame);
                 let _ = self.out.send(frame);
             }
             _ => {}
         }
     }
 
-    async fn on_reader_exit(self: &Arc<Self>) {
+    /// 记下读取器最新的网页消息身份、待确认记录和原生命令状态：重新启动读取器时按它恢复，
+    /// 不能退回建立连接时的旧值，否则其间发出的消息无法再按原生记录核对。
+    fn remember_reader_state(&self, frame: &Value) {
+        let mut request = lock(&self.initialize_request);
+        if !request.is_object() {
+            return;
+        }
+        for key in ["clients", "pending", "native_control"] {
+            if !frame[key].is_null() {
+                request[key] = frame[key].clone();
+            }
+        }
+    }
+
+    async fn on_reader_exit(self: &Arc<Self>, generation: u64) {
+        // 清理期间一直持有读取器锁：新的读取器装不上来，不会把它的请求一起按“已退出”结束。
+        let mut reader = self.reader.lock().await;
+        if reader
+            .as_ref()
+            .is_some_and(|current| current.generation != generation)
+        {
+            return;
+        }
+        let exited = reader.take().is_some();
         for (_, sender) in lock(&self.reader_pending).drain() {
             let _ = sender.send(Err(ReaderFailure::local("Claude 历史读取器已退出", false)));
         }
-        self.reader.lock().await.take();
+        // 上层释放会话时的正常收尾不记录。
+        if exited && !self.closed.load(Ordering::Acquire) {
+            diagnose("reader_exited", &self.spec.native_id, json!({}));
+        }
     }
 
     // ------------------------------------------------------------ 具体操作
@@ -1240,7 +1325,7 @@ impl Inner {
         if self.state(|state| state.compacting()) {
             // 压缩被中断：读取器据此在压缩结束时记为“已停止”而不是“待核对”。
             let _ = self
-                .reader_control(json!({"subtype":"sdk_signal","stopping":true}))
+                .reader_request(json!({"subtype":"sdk_signal","stopping":true}))
                 .await;
         }
         // 写入失败说明停止请求明确没有送达，原样报告；已写入才进入下面的等待。
@@ -1524,7 +1609,11 @@ async fn read_cli(inner: Arc<Inner>, generation: u64, reader: Box<dyn AsyncRead 
     inner.on_cli_exit(generation).await;
 }
 
-async fn read_reader(inner: Arc<Inner>, reader: Box<dyn AsyncRead + Send + Unpin>) {
+async fn read_reader(
+    inner: Arc<Inner>,
+    generation: u64,
+    reader: Box<dyn AsyncRead + Send + Unpin>,
+) {
     let mut reader = BufReader::new(reader);
     let mut line = Vec::new();
     while let Some(parsed) = read_json_line(&mut reader, &mut line).await {
@@ -1535,7 +1624,7 @@ async fn read_reader(inner: Arc<Inner>, reader: Box<dyn AsyncRead + Send + Unpin
             inner.on_reader_frame(frame).await;
         }
     }
-    inner.on_reader_exit().await;
+    inner.on_reader_exit(generation).await;
 }
 
 /// 合并读取器快照与实时状态后发给上层；只在任一侧变化时发送。
@@ -1643,6 +1732,26 @@ mod tests {
         rewound_at: StdMutex<Option<tokio::time::Instant>>,
         /// 为真时假读取器在 shared_sync 时不重发快照（真实读取器没有变化时的行为，见 claude_shared.py 的 skip_unchanged）。
         quiet_sync: StdMutex<bool>,
+        /// 结束当前假读取器进程（模拟重启 WSL 等外部结束）。
+        reader_stop: StdMutex<Option<oneshot::Sender<()>>>,
+        /// 为真时假读取器拒绝初始化请求。
+        refuse_reader_init: StdMutex<bool>,
+    }
+
+    impl Log {
+        async fn stop_reader(&self) {
+            let _ = lock(&self.reader_stop).take().unwrap().send(());
+            // 让对端读到结束并完成清理。
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        fn reader_initializations(&self) -> Vec<Value> {
+            lock(&self.reader)
+                .iter()
+                .filter(|request| request["subtype"] == "initialize")
+                .cloned()
+                .collect()
+        }
     }
 
     struct Fake {
@@ -1807,14 +1916,26 @@ mod tests {
             let (writer, reader_in) = duplex(1 << 20);
             let (mut reader_out, reader) = duplex(1 << 20);
             let log = self.log.clone();
+            let (stop, mut stopped) = oneshot::channel();
+            *lock(&log.reader_stop) = Some(stop);
             tokio::spawn(async move {
                 let mut lines = BufReader::new(reader_in).lines();
-                while let Ok(Some(text)) = lines.next_line().await {
+                loop {
+                    let next = tokio::select! {
+                        next = lines.next_line() => next,
+                        _ = &mut stopped => break,
+                    };
+                    let Ok(Some(text)) = next else {
+                        break;
+                    };
                     let frame: Value = serde_json::from_str(&text).unwrap();
                     lock(&log.reader).push(frame["request"].clone());
                     let (id, request) = (&frame["request_id"], &frame["request"]);
                     let mut out = Vec::new();
                     match request["subtype"].as_str().unwrap_or("") {
+                        "initialize" if *lock(&log.refuse_reader_init) => {
+                            out.push(failure(id, "refused"));
+                        }
                         "initialize" => {
                             out.push(snapshot());
                             out.push(success(id, json!({"contextConfiguration":{"source":"fake"}})));
@@ -2389,6 +2510,69 @@ mod tests {
             .unwrap();
         assert!(snapshots(&upper) > settled, "有变化时发出新的快照");
         assert!(latest < receipt, "回执之前上层必须已经看到最新快照");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_exited_reader_is_restarted_with_the_latest_state_before_it_is_used_again() {
+        // 重启过 WSL 之后读取器进程不在了：下一次发送前的同步要重新启动它，而不是让这条连接从此无法发送。
+        let mut upper = Upper::standard();
+        upper.initialize(json!({"clients":{"stale":"value"}})).await;
+        upper.call(json!({"subtype":"shared_sync"})).await;
+        let sent = upper.call(send_request("client-1", "第一条")).await;
+        assert_eq!(sent["subtype"], "success");
+        assert_eq!(
+            upper.log.reader_initializations().len(),
+            1,
+            "读取器正常时不重启"
+        );
+
+        upper.log.stop_reader().await;
+        let response = upper.call(json!({"subtype":"shared_sync"})).await;
+        assert_eq!(response["subtype"], "success", "{response}");
+        let initializations = upper.log.reader_initializations();
+        assert_eq!(initializations.len(), 2);
+        // 按读取器最后报告的状态恢复，不退回建立连接时的旧值；快照之后的派发意图也不丢。
+        assert_eq!(initializations[1]["clients"], json!({}));
+        assert_eq!(
+            initializations[1]["native_control"],
+            snapshot()["native_control"]
+        );
+        assert_eq!(
+            initializations[1]["pending"][0]["clientUserMessageId"],
+            "client-1"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn typing_warms_the_session_and_also_restarts_an_exited_reader() {
+        let mut upper = Upper::standard();
+        upper.initialize(json!({})).await;
+        upper.log.stop_reader().await;
+        let response = upper.call(json!({"subtype":"shared_warm"})).await;
+        assert_eq!(response["subtype"], "success", "{response}");
+        assert_eq!(upper.log.reader_initializations().len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reader_that_cannot_restart_reports_why_and_is_retried_on_the_next_request() {
+        let mut upper = Upper::standard();
+        upper.initialize(json!({})).await;
+        upper.log.stop_reader().await;
+        *lock(&upper.log.refuse_reader_init) = true;
+        let response = upper.call(json!({"subtype":"shared_sync"})).await;
+        assert_eq!(response["subtype"], "error");
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("Claude 历史读取器初始化失败"),
+            "{response}"
+        );
+        // 初始化失败的读取器不能当作可用：下一次请求重新启动，而不是向它同步后答成功。
+        *lock(&upper.log.refuse_reader_init) = false;
+        let response = upper.call(json!({"subtype":"shared_sync"})).await;
+        assert_eq!(response["subtype"], "success", "{response}");
+        assert_eq!(upper.log.reader_initializations().len(), 3);
     }
 
     #[tokio::test(start_paused = true)]
