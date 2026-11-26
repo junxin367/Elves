@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [ValidateSet("List", "Request", "Read", "Collect", "Audit")]
     [string]$Action = "List",
@@ -8,7 +8,7 @@ param(
     [string]$OutputPath = ""
 )
 $ErrorActionPreference = "Stop"
-$stateDirectory = if ($env:ELVES_STATE_DIR) { $env:ELVES_STATE_DIR } else { Join-Path ([Environment]::GetFolderPath("UserProfile")) ".codex-session-delete" }
+$stateDirectory = if ($env:ELVES_STATE_DIR) { $env:ELVES_STATE_DIR } else { Join-Path ([Environment]::GetFolderPath("UserProfile")) ".elves" }
 $endpointPath = Join-Path $stateDirectory "harness-service.json"
 if ($Action -notin @("List", "Audit") -and [string]::IsNullOrWhiteSpace($DeviceId)) {
     throw "请先用 -Action List 查看设备，再指定 -DeviceId。"

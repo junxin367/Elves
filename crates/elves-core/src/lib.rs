@@ -13,6 +13,7 @@ pub mod http_client;
 mod image_generation;
 pub mod lan_proxy;
 pub mod layered_compaction;
+pub mod legacy_migration;
 pub mod local_proxy_service;
 mod log_limits;
 pub mod model_capabilities;

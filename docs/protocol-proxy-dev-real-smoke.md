@@ -16,7 +16,7 @@
 默认从当前用户环境复制：
 
 - Codex 配置：`$env:CODEX_HOME`，不存在时使用 `%USERPROFILE%\.codex`
-- Elves / Harness 设置：`%USERPROFILE%\.codex-session-delete\settings.json`，显式设置 `ELVES_STATE_DIR` 时使用该目录。
+- Elves / Harness 设置：`%USERPROFILE%\.elves\settings.json`，显式设置 `ELVES_STATE_DIR` 时使用该目录。
 
 ```powershell
 .\scripts\dev-codex-real-smoke.ps1

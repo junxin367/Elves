@@ -35,7 +35,7 @@ Android App 会记录最近的连接、WebSocket、图片及页面故障，便�
 读取后的默认导出目录：
 
 ```text
-%USERPROFILE%\.codex-session-delete\remote-client-diagnostics-export\
+%USERPROFILE%\.elves\remote-client-diagnostics-export\
 ```
 
 可以用 `-OutputPath <新文件路径>` 指定位置；脚本不会覆盖已有文件。电脑端原始存储位于 `remote-client-diagnostics/`，文件名为设备 ID 的 SHA-256，每设备保留最近一份。`Read` 返回的可能是此前收到的报告，排查时应核对 `requestId`、`receivedAtMs` 和 `capturedAtMs`。
@@ -69,7 +69,7 @@ Android App 会记录最近的连接、WebSocket、图片及页面故障，便�
 Android 网页的 GET `/api/session` 和 `/api/channels` 请求会附加单独生成的 `diag` 请求 ID；网页或 SharedWorker 的 `/api/events/ws` WebSocket 握手也携带独立 ID。服务端只对这三条 GET 路由记录有效的 `diag`，并把 ID、路由、阶段、状态码和耗时写入电脑端诊断日志：
 
 ```text
-%USERPROFILE%\.codex-session-delete\codex-elves.log
+%USERPROFILE%\.elves\codex-elves.log
 ```
 
 用手机报告中的 `requestId` 对照该文件里的 `remote_access.connection_request` 记录。HTTP 阶段包括 `received`、`response_headers_ready` 和必要时的 `request_cancelled`；WebSocket 记录包括 `websocket_opened`、`websocket_handler_ended` 及 `closeCode`。HTTP 请求到达服务端但握手被拒绝时，仍有入站和响应状态记录，只是没有 `websocket_opened`。响应头就绪不证明手机已收全；找不到服务端记录时也要先排除日志范围、轮转或丢弃，不能直接断定网络故障。服务端日志不保存其他查询参数值。

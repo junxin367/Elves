@@ -3,7 +3,11 @@ use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-const APP_STATE_DIR: &str = ".codex-session-delete";
+const APP_STATE_DIR: &str = ".elves";
+pub const LEGACY_APP_STATE_DIR: &str = ".codex-session-delete";
+pub const LEGACY_CLI_HOME_DIR: &str = ".codex-elves-cli";
+const DESKTOP_DATA_SUBDIR: &str = "desktop";
+const CLI_HOME_SUBDIR: &str = "cli";
 const SETTINGS_FILE: &str = "settings.json";
 const DIAGNOSTIC_LOG_FILE: &str = "codex-elves.log";
 const PROXY_LOG_FILE: &str = "proxy-requests.jsonl";
@@ -16,7 +20,9 @@ pub fn default_app_state_dir() -> PathBuf {
     if let Some(path) = app_state_dir_for_tests() {
         return path;
     }
-    // 独立 Harness 可显式使用隔离状态目录；默认沿用旧目录，保留用户设置、会话与授权。
+    // 用户要求将 Elves 共享配置、桌面端数据与 CLI 目录统一收敛到 `~/.elves` 下，
+    // 不再直接读写旧版 CodexElves 目录；旧数据仅在安装包阶段单向同步，保留旧目录不变。
+    // 显式设置 `ELVES_STATE_DIR` 时仍优先用于隔离开发与验收。
     if let Some(directory) = std::env::var_os("ELVES_STATE_DIR") {
         let directory = PathBuf::from(directory);
         assert!(directory.is_absolute(), "ELVES_STATE_DIR 必须是绝对路径");
@@ -27,6 +33,43 @@ pub fn default_app_state_dir() -> PathBuf {
     }
 
     PathBuf::from(APP_STATE_DIR)
+}
+
+/// 桌面客户端默认数据目录（`~/.elves/desktop`），存放窗口配置与 WebView2 缓存。
+/// 与 `apps/elves/src-tauri/src/desktop.rs` 联动；显式设置 `ELVES_DATA_DIR` 时由客户端优先覆盖。
+pub fn default_desktop_data_dir() -> PathBuf {
+    default_app_state_dir().join(DESKTOP_DATA_SUBDIR)
+}
+
+/// CLI Wrapper 默认 `CODEX_HOME` 目录（`~/.elves/cli`），与 `cli_wrapper::cli_home_dir` 联动。
+pub fn default_cli_home_dir() -> PathBuf {
+    default_app_state_dir().join(CLI_HOME_SUBDIR)
+}
+
+/// 旧版共享状态目录（`~/.codex-session-delete`），仅用于安装包阶段识别并单向同步旧数据。
+pub fn legacy_app_state_dir() -> Option<PathBuf> {
+    directories::BaseDirs::new().map(|dirs| dirs.home_dir().join(LEGACY_APP_STATE_DIR))
+}
+
+/// 旧版 CLI Wrapper 目录（`~/.codex-elves-cli`），仅用于安装包阶段识别并单向同步旧数据。
+pub fn legacy_cli_home_dir() -> Option<PathBuf> {
+    directories::BaseDirs::new().map(|dirs| dirs.home_dir().join(LEGACY_CLI_HOME_DIR))
+}
+
+/// 旧版桌面客户端本地数据候选目录，按既有使用优先级排列：
+/// 先检查更名后曾使用的 `%LOCALAPPDATA%\com.elves.app`，再检查旧版 `%LOCALAPPDATA%\com.codexelves.remote`。
+pub fn legacy_desktop_data_candidates_from(local_app_data: Option<&std::path::Path>) -> Vec<PathBuf> {
+    let Some(base) = local_app_data else {
+        return Vec::new();
+    };
+    vec![base.join("com.elves.app"), base.join("com.codexelves.remote")]
+}
+
+pub fn legacy_desktop_data_candidates() -> Vec<PathBuf> {
+    let local = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.data_local_dir().to_path_buf()));
+    legacy_desktop_data_candidates_from(local.as_deref())
 }
 
 pub fn default_settings_path() -> PathBuf {
@@ -162,8 +205,9 @@ fn app_state_dir_for_tests() -> Option<PathBuf> {
 }
 
 /// 默认状态目录是否已被显式改向（测试覆盖或 `ELVES_STATE_DIR`）。
-/// 诊断日志用它区分“测试自己指定了落点”和“测试没指定、会落进用户真实目录”。
-pub(crate) fn state_dir_redirected() -> bool {
+/// 诊断日志用它区分“测试自己指定了落点”和“测试没指定、会落进用户真实目录”；
+/// 安装器关停检查也据此区分隔离目录与真实用户目录。
+pub fn state_dir_redirected() -> bool {
     app_state_dir_for_tests().is_some() || std::env::var_os("ELVES_STATE_DIR").is_some()
 }
 
@@ -207,27 +251,33 @@ mod tests {
     fn default_settings_path_uses_app_state_directory() {
         let path = default_settings_path();
 
-        assert!(path.ends_with(".codex-session-delete/settings.json"));
+        assert!(path.ends_with(".elves/settings.json"));
+    }
+
+    #[test]
+    fn default_desktop_and_cli_paths_live_under_elves_directory() {
+        assert!(default_desktop_data_dir().ends_with(".elves/desktop"));
+        assert!(default_cli_home_dir().ends_with(".elves/cli"));
     }
 
     #[test]
     fn default_diagnostic_log_path_uses_app_state_directory() {
         let path = default_diagnostic_log_path();
 
-        assert!(path.ends_with(".codex-session-delete/codex-elves.log"));
+        assert!(path.ends_with(".elves/codex-elves.log"));
     }
 
     #[test]
     fn default_proxy_log_path_uses_app_state_directory() {
         let path = default_proxy_log_path();
 
-        assert!(path.ends_with(".codex-session-delete/proxy-requests.jsonl"));
+        assert!(path.ends_with(".elves/proxy-requests.jsonl"));
     }
 
     #[test]
     fn cleanup_obsolete_session_backups_runs_once_and_preserves_other_files() {
         let temp = tempfile::tempdir().unwrap();
-        let app_state_dir = temp.path().join(".codex-session-delete");
+        let app_state_dir = temp.path().join(".elves");
         let backups_dir = app_state_dir.join("backups");
         std::fs::create_dir_all(&backups_dir).unwrap();
         let obsolete = backups_dir.join("1787048785-da1547faf8834dc192a160c1072b7890.json");
@@ -259,7 +309,7 @@ mod tests {
     #[test]
     fn cleanup_obsolete_session_backups_retries_after_failed_migration() {
         let temp = tempfile::tempdir().unwrap();
-        let app_state_dir = temp.path().join(".codex-session-delete");
+        let app_state_dir = temp.path().join(".elves");
         let backups_path = app_state_dir.join("backups");
         std::fs::create_dir_all(&app_state_dir).unwrap();
         std::fs::write(&backups_path, "not a directory").unwrap();

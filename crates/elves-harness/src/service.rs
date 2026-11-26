@@ -49,15 +49,9 @@ fn shutdown_response_is_safe(value: &Value) -> bool {
     matches!(value["status"].as_str(), Some("stopped" | "not_running"))
 }
 
-/// 安装器 `StopElves` 会结束的 Elves 进程名（含旧品牌），用于关停说明。
-const ELVES_PROCESS_NAMES: &[&str] = &[
-    "elves.exe",
-    "elves-manager.exe",
-    "codex-elves.exe",
-    "codex-elves-manager.exe",
-    "codex-elves-task-board.exe",
-    "codex-elves-remote.exe",
-];
+/// 安装器 `StopElves` 会结束的 Elves 进程名，用于关停说明。
+/// 用户要求安装和卸载过程中不得终止或删除 CodexElves 相关程序，仅管理 Elves 自身进程。
+const ELVES_PROCESS_NAMES: &[&str] = &["elves.exe", "elves-manager.exe"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProcessSample {
@@ -249,16 +243,10 @@ fn acquire_service_lock(directory: &Path) -> anyhow::Result<Option<File>> {
 }
 
 fn load_endpoint_any(directory: &Path) -> anyhow::Result<Option<Endpoint>> {
-    // 旧安装端点仅用于安全退出和迁移；新运行时始终写 Harness 自己的端点。
+    // 仅读取 Elves Harness 自身端点，不再触碰旧版 CodexElves 的 `remote-access-service.json`。
     let bytes = match std::fs::read(directory.join(ENDPOINT_FILE)) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match std::fs::read(directory.join("remote-access-service.json")) {
-                Ok(bytes) => bytes,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(error) => return Err(error).context("无法读取旧版本后台状态"),
-            }
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).context("无法读取 Harness 后台状态"),
     };
     Ok(serde_json::from_slice::<Endpoint>(&bytes)
@@ -270,6 +258,25 @@ fn load_endpoint_any(directory: &Path) -> anyhow::Result<Option<Endpoint>> {
                 && endpoint.token.len() == 64
                 && endpoint.token.bytes().all(|byte| byte.is_ascii_hexdigit())
         }))
+}
+
+/// 核对进程号是否属于 `elves.exe` 自身（绝不匹配 `codex-elves*.exe`）。
+/// 用于首次从旧目录升级到 `~/.elves` 时，只优雅关停旧版 Elves 自身后台，不影响同时运行的 CodexElves。
+fn is_elves_executable_pid(process_id: u32) -> bool {
+    #[cfg(windows)]
+    {
+        elves_core::windows_integration::enumerate_processes()
+            .into_iter()
+            .any(|process| {
+                process.process_id == process_id
+                    && process.exe_file.eq_ignore_ascii_case("elves.exe")
+            })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = process_id;
+        false
+    }
 }
 
 fn load_endpoint(directory: &Path) -> anyhow::Result<Option<Endpoint>> {
@@ -506,9 +513,30 @@ async fn request(endpoint: &Endpoint, action: &str, payload: &Value) -> anyhow::
 pub async fn prepare_shutdown_status(reason: &str) -> anyhow::Result<Value> {
     let directory = crate::paths::default_app_state_dir();
     // 用户要求（2026-11-21）：安装程序自己关闭 Elves，不要求用户先退出。端点缺失或失效时没有可询问的
-    // Harness，剩余进程（含无响应的旧客户端、独立代理）只列进日志，由安装器 StopElves 结束；新版执行中的
-    // Codex 在私有服务里，不随这些进程结束。
-    let Some(endpoint) = load_endpoint_any(&directory)? else {
+    // Harness，剩余进程（仅限 Elves 自身，不含 CodexElves）只列进日志，由安装器 StopElves 结束；
+    // 新版执行中的 Codex 在私有服务里，不随这些进程结束。
+    let (endpoint_dir, endpoint) = match load_endpoint_any(&directory)? {
+        Some(endpoint) => (directory.clone(), Some(endpoint)),
+        None if reason == "installer"
+            && !elves_core::paths::state_dir_redirected()
+            && !elves_core::legacy_migration::legacy_state_migration_completed(&directory) =>
+        {
+            // 首次从旧目录升级到 `~/.elves` 时，上一版正在运行的 `elves.exe` 后台端点仍在旧目录；
+            // 仅确认 PID 为 `elves.exe` 时请求优雅关停，避免影响任何正在运行的 CodexElves 进程。
+            match elves_core::paths::legacy_app_state_dir().and_then(|legacy| {
+                load_endpoint_any(&legacy)
+                    .ok()
+                    .flatten()
+                    .filter(|endpoint| is_elves_executable_pid(endpoint.process_id))
+                    .map(|endpoint| (legacy, endpoint))
+            }) {
+                Some((legacy, endpoint)) => (legacy, Some(endpoint)),
+                None => (directory.clone(), None),
+            }
+        }
+        None => (directory.clone(), None),
+    };
+    let Some(endpoint) = endpoint else {
         return Ok(not_running_status("找不到端点"));
     };
     if !endpoint_is_active(&endpoint).await? {
@@ -520,7 +548,7 @@ pub async fn prepare_shutdown_status(reason: &str) -> anyhow::Result<Value> {
     if reason == "installer" && !build_matches && endpoint.protocol_version >= 9 {
         // 首次从旧版直连 stdio Harness 升级时，先调用旧版自己的安全退出检查。
         // 不能把常驻的 codex.exe 进程当成“执行中”：空闲时旧版会返回 stopped，执行中或未知才返回 busy。
-        if claude_execution_active(&directory) {
+        if claude_execution_active(&endpoint_dir) {
             return Ok(json!({
                 "status":"busy",
                 "reason":"claude_active",
@@ -741,9 +769,12 @@ mod tests {
         let leftovers = classify_leftovers(
             7,
             [
-                // 当前 helper 自身、无关进程不列出。
+                // 当前 helper 自身、无关进程以及旧版 CodexElves 进程均不列出、不终止。
                 sample(7, "elves.exe", 3, None),
                 sample(8, "explorer.exe", 90, None),
+                sample(9, "codex-elves.exe", 8, Some(r"C:\CodexElves\codex-elves.exe")),
+                sample(10, "codex-elves-manager.exe", 6, None),
+                sample(11, "codex-elves-remote.exe", 10, None),
                 // 2026-11-21 现场：Windows 错误报告留下的无响应快照，没有线程、读不到映像路径。
                 sample(44300, "elves.exe", 0, None),
                 sample(46780, "ELVES.EXE", 12, Some(r"C:\Elves\elves.exe")),

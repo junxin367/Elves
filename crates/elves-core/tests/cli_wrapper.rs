@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 
 use elves_core::cli_wrapper::{
-    build_wrapper_source, parse_wrapper_source_settings, resolve_real_codex_from_candidates,
-    should_refresh_cli_wrapper, wrapper_dir_from_roaming, wrapper_settings_for_refresh,
+    build_wrapper_source, cli_home_dir, parse_wrapper_source_settings,
+    resolve_real_codex_from_candidates, should_refresh_cli_wrapper, wrapper_dir_from_roaming,
+    wrapper_settings_for_refresh,
 };
 use elves_core::settings::BackendSettings;
 
@@ -19,7 +20,7 @@ fn wrapper_source_embeds_absolute_real_codex_path() {
         &PathBuf::from(
             r"C:\Program Files\WindowsApps\OpenAI.Codex_1.0.0.0_x64__abc\app\resources\codex.exe",
         ),
-        &PathBuf::from(r"C:\Users\me\.codex-elves-cli"),
+        &PathBuf::from(r"C:\Users\me\.elves\cli"),
         &settings,
     );
 
@@ -81,6 +82,11 @@ fn wrapper_dir_uses_roaming_codex_elves() {
         wrapper_dir_from_roaming(&PathBuf::from(r"C:\Users\me\AppData\Roaming")),
         PathBuf::from(r"C:\Users\me\AppData\Roaming\Elves")
     );
+}
+
+#[test]
+fn cli_home_dir_lives_under_elves_directory() {
+    assert!(cli_home_dir().ends_with(".elves/cli"));
 }
 
 #[test]

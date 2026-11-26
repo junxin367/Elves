@@ -1261,8 +1261,11 @@ fn open_about(app: &tauri::AppHandle) -> tauri::Result<()> {
             "resourceRevision",
             &elves_assets::resource_revision().to_string(),
         );
+    let about_webview_dir = app.state::<ClientState>().directory.join("about-webview");
     let mut builder =
         tauri::WebviewWindowBuilder::new(app, "elves-about", WebviewUrl::External(address))
+            // 关于弹窗的 WebView2 目录同样收敛在桌面数据目录内，不再写入旧版 LocalAppData 目录。
+            .data_directory(about_webview_dir)
             .title("关于 Elves")
             // 按效果图使用紧凑两栏布局；500×300 为逻辑像素，保证信息列和右下确认区不互相挤压。
             .inner_size(500.0, 300.0)
@@ -1663,16 +1666,9 @@ pub fn run() -> anyhow::Result<()> {
                     path
                 }
                 None => {
-                    let current = app.path().app_local_data_dir()?;
-                    // 升级保留原客户端窗口及 WebView 缓存；旧目录只是存储兼容名，不再作为产品入口。
-                    let legacy = current
-                        .parent()
-                        .map(|parent| parent.join("com.codexelves.remote"));
-                    if !current.exists() {
-                        legacy.filter(|path| path.is_dir()).unwrap_or(current)
-                    } else {
-                        current
-                    }
+                    // 用户要求桌面客户端数据统一收敛到 `~/.elves/desktop`，不再在启动时直接回退读写
+                    // 旧版 `%LOCALAPPDATA%\com.codexelves.remote` 或 `com.elves.app`；旧数据由安装包阶段单向同步。
+                    elves_core::paths::default_desktop_data_dir()
                 }
             };
             std::fs::create_dir_all(&directory)?;

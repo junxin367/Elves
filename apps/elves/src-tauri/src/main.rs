@@ -1,6 +1,33 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 fn main() {
+    // 用户要求在安装包阶段识别旧版目录并单向同步配置与数据到新版 `~/.elves` 目录，
+    // 完整保留旧版 CodexElves 程序和目录；由 NSIS 调用此专用模式并按系统代码页输出安装日志。
+    if std::env::args().any(|arg| arg == "--migrate-legacy-data") {
+        match elves_core::legacy_migration::migrate_default_legacy_data() {
+            Ok(report) => {
+                for line in report.summary_lines() {
+                    installer_output(&line);
+                }
+                let _ = elves_core::diagnostic_log::append_diagnostic_log(
+                    "installer.legacy_data_migration",
+                    &report,
+                );
+                if report.has_failures() {
+                    std::process::exit(1);
+                }
+            }
+            Err(error) => {
+                installer_output(&format!("旧版数据同步失败：{error:#}"));
+                let _ = elves_core::diagnostic_log::append_diagnostic_log(
+                    "installer.legacy_data_migration_failed",
+                    serde_json::json!({"message":format!("{error:#}")}),
+                );
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if std::env::args().any(|arg| arg == elves_core::local_proxy_service::PROXY_SERVICE_ARG) {
         if let Err(error) = elves_core::local_proxy_service::run_service_process() {
             eprintln!("独立本地代理服务启动失败：{error:#}");

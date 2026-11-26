@@ -1,4 +1,4 @@
-param(
+﻿param(
     [int]$Port = 51555,
     [int[]]$ReservedProxyPorts = @(45221),
     [string]$RunRoot = "",
@@ -141,8 +141,8 @@ function Resolve-DefaultSettingsPath {
     if (-not [string]::IsNullOrWhiteSpace($SourceSettingsPath)) {
         return $SourceSettingsPath
     }
-    # 更名后继续使用 Harness 的既有状态目录，不因品牌变化读取不存在的新配置。
-    $stateDirectory = if ($env:ELVES_STATE_DIR) { $env:ELVES_STATE_DIR } else { Join-Path $env:USERPROFILE ".codex-session-delete" }
+    # 默认使用新版 Elves 统一状态目录 `~/.elves`，不再默认读取旧版 `~/.codex-session-delete`。
+    $stateDirectory = if ($env:ELVES_STATE_DIR) { $env:ELVES_STATE_DIR } else { Join-Path $env:USERPROFILE ".elves" }
     return Join-Path $stateDirectory "settings.json"
 }
 

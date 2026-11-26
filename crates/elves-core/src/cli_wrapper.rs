@@ -10,7 +10,6 @@ use crate::settings::BackendSettings;
 
 pub const WRAPPER_EXE: &str = "codex-wrapper.exe";
 pub const WRAPPER_SOURCE: &str = "codex-wrapper.cs";
-const CLI_HOME_DIR: &str = ".codex-elves-cli";
 const MAX_VERSION_BYTES: usize = 16 * 1024;
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -487,9 +486,8 @@ pub fn wrapper_dir_from_roaming(roaming: &Path) -> PathBuf {
 }
 
 pub fn cli_home_dir() -> PathBuf {
-    directories::BaseDirs::new()
-        .map(|dirs| dirs.home_dir().join(CLI_HOME_DIR))
-        .unwrap_or_else(|| PathBuf::from(CLI_HOME_DIR))
+    // 用户要求将 CLI Wrapper 目录统一收敛到 `~/.elves/cli`，不再默认读写旧版 `~/.codex-elves-cli`。
+    crate::paths::default_cli_home_dir()
 }
 
 pub fn build_wrapper_source(

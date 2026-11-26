@@ -24,11 +24,11 @@ Harness 本机工作区默认只监听 `127.0.0.1:45223`，与网页远程入口
 
 任务栏角标按未读主会话 ID 去重，侧边会话、子代理和归档不另计，搜索和折叠不改变总数，超过 99 显示 `99+`。仅主窗口上报数量。
 
-托盘退出安全回收本客户端拥有的 Harness、代理和隧道；原生会话仍沿用既有安全停止规则。升级先请求安全退出，再替换程序并移除旧程序和快捷方式；卸载保留设置、历史、授权及缓存。
+托盘退出安全回收本客户端拥有的 Harness、代理和隧道；原生会话仍沿用既有安全停止规则。安装与升级先请求 Elves 自身安全退出并替换 Elves 程序、清理 Elves 自身历史残留；全程不得终止、删除或修改任何 CodexElves 程序、进程、快捷方式及注册表项。卸载保留 `~/.elves/` 中的设置、历史、授权及缓存。
 
 ## 数据与资源
 
-共享数据保持在 `~/.codex-session-delete/`。客户端默认使用 `%LOCALAPPDATA%\com.elves.app\`；若新目录不存在且旧 `%LOCALAPPDATA%\com.codexelves.remote\` 已存在，则沿用旧目录以保留窗口和 WebView 数据。`settings.json` 只保存窗口状态，不保存服务地址。
+共享配置与状态统一位于 `~/.elves/`，桌面客户端数据（窗口状态 `settings.json`、WebView2 缓存及公开资源缓存）位于 `~/.elves/desktop/`，CLI Wrapper 目录位于 `~/.elves/cli/`。客户端启动不再直接读写旧版目录；安装包阶段自动识别旧版目录（`~/.codex-session-delete/`、`%LOCALAPPDATA%\com.elves.app\` 或 `%LOCALAPPDATA%\com.codexelves.remote\`、`~/.codex-elves-cli/`）并将持久数据单向同步到 `~/.elves/`，跳过运行态锁/端点/套接字，且完整保留旧版目录不变。`desktop/settings.json` 只保存窗口状态，不保存服务地址。
 
 开发验收可用绝对路径环境变量 `ELVES_DATA_DIR` 隔离客户端数据，用 `ELVES_STATE_DIR` 隔离 Harness 状态。两者须同时设置，不能用隔离客户端目录代替隔离后台设置。
 
