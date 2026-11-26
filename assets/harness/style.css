@@ -43,9 +43,9 @@
 @property --notice-text{syntax:"<color>";inherits:true;initial-value:#1f1f1f}
 @property --notice-border{syntax:"<color>";inherits:true;initial-value:#e8e8e8}
 @property --notice-accent{syntax:"<color>";inherits:true;initial-value:#171717}
-@property --notice-error-bg{syntax:"<color>";inherits:true;initial-value:#912018}
-@property --notice-error-text{syntax:"<color>";inherits:true;initial-value:#ffffff}
-@property --notice-error-border{syntax:"<color>";inherits:true;initial-value:#912018}
+@property --notice-error-bg{syntax:"<color>";inherits:true;initial-value:#fdecec}
+@property --notice-error-text{syntax:"<color>";inherits:true;initial-value:#991b1b}
+@property --notice-error-border{syntax:"<color>";inherits:true;initial-value:#dc2626}
 @property --danger{syntax:"<color>";inherits:true;initial-value:#b42318}
 @property --green{syntax:"<color>";inherits:true;initial-value:#168350}
 /* 用户要求卡片、页面、侧栏和控件同帧过渡。300ms 是原有整页时长，JS 等实际过渡结束；期间不叠加控件自己的颜色动效。 */
@@ -2345,11 +2345,12 @@ body{font-weight:var(--ui-font-weight,400)}
   background:var(--notice-bg);color:var(--notice-text);font-size:.78571rem;line-height:1.8
 }
 .pending-banner .text-button{color:var(--notice-accent)}
+/* 用户要求顶部 Toast（#notice）四边边框粗细统一为 1px，不再加粗左侧边框。 */
 #notice{
-  border:1px solid var(--notice-border);border-left:3px solid var(--notice-accent);
+  border:1px solid var(--notice-border);
   box-shadow:0 8px 28px #0004;line-height:1.5
 }
 #notice.error{
   background:var(--notice-error-bg);color:var(--notice-error-text);
-  border-color:var(--notice-error-border);border-left-color:var(--danger)
+  border-color:var(--notice-error-border)
 }

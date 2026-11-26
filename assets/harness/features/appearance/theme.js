@@ -456,9 +456,12 @@ export function appearanceThemeColors(theme, palette) {
   const noticeBg = mixColor(background, accent, dark ? .22 : .12);
   const noticeText = appearanceReadableForeground(noticeBg, foreground);
   const noticeBorder = appearanceAccessibleColor(accent, noticeBg, 3);
-  const noticeErrorBg = mixColor(background, danger, dark ? .22 : .12);
-  const noticeErrorText = appearanceReadableForeground(noticeErrorBg, foreground);
-  const noticeErrorBorder = appearanceAccessibleColor(danger, noticeErrorBg, 3);
+  // 用户要求错误 Toast 采用轻透语义红（方案 A）：使用纯正红基准色派生底色、边框和红系可读文字，
+  // 不再用深色淡粉文字色 danger 混底色，避免深色模式下发灰发褐；同时按 4.5:1 / 3:1 核对对比度。
+  const noticeErrorBase = dark ? "#dc2626" : "#ef4444";
+  const noticeErrorBg = mixColor(background, noticeErrorBase, dark ? .24 : .10);
+  const noticeErrorText = appearanceAccessibleColor(dark ? "#fecaca" : "#991b1b", noticeErrorBg, 4.5);
+  const noticeErrorBorder = appearanceAccessibleColor(dark ? "#ef4444" : "#dc2626", noticeErrorBg, 3);
   const focus = appearanceAccessibleColor(dark
     ? mixColor(background, accentText, .7 + .1 * contrast) : accent, background, 3);
   // 设置内描边同时邻接控件填充与卡片；独立校验实际表面，保留其他区域既有焦点和错误颜色。
