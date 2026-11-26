@@ -1,5 +1,7 @@
-// Claude 与 Antigravity 账号/额度提示：Claude 经所属 WSL CLI 展示 5h/7d 额度、订阅与重置时间；
-// Antigravity 严格经官方 ACP 协议展示官方订阅等级、CLI 状态与 ACP 会话 Token 统计（不绕过 CLI）。
+// 5h/7d 额度与消耗预测提示：
+// - Claude 实例经所属 WSL Claude CLI 读取 5h/7d 剩余额度、账号、订阅与重置时间，展开时统计该 WSL 本地日志消耗与预估总额度；
+// - Antigravity 实例经目标环境官方 `agy -p "/usage" --output-format json` 读取 `Gemini Models` 与 `Claude and GPT models` 分组额度，
+//   结合本地 `~/.gemini/google_accounts.json` 展示邮箱、ACP 订阅等级与本地转录日志分组统计展示底部 `5h xx% 7d xx%` 及 320px 弹层。
 
 import { $, element } from "../../ui/dom.js";
 import { icon } from "../../ui/icons.js";
@@ -8,6 +10,7 @@ import { closeComposerMenus } from "../../core/actions.js";
 import { connected, creating, pageLeaving, selectedId, session, sidebar, thread } from "../../core/state.js";
 import { api } from "../api.js";
 import { fitComposerMetrics } from "./metrics.js";
+import { modelDefaults, selectedModel } from "./options-state.js";
 import { isAntigravity, isClaude, privateInputScope } from "../session/capabilities.js";
 import { activeInstanceId, sessionInstanceEnabled } from "../session/instances.js";
 import { currentThreadDisplay } from "../session/thread-cache.js";
@@ -23,20 +26,40 @@ function claudeUsageContext() {
       ...(sidebar?.projects || []).flatMap(project => project.threads || [])].find(item => item.id === selectedId) : null);
   // 用户要求切换时先显示目标实例的缓存；详情未到时只认目标会话缓存/侧栏明确提供的实例，不借用旧会话或默认实例。
   const instanceId = creating || current ? activeInstanceId() : display?.instanceId;
-  const backend = creating || current
-    ? (isClaude() ? "claude" : isAntigravity() ? "antigravity" : "")
-    : (display?.backend === "claude" || display?.backend === "antigravity" ? display.backend : "");
-  if (!backend || !instanceId || !sessionInstanceEnabled(instanceId) || display?.viewKind === "subagent") return null;
-  if (backend === "claude" && session?.capabilities?.claudeSubscriptionUsage !== true) return null;
-  if (backend === "antigravity" && session?.capabilities?.antigravityUsage !== true) return null;
+  const antigravityActive = typeof isAntigravity === "function" && isAntigravity();
+  const backend = creating || current ? (isClaude() ? "claude" : antigravityActive ? "antigravity" : "")
+    : ["claude", "antigravity"].includes(display?.backend) ? display.backend : "";
+  const supported = backend === "claude" ? session?.capabilities?.claudeSubscriptionUsage === true
+    : backend === "antigravity" ? session?.capabilities?.antigravityUsage === true : false;
+  if (!backend || !supported || !instanceId || !sessionInstanceEnabled(instanceId) || display?.viewKind === "subagent") return null;
   return {
-    key: JSON.stringify([owner, backend, instanceId]),
-    backend,
+    key: JSON.stringify([owner, instanceId]),
     owner,
+    backend,
     instanceId,
     canRead: connected && (creating || !!current),
     payload: { backend, instanceId, ...(!creating ? { threadId: selectedId } : {}) }
   };
+}
+function claudeUsageCurrentModelGroup() {
+  const model = ((typeof selectedModel === "string" && selectedModel)
+    || currentThreadDisplay()?.model
+    || (typeof thread === "object" && thread?.model)
+    || (typeof modelDefaults === "object" && modelDefaults?.model)
+    || "").trim().toLowerCase();
+  return /^(?:claude-|gpt-|o1|o3|o4)/.test(model) ? "thirdParty" : "gemini";
+}
+function claudeUsageGroups(value) {
+  return value?.source === "antigravity-native-usage" && Array.isArray(value.groups)
+    ? value.groups.filter(group => group && typeof group.id === "string" && group.id) : [];
+}
+function claudeUsageResolveGroup(value, preferred = "") {
+  const groups = claudeUsageGroups(value);
+  if (!groups.length) return null;
+  const modelGroup = claudeUsageCurrentModelGroup();
+  return groups.find(group => group.id === preferred)
+    || groups.find(group => group.id === modelGroup)
+    || groups[0];
 }
 // 用户要求打开 Claude 会话时底部额度先显示缓存、数据又要及时刷新：每 60 秒读取一次，电脑端距上次读取超过 60 秒即经 CLI 重新读取；
 // 72 小时只是原采集时间的显示上限，不是刷新周期。电脑端先返回保留结果并在后台刷新（refreshing）时，5 秒后复查以尽快换上新数据。
@@ -46,43 +69,44 @@ function claudeUsageRefreshDelay(state) {
   return state?.refreshing ? claudeUsageFollowUpMs : claudeUsageRefreshMs;
 }
 const claudeUsageCache = new Map();
-function antigravityUsageUsable(value, now = Date.now()) {
-  return value?.source === "antigravity-acp" && typeof value.observedAtMs === "number"
-    && Number.isFinite(value.observedAtMs) && value.observedAtMs > 0
-    && value.observedAtMs <= now + 30000 && now - value.observedAtMs < claudeUsageMaxAgeMs;
-}
-function hasCachedUsage(entry, now = Date.now()) {
-  return entry?.backend === "antigravity" ? antigravityUsageUsable(entry.value, now) : claudeUsageWindows(entry?.value, now).length > 0;
-}
 function rememberClaudeUsage(state = claudeUsageState) {
   const owner = privateInputScope(session);
   for (const [key, cached] of claudeUsageCache) {
-    if (cached.owner !== owner || !hasCachedUsage(cached)) claudeUsageCache.delete(key);
+    if (cached.owner !== owner || !claudeUsageWindows(cached.value).length) claudeUsageCache.delete(key);
   }
   if (!state) return;
   claudeUsageCache.delete(state.key);
-  if (state.owner === owner && hasCachedUsage(state)) {
+  if (state.owner === owner && claudeUsageWindows(state.value).length) {
     // 用户要求打开时先显示缓存；仅在内存中按授权和实例保存最近有效数据，切会话/前后台不丢失。
-    claudeUsageCache.set(state.key, { owner, backend: state.backend, value: state.value, checkedAt: state.checkedAt,
+    claudeUsageCache.set(state.key, { owner, value: state.value, checkedAt: state.checkedAt,
       refreshing: state.refreshing === true, details: state.details, detailsRead: state.detailsRead });
     // 最多保留 16 个最近使用实例，且仍受 72 小时真实采集时间约束，不保存 DOM、请求或凭据。
     while (claudeUsageCache.size > 16) claudeUsageCache.delete(claudeUsageCache.keys().next().value);
   }
 }
-function claudeUsageWindows(value, now = Date.now()) {
+function claudeUsageWindows(value, now = Date.now(), preferredGroup = "") {
   // 用户要求真实账号额度；缺失、过期或非法字段不能显示成 0%，窗口到期后也不推测已恢复的额度。
-  if (value?.source !== "claude-native-usage" || typeof value.observedAtMs !== "number"
+  if (!["claude-native-usage", "antigravity-native-usage"].includes(value?.source) || typeof value.observedAtMs !== "number"
       || !Number.isFinite(value.observedAtMs) || value.observedAtMs <= 0
       || value.observedAtMs > now + 30000 || now - value.observedAtMs >= claudeUsageMaxAgeMs) return [];
+  const activeGroup = claudeUsageResolveGroup(value, preferredGroup);
+  const bucketSource = activeGroup || value;
+  const groupPrefix = activeGroup ? `${activeGroup.id}:` : "";
   return [["fiveHour", "5h", "5 小时"], ["sevenDay", "7d", "7 天"]].flatMap(([key, short, label]) => {
-    const data = value[key], used = data?.usedPercentage;
+    const data = bucketSource[key], used = data?.usedPercentage;
     if (typeof used !== "number" || !Number.isFinite(used) || used < 0 || used > 100) return [];
     const reset = data.resetsAt == null ? null : typeof data.resetsAt === "string" ? Date.parse(data.resetsAt)
       : typeof data.resetsAt === "number" ? data.resetsAt * (data.resetsAt < 1e12 ? 1000 : 1) : NaN;
     if (reset != null && (!Number.isFinite(reset) || reset <= now || reset > 8640000000000000)) return [];
     // 用户要求底部和账号信息统一显示剩余比例，直接按 100 - 原生已用比例取整；预测仍使用未取整的原生已用值。
-    return [{ key, short, label, used: Math.round(used), remaining: Math.round(100 - used), usedPercentage: used, resetAt: reset }];
+    return [{ key, detailKey: `${groupPrefix}${key}`, groupId: activeGroup?.id || "", short, label,
+      used: Math.round(used), remaining: Math.round(100 - used), usedPercentage: used, resetAt: reset }];
   });
+}
+function claudeUsageAllWindows(value, now = Date.now()) {
+  const groups = claudeUsageGroups(value);
+  if (!groups.length) return claudeUsageWindows(value, now);
+  return groups.flatMap(group => claudeUsageWindows(value, now, group.id));
 }
 function claudeUsageDefaultWindows() {
   // 用户要求真实额度返回前先显示满额占位；占位只用于当前可读取实例，不写入缓存或本地统计。
@@ -165,15 +189,18 @@ function claudeUsageEnvironmentTimeZone() {
 function claudeUsageResetTitle(value, resetAt) {
   if (resetAt == null) return "";
   const wslTimeZone = claudeUsageTimeZone(value);
-  if (!wslTimeZone) return "";
+  const environmentTimeZone = claudeUsageEnvironmentTimeZone();
+  if (!wslTimeZone && !(value?.source === "antigravity-native-usage" && value?.hostLocal === true && environmentTimeZone)) return "";
   try {
     const format = timeZone => new Intl.DateTimeFormat("zh-CN", {
       year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit",
       hour12: false, timeZone, timeZoneName: "short"
     }).format(new Date(resetAt));
+    if (!wslTimeZone) {
+      return `${claudeUsageResetCountdownText(resetAt)}\n${format(environmentTimeZone)}（${environmentTimeZone}）`;
+    }
     // 用户要求保留 WSL 原始时区，同时补充转换到打开 Harness 的当前环境时区；两者都使用 24 小时制且不显示秒。
     const wslFormatted = format(wslTimeZone);
-    const environmentTimeZone = claudeUsageEnvironmentTimeZone();
     const environment = environmentTimeZone
       ? `\n${format(environmentTimeZone)}（${environmentTimeZone}）` : "";
     // 用户要求 hover 在两个绝对时间上方补充精确到小时和分钟的重置倒计时。
@@ -200,13 +227,14 @@ function claudeUsageEstimatedTotal(used, usedPercentage) {
 }
 function claudeUsageMetricsMatch(metrics, window, now = Date.now()) {
   const duration = window.key === "fiveHour" ? 18000000 : 604800000;
-  return metrics?.source === "claude-wsl-local-journal" && claudeUsageNumber(metrics.observedAtMs)
+  return ["claude-wsl-local-journal", "antigravity-local-journal"].includes(metrics?.source) && claudeUsageNumber(metrics.observedAtMs)
     && metrics.observedAtMs > 0 && metrics.observedAtMs <= now + 30000 && now - metrics.observedAtMs < claudeUsageMaxAgeMs
     && window.resetAt != null && metrics.windowEndMs === window.resetAt
     && metrics.windowStartMs === window.resetAt - duration;
 }
 function claudeUsageMetrics(window, now = Date.now()) {
-  const metrics = claudeUsageState?.details?.value?.[window.key];
+  const detailKey = window.detailKey || window.key;
+  const metrics = claudeUsageState?.details?.value?.[detailKey] ?? claudeUsageState?.details?.value?.[window.key];
   return claudeUsageMetricsMatch(metrics, window, now) ? { ...metrics,
     usedCostUsd: claudeUsageMetricValue(metrics, "usedCostUsd", "costObservedAtMs", now),
     usedTokens: claudeUsageMetricValue(metrics, "usedTokens", "tokensObservedAtMs", now) } : null;
@@ -217,15 +245,21 @@ function claudeUsageMetricValue(metrics, key, timeKey, now = Date.now()) {
     && at <= now + 30000 && now - at < claudeUsageMaxAgeMs ? metrics[key] : null;
 }
 function claudeUsageSignature(windows) {
-  return JSON.stringify(windows.map(window => [window.key, window.resetAt]));
+  return JSON.stringify(windows.map(window => [window.detailKey || window.key, window.resetAt]));
 }
 function rememberClaudeUsageDetails(state, usage, windows) {
   let received = false;
+  const groups = claudeUsageGroups(usage);
   const value = Object.fromEntries(windows.map(window => {
-    const incoming = usage?.[window.key]?.metrics, previous = state.details?.value?.[window.key];
+    const detailKey = window.detailKey || window.key;
+    const groupData = window.groupId ? groups.find(item => item.id === window.groupId) : null;
+    const incoming = (groupData || usage)?.[window.key]?.metrics;
+    const previous = state.details?.value?.[detailKey];
     const retained = claudeUsageMetricsMatch(previous, window) ? previous : null;
     const usable = claudeUsageMetricsMatch(incoming, window);
-    const metrics = { source: "claude-wsl-local-journal", windowEndMs: window.resetAt,
+    const source = incoming?.source === "antigravity-local-journal" || retained?.source === "antigravity-local-journal"
+      ? "antigravity-local-journal" : "claude-wsl-local-journal";
+    const metrics = { source, windowEndMs: window.resetAt,
       windowStartMs: window.resetAt - (window.key === "fiveHour" ? 18000000 : 604800000) };
     // 用户要求使用和预测先展示缓存：金额与 Token 各自接替，单项缺失不覆盖另一项已有数字，且不延长旧值的采集时间。
     for (const [key, timeKey] of [["usedCostUsd", "costObservedAtMs"], ["usedTokens", "tokensObservedAtMs"]]) {
@@ -236,7 +270,7 @@ function rememberClaudeUsageDetails(state, usage, windows) {
       } else { metrics[key] = old; metrics[timeKey] = claudeUsageNumber(old) ? oldAt : null; }
     }
     metrics.observedAtMs = Math.max(metrics.costObservedAtMs || 0, metrics.tokensObservedAtMs || 0);
-    return [window.key, metrics.observedAtMs ? metrics : null];
+    return [detailKey, metrics.observedAtMs ? metrics : null];
   }));
   // 刷新失败或缺少数字时保留同窗口的有效旧值；新窗口、过期数据和迟到的较旧统计不能覆盖当前值。
   state.details = Object.values(value).some(Boolean)
@@ -245,21 +279,22 @@ function rememberClaudeUsageDetails(state, usage, windows) {
 }
 function loadClaudeUsageDetails() {
   const state = claudeUsageState, context = claudeUsageContext();
-  if (!state?.tip || state.backend !== "claude" || state.key !== context?.key || !context.canRead || state.detailsPending || state.pending) return;
-  const windows = claudeUsageWindows(state.value);
-  const signature = claudeUsageSignature(windows);
-  if (!windows.length || state.detailsRead?.signature === signature
+  if (!state?.tip || state.key !== context?.key || !context.canRead || state.detailsPending || state.pending) return;
+  const allWindows = claudeUsageAllWindows(state.value);
+  const resettableWindows = allWindows.filter(window => window.resetAt != null);
+  const signature = claudeUsageSignature(resettableWindows);
+  if (!resettableWindows.length || state.detailsRead?.signature === signature
       && Date.now() - state.detailsRead.checkedAt < claudeUsageRefreshMs) return;
   const tip = state.tip, controller = new AbortController();
   state.detailsPending = true; state.detailsController = controller;
-  // 用户要求仅展开时扫描 WSL 日志；关闭、切换授权/实例后丢弃迟到结果，详情失败不影响百分比。
+  // 用户要求仅展开时扫描本地日志；关闭、切换授权/实例后丢弃迟到结果，详情失败不影响百分比。
   void api("/api/read/claudeUsage", { ...context.payload, includeLocal: true }, undefined, controller.signal,
     { resourcePriority: "background" })
     .then(result => {
       if (claudeUsageState !== state || state.tip !== tip || state.detailsController !== controller) return;
-      if (result?.ok !== true || result.backend !== "claude" || result.instanceId !== context.instanceId)
-        throw new Error("Claude 额度详情响应无效");
-      rememberClaudeUsageDetails(state, result.usage, claudeUsageWindows(state.value));
+      if (result?.ok !== true || result.backend !== context.backend || result.instanceId !== context.instanceId)
+        throw new Error("额度详情响应无效");
+      rememberClaudeUsageDetails(state, result.usage, claudeUsageAllWindows(state.value));
     })
     .catch(error => {
       if (claudeUsageState !== state || state.tip !== tip || state.detailsController !== controller) return;
@@ -273,7 +308,7 @@ function loadClaudeUsageDetails() {
       state.detailsRead = { signature, checkedAt: Date.now() };
       rememberClaudeUsage(state);
       if (state.tip === tip) {
-        const current = claudeUsageWindows(state.value);
+        const current = claudeUsageAllWindows(state.value).filter(window => window.resetAt != null);
         renderClaudeUsage();
         if (claudeUsageSignature(current) !== signature) loadClaudeUsageDetails();
       }
@@ -330,12 +365,17 @@ export function fitClaudeUsageTip() {
   tip.node.style.top = `${Math.max(top + padding, Math.min(upwards ? box.top - gap - actual.height : box.bottom + gap,
     top + height - actual.height - padding))}px`;
 }
-function renderClaudeUsageTip(windows) {
+function renderClaudeUsageTip(defaultOrBarWindows) {
   const tip = claudeUsageState?.tip;
   if (!tip) return;
+  const value = claudeUsageState.value;
+  const isAntigravityUsage = value?.source === "antigravity-native-usage";
+  const groups = claudeUsageGroups(value);
+  const activeGroup = groups.length ? claudeUsageResolveGroup(value, tip.selectedGroup) : null;
+  const windows = activeGroup ? claudeUsageWindows(value, Date.now(), activeGroup.id) : defaultOrBarWindows;
   if (!windows.length) { closeClaudeUsageTip(); return; }
-  const subscription = claudeUsageSubscription(claudeUsageState.value);
-  const account = claudeUsageAccount(claudeUsageState.value);
+  const subscription = claudeUsageSubscription(value);
+  const account = claudeUsageAccount(value);
   const title = element("div", "claude-usage-title");
   // 用户要求邮箱默认脱敏；同次弹层刷新保留眼睛状态，账号变化或重新打开时恢复脱敏。
   if (tip.account !== account) { tip.account = account; tip.accountVisible = false; }
@@ -369,10 +409,33 @@ function renderClaudeUsageTip(windows) {
   // 用户确认缺少等级时直接不显示，不添加未知标签、占位或说明，也不使用效果图里的示例等级补齐。
   if (subscription.type) {
     const badge = element("span", "claude-usage-subscription", subscription.label);
-    badge.title = `所属 WSL Claude CLI 返回的订阅类型：${subscription.type}`;
+    badge.title = isAntigravityUsage
+      ? `所属 Antigravity 实例官方返回的订阅等级：${subscription.type}`
+      : `所属 WSL Claude CLI 返回的订阅类型：${subscription.type}`;
     badge.setAttribute("aria-label", `订阅等级：${subscription.label}`); title.append(badge);
   }
   const content = [title];
+  if (groups.length > 1 && activeGroup) {
+    const tabs = element("div", "claude-usage-groups");
+    tabs.setAttribute("role", "tablist");
+    tabs.setAttribute("aria-label", "模型额度分组");
+    for (const group of groups) {
+      const selected = group.id === activeGroup.id;
+      const tab = element("button", "claude-usage-group-tab", group.label || group.name || group.id);
+      tab.type = "button";
+      tab.setAttribute("role", "tab");
+      tab.setAttribute("aria-selected", selected ? "true" : "false");
+      if (group.description) tab.title = group.description;
+      tab.onclick = () => {
+        if (claudeUsageState?.tip !== tip) return;
+        tip.selectedGroup = group.id;
+        renderClaudeUsageTip(defaultOrBarWindows);
+      };
+      tabs.append(tab);
+    }
+    content.push(tabs);
+  }
+  const localLabel = isAntigravityUsage ? "仅此实例本地原生转录日志" : "仅此 WSL 本地原生日志";
   for (const window of windows) {
     const section = element("section", "claude-usage-section");
     const row = element("div", "claude-usage-detail-row");
@@ -386,18 +449,22 @@ function renderClaudeUsageTip(windows) {
       const item = element("span", `claude-usage-metric ${estimated ? "claude-usage-forecast" : "claude-usage-consumed"}`);
       const cost = estimated ? claudeUsageEstimatedTotal(metrics?.usedCostUsd, window.usedPercentage) : metrics?.usedCostUsd;
       const tokens = estimated ? claudeUsageEstimatedTotal(metrics?.usedTokens, window.usedPercentage) : metrics?.usedTokens;
-      item.title = `${estimated ? "预估总额度（已消耗 ÷ 原生已用比例）" : "本窗口已消耗"}；仅此 WSL 本地原生日志；金额按公开模型价格估算`;
+      item.title = `${estimated ? "预估总额度（已消耗 ÷ 原生已用比例）" : "本窗口已消耗"}；${localLabel}；金额按公开模型价格估算`;
       item.setAttribute("aria-label", `${estimated ? "预估总额度" : "已消耗"} ${claudeUsageCompact(cost, true)} / ${claudeUsageCompact(tokens)} Token`);
       item.append(icon(estimated ? "usageForecast" : "usageConsumed"),
         element("span", "", claudeUsageCompact(cost, true)), element("span", "claude-usage-slash", "/"),
         element("span", "", claudeUsageCompact(tokens)));
       stats.append(item);
     }
-    const reset = element("span", "claude-usage-reset", claudeUsageResetText(window.resetAt));
-    const resetTitle = claudeUsageResetTitle(claudeUsageState.value, window.resetAt);
+    const unstarted = isAntigravityUsage && window.resetAt == null && window.usedPercentage === 0 && !window.default;
+    const reset = element("span", "claude-usage-reset", unstarted ? "未开始" : claudeUsageResetText(window.resetAt));
+    const resetTitle = claudeUsageResetTitle(value, window.resetAt);
     if (resetTitle) {
       reset.title = resetTitle;
       reset.setAttribute("aria-label", `重置时间：${resetTitle}`);
+    } else if (unstarted) {
+      reset.title = "当前分组尚未消耗额度，滚动计时窗口将在首次使用后启动";
+      reset.setAttribute("aria-label", "重置时间：尚未开始计时");
     } else if (window.resetAt != null) {
       // 未能核对目标 WSL 时区时不能退回浏览器本地时间，避免显示看似精确但来源错误的时间。
       reset.title = "目标 WSL 时区未知";
@@ -408,121 +475,17 @@ function renderClaudeUsageTip(windows) {
   tip.node.replaceChildren(...content);
   fitClaudeUsageTip();
 }
-function antigravityUsageTriggerView(state, now = Date.now()) {
-  if (!state || state.backend !== "antigravity") return null;
-  const value = antigravityUsageUsable(state.value, now) ? state.value : null;
-  if (value) {
-    if (value.authRequired === true) {
-      return { text: "未登录", warning: true, label: "Antigravity 未登录，点击查看 ACP 账号与登录说明" };
-    }
-    const tier = typeof (value.tierName || value.subscriptionType || value.subscriptionTier?.name) === "string"
-      ? (value.tierName || value.subscriptionType || value.subscriptionTier?.name).trim() : "";
-    if (tier) {
-      return { text: tier, warning: false, label: `Antigravity 订阅等级 ${tier}，点击查看 ACP 账号与统计` };
-    }
-    if (value.authenticated === true) {
-      return { text: "已登录", warning: false, label: "Antigravity 已通过 ACP 登录，点击查看统计" };
-    }
-  }
-  if (state.checkedAt === 0 || state.pending) {
-    return { text: "Antigravity", warning: false, label: "正在通过 ACP 读取 Antigravity 账号状态" };
-  }
-  return null;
-}
-function renderAntigravityUsageTip() {
-  const tip = claudeUsageState?.tip;
-  if (!tip) return;
-  const view = antigravityUsageTriggerView(claudeUsageState);
-  if (!view) { closeClaudeUsageTip(); return; }
-  const value = antigravityUsageUsable(claudeUsageState.value) ? claudeUsageState.value : null;
-  const title = element("div", "claude-usage-title");
-  const heading = typeof value?.instanceLabel === "string" && value.instanceLabel.trim()
-    ? value.instanceLabel.trim() : "Antigravity";
-  const titleText = element("span", "claude-usage-title-text", heading);
-  title.append(titleText);
-  const rawTier = value?.tierName || value?.subscriptionType || value?.subscriptionTier?.name || "";
-  const tier = typeof rawTier === "string" ? rawTier.trim() : "";
-  if (tier) {
-    const badge = element("span", "claude-usage-subscription", tier);
-    badge.title = `Antigravity 官方 ACP 返回的订阅等级：${tier}`;
-    badge.setAttribute("aria-label", `订阅等级：${tier}`);
-    title.append(badge);
-  } else if (value?.authRequired === true) {
-    const badge = element("span", "claude-usage-subscription is-warning", "未登录");
-    badge.title = "目标 Antigravity 实例尚未通过 ACP 登录";
-    title.append(badge);
-  }
-  const content = [title];
-  // 区块 1：ACP 连接与账号状态
-  const statusSection = element("section", "claude-usage-section");
-  const statusRow = element("div", "claude-usage-detail-row");
-  const rawVersion = value?.agentVersion || value?.agentInfo?.version || "";
-  const version = typeof rawVersion === "string" && rawVersion.trim() ? `v${rawVersion.trim()}` : "";
-  const statusValue = !value ? "正在读取 ACP 状态…"
-    : value.authRequired === true ? "未登录"
-    : value.authenticated === true ? (version ? `已登录 · ${version}` : "已登录")
-    : "暂不可用";
-  statusRow.append(element("span", "", "ACP 连接状态"), element("span", "claude-usage-remaining", statusValue));
-  statusSection.append(statusRow);
-  const authNote = value?.authMessage || value?.error || "";
-  if (value?.authRequired === true && typeof authNote === "string" && authNote.trim()) {
-    statusSection.append(element("p", "antigravity-usage-note", authNote.trim()));
-  }
-  content.push(statusSection);
-  // 区块 2：ACP 实测会话 Token 统计
-  const tokens = value?.sessionTokens || value?.acpSessionTokens;
-  const tokenSection = element("section", "claude-usage-section");
-  const tokenRow = element("div", "claude-usage-detail-row");
-  tokenRow.append(element("span", "", "ACP 会话 Token"),
-    element("span", "claude-usage-remaining", claudeUsageCompact(tokens?.totalTokens)));
-  const tokenMetrics = element("div", "claude-usage-metrics");
-  const stats = element("div", "claude-usage-stats");
-  stats.append(
-    element("span", "claude-usage-metric", `输入 ${claudeUsageCompact(tokens?.inputTokens)}`),
-    element("span", "claude-usage-metric", `输出 ${claudeUsageCompact(tokens?.outputTokens)}`)
-  );
-  if (claudeUsageNumber(tokens?.cachedInputTokens) && tokens.cachedInputTokens > 0) {
-    stats.append(element("span", "claude-usage-metric", `缓存 ${claudeUsageCompact(tokens.cachedInputTokens)}`));
-  }
-  const rawSessionsCount = tokens?.sessionCount ?? tokens?.sessions;
-  const sessionsCount = Number.isSafeInteger(rawSessionsCount) ? rawSessionsCount : 0;
-  tokenMetrics.append(stats, element("span", "claude-usage-reset", `${sessionsCount} 个会话`));
-  tokenSection.append(tokenRow, tokenMetrics);
-  content.push(tokenSection);
-  // 区块 3：诚实说明 ACP 协议边界（遵循 AGENTS.md，不绕过官方 CLI 读取凭据或直连私有接口）
-  const limitSection = element("section", "claude-usage-section");
-  limitSection.append(element("p", "antigravity-usage-note",
-    "官方 ACP 协议暂未提供 5h/7d 剩余额度百分比、重置时间与 Google 账号邮箱；Elves 严格通过官方 agy acp 读取状态，不绕过 CLI。"));
-  content.push(limitSection);
-  tip.node.replaceChildren(...content);
-  fitClaudeUsageTip();
-}
 function renderClaudeUsage() {
   const trigger = $("#claude-usage");
   if (!trigger) return;
-  if (claudeUsageState?.backend === "antigravity") {
-    const view = antigravityUsageTriggerView(claudeUsageState);
-    trigger.hidden = !view;
-    fitComposerMetrics();
-    if (!view) { closeClaudeUsageTip(); return; }
-    const signature = JSON.stringify(["antigravity", view.text, view.warning]);
-    if (trigger.dataset.usage !== signature) {
-      trigger.dataset.usage = signature;
-      const row = element("span", "claude-usage-window");
-      row.append(element("span", view.warning ? "error-text" : "claude-usage-percent", view.text));
-      trigger.replaceChildren(row);
-      trigger.setAttribute("aria-label", view.label);
-    }
-    renderAntigravityUsageTip();
-    fitComposerMetrics();
-    return;
-  }
+  const context = claudeUsageContext();
   const windows = claudeUsageDisplayWindows(claudeUsageState);
   trigger.hidden = !windows.length;
   fitComposerMetrics();
   if (!windows.length) { closeClaudeUsageTip(); return; }
   const isDefault = windows[0]?.default === true;
-  const signature = JSON.stringify([isDefault ? "default" : "remaining",
+  const activeGroup = claudeUsageResolveGroup(claudeUsageState?.value);
+  const signature = JSON.stringify([isDefault ? "default" : "remaining", activeGroup?.id || "",
     ...windows.map(window => [window.key, window.remaining])]);
   if (trigger.dataset.usage !== signature) {
     trigger.dataset.usage = signature;
@@ -535,8 +498,10 @@ function renderClaudeUsage() {
     }
     trigger.replaceChildren(...nodes);
     const account = claudeUsageAccount(claudeUsageState.value);
+    const brandName = context?.backend === "antigravity" ? "Antigravity" : "Claude";
+    const groupText = activeGroup ? `${activeGroup.label} 分组，` : "";
     // 用户要求默认脱敏同时覆盖底部按钮的读屏文本，不能只在弹层视觉上隐藏完整邮箱。
-    trigger.setAttribute("aria-label", `Claude ${account ? `登录账号 ${claudeUsageMaskAccount(account)}，` : "账号信息，"}${isDefault ? "真实额度读取中，当前按满额显示，" : ""}${windows.map(window => `${window.short} ${window.remaining}%`).join("，")}，查看重置时间`);
+    trigger.setAttribute("aria-label", `${brandName} ${account ? `登录账号 ${claudeUsageMaskAccount(account)}，` : "账号信息，"}${groupText}${isDefault ? "真实额度读取中，当前按满额显示，" : ""}${windows.map(window => `${window.short} ${window.remaining}%`).join("，")}，查看重置时间`);
   }
   renderClaudeUsageTip(windows);
   fitComposerMetrics();
@@ -548,8 +513,8 @@ function scheduleClaudeUsageUpdate() {
   const context = claudeUsageContext();
   if (context?.key !== state.key) return;
   const now = Date.now();
-  const windows = state.backend === "claude" ? claudeUsageWindows(state.value, now) : [];
-  const expiry = [state.value?.observedAtMs, ...(state.backend === "claude" && state.tip
+  const windows = claudeUsageAllWindows(state.value, now);
+  const expiry = [state.value?.observedAtMs, ...(state.tip
     ? Object.values(state.details?.value || {}).flatMap(metrics =>
       [metrics?.observedAtMs, metrics?.costObservedAtMs, metrics?.tokensObservedAtMs]) : [])]
     .filter(claudeUsageNumber).map(at => at + claudeUsageMaxAgeMs).filter(at => at > now);
@@ -570,7 +535,7 @@ export function syncClaudeUsage() {
     // 切换实例时原子替换数据并直接渲染目标缓存，不能先 hidden=true 再等待会话详情。
     resetClaudeUsage({ hideTrigger: false });
     const cached = claudeUsageCache.get(context.key);
-    claudeUsageState = { key: context.key, backend: context.backend, owner: context.owner, value: cached?.value || null,
+    claudeUsageState = { key: context.key, owner: context.owner, value: cached?.value || null,
       checkedAt: cached?.checkedAt || 0, refreshing: cached?.refreshing === true, pending: false, controller: null, timer: null, tip: null,
       details: cached?.details || null, detailsRead: cached?.detailsRead || null, detailsPending: false, detailsController: null };
   }
@@ -582,76 +547,64 @@ export function syncClaudeUsage() {
     state.pending = true;
     const controller = new AbortController();
     state.controller = controller;
-    if (context.backend === "antigravity") {
-      // 用户要求 Antigravity 必须经官方 ACP 协议读取账号等级与会话统计，不绕过 CLI。
-      void api("/api/read/antigravityUsage", context.payload, undefined, controller.signal, { resourcePriority: "background" })
-        .then(result => {
-          if (claudeUsageState !== state || state.controller !== controller || controller.signal.aborted) return;
-          if (result?.ok !== true || result.backend !== "antigravity" || result.instanceId !== context.instanceId)
-            throw new Error("Antigravity ACP 状态响应无效");
-          state.refreshing = false;
-          if (antigravityUsageUsable(result.usage)) {
-            state.value = {
-              ...(typeof result.instanceLabel === "string" && result.instanceLabel ? { instanceLabel: result.instanceLabel } : {}),
-              ...result.usage
-            };
-          }
-        })
-        .catch(error => {
-          if (claudeUsageState !== state || state.controller !== controller) return;
-          state.refreshing = false;
-          if ([401, 403].includes(error.code)) {
-            state.value = null; claudeUsageCache.delete(state.key);
-          }
-        })
-        .finally(() => {
-          if (claudeUsageState !== state || state.controller !== controller) return;
-          state.checkedAt = Date.now(); state.pending = false; state.controller = null;
-          rememberClaudeUsage(state);
-          renderClaudeUsage(); scheduleClaudeUsageUpdate();
-        });
-    } else {
-      // 用户要求额度按账号所属实例显示；授权或实例切换后丢弃迟到响应，后台页不轮询。
-      void api("/api/read/claudeUsage", context.payload, undefined, controller.signal, { resourcePriority: "background" })
-        .then(result => {
-          if (claudeUsageState !== state || state.controller !== controller || controller.signal.aborted) return;
-          if (result?.ok !== true || result.backend !== "claude" || result.instanceId !== context.instanceId)
-            throw new Error("Claude 额度响应无效");
-          // 电脑端先返回保留结果并在后台经 CLI 刷新时按 5 秒复查，新结果到达后恢复 60 秒周期。
-          state.refreshing = result.refreshing === true;
-          const value = result.usage, windows = claudeUsageWindows(value);
-          // 读取暂未返回有效窗口时保留该实例仍有效的快照；采集时间不更新，超时/重置仍按原边界失效。
-          if (!windows.length && claudeUsageWindows(state.value).length) return;
-          const account = claudeUsageAccount(value);
-          const timeZone = claudeUsageTimeZone(value);
-          state.value = windows.length ? { source: value.source, observedAtMs: value.observedAtMs,
-            ...(timeZone ? { timeZone } : {}),
-            ...(account ? { accountEmail: account } : {}),
-            ...(Object.hasOwn(value, "subscriptionType") ? { subscriptionType: claudeUsageSubscription(value).type } : {}),
-            ...Object.fromEntries(windows.map(window => [window.key,
-              { usedPercentage: window.usedPercentage, resetsAt: window.resetAt }])) } : null;
-          const received = rememberClaudeUsageDetails(state, value, windows);
-          if (received && windows.every(window => claudeUsageMetricsMatch(state.details?.value?.[window.key], window))) {
-            const observed = Math.min(Date.now(), ...Object.values(state.details.value).filter(Boolean).map(metrics => metrics.observedAtMs));
-            state.detailsRead = { signature: claudeUsageSignature(windows),
-              checkedAt: Math.max(observed, state.detailsRead?.signature === claudeUsageSignature(windows) ? state.detailsRead.checkedAt : 0) };
-          }
-        })
-        .catch(error => {
-          if (claudeUsageState !== state || state.controller !== controller) return;
-          // 请求失败或响应无效时不按刷新在途提前复查，回到 60 秒退避。
-          state.refreshing = false;
-          if ([401, 403].includes(error.code)) {
-            state.value = null; state.details = null; claudeUsageCache.delete(state.key);
-          }
-        })
-        .finally(() => {
-          if (claudeUsageState !== state || state.controller !== controller) return;
-          state.checkedAt = Date.now(); state.pending = false; state.controller = null;
-          rememberClaudeUsage(state);
-          renderClaudeUsage(); loadClaudeUsageDetails(); scheduleClaudeUsageUpdate();
-        });
-    }
+    // 用户要求额度按账号所属实例显示；授权或实例切换后丢弃迟到响应，后台页不轮询。
+    void api("/api/read/claudeUsage", context.payload, undefined, controller.signal, { resourcePriority: "background" })
+      .then(result => {
+        if (claudeUsageState !== state || state.controller !== controller || controller.signal.aborted) return;
+        if (result?.ok !== true || result.backend !== context.backend || result.instanceId !== context.instanceId)
+          throw new Error("额度响应无效");
+        // 电脑端先返回保留结果并在后台经 CLI 刷新时按 5 秒复查，新结果到达后恢复 60 秒周期。
+        state.refreshing = result.refreshing === true;
+        const value = result.usage, windows = claudeUsageAllWindows(value);
+        // 读取暂未返回有效窗口时保留该实例仍有效的快照；采集时间不更新，超时/重置仍按原边界失效。
+        if (!windows.length && claudeUsageAllWindows(state.value).length) return;
+        const account = claudeUsageAccount(value);
+        const timeZone = claudeUsageTimeZone(value);
+        const rawGroups = claudeUsageGroups(value);
+        const normalizedGroups = rawGroups.map(group => {
+          const gWindows = claudeUsageWindows(value, Date.now(), group.id);
+          if (!gWindows.length) return null;
+          return {
+            id: group.id,
+            label: typeof group.label === "string" ? group.label.slice(0, 32) : group.id,
+            name: typeof group.name === "string" ? group.name.slice(0, 64) : "",
+            description: typeof group.description === "string" ? group.description.slice(0, 240) : "",
+            ...Object.fromEntries(gWindows.map(window => [window.key,
+              { usedPercentage: window.usedPercentage, resetsAt: window.resetAt }]))
+          };
+        }).filter(Boolean);
+        const primaryWindows = claudeUsageWindows(value);
+        state.value = windows.length ? { source: value.source, observedAtMs: value.observedAtMs,
+          ...(value?.hostLocal === true ? { hostLocal: true } : {}),
+          ...(timeZone ? { timeZone } : {}),
+          ...(account ? { accountEmail: account } : {}),
+          ...(Object.hasOwn(value, "subscriptionType") ? { subscriptionType: claudeUsageSubscription(value).type } : {}),
+          ...(normalizedGroups.length ? { groups: normalizedGroups } : {}),
+          ...Object.fromEntries(primaryWindows.map(window => [window.key,
+            { usedPercentage: window.usedPercentage, resetsAt: window.resetAt }])) } : null;
+        const resettableWindows = windows.filter(window => window.resetAt != null);
+        const received = rememberClaudeUsageDetails(state, value, resettableWindows);
+        if (received && resettableWindows.length && resettableWindows.every(window =>
+            claudeUsageMetricsMatch(state.details?.value?.[window.detailKey || window.key], window))) {
+          const observed = Math.min(Date.now(), ...Object.values(state.details.value).filter(Boolean).map(metrics => metrics.observedAtMs));
+          state.detailsRead = { signature: claudeUsageSignature(resettableWindows),
+            checkedAt: Math.max(observed, state.detailsRead?.signature === claudeUsageSignature(resettableWindows) ? state.detailsRead.checkedAt : 0) };
+        }
+      })
+      .catch(error => {
+        if (claudeUsageState !== state || state.controller !== controller) return;
+        // 请求失败或响应无效时不按刷新在途提前复查，回到 60 秒退避。
+        state.refreshing = false;
+        if ([401, 403].includes(error.code)) {
+          state.value = null; state.details = null; claudeUsageCache.delete(state.key);
+        }
+      })
+      .finally(() => {
+        if (claudeUsageState !== state || state.controller !== controller) return;
+        state.checkedAt = Date.now(); state.pending = false; state.controller = null;
+        rememberClaudeUsage(state);
+        renderClaudeUsage(); loadClaudeUsageDetails(); scheduleClaudeUsageUpdate();
+      });
   }
   loadClaudeUsageDetails();
   scheduleClaudeUsageUpdate();
@@ -660,21 +613,6 @@ function showClaudeUsageTip() {
   syncClaudeUsage();
   const state = claudeUsageState, trigger = $("#claude-usage");
   if (!trigger?.isConnected || trigger.hidden || !state) return;
-  if (state.backend === "antigravity") {
-    if (!antigravityUsageTriggerView(state)) return;
-    if (state.tip) { renderAntigravityUsageTip(); return; }
-    closePopup(); closeComposerMenus();
-    const node = element("div", "ui-popup claude-usage-tooltip");
-    node.id = "claude-usage-tooltip"; node.setAttribute("role", "tooltip");
-    if (typeof node.showPopover === "function") node.setAttribute("popover", "manual");
-    state.tip = { trigger, node, account: "", accountVisible: false };
-    trigger.setAttribute("aria-expanded", "true"); trigger.setAttribute("aria-describedby", node.id);
-    document.body.append(node);
-    renderAntigravityUsageTip();
-    if (node.hasAttribute("popover")) node.showPopover();
-    fitClaudeUsageTip();
-    return;
-  }
   const windows = claudeUsageDisplayWindows(state);
   if (!windows.length) return;
   if (state.tip) {
@@ -684,7 +622,7 @@ function showClaudeUsageTip() {
   const node = element("div", "ui-popup claude-usage-tooltip");
   node.id = "claude-usage-tooltip"; node.setAttribute("role", "tooltip");
   if (typeof node.showPopover === "function") node.setAttribute("popover", "manual");
-  state.tip = { trigger, node, account: "", accountVisible: false };
+  state.tip = { trigger, node, account: "", accountVisible: false, selectedGroup: "" };
   trigger.setAttribute("aria-expanded", "true"); trigger.setAttribute("aria-describedby", node.id);
   document.body.append(node);
   // 用户要求缓存优先：先构造完整额度与已缓存数字，再展示弹层，刷新在后台进行。

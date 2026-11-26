@@ -138,6 +138,10 @@ fn model_default(model: &str) -> Option<u64> {
         // CLI 的订阅 1h 分支受配置、模型和超额用量影响；无原生明细时只采用 Claude 的默认 5m，不能凭登录方式推断 1h。
         return Some(5 * MINUTE);
     }
+    if model.starts_with("gemini-") || model.starts_with("orchestrator") {
+        // Gemini / Antigravity 隐式上下文缓存无显式 TTL 返回时采用保守的 5m 默认窗口。
+        return Some(5 * MINUTE);
+    }
     if let Some(version) = model.strip_prefix("gpt-") {
         let mut pieces = version.split(['.', '-']);
         let major = pieces

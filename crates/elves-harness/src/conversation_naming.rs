@@ -85,6 +85,7 @@ pub(super) fn validate(value: &Value) -> Result<Settings, ApiError> {
         || settings.instance_id.len() > 160
         || !settings.instance_id.starts_with("codex:")
             && !settings.instance_id.starts_with("claude:")
+            && !settings.instance_id.starts_with("antigravity:")
         || settings
             .instance_id
             .bytes()
@@ -493,6 +494,8 @@ impl ConversationNaming {
         let initial = record.generated_title.is_none();
         let context = if super::claude::Claude::owns_id(id) {
             controller.claude.naming_context(id, initial).await?
+        } else if super::antigravity::Antigravity::owns_id(id) {
+            controller.antigravity.naming_context(id, initial).await?
         } else {
             controller.harness.naming_context(id, initial).await?
         };
@@ -616,6 +619,12 @@ impl ConversationNaming {
                 .await?;
             // 后台命名不启动普通 Claude 目录探测进程，避免加载该实例的 Hooks/MCP；显式模型由隔离 CLI 校验。
             return inference::claude(&config, settings, input, authorization).await;
+        }
+        if settings.instance_id.starts_with("antigravity:") {
+            let config = controller
+                .antigravity_instance_config(&settings.instance_id)
+                .await?;
+            return inference::antigravity(&config, settings, input, authorization).await;
         }
         anyhow::ensure!(
             settings.instance_id == "codex:local",

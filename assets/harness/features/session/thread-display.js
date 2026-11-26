@@ -13,7 +13,7 @@ import {
 import { transcriptModelName } from "../messages/item-presentation.js";
 import { reconcileSentMessageDisplays } from "../queue/sent-display.js";
 import { queueSnapshotIsVersioned } from "../queue/state.js";
-import { claudeThreadId, normalizeRelatedView, privateInputScope, validRelatedThreadId } from "./capabilities.js";
+import { conversationBackend, normalizeRelatedView, privateInputScope, validRelatedThreadId } from "./capabilities.js";
 import { relatedHistoryKey, relatedSessionView } from "./related-state.js";
 import {
   cacheDisplayData, cachedReadingPosition, currentThreadDisplay, discardPersistentThreadDisplay,
@@ -63,7 +63,7 @@ export function rememberThreadDisplay(value = thread, { persist = true } = {}) {
   const usage = contextUsage(value.tokenUsage), ephemeral = threadEphemeralState(value.id, value);
   // 缓存目标和队列的展示数据；审批、权限及写操作仍使用重新读取的会话。
   const display = {
-    id: value.id, backend: value.backend || (claudeThreadId(value.id) ? "claude" : "codex"),
+    id: value.id, backend: conversationBackend(value),
     ...(value.instanceId ? { instanceId: value.instanceId, instanceLabel: value.instanceLabel,
       wslDistribution: value.wslDistribution, wslUser: value.wslUser } : {}),
     model: value.model || "", reasoningEffort: value.reasoningEffort || "",

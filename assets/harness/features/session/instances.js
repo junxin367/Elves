@@ -1,7 +1,7 @@
 // 会话实例：实例目录状态与启用判断、当前与会话所属实例、新建会话的后端选项、会话位置显示与 Claude 回顾默认值提示；目录加载与实例列表渲染在 instance-catalog.js。
 
 import { notice } from "../../ui/notice.js";
-import { creating, selectedId, session, thread } from "../../core/state.js";
+import { creating, selectedId, session, sidebar, thread } from "../../core/state.js";
 import { appearance } from "../appearance/theme.js";
 import { creationInstanceId } from "../composer/creation-state.js";
 import { conversationBackend } from "./capabilities.js";
@@ -16,23 +16,52 @@ export let sessionTypes = [
   { id: "antigravity", label: "Antigravity" }
 ];
 export function setSessionTypes(value) { return sessionTypes = value; }
+function sidebarSummaryForId(id) {
+  if (!id || !sidebar) return null;
+  return [...(sidebar.recent || []), ...(sidebar.pinnedThreads || []),
+    ...(sidebar.projects || []).flatMap(project => project.threads || [])].find(item => item.id === id) || null;
+}
 export function availableSessionInstances() {
   if (sessionInstances.length) return sessionInstances;
   // 用户要求实例显示名不拼接“本机”“WSL”；目录未返回时的默认名称也遵循同一规则。
-  return [{ id: "codex:local", backend: "codex", label: "Codex", ready: true, legacyDefault: true },
+  // 启动初期在 /api/settings/environments 返回前，也要把共享设置中已启用的 Antigravity 实例纳入候选，
+  // 避免点击历史 Antigravity 会话时误判为“此会话实例尚未启用”并卡在“正在读取模型...”。
+  const fallback = [{ id: "codex:local", backend: "codex", label: "Codex", ready: true, legacyDefault: true },
     ...(session?.claudeInstanceId ? [{ id: session.claudeInstanceId, backend: "claude",
       label: ["Claude", session.claudeWslDistribution].filter(Boolean).join(" · "), ready: true, legacyDefault: true }] : [])];
+  if (appearance.sessionInstances && typeof appearance.sessionInstances === "object") {
+    for (const [id, enabled] of Object.entries(appearance.sessionInstances)) {
+      if (enabled !== true || !id.startsWith("antigravity:") || fallback.some(item => item.id === id)) continue;
+      fallback.push({
+        id,
+        backend: "antigravity",
+        label: id === "antigravity:local" ? "Antigravity" : "Antigravity · WSL",
+        ready: true,
+        legacyDefault: false
+      });
+    }
+  }
+  return fallback;
 }
 export function conversationInstanceId(value) {
   if (value?.instanceId) return value.instanceId;
   const backend = conversationBackend(value);
-  return availableSessionInstances().find(instance => instance.backend === backend
+  const instances = availableSessionInstances();
+  const matched = instances.find(instance => instance.backend === backend
     && (value?.wslDistribution ? instance.distribution === value.wslDistribution
-      && (!value.wslUser || instance.user === value.wslUser) : instance.legacyDefault))?.id
-    || (backend === "codex" ? "codex:local" : "");
+      && (!value.wslUser || instance.user === value.wslUser) : instance.legacyDefault))?.id;
+  if (matched) return matched;
+  if (backend === "codex") return "codex:local";
+  // Antigravity 等无 legacyDefault 的后端，在会话详情尚未加载且缺少显式 instanceId 时，
+  // 优先匹配该后端已启用的实例，避免误判为未启用而阻断模型加载与输入区。
+  return instances.find(instance => instance.backend === backend && sessionInstanceEnabled(instance.id))?.id
+    || instances.find(instance => instance.backend === backend)?.id
+    || "";
 }
 export function activeInstanceId() {
-  const display = thread || (typeof currentThreadDisplay === "function" ? currentThreadDisplay() : null);
+  const current = thread?.id === selectedId ? thread : null;
+  const cached = typeof currentThreadDisplay === "function" ? currentThreadDisplay() : null;
+  const display = current || (cached?.id === selectedId ? cached : null) || sidebarSummaryForId(selectedId);
   return creating ? creationInstanceId : conversationInstanceId(display || { id: selectedId });
 }
 export function sessionInstanceEnabled(id, preferences = appearance) {

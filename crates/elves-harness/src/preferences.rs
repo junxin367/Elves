@@ -40,6 +40,17 @@ pub(super) struct Environment {
     pub(super) claude_home: String,
 }
 
+impl Environment {
+    /// Antigravity 用户级本地配置目录固定位于所属环境的 `~/.gemini`。
+    pub(super) fn antigravity_home(&self) -> String {
+        if self.home.is_empty() {
+            String::new()
+        } else {
+            format!("{}/.gemini", self.home.trim_end_matches(['/', '\\']))
+        }
+    }
+}
+
 type DetectionCache = Option<(PathBuf, Instant, Vec<Environment>)>;
 static ENVIRONMENTS: OnceLock<Mutex<DetectionCache>> = OnceLock::new();
 static INSTRUCTION_WRITE: OnceLock<Mutex<()>> = OnceLock::new();
@@ -425,6 +436,28 @@ pub(super) async fn harness_file_roots(context: &Value) -> Result<Vec<PathBuf>, 
             )
             .await
         }
+        "antigravity" => {
+            let distribution = context["wslDistribution"]
+                .as_str()
+                .filter(|name| valid_distribution_name(name));
+            if let Some(distribution) = distribution {
+                let user = context["wslUser"]
+                    .as_str()
+                    .filter(|user| !user.is_empty())
+                    .ok_or_else(|| ApiError::new(403, "无法确认会话所属的 WSL 用户"))?;
+                if context["instanceId"] != super::instances::id("antigravity", distribution, user)
+                {
+                    return Err(ApiError::new(403, "会话实例身份已变化，请重新打开会话"));
+                }
+                probe_wsl(
+                    distribution.to_owned(),
+                    &json!({"distribution":distribution,"user":user}),
+                )
+                .await
+            } else {
+                native_environment()
+            }
+        }
         _ => return Err(ApiError::new(403, "该会话实例尚不支持引擎文件访问")),
     };
     harness_roots(&environment, backend)
@@ -434,9 +467,14 @@ fn harness_roots(environment: &Environment, backend: &str) -> Result<Vec<PathBuf
     if environment.error.is_some() {
         return Err(ApiError::new(503, "无法读取会话引擎的用户目录"));
     }
-    let home = match backend {
+    let antigravity_home;
+    let home: &str = match backend {
         "codex" => &environment.codex_home,
         "claude" => &environment.claude_home,
+        "antigravity" => {
+            antigravity_home = environment.antigravity_home();
+            &antigravity_home
+        }
         _ => return Err(ApiError::new(403, "会话引擎类型无效")),
     };
     if home.is_empty() || environment.home.is_empty() {
@@ -493,14 +531,14 @@ fn instruction_target(
         .find(|kind| kind.id == instance.backend)
         .ok_or_else(|| ApiError::new(400, "指令会话类型无效"))?;
     let name = kind.instruction_file;
-    let home = match kind.id {
+    let antigravity_home;
+    let home: &str = match kind.id {
         "codex" => &environment.codex_home,
         "claude" => &environment.claude_home,
         "antigravity" => {
-            return Err(ApiError::new(
-                400,
-                "Antigravity 实例严格通过 ACP 协议管理，不直接读写本地指令文件。",
-            ));
+            // 用户确认：读取修改 ~/.gemini/GEMINI.md 属于本地用户配置，不涉及调用谷歌上游能力。
+            antigravity_home = environment.antigravity_home();
+            &antigravity_home
         }
         _ => return Err(ApiError::new(400, "该会话类型尚未支持自定义指令")),
     };

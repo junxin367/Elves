@@ -756,7 +756,10 @@ fn valid_instance_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b":_-".contains(&byte))
-        && matches!(id.split(':').next().unwrap_or(""), "codex" | "claude")
+        && matches!(
+            id.split(':').next().unwrap_or(""),
+            "codex" | "claude" | "antigravity"
+        )
 }
 
 fn parse_schedule(value: &Value, now: u64) -> Result<Schedule, ApiError> {

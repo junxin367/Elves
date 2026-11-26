@@ -16,7 +16,7 @@ import {
   setGoalEditDraft, setGoalEditPending, setGoalEditPollTimer, setGoalEditReceiptRequest,
   setGoalVersion, setNotifiedGoal, stopGoalLiveTimer, updateGoalLiveView, validGoalEditPayload
 } from "./state.js";
-import { isClaude, threadReadOnly } from "../session/capabilities.js";
+import { isAntigravity, isClaude, threadReadOnly } from "../session/capabilities.js";
 import { currentThreadDisplay } from "../session/thread-cache.js";
 
 function scheduleGoalEditReceipt() {
@@ -263,7 +263,7 @@ function renderGoalEditor(goal, pendingRecord) {
   const unlock = button("已在桌面核对", "确认在桌面核对后解除目标操作锁定", async () => {
     const current = goalEditPending;
     if (await confirmAction("解除目标操作锁定",
-      "请先在 Codex 桌面核对目标状态。解除锁定不会再次提交；仅在已确认操作完成或未执行后继续。",
+      "请先在本机客户端核对当前会话目标状态。解除锁定不会再次提交；仅在已确认操作完成或未执行后继续。",
       "已核对，解除锁定", true) && goalEditPending === current) {
       setGoalEditPending(null);
       setGoalEditDraft(null);
@@ -284,8 +284,9 @@ function renderGoalEditor(goal, pendingRecord) {
     title.textContent = controlPending ? "核对目标操作" : "编辑目标";
     const unavailable = !!record && record.deviceId !== session?.device.id;
     if (goalEditDraft?.threadId === thread?.id) goalEditDraft.objective = input.value;
-    const tooLong = isClaude() ? input.value.trim().length > 4000 : bytes > 16 * 1024;
-    count.textContent = isClaude() ? `${input.value.trim().length} / 4,000`
+    const charLimited = isClaude() || isAntigravity();
+    const tooLong = charLimited ? input.value.trim().length > 4000 : bytes > 16 * 1024;
+    count.textContent = charLimited ? `${input.value.trim().length} / 4,000`
       : `${bytes.toLocaleString("zh-CN")} / 16,384 B`;
     count.classList.toggle("error-text", tooLong);
     const baselineChanged = !sameGoalEditBaseline(currentGoal, baseline);

@@ -103,16 +103,26 @@ pub(crate) struct AcpChannels {
 }
 
 impl AcpClient {
-    /// 启动指定本机或 WSL 环境中的 `agy acp` 进程。
+    /// 启动指定本机或 WSL 环境中的 `agy acp` 进程；恢复桌面 App/IDE 历史会话时可传官方 `--app-data-dir` 参数，
+    /// 选择“无限制模式”时传递官方 `--dangerously-skip-permissions` 参数。
     pub(crate) async fn spawn(
         config: &EnvConfig,
         cwd: &str,
         linux_cwd: &str,
+        app_data_dir: Option<&str>,
+        dangerously_skip_permissions: bool,
     ) -> anyhow::Result<(Arc<Self>, AcpChannels)> {
         config.validate()?;
+        let verified_data_dir = app_data_dir.filter(|dir| super::local_store::valid_app_data_dir(dir));
         let mut command = if config.is_local() {
             let mut cmd = Command::new(&config.executable);
             cmd.arg("acp");
+            if dangerously_skip_permissions {
+                cmd.arg("--dangerously-skip-permissions");
+            }
+            if let Some(dir) = verified_data_dir {
+                cmd.args(["--app-data-dir", dir]);
+            }
             if !cwd.is_empty() && Path::new(cwd).is_dir() {
                 cmd.current_dir(cwd);
             }
@@ -133,6 +143,12 @@ impl AcpClient {
             cmd.args(["--exec", "/bin/bash", "-lc", "exec \"$@\"", "--"]);
             cmd.arg(&config.executable);
             cmd.arg("acp");
+            if dangerously_skip_permissions {
+                cmd.arg("--dangerously-skip-permissions");
+            }
+            if let Some(dir) = verified_data_dir {
+                cmd.args(["--app-data-dir", dir]);
+            }
             cmd
         };
         #[cfg(windows)]
@@ -536,6 +552,12 @@ pub(crate) fn map_acp_rpc_error(code: i64, message: &str) -> ApiError {
     }
     if lower.contains("subscription_required") {
         return ApiError::new(403, "当前 Google 账号需要有效的 Antigravity 订阅才能使用。");
+    }
+    if lower.contains("trajectory not found") {
+        return ApiError::new(
+            404,
+            format!("未在当前数据目录找到该 Antigravity 会话轨迹（可能已在原生客户端删除或尚未落盘）：{message}"),
+        );
     }
     if code == -32601 {
         return ApiError::new(

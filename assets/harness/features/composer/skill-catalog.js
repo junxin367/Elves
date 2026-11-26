@@ -92,9 +92,16 @@ export function stopCatalogRefresh() {
   clearTimeout(catalogRefreshTimer); catalogRefreshTimer = null;
 }
 export function validCachedSkill(skill) {
-  return typeof skill?.name === "string" && typeof skill?.path === "string"
-    && (skill.backend !== "claude" || skill.command === skill.name
-      && /^[\p{L}\p{N}_.:-]{1,256}$/u.test(skill.command) && skill.path === `claude-skill:${skill.command}`);
+  if (typeof skill?.name !== "string" || typeof skill?.path !== "string") return false;
+  if (skill.backend === "claude" || skill.backend === "antigravity") {
+    return skill.command === skill.name
+      && /^[\p{L}\p{N}_.:-]{1,256}$/u.test(skill.command)
+      && skill.path === `${skill.backend}-skill:${skill.command}`;
+  }
+  return true;
+}
+function isolatedSkillBackend(scope) {
+  return scope.startsWith("claude:") ? "claude" : scope.startsWith("antigravity:") ? "antigravity" : "";
 }
 export function skillCwdKey(cwd) {
   if (typeof cwd !== "string" || !cwd) return null;
@@ -103,7 +110,7 @@ export function skillCwdKey(cwd) {
 }
 export function skillScopeKey(scope) {
   if (skillScopeAliases.has(scope)) return skillScopeAliases.get(scope);
-  if (scope.startsWith("claude:")) return `context:${scope}`;
+  if (isolatedSkillBackend(scope)) return `context:${scope}`;
   let cwd;
   if (scope.startsWith("thread:")) {
     const id = scope.slice(7);
@@ -115,20 +122,21 @@ export function skillScopeKey(scope) {
   return skillCwdKey(cwd) || `context:${scope}`;
 }
 export function skillCatalogFresh(scope) {
-  const record = skillCatalogs.get(skillScopeKey(scope));
-  if (scope.startsWith("claude:"))
-    return record?.backend === "claude" && record.epoch === globalSkillEpoch && catalogFresh(record);
+  const record = skillCatalogs.get(skillScopeKey(scope)), isolated = isolatedSkillBackend(scope);
+  if (isolated)
+    return record?.backend === isolated && record.epoch === globalSkillEpoch && catalogFresh(record);
   return !globalSkillsInvalidated && (record?.epoch || "") === globalSkillEpoch
     && catalogFresh(record) && catalogFresh({ loadedAt: globalSkillsLoadedAt });
 }
 export function skillCatalogUsable(scope) {
-  if (scope.startsWith("claude:")) {
+  const isolated = isolatedSkillBackend(scope);
+  if (isolated) {
     const record = skillCatalogs.get(skillScopeKey(scope));
-    return record?.backend === "claude" && catalogUsable(record);
+    return record?.backend === isolated && catalogUsable(record);
   }
   return catalogUsable(skillCatalogs.get(skillScopeKey(scope))) && catalogUsable({ loadedAt: globalSkillsLoadedAt });
 }
 export function skillCatalogNeedsRefresh(scope) {
   return !skillCatalogFresh(scope) || catalogNeedsRefresh(skillCatalogs.get(skillScopeKey(scope)))
-    || !scope.startsWith("claude:") && catalogNeedsRefresh({ loadedAt: globalSkillsLoadedAt });
+    || !isolatedSkillBackend(scope) && catalogNeedsRefresh({ loadedAt: globalSkillsLoadedAt });
 }

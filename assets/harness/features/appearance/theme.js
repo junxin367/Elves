@@ -46,7 +46,7 @@ export function defaultAppearance(theme = matchMedia("(prefers-color-scheme: dar
   return { theme, themeMode: "manual", automaticThemeLightLux: automaticThemeLightLuxDefault,
     // 用户要求默认字号为界面 14px、代码及文件阅读 12px；同步核对 fileReadingFontDefault、设置说明和 CSS 回退值，保留已保存字号。
     fontSize: 14, codeFontSize: 12, uiFont: "", codeFont: "", uiFontWeight: 400, codeFontWeight: 400,
-    conversationWidth: conversationWidthDefault, sessionTypes: { codex: true, claude: false }, sessionInstances: null, sessionFilter: "all",
+    conversationWidth: conversationWidthDefault, sessionTypes: { codex: true, claude: false, antigravity: false }, sessionInstances: null, sessionFilter: "all",
     // 首次使用及“恢复默认外观”均选择 Elver；读取时继续保留已保存的主题和自定义配色。
     themePreset: "elver", palettes, colors: palettes.elver,
     fileReadingFontSize: fileReadingFontDefault, projectThreadLimit: 5, backgroundOpacity: 35, backgroundFit: "cover" };

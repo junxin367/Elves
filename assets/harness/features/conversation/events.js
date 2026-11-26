@@ -45,7 +45,7 @@ import { markVisibleThreadRead } from "../messages/user-content.js";
 import { applyQueueSnapshot, reloadQueue } from "../queue/queue.js";
 import { clearSentMessageDisplays, reconcileConfirmedInputOrder, reconcileSentMessageDisplays, retiredSendPayloads } from "../queue/sent-display.js";
 import { queueVersion, setNotifiedQueue, setNotifiedQueueEdits, setQueueVersion } from "../queue/state.js";
-import { backendAvailable, claudeThreadId, privateInputScope } from "../session/capabilities.js";
+import { antigravityThreadId, backendAvailable, claudeThreadId, privateInputScope } from "../session/capabilities.js";
 import { stream, withRecoveryErrorSilence } from "../session/connection-state.js";
 import { refreshConnectedSession, setConnection } from "../session/connection.js";
 import { relatedMenuTimer, relatedSessionView, setRelatedMenuTimer } from "../session/related-state.js";
@@ -498,7 +498,7 @@ export function receive(event) {
             turn.remotePlanRevision = params.remotePlanRevision;
           }
           turnFieldVersions.set(`${turnId}:plan`, version);
-          if (claudeThreadId(selectedId)) {
+          if (claudeThreadId(selectedId) || antigravityThreadId(selectedId)) {
             setSessionPlan(params.plan); turnFieldVersions.set("$session:plan", version);
           }
         }

@@ -258,6 +258,9 @@ export async function selectThread(id, { closeSidebar = true, force = false, rel
   rememberReadingPosition();
   const summary = [...(sidebar?.recent || []), ...(sidebar?.pinnedThreads || []),
     ...(sidebar?.projects || []).flatMap(project => project.threads || [])].find(item => item.id === id);
+  // 首次点击尚未缓存详情的会话（例如新发现的 Antigravity 会话）时，立即用侧栏摘要补齐 instanceId 与 backend，
+  // 避免等待 /api/read/thread 返回前误判实例未启用或延迟加载模型目录。
+  if (summary && !currentThreadDisplay()) rememberThreadDisplay(summary, { persist: false });
   $("#thread-title").textContent = initialSide?.title || relatedSessionView?.name || summary?.title || cached?.title || "正在打开会话";
   $("#thread-path").textContent = threadLocation(initialSide) || threadLocation(summary) || threadLocation(cached) || "正在读取会话设置…";
   if (typeof renderOutcomeMarker === "function") renderOutcomeMarker(initialSide || cached || null);

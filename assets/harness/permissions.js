@@ -18,12 +18,13 @@ const claudeModes = [
   { value: "auto", label: "自动", icon: "claudeAuto", description: "由 Claude 处理权限决策" },
   { value: "bypassPermissions", label: "绕过权限", icon: "claudeBypass", description: "接受所有权限请求" }
 ];
-// Antigravity 严格通过官方 ACP session/set_mode 切换权限模式，仅列出 ACP 协议原生支持的四种模式。
+// 用户要求 Antigravity 权限菜单去除计划模式、增加无限制模式并参考 Claude 绕过权限的菜单效果与警示色；
+// 其中 default / accept-edits / auto 经官方 ACP session/set_mode 切换，bypassPermissions 经官方 `agy acp --dangerously-skip-permissions` 生效。
 const antigravityModes = [
-  { value: "default", label: "询问确认", icon: "claudeManual", description: "执行敏感操作前请求确认" },
-  { value: "accept-edits", label: "自动编辑", icon: "claudeEdits", description: "自动接受文件修改，命令仍需确认" },
-  { value: "auto", label: "自动执行", icon: "claudeAuto", description: "由 Antigravity 自动执行大部分操作" },
-  { value: "plan", label: "计划模式", icon: "claudePlan", description: "只分析与制定计划，不直接修改文件" }
+  { value: "default", label: "询问确认", icon: "claudeManual", description: "按权限设置，在编辑与执行命令前询问" },
+  { value: "accept-edits", label: "自动编辑", icon: "claudeEdits", description: "自动接受工作区文件修改，命令仍需确认" },
+  { value: "auto", label: "自动执行", icon: "claudeAuto", description: "自动批准文件编辑与安全命令，不可逆操作仍询问" },
+  { value: "bypassPermissions", label: "无限制模式", shortLabel: "无限制", icon: "claudeBypass", description: "自动批准所有权限请求，不再询问" }
 ];
 
 export function permissionOptions(backend, supportedModes = null) {
@@ -144,7 +145,7 @@ export function mountInstancePermissions({
           fields.append(element("p", "appearance-hint",
             "当前访问范围包含本界面不支持的配置，请在原生 config.toml 中调整。"));
       } else {
-        const modes = permissionOptions("claude", record.supportedModes).filter(option => option.value !== "configured");
+        const modes = permissionOptions(record.backend, record.supportedModes).filter(option => option.value !== "configured");
         addField("默认权限模式", "permissionMode", [defaults, ...modes], record.draft.permissionMode,
           record.supportedModes?.length === 0);
         if (record.supportedModes?.length === 0)

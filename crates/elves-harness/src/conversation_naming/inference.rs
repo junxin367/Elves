@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
 use super::super::HarnessAuthorization;
+use super::super::antigravity::acp::EnvConfig as AntigravityConfig;
 use super::super::claude::{Claude, WslConfig};
 use super::Settings;
 
@@ -236,6 +237,138 @@ pub(super) async fn claude(
     .unwrap_or_else(|_| Err(anyhow::anyhow!("Claude 会话命名超时")));
     let _ = child.start_kill();
     let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    outcome
+}
+
+pub(super) async fn antigravity(
+    config: &AntigravityConfig,
+    settings: &Settings,
+    input: &Value,
+    authorization: &HarnessAuthorization,
+) -> anyhow::Result<String> {
+    config.validate()?;
+    let prompt = format!(
+        "{}\n\n严格只输出符合以下 JSON Schema 的单个 JSON 对象，严禁调用任何工具或命令，不要输出 Markdown 代码块：\n{}\n\n输入记录：\n{}",
+        settings.system_prompt,
+        schema(),
+        input
+    );
+    let mut command = if config.is_local() {
+        let mut cmd = tokio::process::Command::new(&config.executable);
+        cmd.current_dir(std::env::temp_dir());
+        cmd
+    } else {
+        anyhow::ensure!(cfg!(windows), "WSL Antigravity 实例需要 Windows WSL2");
+        let mut cmd = tokio::process::Command::new("wsl.exe");
+        cmd.args([
+            "--distribution",
+            &config.distribution,
+            "--user",
+            &config.user,
+            "--cd",
+            "~",
+            "--exec",
+            "/bin/bash",
+            "-lc",
+            "exec \"$@\"",
+            "--",
+            &config.executable,
+        ]);
+        cmd
+    };
+    command.args([
+        "-p",
+        &prompt,
+        "--output-format",
+        "json",
+        "--model",
+        &settings.model,
+    ]);
+    #[cfg(windows)]
+    command.creation_flags(crate::windows_create_hidden_process());
+    let permit = authorization.prepare_dispatch().await?;
+    let mut child = permit.commit(|| {
+        Ok(command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()?)
+    })?;
+    let mut temp_conv_id: Option<String> = None;
+    let outcome = tokio::time::timeout(TIMEOUT, async {
+        let output = child.stdout.take().context("Antigravity 命名输出不可用")?;
+        let mut bytes = Vec::new();
+        output.take(MAX_OUTPUT + 1).read_to_end(&mut bytes).await?;
+        anyhow::ensure!(
+            bytes.len() as u64 <= MAX_OUTPUT,
+            "Antigravity 命名输出超过限制"
+        );
+        anyhow::ensure!(
+            child.wait().await?.success(),
+            "Antigravity 命名进程未成功结束"
+        );
+        let raw_text = String::from_utf8_lossy(&bytes);
+        let json_slice = raw_text
+            .find('{')
+            .map(|idx| &raw_text[idx..])
+            .unwrap_or(raw_text.as_ref());
+        let value: Value = serde_json::from_str(json_slice.trim())?;
+        if let Some(cid) = value["conversation_id"]
+            .as_str()
+            .filter(|s| crate::antigravity::local_store::valid_native_id(s))
+        {
+            temp_conv_id = Some(cid.to_owned());
+        }
+        let response_text = value["response"]
+            .as_str()
+            .or_else(|| value["result"].as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .context("Antigravity 命名未返回文本结果")?;
+        let cleaned = response_text
+            .strip_prefix("```json")
+            .or_else(|| response_text.strip_prefix("```"))
+            .and_then(|s| s.strip_suffix("```"))
+            .map(str::trim)
+            .unwrap_or(response_text);
+        Ok(cleaned.to_owned())
+    })
+    .await
+    .unwrap_or_else(|_| Err(anyhow::anyhow!("Antigravity 会话命名超时")));
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    // 清理单次无状态命名调用在 antigravity-cli 下生成的临时会话文件，不污染用户历史列表。
+    if let Some(cid) = temp_conv_id {
+        let gemini_root = if config.is_local() {
+            directories::BaseDirs::new().map(|d| d.home_dir().join(".gemini"))
+        } else if !config.user.is_empty() {
+            let linux_home = if config.user == "root" {
+                "/root/.gemini".to_owned()
+            } else {
+                format!("/home/{}/.gemini", config.user)
+            };
+            crate::preferences::wsl_path(&config.distribution, &linux_home).ok()
+        } else {
+            None
+        };
+        if let Some(root) = gemini_root {
+            let _ = tokio::task::spawn_blocking(move || {
+                let cli_root = root.join("antigravity-cli");
+                for ext in ["db", "pb"] {
+                    let p = cli_root.join("conversations").join(format!("{cid}.{ext}"));
+                    if std::fs::symlink_metadata(&p).is_ok_and(|m| !m.file_type().is_symlink() && m.is_file()) {
+                        let _ = std::fs::remove_file(&p);
+                    }
+                }
+                let brain = cli_root.join("brain").join(&cid);
+                if std::fs::symlink_metadata(&brain).is_ok_and(|m| !m.file_type().is_symlink() && m.is_dir()) {
+                    let _ = std::fs::remove_dir_all(&brain);
+                }
+            })
+            .await;
+        }
+    }
     outcome
 }
 

@@ -262,7 +262,8 @@ async function refreshSkillCatalogRecord(scope, payload, force) {
           || skill.path !== `claude-skill:${skill.command}`)))
       throw new Error("Claude Skill 目录与当前实例不匹配");
     if (antigravity && (result.backend !== "antigravity" || result.instanceId !== payload.instanceId
-        || result.data.some(skill => skill.backend !== "antigravity" || skill.command !== skill.name)))
+        || result.data.some(skill => skill.backend !== "antigravity" || skill.command !== skill.name
+          || skill.path !== `antigravity-skill:${skill.command}`)))
       throw new Error("Antigravity ACP 命令目录与当前实例不匹配");
     const data = result.data;
     const globals = isolated ? [] : data.filter(skill => ["user", "system", "admin"].includes(skill.scope));

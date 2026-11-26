@@ -2,13 +2,13 @@
 
 import { permissionModeKnown } from "../../permissions.js";
 import { session, thread } from "../../core/state.js";
-import { claudeThreadId, privateInputScope } from "../session/capabilities.js";
+import { antigravityThreadId, claudeThreadId, privateInputScope } from "../session/capabilities.js";
 
 // 会话权限按授权及真实会话保存；新建页的选择按实例/项目草稿隔离，不写入全局设置。
 export const draftPermissionChoices = new Map(), permissionSelections = new Map(), permissionWrites = new Map();
 export const instancePermissionCatalogs = new Map(), instancePermissionReads = new Map();
 export function rememberPermissionSelection(id, mode, revision = 0) {
-  const backend = claudeThreadId(id) ? "claude" : "codex";
+  const backend = claudeThreadId(id) ? "claude" : antigravityThreadId(id) ? "antigravity" : "codex";
   if (!id || !permissionModeKnown(backend, mode)) return;
   const scope = privateInputScope(session), previous = permissionSelections.get(id);
   if (previous?.scope === scope && previous.revision > revision) return;
@@ -19,7 +19,7 @@ export function rememberPermissionSelection(id, mode, revision = 0) {
   }
 }
 export function rememberInstancePermissionCatalog(id, value) {
-  if (value.backend !== "claude" || value.instanceId !== id || !Array.isArray(value.supportedModes)) return;
+  if (!["claude", "antigravity"].includes(value.backend) || value.instanceId !== id || !Array.isArray(value.supportedModes)) return;
   instancePermissionCatalogs.set(id, { scope: privateInputScope(session), modes: value.supportedModes,
     defaultMode: typeof value.settings?.permissionMode === "string" ? value.settings.permissionMode : "",
     loadedAt: Date.now() });

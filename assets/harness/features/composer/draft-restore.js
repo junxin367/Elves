@@ -41,7 +41,7 @@ import { setSelectedScheduledAt } from "./scheduled-state.js";
 import { editingMessage, setEditingMessage } from "../messages/message-edit.js";
 import { sentMessageDisplays } from "../queue/sent-display.js";
 import { editingQueuedMessage, queuedEdits, setEditingQueuedMessage, validQueuedMessageEdit } from "../queue/state.js";
-import { isClaude, privateInputScope } from "../session/capabilities.js";
+import { isAntigravity, isClaude, privateInputScope } from "../session/capabilities.js";
 import { setSessionInstanceRequest, setSessionInstances } from "../session/instances.js";
 import { resetRelatedSessions } from "../session/related.js";
 import { clearReadViews } from "../session/thread-cache.js";
@@ -143,7 +143,8 @@ export async function restorePrivateInputs(value, { expected = null, requestGene
     if (Number.isSafeInteger(draft.scheduledAtMs) && draft.scheduledAtMs > 0)
       scheduledAtDrafts.set(id, draft.scheduledAtMs);
     if (id.startsWith("$new:") && typeof draft.permissionMode === "string"
-        && (permissionModeKnown("codex", draft.permissionMode) || permissionModeKnown("claude", draft.permissionMode)))
+        && (permissionModeKnown("codex", draft.permissionMode) || permissionModeKnown("claude", draft.permissionMode)
+          || permissionModeKnown("antigravity", draft.permissionMode)))
       draftPermissionChoices.set(id, draft.permissionMode);
   }
   for (const { id, value: record } of savedFailures)
@@ -211,7 +212,7 @@ export function clearSubmittedDraft(payload, current = true) {
   const choice = submittedDrafts.get(payload)?.modelChoice;
   // 用户要求拒绝原生模型切换后显示原模型；送达后交给原生设置状态展示，不保留已提交的本地覆盖值。
   // 菜单后来做出的新选择有独立版本，迟到回执不能清掉新草稿的模型或等级。
-  if (current && choice && choice.version === modelChoiceVersion && isClaude()) {
+  if (current && choice && choice.version === modelChoiceVersion && (isClaude() || isAntigravity())) {
     if (selectedModel === choice.model) setSelectedModel("");
     if (selectedEffort === choice.effort) setSelectedEffort("");
   }

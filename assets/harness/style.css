@@ -457,12 +457,15 @@ html[data-workspace-side-panel=true] .composer-anchor>.composer-metrics,
 .claude-usage-title-text{min-width:0;flex:0 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 /* 等级通过自动左边距保持在行右侧，不再把紧跟账号的眼睛挤到末尾；320px 弹层和手机字号保持不变。 */
 .claude-usage-subscription{display:inline-block;flex:0 1 auto;min-width:0;max-width:128px;height:20px;margin-left:auto;padding:0 6px;border:1px solid color-mix(in srgb,#ad83e7 45%,transparent);border-radius:6px;background:color-mix(in srgb,#ad83e7 15%,transparent);color:color-mix(in srgb,#ad83e7 65%,var(--text));font-size:11px;font-weight:600;line-height:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.claude-usage-subscription.is-warning{border-color:color-mix(in srgb,var(--danger) 45%,transparent);background:color-mix(in srgb,var(--danger) 14%,transparent);color:var(--danger)}
-.antigravity-usage-note{margin:6px 0 0;color:var(--muted);font-size:11px;line-height:1.45;white-space:normal}
 /* 用户指定眼睛开关紧跟账号文本；使用现有 eye/eyeOff 图标，不增加文字按钮。 */
 .claude-usage-account-toggle{display:inline-grid;place-items:center;flex:0 0 24px;width:24px;height:20px;padding:0;border:0;border-radius:4px;background:transparent;color:var(--muted);cursor:pointer}
 .claude-usage-account-toggle:is(:hover,:active){background:var(--control-hover);color:var(--text)}
 .claude-usage-account-toggle>.ui-icon{width:14px;height:14px}
+/* Antigravity 双模型分组（Gemini / Claude · GPT）紧凑切换条，保持 320px 弹层宽度不变。 */
+.claude-usage-groups{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px;margin-bottom:12px;padding:2px;border-radius:7px;background:color-mix(in srgb,var(--text) 7%,transparent)}
+.claude-usage-group-tab{height:24px;min-width:0;padding:0 8px;border:0;border-radius:5px;background:transparent;color:var(--muted);font-size:11px;font-weight:500;line-height:24px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}
+.claude-usage-group-tab:hover{color:var(--text)}
+.claude-usage-group-tab[aria-selected=true]{background:var(--control-bg,var(--side));color:var(--text);font-weight:600;box-shadow:0 1px 2px #0002}
 .claude-usage-section+.claude-usage-section{margin-top:16px}
 .claude-usage-detail-row{display:flex;align-items:center;justify-content:space-between;gap:12px;white-space:nowrap;font-variant-numeric:tabular-nums}
 .claude-usage-remaining{font-size:11px}
@@ -507,9 +510,9 @@ html[data-workspace-side-panel=true] .composer-anchor>.composer-metrics,
 /* 用户要求会话权限入口不显示右侧下拉箭头；通用 Select 和其他控件继续保留各自箭头。 */
 .permission-button>.ui-icon:last-child{display:none}
 .permission-button .permission-button-label{min-width:0;overflow:hidden;text-overflow:ellipsis}
-/* Codex“完全访问”和 Claude“绕过权限”共用警示色；入口、菜单标题和图标随明暗主题同步。 */
+/* Codex“完全访问”、Claude“绕过权限”与 Antigravity“无限制模式”共用警示色；入口、菜单标题和图标随明暗主题同步。 */
 :root{--permission-elevated-color:light-dark(#9d690a,#e3b35e)}
-.permission-button[data-permission-backend=codex][data-permission-mode=full-access],.permission-button[data-permission-backend=claude][data-permission-mode=bypassPermissions]{color:var(--permission-elevated-color)}
+.permission-button[data-permission-backend=codex][data-permission-mode=full-access],.permission-button[data-permission-backend=claude][data-permission-mode=bypassPermissions],.permission-button[data-permission-backend=antigravity][data-permission-mode=bypassPermissions]{color:var(--permission-elevated-color)}
 .composer-toolbar .permission-button:is(:focus-visible,[aria-expanded=true]){background:var(--composer-hover,var(--hover))}
 @media(hover:hover) and (pointer:fine){.composer-toolbar .permission-button:hover:not(:disabled){background:var(--composer-hover,var(--hover))}}
 .context-info{position:relative;display:flex;align-items:center;justify-content:center;flex:0 0 28px;width:28px;height:28px;min-width:0;padding:0;border:0;border-radius:6px;font-size:calc(var(--font-size)*.78);white-space:nowrap}
@@ -789,9 +792,9 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .composer-permissions-popup .popup-option>.ui-icon{flex:0 0 20px;width:20px;height:20px;margin-top:1px}
 .composer-permissions-popup .popup-option-label small{text-wrap:pretty;font-size:inherit}
 .composer-permissions-popup .popup-option[aria-selected=true]{background:var(--control-hover,var(--hover))}
-.composer-codex-permissions-popup .popup-option[data-value=full-access]>.ui-icon,.composer-codex-permissions-popup .popup-option[data-value=full-access]>.popup-option-label>span,.composer-claude-permissions-popup .popup-option[data-value=bypassPermissions]>.ui-icon,.composer-claude-permissions-popup .popup-option[data-value=bypassPermissions]>.popup-option-label>span{color:var(--permission-elevated-color)}
+.composer-codex-permissions-popup .popup-option[data-value=full-access]>.ui-icon,.composer-codex-permissions-popup .popup-option[data-value=full-access]>.popup-option-label>span,.composer-claude-permissions-popup .popup-option[data-value=bypassPermissions]>.ui-icon,.composer-claude-permissions-popup .popup-option[data-value=bypassPermissions]>.popup-option-label>span,.composer-antigravity-permissions-popup .popup-option[data-value=bypassPermissions]>.ui-icon,.composer-antigravity-permissions-popup .popup-option[data-value=bypassPermissions]>.popup-option-label>span{color:var(--permission-elevated-color)}
 .composer-permissions-popup .popup-note{flex-shrink:0;margin:4px 8px 0;padding:10px 4px 6px;border-top:1px solid var(--menu-divider,var(--line));color:var(--muted);font-size:inherit;line-height:1.5}
-.composer-claude-permissions-popup .popup-note{margin:0 8px 4px;border-top:0;border-bottom:1px solid var(--menu-divider,var(--line))}
+.composer-claude-permissions-popup .popup-note,.composer-antigravity-permissions-popup .popup-note{margin:0 8px 4px;border-top:0;border-bottom:1px solid var(--menu-divider,var(--line))}
 .composer-codex-permissions-popup .popup-help{display:flex;flex-shrink:0;align-items:center;gap:6px;margin-top:0;padding:0 12px 10px;border-top:0;border-bottom:1px solid var(--menu-divider,var(--line));color:var(--muted);font-size:inherit;text-decoration:none}
 .composer-codex-permissions-popup .popup-help>.ui-icon{width:13px;height:13px}
 .composer-add-popup .popup-option:is([data-value=compact],[data-value=goal]){font-size:calc(var(--font-size)*.9)}

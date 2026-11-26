@@ -658,7 +658,16 @@ Claude 新建及恢复会话都必须使用当前 WSL 用户的有效登录时�
 
 Antigravity 实例同时识别 Windows 本机（`agy.exe`、`%LOCALAPPDATA%\agy\bin\agy.exe`）与已安装 `agy` 的 WSL 发行版环境；在「设置 → 会话实例」中按实例独立启用与停用，默认关闭，启用后可参与侧栏发现、筛选与新建会话。
 
-所有 Antigravity 会话交互、模型与思考深度读取、权限模式切换、命令列表、账号等级与会话发现必须严格经官方 CLI 的 ACP（Agent Client Protocol，`agy acp`）协议完成；不得绕过官方 CLI 直接读写内部数据库、配置文件或提取凭据。
+涉及调用官方运行时与上游在线能力的场景（对话执行、流式输出、模型与思考深度能力发现、会话权限切换、审批与提问、会话发现/创建/恢复/停止、官方订阅与额度查询、隔离命名调用）严格经目标实例的官方 `agy` CLI 公开接口（`agy acp` 协议，以及官方无状态查询命令 `agy -p "/usage" --output-format json`、`agy models`）完成，禁止绕过 CLI 提取凭据或直连私有接口；本地非敏感状态与用户配置文件（`~/.gemini/google_accounts.json` 登录展示邮箱记录、`~/.gemini/GEMINI.md`、`~/.gemini/config/mcp_config.json`、`~/.gemini/config/hooks.json`、`~/.gemini/config/skills/`、`~/.gemini/antigravity/skills/` 及 Elves 实例偏好）与本地已落盘对话转录（`~/.gemini/{antigravity,antigravity-cli,antigravity-ide}/brain/<id>/.system_generated/logs/transcript[_full].jsonl`）属于本地数据操作，按本机或所属 WSL 实例直接安全读写。
 
-- **已支持能力**：本机与 WSL 实例自动识别；通过 ACP `session/list` 发现历史会话、`session/new` / `session/load` / `session/resume` / `session/prompt` / `session/cancel` 执行对话；流式正文、思考过程、工具调用（命令/文件变更/通用工具）、计划、审批与交互式提问、图片与文件附件；输入区模型、思考深度（`thought_level`）与四种 ACP 权限模式（`default` / `accept-edits` / `auto` / `plan`）；消息排队（入队、引导、编辑、删除、拖动排序）、持续目标（`/goal` 与暂停/继续/编辑/删除）、历史消息重新编辑（经 ACP 新建会话与官方 `_meta.antigravity.systemPrompt.append` 注入保留历史重放）以及底栏 ACP 订阅等级（`_meta.antigravity.tier`）与 ACP 实测会话 Token 统计弹层。
-- **受 ACP 协议限制的能力**：官方 `agy acp` 未提供 5h/7d 剩余额度百分比、重置倒计时与 Google 账号邮箱，弹层如实展示官方订阅等级、CLI 状态、ACP 会话 Token 及协议限制说明；官方 ACP 未提供 `session/delete`、原生 `session/fork`、工作区文件回退、手动 `/compact`、全局权限/指令文件编辑及独立子代理/侧边会话列表，移除会话仅从 Elves 列表移除并保留原生 CLI 历史。
+- **已支持能力**：
+  - 本机与 WSL 实例自动识别；通过 ACP `session/list` 发现历史会话，`session/new` / `session/load` / `session/resume` / `session/prompt` / `session/cancel` 执行对话；打开已有会话时优先直接读取本地 JSONL 转录文件以实现即时历史加载，缺失时在后台异步经 ACP 同步，不阻塞界面。
+  - 流式正文、思考过程、内置工具与 MCP 工具分流展示（命令、文件变更、内置文件浏览/搜索/通用工具、MCP 集成）、计划、审批与交互式提问、图片与文件附件；输入区模型、思考深度（`thought_level`）与四种权限模式（`default` 询问确认、`accept-edits` 自动编辑、`auto` 自动执行、`bypassPermissions` 无限制模式；移除原 `plan` 计划模式项，其中前三项经官方 ACP `session/set_mode` 切换，无限制模式经官方 `agy acp --dangerously-skip-permissions` 启动并在空闲切入/切出时经 `session/resume` 平滑重连，入口与菜单项复用 Claude「绕过权限」图标与 `--permission-elevated-color` 警示色）。
+  - `/` 斜杠命令与技能目录：合并 ACP `available_commands_update` 命令列表与用户/工作区 Skills 目录，以原生 `/command` 语法填入输入区。
+  - 左下角会话统计与上下文占用环：展示生成速率（`tk/s`）、本轮步数与 Token、累计总 Token、缓存剩余倒计时、悬停明细（首 Token 时间、本轮耗时、缓存命中率、工具耗时）以及模型上下文窗口百分比环。
+  - 右下角 5h/7d 额度监控与消耗预测：经官方 `agy -p "/usage" --output-format json` 读取 `Gemini Models` 与 `Claude and GPT models` 分组的 5 小时/7 天剩余比例与重置时间，底部按当前所选模型所属分组展示 `5h xx% 7d xx%`；320px 弹层展示 `~/.gemini/google_accounts.json` 脱敏邮箱（含眼睛显隐开关）、ACP 订阅等级标签（如 `Google AI Pro`）、分组切换、5h/7d 进度条、基于本地转录日志与公开模型价格估算的已消耗/预估总额度及重置倒计时。
+  - 消息排队（入队、引导、编辑、删除、拖动排序）、持续目标（`/goal` 与暂停/继续/编辑/删除）、历史消息重新编辑（经 ACP 新建会话与官方 `_meta.antigravity.systemPrompt.append` 注入保留历史重放）、定时任务（可选 Antigravity 实例与模型）及跨实例自动会话命名（所有 Codex、Claude、Antigravity 主会话及 Codex 侧边会话共用自动命名配置，且可选 Antigravity 实例作为命名引擎）。
+  - 完整实例设置页：会话实例（默认模型、默认思考深度、按实例隐藏/显示模型）、权限（按实例配置新会话默认权限模式）、自定义指令（读写 `~/.gemini/GEMINI.md`）、扩展 Skills（扫描本地与 WSL 用户目录 Skills）、MCP（读写 `~/.gemini/config/mcp_config.json` 并切换服务启停）与钩子（读写 `~/.gemini/config/hooks.json` 并按具名钩子独立启停）。
+- **受 ACP 协议限制的能力与边界**：
+  - **外部占用互斥保护**：读取与写入 Antigravity 会话前只读核对本地/WSL 对应会话的 `presence/<id>.lock` 文件锁与 `conversations/<id>.db` 句柄占用（Elves 自身持有的活跃 ACP 连接除外）；若检测到 Antigravity App 或 `agy` CLI 正在占用该会话，会话页按与 Codex 一致的规则展示“已在另一个应用中打开”并置为只读（保留历史只读查看与“重试”核对），同时拒绝发送、编辑、权限修改、目标更新、删除及队列自动派发。
+  - 官方 ACP 暂未提供原生 `session/fork`、工作区文件回退、手动 `/compact` 及独立子代理/侧边会话列表；移除会话参考 Claude CLI 方式，从 Elves 会话列表移除并清理 Elves 侧缓存，保留 Antigravity 原生本地历史。

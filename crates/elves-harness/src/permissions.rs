@@ -38,8 +38,14 @@ pub(super) const CLAUDE_MODES: &[&str] = &[
     "dontAsk",
     "auto",
 ];
-// Antigravity 权限模式严格对齐官方 `agy acp` 宣告的可用模式，不虚构未支持项。
-pub(super) const ANTIGRAVITY_MODES: &[&str] = &["default", "accept-edits", "auto", "plan"];
+// 用户要求 Antigravity 权限菜单去除计划模式，增加无限制模式（bypassPermissions，对应官方 `agy acp --dangerously-skip-permissions`）；
+// 其余三项严格对齐官方 `agy acp` 的 `session/set_mode` 可用模式。
+pub(super) const ANTIGRAVITY_MODES: &[&str] = &[
+    "default",
+    "accept-edits",
+    "auto",
+    "bypassPermissions",
+];
 
 pub(super) fn validate_mode<'a>(backend: &str, value: &'a Value) -> Result<&'a str, ApiError> {
     let modes = match backend {
@@ -122,6 +128,8 @@ pub(super) struct ConfigFile {
     pub display: String,
     pub backend: String,
     pub claude_config: Option<super::claude::WslConfig>,
+    pub antigravity_root: Option<PathBuf>,
+    pub antigravity_home_root: Option<PathBuf>,
     pub home: String,
 }
 
@@ -139,14 +147,14 @@ pub(super) fn config_target(
             environment.id == instance.environment_id && environment.error.is_none()
         })
         .ok_or_else(|| ApiError::new(404, "无法确认该实例的配置目录"))?;
-    let (home, name) = match instance.backend.as_str() {
+    let antigravity_home;
+    let (home, name): (&str, &str) = match instance.backend.as_str() {
         "codex" => (&environment.codex_home, "config.toml"),
         "claude" => (&environment.claude_home, "settings.json"),
         "antigravity" => {
-            return Err(ApiError::new(
-                400,
-                "Antigravity 实例严格通过 ACP 协议管理，不直接读写本地配置文件；请在会话输入区切换权限模式。",
-            ));
+            // 用户确认：读取修改 Antigravity 本地用户配置文件不涉及调用谷歌上游能力，允许按本机或 WSL 实例直接管理。
+            antigravity_home = environment.antigravity_home();
+            (&antigravity_home, "config/config.json")
         }
         _ => return Err(ApiError::new(400, "该实例尚不支持权限设置")),
     };
@@ -158,12 +166,23 @@ pub(super) fn config_target(
     if home.is_empty() || !root.is_absolute() {
         return Err(ApiError::new(403, "实例配置目录无效"));
     }
+    let antigravity_home_root = if instance.backend == "antigravity" && !environment.home.is_empty() {
+        if environment.distribution.is_empty() {
+            Some(PathBuf::from(&environment.home))
+        } else {
+            super::preferences::wsl_path(&environment.distribution, &environment.home).ok()
+        }
+    } else {
+        None
+    };
     Ok(ConfigFile {
         instance_id: instance_id.to_owned(),
         path: root.join(name),
         display: format!("{}/{name}", home.trim_end_matches(['/', '\\'])),
         backend: instance.backend.clone(),
         home: environment.home.clone(),
+        antigravity_root: (instance.backend == "antigravity").then_some(root),
+        antigravity_home_root,
         claude_config: (instance.backend == "claude").then(|| super::claude::WslConfig {
             distribution: environment.distribution.clone(),
             user: environment.user.clone(),
@@ -626,6 +645,69 @@ pub(super) async fn settings(
         .authorization(device, write.then_some("setPermissions"));
     let environments = super::preferences::detect(&state.controller.state_dir, false).await;
     let target = config_target(&environments, instance)?;
+    if target.backend == "antigravity" {
+        // Antigravity 默认权限模式按实例保存在 Elves 偏好文件，新会话创建时经官方 ACP session/set_mode 应用，
+        // 不向谷歌原生 settings.json 写入未定义字段。
+        let _serial = CONFIG_WRITE.get_or_init(|| Mutex::new(())).lock().await;
+        let (_current_mode, revision) = super::instance_settings::antigravity_permission_view(
+            &state.controller.state_dir,
+            instance,
+        )?;
+        if write {
+            if payload["expectedRevision"] != revision {
+                return Err(ApiError::new(409, "实例配置已变化，请重新读取后再保存"));
+            }
+            let object = payload["settings"]
+                .as_object()
+                .ok_or_else(|| ApiError::new(400, "权限配置无效"))?;
+            if object.len() != 1 || !object.contains_key("permissionMode") {
+                return Err(ApiError::new(400, "只允许修改 Antigravity 默认权限模式"));
+            }
+            let mode = object["permissionMode"]
+                .as_str()
+                .filter(|mode| mode.is_empty() || ANTIGRAVITY_MODES.contains(mode))
+                .ok_or_else(|| ApiError::new(400, "Antigravity 权限模式无效"))?;
+            super::instance_settings::save_antigravity_permission_mode(
+                &state.controller.state_dir,
+                instance,
+                mode,
+                &revision,
+                &authorization,
+            )
+            .await?;
+            state.controller.shared_settings.instance_settings_changed(
+                &state.controller,
+                instance,
+                &payload["settings"],
+            );
+        }
+        let (mode, revision) = super::instance_settings::antigravity_permission_view(
+            &state.controller.state_dir,
+            instance,
+        )?;
+        authorization
+            .check()
+            .await
+            .map_err(super::authorization_error)?;
+        let (settings_epoch, instance_revision) =
+            state.controller.shared_settings.instance_version();
+        return Ok((
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(json!({
+                "ok": true,
+                "instanceId": instance,
+                "backend": "antigravity",
+                "settingsEpoch": settings_epoch,
+                "instanceRevision": instance_revision,
+                "path": "Elves 实例偏好（默认权限模式）",
+                "revision": revision,
+                "settings": { "permissionMode": mode },
+                "supportedModes": ANTIGRAVITY_MODES,
+                "readOnly": state.settings.read_only
+            })),
+        )
+            .into_response());
+    }
     let supported_modes = match &target.claude_config {
         Some(config) => Some(claude_modes(config).await),
         None => None,

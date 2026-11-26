@@ -162,10 +162,10 @@ export function updateGoalLiveView(root, goal) {
   const tokenBudget = formatGoalTokens(goal?.tokenBudget);
   const values = {
     "tokens-used": tokensUsed,
-    "token-budget": goal?.tokenBudget == null ? goal?.source === "claude" ? null : "无上限" : tokenBudget,
+    "token-budget": goal?.tokenBudget == null ? ["claude", "antigravity"].includes(goal?.source) ? null : "无上限" : tokenBudget,
     "tokens-remaining": tokenBudget != null && tokensUsed != null
       ? formatGoalTokens(Math.max(0, goal.tokenBudget - goal.tokensUsed)) : null,
-    iterations: goal?.source === "claude" && Number.isSafeInteger(goal.iterations) && goal.iterations >= 0
+    iterations: ["claude", "antigravity"].includes(goal?.source) && Number.isSafeInteger(goal.iterations) && goal.iterations >= 0
       ? String(goal.iterations) : null,
     duration
   };

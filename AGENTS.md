@@ -101,8 +101,9 @@
 
 ## Antigravity 实例协议约束（强制）
 
-- Antigravity 实例的所有交互、状态读取、会话管理及扩展能力必须通过官方 CLI 提供的 ACP（Agent Client Protocol）协议处理，不允许绕过官方 CLI 直接操作（包括但不限于直接读写内部数据库/状态文件、直连非 ACP 内部端口、抓取网页或提取复用凭据）。
-- 需要实现的功能如果不受 ACP 协议支持，必须明确告知用户缺失的 ACP 能力、原因及影响范围，不得绕过官方 CLI 或用非 ACP 方式偷偷补齐。
+- Antigravity 实例涉及**调用官方运行时与上游在线能力**的场景（包括对话执行与流式输出、模型与思考深度能力发现、会话权限模式切换、审批与提问交互、会话创建/恢复/中断，以及官方订阅/额度查询与隔离命名调用等），必须通过目标本机或所属 WSL 实例的官方 `agy` CLI 公开接口（`agy acp` 协议，以及官方无状态查询命令 `agy -p "/usage" --output-format json`、`agy models` 等）处理；禁止绕过官方 CLI 提取或复用凭据、直连非官方内部端口、抓取网页或直接请求 Google / Antigravity 私有上游接口。
+- 本地非敏感状态与用户配置文件（如 `~/.gemini/google_accounts.json` 登录展示邮箱记录、`~/.gemini/GEMINI.md`、`~/.gemini/config/mcp_config.json`、`~/.gemini/config/hooks.json`、`~/.gemini/config/skills/`、`~/.gemini/antigravity/skills/` 及 Elves 实例偏好文件）和本地已落盘会话转录读取/清理不涉及调用 Google 上游能力，允许按本机或所属 WSL 实例直接安全读写（绝不读取 `oauth_creds.json` 等凭据文件），读写时须校验路径范围、保留原文件无关内容并防范并发覆盖。
+- 开发中的 Antigravity 实例不做任何特殊旧状态回退兼容逻辑（如已移除模式的自动迁移或历史开发期缺陷补丁）；涉及官方 CLI 或 ACP 暂不支持的能力（如原生会话分支、手动 `/compact`、工作区文件回退等），明确告知用户缺失的能力、原因及影响范围，不得绕过官方 CLI 偷偷补齐。
 
 ## 远程会话发送与显示约束
 

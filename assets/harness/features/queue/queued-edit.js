@@ -29,7 +29,7 @@ import {
   editingQueuedMessage, notifiedQueueEdits, queueMessageText, queueVersion, queuedActionBusy,
   queuedEdits, setEditingQueuedMessage, setNotifiedQueueEdits
 } from "./state.js";
-import { isClaude, queueCapability, threadReadOnly } from "../session/capabilities.js";
+import { isAntigravity, isClaude, queueCapability, threadReadOnly } from "../session/capabilities.js";
 
 export function restoreUnfinishedQueuedMessageEdit() {
   // 用户要求压缩不锁定排队编辑：取回、草稿恢复与再次提交均保持可用，仍保留未知回执及授权保护。
@@ -177,7 +177,7 @@ export async function submitQueuedMessageEdit() {
   if (!prompt && !composerHasAttachments()) { notice("请输入消息或保留至少一张图片", true); return; }
   const images = edit.imageEditing ? composerAttachmentsPayload() : [];
   const files = composerLocalInputsPayload();
-  if (images.some(image => image.staged) && (isClaude() || session.capabilities?.desktopCodexImageInput !== true)) {
+  if (images.some(image => image.staged) && (isClaude() || isAntigravity() || session.capabilities?.desktopCodexImageInput !== true)) {
     notice("原图只能在支持原图发送的本机 Codex 会话使用，修改已保留。", true);
     return;
   }

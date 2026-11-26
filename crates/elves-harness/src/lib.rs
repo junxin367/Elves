@@ -2091,8 +2091,23 @@ impl HarnessController {
                 self.claude
                     .subscription_usage(config, allow_probe, include_local)
                     .await
+            } else if antigravity_thread {
+                self.antigravity
+                    .session_subscription_usage(thread_id.unwrap(), allow_probe, include_local)
+                    .await
+                    .map_err(antigravity::api_error)
+            } else if requested == Some("antigravity") {
+                let config = if let Some(id) = &instance_id {
+                    self.antigravity_instance_config(id).await?
+                } else {
+                    self.antigravity_default_config().await?
+                };
+                self.antigravity
+                    .subscription_usage(config, allow_probe, include_local)
+                    .await
+                    .map_err(antigravity::api_error)
             } else {
-                Err(ApiError::new(400, "额度读取仅支持 Claude 实例").into())
+                Err(ApiError::new(400, "额度读取仅支持 Claude 或 Antigravity 实例").into())
             };
         }
         if action == "antigravityUsage" {
@@ -4506,6 +4521,7 @@ async fn session(
         "claudeSessions":true,"claudeProjectTrust":true,"claudeSubscriptionUsage":true}});
     response["antigravityAllowApprovals"] = json!(policy.allow_approvals);
     response["capabilities"]["antigravitySessions"] = json!(true);
+    // 用户要求 Antigravity 参考 Claude 实例在右下角开放 5h/7d 额度监控与消耗预测，数据经官方 `agy -p "/usage" --output-format json` 获取。
     response["capabilities"]["antigravityUsage"] = json!(true);
     response["capabilities"]["desktopCodexImageInput"] =
         json!(state.desktop && device.key_id == desktop::DEVICE_KEY_ID && native_write_available);

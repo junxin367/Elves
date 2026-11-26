@@ -180,8 +180,8 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     control.onchange = () => {
       if (record !== owner || selected !== ownerId || !control.isConnected) return;
       const settings = { [key]: transform(control.value) };
-      if (key === "model" && record.backend === "codex") {
-        // 切换 Codex 实例默认模型时恢复模型默认思考深度，避免把旧模型的专属等级带给新模型。
+      if (key === "model" && ["codex", "antigravity"].includes(record.backend)) {
+        // 切换 Codex 或 Antigravity 实例默认模型时恢复模型默认思考深度，避免把旧模型的专属等级带给新模型。
         settings.reasoningEffort = null;
       }
       void save(settings);
@@ -196,7 +196,8 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
   }
   function renderGeneral() {
     const backend = record.backend, values = record.settings;
-    const card = section(content, `${backend === "claude" ? "Claude" : "Codex"} 常规设置`, backend);
+    const label = backend === "claude" ? "Claude" : backend === "antigravity" ? "Antigravity" : "Codex";
+    const card = section(content, `${label} 常规设置`, backend);
     if (backend === "codex") {
       for (const [key, label, description] of [
         ["todo", "任务清单（Todo）", "允许 Codex 创建任务清单并更新任务进度。"],
@@ -211,6 +212,21 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
       addSwitch(sides, "persistentSideThreads", "持久侧边会话",
         "默认关闭。开启后新建的侧边会保留历史，可在关闭标签或服务重启后重新打开；已有侧边不转换。",
         values.persistentSideThreads === true, typeof values.persistentSideThreads !== "boolean");
+    } else if (backend === "antigravity") {
+      // 用户要求参考 Codex / Claude 补齐 Antigravity 设置，同时明确区分 ACP 运行时边界与本地配置文件能力。
+      for (const [title, description, value] of [
+        ["执行协议", "会话执行、模型能力发现、审批与权限切换均经官方 agy acp 协议处理。", "ACP"],
+        ["默认权限", "可在「设置 → 权限」按实例配置新会话默认权限模式。", "权限页配置"],
+        ["全局自定义指令", "直接读写所选实例的 ~/.gemini/GEMINI.md。", "自定义指令页"]
+      ]) {
+        const row = element("div", "appearance-field");
+        row.append(fieldCopy(title, description), element("span", "muted", value));
+        card.append(row);
+      }
+      content.append(element("p", "appearance-hint",
+        "默认模型、默认思考深度与显示模型按所选 Antigravity 实例保存在 Elves 偏好中，新会话创建时经 ACP 自动应用。"));
+      if (record.capabilityError)
+        content.append(element("p", "appearance-hint error-text", `无法读取当前 Antigravity 实例模型目录：${record.capabilityError}`));
     } else {
       addSwitch(card, "awaySummaryEnabled", "离开期间回顾",
         "离开后返回时自动回顾会话进展；关闭后保留已有回顾。", values.awaySummaryEnabled);
@@ -239,7 +255,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     const values = record.settings;
     const card = section(content, "实例默认值");
     const models = record.models || [];
-    const hidden = record.backend === "claude" ? values.hiddenModelIds || [] : [];
+    const hidden = ["claude", "antigravity"].includes(record.backend) ? values.hiddenModelIds || [] : [];
     const modelControl = settingSelect("model", "默认模型",
       [inherit,
         ...models.filter(model => !hidden.includes(model.model))
@@ -257,11 +273,11 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
           ({ value: effort.reasoningEffort, label: effortLabels[effort.reasoningEffort] || effort.reasoningEffort }))],
         values.reasoningEffort || "", apiValue, !model || claudeEffortUnsupported);
     effortControl.classList.add("instance-model-default-effort");
-    // 用户要求 Codex、Claude 的默认模型与思考深度合为一行：模型在前、深度在后，保留各自的能力校验及保存行为。
+    // 用户要求 Codex、Claude、Antigravity 的默认模型与思考深度合为一行：模型在前、深度在后，保留各自的能力校验及保存行为。
     const row = element("div", "appearance-field instance-model-defaults-row");
     const selectors = element("div", "instance-model-defaults-selectors");
     selectors.append(modelControl, effortControl);
-    row.append(fieldCopy("默认模型与思考深度", record.backend === "codex"
+    row.append(fieldCopy("默认模型与思考深度", ["codex", "antigravity"].includes(record.backend)
       ? "切换默认模型后，思考深度恢复为“使用模型默认”；可选深度由模型能力决定。"
       : "用于此实例后续新会话；输入区已记住的有效选择优先，已有会话保持原深度。"), selectors);
     card.append(row);
@@ -279,9 +295,9 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     }
   }
   function renderModelVisibility() {
-    if (record.backend !== "claude" || !Array.isArray(record.settings.hiddenModelIds)) return;
+    if (!["claude", "antigravity"].includes(record.backend) || !Array.isArray(record.settings.hiddenModelIds)) return;
     const owner = record, ownerId = selected, hidden = record.settings.hiddenModelIds, models = record.models || [];
-    const card = section(content, "显示模型", "claude");
+    const card = section(content, "显示模型", record.backend);
     const reset = button("全部显示", "显示当前实例的全部模型", () => {
       if (record === owner && selected === ownerId && reset.isConnected && hidden.length)
         void save({ hiddenModelIds: [] });
@@ -292,7 +308,9 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
       "默认显示全部；关闭某项后，仅从此实例的模型选择列表隐藏。新增模型自动显示，已有会话保留当前模型。"), reset);
     card.append(summary);
     if (!models.length) card.append(element("p", "appearance-hint",
-      "尚未取得当前实例的完整模型目录；可以先恢复全部显示，再重新读取。"));
+      record.capabilityError
+        ? `当前实例未能返回模型列表（${record.capabilityError}），请确认登录状态后点击重新读取。`
+        : "尚未取得当前实例的完整模型目录；可以先恢复全部显示，再重新读取。"));
     // 完整原生目录仍保留在设置页，隐藏名单只按当前实例保存，不能变成全局模型白名单或修改 Claude 配置。
     for (const model of models) {
       const label = model.displayName || model.model;
@@ -312,7 +330,8 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
   }
   function renderInventory() {
     const inventory = record.inventory || {};
-    if (name === "hooks") {
+    // Antigravity 的 hooks.json 按具名钩子单独声明 enabled，无全局总开关。
+    if (name === "hooks" && record.backend !== "antigravity") {
       const card = section(content, "钩子设置");
       addSwitch(card, "enabled", "开启钩子", "按所选实例的原生钩子配置执行。", inventory.enabled);
     }
@@ -376,8 +395,10 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
         const control = switchControl(value.name || value.id, enabled);
         const owner = record, ownerId = selected;
         control.onchange = () => {
-          if (record === owner && selected === ownerId && control.isConnected)
-            void save({ [name === "skills" ? "skill" : "server"]: { id: value.id, enabled: control.checked } });
+          if (record === owner && selected === ownerId && control.isConnected) {
+            const actionKey = name === "skills" ? "skill" : name === "hooks" ? "hook" : "server";
+            void save({ [actionKey]: { id: value.id, enabled: control.checked } });
+          }
         };
         controls.add(control); inventoryControls.add(control);
         row.append(control);
@@ -509,7 +530,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
         || !result.settings || Array.isArray(result.settings) || typeof result.settings !== "object")
       throw new Error("实例设置返回结果无法确认，请重新读取。");
     const values = result.settings;
-    if (result.backend === "claude" && values.hiddenModelIds != null
+    if (["claude", "antigravity"].includes(result.backend) && values.hiddenModelIds != null
         && (!Array.isArray(values.hiddenModelIds) || values.hiddenModelIds.length > 512
           || new Set(values.hiddenModelIds).size !== values.hiddenModelIds.length
           || values.hiddenModelIds.some(id => typeof id !== "string" || !id.length || id.length > 200
@@ -542,7 +563,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
       throw new Error("实例额外设置字段无法确认，请重新读取。");
     if (name === "general") {
       const keys = result.backend === "codex" ? ["todo", "memories", "multiAgent", "goals"]
-        : ["awaySummaryEnabled", "promptSuggestionEnabled"];
+        : result.backend === "claude" ? ["awaySummaryEnabled", "promptSuggestionEnabled"] : [];
       if (keys.some(key => !Object.hasOwn(values, key) || values[key] !== null && typeof values[key] !== "boolean"))
         throw new Error("实例常规设置字段不完整，请重新读取。");
       if (result.backend === "codex" && Object.hasOwn(values, "persistentSideThreads")
@@ -642,10 +663,10 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
       record = checkedResult(result, id);
       for (const [key, value] of Object.entries(settings)) {
         const actual = key === "enabled" ? record.inventory?.enabled
-          : ["skill", "server"].includes(key) ? record.inventory?.data?.find(row => row.id === value.id)?.enabled
+          : ["skill", "server", "hook"].includes(key) ? record.inventory?.data?.find(row => row.id === value.id)?.enabled
             : record.settings[key === "effortLevel" ? "reasoningEffort" : key];
         if (key === "hiddenModelIds" ? JSON.stringify(actual) !== JSON.stringify(value)
-          : actual !== (["skill", "server"].includes(key) ? value.enabled : value))
+          : actual !== (["skill", "server", "hook"].includes(key) ? value.enabled : value))
           throw new Error("保存结果与所选设置不一致，请重新读取核对。");
       }
       record = storeInstanceSettings(id, name, record);

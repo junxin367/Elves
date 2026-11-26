@@ -597,24 +597,26 @@ export async function sendMessage() {
     // 默认值读取期间切换项目、授权或已有会话时，本次发送失效；不能将旧项目配置带给新目标。
     if (codexCreationDefaultsKey() !== key || busy || stopping || pending || !connected) return;
   }
-  const claudePreferences = creating && isClaude() ? rememberedNewChatSettings() : null;
-  if (claudePreferences && (claudePreferences.model || claudePreferences.reasoningEffort || claudePreferences.permissionMode)) {
+  const isolatedNewChat = creating && (isClaude() || isAntigravity());
+  const instancePreferences = isolatedNewChat ? rememberedNewChatSettings() : null;
+  if (instancePreferences && (instancePreferences.model || instancePreferences.reasoningEffort || instancePreferences.permissionMode)) {
     const preferenceScope = newChatPreferenceScope(), project = creationProject,
-      version = selectionVersion, connection = nativeConnectionVersion, instanceId = activeInstanceId();
-    const current = () => creating && isClaude() && newChatPreferenceScope() === preferenceScope
+      version = selectionVersion, connection = nativeConnectionVersion, instanceId = activeInstanceId(),
+      targetAntigravity = isAntigravity();
+    const current = () => creating && (targetAntigravity ? isAntigravity() : isClaude()) && newChatPreferenceScope() === preferenceScope
       && creationProject === project && selectionVersion === version && nativeConnectionVersion === connection;
     try {
-      // 用户要求 Claude 新建恢复三项记忆；模型目录及权限能力读取完成后再构造请求，不能把加载中误判为已失效。
+      // 用户要求新建会话恢复三项记忆；模型目录及权限能力读取完成后再构造请求，不能把加载中误判为已失效。
       await Promise.all([
-        claudePreferences.model || claudePreferences.reasoningEffort ? loadModels(false, { includeAvailable: true }) : null,
-        claudePreferences.permissionMode && session.capabilities?.sessionPermissions === true ? loadInstancePermissionCatalog(instanceId) : null
+        instancePreferences.model || instancePreferences.reasoningEffort ? loadModels(false, { includeAvailable: true }) : null,
+        instancePreferences.permissionMode && session.capabilities?.sessionPermissions === true ? loadInstancePermissionCatalog(instanceId) : null
       ]);
     } catch (error) {
-      if (current()) notice(`无法确认 Claude 新会话设置：${error.message}`, true);
+      if (current()) notice(`无法确认 ${targetAntigravity ? "Antigravity" : "Claude"} 新会话设置：${error.message}`, true);
       return;
     }
     if (!current() || busy || stopping || pending || !connected) return;
-    if (claudePreferences.permissionMode && session.capabilities?.sessionPermissions === true) {
+    if (instancePreferences.permissionMode && session.capabilities?.sessionPermissions === true) {
       const catalog = instancePermissionCatalogs.get(instanceId);
       if (catalog?.scope !== privateInputScope(session) || catalog?.error) return;
     }

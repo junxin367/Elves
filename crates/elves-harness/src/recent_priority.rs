@@ -94,7 +94,8 @@ fn clearable(sidebar: &Value) -> HashSet<&str> {
             && item["hasUnreadTurn"] == false
             && item["requestsKnown"] != false
             && attention(item).is_none()
-            && (item["backend"] == "claude" || sidebar["sideThreadsComplete"] != false)
+            && (matches!(item["backend"].as_str(), Some("claude" | "antigravity"))
+                || sidebar["sideThreadsComplete"] != false)
         {
             eligible.insert(id);
         } else {

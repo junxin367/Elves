@@ -188,8 +188,50 @@ export function claudeToolPresentation(item) {
     default: return { icon: "tools", description: readableToolName(item) };
   }
 }
+export function antigravityToolPresentation(item) {
+  const input = item.arguments && typeof item.arguments === "object" ? item.arguments : {};
+  const clip = value => Array.from(String(value ?? "").replace(/\s+/g, " ").trim()).slice(0, 80).join("");
+  const file = value => clip(String(value || "").split(/[\\/]/).filter(Boolean).at(-1) || "");
+  const join = (...parts) => parts.filter(Boolean).join(" · ");
+  const host = value => {
+    try { return new URL(value).host; } catch { return clip(value); }
+  };
+  const tool = String(item.tool || "");
+  switch (tool) {
+    case "read_file": case "view_file": case "view_file_outline": case "view_code_item":
+      return { icon: "eye", description: join("读取文件", file(input.Path || input.AbsolutePath || input.File || input.path)), explore: true };
+    case "grep_search":
+      return { icon: "search", description: join("搜索", input.Query ? `“${clip(input.Query)}”` : "", file(input.SearchPath)), explore: true };
+    case "find_by_name":
+      return { icon: "search", description: join("查找文件", clip(input.Pattern), file(input.SearchDirectory)), explore: true };
+    case "list_dir":
+      return { icon: "folderClosed", description: join("列出目录", file(input.DirectoryPath || input.path)), explore: true };
+    case "read_url_content":
+      return { icon: "globe", description: join("读取网页", input.Url ? host(input.Url) : "") };
+    case "invoke_subagent":
+      return { icon: "tools", description: join("调用子代理", clip(input.Role || input.TypeName)) };
+    case "send_message":
+      return { icon: "chat", description: join("发送子代理消息", clip(input.Recipient)) };
+    case "manage_subagents":
+      return { icon: "tools", description: "管理子代理" };
+    case "manage_task":
+      return { icon: "terminal", description: join("管理后台任务", clip(input.Action)) };
+    case "ask_question":
+      return { icon: "chat", description: join("提问", clip(Array.isArray(input.questions) ? input.questions[0]?.question : "")) };
+    case "update_steps": case "update_focus":
+      return { icon: "queue", description: clip(input.focus) || "更新任务状态" };
+    case "schedule":
+      return { icon: "recent", description: "设置计划唤醒" };
+    default: {
+      const title = typeof input.title === "string" ? clip(input.title) : "";
+      const explore = /^(?:read|view|list|find|grep|search)\b/i.test(tool);
+      return { icon: explore ? "eye" : "tools", description: title || readableToolName(item), explore };
+    }
+  }
+}
 export function genericToolPresentation(item) {
   if (item.source === "claude" && item.type === "dynamicToolCall") return claudeToolPresentation(item);
+  if (item.source === "antigravity" && item.type === "dynamicToolCall") return antigravityToolPresentation(item);
   const surfaces = [
     item.toolSurface,
     item._meta?.["codex/toolSurface"],

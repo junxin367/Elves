@@ -94,11 +94,11 @@ export function workGroupSummary(items, running = false) {
   const commands = items.filter(item => item.type === "commandExecution" && !skillReadInfo(item));
   const changes = items.filter(item => item.type === "fileChange");
   const tools = items.filter(item => ["mcpToolCall", "dynamicToolCall"].includes(item.type));
-  // Claude 内置工具不是集成：按动作汇总为“浏览了文件 / 使用了工具”，Claude 的 MCP 工具仍按服务器名显示集成。
-  const claudeTools = tools.filter(item => item.source === "claude" && item.type === "dynamicToolCall");
-  const integrationTools = tools.filter(item => !claudeTools.includes(item));
-  const explored = claudeTools.some(item => claudeToolPresentation(item).explore);
-  const usedTools = claudeTools.some(item => !claudeToolPresentation(item).explore);
+  // Claude 与 Antigravity 内置工具不是外部集成：按动作汇总为“浏览了文件 / 使用了工具”，MCP 工具仍按服务器名显示集成。
+  const builtinTools = tools.filter(item => ["claude", "antigravity"].includes(item.source) && item.type === "dynamicToolCall");
+  const integrationTools = tools.filter(item => !builtinTools.includes(item));
+  const explored = builtinTools.some(item => genericToolPresentation(item).explore);
+  const usedTools = builtinTools.some(item => !genericToolPresentation(item).explore);
   const searches = items.filter(item => item.type === "webSearch");
   const reasoning = items.filter(item => item.type === "reasoning");
   const paths = new Set(changes.flatMap(item => item.changes || []).map(change => change.path).filter(Boolean));

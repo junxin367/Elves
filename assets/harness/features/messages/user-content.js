@@ -9,7 +9,7 @@ import {
 import {
   followMessages, historyError, historyInitialized, messageVersion, transcriptChecking
 } from "../conversation/history-state.js";
-import { isClaude, threadActionReadOnly } from "../session/capabilities.js";
+import { isAntigravity, isClaude, threadActionReadOnly } from "../session/capabilities.js";
 import { syncSideThreadUnread } from "../session/related-state.js";
 import { sessionMenu } from "../shell-state.js";
 import { threadDeleted, threadDeletionLocked } from "../sidebar/deletion-state.js";
@@ -153,8 +153,8 @@ export function userMessageSkillOptions(item) {
   };
 }
 export function loadMessageSkillChoices(items) {
-  // 历史中的 $标记属于 Codex；Claude 原生 /Skill 文本不能借此读取或污染 Codex 的全局目录。
-  if (isClaude() || !session || !selectedId || !items.some(userMessageHasSkills)) return;
+  // 历史中的 $标记属于 Codex；Claude 与 Antigravity 原生 /Skill 文本不能借此读取或污染 Codex 的全局目录。
+  if (isClaude() || isAntigravity() || !session || !selectedId || !items.some(userMessageHasSkills)) return;
   const scope = `thread:${selectedId}`;
   if (skillScope === scope || messageSkillLoadScope === scope) return;
   setMessageSkillLoadScope(scope);

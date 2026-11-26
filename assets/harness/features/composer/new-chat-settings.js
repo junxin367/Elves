@@ -154,5 +154,9 @@ export function newClaudePermissionMode() {
 export function newAntigravityPermissionMode() {
   if (!creating || !isAntigravity()) return "";
   const remembered = rememberedNewChatSettings().permissionMode;
-  return permissionOptions("antigravity").find(option => option.value === remembered)?.value || "default";
+  const catalog = instancePermissionCatalogs.get(activeInstanceId());
+  const defaultMode = catalog?.scope === privateInputScope(session) && !catalog.error ? catalog.defaultMode : "";
+  return permissionOptions("antigravity").find(option => option.value === remembered)?.value
+    || permissionOptions("antigravity").find(option => option.value === defaultMode)?.value
+    || "default";
 }

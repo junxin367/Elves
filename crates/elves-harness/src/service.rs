@@ -556,6 +556,14 @@ pub async fn prepare_shutdown_status(reason: &str) -> anyhow::Result<Value> {
                 "cleanup":{"complete":false,"pendingStartupCheck":false}
             }));
         }
+        if crate::antigravity::saved_execution_active(&endpoint_dir) {
+            return Ok(json!({
+                "status":"busy",
+                "reason":"antigravity_active",
+                "message":"Antigravity 仍在执行任务，等待任务完成后再安装",
+                "cleanup":{"complete":false,"pendingStartupCheck":false}
+            }));
+        }
         return request_and_wait_for_shutdown(&endpoint, "installer").await;
     }
     if endpoint.protocol_version < 9 {

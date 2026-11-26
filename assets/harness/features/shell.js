@@ -187,12 +187,12 @@ export function shell() {
   permissions.onchange = () => void changeComposerPermissions();
   // 权限菜单沿用 Select 自带的点击开关；这里只读取 Claude 模式，避免同一次点击打开后又被关闭。
   permissions.addEventListener("click", () => {
-    if (isClaude()) void loadInstancePermissionCatalog(activeInstanceId());
+    if (isClaude() || isAntigravity()) void loadInstancePermissionCatalog(activeInstanceId());
   });
   const permissionKeydown = permissions.onkeydown;
   permissions.onkeydown = event => {
     permissionKeydown(event);
-    if (isClaude() && ["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key))
+    if ((isClaude() || isAntigravity()) && ["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key))
       void loadInstancePermissionCatalog(activeInstanceId());
   };
   add.after(permissions);

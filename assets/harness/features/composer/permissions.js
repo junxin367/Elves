@@ -26,7 +26,8 @@ import { currentThreadDisplay } from "../session/thread-cache.js";
 import { threadDeletionLocked } from "../sidebar/deletion-state.js";
 
 export async function loadInstancePermissionCatalog(id) {
-  if (!id || !id.startsWith("claude:")) return;
+  if (!id || !id.startsWith("claude:") && !id.startsWith("antigravity:")) return;
+  const expectedBackend = id.startsWith("antigravity:") ? "antigravity" : "claude";
   const scope = privateInputScope(session);
   const pending = instancePermissionReads.get(id);
   if (pending?.scope === scope) return pending;
@@ -35,7 +36,7 @@ export async function loadInstancePermissionCatalog(id) {
   if (cached?.scope === scope && !cached.error && Date.now() - cached.loadedAt < 60000) return cached;
   const operation = api("/api/settings/permissions", { instanceId: id }).then(result => {
     if (scope !== privateInputScope(session)) return;
-    if (result?.instanceId !== id || result.backend !== "claude"
+    if (result?.instanceId !== id || result.backend !== expectedBackend
         || !Array.isArray(result.supportedModes) || result.supportedModes.some(mode => typeof mode !== "string")
         || !result.settings || typeof result.settings !== "object" || Array.isArray(result.settings))
       throw new Error("实例权限读取结果不匹配，请重新读取。");
@@ -79,8 +80,8 @@ export function updateComposerPermissions() {
   const mode = choice || (creating && !nativeDefaultsEnabled && !antigravity ? "configured" : "");
   const catalogRecord = instancePermissionCatalogs.get(activeInstanceId());
   const catalog = catalogRecord?.scope === privateInputScope(session) ? catalogRecord : null;
-  // 用户要求 Claude 新建沿用当前实例记住的权限；Antigravity 通过 ACP 固定提供四种模式，默认询问确认。
-  const effectiveMode = antigravity ? (choice || (!creating && display?.permissionMode) || "default")
+  // 用户要求 Claude 与 Antigravity 新建均沿用当前实例记住的权限；没有记住选择时继承实例默认权限设置。
+  const effectiveMode = antigravity ? (choice || (!creating && display?.permissionMode) || catalog?.defaultMode || "default")
     : !codex && (!mode || mode === "configured")
     ? (!creating && display?.nativeSettings?.permissionMode) || catalog?.defaultMode || "" : mode;
   control.dataset.permissionBackend = activeBackend();
@@ -95,9 +96,9 @@ export function updateComposerPermissions() {
   control.popupHelpAfterTitle = codex;
   control.popupNotePosition = codex ? "bottom" : "top";
   control.popupNote = codex ? ""
-    : antigravity ? "通过官方 ACP 协议为当前会话切换权限模式"
+    : antigravity ? "通过官方 ACP 协议切换权限；无限制模式采用官方免确认参数"
     : "“绕过权限”仅在该实例 CLI 支持且已允许时显示";
-  if (isClaude() && !catalog && connected && session?.capabilities?.sessionPermissions === true
+  if ((isClaude() || antigravity) && !catalog && connected && session?.capabilities?.sessionPermissions === true
       && sessionInstanceEnabled(activeInstanceId())) void loadInstancePermissionCatalog(activeInstanceId());
   let supported = codex ? nativeDefaultsEnabled ? codexCreationDefaults()?.permissionModes || null : null
     : antigravity ? (!creating && Array.isArray(display?.permissionModes) && display.permissionModes.length ? display.permissionModes : null)

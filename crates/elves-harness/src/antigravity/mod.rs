@@ -1,16 +1,13 @@
-//! Antigravity 会话执行后端：严格通过官方 CLI 的 ACP（Agent Client Protocol）协议管理本机与 WSL 实例。
-//!
-//! 约束说明（见 AGENTS.md）：
-//! - 所有交互、模型/模式读取、会话发现、发送、审批与停止均经 `agy acp` 的标准 ACP JSON-RPC 2.0 协议完成；
-//! - 不绕过 CLI 直接读写 Antigravity 内部数据库、配置文件或提取系统凭据；
-//! - ACP 暂未提供的能力（如 5h/7d 剩余额度百分比、重置时间、Google 邮箱、`session/delete`、原生 `session/fork`）
-//!   均在状态与接口中如实声明，不伪造、不偷走非 ACP 路径。
+//! Antigravity 会话执行后端：调用官方运行时与上游在线能力严格经官方 CLI 的 ACP（Agent Client Protocol）协议处理；
+//! 本地用户配置文件与本地已落盘对话转录按本机或所属 WSL 实例直接只读/安全写入（见 AGENTS.md）。
 
 pub(crate) mod acp;
+pub(crate) mod local_store;
 pub(crate) mod projection;
 pub(crate) mod queue;
+pub(crate) mod usage;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -81,6 +78,10 @@ struct Conversation {
     discovered: bool,
     #[serde(default)]
     history_loaded: bool,
+    #[serde(default)]
+    local_transcript_mtime_ms: u64,
+    #[serde(default)]
+    local_transcript_len: u64,
     #[serde(default)]
     edit_history_head: String,
     #[serde(default)]
@@ -204,11 +205,7 @@ impl Conversation {
             "reasoningEffort": self.effort,
             "permissionMode": self.permission_mode,
             "permissionRevision": self.permission_revision,
-            "permissionModes": if self.available_modes.is_empty() {
-                json!(["default", "accept-edits", "auto", "plan"])
-            } else {
-                json!(self.available_modes)
-            },
+            "permissionModes": json!(exposed_permission_modes(&self.available_modes)),
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
             "recencyAt": self.updated_at,
@@ -243,6 +240,7 @@ struct ActiveRuntime {
     initialize_result: Value,
     supports_image: bool,
     supports_steering: bool,
+    dangerously_skip_permissions: bool,
 }
 
 struct PendingPermission {
@@ -276,6 +274,10 @@ pub(crate) struct Antigravity {
     catalogs: Mutex<HashMap<String, CachedCatalog>>,
     discoveries: Mutex<HashMap<String, Instant>>,
     usage_cache: Mutex<HashMap<String, CachedUsage>>,
+    quota_usage_cache: Mutex<HashMap<String, usage::CachedQuotaUsage>>,
+    local_quota_cache: Mutex<HashMap<String, usage::CachedLocalQuotaMetrics>>,
+    quota_prices: Mutex<usage::QuotaPriceCache>,
+    syncing_discovered: Mutex<HashSet<String>>,
     controller: OnceLock<Weak<HarnessController>>,
     accepting: AtomicBool,
     lifecycle_gate: RwLock<()>,
@@ -334,6 +336,10 @@ impl Antigravity {
             catalogs: Mutex::new(HashMap::new()),
             discoveries: Mutex::new(HashMap::new()),
             usage_cache: Mutex::new(HashMap::new()),
+            quota_usage_cache: Mutex::new(HashMap::new()),
+            local_quota_cache: Mutex::new(HashMap::new()),
+            quota_prices: Mutex::new(usage::QuotaPriceCache::default()),
+            syncing_discovered: Mutex::new(HashSet::new()),
             controller: OnceLock::new(),
             accepting: AtomicBool::new(true),
             lifecycle_gate: RwLock::new(()),
@@ -580,7 +586,7 @@ impl Antigravity {
         } else {
             String::new()
         };
-        let (client, _channels) = AcpClient::spawn(config, &home_cwd, "~").await?;
+        let (client, _channels) = AcpClient::spawn(config, &home_cwd, "~", None, false).await?;
         let res = async {
             let _init = client.initialize().await?;
             // 先直接调用只读 session/list；未登录时会立即返回 -32000，避免触发 authenticate 阻塞等待浏览器 OAuth。
@@ -656,7 +662,7 @@ impl Antigravity {
                         "default".into(),
                         "accept-edits".into(),
                         "auto".into(),
-                        "plan".into(),
+                        "bypassPermissions".into(),
                     ],
                     created_at: updated_at,
                     updated_at,
@@ -665,6 +671,8 @@ impl Antigravity {
                     deleted: false,
                     discovered: true,
                     history_loaded: false,
+                    local_transcript_mtime_ms: 0,
+                    local_transcript_len: 0,
                     edit_history_head: "agy-head-0".into(),
                     token_usage: Value::Null,
                     goal: Value::Null,
@@ -775,38 +783,30 @@ impl Antigravity {
             linux_cwd.clone()
         };
 
-        let (client, mut channels) = AcpClient::spawn(config, &probe_cwd, &linux_cwd).await?;
+        let (client, mut channels) = AcpClient::spawn(config, &probe_cwd, &linux_cwd, None, false).await?;
+        let mut temp_session_id: Option<String> = None;
         let outcome = async {
             let init = client.initialize().await?;
             // 先调用只读 session/list 确认已登录；未登录时会立即返回 -32000，不触发 authenticate 的交互式 OAuth 阻塞。
-            let sessions = client.session_list().await?;
+            let _sessions = client.session_list().await?;
             let auth = client
                 .authenticate("oauth-personal")
                 .await
                 .unwrap_or(Value::Null);
             let mut tier = projection::extract_tier(&auth);
-            // 优先只读复用已有会话执行 session/load 获取模型/模式/等级，避免在用户历史中留下空会话。
-            let setup = if let Some(first) = sessions.first()
-                && let Some(sid) = first["sessionId"].as_str().filter(|s| !s.is_empty())
-            {
-                let scwd = first["cwd"]
-                    .as_str()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(&effective_cwd);
-                client.session_load(sid, scwd).await?
-            } else {
-                let created = client.session_new(&effective_cwd, None).await?;
-                if let Some(sid) = created["sessionId"].as_str() {
-                    let _ = client.session_close(sid).await;
-                }
-                created
-            };
+            // 直接创建轻量临时 ACP 会话获取完整模型/思考深度/模式目录及 available_commands_update，
+            // 绝不对 session/list 中的任意桌面 App 历史会话调用 session/load（跨 app-data-dir 或外部占用会报 404 trajectory not found）。
+            let setup = client.session_new(&effective_cwd, None).await?;
+            temp_session_id = setup["sessionId"]
+                .as_str()
+                .filter(|s| local_store::valid_native_id(s))
+                .map(str::to_owned);
             if tier.is_none() {
                 tier = projection::extract_tier(&setup);
             }
-            // 短暂收集初始化后可能到达的 available_commands_update（最多 400ms）。
+            // 在关闭临时会话前等待并接收 available_commands_update（最多 1200ms，收到即提前结束）。
             let mut commands = Vec::new();
-            let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(1200);
             while let Ok(Some(frame)) =
                 tokio::time::timeout_at(deadline, channels.updates.recv()).await
             {
@@ -815,26 +815,20 @@ impl Antigravity {
                     if update["sessionUpdate"] == "available_commands_update"
                         && let Some(list) = update["availableCommands"].as_array()
                     {
-                        commands = list
-                            .iter()
-                            .filter_map(|cmd| {
-                                let name = cmd["name"].as_str()?.trim();
-                                if name.is_empty() {
-                                    return None;
-                                }
-                                Some(json!({
-                                    "name": name,
-                                    "description": cmd["description"].as_str().unwrap_or("").trim(),
-                                    "argumentHint": cmd["input"]["hint"].as_str().unwrap_or("").trim(),
-                                    "source": "antigravity",
-                                }))
-                            })
-                            .collect();
+                        commands = projection::normalize_available_commands(list);
                         break;
                     }
                 }
             }
-            let models = projection::normalize_models_from_setup(&setup);
+            if let Some(sid) = temp_session_id.as_deref() {
+                let _ = client.session_close(sid).await;
+            }
+            let mut models = projection::normalize_models_from_setup(&setup);
+            if models["data"].as_array().is_none_or(Vec::is_empty)
+                && let Some(fallback) = usage::probe_models_cli(config).await
+            {
+                models = fallback;
+            }
             Ok::<_, anyhow::Error>(CachedCatalog {
                 at: Instant::now(),
                 models,
@@ -845,6 +839,26 @@ impl Antigravity {
         }
         .await;
         client.close().await;
+        // 清理本次目录探测产生的空临时会话轨迹，不在用户历史中留下空白记录。
+        if let Some(sid) = temp_session_id
+            && let Some(gemini_root) = self.resolve_gemini_root(config).await
+        {
+            tokio::task::spawn_blocking(move || {
+                let cli_root = gemini_root.join("antigravity-cli");
+                for ext in ["db", "pb"] {
+                    let p = cli_root.join("conversations").join(format!("{sid}.{ext}"));
+                    if std::fs::symlink_metadata(&p).is_ok_and(|m| !m.file_type().is_symlink() && m.is_file()) {
+                        let _ = std::fs::remove_file(&p);
+                    }
+                }
+                let brain = cli_root.join("brain").join(&sid);
+                if std::fs::symlink_metadata(&brain).is_ok_and(|m| !m.file_type().is_symlink() && m.is_dir()) {
+                    let _ = std::fs::remove_dir_all(&brain);
+                }
+            })
+            .await
+            .ok();
+        }
         let catalog = outcome?;
         self.catalogs
             .lock()
@@ -860,7 +874,12 @@ impl Antigravity {
         force: bool,
     ) -> anyhow::Result<Value> {
         let catalog = self.probe_catalog(&config, cwd, force).await?;
-        Ok(catalog.models)
+        let inst_id = config.instance_id();
+        Ok(super::instance_settings::decorate_antigravity_model_visibility(
+            &self.directory,
+            &inst_id,
+            catalog.models,
+        )?)
     }
 
     pub(crate) async fn session_models(
@@ -880,10 +899,37 @@ impl Antigravity {
         force: bool,
     ) -> anyhow::Result<Value> {
         let catalog = self.probe_catalog(&config, cwd, force).await?;
+        let inst_id = config.instance_id();
+        let gemini_root = self.resolve_gemini_root(&config).await;
+        let workspace_path = (!cwd.is_empty()).then(|| PathBuf::from(cwd));
+        let local_skills = if let Some(root) = gemini_root {
+            let user_home = root.parent().map(Path::to_path_buf);
+            let ws = workspace_path.clone();
+            tokio::task::spawn_blocking(move || {
+                local_store::scan_slash_skills(&root, user_home.as_deref(), ws.as_deref())
+            })
+            .await
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        let mut merged = Vec::new();
+        for item in catalog.commands.into_iter().chain(local_skills) {
+            if let Some(name) = item["name"].as_str() {
+                let key = name.to_ascii_lowercase();
+                if seen.insert(key) {
+                    merged.push(item);
+                }
+            }
+        }
         Ok(json!({
             "ok": true,
             "backend": "antigravity",
-            "data": catalog.commands,
+            "instanceId": inst_id,
+            "cwd": cwd,
+            "globalPaths": [],
+            "data": merged,
             "nativeCapabilities": { "goal": true, "compact": false },
         }))
     }
@@ -920,7 +966,8 @@ impl Antigravity {
                 .values()
                 .filter(|c| !c.deleted && c.config.instance_id() == inst_id)
             {
-                let metrics = projection::compute_session_metrics(&c.turns, &c.token_usage);
+                let metrics =
+                    projection::compute_session_metrics(&c.turns, &c.token_usage, &c.model, now_ms());
                 per_session.insert(c.id.clone(), metrics);
             }
             projection::aggregate_instance_acp_tokens(&per_session)
@@ -1041,8 +1088,14 @@ impl Antigravity {
     }
 
     pub(crate) async fn session_metrics(&self, id: &str) -> anyhow::Result<Value> {
+        self.sync_local_transcript_if_available(id).await;
         let c = self.conversation(id).await?;
-        Ok(projection::compute_session_metrics(&c.turns, &c.token_usage))
+        Ok(projection::compute_session_metrics(
+            &c.turns,
+            &c.token_usage,
+            &c.model,
+            now_ms(),
+        ))
     }
 
     pub(crate) async fn workspace(&self, id: &str) -> anyhow::Result<Value> {
@@ -1112,21 +1165,206 @@ impl Antigravity {
         }))
     }
 
-    /// 首次打开从 `session/list` 发现的外部会话时，经 ACP `session/load` 尝试同步元数据和回放历史。
-    async fn sync_discovered_if_needed(self: &Arc<Self>, id: &str) -> anyhow::Result<()> {
+    /// 定位目标 Antigravity 实例的 `~/.gemini` 本地配置与转录根目录（本机或 WSL UNC）。
+    async fn resolve_gemini_root(&self, config: &EnvConfig) -> Option<PathBuf> {
+        if config.is_local() {
+            return directories::BaseDirs::new().map(|d| d.home_dir().join(".gemini"));
+        }
+        let envs = super::preferences::detect(&self.directory, false).await;
+        if let Some(env) = envs.iter().find(|e| {
+            e.error.is_none()
+                && e.distribution.eq_ignore_ascii_case(&config.distribution)
+                && (config.user.is_empty() || e.user == config.user)
+        }) {
+            let home = env.antigravity_home();
+            if !home.is_empty()
+                && let Ok(path) = super::preferences::wsl_path(&config.distribution, &home)
+            {
+                return Some(path);
+            }
+        }
+        let fallback_home = if config.user == "root" {
+            "/root/.gemini".to_owned()
+        } else if !config.user.is_empty() {
+            format!("/home/{}/.gemini", config.user)
+        } else {
+            return None;
+        };
+        super::preferences::wsl_path(&config.distribution, &fallback_home).ok()
+    }
+
+    /// 优先直接读取本地 Antigravity JSONL 转录文件（毫秒级完成），避免打开历史会话时阻塞在 `agy acp session/load` 冷启动上。
+    async fn sync_local_transcript_if_available(&self, id: &str) {
+        let Ok(c) = self.conversation(id).await else {
+            return;
+        };
+        if c.active() || !local_store::valid_native_id(&c.native_id) {
+            return;
+        }
+        let Some(gemini_root) = self.resolve_gemini_root(&c.config).await else {
+            return;
+        };
+        let native_id = c.native_id.clone();
+        let probe_root = gemini_root.clone();
+        let probe_id = native_id.clone();
+        let found = tokio::task::spawn_blocking(move || {
+            local_store::find_local_transcript_file(&probe_root, &probe_id)
+        })
+        .await
+        .ok()
+        .flatten();
+        let Some((_path, mtime_ms, file_len)) = found else {
+            return;
+        };
+        let needs_read = !c.history_loaded
+            || c.turns.is_empty()
+            || mtime_ms != c.local_transcript_mtime_ms
+            || file_len != c.local_transcript_len;
+        if !needs_read {
+            return;
+        }
+        let parsed = tokio::task::spawn_blocking(move || {
+            local_store::read_local_transcript(&gemini_root, &native_id)
+        })
+        .await
+        .ok()
+        .flatten();
+        let Some(parsed) = parsed else {
+            return;
+        };
+        let mut saved = self.saved.lock().await;
+        if let Some(conv) = saved.conversations.get_mut(id)
+            && !conv.deleted
+            && !conv.active()
+        {
+            if conv.discovered || conv.turns.is_empty() {
+                conv.turns = parsed.turns;
+                conv.edit_history_head = format!("agy-head-{}", conv.turns.len());
+            } else {
+                // Elves 自身创建的会话在轮次完成后同步本地转录记录的多步规划步数与真实输入/缓存/输出明细，
+                // 不改写已确认的用户消息、图片或正式轮次 ID。
+                sync_turn_usage_from_transcript(&mut conv.turns, &parsed.turns);
+            }
+            conv.history_loaded = true;
+            conv.local_transcript_mtime_ms = parsed.mtime_ms;
+            conv.local_transcript_len = parsed.file_len;
+            if conv.model.is_empty() && !parsed.model.is_empty() {
+                conv.model = parsed.model;
+            }
+            if conv.effort.is_empty() && !parsed.effort.is_empty() {
+                conv.effort = parsed.effort;
+            }
+            if !parsed.token_usage.is_null() {
+                conv.token_usage = projection::merge_token_usage(
+                    &conv.token_usage,
+                    &parsed.token_usage,
+                    &conv.model,
+                );
+            }
+            let _ = self.persist_locked(&saved, Some(id)).await;
+        }
+    }
+
+    /// 本地无可用转录时，在后台异步触发一次 ACP `session/load` 补齐历史与元数据，绝不阻塞 `detail`/`history` 响应。
+    async fn spawn_background_acp_sync(self: &Arc<Self>, id: &str) {
+        {
+            let mut syncing = self.syncing_discovered.lock().await;
+            if !syncing.insert(id.to_owned()) {
+                return;
+            }
+        }
+        let service = self.clone();
+        let tid = id.to_owned();
+        tokio::spawn(async move {
+            let changed = service.sync_discovered_if_needed(&tid).await.unwrap_or(false);
+            service.syncing_discovered.lock().await.remove(&tid);
+            if changed {
+                service.publish(json!({
+                    "method": "remote/resync",
+                    "params": { "threadId": tid, "reason": "antigravity_discovered_synced" }
+                }));
+            }
+        });
+    }
+
+    /// 只读检查指定 Antigravity 会话是否正被其他应用（Antigravity App / IDE / 终端 `agy` CLI / 其他 ACP 进程）占用。
+    /// 本服务自己持有的活跃 ACP 连接不算外部占用。
+    async fn is_externally_occupied(&self, c: &Conversation) -> bool {
+        if self
+            .runtimes
+            .lock()
+            .await
+            .get(&c.id)
+            .is_some_and(|rt| rt.client.is_live())
+        {
+            return false;
+        }
+        if !local_store::valid_native_id(&c.native_id) {
+            return false;
+        }
+        if c.config.is_local() {
+            let Some(gemini_root) = self.resolve_gemini_root(&c.config).await else {
+                return false;
+            };
+            let native_id = c.native_id.clone();
+            tokio::task::spawn_blocking(move || {
+                local_store::is_local_session_occupied(&gemini_root, &native_id)
+            })
+            .await
+            .unwrap_or(false)
+        } else {
+            local_store::is_wsl_session_occupied(
+                &c.config.distribution,
+                &c.config.user,
+                &c.native_id,
+            )
+            .await
+        }
+    }
+
+    /// 写操作或启动 ACP 前的强制占用保护：只要检测到外部 Antigravity App / CLI 占用，立即拒绝写入。
+    async fn ensure_not_externally_occupied(&self, c: &Conversation) -> anyhow::Result<()> {
+        if self.is_externally_occupied(c).await {
+            return Err(error(
+                409,
+                "此 Antigravity 会话已在另一个应用（Antigravity App 或 agy CLI）中打开，请先在那边关闭会话后再继续。",
+            ));
+        }
+        Ok(())
+    }
+
+    /// 检测已有原生会话实际归属的 Antigravity 数据目录（`antigravity` / `antigravity-cli` / `antigravity-ide`），
+    /// 供 `agy acp --app-data-dir` 定位轨迹库，避免桌面 App 会话续聊时触发 `trajectory not found`。
+    async fn resolve_session_app_data_dir(&self, c: &Conversation) -> Option<&'static str> {
+        if !local_store::valid_native_id(&c.native_id) {
+            return None;
+        }
+        let gemini_root = self.resolve_gemini_root(&c.config).await?;
+        let native_id = c.native_id.clone();
+        tokio::task::spawn_blocking(move || {
+            local_store::detect_session_app_data_dir(&gemini_root, &native_id)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// 后台同步从 `session/list` 发现且本地尚无转录文件的外部会话：经 ACP `session/load` 补齐元数据和回放历史。
+    async fn sync_discovered_if_needed(self: &Arc<Self>, id: &str) -> anyhow::Result<bool> {
         let c = self.conversation(id).await?;
-        if !c.discovered || c.history_loaded {
-            return Ok(());
+        if !c.discovered || c.history_loaded || self.is_externally_occupied(&c).await {
+            return Ok(false);
         }
         let lock = self.lock(id).await;
         let _guard = lock.lock().await;
         let c = self.conversation(id).await?;
-        if !c.discovered || c.history_loaded {
-            return Ok(());
+        if !c.discovered || c.history_loaded || self.is_externally_occupied(&c).await {
+            return Ok(false);
         }
         let effective_cwd = c.effective_cwd().to_owned();
+        let app_data_dir = self.resolve_session_app_data_dir(&c).await;
         let (client, mut channels) =
-            AcpClient::spawn(&c.config, &c.cwd, &c.linux_cwd).await?;
+            AcpClient::spawn(&c.config, &c.cwd, &c.linux_cwd, app_data_dir, false).await?;
         let mut updates = Vec::new();
         let outcome = async {
             let _init = client.initialize().await?;
@@ -1151,11 +1389,12 @@ impl Antigravity {
                 if let Some(conv) = saved.conversations.get_mut(id) {
                     conv.history_loaded = true;
                 }
-                return Ok(());
+                return Ok(false);
             }
         };
         let replay_turns = projection::collect_replay_turns(&updates, now_ms());
         let models_view = projection::normalize_models_from_setup(&loaded);
+        let mut updated_any = false;
         let mut saved = self.saved.lock().await;
         if let Some(conv) = saved.conversations.get_mut(id) {
             conv.history_loaded = true;
@@ -1163,6 +1402,7 @@ impl Antigravity {
                 && let Some(m) = models_view["defaultModel"].as_str().filter(|s| !s.is_empty())
             {
                 conv.model = m.to_owned();
+                updated_any = true;
             }
             if conv.effort.is_empty()
                 && let Some(e) = models_view["defaultReasoningEffort"]
@@ -1170,6 +1410,7 @@ impl Antigravity {
                     .filter(|s| !s.is_empty())
             {
                 conv.effort = e.to_owned();
+                updated_any = true;
             }
             if let Some(modes) = models_view["permissionModes"].as_array() {
                 conv.available_modes = modes
@@ -1181,10 +1422,11 @@ impl Antigravity {
             if conv.turns.is_empty() && !replay_turns.is_empty() {
                 conv.turns = replay_turns;
                 conv.edit_history_head = format!("agy-head-{}", conv.turns.len());
+                updated_any = true;
             }
             let _ = self.persist_locked(&saved, Some(id)).await;
         }
-        Ok(())
+        Ok(updated_any)
     }
 
     pub(crate) async fn detail_authorized(
@@ -1192,8 +1434,13 @@ impl Antigravity {
         id: &str,
         _authorization: Option<&HarnessAuthorization>,
     ) -> anyhow::Result<Value> {
-        let _ = self.sync_discovered_if_needed(id).await;
+        self.sync_local_transcript_if_available(id).await;
         let c = self.conversation(id).await?;
+        // 用户要求检测 agy CLI / Antigravity App 占用：若被外部占用，参考 Codex/Claude 原位提示“已在另一个应用中打开”并只读保护。
+        let occupied = self.is_externally_occupied(&c).await;
+        if c.discovered && !c.history_loaded && !occupied {
+            self.spawn_background_acp_sync(id).await;
+        }
         let requests = self.requests.lock().await;
         let req_list: Vec<Value> = requests
             .get(id)
@@ -1205,6 +1452,13 @@ impl Antigravity {
         thread["requestsKnown"] = json!(true);
         thread["requestsEpoch"] = json!(self.epoch);
         thread["requestsRevision"] = json!(self.request_revision.load(Ordering::Acquire));
+        thread["externalWriter"] = json!(occupied);
+        if occupied {
+            thread["readOnly"] = json!(true);
+            thread["readOnlyReason"] = json!("请先在那边关闭会话，才能在这里继续。");
+        } else {
+            thread["readOnly"] = json!(false);
+        }
         Ok(json!({
             "ok": true,
             "thread": thread,
@@ -1220,8 +1474,11 @@ impl Antigravity {
         let id = payload["threadId"]
             .as_str()
             .context("缺少 Antigravity 会话 ID")?;
-        let _ = self.sync_discovered_if_needed(id).await;
+        self.sync_local_transcript_if_available(id).await;
         let c = self.conversation(id).await?;
+        if c.discovered && !c.history_loaded && !self.is_externally_occupied(&c).await {
+            self.spawn_background_acp_sync(id).await;
+        }
         let end = match &payload["cursor"] {
             Value::Null => c.turns.len(),
             Value::String(value) => value
@@ -1249,22 +1506,59 @@ impl Antigravity {
         }))
     }
 
-    /// 确保目标会话已有活跃的 `agy acp` 进程，并绑定更新和审批监听任务。
-    async fn ensure_runtime(
+    /// 为自动命名服务提供 Antigravity 会话的当前标题与首条/近期对话文本，不启动 ACP 进程。
+    pub(crate) async fn naming_context(&self, id: &str, initial: bool) -> anyhow::Result<Value> {
+        let c = self.conversation(id).await?;
+        let first = super::conversation_naming::first_user_message(&c.turns);
+        let fallback = first
+            .as_deref()
+            .unwrap_or("")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(36)
+            .collect::<String>();
+        let eligible = c.title.is_empty()
+            || c.title == "Antigravity 会话"
+            || c.title == "新会话"
+            || (!fallback.is_empty() && c.title == fallback);
+        Ok(json!({
+            "title": c.title,
+            "expectedName": c.title,
+            "eligible": eligible,
+            "firstUserMessage": if initial { first } else { None },
+            "messages": if initial {
+                Vec::new()
+            } else {
+                super::conversation_naming::messages(&c.turns[c.turns.len().saturating_sub(8)..])
+            }
+        }))
+    }
+
+    /// 启动新的 `agy acp` 进程并完成初始化与建/恢会话，返回尚未挂载监听泵的通道，
+    /// 供新建会话在写入正式会话 ID 后再绑定 `spawn_runtime_pumps`，避免事件误投到临时 ID。
+    async fn start_runtime(
         self: &Arc<Self>,
         c: &Conversation,
         create_new: bool,
         system_prompt_append: Option<&str>,
-    ) -> anyhow::Result<(Arc<ActiveRuntime>, Value)> {
-        if !create_new
-            && let Some(existing) = self.runtimes.lock().await.get(&c.id).cloned()
-            && existing.client.is_live()
-        {
-            return Ok((existing, Value::Null));
-        }
-
+    ) -> anyhow::Result<(Arc<ActiveRuntime>, Value, AcpChannels)> {
         let effective_cwd = c.effective_cwd().to_owned();
-        let (client, channels) = AcpClient::spawn(&c.config, &c.cwd, &c.linux_cwd).await?;
+        let app_data_dir = if create_new || c.native_id.is_empty() {
+            None
+        } else {
+            self.resolve_session_app_data_dir(c).await
+        };
+        let dangerously_skip_permissions = c.permission_mode.as_deref() == Some("bypassPermissions");
+        let (client, channels) = AcpClient::spawn(
+            &c.config,
+            &c.cwd,
+            &c.linux_cwd,
+            app_data_dir,
+            dangerously_skip_permissions,
+        )
+        .await?;
         let setup_res = async {
             let init = client.initialize().await?;
             let _auth = client.authenticate("oauth-personal").await?;
@@ -1302,7 +1596,39 @@ impl Antigravity {
             initialize_result: init,
             supports_image,
             supports_steering,
+            dangerously_skip_permissions,
         });
+        Ok((runtime, setup, channels))
+    }
+
+    /// 确保目标会话已有活跃的 `agy acp` 进程，并绑定更新和审批监听任务。
+    async fn ensure_runtime(
+        self: &Arc<Self>,
+        c: &Conversation,
+        create_new: bool,
+        system_prompt_append: Option<&str>,
+    ) -> anyhow::Result<(Arc<ActiveRuntime>, Value)> {
+        let want_skip = c.permission_mode.as_deref() == Some("bypassPermissions");
+        if !create_new
+            && let Some(existing) = self.runtimes.lock().await.get(&c.id).cloned()
+            && existing.client.is_live()
+        {
+            if existing.dangerously_skip_permissions == want_skip || c.active() {
+                return Ok((existing, Value::Null));
+            }
+            // 切入或切出“无限制模式”需调整官方 `--dangerously-skip-permissions` 启动参数：
+            // 仅在会话空闲时优雅关闭旧连接并用 session/resume 接回，不中断正在执行的任务。
+            if let Some(old_rt) = self.runtimes.lock().await.remove(&c.id) {
+                let _ = old_rt.client.session_close(&old_rt.native_session_id).await;
+                old_rt.client.close().await;
+            }
+        }
+        if !create_new && !c.native_id.is_empty() {
+            self.ensure_not_externally_occupied(c).await?;
+        }
+        let (runtime, setup, channels) = self
+            .start_runtime(c, create_new, system_prompt_append)
+            .await?;
         self.runtimes
             .lock()
             .await
@@ -1348,6 +1674,7 @@ impl Antigravity {
     async fn handle_session_update(&self, thread_id: &str, update: &Value) {
         let now = now_ms();
         let mut events = Vec::new();
+        let mut commands_to_cache: Option<(String, Vec<Value>)> = None;
         {
             let mut saved = self.saved.lock().await;
             let Some(c) = saved.conversations.get_mut(thread_id).filter(|c| !c.deleted) else {
@@ -1370,25 +1697,38 @@ impl Antigravity {
                 c.title = title.clone();
                 events.push(json!({
                     "method": "thread/name/updated",
-                    "params": { "threadId": thread_id, "title": title }
+                    "params": { "threadId": thread_id, "name": title, "title": title }
                 }));
             }
             if let Some(mode) = effect.mode_updated {
                 c.permission_mode = Some(mode);
             }
+            if let Some(cmds) = effect.available_commands {
+                commands_to_cache = Some((c.config.instance_id(), cmds));
+            }
             if let Some(usage) = effect.token_usage {
-                c.token_usage = usage.clone();
+                let merged = projection::merge_token_usage(&c.token_usage, &usage, &c.model);
+                c.token_usage = merged.clone();
+                // 仅当通知携带真实输入/输出 Token 明细时更新 `_acpUsage`；纯上下文窗口通知（`{used, size}`）不得将轮次 Token 置零。
                 if let Some(last) = usage.get("last") {
-                    c.turns[idx]["_acpUsage"] = json!({
-                        "inputTokens": last["inputTokens"].as_u64().unwrap_or(0),
-                        "outputTokens": last["outputTokens"].as_u64().unwrap_or(0),
-                        "cachedReadTokens": last["cachedInputTokens"].as_u64().unwrap_or(0),
-                        "thoughtTokens": last["reasoningOutputTokens"].as_u64().unwrap_or(0),
-                    });
+                    let in_tok = last["inputTokens"].as_u64().unwrap_or(0);
+                    let out_tok = last["outputTokens"].as_u64().unwrap_or(0);
+                    if in_tok > 0 || out_tok > 0 {
+                        let cached_tok = last["cachedInputTokens"].as_u64().unwrap_or(0);
+                        let thought_tok = last["reasoningOutputTokens"].as_u64().unwrap_or(0);
+                        c.turns[idx]["_acpUsage"] = json!({
+                            "inputTokens": in_tok,
+                            "outputTokens": out_tok,
+                            "cachedReadTokens": cached_tok,
+                            "thoughtTokens": thought_tok,
+                            "lastObservedAtMs": now,
+                            "model": c.model,
+                        });
+                    }
                 }
                 events.push(json!({
                     "method": "thread/tokenUsage/updated",
-                    "params": { "threadId": thread_id, "tokenUsage": usage }
+                    "params": { "threadId": thread_id, "tokenUsage": merged }
                 }));
             }
             for item in effect.changed_items {
@@ -1410,6 +1750,12 @@ impl Antigravity {
                     "params": { "threadId": thread_id, "turnId": turn_id, "plan": plan }
                 }));
             }
+        }
+        if let Some((inst_id, cmds)) = commands_to_cache
+            && !cmds.is_empty()
+            && let Some(cached) = self.catalogs.lock().await.get_mut(&inst_id)
+        {
+            cached.commands = cmds;
         }
         for event in events {
             self.publish(event);
@@ -1515,13 +1861,15 @@ impl Antigravity {
         if let Some(mode) = payload["permissionMode"]
             .as_str()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
+            .filter(|s| matches!(*s, "default" | "accept-edits" | "auto" | "bypassPermissions"))
         {
-            if runtime
-                .client
-                .session_set_mode(&runtime.native_session_id, mode)
-                .await
-                .is_err()
+            // 无限制模式由启动参数 `--dangerously-skip-permissions` 控制，不调用 session/set_mode 发送非原生值。
+            if mode != "bypassPermissions"
+                && runtime
+                    .client
+                    .session_set_mode(&runtime.native_session_id, mode)
+                    .await
+                    .is_err()
             {
                 let _ = runtime
                     .client
@@ -1570,6 +1918,36 @@ impl Antigravity {
             .chars()
             .take(36)
             .collect::<String>();
+        let inst_id = config.instance_id();
+        let mut effective_payload = payload.clone();
+        if effective_payload["permissionMode"]
+            .as_str()
+            .is_none_or(|s| s.trim().is_empty())
+            && let Ok(default_mode) =
+                super::instance_settings::antigravity_default_permission_mode(&self.directory, &inst_id)
+            && !default_mode.is_empty()
+            && default_mode != "default"
+        {
+            effective_payload["permissionMode"] = json!(default_mode);
+        }
+        if let Ok((pref_model, pref_effort)) =
+            super::instance_settings::antigravity_default_model_and_effort(&self.directory, &inst_id)
+        {
+            if effective_payload["model"]
+                .as_str()
+                .is_none_or(|s| s.trim().is_empty())
+                && let Some(model) = pref_model
+            {
+                effective_payload["model"] = json!(model);
+            }
+            if effective_payload["reasoningEffort"]
+                .as_str()
+                .is_none_or(|s| s.trim().is_empty())
+                && let Some(effort) = pref_effort
+            {
+                effective_payload["reasoningEffort"] = json!(effort);
+            }
+        }
         let temp_conv = Conversation {
             backend: antigravity_backend(),
             id: format!("antigravity-pending-{}", uuid::Uuid::new_v4()),
@@ -1585,8 +1963,8 @@ impl Antigravity {
             },
             model: String::new(),
             effort: String::new(),
-            permission_mode: payload["permissionMode"].as_str().map(str::to_owned),
-            permission_revision: u64::from(payload["permissionMode"].is_string()),
+            permission_mode: effective_payload["permissionMode"].as_str().map(str::to_owned),
+            permission_revision: u64::from(effective_payload["permissionMode"].is_string()),
             available_modes: vec![
                 "default".into(),
                 "accept-edits".into(),
@@ -1600,6 +1978,8 @@ impl Antigravity {
             deleted: false,
             discovered: false,
             history_loaded: true,
+            local_transcript_mtime_ms: 0,
+            local_transcript_len: 0,
             edit_history_head: "agy-head-0".into(),
             token_usage: Value::Null,
             goal: Value::Null,
@@ -1608,15 +1988,9 @@ impl Antigravity {
             turns: Vec::new(),
         };
 
-        let (runtime, setup) = self.ensure_runtime(&temp_conv, true, None).await?;
+        let (runtime, setup, channels) = self.start_runtime(&temp_conv, true, None).await?;
         let native_id = runtime.native_session_id.clone();
         let id = format!("antigravity-{native_id}");
-        // 把临时键下的 runtime 迁移到正式会话 ID。
-        {
-            let mut rts = self.runtimes.lock().await;
-            rts.remove(&temp_conv.id);
-            rts.insert(id.clone(), runtime.clone());
-        }
 
         let models_view = projection::normalize_models_from_setup(&setup);
         let mut c = temp_conv;
@@ -1637,16 +2011,22 @@ impl Antigravity {
                 .map(str::to_owned)
                 .collect();
         }
-        Self::apply_acp_options(&runtime, &mut c, payload).await?;
+        if let Err(err) = Self::apply_acp_options(&runtime, &mut c, &effective_payload).await {
+            runtime.client.close().await;
+            return Err(err);
+        }
 
         let mut dispatch_payload = payload.clone();
         if goal_mode {
-            let objective = payload["prompt"]
+            let Some(objective) = payload["prompt"]
                 .as_str()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .ok_or_else(|| error(400, "目标内容不能为空"))?
-                .to_owned();
+                .map(str::to_owned)
+            else {
+                runtime.client.close().await;
+                return Err(error(400, "目标内容不能为空"));
+            };
             c.goal = json!({
                 "objective": objective,
                 "status": "active",
@@ -1661,8 +2041,21 @@ impl Antigravity {
         {
             let mut saved = self.saved.lock().await;
             saved.conversations.insert(id.clone(), c.clone());
-            self.persist_locked(&saved, Some(&id)).await?;
+            if let Err(err) = self.persist_locked(&saved, Some(&id)).await {
+                saved.conversations.remove(&id);
+                drop(saved);
+                runtime.client.close().await;
+                return Err(err);
+            }
         }
+        // 必须在正式会话写入 saved 后，再以正式会话 ID 注册 runtime 并启动监听泵，
+        // 避免 session/update（思考、工具、回复）与 session/request_permission 误投到临时占位 ID 而丢失。
+        self.runtimes
+            .lock()
+            .await
+            .insert(id.clone(), runtime.clone());
+        self.spawn_runtime_pumps(id.clone(), runtime.clone(), channels);
+
         let thread_view = c.view(false, &self.epoch);
         self.publish(json!({
             "method": "thread/started",
@@ -1821,12 +2214,17 @@ impl Antigravity {
             projection::finalize_turn_items(turn, failed, interrupted, now);
 
             let mut usage_ev = None;
-            if let Some(u) = prompt_usage
+            if let Some(mut u) = prompt_usage
                 && let Some(normalized) = projection::normalize_usage_update(&u)
             {
+                u["lastObservedAtMs"] = json!(now);
+                if !c.model.is_empty() {
+                    u["model"] = json!(c.model);
+                }
                 turn["_acpUsage"] = u;
-                c.token_usage = normalized.clone();
-                usage_ev = Some(normalized);
+                let merged = projection::merge_token_usage(&c.token_usage, &normalized, &c.model);
+                c.token_usage = merged.clone();
+                usage_ev = Some(merged);
             }
 
             let assistant_text: String = turn["items"]
@@ -1915,6 +2313,35 @@ impl Antigravity {
                 .get(&id)
                 .is_some_and(|m| !m.is_empty());
             if has_reqs {
+                continue;
+            }
+            if let Ok(candidate_conv) = self.conversation(&id).await
+                && self.is_externally_occupied(&candidate_conv).await
+            {
+                let paused = {
+                    let mut saved = self.saved.lock().await;
+                    if let Some(c) = saved.conversations.get_mut(&id) {
+                        let mut changed = false;
+                        if !c.remote_queue.paused && !c.remote_queue.messages.is_empty() {
+                            c.remote_queue.pause("会话已在另一个应用中打开，队列已暂停");
+                            changed = true;
+                        }
+                        if c.goal["status"] == "active" {
+                            c.goal["status"] = json!("paused");
+                            c.goal["updatedAt"] = json!(now_ms());
+                            changed = true;
+                        }
+                        if changed {
+                            let _ = self.persist_locked(&saved, None).await;
+                        }
+                        changed
+                    } else {
+                        false
+                    }
+                };
+                if paused {
+                    self.queue_changed(&id).await;
+                }
                 continue;
             }
             enum NextDispatch {
@@ -2015,6 +2442,19 @@ impl Antigravity {
         let lock = self.lock(id).await;
         let _guard = lock.lock().await;
         let mut c = self.conversation(id).await?;
+        // 若该会话正被 Antigravity App 或外部 agy CLI 占用，禁止 Harness 发起任何发送/编辑/权限/删除写操作。
+        if matches!(
+            action,
+            "send"
+                | "steerQueued"
+                | "setGoal"
+                | "updateGoal"
+                | "editMessage"
+                | "setPermissions"
+                | "deleteThread"
+        ) {
+            self.ensure_not_externally_occupied(&c).await?;
+        }
 
         match action {
             "send" => {
@@ -2036,6 +2476,13 @@ impl Antigravity {
                     snap["queued"] = json!(true);
                     snap["queuedMessage"] = msg.view(false);
                     return Ok(snap);
+                }
+                if let Some(mode) = payload["permissionMode"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|m| matches!(*m, "default" | "accept-edits" | "auto" | "bypassPermissions"))
+                {
+                    c.permission_mode = Some(mode.to_owned());
                 }
                 let (runtime, _) = self.ensure_runtime(&c, false, None).await?;
                 Self::apply_acp_options(&runtime, &mut c, payload).await?;
@@ -2066,6 +2513,13 @@ impl Antigravity {
                     msg
                 };
                 self.queue_changed(id).await;
+                if let Some(mode) = payload["permissionMode"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|m| matches!(*m, "default" | "accept-edits" | "auto" | "bypassPermissions"))
+                {
+                    c.permission_mode = Some(mode.to_owned());
+                }
                 let (runtime, _) = self.ensure_runtime(&c, false, None).await?;
                 if c.active() && runtime.supports_steering {
                     // agy acp 1.5.0+ 原生支持运行中再次发送 session/prompt 作为引导，无需强行中断子任务。
@@ -2202,6 +2656,13 @@ impl Antigravity {
                     "iterations": 1,
                     "source": "antigravity",
                 });
+                if let Some(mode) = payload["permissionMode"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|m| matches!(*m, "default" | "accept-edits" | "auto" | "bypassPermissions"))
+                {
+                    c.permission_mode = Some(mode.to_owned());
+                }
                 let (runtime, _) = self.ensure_runtime(&c, false, None).await?;
                 Self::apply_acp_options(&runtime, &mut c, payload).await?;
                 {
@@ -2333,25 +2794,40 @@ impl Antigravity {
                 Ok(sent)
             }
             "setPermissions" => {
+                // 用户要求 Antigravity 去除计划模式，增加无限制模式（bypassPermissions）；
+                // 切入/切出无限制模式时，若当前会话空闲则关闭旧 ACP 连接，使下一轮按新启动参数接回。
                 let mode = payload["permissionMode"]
                     .as_str()
-                    .filter(|m| matches!(*m, "default" | "accept-edits" | "auto" | "plan"))
+                    .filter(|m| matches!(*m, "default" | "accept-edits" | "auto" | "bypassPermissions"))
                     .ok_or_else(|| error(400, "Antigravity 权限模式无效"))?;
+                let want_skip = mode == "bypassPermissions";
+                let mut applied_live = false;
                 if let Some(rt) = self.runtimes.lock().await.get(id).cloned()
                     && rt.client.is_live()
                 {
-                    if rt
-                        .client
-                        .session_set_mode(&rt.native_session_id, mode)
-                        .await
-                        .is_err()
-                    {
-                        let _ = rt
-                            .client
-                            .session_set_config_option(&rt.native_session_id, "mode", mode)
-                            .await;
+                    if rt.dangerously_skip_permissions == want_skip {
+                        if want_skip
+                            || rt
+                                .client
+                                .session_set_mode(&rt.native_session_id, mode)
+                                .await
+                                .is_ok()
+                            || rt
+                                .client
+                                .session_set_config_option(&rt.native_session_id, "mode", mode)
+                                .await
+                                .is_ok()
+                        {
+                            applied_live = true;
+                        }
+                    } else if !c.active() {
+                        if let Some(old_rt) = self.runtimes.lock().await.remove(id) {
+                            let _ = old_rt.client.session_close(&old_rt.native_session_id).await;
+                            old_rt.client.close().await;
+                        }
                     }
                 }
+                let instance_id = c.config.instance_id();
                 let rev = {
                     let mut saved = self.saved.lock().await;
                     let conv = saved
@@ -2364,15 +2840,25 @@ impl Antigravity {
                     self.persist_locked(&saved, None).await?;
                     rev
                 };
+                // 必须同时返回并广播 instanceId 与 appliesTo，以通过前端 changeComposerPermissions 回执核对。
+                let applies_to = if applied_live { "immediate" } else { "nextTurn" };
                 self.publish(json!({
                     "method": "thread/settings/updated",
-                    "params": { "threadId": id, "permissionMode": mode, "permissionRevision": rev }
+                    "params": {
+                        "threadId": id,
+                        "instanceId": instance_id,
+                        "permissionMode": mode,
+                        "permissionRevision": rev,
+                        "appliesTo": applies_to,
+                    }
                 }));
                 Ok(json!({
                     "ok": true,
                     "threadId": id,
+                    "instanceId": instance_id,
                     "permissionMode": mode,
                     "permissionRevision": rev,
+                    "appliesTo": applies_to,
                 }))
             }
             "stop" => {
@@ -2433,7 +2919,7 @@ impl Antigravity {
                 if c.active() {
                     return Err(error(409, "请先停止 Antigravity 当前任务后再移除会话"));
                 }
-                // ACP 不提供 session/delete，仅关闭活跃连接并从 Elves 侧栏移除，原生历史保留。
+                // 参考 Claude CLI 处理：关闭活跃连接并从 Elves 列表及缓存中移除，原生本地会话历史安全保留。
                 if let Some(rt) = self.runtimes.lock().await.remove(id) {
                     let _ = rt.client.session_close(&rt.native_session_id).await;
                     rt.client.close().await;
@@ -2456,6 +2942,7 @@ impl Antigravity {
         id: &str,
         payload: &Value,
     ) -> anyhow::Result<Value> {
+        let mut renamed_title: Option<String> = None;
         {
             let mut saved = self.saved.lock().await;
             let c = saved
@@ -2467,11 +2954,17 @@ impl Antigravity {
                 "markRead" => c.unread = false,
                 "pinThread" => c.pinned = payload["pinned"] == true,
                 "rename" => {
+                    if let Some(expected) = payload["expectedName"].as_str()
+                        && c.title != expected
+                    {
+                        return Err(error(409, "会话名称已变化，已丢弃自动命名结果"));
+                    }
                     let title = payload["title"].as_str().unwrap_or("").trim();
                     if title.is_empty() || title.chars().count() > 200 {
                         return Err(error(400, "标题需为 1–200 个字符"));
                     }
                     c.title = title.to_owned();
+                    renamed_title = Some(c.title.clone());
                 }
                 "deleteThread" => {
                     c.deleted = true;
@@ -2485,6 +2978,12 @@ impl Antigravity {
             let _ = std::fs::remove_file(self.directory.join(TURNS_DIR).join(format!("{id}.json")));
             self.publish(json!({ "method": "thread/deleted", "params": { "threadId": id } }));
         } else {
+            if let Some(title) = renamed_title {
+                self.publish(json!({
+                    "method": "thread/name/updated",
+                    "params": { "threadId": id, "name": title, "title": title }
+                }));
+            }
             self.publish(json!({
                 "method": "remote/sidebarChanged",
                 "params": { "threadId": id, "reason": if action == "markRead" { "read" } else { "metadata" } }
@@ -2519,6 +3018,54 @@ fn normalize_path_key(path: &str) -> String {
     } else {
         trimmed.to_owned()
     }
+}
+
+/// 统一投影 Antigravity 会话可用权限模式：去除计划模式，保留原生三档并固定附带无限制模式（bypassPermissions），
+/// 确保历史已存档的旧会话也能立即显示新菜单项。
+fn exposed_permission_modes(raw: &[String]) -> Vec<String> {
+    let mut modes: Vec<String> = raw
+        .iter()
+        .filter(|m| matches!(m.as_str(), "default" | "accept-edits" | "auto"))
+        .cloned()
+        .collect();
+    if modes.is_empty() {
+        modes = vec!["default".into(), "accept-edits".into(), "auto".into()];
+    }
+    if !modes.iter().any(|m| m == "bypassPermissions") {
+        modes.push("bypassPermissions".into());
+    }
+    modes
+}
+
+/// 将本地转录中记录的多步规划步数与真实输入/缓存/输出明细同步到已完成轮次，不修改用户消息或轮次 ID。
+fn sync_turn_usage_from_transcript(saved_turns: &mut [Value], parsed_turns: &[Value]) {
+    if saved_turns.len() == parsed_turns.len() {
+        for (saved, parsed) in saved_turns.iter_mut().zip(parsed_turns.iter()) {
+            if !parsed["_acpUsage"].is_null() {
+                saved["_acpUsage"] = parsed["_acpUsage"].clone();
+            }
+        }
+    } else if let (Some(saved_last), Some(parsed_last)) = (saved_turns.last_mut(), parsed_turns.last())
+        && !parsed_last["_acpUsage"].is_null()
+    {
+        saved_last["_acpUsage"] = parsed_last["_acpUsage"].clone();
+    }
+}
+
+/// 安装升级检查辅助：判断存档中是否存在正在执行的 Antigravity 会话。
+pub(crate) fn saved_execution_active(directory: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(directory.join(SESSIONS_FILE)) else {
+        return false;
+    };
+    let Ok(saved) = serde_json::from_slice::<Value>(&bytes) else {
+        return true;
+    };
+    saved["conversations"]
+        .as_object()
+        .into_iter()
+        .flat_map(|map| map.values())
+        .filter(|conv| conv["deleted"] != true)
+        .any(|conv| conv["activeTurnId"].as_str().is_some_and(|s| !s.is_empty()))
 }
 
 #[cfg(test)]
@@ -2600,6 +3147,10 @@ mod tests {
         assert_eq!(normalized["backend"], "antigravity");
         assert_eq!(normalized["defaultModel"], "gemini-4-neon");
         assert_eq!(normalized["defaultReasoningEffort"], "high");
+        assert_eq!(
+            normalized["permissionModes"],
+            json!(["default", "accept-edits", "auto", "bypassPermissions"])
+        );
         let rows = normalized["data"].as_array().unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(
@@ -2819,12 +3370,325 @@ mod tests {
                 let mut merged = sidebar_stub;
                 ag.merge_sidebar_instances(&mut merged, Some(&[inst.id.clone()]))
                     .await;
-                eprintln!(
-                    "Discovered recent count for {}: {}",
-                    inst.id,
-                    merged["recent"].as_array().map_or(0, Vec::len)
+                let recents = merged["recent"].as_array().cloned().unwrap_or_default();
+                eprintln!("Discovered recent count for {}: {}", inst.id, recents.len());
+                for row in &recents {
+                    if let Some(tid) = row["id"].as_str() {
+                        let started = Instant::now();
+                        let detail = ag.detail_authorized(tid, None).await.unwrap();
+                        let history = ag
+                            .history_authorized(&json!({"threadId": tid}), None)
+                            .await
+                            .unwrap();
+                        let elapsed_ms = started.elapsed().as_millis();
+                        let turn_count = history["data"].as_array().map_or(0, Vec::len);
+                        eprintln!(
+                            "Session {tid}: externalWriter={}, readOnly={}, turns={}, elapsed={}ms",
+                            detail["thread"]["externalWriter"],
+                            detail["thread"]["readOnly"],
+                            turn_count,
+                            elapsed_ms
+                        );
+                        assert_eq!(detail["ok"], true);
+                        assert_eq!(detail["thread"]["instanceId"], inst.id);
+                        assert!(elapsed_ms < 2500, "打开已发现会话不得被 ACP 冷启动阻塞: {elapsed_ms}ms");
+                        if turn_count > 0 {
+                            let sm = ag.session_metrics(tid).await.unwrap();
+                            eprintln!("Session metrics for {tid}: {sm}");
+                            assert_eq!(sm["source"], "antigravity-acp");
+                            assert!(sm["turnId"].as_str().is_some_and(|s| !s.is_empty()));
+                        }
+                    }
+                }
+
+                let skills = ag.skills_in(cfg.clone(), "", false).await.unwrap();
+                let skill_rows = skills["data"].as_array().unwrap();
+                eprintln!("Skills for {}: count={}", inst.id, skill_rows.len());
+                assert_eq!(skills["instanceId"], inst.id);
+                assert!(skills["globalPaths"].is_array());
+                assert!(!skill_rows.is_empty(), "已登录实例应返回可用斜杠命令或 Skills");
+                assert!(skill_rows.iter().all(|s| {
+                    s["backend"] == "antigravity"
+                        && s["command"] == s["name"]
+                        && s["path"] == format!("antigravity-skill:{}", s["command"].as_str().unwrap_or(""))
+                }));
+
+                let quota = ag.subscription_usage(cfg.clone(), true, true).await.unwrap();
+                eprintln!("Quota for {}: {}", inst.id, serde_json::to_string(&quota).unwrap());
+                assert_eq!(quota["ok"], true);
+                assert_eq!(quota["backend"], "antigravity");
+                assert_eq!(quota["usage"]["source"], "antigravity-native-usage");
+                assert!(
+                    quota["usage"]["groups"].as_array().is_some_and(|g| !g.is_empty()),
+                    "官方 /usage 应返回模型额度分组"
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn set_permissions_response_includes_instance_id_and_applies_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let ag = Antigravity::new(dir.path()).unwrap();
+        let id = "antigravity-perm-test-1";
+        let cfg = EnvConfig {
+            distribution: String::new(),
+            user: String::new(),
+            executable: r"C:\agy\bin\agy.exe".into(),
+        };
+        {
+            let mut saved = ag.saved.lock().await;
+            saved.conversations.insert(
+                id.into(),
+                Conversation {
+                    backend: antigravity_backend(),
+                    id: id.into(),
+                    native_id: "perm-test-1".into(),
+                    project_id: Value::Null,
+                    cwd: r"C:\work".into(),
+                    linux_cwd: String::new(),
+                    config: cfg.clone(),
+                    title: "Perm Test".into(),
+                    model: String::new(),
+                    effort: String::new(),
+                    permission_mode: Some("default".into()),
+                    permission_revision: 0,
+                    available_modes: vec![
+                        "default".into(),
+                        "accept-edits".into(),
+                        "auto".into(),
+                        "bypassPermissions".into(),
+                    ],
+                    created_at: 1,
+                    updated_at: 1,
+                    pinned: false,
+                    unread: false,
+                    deleted: false,
+                    discovered: false,
+                    history_loaded: true,
+                    local_transcript_mtime_ms: 0,
+                    local_transcript_len: 0,
+                    edit_history_head: "agy-head-0".into(),
+                    token_usage: Value::Null,
+                    goal: Value::Null,
+                    remote_queue: AntigravityQueue::default(),
+                    active_turn_id: None,
+                    turns: Vec::new(),
+                },
+            );
+        }
+        let detail = ag.detail_authorized(id, None).await.unwrap();
+        assert_eq!(detail["thread"]["instanceId"], "antigravity:local");
+        assert_eq!(detail["thread"]["permissionMode"], "default");
+        assert_eq!(
+            detail["thread"]["permissionModes"],
+            json!(["default", "accept-edits", "auto", "bypassPermissions"])
+        );
+        assert_eq!(cfg.instance_id(), "antigravity:local");
+    }
+
+    #[test]
+    fn syncs_multi_step_turn_usage_and_computes_complete_session_metrics() {
+        let mut saved_turns = vec![json!({
+            "id": "agy-turn-1",
+            "status": "completed",
+            "turnStartedAtMs": 1_000,
+            "firstTokenAtMs": 1_400,
+            "turnCompletedAtMs": 3_400,
+            "items": [{
+                "id": "agy-turn-1-user",
+                "type": "userMessage",
+                "content": [{ "type": "text", "text": "排查问题" }]
+            }, {
+                "id": "agy-turn-1-msg",
+                "type": "agentMessage",
+                "text": "已完成"
+            }]
+        })];
+        let parsed = local_store::parse_transcript_jsonl(
+            &[
+                r#"{"type":"USER_INPUT","step_index":0,"created_at":"2026-11-26T12:00:01Z","content":"<USER_REQUEST>排查问题</USER_REQUEST>"}"#,
+                r#"{"type":"PLANNER_RESPONSE","step_index":1,"created_at":"2026-11-26T12:00:02Z","model":"gemini-4-neon-xhigh","input_tokens":1000,"cache_read_tokens":9000,"output_tokens":200,"thinking":"step1","tool_calls":[{"name":"read_file","args":{"Path":"a.rs"}}]}"#,
+                r#"{"type":"PLANNER_RESPONSE","step_index":2,"created_at":"2026-11-26T12:00:04Z","model":"gemini-4-neon-xhigh","input_tokens":1200,"cache_read_tokens":9500,"output_tokens":300,"content":"已完成"}"#,
+            ]
+            .join("\n"),
+        );
+        assert_eq!(parsed.token_usage["modelContextWindow"], 1_048_576);
+        sync_turn_usage_from_transcript(&mut saved_turns, &parsed.turns);
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-26T12:01:04Z")
+            .unwrap()
+            .timestamp_millis() as u64;
+        let metrics = projection::compute_session_metrics(
+            &saved_turns,
+            &parsed.token_usage,
+            "gemini-4-neon",
+            now,
+        );
+        assert_eq!(metrics["source"], "antigravity-acp");
+        assert_eq!(metrics["turnId"], "agy-turn-1");
+        assert_eq!(metrics["steps"], 2);
+        assert_eq!(metrics["turnTokens"], 21_200);
+        assert_eq!(metrics["totalTokens"], 21_200);
+        assert_eq!(metrics["firstTokenMs"], 400);
+        assert_eq!(metrics["durationMs"], 2_400);
+        assert!((metrics["tokensPerSecond"].as_f64().unwrap() - 250.0).abs() < 1e-6);
+        assert!(metrics["cacheHitRate"].as_f64().unwrap() <= 1.0);
+        assert_eq!(metrics["cacheExpirySource"], "model-default");
+        assert!(metrics["cacheRemainingMs"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn naming_context_and_rename_expected_name_support_antigravity() {
+        let dir = tempfile::tempdir().unwrap();
+        let ag = Antigravity::new(dir.path()).unwrap();
+        let id = "antigravity-naming-1";
+        let cfg = EnvConfig {
+            distribution: String::new(),
+            user: String::new(),
+            executable: r"C:\agy\bin\agy.exe".into(),
+        };
+        {
+            let mut saved = ag.saved.lock().await;
+            saved.conversations.insert(
+                id.into(),
+                Conversation {
+                    backend: antigravity_backend(),
+                    id: id.into(),
+                    native_id: "naming-1".into(),
+                    project_id: Value::Null,
+                    cwd: r"C:\work".into(),
+                    linux_cwd: String::new(),
+                    config: cfg,
+                    title: "检查自动命名为什么失败".into(),
+                    model: String::new(),
+                    effort: String::new(),
+                    permission_mode: Some("default".into()),
+                    permission_revision: 0,
+                    available_modes: vec!["default".into()],
+                    created_at: 1,
+                    updated_at: 1,
+                    pinned: false,
+                    unread: false,
+                    deleted: false,
+                    discovered: false,
+                    history_loaded: true,
+                    local_transcript_mtime_ms: 0,
+                    local_transcript_len: 0,
+                    edit_history_head: "agy-head-1".into(),
+                    token_usage: Value::Null,
+                    goal: Value::Null,
+                    remote_queue: AntigravityQueue::default(),
+                    active_turn_id: None,
+                    turns: vec![json!({
+                        "id": "t1",
+                        "status": "completed",
+                        "items": [
+                            { "id": "u1", "type": "userMessage", "content": [{ "type": "text", "text": "检查自动命名为什么失败" }] },
+                            { "id": "a1", "type": "agentMessage", "text": "已定位" }
+                        ]
+                    })],
+                },
+            );
+        }
+        let ctx = ag.naming_context(id, true).await.unwrap();
+        assert_eq!(ctx["eligible"], true);
+        assert_eq!(ctx["expectedName"], "检查自动命名为什么失败");
+        assert_eq!(ctx["firstUserMessage"], "检查自动命名为什么失败");
+
+        // expectedName 匹配时允许自动命名改名。
+        ag.change_metadata(
+            "rename",
+            id,
+            &json!({ "title": "排查自动命名失败", "expectedName": "检查自动命名为什么失败" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ag.conversation(id).await.unwrap().title, "排查自动命名失败");
+
+        // 标题已变后，迟到的旧 expectedName 必须返回 409 拒绝覆盖。
+        let stale = ag
+            .change_metadata(
+                "rename",
+                id,
+                &json!({ "title": "迟到标题", "expectedName": "检查自动命名为什么失败" }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            stale.downcast_ref::<ApiError>().map(|e| e.code),
+            Some(409)
+        );
+        // 已有自定义标题后，初始自动命名 eligible 为 false。
+        let ctx_after = ag.naming_context(id, true).await.unwrap();
+        assert_eq!(ctx_after["eligible"], false);
+    }
+
+    #[tokio::test]
+    async fn handle_session_update_delivers_streaming_reply_to_final_thread_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let ag = Antigravity::new(dir.path()).unwrap();
+        let id = "antigravity-final-stream-1";
+        let cfg = EnvConfig {
+            distribution: String::new(),
+            user: String::new(),
+            executable: r"C:\agy\bin\agy.exe".into(),
+        };
+        {
+            let mut saved = ag.saved.lock().await;
+            saved.conversations.insert(
+                id.into(),
+                Conversation {
+                    backend: antigravity_backend(),
+                    id: id.into(),
+                    native_id: "final-stream-1".into(),
+                    project_id: Value::Null,
+                    cwd: r"C:\work".into(),
+                    linux_cwd: String::new(),
+                    config: cfg,
+                    title: "Antigravity 会话".into(),
+                    model: String::new(),
+                    effort: String::new(),
+                    permission_mode: Some("default".into()),
+                    permission_revision: 0,
+                    available_modes: vec!["default".into()],
+                    created_at: 1,
+                    updated_at: 1,
+                    pinned: false,
+                    unread: false,
+                    deleted: false,
+                    discovered: false,
+                    history_loaded: true,
+                    local_transcript_mtime_ms: 0,
+                    local_transcript_len: 0,
+                    edit_history_head: "agy-head-1".into(),
+                    token_usage: Value::Null,
+                    goal: Value::Null,
+                    remote_queue: AntigravityQueue::default(),
+                    active_turn_id: Some("agy-turn-1".into()),
+                    turns: vec![json!({
+                        "id": "agy-turn-1",
+                        "status": "inProgress",
+                        "items": [
+                            { "id": "agy-turn-1-user", "type": "userMessage", "content": [{ "type": "text", "text": "hello" }] }
+                        ]
+                    })],
+                },
+            );
+        }
+        ag.handle_session_update(
+            id,
+            &json!({ "sessionUpdate": "agent_thought_chunk", "content": { "type": "text", "text": "thinking..." } }),
+        )
+        .await;
+        ag.handle_session_update(
+            id,
+            &json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "你好！" } }),
+        )
+        .await;
+        let conv = ag.conversation(id).await.unwrap();
+        assert_eq!(conv.turns[0]["items"].as_array().unwrap().len(), 3);
+        assert_eq!(conv.turns[0]["items"][1]["type"], "reasoning");
+        assert_eq!(conv.turns[0]["items"][2]["type"], "agentMessage");
+        assert_eq!(conv.turns[0]["items"][2]["text"], "你好！");
     }
 }

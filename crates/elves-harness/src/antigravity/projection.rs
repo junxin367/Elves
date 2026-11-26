@@ -182,21 +182,24 @@ pub(crate) fn normalize_models_from_setup(setup: &Value) -> Value {
     let mut permission_modes = Vec::new();
     if let Some(modes) = setup["modes"]["availableModes"].as_array() {
         for mode in modes {
-            if let Some(id) = mode["id"].as_str().filter(|s| !s.is_empty()) {
+            if let Some(id) = mode["id"]
+                .as_str()
+                .filter(|s| matches!(*s, "default" | "accept-edits" | "auto"))
+            {
                 permission_modes.push(id.to_owned());
             }
         }
     } else if let Some(opt) = mode_opt {
-        permission_modes = extract_select_option_values(opt);
+        permission_modes = extract_select_option_values(opt)
+            .into_iter()
+            .filter(|s| matches!(s.as_str(), "default" | "accept-edits" | "auto"))
+            .collect();
     }
     if permission_modes.is_empty() {
-        permission_modes = vec![
-            "default".into(),
-            "accept-edits".into(),
-            "auto".into(),
-            "plan".into(),
-        ];
+        permission_modes = vec!["default".into(), "accept-edits".into(), "auto".into()];
     }
+    // 用户要求去除计划模式、增加无限制模式（经官方 `agy acp --dangerously-skip-permissions` 实现）。
+    permission_modes.push("bypassPermissions".into());
 
     json!({
         "ok": true,
@@ -481,18 +484,7 @@ pub(crate) fn apply_session_update(
         }
         "available_commands_update" => {
             if let Some(commands) = update["availableCommands"].as_array() {
-                let normalized: Vec<Value> = commands
-                    .iter()
-                    .filter_map(|cmd| {
-                        let name = cmd["name"].as_str().map(str::trim).filter(|s| !s.is_empty())?;
-                        Some(json!({
-                            "name": name,
-                            "description": cmd["description"].as_str().unwrap_or("").trim(),
-                            "argumentHint": cmd["input"]["hint"].as_str().unwrap_or("").trim(),
-                            "source": "antigravity"
-                        }))
-                    })
-                    .collect();
+                let normalized = normalize_available_commands(commands);
                 effect.available_commands = Some(normalized);
             }
         }
@@ -805,19 +797,50 @@ fn simple_diff_preview(old_text: &str, new_text: &str) -> String {
     out
 }
 
+/// 归一化 ACP `available_commands_update` 命令列表为 Elves 斜杠技能结构（自动过滤与内置菜单重复的 `goal`/`compact`）。
+pub(crate) fn normalize_available_commands(commands: &[Value]) -> Vec<Value> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for cmd in commands {
+        let Some(name) = cmd["name"].as_str().map(str::trim).filter(|s| {
+            super::local_store::valid_slash_command_name(s)
+        }) else {
+            continue;
+        };
+        let key = name.to_ascii_lowercase();
+        if matches!(key.as_str(), "goal" | "compact") || !seen.insert(key) {
+            continue;
+        }
+        out.push(json!({
+            "name": name,
+            "command": name,
+            "path": format!("antigravity-skill:{name}"),
+            "description": cmd["description"].as_str().unwrap_or("").trim(),
+            "argumentHint": cmd["input"]["hint"].as_str().unwrap_or("").trim(),
+            "backend": "antigravity",
+            "source": "antigravity",
+        }));
+    }
+    out
+}
+
 /// 将 ACP `usage_update` 通知或 `PromptResponse.usage` 转换为 Elves `tokenUsage` 结构。
 pub(crate) fn normalize_usage_update(value: &Value) -> Option<Value> {
     let size = value["size"].as_u64();
     let used = value["used"].as_u64();
     let input = value["inputTokens"].as_u64();
     let output = value["outputTokens"].as_u64();
-    let cached = value["cachedReadTokens"].as_u64();
-    let thought = value["thoughtTokens"].as_u64();
+    let cached = value["cachedReadTokens"]
+        .as_u64()
+        .or_else(|| value["cachedInputTokens"].as_u64());
+    let thought = value["thoughtTokens"]
+        .as_u64()
+        .or_else(|| value["reasoningOutputTokens"].as_u64());
     let total = value["totalTokens"]
         .as_u64()
         .or(used)
         .or_else(|| match (input, output) {
-            (Some(i), Some(o)) => Some(i.saturating_add(o)),
+            (Some(i), Some(o)) => Some(i.saturating_add(cached.unwrap_or(0)).saturating_add(o)),
             _ => None,
         });
     if total.is_none() && size.is_none() && input.is_none() && output.is_none() {
@@ -844,6 +867,29 @@ pub(crate) fn normalize_usage_update(value: &Value) -> Option<Value> {
         usage["modelContextWindowSource"] = json!({"kind": "native", "key": "acp.usage_update.size"});
     }
     Some(usage)
+}
+
+/// 合并已有 `tokenUsage` 与新到达的 `usage_update` / `PromptResponse.usage` / 本地转录用量，
+/// 保证 `PromptResponse.usage`（不含 `size`）不会冲掉 `usage_update` 已提供的原生 `modelContextWindow`。
+pub(crate) fn merge_token_usage(existing: &Value, incoming: &Value, fallback_model: &str) -> Value {
+    let mut merged = incoming.clone();
+    if !merged["modelContextWindow"].is_u64() {
+        if existing["modelContextWindow"].as_u64().is_some_and(|w| w > 0) {
+            merged["modelContextWindow"] = existing["modelContextWindow"].clone();
+            if !existing["modelContextWindowSource"].is_null() {
+                merged["modelContextWindowSource"] = existing["modelContextWindowSource"].clone();
+            }
+        } else if let Some(window) = super::local_store::known_antigravity_context_window(fallback_model) {
+            merged["modelContextWindow"] = json!(window);
+            merged["modelContextWindowSource"] = json!({"kind": "model-default", "key": fallback_model});
+        }
+    }
+    if merged["last"]["totalTokens"].as_u64().unwrap_or(0) == 0
+        && existing["last"]["totalTokens"].as_u64().unwrap_or(0) > 0
+    {
+        merged["last"] = existing["last"].clone();
+    }
+    merged
 }
 
 /// 将 ACP `session/request_permission` 映射为 Elves 审批或用户提问请求。
@@ -1128,59 +1174,228 @@ pub(crate) fn collect_replay_turns(updates: &[Value], now_ms: u64) -> Vec<Value>
     turns
 }
 
-/// 计算单会话累计统计指标，复用 Elves 输入区左下 Token 统计格式。
-pub(crate) fn compute_session_metrics(turns: &[Value], token_usage: &Value) -> Value {
+fn estimate_turn_steps(turn: &Value) -> Option<u64> {
+    if let Some(steps) = turn["_acpUsage"]["steps"].as_u64().filter(|&s| s > 0) {
+        return Some(steps);
+    }
+    let items = turn["items"].as_array()?;
+    let mut steps = 0u64;
+    let mut in_planner_step = false;
+    for item in items {
+        match item["type"].as_str() {
+            Some("userMessage") => {
+                in_planner_step = false;
+            }
+            Some("reasoning" | "agentMessage") => {
+                if !in_planner_step {
+                    steps = steps.saturating_add(1);
+                    in_planner_step = true;
+                }
+            }
+            Some("commandExecution" | "fileChange" | "mcpToolCall" | "dynamicToolCall" | "webSearch") => {
+                if !in_planner_step {
+                    steps = steps.saturating_add(1);
+                }
+                // 工具执行结束后，后续思考或正文属于下一轮规划步。
+                in_planner_step = false;
+            }
+            _ => {}
+        }
+    }
+    (steps > 0).then_some(steps)
+}
+
+fn turn_has_observable_activity(turn: &Value) -> bool {
+    turn.get("_acpUsage").is_some_and(Value::is_object)
+        || turn["items"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["type"] != "userMessage"))
+}
+
+/// 计算单会话累计统计指标，完整对齐 Elves 输入区左下 `#session-metrics` 字段契约。
+pub(crate) fn compute_session_metrics(
+    turns: &[Value],
+    token_usage: &Value,
+    fallback_model: &str,
+    now_ms: u64,
+) -> Value {
     let mut total_input = 0u64;
     let mut total_output = 0u64;
     let mut total_cached = 0u64;
     let mut total_thought = 0u64;
+    let mut has_turn_usage = false;
     for turn in turns {
         if let Some(u) = turn.get("_acpUsage").filter(|v| v.is_object()) {
-            total_input = total_input.saturating_add(u["inputTokens"].as_u64().unwrap_or(0));
-            total_output = total_output.saturating_add(u["outputTokens"].as_u64().unwrap_or(0));
-            total_cached = total_cached.saturating_add(u["cachedReadTokens"].as_u64().unwrap_or(0));
+            let uncached_or_in = u["inputTokens"].as_u64().unwrap_or(0);
+            let cached = u["cachedReadTokens"]
+                .as_u64()
+                .or_else(|| u["cachedInputTokens"].as_u64())
+                .unwrap_or(0);
+            // 若来源未预合并 cachedReadTokens（如直接来自 PromptResponse.usage），补齐总输入口径。
+            let step_in = if u.get("uncachedInputTokens").is_some() {
+                uncached_or_in
+            } else {
+                uncached_or_in.saturating_add(cached)
+            };
+            let step_out = u["outputTokens"].as_u64().unwrap_or(0);
+            if step_in > 0 || step_out > 0 || u["totalTokens"].as_u64().unwrap_or(0) > 0 {
+                has_turn_usage = true;
+            }
+            total_input = total_input.saturating_add(step_in);
+            total_output = total_output.saturating_add(step_out);
+            total_cached = total_cached.saturating_add(cached);
             total_thought = total_thought.saturating_add(u["thoughtTokens"].as_u64().unwrap_or(0));
         }
     }
-    let last_turn = turns.last();
-    let last_usage = last_turn.and_then(|t| t.get("_acpUsage")).filter(|v| v.is_object());
+    // 新轮次刚发起且尚无实测活动时保留上一轮完整统计（保留上一轮真实 turnId）。
+    let scored_turn = turns
+        .iter()
+        .rev()
+        .find(|t| turn_has_observable_activity(t))
+        .or_else(|| turns.last());
+    let Some(turn) = scored_turn else {
+        return Value::Null;
+    };
+    let Some(turn_id) = turn["id"].as_str().filter(|s| !s.is_empty()) else {
+        return Value::Null;
+    };
+
+    let cumulative_total = if has_turn_usage {
+        Some(total_input.saturating_add(total_output))
+    } else {
+        token_usage["total"]["totalTokens"]
+            .as_u64()
+            .or_else(|| token_usage["last"]["totalTokens"].as_u64())
+            .filter(|&n| n > 0)
+    };
+
     let mut metrics = json!({
         "source": "antigravity-acp",
-        "totalTokens": total_input.saturating_add(total_output),
-        "inputTokens": total_input,
-        "outputTokens": total_output,
-        "cachedInputTokens": total_cached,
-        "reasoningTokens": total_thought,
+        "turnId": turn_id,
     });
+    if let Some(total) = cumulative_total {
+        metrics["totalTokens"] = json!(total);
+        metrics["inputTokens"] = json!(total_input);
+        metrics["outputTokens"] = json!(total_output);
+        metrics["cachedInputTokens"] = json!(total_cached);
+        metrics["reasoningTokens"] = json!(total_thought);
+    }
+    if let Some(steps) = estimate_turn_steps(turn) {
+        metrics["steps"] = json!(steps);
+    }
+
+    let last_usage = turn.get("_acpUsage").filter(|v| v.is_object());
+    let mut turn_out_for_speed = 0u64;
     if let Some(u) = last_usage {
-        let turn_in = u["inputTokens"].as_u64().unwrap_or(0);
+        let raw_in = u["inputTokens"].as_u64().unwrap_or(0);
+        let turn_cached = u["cachedReadTokens"]
+            .as_u64()
+            .or_else(|| u["cachedInputTokens"].as_u64())
+            .unwrap_or(0);
+        let turn_in = if u.get("uncachedInputTokens").is_some() {
+            raw_in
+        } else {
+            raw_in.saturating_add(turn_cached)
+        };
         let turn_out = u["outputTokens"].as_u64().unwrap_or(0);
-        let turn_cached = u["cachedReadTokens"].as_u64().unwrap_or(0);
-        metrics["turnTokens"] = json!(turn_in.saturating_add(turn_out));
-        metrics["turnInputTokens"] = json!(turn_in);
-        metrics["turnOutputTokens"] = json!(turn_out);
+        let turn_total = u["totalTokens"]
+            .as_u64()
+            .filter(|&t| t > 0)
+            .unwrap_or_else(|| turn_in.saturating_add(turn_out));
+        turn_out_for_speed = turn_out;
+        if turn_total > 0 {
+            metrics["turnTokens"] = json!(turn_total);
+            metrics["inputTokens"] = json!(turn_in);
+            metrics["outputTokens"] = json!(turn_out);
+        }
         if turn_in > 0 && turn_cached > 0 {
-            metrics["cacheHitRate"] = json!((turn_cached as f64) / (turn_in as f64));
+            let denom = turn_in.max(turn_cached) as f64;
+            metrics["cacheHitRate"] = json!(((turn_cached as f64) / denom).clamp(0.0, 1.0));
         }
     }
-    if let Some(turn) = last_turn {
-        if let (Some(start), Some(first)) = (
-            turn["turnStartedAtMs"].as_u64(),
-            turn["firstTokenAtMs"].as_u64(),
-        ) && first >= start
-        {
-            metrics["firstTokenMs"] = json!(first - start);
+
+    let start_ms = turn["turnStartedAtMs"]
+        .as_u64()
+        .or_else(|| turn["createdAt"].as_u64())
+        .filter(|&t| t > 0);
+    let first_ms = turn["firstTokenAtMs"].as_u64().filter(|&t| t > 0);
+    let end_ms = turn["turnCompletedAtMs"]
+        .as_u64()
+        .or_else(|| turn["completedAt"].as_u64())
+        .filter(|&t| t > 0)
+        .or_else(|| (turn["status"] == "inProgress").then_some(now_ms));
+
+    if let (Some(start), Some(first)) = (start_ms, first_ms)
+        && first >= start
+    {
+        metrics["firstTokenMs"] = json!(first - start);
+    }
+    if let (Some(start), Some(end)) = (start_ms, end_ms)
+        && end >= start
+    {
+        let duration = end - start;
+        if duration > 0 {
+            metrics["durationMs"] = json!(duration);
         }
-        if let (Some(start), Some(end)) = (
-            turn["turnStartedAtMs"].as_u64(),
-            turn["turnCompletedAtMs"].as_u64(),
-        ) && end >= start
-        {
-            metrics["turnDurationMs"] = json!(end - start);
+        if turn_out_for_speed > 0 {
+            let gen_start = first_ms.filter(|&f| f >= start && f < end).unwrap_or(start);
+            let gen_ms = end.saturating_sub(gen_start);
+            if gen_ms > 0 {
+                let speed = (turn_out_for_speed as f64) * 1000.0 / (gen_ms as f64);
+                if speed.is_finite() && speed > 0.0 {
+                    metrics["tokensPerSecond"] = json!(speed);
+                }
+            }
         }
     }
+
+    // 推断缓存过期倒计时（仅基于最后一次真实模型响应时间计算，轮询不会续期）。
+    if let Some(u) = last_usage {
+        let model = u["model"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(fallback_model);
+        let observed_at = u["lastObservedAtMs"]
+            .as_u64()
+            .filter(|&t| t > 0)
+            .or_else(|| {
+                turn["turnCompletedAtMs"]
+                    .as_u64()
+                    .or_else(|| turn["completedAt"].as_u64())
+                    .filter(|&t| t > 0)
+            });
+        if let Some(at) = observed_at
+            && !model.is_empty()
+        {
+            let cache_evidence = json!({
+                "inputTokens": u["inputTokens"].as_u64().unwrap_or(0),
+                "cachedInputTokens": u["cachedReadTokens"]
+                    .as_u64()
+                    .or_else(|| u["cachedInputTokens"].as_u64())
+                    .unwrap_or(0),
+            });
+            if let Some(expiry) = elves_core::cache_expiry::infer_cache_expiry(
+                "antigravity",
+                model,
+                &json!({}),
+                &cache_evidence,
+                at,
+                None,
+            ) {
+                metrics["cacheModel"] = json!(model);
+                metrics["cacheObservedAtMs"] = json!(expiry.observed_at_ms);
+                metrics["cacheTtlMs"] = json!(expiry.ttl_ms);
+                metrics["cacheExpiresAtMs"] = json!(expiry.expires_at_ms);
+                metrics["cacheRemainingMs"] = json!(expiry.expires_at_ms.saturating_sub(now_ms));
+                metrics["cacheExpirySource"] = json!(expiry.source);
+            }
+        }
+    }
+
     if token_usage["modelContextWindow"].is_u64() {
         metrics["modelContextWindow"] = token_usage["modelContextWindow"].clone();
+    } else if let Some(window) = super::local_store::known_antigravity_context_window(fallback_model) {
+        metrics["modelContextWindow"] = json!(window);
     }
     metrics
 }

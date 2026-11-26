@@ -116,7 +116,7 @@ function installSettingsSelectWidths(host) {
       cache.set(control, { options, signature });
       measure.font = textFont;
       const required = options.reduce((maximum, option) => {
-        const brand = icons.length > 1 && control.renderSelectValue || ["codex", "claude"].includes(option.icon);
+        const brand = icons.length > 1 && control.renderSelectValue || ["codex", "claude", "antigravity"].includes(option.icon);
         return Math.max(maximum, frameWidth + measure.measureText(option.label || "").width
           + (arrowWidth ? arrowWidth + gap : 0) + (brand ? brandWidth + gap : 0));
       }, 0);
@@ -354,7 +354,7 @@ export function mountSettingsPage(screen, { onBack, fromLogin = false }) {
     </section>`).join("")}
     <section id="appearance-naming-page" class="appearance-body appearance-settings-page" hidden>
     <h3 class="appearance-panel-title">会话命名</h3>
-    <p class="appearance-hint">同一 Harness的所有 Codex、Claude 实例的主会话共用命名实例与模型。</p>
+    <p class="appearance-hint">同一 Harness 的所有实例（Codex、Claude、Antigravity）主会话共用下方命名实例与模型，无需按实例单独选择。</p>
     <div id="appearance-naming-settings"></div>
     </section>
     <section id="appearance-shortcuts-page" class="appearance-body appearance-settings-page" hidden>

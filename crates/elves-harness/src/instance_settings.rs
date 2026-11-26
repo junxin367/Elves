@@ -100,6 +100,144 @@ pub(super) fn decorate_claude_model_visibility(
     Ok(catalog)
 }
 
+fn antigravity_default_effort(value: &Value) -> Result<Option<&str>, ApiError> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_str()
+        .filter(|effort| ["minimal", "low", "medium", "high", "xhigh", "max"].contains(effort))
+        .map(Some)
+        .ok_or_else(|| ApiError::new(400, "Antigravity 默认思考深度必须是当前模型支持的原生等级，或使用模型默认"))
+}
+
+fn antigravity_default_model(value: &Value) -> Result<Option<&str>, ApiError> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_str()
+        .filter(|id| !id.is_empty() && id.len() <= 200 && !id.chars().any(char::is_control))
+        .map(Some)
+        .ok_or_else(|| ApiError::new(400, "Antigravity 默认模型名称无效"))
+}
+
+pub(super) fn antigravity_permission_view(
+    directory: &Path,
+    instance: &str,
+) -> Result<(String, String), ApiError> {
+    let (preference, revision) = preferences(directory)?;
+    let value = &preference["instances"][instance]["defaultPermissionMode"];
+    let mode = match value {
+        Value::Null => String::new(),
+        Value::String(s) if s.is_empty() || permissions::ANTIGRAVITY_MODES.contains(&s.as_str()) => {
+            s.clone()
+        }
+        _ => {
+            return Err(ApiError::new(
+                422,
+                "Antigravity 默认权限配置无效，请重新读取实例权限",
+            ));
+        }
+    };
+    Ok((mode, revision))
+}
+
+pub(super) fn antigravity_default_permission_mode(
+    directory: &Path,
+    instance: &str,
+) -> Result<String, ApiError> {
+    let (mode, _) = antigravity_permission_view(directory, instance)?;
+    Ok(if mode.is_empty() {
+        "default".into()
+    } else {
+        mode
+    })
+}
+
+pub(super) async fn save_antigravity_permission_mode(
+    directory: &Path,
+    instance: &str,
+    mode: &str,
+    expected: &str,
+    authorization: &HarnessAuthorization,
+) -> Result<(), ApiError> {
+    let value = if mode.is_empty() {
+        Value::Null
+    } else {
+        json!(mode)
+    };
+    save_preference(
+        directory,
+        instance,
+        "defaultPermissionMode",
+        &value,
+        expected,
+        authorization,
+    )
+    .await
+}
+
+pub(super) fn antigravity_default_model_and_effort(
+    directory: &Path,
+    instance: &str,
+) -> Result<(Option<String>, Option<String>), ApiError> {
+    let (preference, _) = preferences(directory)?;
+    let model = antigravity_default_model(&preference["instances"][instance]["defaultModel"])?
+        .map(str::to_owned);
+    let effort =
+        antigravity_default_effort(&preference["instances"][instance]["defaultReasoningEffort"])?
+            .map(str::to_owned);
+    Ok((model, effort))
+}
+
+/// 为 Antigravity 官方 ACP 模型目录叠加当前实例的显示名单与默认模型/思考深度偏好，不修改 ACP 原始缓存。
+pub(super) fn decorate_antigravity_model_visibility(
+    directory: &Path,
+    instance: &str,
+    mut catalog: Value,
+) -> Result<Value, ApiError> {
+    let (preference, _) = preferences(directory)?;
+    let hidden = hidden_model_ids(&preference["instances"][instance]["hiddenModelIds"])?;
+    let configured_model =
+        antigravity_default_model(&preference["instances"][instance]["defaultModel"])?;
+    let configured_effort =
+        antigravity_default_effort(&preference["instances"][instance]["defaultReasoningEffort"])?;
+    if let Some(rows) = catalog["data"].as_array_mut() {
+        for row in rows {
+            row["hiddenByInstance"] = json!(row["model"]
+                .as_str()
+                .is_some_and(|id| hidden.iter().any(|hidden| hidden == id)));
+        }
+    }
+    if let Some(model) = configured_model
+        && catalog["data"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| row["model"] == model))
+    {
+        catalog["defaultModel"] = json!(model);
+    }
+    let effective_model = catalog["defaultModel"].as_str().unwrap_or("").to_owned();
+    if let Some(effort) = configured_effort {
+        let supported = catalog["data"].as_array().is_some_and(|rows| {
+            rows.iter().any(|row| {
+                (effective_model.is_empty() || row["model"] == effective_model.as_str())
+                    && row["supportedReasoningEfforts"]
+                        .as_array()
+                        .is_some_and(|efforts| {
+                            efforts
+                                .iter()
+                                .any(|value| value["reasoningEffort"] == effort)
+                        })
+            })
+        });
+        if supported {
+            catalog["defaultReasoningEffort"] = json!(effort);
+        }
+    }
+    Ok(catalog)
+}
+
 fn validate_hidden_model_selection(
     ids: &[String],
     previous: &[String],
@@ -1013,6 +1151,303 @@ async fn settings_capabilities(
     (capabilities, native_features, capability_error)
 }
 
+async fn save_preferences_patch(
+    directory: &Path,
+    instance: &str,
+    updates: &[(&str, Value)],
+    expected: &str,
+    authorization: &HarnessAuthorization,
+) -> Result<(), ApiError> {
+    let (mut document, revision) = preferences(directory)?;
+    if revision != expected {
+        return Err(ApiError::new(409, "实例偏好已变化，请重新读取后再保存"));
+    }
+    let instances = document["instances"].as_object_mut().unwrap();
+    let entry = instances.entry(instance).or_insert_with(|| json!({}));
+    let entry = entry
+        .as_object_mut()
+        .ok_or_else(|| ApiError::new(422, "实例偏好格式无效，未覆盖原文件"))?;
+    for (key, value) in updates {
+        if value.is_null() {
+            entry.remove(*key);
+        } else {
+            entry.insert((*key).to_owned(), value.clone());
+        }
+    }
+    let output = serde_json::to_string_pretty(&document).unwrap() + "\n";
+    let permit = authorization
+        .prepare_dispatch()
+        .await
+        .map_err(super::authorization_error)?;
+    permit
+        .commit(|| permissions::save_file(&directory.join(PREFERENCES_FILE), &output, expected))
+        .map_err(super::authorization_error)
+}
+
+async fn antigravity_settings(
+    state: &WebState,
+    target: &ConfigFile,
+    instance: &str,
+    section: &str,
+    write: bool,
+    payload: &Value,
+    authorization: &HarnessAuthorization,
+) -> Result<Response, ApiError> {
+    let gemini_root = target
+        .antigravity_root
+        .as_deref()
+        .ok_or_else(|| ApiError::new(404, "无法确认该 Antigravity 实例的配置目录"))?;
+    let directory = &state.controller.state_dir;
+    let model_settings = matches!(section, "general" | "models");
+    let mut capability_error = String::new();
+    let mut catalog = if model_settings {
+        match model_catalog(state, instance, authorization, payload["forceReload"] == true).await {
+            Ok(value) => Some(value),
+            Err(failure) if section == "general" => {
+                capability_error = format!("无法读取当前 Antigravity 实例模型目录：{}", failure.message);
+                None
+            }
+            Err(failure) => return Err(failure),
+        }
+    } else {
+        None
+    };
+
+    let _serial = permissions::CONFIG_WRITE
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .await;
+    let mut updated = false;
+
+    if write {
+        let changes = payload["settings"]
+            .as_object()
+            .filter(|changes| !changes.is_empty())
+            .ok_or_else(|| ApiError::new(400, "请选择需要保存的设置"))?;
+        match section {
+            "general" | "models" => {
+                if changes.contains_key("hiddenModelIds") {
+                    if changes.len() != 1 || !changes["hiddenModelIds"].is_array() {
+                        return Err(ApiError::new(
+                            400,
+                            "模型显示设置仅支持单独修改当前 Antigravity 实例的隐藏名单",
+                        ));
+                    }
+                    let ids = hidden_model_ids(&changes["hiddenModelIds"])?;
+                    let (preference, _) = preferences(directory)?;
+                    let previous =
+                        hidden_model_ids(&preference["instances"][instance]["hiddenModelIds"])?;
+                    validate_hidden_model_selection(&ids, &previous, catalog.as_ref())?;
+                    save_preference(
+                        directory,
+                        instance,
+                        "hiddenModelIds",
+                        &json!(ids),
+                        payload["expectedPreferenceRevision"]
+                            .as_str()
+                            .unwrap_or(""),
+                        authorization,
+                    )
+                    .await?;
+                } else if changes
+                    .keys()
+                    .all(|k| matches!(k.as_str(), "model" | "reasoningEffort"))
+                {
+                    let Some(cat) = catalog.as_ref() else {
+                        return Err(ApiError::new(
+                            409,
+                            "未取得当前 Antigravity 实例模型目录，请重新读取后再保存模型设置",
+                        ));
+                    };
+                    let (current_model, _) =
+                        antigravity_default_model_and_effort(directory, instance)?;
+                    let effective_doc = json!({ "model": current_model });
+                    if let Some(m) = changes.get("model") {
+                        antigravity_default_model(m)?;
+                    }
+                    if let Some(e) = changes.get("reasoningEffort") {
+                        antigravity_default_effort(e)?;
+                    }
+                    validate_models("antigravity", &effective_doc, &payload["settings"], cat, false)?;
+                    let mut patch: Vec<(&str, Value)> = Vec::new();
+                    if let Some(m) = changes.get("model") {
+                        patch.push(("defaultModel", m.clone()));
+                        if !changes.contains_key("reasoningEffort") {
+                            patch.push(("defaultReasoningEffort", Value::Null));
+                        }
+                    }
+                    if let Some(e) = changes.get("reasoningEffort") {
+                        patch.push(("defaultReasoningEffort", e.clone()));
+                    }
+                    save_preferences_patch(
+                        directory,
+                        instance,
+                        &patch,
+                        payload["expectedPreferenceRevision"]
+                            .as_str()
+                            .unwrap_or(""),
+                        authorization,
+                    )
+                    .await?;
+                } else {
+                    return Err(ApiError::new(400, "不支持的 Antigravity 实例设置"));
+                }
+            }
+            "mcp" => {
+                if changes.len() != 1 || !changes.contains_key("server") {
+                    return Err(ApiError::new(400, "只允许切换已有 Antigravity MCP 服务"));
+                }
+                super::antigravity::local_store::update_mcp_server_enabled(
+                    gemini_root,
+                    payload["expectedRevision"].as_str().unwrap_or(""),
+                    &changes["server"],
+                    authorization,
+                )
+                .await?;
+            }
+            "hooks" => {
+                if changes.len() != 1 || !changes.contains_key("hook") {
+                    return Err(ApiError::new(400, "只允许切换已有 Antigravity 钩子"));
+                }
+                super::antigravity::local_store::update_hook_enabled(
+                    gemini_root,
+                    payload["expectedRevision"].as_str().unwrap_or(""),
+                    &changes["hook"],
+                    authorization,
+                )
+                .await?;
+            }
+            "skills" => {
+                return Err(ApiError::new(
+                    400,
+                    "Antigravity Skills 按用户目录自动发现，暂不支持单独开关",
+                ));
+            }
+            _ => return Err(ApiError::new(400, "不支持的 Antigravity 设置分类")),
+        }
+        state.controller.shared_settings.instance_settings_changed(
+            &state.controller,
+            instance,
+            &payload["settings"],
+        );
+        updated = true;
+    }
+
+    if updated
+        && model_settings
+        && catalog.is_some()
+        && ["model", "reasoningEffort"]
+            .iter()
+            .any(|key| payload["settings"].get(*key).is_some())
+    {
+        catalog = Some(model_catalog(state, instance, authorization, false).await?);
+    }
+
+    let (preference, preference_revision) = preferences(directory)?;
+    let (values, revision, path_display, inventory) = match section {
+        "general" | "models" => {
+            let (_, rev) = permissions::read_file(&target.path)?;
+            let (default_model, default_effort) =
+                antigravity_default_model_and_effort(directory, instance)?;
+            let hidden = hidden_model_ids(&preference["instances"][instance]["hiddenModelIds"])?;
+            (
+                json!({
+                    "model": default_model,
+                    "reasoningEffort": default_effort,
+                    "hiddenModelIds": hidden,
+                }),
+                rev,
+                target.display.clone(),
+                None,
+            )
+        }
+        "skills" => {
+            let (_, rev) = permissions::read_file(&target.path)?;
+            let inv = super::antigravity::local_store::scan_local_skills(
+                gemini_root,
+                target.antigravity_home_root.as_deref(),
+            )?;
+            (
+                json!({}),
+                rev,
+                format!(
+                    "{}/antigravity/skills",
+                    target
+                        .display
+                        .trim_end_matches("/config/config.json")
+                        .trim_end_matches(['/', '\\'])
+                ),
+                Some(inv),
+            )
+        }
+        "mcp" => {
+            let (inv, rev) = super::antigravity::local_store::read_mcp_inventory(gemini_root)?;
+            (
+                json!({}),
+                rev,
+                format!(
+                    "{}/config/mcp_config.json",
+                    target
+                        .display
+                        .trim_end_matches("/config/config.json")
+                        .trim_end_matches(['/', '\\'])
+                ),
+                Some(inv),
+            )
+        }
+        "hooks" => {
+            let (inv, rev) = super::antigravity::local_store::read_hooks_inventory(gemini_root)?;
+            (
+                json!({}),
+                rev,
+                format!(
+                    "{}/config/hooks.json",
+                    target
+                        .display
+                        .trim_end_matches("/config/config.json")
+                        .trim_end_matches(['/', '\\'])
+                ),
+                Some(inv),
+            )
+        }
+        _ => return Err(ApiError::new(400, "实例设置分类无效")),
+    };
+
+    authorization
+        .check()
+        .await
+        .map_err(super::authorization_error)?;
+    let (settings_epoch, instance_revision) = state.controller.shared_settings.instance_version();
+    let mut response = json!({
+        "ok": true,
+        "instanceId": instance,
+        "backend": "antigravity",
+        "settingsEpoch": settings_epoch,
+        "instanceRevision": instance_revision,
+        "path": path_display,
+        "revision": revision,
+        "preferenceRevision": preference_revision,
+        "settings": values,
+        "capabilities": {},
+        "capabilityError": capability_error,
+        "extraSettings": [],
+        "readOnly": state.settings.read_only,
+        "readOnlyReason": "",
+        "updated": updated,
+    });
+    if let Some(cat) = catalog {
+        let decorated = decorate_antigravity_model_visibility(directory, instance, cat)?;
+        response["models"] = decorated["data"].clone();
+        response["effectiveModel"] = decorated["defaultModel"].clone();
+    } else if matches!(section, "general" | "models") {
+        response["models"] = json!([]);
+    }
+    if let Some(inv) = inventory {
+        response["inventory"] = inv;
+    }
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(response)).into_response())
+}
+
 pub(super) async fn settings(
     State(state): State<WebState>,
     headers: HeaderMap,
@@ -1040,6 +1475,18 @@ pub(super) async fn settings(
         .authorization(device, write.then_some("setInstanceSettings"));
     let environments = super::preferences::detect(&state.controller.state_dir, false).await;
     let target = permissions::config_target(&environments, instance)?;
+    if target.backend == "antigravity" {
+        return antigravity_settings(
+            &state,
+            &target,
+            instance,
+            section,
+            write,
+            &payload,
+            &authorization,
+        )
+        .await;
+    }
     let adapter_read_only = target.backend == "codex" && instance != "codex:local";
     if write && adapter_read_only {
         return Err(ApiError::new(
@@ -1912,6 +2359,81 @@ mod tests {
                 &json!({"nativeModelEffort:claude-fixture":"max"})
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn antigravity_model_visibility_defaults_and_permission_preferences_are_instance_scoped() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(PREFERENCES_FILE);
+        std::fs::write(
+            &path,
+            serde_json::to_string(&json!({
+                "instances": {
+                    "antigravity:local": {
+                        "defaultModel": "claude-opus-5-5",
+                        "defaultReasoningEffort": "high",
+                        "hiddenModelIds": ["gpt-oss-120b"],
+                        "defaultPermissionMode": "accept-edits"
+                    },
+                    "antigravity:wsl:other": {
+                        "defaultPermissionMode": "bypassPermissions"
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let catalog = json!({
+            "data": [
+                {
+                    "model": "gemini-4-neon",
+                    "supportedReasoningEfforts": [{"reasoningEffort": "high"}, {"reasoningEffort": "xhigh"}]
+                },
+                {
+                    "model": "claude-opus-5-5",
+                    "supportedReasoningEfforts": [{"reasoningEffort": "medium"}, {"reasoningEffort": "high"}]
+                },
+                {
+                    "model": "gpt-oss-120b",
+                    "supportedReasoningEfforts": [{"reasoningEffort": "medium"}]
+                }
+            ],
+            "defaultModel": "gemini-4-neon",
+            "defaultReasoningEffort": "xhigh"
+        });
+        let local = decorate_antigravity_model_visibility(
+            directory.path(),
+            "antigravity:local",
+            catalog.clone(),
+        )
+        .unwrap();
+        assert_eq!(local["defaultModel"], "claude-opus-5-5");
+        assert_eq!(local["defaultReasoningEffort"], "high");
+        assert_eq!(local["data"][0]["hiddenByInstance"], false);
+        assert_eq!(local["data"][1]["hiddenByInstance"], false);
+        assert_eq!(local["data"][2]["hiddenByInstance"], true);
+
+        let other = decorate_antigravity_model_visibility(
+            directory.path(),
+            "antigravity:wsl:other",
+            catalog,
+        )
+        .unwrap();
+        assert_eq!(other["defaultModel"], "gemini-4-neon");
+        assert_eq!(other["data"][2]["hiddenByInstance"], false);
+
+        assert_eq!(
+            antigravity_default_permission_mode(directory.path(), "antigravity:local").unwrap(),
+            "accept-edits"
+        );
+        assert_eq!(
+            antigravity_default_permission_mode(directory.path(), "antigravity:wsl:other").unwrap(),
+            "bypassPermissions"
+        );
+        assert_eq!(
+            antigravity_default_permission_mode(directory.path(), "antigravity:wsl:unset").unwrap(),
+            "default"
         );
     }
 }

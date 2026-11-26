@@ -66,7 +66,8 @@ export function storeDraft(key, draft) {
     scheduledAtDrafts.set(key, draft.scheduledAtMs);
   else scheduledAtDrafts.delete(key);
   if (key.startsWith("$new:") && typeof draft.permissionMode === "string"
-      && (permissionModeKnown("codex", draft.permissionMode) || permissionModeKnown("claude", draft.permissionMode)))
+      && (permissionModeKnown("codex", draft.permissionMode) || permissionModeKnown("claude", draft.permissionMode)
+        || permissionModeKnown("antigravity", draft.permissionMode)))
     draftPermissionChoices.set(key, draft.permissionMode);
   void persistInputDraft(key).catch(() => {});
 }

@@ -227,7 +227,8 @@ export function mountScheduledTasksPage(root) {
         backend, instanceId, includeAvailable: true
       });
       if (disposed || instanceSelect.value !== instanceId) return;
-      modelRows = Array.isArray(result?.data) ? result.data : [];
+      modelRows = Array.isArray(result?.data)
+        ? result.data.filter(row => row.hiddenByInstance !== true) : [];
       const options = modelRows
         .map(row => ({
           value: row.id || row.model || row.requestModel || "",
