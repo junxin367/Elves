@@ -788,7 +788,7 @@ body {
 }
 
 .light .good {
-  color: hsl(164 74% 62%);
+  color: hsl(151 64% 32%);
 }
 
 .warn {
@@ -3413,7 +3413,8 @@ body {
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  height: 30px;
+  /* 与同行 size="sm" 刷新按钮保持 32px 等高（DESIGN.md 第 39.4 条）。 */
+  height: 32px;
   padding: 0 12px;
   border: 1px solid hsl(var(--border));
   border-radius: 8px;
@@ -6064,8 +6065,22 @@ body {
   animation: toast-progress 4200ms linear forwards;
 }
 
+.toast-card.paused .toast-progress {
+  animation-play-state: paused;
+}
+
+.light .toast-card {
+  box-shadow: 0 14px 38px hsl(220 20% 12% / 0.14);
+}
+
 .toast-card.failed .toast-progress {
   background: hsl(0 72% 61%);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .toast-card {
+    animation: none;
+  }
 }
 
 .toast-icon {

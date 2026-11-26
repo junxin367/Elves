@@ -149,9 +149,15 @@ async fn manager_command(command: String, payload: Value) -> Result<Value, Strin
 async fn ensure_proxy_service() -> Result<Value, String> {
     let executable =
         std::env::current_exe().map_err(|error| format!("读取管理器路径失败：{error}"))?;
-    match elves_core::local_proxy_service::ensure_service_process(&executable)
-        .await
-        .map_err(|error| format!("{error:#}"))?
+    let settings = elves_core::settings::SettingsStore::default()
+        .load()
+        .map_err(|error| format!("读取本地代理设置失败：{error:#}"))?;
+    match elves_core::local_proxy_service::ensure_service_process_for_settings(
+        &executable,
+        &settings,
+    )
+    .await
+    .map_err(|error| format!("{error:#}"))?
     {
         elves_core::local_proxy_service::EnsureServiceResult::Disabled => {
             Ok(json!({"status":"disabled","managed":false}))
@@ -160,6 +166,11 @@ async fn ensure_proxy_service() -> Result<Value, String> {
             Ok(json!({"status":"running","managed":false}))
         }
         elves_core::local_proxy_service::EnsureServiceResult::Started { process_id } => {
+            let _ = elves_core::local_proxy_service::sync_after_settings_change(
+                &executable,
+                &settings,
+            )
+            .await;
             Ok(json!({"status":"started","managed":true,"processId":process_id}))
         }
     }

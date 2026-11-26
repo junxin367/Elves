@@ -534,6 +534,7 @@ export function LocalProxyScreen({
   selectedId,
   loadingDetailId,
   form,
+  onFormChange,
   actions,
 }: {
   status: LocalProxyStatusResult | null;
@@ -543,6 +544,7 @@ export function LocalProxyScreen({
   selectedId: string | null;
   loadingDetailId: string | null;
   form: BackendSettings;
+  onFormChange: (value: BackendSettings) => void;
   actions: Actions;
 }) {
   const selectedEntry = detail?.entry && detail.entry.id === selectedId ? detail.entry : null;
@@ -583,10 +585,17 @@ export function LocalProxyScreen({
   const lanPendingText = !status
     ? "正在读取状态"
     : !status.listening
-      ? "启动后生效"
+      ? status.startupEnabled
+        ? "启动后生效"
+        : "开启随 Elves 启动后生效"
       : !status.lanListening
-        ? "重启后生效"
+        ? "等待代理同步或重启"
         : "未检测到局域网 IPv4";
+  const toggleProxyOption = (patch: Partial<BackendSettings>) => {
+    const next = { ...form, ...patch };
+    onFormChange(next);
+    void actions.saveSettingsValue(next, false);
+  };
   const visibleEntries = useMemo(
     () => filteredEntries.slice((page - 1) * LOCAL_PROXY_LOG_PAGE_SIZE, page * LOCAL_PROXY_LOG_PAGE_SIZE),
     [filteredEntries, page],
@@ -620,23 +629,20 @@ export function LocalProxyScreen({
                 <input
                   checked={form.localProxyStartupEnabled}
                   onChange={(event) =>
-                    void actions.saveSettingsValue(
-                      { ...form, localProxyStartupEnabled: event.currentTarget.checked },
-                      false,
-                    )
+                    toggleProxyOption({ localProxyStartupEnabled: event.currentTarget.checked })
                   }
                   type="checkbox"
                 />
                 <span>随 Elves 启动</span>
               </label>
-              <label className="proxy-inline-toggle">
+              <label
+                className="proxy-inline-toggle"
+                data-tooltip="开启后允许同局域网设备访问本地协议代理，保存后自动重绑监听地址。"
+              >
                 <input
                   checked={form.lanProxyEnabled}
                   onChange={(event) =>
-                    void actions.saveSettingsValue(
-                      { ...form, lanProxyEnabled: event.currentTarget.checked },
-                      false,
-                    )
+                    toggleProxyOption({ lanProxyEnabled: event.currentTarget.checked })
                   }
                   type="checkbox"
                 />
@@ -693,6 +699,11 @@ export function LocalProxyScreen({
                         <span className="proxy-status-address-value">{lanPendingText}</span>
                       </div>
                     )
+                  ) : null}
+                  {status && status.enabled && !status.listening && status.message ? (
+                    <small className="proxy-status-reason" title={status.message}>
+                      {status.message}
+                    </small>
                   ) : null}
                 </div>
               </div>
@@ -1258,7 +1269,7 @@ export function RelayScreen({
   const isNewProfile = !!newProfileDraft;
   const saveRelaySettings = async (next: BackendSettings) => {
     onFormChange(next);
-    await actions.saveSettingsValue(next, true);
+    await actions.saveSettingsValue(next, false, true);
     await actions.refreshRelayFiles();
   };
   const createNewAggregateProfile = () => {

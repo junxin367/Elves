@@ -353,8 +353,9 @@ pub async fn save_settings(settings: BackendSettings) -> CommandResult<SettingsP
     let _guard = settings_write_mutex().lock().await;
     let store = SettingsStore::default();
     let mut settings = normalize_settings_before_save(settings);
-    if let Ok(saved) = store.load() {
-        merge_saved_responses_websocket_capabilities(&mut settings, &saved);
+    let previous_settings = store.load().ok();
+    if let Some(saved) = previous_settings.as_ref() {
+        merge_saved_responses_websocket_capabilities(&mut settings, saved);
     }
     if let Err(error) = ensure_codex_home_path_ready(&settings) {
         return failed(
@@ -373,10 +374,101 @@ pub async fn save_settings(settings: BackendSettings) -> CommandResult<SettingsP
     let timeout = sync_applied_stream_idle_timeout_after_settings_save(&settings);
     let catalog = sync_applied_model_catalog_after_settings_save(&settings);
     let websocket = sync_applied_websocket_after_settings_save(&settings);
+    let proxy_sync = sync_local_proxy_after_settings_save(previous_settings.as_ref(), &settings).await;
     settings_payload(
-        &format!("设置已保存。{provider}{base_url}{timeout}{catalog}{websocket}"),
+        &format!("设置已保存。{provider}{base_url}{timeout}{catalog}{websocket}{proxy_sync}"),
         "设置回读失败",
     )
+}
+
+/// 用户要求在代理管理器中开关“局域网代理”“随 Elves 启动”或更改供应商代理开关后立即同步独立代理服务，
+/// 并返回真实的生效或失败说明，不能只保存文件而不拉起/重绑代理。
+async fn sync_local_proxy_after_settings_save(
+    previous: Option<&BackendSettings>,
+    current: &BackendSettings,
+) -> String {
+    let previous_lan = previous.is_some_and(|saved| saved.lan_proxy_enabled);
+    let previous_startup = previous
+        .map(|saved| saved.local_proxy_startup_enabled)
+        .unwrap_or(true);
+    let previous_desired = previous.map(elves_core::local_proxy_service::desired_state);
+    let current_desired = elves_core::local_proxy_service::desired_state(current);
+    let lan_changed = previous_lan != current.lan_proxy_enabled;
+    let startup_changed = previous_startup != current.local_proxy_startup_enabled;
+    if previous_desired == Some(current_desired) && !lan_changed && !startup_changed {
+        return String::new();
+    }
+    let Ok(executable) = std::env::current_exe() else {
+        return String::new();
+    };
+    let outcome =
+        elves_core::local_proxy_service::sync_after_settings_change(&executable, current).await;
+    if lan_changed {
+        return if current.lan_proxy_enabled {
+            match outcome {
+                elves_core::local_proxy_service::SyncServiceOutcome::Synced {
+                    listening: true,
+                    lan_listening: true,
+                } => " 局域网代理已开启并生效。".to_string(),
+                elves_core::local_proxy_service::SyncServiceOutcome::Failed(error) => {
+                    format!(" 局域网代理已开启，但本地代理同步失败：{error}")
+                }
+                _ if !current.active_relay_uses_protocol_proxy() => {
+                    " 局域网代理已开启，当前供应商未启用本地代理，启用后生效。".to_string()
+                }
+                _ if !current.local_proxy_startup_enabled => {
+                    " 局域网代理已开启，当前已关闭随 Elves 启动，启动代理后生效。".to_string()
+                }
+                _ => " 局域网代理已开启，正在同步代理监听。".to_string(),
+            }
+        } else {
+            match outcome {
+                elves_core::local_proxy_service::SyncServiceOutcome::Synced { .. } => {
+                    " 局域网代理已关闭。".to_string()
+                }
+                elves_core::local_proxy_service::SyncServiceOutcome::Failed(error) => {
+                    format!(" 局域网代理已关闭，但本地代理重绑失败：{error}")
+                }
+                elves_core::local_proxy_service::SyncServiceOutcome::Pending => {
+                    " 局域网代理已关闭，正在同步代理监听。".to_string()
+                }
+            }
+        };
+    }
+    if startup_changed {
+        return if current.local_proxy_startup_enabled {
+            match outcome {
+                elves_core::local_proxy_service::SyncServiceOutcome::Synced {
+                    listening: true,
+                    ..
+                } => " 已开启随 Elves 启动，本地代理已启动。".to_string(),
+                elves_core::local_proxy_service::SyncServiceOutcome::Failed(error) => {
+                    format!(" 已开启随 Elves 启动，但本地代理启动失败：{error}")
+                }
+                _ if !current.active_relay_uses_protocol_proxy() => {
+                    " 已开启随 Elves 启动（当前供应商未启用本地代理）。".to_string()
+                }
+                _ => " 已开启随 Elves 启动，本地代理正在启动。".to_string(),
+            }
+        } else {
+            match outcome {
+                elves_core::local_proxy_service::SyncServiceOutcome::Synced {
+                    listening: false,
+                    ..
+                } => " 已关闭随 Elves 启动，本地代理已停止。".to_string(),
+                elves_core::local_proxy_service::SyncServiceOutcome::Failed(error) => {
+                    format!(" 已关闭随 Elves 启动，但同步代理状态失败：{error}")
+                }
+                _ => " 已关闭随 Elves 启动。".to_string(),
+            }
+        };
+    }
+    match outcome {
+        elves_core::local_proxy_service::SyncServiceOutcome::Failed(error) => {
+            format!(" 但本地代理同步失败：{error}")
+        }
+        _ => String::new(),
+    }
 }
 
 fn normalize_settings_before_save(mut settings: BackendSettings) -> BackendSettings {
@@ -1312,6 +1404,21 @@ pub async fn switch_relay_profile(
     ) {
         Ok(result) => {
             let status = elves_core::relay_config::relay_status_from_home(&home);
+            let proxy_note = if let Ok(executable) = std::env::current_exe() {
+                match elves_core::local_proxy_service::sync_after_settings_change(
+                    &executable,
+                    &result.settings,
+                )
+                .await
+                {
+                    elves_core::local_proxy_service::SyncServiceOutcome::Failed(error) => {
+                        format!(" 但本地代理同步失败：{error}")
+                    }
+                    _ => String::new(),
+                }
+            } else {
+                String::new()
+            };
             log_manager_event(
                 "manager.switch_relay_profile.ok",
                 json!({
@@ -1321,7 +1428,7 @@ pub async fn switch_relay_profile(
                 }),
             );
             ok(
-                "供应商已切换。",
+                &format!("供应商已切换。{proxy_note}"),
                 relay_switch_payload(result.settings, status, result.backup_path),
             )
         }
