@@ -21,6 +21,8 @@ use super::acp::EnvConfig;
 use super::{Antigravity, local_store, now_ms};
 
 const USAGE_REFRESH: Duration = Duration::from_secs(60);
+// 临时开关：true 时 `agy -p "/usage"` 仅在请求带 `manualRefresh`（用户手动点击额度弹窗）时执行，见 subscription_usage。
+const QUOTA_CLI_MANUAL_ONLY: bool = true;
 const USAGE_RETENTION_MS: u64 = 72 * 60 * 60 * 1000;
 const QUERY_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_USAGE_OUTPUT: u64 = 256 * 1024;
@@ -69,9 +71,10 @@ impl Antigravity {
         id: &str,
         allow_probe: bool,
         include_local: bool,
+        manual_refresh: bool,
     ) -> anyhow::Result<Value> {
         let c = self.conversation(id).await?;
-        self.subscription_usage(c.config, allow_probe, include_local)
+        self.subscription_usage(c.config, allow_probe, include_local, manual_refresh)
             .await
     }
 
@@ -80,9 +83,15 @@ impl Antigravity {
         config: EnvConfig,
         allow_probe: bool,
         include_local: bool,
+        manual_refresh: bool,
     ) -> anyhow::Result<Value> {
         config.validate()?;
-        let mut response = self.quota_account_usage(&config, allow_probe).await?;
+        // 用户要求（临时处理）：避免频繁调用官方 `agy -p "/usage"` 触发风控，额度只在用户手动点击额度弹窗时才读取；
+        // 弹窗展开后的本地统计、后台轮询等未带 `manualRefresh` 的请求只返回已有缓存，不启动 agy 进程。
+        // 官方开放后将 QUOTA_CLI_MANUAL_ONLY 改为 false 即可恢复自动刷新；前端 claude-usage.js 的
+        // antigravityUsageManualOnly 须同步核对。本地转录统计仍沿用 allow_probe，不受此开关影响。
+        let allow_cli = allow_probe && (manual_refresh || !QUOTA_CLI_MANUAL_ONLY);
+        let mut response = self.quota_account_usage(&config, allow_cli).await?;
         if response["usage"].is_object() {
             // 若 ACP 目录缓存中已有订阅等级（如 Google AI Pro），实时附带；尚未探测时在后台异步预热，不阻塞额度返回。
             let inst_id = config.instance_id();
@@ -96,7 +105,7 @@ impl Antigravity {
                 if let Some(name) = sanitize_subscription_type(tier["name"].as_str()) {
                     response["usage"]["subscriptionType"] = json!(name);
                 }
-            } else if allow_probe {
+            } else if allow_cli {
                 let service = Arc::clone(self);
                 let probe_cfg = config.clone();
                 tokio::spawn(async move {

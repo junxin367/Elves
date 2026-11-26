@@ -2092,8 +2092,14 @@ impl HarnessController {
                     .subscription_usage(config, allow_probe, include_local)
                     .await
             } else if antigravity_thread {
+                // 用户要求（临时）：Antigravity 额度只在手动点击额度弹窗（manualRefresh）时才调用官方 CLI。
                 self.antigravity
-                    .session_subscription_usage(thread_id.unwrap(), allow_probe, include_local)
+                    .session_subscription_usage(
+                        thread_id.unwrap(),
+                        allow_probe,
+                        include_local,
+                        payload["manualRefresh"] == true,
+                    )
                     .await
                     .map_err(antigravity::api_error)
             } else if requested == Some("antigravity") {
@@ -2103,7 +2109,12 @@ impl HarnessController {
                     self.antigravity_default_config().await?
                 };
                 self.antigravity
-                    .subscription_usage(config, allow_probe, include_local)
+                    .subscription_usage(
+                        config,
+                        allow_probe,
+                        include_local,
+                        payload["manualRefresh"] == true,
+                    )
                     .await
                     .map_err(antigravity::api_error)
             } else {

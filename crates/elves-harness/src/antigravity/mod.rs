@@ -3413,7 +3413,7 @@ mod tests {
                         && s["path"] == format!("antigravity-skill:{}", s["command"].as_str().unwrap_or(""))
                 }));
 
-                let quota = ag.subscription_usage(cfg.clone(), true, true).await.unwrap();
+                let quota = ag.subscription_usage(cfg.clone(), true, true, true).await.unwrap();
                 eprintln!("Quota for {}: {}", inst.id, serde_json::to_string(&quota).unwrap());
                 assert_eq!(quota["ok"], true);
                 assert_eq!(quota["backend"], "antigravity");

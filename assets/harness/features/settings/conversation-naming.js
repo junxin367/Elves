@@ -148,8 +148,13 @@ export function mountConversationNaming(page) {
     });
   }
   function renderInstances() {
-    const choices = availableSessionInstances().map(instance => ({ value: instance.id,
-      label: instance.label, icon: instance.backend, disabled: !instance.ready || !!instance.error }));
+    // 用户要求（临时）：Antigravity 的 agy -p 调用容易触发官方风控，命名实例暂不可选 Antigravity；
+    // 电脑端 conversation_naming/inference.rs 的 ANTIGRAVITY_NAMING_BLOCKED 同步屏蔽，官方开放后一起恢复。
+    const choices = availableSessionInstances().map(instance => {
+      const blocked = instance.backend === "antigravity";
+      return { value: instance.id, label: blocked ? `${instance.label}（暂不可用）` : instance.label,
+        icon: instance.backend, disabled: blocked || !instance.ready || !!instance.error };
+    });
     if (draft?.instanceId && !choices.some(option => option.value === draft.instanceId)) {
       const previous = instances.selectOptions.find(option => option.value === draft.instanceId);
       choices.push({ value: draft.instanceId, label: previous?.label || draft.instanceId,

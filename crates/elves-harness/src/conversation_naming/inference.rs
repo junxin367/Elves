@@ -240,12 +240,20 @@ pub(super) async fn claude(
     outcome
 }
 
+const ANTIGRAVITY_NAMING_BLOCKED: bool = true;
+
 pub(super) async fn antigravity(
     config: &AntigravityConfig,
     settings: &Settings,
     input: &Value,
     authorization: &HarnessAuthorization,
 ) -> anyhow::Result<String> {
+    // 用户要求（临时）：`agy -p` 单次调用容易触发官方风控，先屏蔽 Antigravity 实例作为命名引擎；
+    // 官方开放后将 ANTIGRAVITY_NAMING_BLOCKED 改为 false 恢复。前端 conversation-naming.js 的命名实例下拉同步禁用该实例。
+    anyhow::ensure!(
+        !ANTIGRAVITY_NAMING_BLOCKED,
+        "Antigravity 实例暂不可用于自动命名（已临时屏蔽 agy -p 调用），请改选 Codex 或 Claude 实例"
+    );
     config.validate()?;
     let prompt = format!(
         "{}\n\n严格只输出符合以下 JSON Schema 的单个 JSON 对象，严禁调用任何工具或命令，不要输出 Markdown 代码块：\n{}\n\n输入记录：\n{}",

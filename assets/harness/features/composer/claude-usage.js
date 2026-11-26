@@ -65,6 +65,16 @@ function claudeUsageResolveGroup(value, preferred = "") {
 // 72 小时只是原采集时间的显示上限，不是刷新周期。电脑端先返回保留结果并在后台刷新（refreshing）时，5 秒后复查以尽快换上新数据。
 // 电脑端 crates/elves-harness/src/claude_usage.rs 的 USAGE_REFRESH / USAGE_RETENTION_MS 须同步核对。
 const claudeUsageRefreshMs = 60000, claudeUsageFollowUpMs = 5000, claudeUsageMaxAgeMs = 72 * 60 * 60 * 1000;
+// 用户要求（临时处理）：官方 `agy -p "/usage"` 频繁调用容易触发风控，Antigravity 额度不再自动轮询，
+// 只在用户手动点击底部额度按钮展开弹窗时读取一次（请求带 manualRefresh，距上次读取不足 60 秒则直接用缓存）。
+// 打开前没有有效缓存时按钮显示“5h --  7d --”，不伪造满额；读取失败后按钮保留，可重新点开重试。
+// 弹窗保持打开期间，仅当电脑端返回 refreshing（后台仍在刷新）时才 5 秒复查，属于同一次手动点击的后续。
+// 官方开放后将 antigravityUsageManualOnly 改为 false 恢复自动刷新；电脑端 antigravity/usage.rs 的 QUOTA_CLI_MANUAL_ONLY 须同步核对。
+// Claude 实例不受此开关影响，仍按 60 秒周期刷新。
+const antigravityUsageManualOnly = true;
+function claudeUsageManualOnly(backend) {
+  return backend === "antigravity" && antigravityUsageManualOnly;
+}
 function claudeUsageRefreshDelay(state) {
   return state?.refreshing ? claudeUsageFollowUpMs : claudeUsageRefreshMs;
 }
@@ -116,6 +126,10 @@ function claudeUsageDefaultWindows() {
 function claudeUsageDisplayWindows(state, now = Date.now()) {
   const windows = claudeUsageWindows(state?.value, now);
   if (windows.length) return windows;
+  // 手动刷新模式下没有有效额度（未读取、读取中或读取失败）统一显示“--”，保证按钮可点击重试且不显示假满额。
+  if (state && claudeUsageManualOnly(state.backend)) {
+    return claudeUsageDefaultWindows().map(window => ({ ...window, unread: true }));
+  }
   // 首次查询、缓存刷新在途或会话详情尚未完成时先显示满额；已完成的失败/权限响应不伪造额度。
   return state && (state.checkedAt === 0 || state.pending) ? claudeUsageDefaultWindows() : [];
 }
@@ -440,9 +454,9 @@ function renderClaudeUsageTip(defaultOrBarWindows) {
     const section = element("section", "claude-usage-section");
     const row = element("div", "claude-usage-detail-row");
     row.append(element("span", "", `${window.label}额度`),
-      element("span", "claude-usage-remaining", `剩余 ${window.remaining}%`));
+      element("span", "claude-usage-remaining", window.unread ? "剩余 --" : `剩余 ${window.remaining}%`));
     const track = element("div", "claude-usage-track"), fill = element("div", "claude-usage-fill");
-    track.setAttribute("aria-hidden", "true"); fill.style.width = `${window.remaining}%`; track.append(fill);
+    track.setAttribute("aria-hidden", "true"); fill.style.width = window.unread ? "0%" : `${window.remaining}%`; track.append(fill);
     const metrics = claudeUsageMetrics(window), numbers = element("div", "claude-usage-metrics");
     const stats = element("div", "claude-usage-stats");
     for (const estimated of [false, true]) {
@@ -457,7 +471,8 @@ function renderClaudeUsageTip(defaultOrBarWindows) {
       stats.append(item);
     }
     const unstarted = isAntigravityUsage && window.resetAt == null && window.usedPercentage === 0 && !window.default;
-    const reset = element("span", "claude-usage-reset", unstarted ? "未开始" : claudeUsageResetText(window.resetAt));
+    const reset = element("span", "claude-usage-reset", window.unread ? (claudeUsageState?.pending ? "读取中" : "读取失败，可重新点开重试")
+      : unstarted ? "未开始" : claudeUsageResetText(window.resetAt));
     const resetTitle = claudeUsageResetTitle(value, window.resetAt);
     if (resetTitle) {
       reset.title = resetTitle;
@@ -484,8 +499,9 @@ function renderClaudeUsage() {
   fitComposerMetrics();
   if (!windows.length) { closeClaudeUsageTip(); return; }
   const isDefault = windows[0]?.default === true;
+  const isUnread = windows[0]?.unread === true;
   const activeGroup = claudeUsageResolveGroup(claudeUsageState?.value);
-  const signature = JSON.stringify([isDefault ? "default" : "remaining", activeGroup?.id || "",
+  const signature = JSON.stringify([isUnread ? "unread" : isDefault ? "default" : "remaining", activeGroup?.id || "",
     ...windows.map(window => [window.key, window.remaining])]);
   if (trigger.dataset.usage !== signature) {
     trigger.dataset.usage = signature;
@@ -493,7 +509,7 @@ function renderClaudeUsage() {
     const nodes = [];
     for (const window of windows) {
       const row = element("span", "claude-usage-window");
-      row.append(element("span", "", window.short), element("span", "claude-usage-percent", `${window.remaining}%`));
+      row.append(element("span", "", window.short), element("span", "claude-usage-percent", window.unread ? "--" : `${window.remaining}%`));
       nodes.push(row);
     }
     trigger.replaceChildren(...nodes);
@@ -501,7 +517,8 @@ function renderClaudeUsage() {
     const brandName = context?.backend === "antigravity" ? "Antigravity" : "Claude";
     const groupText = activeGroup ? `${activeGroup.label} 分组，` : "";
     // 用户要求默认脱敏同时覆盖底部按钮的读屏文本，不能只在弹层视觉上隐藏完整邮箱。
-    trigger.setAttribute("aria-label", `${brandName} ${account ? `登录账号 ${claudeUsageMaskAccount(account)}，` : "账号信息，"}${groupText}${isDefault ? "真实额度读取中，当前按满额显示，" : ""}${windows.map(window => `${window.short} ${window.remaining}%`).join("，")}，查看重置时间`);
+    trigger.setAttribute("aria-label", isUnread ? `${brandName} 额度尚未读取，点击读取`
+      : `${brandName} ${account ? `登录账号 ${claudeUsageMaskAccount(account)}，` : "账号信息，"}${groupText}${isDefault ? "真实额度读取中，当前按满额显示，" : ""}${windows.map(window => `${window.short} ${window.remaining}%`).join("，")}，查看重置时间`);
   }
   renderClaudeUsageTip(windows);
   fitComposerMetrics();
@@ -519,7 +536,9 @@ function scheduleClaudeUsageUpdate() {
       [metrics?.observedAtMs, metrics?.costObservedAtMs, metrics?.tokensObservedAtMs]) : [])]
     .filter(claudeUsageNumber).map(at => at + claudeUsageMaxAgeMs).filter(at => at > now);
   // 刷新和 72 小时数据失效分别计时；失败退避不能延长真实数据寿命，窗口到期也不能继续显示旧额度。
-  const deadlines = [...(context.canRead && !state.pending ? [state.checkedAt + claudeUsageRefreshDelay(state)] : []), ...expiry,
+  // 手动刷新模式下不排自动刷新；仅弹窗打开且电脑端仍在后台刷新时才复查（见文件顶部 antigravityUsageManualOnly 说明）。
+  const autoRefresh = !claudeUsageManualOnly(state.backend) || (state.refreshing === true && !!state.tip);
+  const deadlines = [...(context.canRead && !state.pending && autoRefresh ? [state.checkedAt + claudeUsageRefreshDelay(state)] : []), ...expiry,
     ...windows.filter(window => window.resetAt != null).map(window => window.resetAt)];
   if (!deadlines.length) { state.timer = null; return; }
   state.timer = setTimeout(() => {
@@ -527,7 +546,7 @@ function scheduleClaudeUsageUpdate() {
     state.timer = null; syncClaudeUsage();
   }, Math.max(250, Math.min(...deadlines) - now + 5));
 }
-export function syncClaudeUsage() {
+export function syncClaudeUsage({ manual = false } = {}) {
   if (!$("#claude-usage")) return;
   const context = claudeUsageContext();
   if (!context) { resetClaudeUsage(); return; }
@@ -535,7 +554,7 @@ export function syncClaudeUsage() {
     // 切换实例时原子替换数据并直接渲染目标缓存，不能先 hidden=true 再等待会话详情。
     resetClaudeUsage({ hideTrigger: false });
     const cached = claudeUsageCache.get(context.key);
-    claudeUsageState = { key: context.key, owner: context.owner, value: cached?.value || null,
+    claudeUsageState = { key: context.key, owner: context.owner, backend: context.backend, value: cached?.value || null,
       checkedAt: cached?.checkedAt || 0, refreshing: cached?.refreshing === true, pending: false, controller: null, timer: null, tip: null,
       details: cached?.details || null, detailsRead: cached?.detailsRead || null, detailsPending: false, detailsController: null };
   }
@@ -543,12 +562,16 @@ export function syncClaudeUsage() {
   if (!context.canRead) pauseClaudeUsage(state);
   renderClaudeUsage();
   if (!context.canRead) { scheduleClaudeUsageUpdate(); return; }
-  if (!state.pending && Date.now() - state.checkedAt >= claudeUsageRefreshDelay(state)) {
+  // 手动刷新模式：只有用户点击额度按钮（manual）或同一次点击触发的后台刷新复查（refreshing 且弹窗打开）才读取。
+  const manualOnly = claudeUsageManualOnly(context.backend);
+  const mayRead = !manualOnly || manual || (state.refreshing === true && !!state.tip);
+  if (mayRead && !state.pending && Date.now() - state.checkedAt >= claudeUsageRefreshDelay(state)) {
     state.pending = true;
     const controller = new AbortController();
     state.controller = controller;
     // 用户要求额度按账号所属实例显示；授权或实例切换后丢弃迟到响应，后台页不轮询。
-    void api("/api/read/claudeUsage", context.payload, undefined, controller.signal, { resourcePriority: "background" })
+    void api("/api/read/claudeUsage", manualOnly ? { ...context.payload, manualRefresh: true } : context.payload,
+      undefined, controller.signal, { resourcePriority: "background" })
       .then(result => {
         if (claudeUsageState !== state || state.controller !== controller || controller.signal.aborted) return;
         if (result?.ok !== true || result.backend !== context.backend || result.instanceId !== context.instanceId)
@@ -610,7 +633,8 @@ export function syncClaudeUsage() {
   scheduleClaudeUsageUpdate();
 }
 function showClaudeUsageTip() {
-  syncClaudeUsage();
+  // 用户点击额度按钮是 Antigravity 额度的唯一手动刷新入口。
+  syncClaudeUsage({ manual: true });
   const state = claudeUsageState, trigger = $("#claude-usage");
   if (!trigger?.isConnected || trigger.hidden || !state) return;
   const windows = claudeUsageDisplayWindows(state);
