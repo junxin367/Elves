@@ -1422,7 +1422,7 @@ impl HarnessController {
                 .action(self, action, &payload, authorization)
                 .await;
         }
-        if matches!(action, "createScheduledMessage" | "cancelScheduledMessage") {
+        if matches!(action, "createScheduledMessage" | "cancelScheduledMessage" | "updateScheduledMessage") {
             return self
                 .scheduled_messages
                 .action(self, action, &payload, authorization)
@@ -4547,6 +4547,7 @@ async fn session(
     response["capabilities"]["warmSession"] = json!(true);
     // 定时发送同样声明为能力：内置旧网页包不会出现，新网页包连旧后台时也不显示入口、不读取定时消息。
     response["capabilities"]["scheduledMessages"] = json!(true);
+    response["capabilities"]["scheduledMessageEditing"] = json!(true);
     response["transport"] = json!(if state.desktop { "desktop" } else { "remote" });
     // 代理设置和会话管理已迁移到独立管理器；Harness 不再声明管理页面或管理 API 能力。
     response["capabilities"]["management"] = json!(false);
@@ -5757,6 +5758,7 @@ async fn action(
             | "runScheduledTask"
             | "createScheduledMessage"
             | "cancelScheduledMessage"
+            | "updateScheduledMessage"
     ) {
         return Err(ApiError::new(404, "不支持的会话操作"));
     }
@@ -5794,6 +5796,9 @@ async fn action(
     }
     if action == "createScheduledMessage" {
         validate_scheduled_message_payload(&payload)?;
+    }
+    if action == "updateScheduledMessage" {
+        scheduled_messages::validate_update(&payload)?;
     }
     if action == "cancelScheduledMessage" {
         if notification_thread_id(&payload["threadId"]).is_none()

@@ -16,7 +16,7 @@ use super::{ApiError, HarnessAuthorization, HarnessController};
 const MAX_MESSAGES: usize = 256;
 const MAX_PROMPT_BYTES: usize = 128 * 1024;
 // 定时消息可带图片和文件（正文内联保存），而每次状态变化都整份重写存档：总量必须有上限，
-// 与其他持久化存档的单文件上限一致。只拦新增，已超限的存档仍可取消、到期清理等缩小操作。
+// 与其他持久化存档的单文件上限一致。新增和编辑不能继续扩大超限存档，仍允许缩小与派发状态记录。
 const MAX_STORE_BYTES: usize = 64 * 1024 * 1024;
 // 用户要求定时发送只允许已有会话，时间按客户端传入的用户本地时间戳保存，最多未来 24 小时。
 const MAX_DELAY_MS: u64 = 24 * 60 * 60 * 1000;
@@ -35,6 +35,10 @@ struct ScheduledMessage {
     last_error: Option<String>,
     created_at_ms: u64,
     updated_at_ms: u64,
+    #[serde(default)]
+    dispatch_started: bool,
+    #[serde(default)]
+    dispatch_id: Option<String>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -65,6 +69,7 @@ impl ScheduledMessages {
                     // execute 会复用原回执，不会重复发送已受理的普通消息。
                     for message in &mut stored.messages {
                         if message.status == "running" {
+                            message.dispatch_started = true;
                             message.status = "scheduled".into();
                         }
                     }
@@ -151,6 +156,12 @@ impl ScheduledMessages {
                 }));
                 Ok(json!({"ok":true,"threadId":thread_id,"messageId":message_id}))
             }
+            "updateScheduledMessage" => {
+                authorization.check().await?;
+                let message = self.update(payload, authorization).await?;
+                self.publish_changed(controller, &message, "updated");
+                Ok(json!({"ok":true,"message":public_message(&message)}))
+            }
             _ => Err(ApiError::new(404, "不支持的定时消息操作").into()),
         }
     }
@@ -194,7 +205,10 @@ impl ScheduledMessages {
             self.publish_changed(controller, &message, "failed");
             return;
         };
-        let request_id = format!("scheduled-{}", message.id);
+        let request_id = message
+            .dispatch_id
+            .clone()
+            .unwrap_or_else(|| format!("scheduled-{}", message.id));
         let result = loop {
             let result = controller
                 .execute(
@@ -326,6 +340,8 @@ impl ScheduledMessages {
             last_error: None,
             created_at_ms: now,
             updated_at_ms: now,
+            dispatch_started: false,
+            dispatch_id: None,
         };
         let mut state = self.state.lock().await;
         if state.load_failed {
@@ -339,6 +355,77 @@ impl ScheduledMessages {
             Ok(())
         })?;
         Ok(message)
+    }
+
+    async fn update(
+        &self,
+        payload: &Value,
+        authorization: &HarnessAuthorization,
+    ) -> Result<ScheduledMessage, ApiError> {
+        validate_update(payload)?;
+        let thread_id = thread_id(payload)?;
+        let id = message_id(payload)?;
+        let mut state = self.state.lock().await;
+        if state.load_failed {
+            return Err(ApiError::new(
+                503,
+                "定时消息存储暂不可用，请重启 Harness 后重试",
+            ));
+        }
+        let message = state
+            .stored
+            .messages
+            .iter()
+            .find(|message| message.id == id && message.thread_id == thread_id)
+            .ok_or_else(|| ApiError::new(404, "定时消息不存在"))?;
+        if let Some(reason) = edit_block(message) {
+            return Err(ApiError::new(409, reason));
+        }
+        // 用户要求修改已创建任务：按打开时的版本原位保存，到期认领与修改共用锁，不能覆盖其他端的更新。
+        if payload["expectedUpdatedAtMs"].as_u64() != Some(message.updated_at_ms) {
+            return Err(ApiError::new(409, "定时消息已变化，请关闭后重新打开编辑"));
+        }
+        let now = super::now_ms();
+        let send_at = payload["sendAtMs"].as_u64().unwrap();
+        if send_at <= now || send_at > now.saturating_add(MAX_DELAY_MS) {
+            return Err(ApiError::new(400, "定时发送只能设置在未来 24 小时内"));
+        }
+        let mut next = message.clone();
+        next.payload["prompt"] = payload["prompt"].clone();
+        let has_attachments = ["images", "files"].iter().any(|key| {
+            next.payload[key]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        });
+        if payload["prompt"].as_str().unwrap().trim().is_empty() && !has_attachments {
+            return Err(ApiError::new(400, "消息不能为空"));
+        }
+        // 编辑仅替换正文与时间，原图片、文件、Skill 和模型设置完整保留，并按本次授权核对文件来源。
+        super::input_files::validate_for_device(
+            &next.payload,
+            authorization.device.key_id == super::desktop::DEVICE_KEY_ID,
+        )?;
+        if message.status == "error" {
+            // 仅确定失败才允许重新安排；新派发身份避开旧失败回执，结果未知时禁止借编辑重发。
+            next.dispatch_id = Some(format!("scheduled-{}", Uuid::new_v4()));
+            next.payload["clientUserMessageId"] = json!(Uuid::new_v4().to_string());
+        }
+        next.dispatch_started = false;
+        next.status = "scheduled".into();
+        next.last_error = None;
+        next.send_at_ms = send_at;
+        next.updated_at_ms = now.max(message.updated_at_ms.saturating_add(1));
+        next.device_id = authorization.device.id.clone();
+        next.key_id = authorization.device.key_id.clone();
+        save_locked(&self.path, &mut state, |stored| {
+            *stored
+                .messages
+                .iter_mut()
+                .find(|message| message.id == id)
+                .unwrap() = next.clone();
+            Ok(())
+        })?;
+        Ok(next)
     }
 
     async fn claim_due(&self, now: u64) -> Vec<ScheduledMessage> {
@@ -370,7 +457,8 @@ impl ScheduledMessages {
         }
         for message in &mut due {
             message.status = "running".into();
-            message.updated_at_ms = now;
+            message.dispatch_started = true;
+            message.updated_at_ms = now.max(message.updated_at_ms.saturating_add(1));
         }
         // 状态只在写盘成功后生效：保存失败时仍是“等待发送”，下一轮再认领。
         let claimed: HashSet<&str> = due.iter().map(|message| message.id.as_str()).collect();
@@ -378,7 +466,8 @@ impl ScheduledMessages {
             for message in &mut stored.messages {
                 if claimed.contains(message.id.as_str()) {
                     message.status = "running".into();
-                    message.updated_at_ms = now;
+                    message.dispatch_started = true;
+                    message.updated_at_ms = now.max(message.updated_at_ms.saturating_add(1));
                 }
             }
             Ok(())
@@ -403,7 +492,8 @@ impl ScheduledMessages {
             if let Some(message) = stored.messages.iter_mut().find(|message| message.id == id) {
                 message.status = status.into();
                 message.last_error = Some(reason.chars().take(512).collect());
-                message.updated_at_ms = super::now_ms();
+                message.updated_at_ms =
+                    super::now_ms().max(message.updated_at_ms.saturating_add(1));
             }
             Ok(())
         });
@@ -429,7 +519,8 @@ impl ScheduledMessages {
             return Err(ApiError::new(404, "定时消息不存在"));
         };
         // 已进入发送流程的消息删除记录也拦不住发送，不能让用户误以为取消成功。
-        if message.status == "running" {
+        if message.status == "running" || message.status == "scheduled" && message.dispatch_started
+        {
             return Err(ApiError::new(409, "定时消息正在发送，无法取消"));
         }
         save_locked(&self.path, &mut state, |stored| {
@@ -499,6 +590,10 @@ fn send_outcome(result: Result<Value, ApiError>) -> Result<(), (&'static str, St
 }
 
 fn public_message(message: &ScheduledMessage) -> Value {
+    let attachment_count: usize = ["images", "files"]
+        .iter()
+        .map(|key| message.payload[key].as_array().map_or(0, Vec::len))
+        .sum();
     json!({
         "id":message.id,
         "threadId":message.thread_id,
@@ -507,8 +602,47 @@ fn public_message(message: &ScheduledMessage) -> Value {
         "clientUserMessageId":message.payload["clientUserMessageId"],
         "status":message.status,
         "lastError":message.last_error,
-        "createdAtMs":message.created_at_ms
+        "createdAtMs":message.created_at_ms,
+        "updatedAtMs":message.updated_at_ms,
+        "canEdit":edit_block(message).is_none(),
+        "editDisabledReason":edit_block(message),
+        "canCancel":!(message.status == "running" || message.status == "scheduled" && message.dispatch_started),
+        "attachmentCount":attachment_count
     })
+}
+
+fn edit_block(message: &ScheduledMessage) -> Option<&'static str> {
+    match message.status.as_str() {
+        "scheduled" if !message.dispatch_started => None,
+        "error" => None,
+        "unknown" => Some("发送结果待确认，不能修改或重新安排"),
+        _ => Some("定时消息已进入发送流程，无法编辑"),
+    }
+}
+
+pub(crate) fn validate_update(payload: &Value) -> Result<(), ApiError> {
+    if payload.as_object().is_none_or(|object| {
+        object.keys().any(|key| {
+            ![
+                "threadId",
+                "messageId",
+                "expectedUpdatedAtMs",
+                "prompt",
+                "sendAtMs",
+            ]
+            .contains(&key.as_str())
+        })
+    }) || payload["prompt"]
+        .as_str()
+        .is_none_or(|text| text.len() > MAX_PROMPT_BYTES)
+        || payload["expectedUpdatedAtMs"].as_u64().is_none()
+        || payload["sendAtMs"].as_u64().is_none()
+    {
+        return Err(ApiError::new(400, "定时消息编辑参数无效"));
+    }
+    thread_id(payload)?;
+    message_id(payload)?;
+    Ok(())
 }
 
 fn thread_id(payload: &Value) -> Result<String, ApiError> {
@@ -550,10 +684,23 @@ fn save_locked_within(
         .checked_add(1)
         .ok_or_else(|| ApiError::new(409, "定时消息版本已达上限"))?;
     let bytes = serde_json::to_vec(&next).map_err(|error| ApiError::new(500, error.to_string()))?;
-    if next.messages.len() > state.stored.messages.len() && bytes.len() > limit {
+    if bytes.len() > limit
+        && next.messages.iter().any(|next| {
+            state
+                .stored
+                .messages
+                .iter()
+                .find(|old| old.id == next.id)
+                .is_none_or(|old| old.payload != next.payload)
+        })
+        && bytes.len()
+            > serde_json::to_vec(&state.stored)
+                .map_err(|error| ApiError::new(500, error.to_string()))?
+                .len()
+    {
         return Err(ApiError::new(
             409,
-            "定时消息总大小已达上限，请先取消部分定时消息",
+            "定时消息总大小已达上限，请缩短内容或先删除部分定时消息",
         ));
     }
     crate::settings::atomic_write(path, &bytes)
@@ -584,6 +731,8 @@ mod tests {
             last_error: None,
             created_at_ms,
             updated_at_ms: created_at_ms,
+            dispatch_started: false,
+            dispatch_id: None,
         }
     }
 
@@ -687,6 +836,113 @@ mod tests {
             snapshot["messages"][0]["status"], "scheduled",
             "重启后未完成的发送恢复为等待发送，由原回执去重"
         );
+        assert_eq!(
+            snapshot["messages"][0]["canEdit"], false,
+            "原回执尚未核对时不能通过编辑改写在途发送"
+        );
+        assert_eq!(snapshot["messages"][0]["canCancel"], false);
+    }
+
+    #[tokio::test]
+    async fn edits_keep_payload_and_identity_check_versions_and_serialize_with_dispatch() {
+        let (directory, authorization) = crate::tests::service_dispatch_fixture().await;
+        let thread = "01234567-89ab-4cde-8123-456789abcdef";
+        let mut original = message(1, thread, super::super::now_ms() + 60_000, 1, 1);
+        original.payload = json!({"threadId":thread,"prompt":"原内容","clientUserMessageId":"original",
+            "images":[{"dataUrl":"data:image/png;base64,AQ=="}],
+            "skills":[{"name":"test","path":"C:/test/SKILL.md"}],"model":"test-model","reasoningEffort":"high"});
+        let store = store_with(directory.path(), vec![original.clone()]);
+        let request = json!({"threadId":thread,"messageId":original.id,"expectedUpdatedAtMs":1,
+            "prompt":"修改内容","sendAtMs":super::super::now_ms() + 120_000});
+        let changed = store.update(&request, &authorization).await.unwrap();
+        assert_eq!(changed.id, original.id);
+        assert_eq!(changed.payload["prompt"], "修改内容");
+        for key in [
+            "images",
+            "skills",
+            "model",
+            "reasoningEffort",
+            "clientUserMessageId",
+        ] {
+            assert_eq!(
+                changed.payload[key], original.payload[key],
+                "{key} 必须保留"
+            );
+        }
+        assert!(changed.updated_at_ms > original.updated_at_ms);
+        assert_eq!(
+            store
+                .update(&request, &authorization)
+                .await
+                .unwrap_err()
+                .code,
+            409,
+            "旧页面不能覆盖新修改"
+        );
+        let mut invalid = request.clone();
+        invalid["expectedUpdatedAtMs"] = json!(changed.updated_at_ms);
+        invalid["sendAtMs"] = json!(super::super::now_ms() + MAX_DELAY_MS + 60_000);
+        assert_eq!(
+            store
+                .update(&invalid, &authorization)
+                .await
+                .unwrap_err()
+                .code,
+            400
+        );
+        invalid["sendAtMs"] = json!(1);
+        assert_eq!(
+            store
+                .update(&invalid, &authorization)
+                .await
+                .unwrap_err()
+                .code,
+            400
+        );
+        invalid["sendAtMs"] = changed.send_at_ms.into();
+        invalid["threadId"] = json!("01234567-89ab-4cde-8123-456789abcdee");
+        assert_eq!(
+            store
+                .update(&invalid, &authorization)
+                .await
+                .unwrap_err()
+                .code,
+            404
+        );
+        assert!(
+            validate_update(&json!({"threadId":thread,"messageId":original.id,
+            "expectedUpdatedAtMs":1,"prompt":"x","sendAtMs":1,"model":"replace"}))
+            .is_err()
+        );
+        let reloaded = ScheduledMessages::new(directory.path()).unwrap();
+        assert_eq!(
+            reloaded.snapshot(thread).await.unwrap()["messages"][0]["prompt"],
+            "修改内容"
+        );
+        assert!(
+            store.claim_due(changed.send_at_ms - 1).await.is_empty(),
+            "改期后旧时间不派发"
+        );
+        assert_eq!(store.claim_due(changed.send_at_ms).await.len(), 1);
+        assert_eq!(
+            store
+                .update(&request, &authorization)
+                .await
+                .unwrap_err()
+                .code,
+            409
+        );
+        store
+            .finish_error(&changed.id, "unknown", "可能已发出")
+            .await;
+        assert_eq!(
+            store
+                .update(&request, &authorization)
+                .await
+                .unwrap_err()
+                .code,
+            409
+        );
     }
 
     struct SendBridge {
@@ -780,6 +1036,37 @@ mod tests {
         .unwrap()
         .0;
         assert_eq!(created["state"], "completed", "{created}");
+        let original = &created["result"]["message"];
+        let mut edit_headers = axum::http::HeaderMap::new();
+        edit_headers.insert(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_static("codex_elves_device=scheduled-cookie"),
+        );
+        edit_headers.insert(
+            "idempotency-key",
+            axum::http::HeaderValue::from_static("edit-1"),
+        );
+        let edited = crate::action(
+            axum::extract::State(crate::WebState {
+                desktop: false,
+                controller: controller.clone(),
+                settings: Default::default(),
+            }),
+            axum::extract::Path("updateScheduledMessage".to_string()),
+            edit_headers,
+            axum::Json(json!({"threadId":thread_id,"messageId":original["id"],
+                "expectedUpdatedAtMs":original["updatedAtMs"],"prompt":"修改后到点发送",
+                "sendAtMs":crate::now_ms() + 90_000})),
+        )
+        .await
+        .map_err(|error| error.to_string())
+        .unwrap()
+        .0;
+        assert_eq!(edited["state"], "completed", "{edited}");
+        assert_eq!(
+            edited["result"]["message"]["id"], original["id"],
+            "编辑原位保存，不删除再创建"
+        );
         assert!(
             store.claim_due(crate::now_ms()).await.is_empty(),
             "未到时间不发送"
@@ -798,8 +1085,10 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(sends().len(), 1);
-        assert_eq!(sends()[0]["prompt"], "到点发送");
+        assert_eq!(sends()[0]["prompt"], "修改后到点发送");
         assert_eq!(sends()[0]["clientUserMessageId"], "create-1");
+        assert_eq!(sends()[0]["skills"][0]["name"], "s");
+        assert_eq!(sends()[0]["model"], "gpt-fixture");
         assert!(sends()[0].get("sendAtMs").is_none() && sends()[0].get("scheduledAtMs").is_none());
         let empty = store.snapshot(thread_id).await.unwrap();
         assert_eq!(empty["messages"], json!([]), "发送完成后删除定时消息");
@@ -818,6 +1107,27 @@ mod tests {
         assert!(
             store.claim_due(crate::now_ms() + 120_000).await.is_empty(),
             "失败的定时消息不再自动认领"
+        );
+        let failed = &failed["messages"][0];
+        let rescheduled = controller.execute(device, "edit-failed".into(), "updateScheduledMessage".into(),
+            json!({"threadId":thread_id,"messageId":failed["id"],"expectedUpdatedAtMs":failed["updatedAtMs"],
+                "prompt":"修改后重试","sendAtMs":crate::now_ms() + 60_000})).await.unwrap();
+        assert_eq!(rescheduled["state"], "completed", "{rescheduled}");
+        bridge.send_fails.store(false, Ordering::SeqCst);
+        let due = store.claim_due(crate::now_ms() + 120_000).await;
+        store.dispatch(&controller, due[0].clone()).await;
+        assert_eq!(
+            sends().len(),
+            3,
+            "明确失败后编辑重新安排使用新回执，实际只多发送一次"
+        );
+        assert_eq!(sends()[2]["prompt"], "修改后重试");
+        assert_ne!(sends()[2]["clientUserMessageId"], "create-2");
+        assert!(
+            store.snapshot(thread_id).await.unwrap()["messages"]
+                .as_array()
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -850,6 +1160,19 @@ mod tests {
         assert!(
             std::fs::read(&path).unwrap().len() <= limit,
             "磁盘上的存档也没有被写成超限内容"
+        );
+        let refused_edit = save_locked_within(&path, &mut state, limit, |stored| {
+            stored.messages[0].payload["prompt"] = json!("x".repeat(5000));
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(refused_edit.code, 409, "编辑不能通过保持条数绕过存储上限");
+        assert_eq!(
+            state.stored.messages[0].payload["prompt"]
+                .as_str()
+                .unwrap()
+                .len(),
+            1200
         );
         // 存档已经超限（例如以前没有上限时写入）：取消、到期清理等缩小操作仍必须成功。
         save_locked_within(&path, &mut state, 100, |stored| {

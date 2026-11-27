@@ -18523,8 +18523,9 @@ test("输入时提前启动 Claude CLI：请求失败静默，不提示也不影
 
 // 定时发送：整模块装入 vm，DOM 只保留渲染用到的属性。
 function scheduledMessageHarness(overrides = {}) {
-  const nodes = [], notices = [], reads = [], actions = [];
+  const nodes = [], notices = [], reads = [], actions = [], menus = [];
   const element = (tag, className = "", text = "") => {
+    const listeners = new Map();
     const node = {
       tag, className, textContent: text, dataset: {}, children: [], disabled: false, hidden: false,
       isConnected: true, open: false,
@@ -18532,7 +18533,8 @@ function scheduledMessageHarness(overrides = {}) {
       append: (...children) => node.children.push(...children),
       replaceChildren: (...children) => { node.children = children; },
       setAttribute(name, value) { node[`attr:${name}`] = value; },
-      addEventListener() {}, focus() {}, showModal() { node.open = true; }, close() { node.open = false; },
+      addEventListener(type, listener) { listeners.set(type, listener); }, focus() {},
+      showModal() { node.open = true; }, close() { node.open = false; listeners.get("close")?.(); },
     };
     nodes.push(node);
     return node;
@@ -18542,7 +18544,12 @@ function scheduledMessageHarness(overrides = {}) {
     ? node : node.children.map(child => find(child, className)).find(Boolean);
   const context = vm.createContext({
     selectedId: "thread-a", selectionVersion: 1, connected: true, thread: { id: "thread-a" },
-    session: { capabilities: { scheduledMessages: true } }, selectedGoal: null,
+    nativeConnectionVersion: 1, privateInputScope: value => value?.device?.id || "fixture",
+    session: { capabilities: { scheduledMessages: true, scheduledMessageEditing: true } }, selectedGoal: null,
+    TextEncoder, queueMicrotask, document: { body: { append() {}, classList: { add() {}, toggle() {} } }, querySelector() {} },
+    window: { addEventListener() {} },
+    activePopup: null, closePopup() {}, closeComposerMenus() {}, confirmAction: async () => true,
+    togglePopup: trigger => menus.push(trigger), openPopup: trigger => menus.push(trigger),
     $: (selector, base) => base ? find(base, selector.slice(1)) : selector === "#scheduled-area" ? root : null,
     element, button: (label, ariaLabel, onClick, className) => Object.assign(element("button", className, label), { ariaLabel, onClick }),
     icon: name => element("span", `ui-icon ${name}`),
@@ -18561,11 +18568,13 @@ function scheduledMessageHarness(overrides = {}) {
     remoteSource.moduleText("features/composer/scheduled-message.js"),
   ].join("\n"), context);
   const rows = () => root.children;
-  return { context, root, rows, find, nodes, reads, actions, notices };
+  return { context, root, rows, find, nodes, reads, actions, notices, menus };
 }
 const settle = () => new Promise(resolve => setImmediate(resolve));
 const scheduledRow = (id, status, extra = {}) => ({
-  id, threadId: "thread-a", sendAtMs: Date.now() + 60_000, prompt: `消息 ${id}`, status, ...extra,
+  id, threadId: "thread-a", sendAtMs: Date.now() + 180_000, prompt: `消息 ${id}`, status,
+  updatedAtMs: 10, canEdit: ["scheduled", "error"].includes(status), canCancel: status !== "running",
+  attachmentCount: 0, ...extra,
 });
 
 test("时间弹窗点确定后先画出编辑框标记再记录草稿，首次选择的时间不丢失", () => {
@@ -18604,7 +18613,14 @@ test("定时消息列表按状态显示标签和原因，发送中的消息不�
   const label = row => h.find(row, "scheduled-message-status")?.textContent ?? null;
   assert.deepEqual(h.rows().map(label), [null, "发送中", "发送失败", "结果待确认"]);
   assert.deepEqual(h.rows().map(row => row.dataset.status), ["scheduled", "running", "error", "unknown"]);
-  assert.deepEqual(h.rows().map(row => h.find(row, "scheduled-message-remove").disabled), [false, true, false, false]);
+  const menus = h.rows().map(row => h.find(row, "scheduled-message-menu"));
+  assert.deepEqual(menus.map(menu => menu.menuOptions[1].disabled), [false, true, false, false]);
+  assert.deepEqual(menus.map(menu => menu.menuOptions[0].disabled), [false, true, false, true]);
+  assert.ok(menus.every(menu => menu.children[0].className.includes("more")));
+  assert.deepEqual(Array.from(menus[0].menuOptions, option => option.label), ["编辑", "删除"]);
+  menus[0].onClick();
+  assert.equal(h.menus[0], menus[0], "单击只打开菜单，不删除任务");
+  assert.equal(h.actions.length, 0);
   assert.equal(h.find(h.rows()[2], "scheduled-message-reason").textContent, "会话已被其他应用打开");
   assert.ok(h.rows().every(row => row.className === "scheduled-message"), "行只用基础类名，状态走 data-status，不与原因文字共用样式");
 });
@@ -18648,6 +18664,106 @@ test("取消定时消息被服务端拒绝时提示原因", async () => {
   await done;
   assert.equal(h.actions[0].url, "/api/action/cancelScheduledMessage");
   assert.deepEqual(h.notices, [{ message: "定时消息正在发送，无法取消", error: true }]);
+});
+
+test("编辑定时发送原位保存正文和时间，成功前保留原任务且不改动输入框草稿", async () => {
+  const h = scheduledMessageHarness({
+    rememberDraft() { assert.fail("编辑已创建任务不能覆盖输入框草稿"); },
+    renderSelectedSkills() { assert.fail("编辑已创建任务不修改输入框标记"); },
+  });
+  const message = scheduledRow("edit", "scheduled", { attachmentCount: 2 });
+  const load = h.context.reloadScheduledMessages();
+  h.reads[0].resolve({ messages: [message] }); await load;
+  h.find(h.rows()[0], "scheduled-message-menu").menuOptions[0].action();
+  const dialog = h.nodes.find(node => node.className === "scheduled-send-dialog"), fields = dialog.scheduleFields;
+  assert.equal(fields.prompt.value, message.prompt);
+  assert.equal(fields.attachments.textContent, "已附加 2 个附件");
+  fields.prompt.value = "修改后的内容";
+  fields.input.value = h.context.localInputValue(Date.now() + 600_000);
+  const save = fields.confirm.onClick();
+  assert.equal(dialog.open, true);
+  assert.equal(fields.confirm.disabled, true);
+  assert.equal(h.actions[0].url, "/api/action/updateScheduledMessage");
+  assert.deepEqual(JSON.parse(JSON.stringify(h.actions[0].payload)), {
+    threadId: "thread-a", messageId: "edit", expectedUpdatedAtMs: 10,
+    prompt: "修改后的内容", sendAtMs: Date.parse(fields.input.value),
+  });
+  assert.equal(h.find(h.rows()[0], "scheduled-message-text").textContent, message.prompt);
+  h.actions[0].resolve({ state: "completed", result: { ok: true } });
+  await settle();
+  h.reads[1].resolve({ messages: [{ ...message, prompt: "修改后的内容", updatedAtMs: 11 }] });
+  await save;
+  assert.equal(dialog.open, false);
+  assert.equal(h.find(h.rows()[0], "scheduled-message-text").textContent, "修改后的内容");
+});
+
+test("定时编辑校验时间、保留失败输入，并在结果待确认时阻止重复保存", async () => {
+  const confirmations = [];
+  const h = scheduledMessageHarness({ confirmAction: async (...args) => { confirmations.push(args); return true; } });
+  const message = scheduledRow("edit", "scheduled");
+  const load = h.context.reloadScheduledMessages(); h.reads[0].resolve({ messages: [message] }); await load;
+  h.context.openScheduledMessageEditor(message);
+  const fields = h.nodes.find(node => node.className === "scheduled-send-dialog").scheduleFields;
+  fields.input.value = h.context.localInputValue(Date.now() - 60_000);
+  await fields.confirm.onClick();
+  assert.equal(h.actions.length, 0);
+  assert.match(fields.error.textContent, /未来 24 小时/);
+  fields.input.value = h.context.localInputValue(Date.now() + 600_000);
+  fields.prompt.value = "保留草稿";
+  const failed = fields.confirm.onClick();
+  h.actions[0].resolve({ state: "failed", result: { message: "保存被拒绝" } }); await failed;
+  assert.equal(fields.prompt.value, "保留草稿");
+  assert.equal(fields.confirm.disabled, false);
+  assert.equal(fields.error.textContent, "保存被拒绝");
+  const uncertain = fields.confirm.onClick();
+  h.actions[1].resolve({ state: "unknown" }); await uncertain;
+  assert.match(fields.error.textContent, /待确认/);
+  await fields.confirm.onClick();
+  assert.equal(h.actions.length, 2, "未知结果不能自动或手动重复写入");
+  await h.context.closeScheduledDialog();
+  assert.match(confirmations[0][1], /关闭不会撤销已提交的修改/);
+});
+
+test("定时编辑发现任务已派发或被其他端修改时保留内容并阻止覆盖", async () => {
+  const h = scheduledMessageHarness(), message = scheduledRow("edit", "scheduled");
+  let load = h.context.reloadScheduledMessages(); h.reads[0].resolve({ messages: [message] }); await load;
+  h.context.openScheduledMessageEditor(message);
+  const fields = h.nodes.find(node => node.className === "scheduled-send-dialog").scheduleFields;
+  fields.prompt.value = "未保存内容";
+  load = h.context.reloadScheduledMessages();
+  h.reads[1].resolve({ messages: [{ ...message, updatedAtMs: 11 }] }); await load;
+  assert.equal(fields.confirm.disabled, true);
+  assert.match(fields.error.textContent, /已变化/);
+  assert.equal(fields.prompt.value, "未保存内容");
+  load = h.context.reloadScheduledMessages();
+  h.reads[2].resolve({ messages: [{ ...message, status: "running", canEdit: false }] }); await load;
+  await fields.confirm.onClick();
+  assert.equal(h.actions.length, 0);
+  assert.match(fields.error.textContent, /发送流程/);
+});
+
+test("定时编辑关闭确认保留未保存内容，更换授权后丢弃迟到保存结果", async () => {
+  let discard = false;
+  const h = scheduledMessageHarness({ confirmAction: async () => discard });
+  const message = scheduledRow("edit", "scheduled");
+  const load = h.context.reloadScheduledMessages(); h.reads[0].resolve({ messages: [message] }); await load;
+  h.context.openScheduledMessageEditor(message);
+  const dialog = h.nodes.find(node => node.className === "scheduled-send-dialog"), fields = dialog.scheduleFields;
+  fields.prompt.value = "修改";
+  await h.context.closeScheduledDialog();
+  assert.equal(dialog.open, true);
+  discard = true; await h.context.closeScheduledDialog();
+  assert.equal(dialog.open, false);
+  h.context.openScheduledMessageEditor(message);
+  fields.prompt.value = "再次修改";
+  const save = fields.confirm.onClick();
+  h.context.session.device = { id: "new-authorization" };
+  h.context.renderScheduledMessages();
+  assert.equal(dialog.open, false);
+  assert.equal(h.root.hidden, true, "授权变化不能继续展示旧任务");
+  h.actions[0].resolve({ state: "completed", result: { ok: true } }); await save;
+  assert.equal(h.reads.length, 1, "旧保存回执不能借用新授权发起读取");
+  assert.equal(h.notices.length, 0);
 });
 
 test("编辑框的定时标记显示“定时发送 · 时间”，按目标标记的结构渲染", () => {
