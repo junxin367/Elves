@@ -90,7 +90,7 @@ pub(crate) struct AcpIncomingRequest {
 pub(crate) struct AcpClient {
     writer: mpsc::Sender<WriteFrame>,
     next_id: AtomicU64,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, ApiError>>>>>,
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<anyhow::Result<Value>>>>>,
     live: Arc<AtomicBool>,
     stderr_tail: Arc<Mutex<String>>,
     child: Mutex<Option<Child>>,
@@ -168,7 +168,7 @@ impl AcpClient {
         let stderr = child.stderr.take().context("Antigravity ACP stderr 不可用")?;
 
         let (writer, _) = spawn_writer(stdin, WRITE_TIMEOUT);
-        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, ApiError>>>>> =
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<anyhow::Result<Value>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let live = Arc::new(AtomicBool::new(true));
         let stderr_tail = Arc::new(Mutex::new(String::new()));
@@ -246,7 +246,7 @@ impl AcpClient {
                         if let Some(error) = frame.get("error").filter(|v| !v.is_null()) {
                             let code = error["code"].as_i64().unwrap_or(-32603);
                             let msg = error["message"].as_str().unwrap_or("ACP 请求失败");
-                            let _ = tx.send(Err(map_acp_rpc_error(code, msg)));
+                            let _ = tx.send(Err(map_acp_rpc_error(code, msg, error.get("data"))));
                         } else {
                             let _ = tx.send(Ok(frame.get("result").cloned().unwrap_or(Value::Null)));
                         }
@@ -262,7 +262,7 @@ impl AcpClient {
             };
             let mut waiters = read_pending.lock().await;
             for (_, tx) in waiters.drain() {
-                let _ = tx.send(Err(ApiError::new(503, detail.clone())));
+                let _ = tx.send(Err(ApiError::new(503, detail.clone()).into()));
             }
         });
 
@@ -551,6 +551,10 @@ impl AcpClient {
         .await;
         // 写入后连接中断不能等同于未发送。保留未知回执，阻止队列自动重发同一消息。
         result.map_err(|failure| {
+            // 用户要求只展示原生最终提示；明确的 RPC 拒绝不是断线，不能按映射后的 503 标成送达未知。
+            if failure.is::<AcpRpcFailure>() {
+                return failure;
+            }
             if let Some(dispatch) = failure.downcast_ref::<crate::service_transport::DispatchFailure>() {
                 let mut mapped = ApiError::new(503, failure.to_string());
                 mapped.outcome_unknown = dispatch.dispatched;
@@ -571,35 +575,76 @@ impl AcpClient {
     }
 }
 
-/// 将 ACP JSON-RPC 错误码转换为面向用户的中文提示。
-pub(crate) fn map_acp_rpc_error(code: i64, message: &str) -> ApiError {
+#[derive(Debug)]
+struct AcpRpcFailure {
+    code: i64,
+    native_message: String,
+    native_details: Vec<String>,
+    api: ApiError,
+}
+
+impl std::fmt::Display for AcpRpcFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.api.fmt(formatter)
+    }
+}
+
+pub(crate) fn map_acp_rpc_error(code: i64, message: &str, data: Option<&Value>) -> anyhow::Error {
+    // 用户要求限额提示沿用目标实例原文，含换行、恢复时间和时区；不根据额度比例或错误码补造文案。
+    // data 是不透明扩展，只读取明确的文本说明，不能把任意 JSON（可能含配置或凭据）直接展示。
+    let mut native_details = Vec::new();
+    if let Some(data) = data {
+        for detail in [
+            data.as_str(),
+            data.get("message").and_then(Value::as_str),
+            data.get("details").and_then(Value::as_str),
+            data.get("error").and_then(|error| error.get("message")).and_then(Value::as_str),
+        ].into_iter().flatten() {
+            if detail != message && !native_details.iter().any(|known| known == detail) {
+                native_details.push(detail.to_owned());
+            }
+        }
+    }
+    // 用户进一步要求错误内容逐字不变：主错误与扩展文本分开保存，不拼接、不 trim、不翻译。
+    let native_message = message.to_owned();
+    let api = map_acp_api_error(code, &native_message);
+    // 保留 ApiError downcast，既有 HTTP 回执仍使用原入口；额外保留原生响应来源，区分终态与传输断线。
+    anyhow::Error::new(api.clone()).context(AcpRpcFailure { code, native_message, native_details, api })
+}
+
+pub(super) fn turn_error(failure: &anyhow::Error) -> Value {
+    let mut value = json!({ "message": failure.to_string() });
+    if let Some(native) = failure.downcast_ref::<AcpRpcFailure>() {
+        value["source"] = json!("antigravity");
+        value["nativeMessage"] = json!(native.native_message);
+        if !native.native_details.is_empty() {
+            value["nativeDetails"] = json!(native.native_details);
+        }
+        value["code"] = json!(native.code);
+        value["statusCode"] = json!(native.api.code);
+    }
+    value
+}
+
+fn map_acp_api_error(code: i64, message: &str) -> ApiError {
     let lower = message.to_ascii_lowercase();
     if code == -32000
         || lower.contains("authentication required")
         || lower.contains("no browser is available here")
     {
-        return ApiError::new(
-            401,
-            "Antigravity 实例尚未登录，请先在对应本机或 WSL 终端运行 `agy` 或 `agy acp --login` 完成 Google 登录。",
-        );
+        return ApiError::new(401, message);
     }
     if lower.contains("subscription_required") {
-        return ApiError::new(403, "当前 Google 账号需要有效的 Antigravity 订阅才能使用。");
+        return ApiError::new(403, message);
     }
     if lower.contains("trajectory not found") {
-        return ApiError::new(
-            404,
-            format!("未在当前数据目录找到该 Antigravity 会话轨迹（可能已在原生客户端删除或尚未落盘）：{message}"),
-        );
+        return ApiError::new(404, message);
     }
     if code == -32601 {
-        return ApiError::new(
-            501,
-            format!("当前 Antigravity ACP 协议暂不支持该操作（{message}）"),
-        );
+        return ApiError::new(501, message);
     }
     if code == -32602 {
-        return ApiError::new(400, format!("Antigravity ACP 参数无效：{message}"));
+        return ApiError::new(400, message);
     }
-    ApiError::new(503, format!("Antigravity ACP 错误：{message}"))
+    ApiError::new(if code == 429 { 429 } else { 503 }, message)
 }

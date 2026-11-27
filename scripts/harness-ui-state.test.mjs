@@ -15212,6 +15212,7 @@ function claudeExecutionFeedbackHarness(turn) {
   });
   nodeVm.runInContext(sourceSection("function completedManualCompactionAfterReply(", "function enrichTurnTranscriptEvents(")
     + sourceSection("function finalMessageIndex(", "function updateActivitySummary(")
+    + sourceSection("function nativeTurnErrorTexts(", "function renderTurnError(")
     + sourceSection("function renderMessa", "function res"), context);
   return { context, activities, taskPlans, root, render() {
     activities.length = 0; taskPlans.length = 0; context.renderMessages(); return activities;
@@ -15270,6 +15271,73 @@ test("Codex 历史合并实际执行确认输入的原生顺序纠正", () => {
     items: [native, reply], itemsPageComplete: true, itemsComplete: true }, 0);
   assert.equal(calls, 1, "历史合并必须调用原生顺序纠正，而不是只定义孤立函数");
   assert.deepEqual(Array.from(merged.items, item => item.id), ["native", "reply"]);
+});
+
+test("AGY 最终限额提示仅显示原文并保留复制和结束时间", () => {
+  const copies = [], actions = [];
+  const element = (tag, className = "", textContent = "") => ({
+    tag, className, textContent, children: [], attributes: {},
+    append(...children) { this.children.push(...children); },
+    setAttribute(name, value) { this.attributes[name] = value; },
+  });
+  const context = nodeVm.createContext({
+    selectedId: "antigravity-fixture", element, icon: name => name,
+    copyText: text => copies.push(text),
+    renderMessageActions(node, item, options, callbacks) {
+      actions.push({ item, state: messageActionState({ item, ...options }), callbacks });
+    },
+    setTimeout() { assert.fail("限额提示不得定时续发"); },
+    api() { assert.fail("展示提示不得查询额度或重发消息"); },
+  });
+  nodeVm.runInContext(sourceSection("function isRateLimitTurnError(", "function scheduleMessages("), context);
+  const original = " \tRESOURCE_EXHAUSTED: Weekly quota exhausted.\r\nResets 2:40pm (America/Los_Angeles)\n<limit>& details  \n";
+  const node = context.renderTurnError({
+    source: "antigravity", nativeMessage: original, message: "不能代替原文的模板", code: -32603
+  }, { turnCompletedAtMs: 1234567890 });
+  assert.equal(node.className, "native-turn-error");
+  assert.equal(node.attributes.role, "alert");
+  assert.equal(node.children.length, 1);
+  assert.equal(node.children[0].className, "message agent-message");
+  assert.equal(node.children[0].children[0].textContent, original, "原文按纯文本写入，不能解析成 HTML 或丢失空白/换行/时区");
+  assert.equal(actions[0].state.canCopy, true);
+  assert.equal(actions[0].state.canEdit, false);
+  assert.equal(actions[0].state.canFork, false);
+  assert.equal(actions[0].state.sentAtMs, 1234567890);
+  actions[0].callbacks.copy(actions[0].item);
+  assert.deepEqual(copies, [original]);
+
+  const generic = context.renderTurnError({ source: "antigravity", nativeMessage: "Internal error" });
+  assert.equal(generic.children[0].children[0].textContent, "Internal error", "CLI 未返回额度详情时不得补造限额原因");
+  const detail = "  Resets 2:40pm\r\n(America/Los_Angeles)\t";
+  const separate = context.renderTurnError({
+    source: "antigravity", nativeMessage: original, nativeDetails: [detail, detail]
+  });
+  assert.deepEqual(separate.children.map(part => part.children[0].textContent), [original, detail],
+    "主错误与扩展详情分别原样展示，只去除完全相同的重复文本");
+  for (const action of actions.slice(-2)) action.callbacks.copy(action.item);
+  assert.deepEqual(copies, [original, original, detail], "每份原生文本独立复制，不插入额外换行或文案");
+  const unknown = context.renderTurnError({ message: "连接中断，结果待核对" });
+  assert.equal(unknown.textContent, "连接中断，结果待核对");
+  const codex = context.renderTurnError({ statusCode: 429, message: "usage limit" });
+  assert.equal(codex.children[0].textContent, "已达到上游使用上限", "本次不修改其他实例的展示");
+});
+
+test("AGY 原生正文已包含相同提示时不重复展示最终错误", () => {
+  const original = "Quota exhausted · resets 2:40pm (America/Los_Angeles)";
+  const turn = { id: "agy-turn-fixture", status: "failed", items: [
+    { id: "native-reply", type: "agentMessage", text: original, phase: "final_answer" }
+  ], error: { source: "antigravity", nativeMessage: original } };
+  const h = claudeExecutionFeedbackHarness(turn);
+  const notices = [];
+  h.context.renderTurnError = (_error, _turn, texts) => { notices.push(Array.from(texts)); return { dataset: {} }; };
+  h.render();
+  assert.deepEqual(notices, [[original]], "原生正文中的同一错误改用纯文本原样渲染，不再追加重复错误");
+  turn.error.nativeDetails = ["  Additional native details\r\n"];
+  h.render();
+  assert.deepEqual(notices, [[original], ["  Additional native details\r\n"]], "正文去重不能隐藏尚未展示的原生扩展详情");
+  turn.items[0].text = "本轮已执行的部分输出";
+  h.render();
+  assert.deepEqual(notices[2], [original, "  Additional native details\r\n"], "不同正文必须保留原文限额提示");
 });
 
 test("Codex turn/completed 通过真实事件入口纠正引导位置", () => {

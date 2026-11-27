@@ -160,6 +160,20 @@ impl Conversation {
         value
     }
 
+    fn sync_local_turns(&mut self, turns: Vec<Value>) {
+        // Elves 已接续执行后，以已保存的真实轮次为准；本地转录可能缺少最终限额错误或只含中间重试，
+        // 不能在重进会话时整段替换，导致原生提示和已确认消息消失。统计仍按原有规则同步。
+        let has_managed_turn = self.turns.iter().any(|turn| {
+            turn["id"].as_str().is_some_and(|id| id.starts_with("agy-turn-"))
+        });
+        if self.turns.is_empty() || self.discovered && !has_managed_turn {
+            self.turns = turns;
+            self.edit_history_head = format!("agy-head-{}", self.turns.len());
+        } else {
+            sync_turn_usage_from_transcript(&mut self.turns, &turns);
+        }
+    }
+
     fn session_plan(&self) -> Vec<Value> {
         self.turns
             .iter()
@@ -1304,14 +1318,7 @@ impl Antigravity {
             && conv.native_id == c.native_id
             && conv.edit_history_head == c.edit_history_head
         {
-            if conv.discovered || conv.turns.is_empty() {
-                conv.turns = parsed.turns;
-                conv.edit_history_head = format!("agy-head-{}", conv.turns.len());
-            } else {
-                // Elves 自身创建的会话在轮次完成后同步本地转录记录的多步规划步数与真实输入/缓存/输出明细，
-                // 不改写已确认的用户消息、图片或正式轮次 ID。
-                sync_turn_usage_from_transcript(&mut conv.turns, &parsed.turns);
-            }
+            conv.sync_local_turns(parsed.turns);
             conv.history_loaded = true;
             conv.local_transcript_mtime_ms = parsed.mtime_ms;
             conv.local_transcript_len = parsed.file_len;
@@ -2399,7 +2406,8 @@ impl Antigravity {
                         turn["_promptStop"] = value["stopReason"].clone();
                     }
                 }
-                Err(err) => { turn["_promptError"] = json!(err.to_string()); }
+                // 原生最终错误连同来源一起保存，重进会话仍显示原文；不把 CLI 内部重试日志投影为失败。
+                Err(err) => { turn["_promptError"] = acp::turn_error(&err); }
             }
             let remaining = turn["_pendingPrompts"].as_u64().unwrap_or(1).saturating_sub(1);
             turn["_pendingPrompts"] = json!(remaining);
@@ -2408,8 +2416,8 @@ impl Antigravity {
                 return;
             }
             turn.as_object_mut().unwrap().remove("_pendingUserItem");
-            if let Some(message) = turn["_promptError"].as_str() {
-                Err(error(503, message))
+            if turn["_promptError"].is_object() {
+                Err(turn["_promptError"].clone())
             } else {
                 Ok(json!({"stopReason":turn["_promptStop"].as_str().unwrap_or("end_turn"),"usage":turn["_promptUsage"]}))
             }
@@ -2445,9 +2453,9 @@ impl Antigravity {
                         ("completed", Value::Null, false, false, usage)
                     }
                 }
-                Err(err) => (
+                Err(error_obj) => (
                     "failed",
-                    json!({ "message": err.to_string() }),
+                    error_obj,
                     false,
                     true,
                     None,
@@ -3733,6 +3741,125 @@ mod tests {
 
     const AUDIT_REJECT: &str = r#"console.log(JSON.stringify({jsonrpc:"2.0",id:q.id,error:{code:-32602,message:"rejected for regression"}}));"#;
     const AUDIT_ACCEPT: &str = r#"console.log(JSON.stringify({jsonrpc:"2.0",id:q.id,result:{}}));"#;
+
+    #[test]
+    fn agy_native_error_preserves_text_and_only_explicit_details() {
+        let message = "RESOURCE_EXHAUSTED";
+        let detail = "Your weekly quota is exhausted.\nResets 2:40pm (America/Los_Angeles)";
+        for data in [json!(detail), json!({"message":detail}), json!({"details":detail}),
+            json!({"error":{"message":detail}}), json!({"message":"","details":detail}),
+            json!({"message":message,"details":detail})] {
+            let failure = acp::map_acp_rpc_error(-32603, message, Some(&data));
+            let api = failure.downcast_ref::<ApiError>().unwrap();
+            assert!(!api.outcome_unknown);
+            assert_eq!(api.message, message, "HTTP 回执也不能拼接或改写实例主错误");
+            let projected = acp::turn_error(&failure);
+            assert_eq!(projected["source"], "antigravity");
+            assert_eq!(projected["nativeMessage"], message);
+            assert_eq!(projected["nativeDetails"].as_array().unwrap().last().unwrap(), detail);
+            assert_eq!(projected["code"], -32603);
+        }
+        let opaque = json!({"headers":{"Authorization":"fixture-secret"},"retryAfter":60});
+        let failure = acp::map_acp_rpc_error(429, message, Some(&opaque));
+        assert_eq!(failure.downcast_ref::<ApiError>().unwrap().code, 429);
+        assert_eq!(acp::turn_error(&failure)["nativeMessage"], message);
+        assert!(!acp::turn_error(&failure).to_string().contains("fixture-secret"));
+        let duplicate = acp::map_acp_rpc_error(429, detail, Some(&json!({"message":detail})));
+        assert_eq!(acp::turn_error(&duplicate)["nativeMessage"], detail);
+        assert!(acp::turn_error(&duplicate).get("nativeDetails").is_none());
+        for (code, raw) in [
+            (-32603, " \tQuota  exceeded\r\n重置时间：2:40pm (America/Los_Angeles)  \n"),
+            (-32602, "Invalid params"),
+            (-32601, "Method not found"),
+            (-32000, "Authentication required"),
+            (-32603, "subscription_required"),
+            (-32603, "trajectory not found"),
+        ] {
+            let failure = acp::map_acp_rpc_error(code, raw, None);
+            assert_eq!(failure.to_string(), raw, "不翻译、不补前后缀、不裁剪空白");
+            assert_eq!(failure.downcast_ref::<ApiError>().unwrap().message, raw);
+            assert_eq!(acp::turn_error(&failure)["nativeMessage"], raw);
+        }
+        let transport = anyhow::Error::new(ApiError::new(503, "connection closed"));
+        assert!(acp::turn_error(&transport).get("nativeMessage").is_none());
+        let auth = acp::map_acp_rpc_error(-32000, "Authentication required", None);
+        assert_eq!(auth.downcast_ref::<ApiError>().unwrap().code, 401);
+    }
+
+    #[tokio::test]
+    async fn agy_quota_terminal_error_is_persisted_without_retry_or_unknown_receipt() {
+        let script = r#"if(q.method==="session/prompt"){
+            globalThis.prompts=(globalThis.prompts||0)+1;
+            console.log(JSON.stringify({id:q.id,error:{code:-32603,message:"RESOURCE_EXHAUSTED",
+                data:{message:"Weekly quota exhausted.\nResets 2:40pm (America/Los_Angeles)"}}}));
+        } else {console.log(JSON.stringify({id:q.id,result:{prompts:globalThis.prompts||0}}));}"#;
+        let (dir, ag, _auth, rt) = audit_fixture(script, false, true).await;
+        {
+            let mut saved = ag.saved.lock().await;
+            let c = saved.conversations.get_mut("antigravity-audit").unwrap();
+            c.goal = json!({"status":"active","objective":"fixture","iterations":1});
+            c.remote_queue.enqueue(json!({"clientUserMessageId":"later","prompt":"queued"}), 1);
+        }
+        let result = ag.dispatch_turn("antigravity-audit", &rt, &json!({
+            "prompt":"limited","clientUserMessageId":"limited"
+        })).await;
+        let failure = result.unwrap_err();
+        assert!(!failure.downcast_ref::<ApiError>().unwrap().outcome_unknown,
+            "原生明确拒绝即使映射到 503 也不属于送达未知");
+        tokio::time::timeout(AUDIT_ACTION_TIMEOUT, async {
+            while ag.conversation("antigravity-audit").await.unwrap().active() {
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        ag.drain_queues_and_goals().await;
+        let count = rt.client.request_with_timeout("fixture/count", json!({}), Some(AUDIT_ACTION_TIMEOUT)).await.unwrap();
+        rt.client.close().await;
+        assert_eq!(count["prompts"], 1, "限额后不得自动续发或派发后续队列");
+        let c = ag.conversation("antigravity-audit").await.unwrap();
+        assert_eq!(c.turns.len(), 1);
+        assert_eq!(c.turns[0]["status"], "failed");
+        assert_eq!(c.turns[0]["error"]["nativeMessage"], "RESOURCE_EXHAUSTED");
+        assert_eq!(c.turns[0]["error"]["nativeDetails"], json!([
+            "Weekly quota exhausted.\nResets 2:40pm (America/Los_Angeles)"
+        ]));
+        assert!(c.turns[0]["items"].as_array().unwrap().is_empty(), "拒绝不能伪造已接收的用户消息");
+        assert!(c.remote_queue.paused);
+        assert_eq!(c.goal["status"], "paused");
+        let reopened = Antigravity::new(dir.path()).unwrap();
+        let history = reopened.history_authorized(&json!({"threadId":"antigravity-audit"}), None).await.unwrap();
+        assert_eq!(history["data"][0]["error"], c.turns[0]["error"]);
+        assert!(history["data"][0].get("_promptError").is_none());
+    }
+
+    #[tokio::test]
+    async fn agy_quota_error_survives_pending_prompts_and_local_history_refresh() {
+        let (_dir, ag, _auth, rt) = audit_fixture(AUDIT_ACCEPT, true, true).await;
+        {
+            let mut saved = ag.saved.lock().await;
+            let c = saved.conversations.get_mut("antigravity-audit").unwrap();
+            c.discovered = true;
+            c.turns[0]["id"] = json!("agy-turn-managed");
+            c.active_turn_id = Some("agy-turn-managed".into());
+            c.turns[0]["_pendingPrompts"] = json!(2);
+            c.turns[0]["items"] = json!([{"id":"reply","type":"agentMessage","text":"partial reply"}]);
+        }
+        let failure = acp::map_acp_rpc_error(429, "Quota exceeded", None);
+        ag.finish_turn("antigravity-audit", "agy-turn-managed", Err(failure)).await;
+        assert!(ag.conversation("antigravity-audit").await.unwrap().active());
+        ag.finish_turn("antigravity-audit", "agy-turn-managed", Ok(json!({"stopReason":"end_turn"}))).await;
+        rt.client.close().await;
+        let mut c = ag.conversation("antigravity-audit").await.unwrap();
+        let before = c.turns.clone();
+        c.sync_local_turns(vec![json!({"id":"agy-local-turn-0","status":"completed","items":[]})]);
+        assert_eq!(c.turns, before, "转录刷新不能清除已确认正文与最终原生错误");
+        assert_eq!(c.turns[0]["status"], "failed");
+        assert_eq!(c.turns[0]["error"]["nativeMessage"], "Quota exceeded");
+        c.turns.clear();
+        c.sync_local_turns(vec![json!({"id":"agy-local-turn-0","items":[]})]);
+        assert_eq!(c.turns[0]["id"], "agy-local-turn-0", "尚未接续执行的外部历史仍正常导入");
+        c.sync_local_turns(vec![json!({"id":"agy-local-turn-1","items":[]})]);
+        assert_eq!(c.turns[0]["id"], "agy-local-turn-1");
+    }
 
     #[tokio::test]
     async fn audit_rejected_options_do_not_claim_applied() {

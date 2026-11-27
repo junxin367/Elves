@@ -60,7 +60,29 @@ function isRateLimitTurnError(error) {
     || /usage_limit|rate\s*limit|ratelimit|too many requests|quota/u.test(text);
 }
 
-function renderTurnError(error) {
+function nativeTurnErrorTexts(error) {
+  if (error?.source !== "antigravity" || typeof error.nativeMessage !== "string") return null;
+  return [error.nativeMessage, ...(Array.isArray(error.nativeDetails) ? error.nativeDetails : [])]
+    .filter((text, index, texts) => typeof text === "string" && text.length > 0 && texts.indexOf(text) === index);
+}
+
+function renderTurnError(error, turn = {}, nativeTexts = nativeTurnErrorTexts(error)) {
+  if (nativeTexts) {
+    // 用户要求 AGY 错误内容逐字不变：各原生文本独立展示与复制，不翻译、拼接、trim 或补写时间/时区。
+    // 仅保留普通回复的复制与结束时间，不增加重试或自动续发。
+    const group = element("div", "native-turn-error");
+    group.setAttribute("role", "alert");
+    for (const text of nativeTexts) {
+      const node = element("article", "message agent-message");
+      node.append(element("div", "native-turn-error-text", text));
+      const item = { type: "agentMessage", text, sentAtMs: turn.turnCompletedAtMs ?? turn.completedAt };
+      renderMessageActions(node, item, { threadId: selectedId, completed: true }, {
+        icon, copy: message => void copyText(message.text)
+      });
+      group.append(node);
+    }
+    return group;
+  }
   const rateLimited = isRateLimitTurnError(error);
   const node = element("div", `turn-error${rateLimited ? " rate-limit-error" : ""}`);
   node.setAttribute("role", "alert");
@@ -135,25 +157,32 @@ export function renderMessages(keepScroll = true) {
         || historyLoadButton("加载更早的过程记录", () => void loadHistory(true, selectionVersion, turn.id), turn.id);
       historyLoad.dataset.historyPage = "older";
     }
+    const nativeErrorTexts = nativeTurnErrorTexts(turn.error);
     const turnItems = turn.items || [], finalIndex = finalMessageIndex(turn),
       turnRunning = turn === lastRealTurn && turn.status === "inProgress"
         && (thread == null || isActiveThread());
     for (const item of turnItems) itemKeys.add(`${turn.id}:${item.id}`);
     const renderMessage = (item, inActivity = false) => {
       const key = `${turn.id}:${item.id}`, cached = renderedItems.get(key);
+      // 原生已把同一错误作为正文返回时也按纯文本展示，不能因 Markdown 渲染改变空格、换行或标签内容。
+      const nativeErrorText = item.type === "agentMessage" && nativeErrorTexts?.includes(textContent(item))
+        ? textContent(item) : null;
+      const nativeError = nativeErrorText !== null;
       const running = turnRunning && (["inProgress", "running"].includes(item.status) || item.type === "reasoning" && item === turnItems.at(-1));
       const editing = item.type === "userMessage" && editingMessage?.threadId === selectedId && editingMessage.messageId === item.id;
       const skillKey = userMessageHasSkills(item)
         ? JSON.stringify([skillRenderVersion, (item.content || []).filter(part => part.type === "skill")]) : "";
       const relatedEnabled = subagentsEnabled();
-      const node = cached?.item === item && cached.inActivity === inActivity && cached.running === running
+      const node = cached?.item === item && cached.nativeError === nativeError
+        && cached.inActivity === inActivity && cached.running === running
         && cached.editing === editing && cached.skillKey === skillKey && cached.markdownVersion === markdownRenderVersion
         && cached.relatedViewKind === relatedViewKind && cached.relatedEnabled === relatedEnabled
-        ? cached.node : renderItem(item, cached?.item.type === item.type ? cached.node : null, inActivity, running);
+        ? cached.node : nativeError ? renderTurnError(turn.error, turn, [nativeErrorText])
+          : renderItem(item, cached?.item.type === item.type && !cached.nativeError ? cached.node : null, inActivity, running);
       node.dataset.key = key;
-      renderedItems.set(key, { item, node, inActivity, running, editing, skillKey, relatedViewKind, relatedEnabled, markdownVersion: markdownRenderVersion });
+      renderedItems.set(key, { item, node, nativeError, inActivity, running, editing, skillKey, relatedViewKind, relatedEnabled, markdownVersion: markdownRenderVersion });
       if (editing) node.messageActionBinding?.dispose();
-      else if (item.type === "userMessage" || item.type === "agentMessage") {
+      else if (!nativeError && (item.type === "userMessage" || item.type === "agentMessage")) {
         const threadId = selectedId;
         renderMessageActions(node, item, {
           threadId, inActivity, readOnly: threadReadOnly(threadId) || !threadSentMessageEditAllowed(threadId),
@@ -251,7 +280,12 @@ export function renderMessages(keepScroll = true) {
       const editedFiles = renderEditedFiles(turn, group.querySelector(":scope > .edited-files-card"));
       if (editedFiles) items.push(editedFiles);
     }
-    if (turn.error) items.push(renderTurnError(turn.error));
+    // 同一原生提示已作为正文返回时只保留该条正文，不能再附加一份最终错误。
+    if (turn.error) {
+      const nativeTexts = nativeErrorTexts?.filter(text =>
+        !turnItems.some(item => item.type === "agentMessage" && textContent(item) === text));
+      if (!nativeTexts || nativeTexts.length) items.push(renderTurnError(turn.error, turn, nativeTexts));
+    }
     // 原生已结束但没有回复时保留已接收消息，结束等待提示；不把未知的结束原因说成用户主动停止。
     // 出字前停止由连接端按终端输入框确认为原生撤回（Rust _nativeWithdrawn）：原文回到原版终端输入框，不进入对话。
     if (turn._nativeEndedWithoutReply === true)
