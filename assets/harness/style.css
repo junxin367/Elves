@@ -2065,7 +2065,7 @@ body{font-weight:var(--ui-font-weight,400)}
 .instruction-selectors>.instruction-path{flex:1 1 auto;min-width:0;margin:0 0 4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .instruction-path{user-select:text}
 .instruction-content{display:block;width:100%;height:45dvh;min-height:180px;resize:vertical;font-size:var(--code-font-size,12px);line-height:1.7;tab-size:2}
-/* 用户要求自定义指令编辑区尽量填满当前设置页的剩余高度；标题、实例选择、状态和操作栏保留固定空间，
+/* 用户要求自定义指令编辑区尽量填满当前设置页的剩余高度；标题、实例选择和操作栏保留固定空间，
  * 文本区只占剩余空间并在自身内部滚动，避免编辑区过大把“重新读取”“保存指令”挤出可视范围。
  * 卡片最小高度 360px，过矮窗口仍保留可用编辑区；调整卡片内固定内容时需同步核对该最小高度。 */
 #appearance-instructions-page>.appearance-page-content{display:flex;flex-direction:column;min-height:100%}
@@ -2077,10 +2077,8 @@ body{font-weight:var(--ui-font-weight,400)}
 }
 #appearance-instructions-page .appearance-instructions-card>.appearance-action-buttons{flex-shrink:0}
 #appearance-instructions-page .instruction-footer{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-shrink:0;margin-top:16px}
-#appearance-instructions-page .instruction-save-hint{flex:1 1 auto;min-width:0;margin:0}
+#appearance-instructions-page .instruction-save-hint{flex:1 1 auto;min-width:0;margin:0;overflow-wrap:anywhere}
 #appearance-instructions-page .instruction-footer>.appearance-action-buttons{flex-shrink:0;margin:0}
-/* 正常读取后隐藏空状态，避免为已移除的提示保留一行。 */
-#instruction-status:empty{display:none}
 /* 手机和 PC 的固定菜单均不拦截页面点击，菜单自身仍可交互；手机普通页面点击隐藏由菜单模块处理，侧边会话除外。 */
 .session-related-menu-layer.session-menu-pinned{pointer-events:none}
 .session-menu-pinned>.session-related-menu{pointer-events:auto}

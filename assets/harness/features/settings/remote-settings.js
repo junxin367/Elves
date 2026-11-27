@@ -18,6 +18,9 @@ export function mountRemoteSettings(dialog, {
   const find = id => $("#" + id, dialog);
   const instance = find("instruction-instance"), input = find("instruction-content");
   const status = find("instruction-status"), save = find("instruction-save"), reload = find("instruction-reload");
+  // 提示与默认描述共用操作栏中的同一个节点；清除状态时恢复描述，不额外增加状态行。
+  const defaultDescription = status.textContent;
+  const setStatus = message => { status.textContent = message || defaultDescription; };
   const detectionButton = find("appearance-detect-environments"), detectionStatus = find("appearance-environments-status");
   let disposed = false, generation = 0, environments = null, instances = [], detection = null, current = null, saving = false;
   let reading = null, needsRead = false, refreshPending = false;
@@ -27,7 +30,7 @@ export function mountRemoteSettings(dialog, {
   const identity = () => ({ instanceId: instance.value });
   const keyFor = value => JSON.stringify([scope, cache?.draftIdentity?.(value.instanceId) || value]);
   const ownerKey = id => cache?.identity(id) ?? id;
-  // 用户要求正常读取后不显示“已读取”；检测、读取及撤销编辑恢复原文时均留空。
+  // 用户要求正常读取后不显示“已读取”；检测、读取及撤销编辑恢复原文时显示默认描述。
   const dirty = () => current && input.value !== current.content;
   // 历史会话保留的已卸载实例不能冒充当前安装；本机 Codex 通过独立远程服务管理全局指令。
   const instanceAvailable = id => instances.some(value => value.id === id && environments?.some(environment =>
@@ -69,13 +72,13 @@ export function mountRemoteSettings(dialog, {
         renderInstances();
         // 检测结果只说明当前操作和共享范围，各能力的默认值由对应设置项说明。
         if (detectionStatus) detectionStatus.textContent = "检测实例安装位置；实例设置由同一 Harness 共用。";
-        if (current) status.textContent = instanceAvailable(current.instanceId)
+        if (current) setStatus(instanceAvailable(current.instanceId)
           ? dirty() ? "未保存的草稿" : ""
-          : "所选实例暂不可用，草稿已保留。";
+          : "所选实例暂不可用，草稿已保留。");
       } catch (error) {
         if (alive()) {
           if (detectionStatus) detectionStatus.textContent = error.message;
-          else status.textContent = error.message;
+          else setStatus(error.message);
         }
       } finally {
         detection = null;
@@ -100,8 +103,8 @@ export function mountRemoteSettings(dialog, {
     needsRead = !!draft && draft.revision !== result.revision;
     if (needsRead) {
       current.revision = draft.revision;
-      status.textContent = "有未保存的草稿，原文件也已变化。请复制草稿后重新读取并合并。";
-    } else status.textContent = dirty() ? "未保存的草稿" : result.exists ? "" : "文件尚不存在，保存时创建。";
+      setStatus("有未保存的草稿，原文件也已变化。请复制草稿后重新读取并合并。");
+    } else setStatus(dirty() ? "未保存的草稿" : result.exists ? "" : "文件尚不存在，保存时创建。");
     find("instruction-path").textContent = result.path;
   }
   async function read({ discard = false, force = false } = {}) {
@@ -114,11 +117,11 @@ export function mountRemoteSettings(dialog, {
       current = null; input.value = ""; find("instruction-path").textContent = "";
     }
     if (!instanceAvailable(value.instanceId)) {
-      needsRead = true; status.textContent = "请选择可用的会话实例。"; update(); return;
+      needsRead = true; setStatus("请选择可用的会话实例。"); update(); return;
     }
     if (!force && cached?.fresh) { update(); return; }
     needsRead ||= force || cached?.blocked === true;
-    if (!current) status.textContent = "正在读取原生指令文件…";
+    if (!current) setStatus("正在读取原生指令文件…");
     const request = { key, promise: null };
     reading = request; update();
     request.promise = (cache ? cache.read(value.instanceId, { force, background: !!current })
@@ -127,7 +130,7 @@ export function mountRemoteSettings(dialog, {
       receive(result, value, key, discard);
     }).catch(error => {
       if (alive() && generation === version && error.name !== "AbortError") {
-        needsRead = true; status.textContent = error.message;
+        needsRead = true; setStatus(error.message);
       }
     }).finally(() => {
       if (reading === request) reading = null;
@@ -142,7 +145,7 @@ export function mountRemoteSettings(dialog, {
     if (!current) return;
     if (dirty()) instructionDrafts.set(current.key, { content: input.value, revision: current.revision });
     else instructionDrafts.delete(current.key);
-    status.textContent = dirty() ? "未保存的草稿" : ""; update();
+    setStatus(dirty() ? "未保存的草稿" : ""); update();
   };
   instance.onchange = () => void read();
   reload.onclick = async () => {
@@ -158,7 +161,7 @@ export function mountRemoteSettings(dialog, {
         || cache?.peek(instance.value)?.blocked || !instanceAvailable(current.instanceId)) return;
     const value = current, content = input.value, owner = ownerKey(instance.value);
     generation++; reading = null; cache?.invalidate(value.instanceId);
-    saving = true; update(); status.textContent = "正在保存…";
+    saving = true; update(); setStatus("正在保存…");
     try {
       const result = await api("/api/settings/instructions", { instanceId: value.instanceId,
         content: instructionFileText(content, value.lineEnding),
@@ -175,8 +178,8 @@ export function mountRemoteSettings(dialog, {
       if (!alive()) return;
       current = { ...value, content, revision: result.revision };
       needsRead = cache?.peek(value.instanceId)?.blocked === true;
-      status.textContent = "已保存至原生指令文件。";
-    } catch (error) { if (alive()) { needsRead = true; status.textContent = `${error.message} 未自动重复保存，请重新读取核对。`; } }
+      setStatus("已保存至原生指令文件。");
+    } catch (error) { if (alive()) { needsRead = true; setStatus(`${error.message} 未自动重复保存，请重新读取核对。`); } }
     finally {
       saving = false;
       if (alive()) {
@@ -194,7 +197,7 @@ export function mountRemoteSettings(dialog, {
       if (saving || reading) { refreshPending = true; return; }
       if (dirty()) {
         needsRead = true; update();
-        status.textContent = "原生指令已在其他客户端更新，未保存的草稿已保留，请重新读取后合并。"; return;
+        setStatus("原生指令已在其他客户端更新，未保存的草稿已保留，请重新读取后合并。"); return;
       }
       void read();
     },

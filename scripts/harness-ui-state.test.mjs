@@ -6076,6 +6076,7 @@ function instructionSettingsHarness(api) {
     const nodes = new Map();
     for (const name of ["content", "status", "save", "reload", "path"])
       nodes.set("#instruction-" + name, element("input"));
+    nodes.get("#instruction-status").textContent = "保存至所选实例的用户级全局指令文件，重新加载后生效。";
     nodes.set("#instruction-instance", select.selectControl("instruction-instance", "会话实例", [], ""));
     if (withDetectionControls) for (const name of ["detect-environments", "environments-status", "environments"])
       nodes.set("#appearance-" + name, element("div"));
@@ -6174,15 +6175,25 @@ test("全局指令只按实例读写，实例开关不限制编辑，草稿和�
   h.context.appearance.sessionInstances = { "codex:local": true, "claude:wsl:fixture": false };
   const page = h.mount();
   await page.settings.show("instructions");
+  const description = "保存至所选实例的用户级全局指令文件，重新加载后生效。";
+  const status = page.get("instruction-status");
+  assert.equal(status.textContent, description);
+  page.edit("Codex 未保存草稿\n");
+  assert.equal(status.textContent, "未保存的草稿", "有提示时替换默认说明");
+  page.edit("Codex 原文\n");
+  assert.equal(status.textContent, description, "撤销编辑后恢复默认说明");
   page.edit("Codex 未保存草稿\n");
   await page.chooseInstance("claude:wsl:fixture");
+  assert.equal(status.textContent, description, "切换至没有草稿的实例时恢复说明");
   assert.equal(page.get("instruction-content").value, "Claude 原文\n");
   page.edit("Claude 全局新指令\n");
   await page.get("instruction-save").onclick();
+  assert.equal(status.textContent, "已保存至原生指令文件。", "保存结果仍显示在同一个说明节点");
   assert.deepEqual(requests.at(-1), { instanceId: "claude:wsl:fixture",
     content: "Claude 全局新指令\r\n", expectedRevision: "a1" });
   assert.equal(page.get("instruction-save").disabled, true);
   await page.chooseInstance("codex:local");
+  assert.equal(status.textContent, "未保存的草稿");
   assert.equal(page.get("instruction-content").value, "Codex 未保存草稿\n");
   assert.equal(stored.get("codex:local").content, "Codex 原文\r\n");
   assert.ok(requests.filter(body => !Object.hasOwn(body, "content"))

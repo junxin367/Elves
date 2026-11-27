@@ -371,9 +371,8 @@ export function mountSettingsPage(screen, { onBack, fromLogin = false }) {
     <!-- 用户要求只选择实例并编辑用户级全局指令；菜单仅由 Select 本体触发，路径与 Select 同行显示在右侧。 -->
     <div class="instruction-selectors"><div class="instruction-selector-field"><span>会话实例</span><div id="instruction-instance-slot"></div></div><p id="instruction-path" class="appearance-hint instruction-path"></p></div>
     <textarea id="instruction-content" class="instruction-content" aria-label="自定义指令内容" spellcheck="false" disabled></textarea>
-    <p id="instruction-status" class="appearance-hint" role="status"></p>
-    <!-- 用户要求说明与操作按钮同一行，说明在左、按钮在右；需要版本核对的指令仍在本页显式保存。 -->
-    <div class="instruction-footer"><p class="appearance-hint instruction-save-hint">保存至所选实例的用户级全局指令文件，重新加载后生效。</p><div class="appearance-action-buttons"><button id="instruction-reload" type="button">重新读取</button><button id="instruction-save" type="button" class="primary" disabled>保存指令</button></div></div>
+    <!-- 用户要求提示替换操作栏左侧的原描述，不另占一行；没有提示时恢复描述，按钮仍在右侧。 -->
+    <div class="instruction-footer"><p id="instruction-status" class="appearance-hint instruction-save-hint" role="status" aria-live="polite">保存至所选实例的用户级全局指令文件，重新加载后生效。</p><div class="appearance-action-buttons"><button id="instruction-reload" type="button">重新读取</button><button id="instruction-save" type="button" class="primary" disabled>保存指令</button></div></div>
     </div></section>
     <section id="appearance-customization-page" class="appearance-body appearance-settings-page" hidden>
     <header class="appearance-panel-heading"><h3 class="appearance-panel-title">外观</h3><button type="button" id="appearance-reset">恢复默认外观</button></header>
