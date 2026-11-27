@@ -497,7 +497,7 @@ export function mountSessionMenu({
   function menuBounds(view) {
     const conversation = trigger.closest(".conversation")?.getBoundingClientRect();
     const header = trigger.closest(".conversation-header")?.getBoundingClientRect();
-    // 用户要求菜单在主会话区域内，与标题栏底部、会话右边缘各距 20px；
+    // 用户要求菜单在主会话区域内，与标题栏底部、会话右边缘统一各距 12px；
     // 侧边标签开关只改变会话实际边界，不能改用整个窗口或按钮右边缘定位。
     return {
       left: Math.max(view.left, conversation?.left ?? view.left),
@@ -513,7 +513,7 @@ export function mountSessionMenu({
   }
   function startPositionTracking() {
     if (positionFrame != null || disposed || !opened || suspended || document.hidden) return;
-    // 用户要求主会话区域变化后仍保持 20px 间距；分栏、标题换行及动画不一定产生窗口 resize，
+    // 用户要求主会话区域变化后仍保持 12px 间距；分栏、标题换行及动画不一定产生窗口 resize，
     // 因此可见时同时跟踪按钮、主会话和标题栏边界；静止不写样式，关闭、挂起及后台时取消跟踪。
     const requestFrame = callback => window.requestAnimationFrame
       ? window.requestAnimationFrame(callback) : setTimeout(callback, 16);
@@ -543,13 +543,13 @@ export function mountSessionMenu({
         || box.right <= view.left || box.left >= view.left + view.width) { close(false, true); return; }
     positionSignature = anchorPositionSignature(box, view, bounds);
     // PC 沿用 300px 宽度，不能因窗口高度低于 600px 而改用手机比例；
-    // 手机短边低于 600px 时仍取视口宽度的 65%，两端均受主会话内侧 20px 留白约束。
-    const inset = 20, availableWidth = Math.max(0, bounds.right - bounds.left - inset * 2);
+    // 手机短边低于 600px 时仍取视口宽度的 65%，两端均受主会话内侧 12px 留白约束。
+    const inset = 12, availableWidth = Math.max(0, bounds.right - bounds.left - inset * 2);
     const phoneViewport = !desktop() && Math.min(view.width, view.height) < 600;
     const width = phoneViewport
       ? Math.min(view.width * .65, availableWidth)
       : Math.min(300, availableWidth);
-    // 20px 从标题栏底边计算，右坐标从主会话右边缘减 20px；需与 menuBounds 和位置跟踪同步核对。
+    // 12px 从标题栏底边计算，右坐标从主会话右边缘减 12px；需与 menuBounds 和位置跟踪同步核对。
     // 窄屏只缩小宽度，低窗口只缩小可滚动高度，不通过翻转或贴边破坏这两个间距。
     const top = bounds.top + inset;
     menu.style.width = `${width}px`;
