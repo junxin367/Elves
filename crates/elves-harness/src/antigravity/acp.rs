@@ -287,6 +287,22 @@ impl AcpClient {
         self.live.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_closed_writer() -> Arc<Self> {
+        // 确定性模拟 stdout 仍在线但写入队列已关闭，不依赖 Windows 管道关闭的调度时序。
+        let (writer, receiver) = mpsc::channel(1);
+        drop(receiver);
+        Arc::new(Self {
+            writer,
+            next_id: AtomicU64::new(1),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            live: Arc::new(AtomicBool::new(true)),
+            stderr_tail: Arc::new(Mutex::new(String::new())),
+            child: Mutex::new(None),
+            initialize_result: Mutex::new(Value::Null),
+        })
+    }
+
     pub(crate) async fn close(&self) {
         self.live.store(false, Ordering::Release);
         if let Some(mut child) = self.child.lock().await.take() {

@@ -110,6 +110,14 @@ impl Conversation {
                 .is_some_and(|t| t["status"] == "inProgress")
     }
 
+    fn stop_requested(&self) -> bool {
+        self.turns.iter().rev().any(|turn| {
+            turn["status"] == "inProgress"
+                && turn["_stopRequested"] == true
+                && self.active_turn_id.as_deref().is_none_or(|id| turn["id"] == id)
+        })
+    }
+
     fn effective_cwd(&self) -> &str {
         if self.config.is_local() {
             &self.cwd
@@ -1875,7 +1883,53 @@ impl Antigravity {
                     mapped,
                 },
             );
+        // 用户要求停止以原生结果为准；取消通知之后迟到的审批也须答复取消，不能让原生轮次继续等用户。
+        if self.conversation(thread_id).await.is_ok_and(|c| c.stop_requested()) {
+            let lock = self.lock(thread_id).await;
+            let _guard = lock.lock().await;
+            let current = self.runtimes.lock().await.get(thread_id).cloned();
+            if current.is_some_and(|rt| Arc::ptr_eq(&rt, runtime))
+                && self.conversation(thread_id).await.is_ok_and(|c| c.stop_requested())
+                && let Err(failure) = self.cancel_pending_permissions(thread_id, runtime).await
+            {
+                // 写入失败保留审批和执行状态；现有等待提示仍可操作，不伪造取消完成。
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "harness.antigravity_cancel_permission_failed",
+                    json!({"threadId":thread_id,"error":failure.to_string()}),
+                );
+            }
+        }
         self.requests_changed(thread_id).await;
+    }
+
+    async fn cancel_pending_permissions(
+        &self,
+        thread_id: &str,
+        runtime: &ActiveRuntime,
+    ) -> anyhow::Result<()> {
+        // 调用方持有会话操作锁，与用户答复、停止及迟到审批串行，避免同一 RPC 被重复答复。
+        let pending = self.requests.lock().await.get(thread_id).cloned().unwrap_or_default();
+        for (request_id, request) in pending {
+            runtime.client.respond_result(
+                request.rpc_id,
+                json!({"outcome":{"outcome":"cancelled"}}),
+            ).await.map_err(|failure| {
+                let mut error = ApiError::new(
+                    503, format!("Antigravity 取消审批失败，停止结果待确认：{failure}"),
+                );
+                error.outcome_unknown = true;
+                error
+            })?;
+            if let Some(requests) = self.requests.lock().await.get_mut(thread_id) {
+                requests.remove(&request_id);
+            }
+            self.publish(json!({
+                "method":"serverRequest/resolved",
+                "params":{"threadId":thread_id,"requestId":request_id}
+            }));
+        }
+        self.requests_changed(thread_id).await;
+        Ok(())
     }
 
     async fn requests_changed(&self, thread_id: &str) {
@@ -2382,8 +2436,8 @@ impl Antigravity {
             let (status, error_obj, interrupted, failed, prompt_usage) = match result {
                 Ok(value) => {
                     let stop = value["stopReason"].as_str().unwrap_or("end_turn");
-                    let was_cancelled = matches!(stop, "cancelled" | "canceled")
-                        || turn["_stopRequested"] == true;
+                    // 停止通知写入成功也不等于轮次已取消；与停止同时自然结束时保留原生完成结果。
+                    let was_cancelled = matches!(stop, "cancelled" | "canceled");
                     let usage = value.get("usage").filter(|u| u.is_object()).cloned();
                     if was_cancelled {
                         ("interrupted", Value::Null, true, false, usage)
@@ -3149,29 +3203,63 @@ impl Antigravity {
                 }))
             }
             "stop" => {
-                {
+                let turn_id = {
                     let mut saved = self.saved.lock().await;
                     if let Some(conv) = saved.conversations.get_mut(id) {
-                        conv.remote_queue.pause("已停止当前任务，队列已暂停");
+                        // 用户要求停止失败不能假成功；先暂停后续派发，不能在原生取消前声称任务已停止。
+                        conv.remote_queue.pause("收到停止请求，队列已暂停");
                         if conv.goal["status"] == "active" {
                             conv.goal["status"] = json!("paused");
                             conv.goal["updatedAt"] = json!(now_ms());
                         }
-                        if let Some(last) = conv.turns.last_mut()
-                            && last["status"] == "inProgress"
-                        {
-                            last["_stopRequested"] = json!(true);
-                        }
-                        let _ = self.persist_locked(&saved, Some(id)).await;
+                        let turn_id = conv.active_turn_id.clone().or_else(|| {
+                            conv.turns.last().filter(|turn| turn["status"] == "inProgress")
+                                .and_then(|turn| turn["id"].as_str()).map(str::to_owned)
+                        });
+                        self.persist_locked(&saved, Some(id)).await?;
+                        turn_id
+                    } else {
+                        None
+                    }
+                };
+                self.queue_changed(id).await;
+                let has_requests = self.requests.lock().await.get(id).is_some_and(|r| !r.is_empty());
+                if turn_id.is_none() && !has_requests {
+                    return Ok(json!({"ok":true,"threadId":id,"stopped":true}));
+                }
+                let runtime = self.runtimes.lock().await.get(id).cloned()
+                    .filter(|rt| rt.client.is_live())
+                    .ok_or_else(|| error(503, "Antigravity ACP 连接已断开，无法确认任务已停止"))?;
+                runtime.client.session_cancel(&runtime.native_session_id).await.map_err(|failure| {
+                    let mut error = ApiError::new(
+                        503, format!("Antigravity 停止请求发送失败：{failure}"),
+                    );
+                    error.outcome_unknown = failure
+                        .downcast_ref::<crate::service_transport::DispatchFailure>()
+                        .is_some_and(|dispatch| dispatch.dispatched);
+                    error
+                })?;
+                {
+                    let mut saved = self.saved.lock().await;
+                    if let Some(conv) = saved.conversations.get_mut(id)
+                        && let Some(turn) = conv.turns.iter_mut().find(|turn| {
+                            turn["status"] == "inProgress"
+                                && turn_id.as_deref().is_some_and(|id| turn["id"] == id)
+                        })
+                    {
+                        turn["_stopRequested"] = json!(true);
+                        self.persist_locked(&saved, Some(id)).await.map_err(|failure| {
+                            let mut error = ApiError::new(
+                                503, format!("Antigravity 停止请求已发送，但状态保存失败：{failure}"),
+                            );
+                            error.outcome_unknown = true;
+                            error
+                        })?;
                     }
                 }
-                self.queue_changed(id).await;
-                if let Some(rt) = self.runtimes.lock().await.get(id).cloned()
-                    && rt.client.is_live()
-                {
-                    let _ = rt.client.session_cancel(&rt.native_session_id).await;
-                }
-                Ok(json!({ "ok": true, "threadId": id }))
+                self.cancel_pending_permissions(id, &runtime).await?;
+                // 此回执只确认取消通知已写入；执行状态及工具终态仍由原生 prompt 最终结果收尾。
+                Ok(json!({ "ok": true, "threadId": id, "stopRequested": true }))
             }
             "approve" | "answer" => {
                 let req_id = payload["requestId"]
@@ -3874,6 +3962,159 @@ mod tests {
         assert!(active_before_stop, "原 prompt 返回时引导尚未结束，不能显示空闲");
         assert!(stop.unwrap().is_ok(), "等待引导回执不应占用停止所需会话锁");
         assert!(released.is_ok(), "等待引导回执不应阻塞服务释放");
+    }
+
+    #[tokio::test]
+    async fn audit_stop_disconnected_or_missing_runtime_preserves_native_state() {
+        for remove_runtime in [false, true] {
+            let (_dir, ag, auth, rt) = audit_fixture(AUDIT_ACCEPT, true, true).await;
+            {
+                let mut saved = ag.saved.lock().await;
+                let c = saved.conversations.get_mut("antigravity-audit").unwrap();
+                c.remote_queue.enqueue(json!({"clientUserMessageId":"queued-1","prompt":"queued"}), 1);
+                c.goal = json!({"status":"active","objective":"continue"});
+            }
+            rt.client.close().await;
+            if remove_runtime {
+                ag.runtimes.lock().await.remove("antigravity-audit");
+            }
+            let result = ag.command("stop", &json!({"threadId":"antigravity-audit"}), &auth).await;
+            assert!(result.unwrap_err().to_string().contains("无法确认任务已停止"));
+            let c = ag.conversation("antigravity-audit").await.unwrap();
+            assert!(c.active());
+            assert!(!c.stop_requested());
+            assert_eq!(c.turns[0]["status"], "inProgress");
+            assert!(c.remote_queue.paused);
+            assert_eq!(c.remote_queue.messages.len(), 1);
+            assert!(!c.remote_queue.messages[0].reason.contains("已停止"));
+            assert_eq!(c.goal["status"], "paused");
+            ag.finish_turn("antigravity-audit", "turn-1", Ok(json!({"stopReason":"end_turn"}))).await;
+            assert_eq!(ag.conversation("antigravity-audit").await.unwrap().turns[0]["status"], "completed");
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_stop_closed_writer_returns_failure_without_marking_cancelled() {
+        let (_dir, ag, auth, rt) = audit_fixture(AUDIT_ACCEPT, true, true).await;
+        let unavailable = Arc::new(ActiveRuntime {
+            client: AcpClient::test_closed_writer(),
+            native_session_id: rt.native_session_id.clone(),
+            initialize_result: Value::Null,
+            supports_image: false,
+            supports_steering: true,
+            dangerously_skip_permissions: false,
+        });
+        ag.runtimes.lock().await.insert("antigravity-audit".into(), unavailable);
+        rt.client.close().await;
+        let failure = ag.command("stop", &json!({"threadId":"antigravity-audit"}), &auth).await.unwrap_err();
+        let api = failure.downcast_ref::<ApiError>().unwrap();
+        assert_eq!(api.code, 503);
+        assert!(api.message.contains("停止请求发送失败"));
+        assert!(!api.outcome_unknown, "写入队列未接收取消请求时仍可明确返回发送失败");
+        let c = ag.conversation("antigravity-audit").await.unwrap();
+        assert!(c.active());
+        assert!(!c.stop_requested());
+        assert!(c.turns[0]["completedAt"].is_null());
+    }
+
+    #[tokio::test]
+    async fn audit_stop_acceptance_waits_for_native_terminal_result() {
+        for (stop_reason, expected_status) in [("cancelled", "interrupted"), ("end_turn", "completed")] {
+            let (_dir, ag, auth, rt) = audit_fixture(AUDIT_ACCEPT, true, true).await;
+            let response = ag.command("stop", &json!({"threadId":"antigravity-audit"}), &auth).await.unwrap();
+            assert_eq!(response["stopRequested"], true);
+            assert_ne!(response["stopped"], true);
+            let c = ag.conversation("antigravity-audit").await.unwrap();
+            assert!(c.active());
+            assert!(c.stop_requested());
+            assert_eq!(c.turns[0]["status"], "inProgress");
+            ag.finish_turn("antigravity-audit", "turn-1", Ok(json!({"stopReason":stop_reason}))).await;
+            let c = ag.conversation("antigravity-audit").await.unwrap();
+            rt.client.close().await;
+            assert!(!c.active());
+            assert_eq!(c.turns[0]["status"], expected_status);
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_stop_cancels_pending_and_late_permissions_without_touching_next_turn() {
+        let script = r#"
+            if(!q.method){(globalThis.replies??=[]).push(q);return;}
+            console.log(JSON.stringify({id:q.id,result:q.method==="fixture/replies"?(globalThis.replies??[]):{}}));
+        "#;
+        let (_dir, ag, auth, rt) = audit_fixture(script, true, true).await;
+        let permission = |id: &str| AcpIncomingRequest {
+            id: json!(id), method: "session/request_permission".into(),
+            params: json!({"toolCall":{"toolCallId":id,"title":"执行命令"},
+                "options":[{"optionId":"allow","kind":"allow_once","name":"允许"}]}),
+        };
+        ag.handle_incoming_request("antigravity-audit", &rt, permission("before-stop")).await;
+        ag.command("stop", &json!({"threadId":"antigravity-audit"}), &auth).await.unwrap();
+        ag.handle_incoming_request("antigravity-audit", &rt, permission("after-stop")).await;
+        assert!(ag.requests.lock().await["antigravity-audit"].is_empty());
+        assert!(ag.conversation("antigravity-audit").await.unwrap().active());
+        let replies = rt.client.request_with_timeout(
+            "fixture/replies", json!({}), Some(AUDIT_ACTION_TIMEOUT),
+        ).await.unwrap();
+        assert_eq!(replies.as_array().unwrap().len(), 2);
+        assert_eq!(replies[0]["id"], "before-stop");
+        assert_eq!(replies[1]["id"], "after-stop");
+        assert!(replies.as_array().unwrap().iter().all(|reply|
+            reply["result"]["outcome"]["outcome"] == "cancelled"));
+        ag.finish_turn("antigravity-audit", "turn-1", Ok(json!({"stopReason":"cancelled"}))).await;
+        {
+            let mut saved = ag.saved.lock().await;
+            let c = saved.conversations.get_mut("antigravity-audit").unwrap();
+            c.turns.push(json!({"id":"turn-2","status":"inProgress","items":[]}));
+            c.active_turn_id = Some("turn-2".into());
+        }
+        ag.handle_incoming_request("antigravity-audit", &rt, permission("next-turn")).await;
+        assert_eq!(ag.requests.lock().await["antigravity-audit"].len(), 1);
+        rt.client.close().await;
+    }
+
+    #[tokio::test]
+    async fn audit_stop_failed_permission_reply_keeps_pending_request() {
+        let (_dir, ag, _auth, rt) = audit_fixture(AUDIT_ACCEPT, true, true).await;
+        ag.handle_incoming_request("antigravity-audit", &rt, AcpIncomingRequest {
+            id:json!("pending"), method:"session/request_permission".into(),
+            params:json!({"toolCall":{"toolCallId":"pending","title":"确认"},
+                "options":[{"optionId":"allow","kind":"allow_once","name":"允许"}]}),
+        }).await;
+        let unavailable = ActiveRuntime {
+            client: AcpClient::test_closed_writer(),
+            native_session_id: "audit".into(),
+            initialize_result: Value::Null,
+            supports_image: false,
+            supports_steering: true,
+            dangerously_skip_permissions: false,
+        };
+        let lock = ag.lock("antigravity-audit").await;
+        let _guard = lock.lock().await;
+        let failure = ag.cancel_pending_permissions("antigravity-audit", &unavailable).await.unwrap_err();
+        assert!(failure.downcast_ref::<ApiError>().unwrap().outcome_unknown);
+        assert_eq!(ag.requests.lock().await["antigravity-audit"].len(), 1);
+        assert!(ag.conversation("antigravity-audit").await.unwrap().active());
+        rt.client.close().await;
+    }
+
+    #[tokio::test]
+    async fn audit_stop_idle_session_only_pauses_future_dispatch() {
+        let (_dir, ag, auth, rt) = audit_fixture(AUDIT_ACCEPT, false, true).await;
+        {
+            let mut saved = ag.saved.lock().await;
+            let c = saved.conversations.get_mut("antigravity-audit").unwrap();
+            c.remote_queue.enqueue(json!({"clientUserMessageId":"queued-1","prompt":"queued"}), 1);
+            c.goal = json!({"status":"active","objective":"continue"});
+        }
+        ag.runtimes.lock().await.remove("antigravity-audit");
+        rt.client.close().await;
+        let response = ag.command("stop", &json!({"threadId":"antigravity-audit"}), &auth).await.unwrap();
+        assert_eq!(response["stopped"], true);
+        let c = ag.conversation("antigravity-audit").await.unwrap();
+        assert!(c.remote_queue.paused);
+        assert_eq!(c.goal["status"], "paused");
+        assert!(c.turns.is_empty());
     }
 
     #[tokio::test]

@@ -8206,6 +8206,27 @@ test("停止压缩实际提交当前会话停止请求，在途重复点击不�
   }
 });
 
+test("AGY 停止仅提示请求已发送，原生已结束和发送失败保留各自回执", async () => {
+  for (const [response, expected] of [
+    [{ ok: true, stopRequested: true }, "已请求停止"],
+    [{ ok: true, stopped: true }, "本轮已结束"],
+    [new Error("Antigravity 停止请求发送失败"), "Antigravity 停止请求发送失败"]
+  ]) {
+    const h = compactionComposerHarness(), notices = [];
+    Object.assign(h.context, { active: true, compaction: { state: "idle" }, compacting: false,
+      isAntigravity: () => true, isClaude: () => false,
+      notice: (...args) => notices.push(args),
+      mutate: async () => { if (response instanceof Error) throw response; return response; },
+      reloadThread: async () => {} });
+    await h.context.stopGeneration();
+    assert.equal(notices[0][0], expected);
+    assert.equal(notices.some(([text]) => text === "已停止"), false);
+    assert.equal(h.context.stopping, false);
+    assert.equal(h.context.active, true, "发送停止请求本身不能提前改写原生执行状态");
+    if (response instanceof Error) assert.equal(notices[0][1], true);
+  }
+});
+
 test("取回排队消息后沿用普通输入和发送入口，修改或清空均不自动恢复队列", () => {
   const h = queuedEditFeedbackHarness();
   for (const active of [false, true]) {

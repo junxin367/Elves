@@ -796,11 +796,12 @@ export async function stopGeneration() {
   setStopping(true); updateComposer();
   try {
     const result = await mutate("stop", { threadId: id });
-    // Claude 与 Antigravity 的停止只中断当前执行，没有后台终端清理；原生 CLI 一直不响应停止请求时服务端会强制结束它的进程，
-    // 必须明确告诉用户（不能静默成功），后续发送会自动重新接上原会话。
+    // 用户要求 AGY 停止只按真实回执提示：取消通知写入仅表示已请求，不能提前显示“已停止”。
+    // Claude 沿用既有强制结束及清理回执，AGY 的轮次结束等待原生事件。
     notice(result?.cleanupPending ? result.message || "会话已停止，后台终端清理尚未确认"
       : result?.forced ? `${antigravity ? "Antigravity" : "Claude"} 没有响应停止请求，已强制结束它的进程；会话已保留，可以继续发送。`
-      : claude || antigravity ? "已停止" : "已请求停止并清理此会话的后台终端");
+      : antigravity ? result?.stopped ? "本轮已结束" : "已请求停止"
+        : claude ? "已停止" : "已请求停止并清理此会话的后台终端");
     if (version === selectionVersion && selectedId === id) await reloadThread();
   } catch (error) { notice(error.message, true); }
   finally { setStopping(false); updateComposer(); }
