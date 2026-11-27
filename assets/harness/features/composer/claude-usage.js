@@ -138,7 +138,10 @@ function claudeUsageSubscription(value) {
   const type = typeof raw === "string" ? raw.trim() : "";
   if (/^[A-Za-z0-9][A-Za-z0-9 _+()./-]{0,63}$/u.test(type)) {
     // 用户要求等级只来自所属 WSL Claude CLI；仅统一首字母显示，不从额度比例推断等级或倍率。
-    return { type, label: type[0].toUpperCase() + type.slice(1) };
+    // 用户要求 AGY 额度标签省略 Google AI 前缀，只显示 Pro/Ultra 等等级；原始类型仍完整保留在缓存中。
+    const display = value?.source === "antigravity-native-usage"
+      ? type.replace(/^Google\s+AI(?:\s+|$)/iu, "") : type;
+    return { type, label: display ? display[0].toUpperCase() + display.slice(1) : "" };
   }
   return { type: null, label: "" };
 }
@@ -421,10 +424,10 @@ function renderClaudeUsageTip(defaultOrBarWindows) {
   // 用户要求眼睛紧跟账号文本；订阅等级继续显示在账号行右侧。
   if (reveal) title.append(reveal);
   // 用户确认缺少等级时直接不显示，不添加未知标签、占位或说明，也不使用效果图里的示例等级补齐。
-  if (subscription.type) {
+  if (subscription.label) {
     const badge = element("span", "claude-usage-subscription", subscription.label);
     badge.title = isAntigravityUsage
-      ? `所属 Antigravity 实例官方返回的订阅等级：${subscription.type}`
+      ? `所属 Antigravity 实例官方返回的订阅等级：${subscription.label}`
       : `所属 WSL Claude CLI 返回的订阅类型：${subscription.type}`;
     badge.setAttribute("aria-label", `订阅等级：${subscription.label}`); title.append(badge);
   }

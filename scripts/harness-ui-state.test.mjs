@@ -18692,7 +18692,7 @@ test("Antigravity 右下角 5h/7d 额度按当前模型分组展示，弹层支�
   assert.equal(trigger.children[0].children[1].textContent, "100%");
   assert.equal(trigger.children[1].children[1].textContent, "100%");
 
-  // 切回 Gemini 模型并展开弹层：验证邮箱脱敏、眼睛开关、Google AI Pro 等级与本地消耗预测
+  // 切回 Gemini 模型并展开弹层：验证邮箱脱敏、眼睛开关、简化等级标签与本地消耗预测。
   context.selectedModel = "gemini-4-neon";
   context.sync();
   trigger.onclick();
@@ -18740,7 +18740,20 @@ test("Antigravity 右下角 5h/7d 额度按当前模型分组展示，弹层支�
   const tipNode = nodes[0];
   const titleRow = tipNode.children[0];
   assert.equal(titleRow.children[0].textContent, "dem***@example.com");
-  assert.equal(titleRow.children[2].textContent, "Google AI Pro");
+  assert.equal(titleRow.children[2].textContent, "Pro");
+  assert.equal(titleRow.children[2].attributes["aria-label"], "订阅等级：Pro");
+  assert.doesNotMatch(titleRow.children[2].title, /Google AI/);
+  assert.equal(rawVm.runInContext("claudeUsageState.value.subscriptionType", context),
+    "Google AI Pro", "只简化显示，不改原始等级");
+  for (const [type, label] of [["Google AI Ultra", "Ultra"], ["google ai plus", "Plus"],
+    ["Pro", "Pro"], ["Google AI", ""]]) {
+    const subscription = context.claudeUsageSubscription({ source: "antigravity-native-usage", subscriptionType: type });
+    assert.equal(subscription.label, label);
+    assert.equal(subscription.type, type);
+  }
+  assert.equal(context.claudeUsageSubscription({
+    source: "claude-native-usage", subscriptionType: "Google AI Pro"
+  }).label, "Google AI Pro", "AGY 的显示规则不能影响 Claude");
   titleRow.children[1].onclick();
   assert.equal(titleRow.children[0].textContent, "demo.user@example.com");
 
