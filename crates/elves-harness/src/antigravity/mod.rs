@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, oneshot};
 
 use self::acp::{AcpChannels, AcpClient, AcpIncomingRequest, EnvConfig};
 use self::projection::MappedPermission;
@@ -123,6 +123,11 @@ impl Conversation {
         let mut value = turn.clone();
         if let Some(obj) = value.as_object_mut() {
             obj.remove("_acpUsage");
+            obj.remove("_pendingUserItem");
+            obj.remove("_pendingPrompts");
+            obj.remove("_promptError");
+            obj.remove("_promptUsage");
+            obj.remove("_promptStop");
         }
         if let Some(items) = value["items"].as_array_mut() {
             for item in items.iter_mut() {
@@ -151,7 +156,6 @@ impl Conversation {
             .find_map(|turn| {
                 turn["plan"]
                     .as_array()
-                    .filter(|plan| !plan.is_empty())
                     .cloned()
             })
             .unwrap_or_default()
@@ -216,7 +220,9 @@ impl Conversation {
             "status": status,
             "editableMessage": null,
             "editHistoryHead": self.edit_history_head,
-            "messageEditReady": !self.active() && !has_waiting_request,
+            "messageEditReady": !self.active() && !has_waiting_request
+                && self.remote_queue.messages.is_empty()
+                && self.remote_queue.edits.values().all(|edit| edit.state != "editing"),
             "goal": self.goal,
             "tokenUsage": self.token_usage,
             "capabilities": capabilities,
@@ -243,6 +249,7 @@ struct ActiveRuntime {
     dangerously_skip_permissions: bool,
 }
 
+#[derive(Clone)]
 struct PendingPermission {
     rpc_id: Value,
     mapped: MappedPermission,
@@ -283,6 +290,7 @@ pub(crate) struct Antigravity {
     lifecycle_gate: RwLock<()>,
     epoch: String,
     request_revision: AtomicU64,
+    prompt_confirmations: Mutex<HashMap<String, oneshot::Sender<Result<(), ApiError>>>>,
 }
 
 impl Antigravity {
@@ -345,6 +353,7 @@ impl Antigravity {
             lifecycle_gate: RwLock::new(()),
             epoch: format!("antigravity-{}", uuid::Uuid::new_v4()),
             request_revision: AtomicU64::new(0),
+            prompt_confirmations: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -1551,7 +1560,7 @@ impl Antigravity {
             self.resolve_session_app_data_dir(c).await
         };
         let dangerously_skip_permissions = c.permission_mode.as_deref() == Some("bypassPermissions");
-        let (client, channels) = AcpClient::spawn(
+        let (client, mut channels) = AcpClient::spawn(
             &c.config,
             &c.cwd,
             &c.linux_cwd,
@@ -1582,6 +1591,8 @@ impl Antigravity {
                 return Err(err);
             }
         };
+        // load/resume 返回前的历史回放属于恢复过程，不能被下一次发送误认成接收证据。
+        while channels.updates.try_recv().is_ok() {}
 
         let native_session_id = setup["sessionId"]
             .as_str()
@@ -1609,8 +1620,10 @@ impl Antigravity {
         system_prompt_append: Option<&str>,
     ) -> anyhow::Result<(Arc<ActiveRuntime>, Value)> {
         let want_skip = c.permission_mode.as_deref() == Some("bypassPermissions");
+        // 克隆后立即释放表锁；后续切换启动参数会移除旧连接，不能在同一分支重复持锁。
+        let existing = self.runtimes.lock().await.get(&c.id).cloned();
         if !create_new
-            && let Some(existing) = self.runtimes.lock().await.get(&c.id).cloned()
+            && let Some(existing) = existing
             && existing.client.is_live()
         {
             if existing.dangerously_skip_permissions == want_skip || c.active() {
@@ -1645,11 +1658,16 @@ impl Antigravity {
     ) {
         let weak_updates = Arc::downgrade(self);
         let tid_updates = thread_id.clone();
+        let update_runtime = runtime.clone();
         tokio::spawn(async move {
             while let Some(frame) = channels.updates.recv().await {
                 let Some(service) = weak_updates.upgrade() else {
                     break;
                 };
+                let current = service.runtimes.lock().await.get(&tid_updates).cloned();
+                if !current.is_some_and(|rt| Arc::ptr_eq(&rt, &update_runtime)) {
+                    break;
+                }
                 if frame["method"] == "session/update" {
                     let update = &frame["params"]["update"];
                     service.handle_session_update(&tid_updates, update).await;
@@ -1664,6 +1682,10 @@ impl Antigravity {
                 let Some(service) = weak_reqs.upgrade() else {
                     break;
                 };
+                let current = service.runtimes.lock().await.get(&tid_reqs).cloned();
+                if !current.is_some_and(|rt| Arc::ptr_eq(&rt, &runtime)) {
+                    break;
+                }
                 service
                     .handle_incoming_request(&tid_reqs, &runtime, req)
                     .await;
@@ -1672,6 +1694,12 @@ impl Antigravity {
     }
 
     async fn handle_session_update(&self, thread_id: &str, update: &Value) {
+        // ACP 没有独立接收回执；空闲发送只有当前原生执行的输出/工具证据或最终成功才能进入正文。
+        if matches!(update["sessionUpdate"].as_str(),
+            Some("agent_message_chunk" | "agent_message" | "agent_thought_chunk" | "agent_thought" | "tool_call"))
+        {
+            self.confirm_active_turn_message(thread_id).await;
+        }
         let now = now_ms();
         let mut events = Vec::new();
         let mut commands_to_cache: Option<(String, Vec<Value>)> = None;
@@ -1779,6 +1807,7 @@ impl Antigravity {
                 .await;
             return;
         }
+        self.confirm_active_turn_message(thread_id).await;
         let request_id = format!("agy-req-{}", uuid::Uuid::new_v4());
         let mapped = projection::map_permission_request(thread_id, &request_id, &req.params);
         self.requests
@@ -1830,56 +1859,83 @@ impl Antigravity {
         c: &mut Conversation,
         payload: &Value,
     ) -> anyhow::Result<()> {
+        let saved_effort = c.effort.clone();
+        let mut restore_effort = true;
         if let Some(model) = payload["model"]
             .as_str()
+            .or_else(|| (!c.model.is_empty()).then_some(c.model.as_str()))
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            && model != c.model
         {
-            let _ = runtime
+            let changing_model = model != c.model;
+            let updated = runtime
                 .client
                 .session_set_config_option(&runtime.native_session_id, "model", model)
                 .await?;
             c.model = model.to_owned();
+            // 更换模型后采用该模型实际返回的默认思考深度；无 thought_level 的模型不能继承旧模型等级。
+            restore_effort = !changing_model;
+            if let Some(options) = updated["configOptions"].as_array() {
+                let thought = options.iter().find(|o| o["id"] == "thought_level" || o["category"] == "thought_level");
+                c.effort = thought.and_then(|o| o["currentValue"].as_str()).unwrap_or("").to_owned();
+                restore_effort &= thought.is_some();
+            } else if changing_model {
+                c.effort.clear();
+            }
         }
         if let Some(effort) = payload["reasoningEffort"]
             .as_str()
+            .or_else(|| (restore_effort && !saved_effort.is_empty()).then_some(saved_effort.as_str()))
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            && effort != c.effort
         {
-            // 部分模型无 thought_level 选项时忽略错误，保留主流程可用。
-            if runtime
+            // 用户选择必须以原生成功回执为准；重连后也重新应用，不能拿本地保存值当作实际状态。
+            runtime
                 .client
                 .session_set_config_option(&runtime.native_session_id, "thought_level", effort)
-                .await
-                .is_ok()
-            {
-                c.effort = effort.to_owned();
-            }
+                .await?;
+            c.effort = effort.to_owned();
         }
         if let Some(mode) = payload["permissionMode"]
             .as_str()
+            .or(c.permission_mode.as_deref())
             .map(str::trim)
             .filter(|s| matches!(*s, "default" | "accept-edits" | "auto" | "bypassPermissions"))
         {
             // 无限制模式由启动参数 `--dangerously-skip-permissions` 控制，不调用 session/set_mode 发送非原生值。
-            if mode != "bypassPermissions"
-                && runtime
-                    .client
-                    .session_set_mode(&runtime.native_session_id, mode)
-                    .await
-                    .is_err()
-            {
-                let _ = runtime
-                    .client
-                    .session_set_config_option(&runtime.native_session_id, "mode", mode)
-                    .await;
+            if (mode == "bypassPermissions") != runtime.dangerously_skip_permissions {
+                return Err(error(409, "权限模式将在当前任务结束并重新连接后生效"));
+            }
+            if mode != "bypassPermissions" {
+                Self::set_native_mode(runtime, mode).await?;
             }
             c.permission_mode = Some(mode.to_owned());
             c.permission_revision += 1;
         }
         Ok(())
+    }
+
+    async fn set_native_mode(runtime: &ActiveRuntime, mode: &str) -> anyhow::Result<()> {
+        match runtime.client.session_set_mode(&runtime.native_session_id, mode).await {
+            Ok(_) => Ok(()),
+            // 只对官方未实现的设置入口使用另一个公开入口；参数拒绝、登录或连接失败必须原样返回。
+            Err(err) if err.downcast_ref::<ApiError>().is_some_and(|e| e.code == 501) => {
+                runtime.client.session_set_config_option(&runtime.native_session_id, "mode", mode).await?;
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn save_options(&self, c: &Conversation) -> anyhow::Result<()> {
+        let mut saved = self.saved.lock().await;
+        let current = saved.conversations.get_mut(&c.id)
+            .ok_or_else(|| error(404, "Antigravity 会话不存在"))?;
+        current.model = c.model.clone();
+        current.effort = c.effort.clone();
+        current.permission_mode = c.permission_mode.clone();
+        current.permission_revision = c.permission_revision;
+        self.persist_locked(&saved, None).await
     }
 
     /// 创建新 Antigravity 会话并发送首条消息（或首条目标）。
@@ -2113,12 +2169,14 @@ impl Antigravity {
                 "editable": true,
             }
         });
-        let turn = json!({
+        let mut turn = json!({
             "id": turn_id,
             "status": "inProgress",
             "turnStartedAtMs": now,
             "startedAt": now,
-            "items": [user_item.clone()],
+            "items": [],
+            "_pendingUserItem": user_item,
+            "_pendingPrompts": 1,
         });
 
         {
@@ -2127,12 +2185,19 @@ impl Antigravity {
                 .conversations
                 .get_mut(thread_id)
                 .ok_or_else(|| error(404, "Antigravity 会话不存在"))?;
+            if c.active() {
+                return Err(error(409, "Antigravity 当前轮次仍在执行，请等待结束或使用队列引导"));
+            }
             c.turns.push(turn.clone());
             c.active_turn_id = Some(turn_id.clone());
             c.updated_at = now;
             c.edit_history_head = format!("agy-head-{}", c.turns.len());
             self.persist_locked(&saved, Some(thread_id)).await?;
         }
+        let (confirmation, received) = oneshot::channel();
+        self.prompt_confirmations.lock().await.insert(turn_id.clone(), confirmation);
+        turn.as_object_mut().unwrap().remove("_pendingUserItem");
+        turn.as_object_mut().unwrap().remove("_pendingPrompts");
 
         self.publish(json!({
             "method": "turn/started",
@@ -2151,11 +2216,29 @@ impl Antigravity {
         let rt = runtime.clone();
         tokio::spawn(async move {
             let prompt_res = rt.client.session_prompt(&rt.native_session_id, blocks).await;
+            if prompt_res.is_ok() {
+                service.confirm_turn_message(&tid, &active_turn_id).await;
+            } else if let Some(sender) = service.prompt_confirmations.lock().await.remove(&active_turn_id) {
+                let failure = prompt_res.as_ref().unwrap_err();
+                let api = failure.downcast_ref::<ApiError>().cloned()
+                    .unwrap_or_else(|| ApiError::new(503, failure.to_string()));
+                let _ = sender.send(Err(api));
+            }
             service
                 .finish_turn(&tid, &active_turn_id, prompt_res)
                 .await;
         });
 
+        // 接收观察窗口与 ACP 写入预算同为 15 秒；超时只返回待核对，后台原请求继续等待，不能重发。
+        match tokio::time::timeout(Duration::from_secs(15), received).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(err))) => return Err(err.into()),
+            _ => {
+                let mut failure = ApiError::new(504, "Antigravity 消息送达结果待核对，未自动重发");
+                failure.outcome_unknown = true;
+                return Err(failure.into());
+            }
+        }
         Ok(json!({
             "ok": true,
             "threadId": thread_id,
@@ -2166,10 +2249,68 @@ impl Antigravity {
         }))
     }
 
+    async fn confirm_active_turn_message(&self, thread_id: &str) {
+        // 流式通知只读取当前轮次标识，避免每个文本片段复制整段会话历史。
+        let turn_id = self.saved.lock().await.conversations.get(thread_id)
+            .and_then(|c| c.active_turn_id.clone());
+        if let Some(turn_id) = turn_id {
+            self.confirm_turn_message(thread_id, &turn_id).await;
+        }
+    }
+
+    async fn confirm_turn_message(&self, thread_id: &str, turn_id: &str) {
+        let item = {
+            let mut saved = self.saved.lock().await;
+            let Some(c) = saved.conversations.get_mut(thread_id).filter(|c| !c.deleted) else { return };
+            let Some(turn) = c.turns.iter_mut().find(|t| t["id"] == turn_id) else { return };
+            let Some(item) = turn.as_object_mut().and_then(|t| t.remove("_pendingUserItem")) else { return };
+            turn["items"].as_array_mut().unwrap().insert(0, item.clone());
+            if let Some(client_id) = item["clientId"].as_str() {
+                c.remote_queue.confirm_sent(client_id);
+            }
+            let _ = self.persist_locked(&saved, Some(thread_id)).await;
+            item
+        };
+        self.publish(json!({"method":"item/updated",
+            "params":{"threadId":thread_id,"turnId":turn_id,"item":item}}));
+        if let Some(sender) = self.prompt_confirmations.lock().await.remove(turn_id) {
+            let _ = sender.send(Ok(()));
+        }
+        self.queue_changed(thread_id).await;
+    }
+
     async fn finish_turn(&self, thread_id: &str, turn_id: &str, result: anyhow::Result<Value>) {
+        // 引导复用原轮次；前一个 prompt 提前返回时仍等待所有在途 prompt，避免把继续执行显示为空闲。
+        let result = {
+            let mut saved = self.saved.lock().await;
+            let Some(turn) = saved.conversations.get_mut(thread_id)
+                .and_then(|c| c.turns.iter_mut().find(|t| t["id"] == turn_id)) else { return };
+            match result {
+                Ok(value) => {
+                    if value["usage"].is_object() { turn["_promptUsage"] = value["usage"].clone(); }
+                    if matches!(value["stopReason"].as_str(), Some("cancelled" | "canceled")) {
+                        turn["_promptStop"] = value["stopReason"].clone();
+                    }
+                }
+                Err(err) => { turn["_promptError"] = json!(err.to_string()); }
+            }
+            let remaining = turn["_pendingPrompts"].as_u64().unwrap_or(1).saturating_sub(1);
+            turn["_pendingPrompts"] = json!(remaining);
+            if remaining > 0 {
+                let _ = self.persist_locked(&saved, Some(thread_id)).await;
+                return;
+            }
+            turn.as_object_mut().unwrap().remove("_pendingUserItem");
+            if let Some(message) = turn["_promptError"].as_str() {
+                Err(error(503, message))
+            } else {
+                Ok(json!({"stopReason":turn["_promptStop"].as_str().unwrap_or("end_turn"),"usage":turn["_promptUsage"]}))
+            }
+        };
         let now = now_ms();
         // 清理此轮残留的未回答审批请求。
-        if let Some(removed) = self.requests.lock().await.remove(thread_id)
+        let removed_requests = self.requests.lock().await.remove(thread_id);
+        if let Some(removed) = removed_requests
             && !removed.is_empty()
         {
             self.requests_changed(thread_id).await;
@@ -2286,6 +2427,113 @@ impl Antigravity {
         self.queue_changed(thread_id).await;
     }
 
+    async fn deliver_queued(
+        self: &Arc<Self>,
+        id: &str,
+        msg: queue::QueuedMessage,
+        allow_steering: bool,
+        guard: tokio::sync::OwnedMutexGuard<()>,
+    ) -> anyhow::Result<Value> {
+        let result = async {
+            let lifecycle = self.lifecycle_gate.read().await;
+            anyhow::ensure!(self.is_accepting(), "远程服务正在关闭，Antigravity 操作尚未派发");
+            let mut c = self.conversation(id).await?;
+            if !c.active() && let Some(mode) = msg.payload["permissionMode"].as_str() {
+                c.permission_mode = Some(mode.to_owned());
+            }
+            let (runtime, _) = self.ensure_runtime(&c, false, None).await?;
+            let blocks = projection::build_prompt_blocks(&msg.payload, runtime.supports_image)?;
+            // 异步准备后重读当前轮次，不能按点击时的旧状态取消任务或错误引导。
+            c = self.conversation(id).await?;
+            if !c.active() {
+                Self::apply_acp_options(&runtime, &mut c, &msg.payload).await?;
+                self.save_options(&c).await?;
+            }
+            let active = {
+                let mut saved = self.saved.lock().await;
+                let c = saved.conversations.get_mut(id).ok_or_else(|| error(404, "Antigravity 会话不存在"))?;
+                let active = if c.active() {
+                    if !allow_steering || !runtime.supports_steering {
+                        return Err(error(409, "当前 Antigravity 不支持运行中引导，消息已保留，请等待本轮结束"));
+                    }
+                    let turn = c.turns.iter_mut().find(|t| Some(t["id"].as_str().unwrap_or("")) == c.active_turn_id.as_deref())
+                        .ok_or_else(|| error(409, "当前轮次状态待核对，消息已保留"))?;
+                    let index = turn["items"].as_array().map_or(0, Vec::len);
+                    turn["_pendingPrompts"] = json!(turn["_pendingPrompts"].as_u64().unwrap_or(1) + 1);
+                    Some((turn["id"].as_str().unwrap().to_owned(), index))
+                } else { None };
+                c.remote_queue.mark_sending(&msg.id)?;
+                self.persist_locked(&saved, Some(id)).await?;
+                active
+            };
+            self.queue_changed(id).await;
+            let mut response = if let Some((turn_id, position)) = active {
+                // 引导等待原生成功回执期间保留队列；释放会话锁，使审批、停止仍可使用。
+                drop(guard);
+                // 等待最终回执不阻塞服务释放；运行时已经登记，关闭流程仍能结束本次连接并返回未知回执。
+                drop(lifecycle);
+                let reply = runtime.client.session_prompt(&runtime.native_session_id, blocks).await;
+                if reply.is_ok() {
+                    let mut content = Vec::new();
+                    if let Some(text) = msg.payload["prompt"].as_str() {
+                        content.push(json!({"type":"text","text":text}));
+                    }
+                    for image in msg.payload["images"].as_array().into_iter().flatten() {
+                        content.push(json!({"type":"image","url":image["dataUrl"]}));
+                    }
+                    let item_id = format!("{turn_id}-steer-{}",msg.id);
+                    let item = json!({"id":item_id,"clientId":msg.id,
+                        "type":"userMessage","content":content,"sentAtMs":msg.created_at,
+                        "messageMetadata":{"turnId":turn_id,"messageId":item_id,"editable":true}});
+                    {
+                        let mut saved = self.saved.lock().await;
+                        if let Some(turn) = saved.conversations.get_mut(id)
+                            .and_then(|c| c.turns.iter_mut().find(|t| t["id"] == turn_id))
+                            && let Some(items) = turn["items"].as_array_mut() {
+                            items.insert(position.min(items.len()), item.clone());
+                        }
+                        let _ = self.persist_locked(&saved, Some(id)).await;
+                    }
+                    self.publish(json!({"method":"item/updated",
+                        "params":{"threadId":id,"turnId":turn_id,"item":item}}));
+                }
+                // 注入被拒绝不能把仍在执行的原任务标为失败；原任务本身的结果仍负责其终态。
+                let finish = reply.as_ref().map(Clone::clone).unwrap_or_else(|_| json!({}));
+                self.finish_turn(id, &turn_id, Ok(finish)).await;
+                reply?;
+                json!({"ok":true,"threadId":id,"turnId":turn_id,"steered":true})
+            } else {
+                self.dispatch_turn(id, &runtime, &msg.payload).await?
+            };
+            {
+                let mut saved = self.saved.lock().await;
+                if let Some(c) = saved.conversations.get_mut(id) {
+                    c.remote_queue.confirm_sent(&msg.id);
+                    if let Err(err) = self.persist_locked(&saved, None).await {
+                        let mut failure = ApiError::new(503, format!("消息已投递，但回执保存失败：{err}"));
+                        failure.outcome_unknown = true;
+                        return Err(failure.into());
+                    }
+                }
+            }
+            response["messageId"] = json!(msg.id);
+            response["clientUserMessageId"] = json!(msg.id);
+            response["confirmed"] = json!(true);
+            response["deliveryState"] = json!("accepted");
+            Ok(response)
+        }.await;
+        if let Err(failure) = &result {
+            let unknown = failure.downcast_ref::<ApiError>().is_some_and(|e| e.outcome_unknown);
+            let mut saved = self.saved.lock().await;
+            if let Some(c) = saved.conversations.get_mut(id) {
+                c.remote_queue.delivery_failed(&msg.id, unknown, &failure.to_string());
+                let _ = self.persist_locked(&saved, None).await;
+            }
+        }
+        self.queue_changed(id).await;
+        result
+    }
+
     async fn drain_queues_and_goals(self: &Arc<Self>) {
         let candidates: Vec<String> = {
             let saved = self.saved.lock().await;
@@ -2303,7 +2551,7 @@ impl Antigravity {
         };
         for id in candidates {
             let lock = self.lock(&id).await;
-            let Ok(_guard) = lock.try_lock() else {
+            let Ok(guard) = lock.try_lock_owned() else {
                 continue;
             };
             let has_reqs = self
@@ -2358,9 +2606,11 @@ impl Antigravity {
                 else {
                     continue;
                 };
-                let (next, dirty) = if let Some(msg) = c.remote_queue.pop_next_ready() {
-                    (NextDispatch::Queue(msg), true)
-                } else if c.goal["status"] == "active" {
+                let (next, dirty) = if let Some(msg) = c.remote_queue.next_ready() {
+                    (NextDispatch::Queue(msg), false)
+                } else if c.goal["status"] == "active"
+                    && c.remote_queue.messages.is_empty()
+                    && c.remote_queue.edits.values().all(|e| e.state != "editing") {
                     let objective = c.goal["objective"].as_str().unwrap_or("").to_owned();
                     let next_iter = c.goal["iterations"].as_u64().unwrap_or(1) + 1;
                     if objective.is_empty() || next_iter > GOAL_MAX_ITERATIONS {
@@ -2386,35 +2636,27 @@ impl Antigravity {
             };
             match next {
                 NextDispatch::Queue(msg) => {
-                    self.queue_changed(&id).await;
-                    if let Ok((runtime, _)) = self.ensure_runtime(&conv, false, None).await {
-                        let mut c_opt = conv.clone();
-                        let _ = Self::apply_acp_options(&runtime, &mut c_opt, &msg.payload).await;
-                        if self.dispatch_turn(&id, &runtime, &msg.payload).await.is_err() {
-                            let mut saved = self.saved.lock().await;
-                            if let Some(c) = saved.conversations.get_mut(&id) {
-                                c.remote_queue.messages.insert(0, msg);
-                                c.remote_queue.pause("队列自动发送失败，已暂停等待确认");
-                                let _ = self.persist_locked(&saved, None).await;
-                            }
-                            self.queue_changed(&id).await;
-                        }
-                    }
+                    let _ = self.deliver_queued(&id, msg, false, guard).await;
                 }
                 NextDispatch::Goal(prompt) => {
-                    if let Ok((runtime, _)) = self.ensure_runtime(&conv, false, None).await {
+                    let result = async {
+                        let (runtime, _) = self.ensure_runtime(&conv, false, None).await?;
+                        let mut c = conv.clone();
+                        Self::apply_acp_options(&runtime, &mut c, &json!({})).await?;
+                        self.save_options(&c).await?;
                         let payload = json!({
                             "prompt": prompt,
                             "clientUserMessageId": uuid::Uuid::new_v4().to_string(),
                         });
-                        if self.dispatch_turn(&id, &runtime, &payload).await.is_err() {
+                        self.dispatch_turn(&id, &runtime, &payload).await
+                    }.await;
+                    if result.is_err() {
                             let mut saved = self.saved.lock().await;
                             if let Some(c) = saved.conversations.get_mut(&id) {
                                 c.goal["status"] = json!("paused");
                                 c.goal["updatedAt"] = json!(now_ms());
                                 let _ = self.persist_locked(&saved, None).await;
                             }
-                        }
                     }
                 }
                 NextDispatch::None => {}
@@ -2440,7 +2682,7 @@ impl Antigravity {
         }
 
         let lock = self.lock(id).await;
-        let _guard = lock.lock().await;
+        let _guard = lock.lock_owned().await;
         let mut c = self.conversation(id).await?;
         // 若该会话正被 Antigravity App 或外部 agy CLI 占用，禁止 Harness 发起任何发送/编辑/权限/删除写操作。
         if matches!(
@@ -2459,7 +2701,7 @@ impl Antigravity {
         match action {
             "send" => {
                 // 仅明确确认当前会话正在执行时允许入队；空闲时直接通过 ACP 发送。
-                if c.active() || payload["queueOnly"] == true {
+                if c.active() {
                     let msg = {
                         let mut saved = self.saved.lock().await;
                         let conv = saved
@@ -2501,46 +2743,9 @@ impl Antigravity {
             }
             "steerQueued" => {
                 let message_id = payload["messageId"].as_str().context("缺少队列消息标识")?;
-                let msg = {
-                    let mut saved = self.saved.lock().await;
-                    let conv = saved
-                        .conversations
-                        .get_mut(id)
-                        .ok_or_else(|| error(404, "Antigravity 会话不存在"))?;
-                    let msg = conv.remote_queue.take_by_id(message_id)?;
-                    conv.remote_queue.paused = false;
-                    self.persist_locked(&saved, None).await?;
-                    msg
-                };
-                self.queue_changed(id).await;
-                if let Some(mode) = payload["permissionMode"]
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|m| matches!(*m, "default" | "accept-edits" | "auto" | "bypassPermissions"))
-                {
-                    c.permission_mode = Some(mode.to_owned());
-                }
-                let (runtime, _) = self.ensure_runtime(&c, false, None).await?;
-                if c.active() && runtime.supports_steering {
-                    // agy acp 1.5.0+ 原生支持运行中再次发送 session/prompt 作为引导，无需强行中断子任务。
-                    let blocks =
-                        projection::build_prompt_blocks(&msg.payload, runtime.supports_image)?;
-                    let rt = runtime.clone();
-                    tokio::spawn(async move {
-                        let _ = rt.client.session_prompt(&rt.native_session_id, blocks).await;
-                    });
-                    return Ok(json!({
-                        "ok": true,
-                        "threadId": id,
-                        "steered": true,
-                        "messageId": message_id,
-                    }));
-                }
-                if c.active() {
-                    let _ = runtime.client.session_cancel(&runtime.native_session_id).await;
-                }
-                Self::apply_acp_options(&runtime, &mut c, &msg.payload).await?;
-                self.dispatch_turn(id, &runtime, &msg.payload).await
+                let msg = c.remote_queue.ready_by_id(message_id)?;
+                drop(_lifecycle);
+                self.deliver_queued(id, msg, true, _guard).await
             }
             "removeQueued" => {
                 let message_id = payload["messageId"].as_str().context("缺少消息 ID")?;
@@ -2638,6 +2843,9 @@ impl Antigravity {
                 Ok(result)
             }
             "setGoal" => {
+                if c.active() {
+                    return Err(error(409, "请等待 Antigravity 结束当前执行后再创建目标"));
+                }
                 if !c.goal.is_null() && c.goal["status"] != "complete" {
                     return Err(error(409, "此会话已有未结束的目标"));
                 }
@@ -2674,6 +2882,8 @@ impl Antigravity {
                     conv.goal = goal.clone();
                     conv.model = c.model.clone();
                     conv.effort = c.effort.clone();
+                    conv.permission_mode = c.permission_mode.clone();
+                    conv.permission_revision = c.permission_revision;
                     self.persist_locked(&saved, None).await?;
                 }
                 let mut goal_payload = payload.clone();
@@ -2736,6 +2946,12 @@ impl Antigravity {
                 if c.active() {
                     return Err(error(409, "请等待 Antigravity 结束当前执行后再编辑历史消息"));
                 }
+                // 历史编辑与共享会话规则一致：待发/未知消息、队列编辑及审批存在时，不能替换其所属原生历史。
+                if !c.remote_queue.messages.is_empty()
+                    || c.remote_queue.edits.values().any(|e| e.state == "editing")
+                    || self.requests.lock().await.get(id).is_some_and(|requests| !requests.is_empty()) {
+                    return Err(error(409, "请先处理待发送消息、队列编辑和审批，再编辑历史消息"));
+                }
                 if !c.edit_history_head.is_empty()
                     && !payload["historyHead"].is_null()
                     && payload["historyHead"] != c.edit_history_head
@@ -2759,19 +2975,30 @@ impl Antigravity {
                 // 因官方 ACP 协议暂不支持原生历史截断与 session/fork，
                 // 这里严格通过 ACP `session/new` 开启新会话，并将截断点之前保留的轮次经 ACP 官方宣告的
                 // `_meta.antigravity.systemPrompt.append` 传入，不触碰内部数据库，也不撤销磁盘文件改动。
-                let kept_turns = c.turns[..turn_idx].to_vec();
+                let mut kept_turns = c.turns[..turn_idx].to_vec();
+                // 引导消息可能处于同一原生轮次；编辑它时仍保留该轮此前已确认的消息与回复。
+                if let Some(items) = c.turns[turn_idx]["items"].as_array()
+                    && let Some(item_idx) = items.iter().position(|item| item["id"] == payload["messageId"])
+                    && item_idx > 0 {
+                    let mut prefix = c.turns[turn_idx].clone();
+                    prefix["items"] = json!(&items[..item_idx]);
+                    kept_turns.push(prefix);
+                }
                 let replay_prompt = projection::build_edit_replay_system_prompt(&kept_turns);
 
-                if let Some(old_rt) = self.runtimes.lock().await.remove(id) {
-                    let _ = old_rt.client.session_close(&old_rt.native_session_id).await;
-                    old_rt.client.close().await;
+                if let Some(mode) = payload["permissionMode"].as_str() {
+                    c.permission_mode = Some(mode.to_owned());
                 }
-                let (new_runtime, _) = self
-                    .ensure_runtime(&c, true, replay_prompt.as_deref())
+                // 新运行时、历史追加和附件都准备成功后才替换原会话；失败不得留下指向空历史的新连接。
+                projection::build_prompt_blocks(payload, true)?;
+                let (new_runtime, _, channels) = self
+                    .start_runtime(&c, true, replay_prompt.as_deref())
                     .await?;
-                Self::apply_acp_options(&new_runtime, &mut c, payload).await?;
-                {
+                let prepared = async {
+                    Self::apply_acp_options(&new_runtime, &mut c, payload).await?;
+                    projection::build_prompt_blocks(payload, new_runtime.supports_image)?;
                     let mut saved = self.saved.lock().await;
+                    let original = saved.conversations.get(id).cloned();
                     let conv = saved
                         .conversations
                         .get_mut(id)
@@ -2781,10 +3008,26 @@ impl Antigravity {
                     conv.model = c.model.clone();
                     conv.effort = c.effort.clone();
                     conv.permission_mode = c.permission_mode.clone();
+                    conv.permission_revision = c.permission_revision;
                     conv.edit_history_head = format!("agy-head-{}", uuid::Uuid::new_v4());
                     conv.updated_at = now_ms();
-                    self.persist_locked(&saved, Some(id)).await?;
+                    if let Err(err) = self.persist_locked(&saved, Some(id)).await {
+                        if let Some(original) = original { saved.conversations.insert(id.into(), original); }
+                        return Err(err);
+                    }
+                    Ok::<_, anyhow::Error>(())
+                }.await;
+                if let Err(err) = prepared {
+                    let _ = new_runtime.client.session_close(&new_runtime.native_session_id).await;
+                    new_runtime.client.close().await;
+                    return Err(err);
                 }
+                let old_runtime = self.runtimes.lock().await.insert(id.into(), new_runtime.clone());
+                if let Some(old_rt) = old_runtime {
+                    let _ = old_rt.client.session_close(&old_rt.native_session_id).await;
+                    old_rt.client.close().await;
+                }
+                self.spawn_runtime_pumps(id.into(), new_runtime.clone(), channels);
                 self.publish(json!({
                     "method": "remote/threadReverted",
                     "params": { "threadId": id }
@@ -2802,24 +3045,15 @@ impl Antigravity {
                     .ok_or_else(|| error(400, "Antigravity 权限模式无效"))?;
                 let want_skip = mode == "bypassPermissions";
                 let mut applied_live = false;
-                if let Some(rt) = self.runtimes.lock().await.get(id).cloned()
+                let current_runtime = self.runtimes.lock().await.get(id).cloned();
+                if let Some(rt) = current_runtime
                     && rt.client.is_live()
                 {
                     if rt.dangerously_skip_permissions == want_skip {
-                        if want_skip
-                            || rt
-                                .client
-                                .session_set_mode(&rt.native_session_id, mode)
-                                .await
-                                .is_ok()
-                            || rt
-                                .client
-                                .session_set_config_option(&rt.native_session_id, "mode", mode)
-                                .await
-                                .is_ok()
-                        {
-                            applied_live = true;
+                        if !want_skip {
+                            Self::set_native_mode(&rt, mode).await?;
                         }
+                        applied_live = true;
                     } else if !c.active() {
                         if let Some(old_rt) = self.runtimes.lock().await.remove(id) {
                             let _ = old_rt.client.session_close(&old_rt.native_session_id).await;
@@ -2895,8 +3129,9 @@ impl Antigravity {
                     .requests
                     .lock()
                     .await
-                    .get_mut(id)
-                    .and_then(|map| map.remove(req_id))
+                    .get(id)
+                    .and_then(|map| map.get(req_id))
+                    .cloned()
                     .ok_or_else(|| error(404, "该审批或提问请求已处理或已过期"))?;
                 let rt = self
                     .runtimes
@@ -2907,7 +3142,16 @@ impl Antigravity {
                     .ok_or_else(|| error(409, "Antigravity ACP 会话连接已断开"))?;
                 let reply =
                     projection::build_permission_response(&pending.mapped, action, payload);
+                if pending.mapped.is_user_input && action == "answer"
+                    && reply["outcome"]["outcome"] == "cancelled"
+                    && payload["response"]["skip"] != true {
+                    return Err(error(400, "请选择 Antigravity 提供的一个选项"));
+                }
+                // 连接/写入失败保留原请求；只有原生管道接收答复后才移除，避免提问凭空消失。
                 rt.client.respond_result(pending.rpc_id, reply).await?;
+                if let Some(requests) = self.requests.lock().await.get_mut(id) {
+                    requests.remove(req_id);
+                }
                 self.requests_changed(id).await;
                 self.publish(json!({
                     "method": "serverRequest/resolved",
@@ -3071,6 +3315,375 @@ pub(crate) fn saved_execution_active(directory: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    // Windows 并行用例的进程启动和首次写盘不计入动作死锁判断；5 秒仍可检测锁重入，避免 2 秒调度抖动误报。
+    const AUDIT_ACTION_TIMEOUT: Duration = Duration::from_secs(5);
+
+    async fn audit_fixture(
+        reply: &str,
+        active: bool,
+        steering: bool,
+    ) -> (tempfile::TempDir, Arc<Antigravity>, HarnessAuthorization, Arc<ActiveRuntime>) {
+        let (dir, auth) = crate::tests::service_dispatch_fixture().await;
+        let ag = Antigravity::new(dir.path()).unwrap();
+        let mut command = tokio::process::Command::new("node");
+        command
+            .args(["-e", &format!(
+                "require('readline').createInterface({{input:process.stdin}}).on('line',line=>{{const q=JSON.parse(line);if(q.id===undefined)return;if(q.method==='fixture/ready'){{console.log(JSON.stringify({{id:q.id,result:{{ready:true}}}}));return;}}{reply}}});"
+            )])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        command.creation_flags(crate::windows_create_hidden_process());
+        let (client, channels) = AcpClient::spawn_command(command).await.unwrap();
+        client.request_with_timeout("fixture/ready", json!({}), Some(Duration::from_secs(10))).await.unwrap();
+        let rt = Arc::new(ActiveRuntime {
+            client,
+            native_session_id: "audit".into(),
+            initialize_result: Value::Null,
+            supports_image: false,
+            supports_steering: steering,
+            dangerously_skip_permissions: false,
+        });
+        let c: Conversation = serde_json::from_value(json!({
+            "id":"antigravity-audit", "nativeId":"audit", "projectId":null,
+            "cwd":dir.path(), "linuxCwd":"",
+            "config":{"executable":dir.path().join("missing-agy.exe")},
+            "title":"隔离协议验证", "model":"test-model", "effort":"high",
+            "permissionMode":"default", "createdAt":1, "updatedAt":1,
+            "pinned":false, "unread":false, "deleted":false, "historyLoaded":true,
+            "activeTurnId":if active {json!("turn-1")} else {Value::Null},
+            "turns":if active {json!([{"id":"turn-1","status":"inProgress","items":[]}])} else {json!([])},
+        })).unwrap();
+        ag.saved.lock().await.conversations.insert(c.id.clone(), c);
+        {
+            let saved = ag.saved.lock().await;
+            ag.persist_locked(&saved, Some("antigravity-audit")).await.unwrap();
+        }
+        ag.runtimes.lock().await.insert("antigravity-audit".into(), rt.clone());
+        ag.spawn_runtime_pumps("antigravity-audit".into(), rt.clone(), channels);
+        (dir, ag, auth, rt)
+    }
+
+    const AUDIT_REJECT: &str = r#"console.log(JSON.stringify({jsonrpc:"2.0",id:q.id,error:{code:-32602,message:"rejected for regression"}}));"#;
+    const AUDIT_ACCEPT: &str = r#"console.log(JSON.stringify({jsonrpc:"2.0",id:q.id,result:{}}));"#;
+
+    #[tokio::test]
+    async fn audit_rejected_options_do_not_claim_applied() {
+        let script = r#"const reject=q.method==="session/set_mode"||q.params.value==="max";
+            console.log(JSON.stringify({id:q.id,...(reject?{error:{code:-32602,message:"rejected"}}:{result:{}})}));"#;
+        let (_dir, ag, _auth, rt) = audit_fixture(script, false, true).await;
+        let mut c = ag.conversation("antigravity-audit").await.unwrap();
+        let mode = Antigravity::apply_acp_options(&rt, &mut c, &json!({"permissionMode":"auto"})).await;
+        let effort = Antigravity::apply_acp_options(&rt, &mut c, &json!({"reasoningEffort":"max"})).await;
+        rt.client.close().await;
+        assert!(mode.is_err(), "原生权限拒绝必须传回调用者");
+        assert!(effort.is_err(), "原生思考深度拒绝必须传回调用者");
+        assert_eq!(c.permission_mode.as_deref(), Some("default"));
+        assert_eq!(c.effort, "high");
+    }
+
+    #[tokio::test]
+    async fn audit_rejected_permission_command_preserves_previous_mode() {
+        let (_dir, ag, auth, rt) = audit_fixture(AUDIT_REJECT, false, true).await;
+        let result = ag.command("setPermissions", &json!({
+            "threadId":"antigravity-audit","permissionMode":"auto"
+        }), &auth).await;
+        let c = ag.conversation("antigravity-audit").await.unwrap();
+        rt.client.close().await;
+        assert!(result.is_err(), "不能把原生拒绝伪装成下一轮生效");
+        assert_eq!(c.permission_mode.as_deref(), Some("default"));
+    }
+
+    #[tokio::test]
+    async fn audit_idle_bypass_transition_releases_runtime_without_deadlock() {
+        let (_dir, ag, auth, rt) = audit_fixture(AUDIT_ACCEPT, false, true).await;
+        let result = tokio::time::timeout(AUDIT_ACTION_TIMEOUT, ag.command("setPermissions", &json!({
+            "threadId":"antigravity-audit","permissionMode":"bypassPermissions"
+        }), &auth)).await;
+        rt.client.close().await;
+        assert!(result.is_ok(), "切换无限制模式不能重复持有 runtimes 锁");
+        assert_eq!(result.unwrap().unwrap()["appliesTo"], "nextTurn");
+    }
+
+    #[tokio::test]
+    async fn audit_queued_preparation_failure_preserves_message() {
+        let (_dir, ag, auth, rt) = audit_fixture(AUDIT_ACCEPT, true, true).await;
+        ag.saved.lock().await.conversations.get_mut("antigravity-audit").unwrap()
+            .remote_queue.enqueue(json!({"clientUserMessageId":"queued-1","prompt":"image",
+                "images":[{"dataUrl":"data:image/png;base64,AQ=="}]}), 1);
+        let result = ag.command("steerQueued", &json!({
+            "threadId":"antigravity-audit","messageId":"queued-1"
+        }), &auth).await;
+        let c = ag.conversation("antigravity-audit").await.unwrap();
+        rt.client.close().await;
+        assert!(result.is_err());
+        assert_eq!(c.remote_queue.messages.len(), 1, "图片预检失败不能丢失队列");
+        assert_eq!(c.active_turn_id.as_deref(), Some("turn-1"));
+    }
+
+    #[tokio::test]
+    async fn audit_rejected_steering_does_not_claim_success() {
+        let (_dir, ag, auth, rt) = audit_fixture(AUDIT_REJECT, true, true).await;
+        ag.saved.lock().await.conversations.get_mut("antigravity-audit").unwrap()
+            .remote_queue.enqueue(json!({"clientUserMessageId":"queued-1","prompt":"queued"}), 1);
+        let result = ag.command("steerQueued", &json!({
+            "threadId":"antigravity-audit","messageId":"queued-1"
+        }), &auth).await;
+        rt.client.close().await;
+        assert!(result.is_err(), "引导 RPC 被拒绝时不得立即返回 steered=true");
+        assert_eq!(ag.conversation("antigravity-audit").await.unwrap().remote_queue.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn audit_unsupported_steering_preserves_running_turn() {
+        let (_dir, ag, auth, rt) = audit_fixture(AUDIT_ACCEPT, true, false).await;
+        ag.saved.lock().await.conversations.get_mut("antigravity-audit").unwrap()
+            .remote_queue.enqueue(json!({"clientUserMessageId":"queued-1","prompt":"queued"}), 1);
+        let result = ag.command("steerQueued", &json!({
+            "threadId":"antigravity-audit","messageId":"queued-1"
+        }), &auth).await;
+        let c = ag.conversation("antigravity-audit").await.unwrap();
+        rt.client.close().await;
+        assert!(result.is_err(), "不支持引导时不能取消原任务另开一轮");
+        assert_eq!(c.active_turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(c.remote_queue.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn audit_automatic_queue_runtime_failure_preserves_message() {
+        let (_dir, ag, _auth, rt) = audit_fixture(AUDIT_ACCEPT, false, true).await;
+        rt.client.close().await;
+        ag.runtimes.lock().await.clear();
+        ag.saved.lock().await.conversations.get_mut("antigravity-audit").unwrap()
+            .remote_queue.enqueue(json!({"clientUserMessageId":"queued-1","prompt":"queued"}), 1);
+        ag.drain_queues_and_goals().await;
+        let c = ag.conversation("antigravity-audit").await.unwrap();
+        assert_eq!(c.remote_queue.messages.len(), 1, "运行时启动失败不能吞掉待发消息");
+        assert!(c.remote_queue.paused);
+    }
+
+    #[tokio::test]
+    async fn audit_idle_queue_only_does_not_enqueue() {
+        let (_dir, ag, auth, rt) = audit_fixture(AUDIT_ACCEPT, false, true).await;
+        let result = ag.command("send", &json!({
+            "threadId":"antigravity-audit","prompt":"direct","queueOnly":true
+        }), &auth).await;
+        rt.client.close().await;
+        assert_ne!(result.unwrap()["queued"], true, "空闲会话不因旧 queueOnly 入队");
+        assert!(ag.conversation("antigravity-audit").await.unwrap().remote_queue.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn audit_explicit_empty_plan_clears_old_plan() {
+        let (_dir, ag, _auth, rt) = audit_fixture(AUDIT_ACCEPT, false, true).await;
+        let mut c = ag.conversation("antigravity-audit").await.unwrap();
+        c.turns = vec![json!({"plan":[{"step":"old","status":"completed"}]}), json!({"plan":[]})];
+        rt.client.close().await;
+        assert!(c.session_plan().is_empty());
+    }
+
+    #[test]
+    fn audit_invalid_reorder_does_not_change_queue() {
+        let mut q = AntigravityQueue::default();
+        for id in ["c", "a", "b"] {
+            q.enqueue(json!({"clientUserMessageId":id,"prompt":id}), 1);
+        }
+        assert!(q.reorder(&["a".into(), "a".into(), "b".into()]).is_err());
+        assert_eq!(q.messages.iter().map(|m|m.id.as_str()).collect::<Vec<_>>(), ["c","a","b"]);
+    }
+
+    #[tokio::test]
+    async fn audit_history_append_capability_is_required() {
+        let (_dir, _ag, _auth, rt) = audit_fixture(AUDIT_ACCEPT, false, true).await;
+        let result = rt.client.session_new("", Some("retained history")).await;
+        rt.client.close().await;
+        assert!(result.is_err(), "缺少上下文追加能力时不得静默丢弃历史");
+    }
+
+    #[test]
+    fn audit_question_accepts_shared_frontend_response_shape() {
+        let mapped = projection::map_permission_request("thread", "request", &json!({
+            "toolCall":{"toolCallId":"interaction_1","title":"选择"},
+            "options":[{"optionId":"one","kind":"allow_once","name":"第一项"}]
+        }));
+        let response = projection::build_permission_response(&mapped, "answer", &json!({
+            "response":{"answers":{"interaction_1":{"answers":["one"]}}}
+        }));
+        assert_eq!(response["outcome"]["optionId"], "one");
+        assert_eq!(mapped.elves_request["params"]["questions"][0]["optionsOnly"], true);
+    }
+
+    #[tokio::test]
+    async fn audit_rejected_send_does_not_insert_user_message() {
+        let (_dir, ag, _auth, rt) = audit_fixture(AUDIT_REJECT, false, true).await;
+        let result = ag.dispatch_turn("antigravity-audit", &rt, &json!({
+            "prompt":"direct","clientUserMessageId":"direct-1"
+        })).await;
+        let c = ag.conversation("antigravity-audit").await.unwrap();
+        rt.client.close().await;
+        assert!(result.is_err());
+        assert!(c.turns.iter().all(|t| t["items"].as_array().unwrap().is_empty()));
+        assert!(c.turns.iter().all(|t| c.displayed_turn(t).get("_pendingUserItem").is_none()));
+    }
+
+    #[tokio::test]
+    async fn audit_send_confirms_on_native_activity_before_completion() {
+        let script = r#"if(q.method==="session/prompt"){
+            console.log(JSON.stringify({method:"session/update",params:{sessionId:"audit",update:{
+                sessionUpdate:"agent_message_chunk",content:{type:"text",text:"native"}}}}));
+        } else {console.log(JSON.stringify({id:q.id,result:{}}));}"#;
+        let (_dir, ag, _auth, rt) = audit_fixture(script, false, true).await;
+        let result = tokio::time::timeout(AUDIT_ACTION_TIMEOUT,
+            ag.dispatch_turn("antigravity-audit", &rt, &json!({"prompt":"direct","clientUserMessageId":"direct-1"}))).await;
+        let c = ag.conversation("antigravity-audit").await.unwrap();
+        rt.client.close().await;
+        assert!(result.unwrap().is_ok());
+        assert!(c.active());
+        assert_eq!(c.turns[0]["items"][0]["clientId"], "direct-1");
+    }
+
+    #[tokio::test]
+    async fn audit_steering_disconnect_is_unknown_and_not_retryable() {
+        let (_dir, ag, auth, rt) = audit_fixture("process.exit(0);", true, true).await;
+        ag.saved.lock().await.conversations.get_mut("antigravity-audit").unwrap()
+            .remote_queue.enqueue(json!({"clientUserMessageId":"queued-1","prompt":"queued"}), 1);
+        let result = ag.command("steerQueued", &json!({
+            "threadId":"antigravity-audit","messageId":"queued-1"
+        }), &auth).await;
+        rt.client.close().await;
+        assert!(result.unwrap_err().downcast_ref::<ApiError>().unwrap().outcome_unknown);
+        let c = ag.conversation("antigravity-audit").await.unwrap();
+        assert_eq!(c.remote_queue.messages[0].state, "unknown");
+        assert!(c.remote_queue.ready_by_id("queued-1").is_err());
+        assert!(c.remote_queue.next_ready().is_none());
+    }
+
+    #[tokio::test]
+    async fn audit_pending_steering_does_not_block_stop_or_finish_original_early() {
+        let (_dir, ag, auth, rt) = audit_fixture("if(q.method!=='session/prompt')console.log(JSON.stringify({id:q.id,result:{}}));", true, true).await;
+        ag.saved.lock().await.conversations.get_mut("antigravity-audit").unwrap()
+            .remote_queue.enqueue(json!({"clientUserMessageId":"queued-1","prompt":"queued"}), 1);
+        let service = ag.clone();
+        let steering_auth = auth.clone();
+        let send = tokio::spawn(async move {
+            service.command("steerQueued", &json!({"threadId":"antigravity-audit","messageId":"queued-1"}), &steering_auth).await
+        });
+        tokio::time::timeout(AUDIT_ACTION_TIMEOUT, async {
+            loop {
+                if ag.conversation("antigravity-audit").await.unwrap().remote_queue.messages[0].state == "sending" { break }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        ag.finish_turn("antigravity-audit", "turn-1", Ok(json!({"stopReason":"end_turn"}))).await;
+        let active_before_stop = ag.conversation("antigravity-audit").await.unwrap().active();
+        let stop = tokio::time::timeout(AUDIT_ACTION_TIMEOUT,
+            ag.command("stop", &json!({"threadId":"antigravity-audit"}), &auth)).await;
+        let released = tokio::time::timeout(AUDIT_ACTION_TIMEOUT, ag.release()).await;
+        rt.client.close().await;
+        let _ = send.await;
+        assert!(active_before_stop, "原 prompt 返回时引导尚未结束，不能显示空闲");
+        assert!(stop.unwrap().is_ok(), "等待引导回执不应占用停止所需会话锁");
+        assert!(released.is_ok(), "等待引导回执不应阻塞服务释放");
+    }
+
+    #[tokio::test]
+    async fn audit_failed_answer_keeps_request() {
+        let (_dir, ag, auth, rt) = audit_fixture(AUDIT_ACCEPT, true, true).await;
+        let params = json!({"toolCall":{"toolCallId":"interaction_1","title":"选择"},
+            "options":[{"optionId":"one","kind":"allow_once","name":"第一项"}]});
+        ag.handle_incoming_request("antigravity-audit", &rt, AcpIncomingRequest {
+            id:json!("rpc-1"), method:"session/request_permission".into(), params
+        }).await;
+        let request_id = ag.requests.lock().await["antigravity-audit"].keys().next().unwrap().clone();
+        let invalid = ag.command("answer", &json!({"threadId":"antigravity-audit",
+            "requestId":request_id,"response":{"answers":{"interaction_1":{"answers":["not-an-option"]}}}}), &auth).await;
+        let retained = ag.requests.lock().await["antigravity-audit"].contains_key(&request_id);
+        rt.client.close().await;
+        assert!(invalid.is_err());
+        assert!(retained);
+    }
+
+    #[tokio::test]
+    async fn audit_goal_runtime_failure_pauses_goal() {
+        let (_dir, ag, _auth, rt) = audit_fixture(AUDIT_ACCEPT, false, true).await;
+        rt.client.close().await;
+        ag.runtimes.lock().await.clear();
+        ag.saved.lock().await.conversations.get_mut("antigravity-audit").unwrap().goal =
+            json!({"status":"active","objective":"fixture","iterations":1});
+        ag.drain_queues_and_goals().await;
+        assert_eq!(ag.conversation("antigravity-audit").await.unwrap().goal["status"], "paused");
+    }
+
+    #[tokio::test]
+    async fn audit_completion_clears_pending_approval_without_deadlock() {
+        let (_dir, ag, _auth, rt) = audit_fixture(AUDIT_ACCEPT, true, true).await;
+        ag.handle_incoming_request("antigravity-audit", &rt, AcpIncomingRequest {
+            id:json!("rpc-1"), method:"session/request_permission".into(),
+            params:json!({"toolCall":{"toolCallId":"tool","title":"审批"},
+                "options":[{"optionId":"allow","kind":"allow_once","name":"允许"}]})
+        }).await;
+        let finished = tokio::time::timeout(AUDIT_ACTION_TIMEOUT,
+            ag.finish_turn("antigravity-audit", "turn-1", Ok(json!({"stopReason":"cancelled"})))).await;
+        rt.client.close().await;
+        assert!(finished.is_ok());
+        assert!(ag.requests.lock().await.get("antigravity-audit").is_none());
+        assert!(!ag.conversation("antigravity-audit").await.unwrap().active());
+    }
+
+    #[tokio::test]
+    async fn audit_history_validation_failure_preserves_original_runtime() {
+        let (_dir, ag, auth, rt) = audit_fixture(AUDIT_ACCEPT, false, true).await;
+        {
+            let mut saved = ag.saved.lock().await;
+            let c = saved.conversations.get_mut("antigravity-audit").unwrap();
+            c.turns = vec![json!({"id":"original","items":[{"id":"user","type":"userMessage",
+                "content":[{"type":"text","text":"original"}]}]})];
+        }
+        let result = ag.command("editMessage", &json!({
+            "threadId":"antigravity-audit","turnId":"original","messageId":"user",
+            "prompt":"invalid-image","images":[{"dataUrl":"invalid"}]
+        }), &auth).await;
+        let still_original = ag.runtimes.lock().await.get("antigravity-audit")
+            .is_some_and(|current| Arc::ptr_eq(current, &rt));
+        let c = ag.conversation("antigravity-audit").await.unwrap();
+        rt.client.close().await;
+        assert!(result.is_err());
+        assert!(still_original);
+        assert_eq!(c.turns[0]["id"], "original");
+    }
+
+    #[tokio::test]
+    async fn audit_model_without_thought_option_does_not_inherit_previous_effort() {
+        let script = r#"if(q.params.configId==="thought_level"){
+            console.log(JSON.stringify({id:q.id,error:{code:-32602,message:"unexpected effort"}}));
+        }else{console.log(JSON.stringify({id:q.id,result:{configOptions:[]}}));}"#;
+        let (_dir, ag, _auth, rt) = audit_fixture(script, false, true).await;
+        let mut c = ag.conversation("antigravity-audit").await.unwrap();
+        let result = Antigravity::apply_acp_options(&rt, &mut c, &json!({"model":"no-thinking"})).await;
+        rt.client.close().await;
+        assert!(result.is_ok());
+        assert_eq!(c.model, "no-thinking");
+        assert!(c.effort.is_empty());
+    }
+
+    #[tokio::test]
+    async fn audit_history_edit_is_blocked_while_queue_exists() {
+        let (_dir, ag, auth, rt) = audit_fixture(AUDIT_ACCEPT, false, true).await;
+        ag.saved.lock().await.conversations.get_mut("antigravity-audit").unwrap()
+            .remote_queue.enqueue(json!({"clientUserMessageId":"queued-1","prompt":"queued"}), 1);
+        let result = ag.command("editMessage", &json!({
+            "threadId":"antigravity-audit","turnId":"original","messageId":"user","prompt":"edited"
+        }), &auth).await;
+        let editable = ag.conversation("antigravity-audit").await.unwrap().view(false, "audit")["messageEditReady"].clone();
+        rt.client.close().await;
+        assert!(result.unwrap_err().to_string().contains("请先处理待发送消息"));
+        assert_eq!(editable, false);
+        assert_eq!(ag.conversation("antigravity-audit").await.unwrap().remote_queue.messages.len(), 1);
+    }
 
     #[test]
     fn normalizes_windows_uri_and_wsl_acp_cwds() {
@@ -3261,10 +3874,13 @@ mod tests {
         q.commit_edit("edit-1", &json!({ "prompt": "second edited" }))
             .unwrap();
         assert_eq!(q.messages[0].payload["prompt"], "second edited");
-        let next = q.pop_next_ready().unwrap();
+        let next = q.next_ready().unwrap();
         assert_eq!(next.id, "m2");
+        q.mark_sending(&next.id).unwrap();
+        assert!(q.next_ready().is_none());
+        q.confirm_sent(&next.id);
         q.pause("stopped");
-        assert!(q.pop_next_ready().is_none());
+        assert!(q.next_ready().is_none());
     }
 
     #[test]

@@ -893,6 +893,7 @@ pub(crate) fn merge_token_usage(existing: &Value, incoming: &Value, fallback_mod
 }
 
 /// 将 ACP `session/request_permission` 映射为 Elves 审批或用户提问请求。
+#[derive(Clone)]
 pub(crate) struct MappedPermission {
     pub elves_request: Value,
     pub is_user_input: bool,
@@ -952,6 +953,7 @@ pub(crate) fn map_permission_request(
                     "header": "Antigravity 提问",
                     "question": title,
                     "options": question_options,
+                    "optionsOnly": true,
                 }]
             }
         });
@@ -1009,7 +1011,8 @@ pub(crate) fn build_permission_response(
     payload: &Value,
 ) -> Value {
     if mapped.is_user_input && action == "answer" {
-        let answers = &payload["answers"];
+        // 共享前端与 Claude 一致以 response.answers 提交；ACP 选项提问不支持任意自由文本。
+        let answers = payload.get("response").unwrap_or(payload).get("answers").unwrap_or(&Value::Null);
         let selected_val = answers
             .get(&mapped.tool_call_id)
             .and_then(|entry| {

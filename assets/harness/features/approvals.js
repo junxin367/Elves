@@ -247,22 +247,34 @@ export function renderApprovals() {
         const choices = element("div", "question-options");
         const selected = new Set((draft.get(question.id) || "").split(", "));
         for (const option of question.options || []) {
+          const optionValue = question.optionsOnly ? option.value || option.label : option.label;
           const choice = button(option.label, option.description || option.label, () => {
             if (question.multiSelect) {
               selected.has(option.label) ? selected.delete(option.label) : selected.add(option.label);
               input.value = [...selected].join(", ");
               for (const node of choices.children) node.setAttribute("aria-pressed", String(selected.has(node.textContent)));
-            } else input.value = option.label;
+            } else {
+              input.value = optionValue;
+              if (question.optionsOnly) for (const node of choices.children)
+                node.setAttribute("aria-pressed", String(node.dataset.optionValue === optionValue));
+            }
             draft.set(question.id, input.value);
           });
           // Claude 原生多选问题允许同时选中多项，保留自由输入并按原生 answers 字符串回传。
           if (question.multiSelect) choice.setAttribute("aria-pressed", String(selected.has(option.label)));
+          if (question.optionsOnly) {
+            choice.dataset.optionValue = optionValue;
+            choice.setAttribute("aria-pressed", String(input.value === optionValue));
+          }
           choices.append(choice);
         }
-        fields.push([question.id, input]); label.append(choices, input); card.append(label);
+        // AGY 原生提问只接受给定 optionId；不展示无法送达的自由输入，Claude 保留原有输入能力。
+        fields.push([question.id, input, question]); label.append(choices);
+        if (!question.optionsOnly) label.append(input);
+        card.append(label);
       }
       actions.append(button("提交回答", "提交所有问题的回答", () => {
-        if (isClaude() && fields.some(([, input]) => !input.value.trim())) {
+        if (fields.some(([, input, question]) => (isClaude() || question.optionsOnly) && !input.value.trim())) {
           notice("请回答所有问题", true); return;
         }
         return reply("answer", {

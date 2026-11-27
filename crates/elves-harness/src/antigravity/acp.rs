@@ -433,8 +433,11 @@ impl AcpClient {
             "mcpServers": [],
         });
         if let Some(append) = system_prompt_append.filter(|s| !s.trim().is_empty())
-            && supports_append
         {
+            // 历史编辑必须完整保留前文；官方未宣告追加能力时拒绝，不能悄悄创建缺失上下文的会话。
+            anyhow::ensure!(supports_append, ApiError::new(
+                501, "当前 Antigravity ACP 未提供历史上下文追加能力，无法安全编辑历史消息",
+            ));
             params["_meta"] = json!({
                 "antigravity": { "systemPrompt": { "append": append } }
             });
@@ -521,7 +524,7 @@ impl AcpClient {
         session_id: &str,
         prompt: Vec<Value>,
     ) -> anyhow::Result<Value> {
-        self.request_with_timeout(
+        let result = self.request_with_timeout(
             "session/prompt",
             json!({
                 "sessionId": session_id,
@@ -529,7 +532,21 @@ impl AcpClient {
             }),
             None,
         )
-        .await
+        .await;
+        // 写入后连接中断不能等同于未发送。保留未知回执，阻止队列自动重发同一消息。
+        result.map_err(|failure| {
+            if let Some(dispatch) = failure.downcast_ref::<crate::service_transport::DispatchFailure>() {
+                let mut mapped = ApiError::new(503, failure.to_string());
+                mapped.outcome_unknown = dispatch.dispatched;
+                return mapped.into();
+            }
+            if let Some(api) = failure.downcast_ref::<ApiError>().filter(|e| matches!(e.code, 503 | 504)) {
+                let mut mapped = api.clone();
+                mapped.outcome_unknown = true;
+                return mapped.into();
+            }
+            failure
+        })
     }
 
     pub(crate) async fn session_cancel(&self, session_id: &str) -> anyhow::Result<()> {

@@ -15577,6 +15577,42 @@ test("Claude 补齐多选显示不清除问答草稿，新问题和已提交状�
   assert.notEqual(context.blockingApprovalIdentity("thread", request), identity);
 });
 
+test("Antigravity 原生选项提问只显示选项，提交 optionId 并保留选择状态", () => {
+  const make = (tag, textContent = "") => ({ tag, textContent, children: [], attributes: {}, dataset: {},
+    append(...items) { this.children.push(...items); },
+    setAttribute(key, value) { this.attributes[key] = value; } });
+  const answers = [], notices = [], draft = new Map();
+  const context = nodeVm.createContext({
+    requestThreadId: "antigravity-question",
+    request: { params: { questions: [{
+      id: "interaction_1", question: "选择分支？", optionsOnly: true,
+      options: [{ value: "branch_main", label: "主分支" }, { value: "branch_dev", label: "开发分支" }],
+    }] } },
+    card: make("section"), actions: make("div"),
+    element: (tag, _className, text) => make(tag, text),
+    button: (text, _label, action) => Object.assign(make("button", text), { action }),
+    blockingApprovalDraft: () => draft, isClaude: () => false,
+    reply: (action, value) => answers.push({ action, value }),
+    notice: text => notices.push(text),
+  });
+  const source = sourceSection('    } else if (request.method === "item/tool/requestUserInput") {',
+    '    } else if (request.method === "item/permissions/requestApproval") {');
+  nodeVm.runInContext(`{${source.slice(source.indexOf("{") + 1)}}`, context);
+  const label = context.card.children[0], choices = label.children[0], submit = context.actions.children[0];
+  assert.equal(label.children.length, 1, "ACP 不接受自由文本，不显示输入框");
+  submit.action();
+  assert.equal(answers.length, 0);
+  assert.equal(notices[0], "请回答所有问题");
+  choices.children[1].action();
+  assert.equal(choices.children[1].attributes["aria-pressed"], "true");
+  assert.equal(choices.children[0].attributes["aria-pressed"], "false");
+  submit.action();
+  assert.equal(draft.get("interaction_1"), "branch_dev");
+  assert.deepEqual(JSON.parse(JSON.stringify(answers[0])), {
+    action: "answer", value: { response: { answers: { interaction_1: { answers: ["branch_dev"] } } } },
+  });
+});
+
 test("Claude 已接收但未启动时显示等待提示，执行与完成后自然接替，不改变真实执行状态", () => {
   const turn = { id: "accepted", _nativeUserId: "native-accepted", status: "pending",
     turnStartedAtMs: Date.now() - 3000, items: [{ id: "input", type: "userMessage" }] };

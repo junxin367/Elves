@@ -1498,6 +1498,8 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .approval-card.question-card{border-color:var(--line);padding:12px 14px;font-size:.85714rem}
 .question-card .question-label{gap:6px;margin:10px 0}
 .question-card .question-options button,.question-card .approval-actions button{min-height:28px;padding:4px 9px;border-radius:14px;font-size:.78571rem;line-height:1.4}
+/* AGY 只接受原生选项；移除自由输入后仍须清楚显示已选项，复用问答控件及主题色。 */
+.question-options button[aria-pressed=true]{background:var(--hover);box-shadow:inset 0 0 0 1px var(--text)}
 .async-question-field{min-width:0;margin:10px 0;padding:0;border:0}
 .async-question-field legend{max-width:100%;padding:0;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.6}
 .async-question-options{display:flex;flex-direction:column;gap:4px;margin-top:8px}

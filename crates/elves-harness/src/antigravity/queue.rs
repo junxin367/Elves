@@ -84,8 +84,9 @@ impl AntigravityQueue {
         let mut changed = false;
         for msg in &mut self.messages {
             if msg.state == "sending" {
-                msg.state = "paused".into();
-                msg.reason = "服务曾重启，队列已暂停，请确认后继续发送".into();
+                // 重启不能证明原请求未送达，禁止把在途消息恢复成可重发项。
+                msg.state = "unknown".into();
+                msg.reason = "服务曾重启，消息送达结果待核对，未自动重发".into();
                 self.paused = true;
                 changed = true;
             }
@@ -129,20 +130,49 @@ impl AntigravityQueue {
         msg
     }
 
-    pub(crate) fn pop_next_ready(&mut self) -> Option<QueuedMessage> {
-        if self.paused || !self.edits.values().all(|e| e.state != "editing") {
+    pub(crate) fn next_ready(&self) -> Option<QueuedMessage> {
+        if self.paused || self.edits.values().any(|e| e.state == "editing")
+            || self.messages.iter().any(|m| matches!(m.state.as_str(), "sending" | "unknown")) {
             return None;
         }
-        let idx = self
-            .messages
-            .iter()
-            .position(|m| matches!(m.state.as_str(), "" | "queued"))?;
-        let msg = self.messages.remove(idx);
+        self.messages.iter().find(|m| matches!(m.state.as_str(), "" | "queued")).cloned()
+    }
+
+    pub(crate) fn ready_by_id(&self, id: &str) -> Result<QueuedMessage, ApiError> {
+        let msg = self.messages.iter().find(|m| m.id == id)
+            .ok_or_else(|| ApiError::new(404, "待发送消息已不在队列中"))?;
+        if !matches!(msg.state.as_str(), "" | "queued" | "paused") {
+            return Err(ApiError::new(409, "消息送达结果待核对，不能重复发送或编辑"));
+        }
+        Ok(msg.clone())
+    }
+
+    pub(crate) fn mark_sending(&mut self, id: &str) -> Result<(), ApiError> {
+        self.ready_by_id(id)?;
+        let msg = self.messages.iter_mut().find(|m| m.id == id).unwrap();
+        msg.state = "sending".into();
+        msg.reason.clear();
         self.revision += 1;
-        Some(msg)
+        Ok(())
+    }
+
+    pub(crate) fn delivery_failed(&mut self, id: &str, unknown: bool, reason: &str) {
+        if let Some(msg) = self.messages.iter_mut().find(|m| m.id == id) {
+            msg.state = if unknown { "unknown" } else { "paused" }.into();
+            msg.reason = reason.to_owned();
+            self.paused = true;
+            self.revision += 1;
+        }
+    }
+
+    pub(crate) fn confirm_sent(&mut self, id: &str) {
+        let before = self.messages.len();
+        self.messages.retain(|m| m.id != id);
+        if self.messages.len() != before { self.revision += 1; }
     }
 
     pub(crate) fn take_by_id(&mut self, id: &str) -> Result<QueuedMessage, ApiError> {
+        self.ready_by_id(id)?;
         let idx = self
             .messages
             .iter()
@@ -154,6 +184,7 @@ impl AntigravityQueue {
     }
 
     pub(crate) fn remove(&mut self, id: &str) -> Result<(), ApiError> {
+        self.ready_by_id(id)?;
         let before = self.messages.len();
         self.messages.retain(|m| m.id != id);
         if self.messages.len() == before {
@@ -166,6 +197,12 @@ impl AntigravityQueue {
     pub(crate) fn reorder(&mut self, ordered_ids: &[String]) -> Result<(), ApiError> {
         if ordered_ids.len() != self.messages.len() {
             return Err(ApiError::new(409, "队列内容已变化，请刷新后重试排序"));
+        }
+        // 先完整校验再重排，重复/失效标识不得改变用户原顺序。
+        let unique: std::collections::HashSet<_> = ordered_ids.iter().collect();
+        if unique.len() != self.messages.len()
+            || self.messages.iter().any(|m| !unique.contains(&m.id)) {
+            return Err(ApiError::new(409, "队列排序标识无效或已变化"));
         }
         let mut by_id: BTreeMap<String, QueuedMessage> = self
             .messages
