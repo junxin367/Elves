@@ -2092,6 +2092,33 @@ class SdkHostConnectionTests(unittest.TestCase):
         host.observe({"type": "system", "subtype": "task_notification", "task_id": "a", "status": "completed"})
         self.assertNotIn("a", host.task_started_at)
 
+    def test_result_api_time_is_a_consecutive_process_delta_not_the_session_total(self):
+        host_type = self.load_host()["Host"]
+        session, user = "00000000-0000-4000-8000-000000000003", "00000000-0000-4000-8000-000000000004"
+        def result(index, cumulative, **fields):
+            return dict({"type": "result", "session_id": session, "user_message_uuid": user,
+                         "user_message_uuids": [user], "begun_message_ids": ["m"], "duration_ms": 1600,
+                         "result_index": index, "duration_api_ms": cumulative}, **fields)
+        host = host_type(session, {"argv": ["claude", "--session-id", session]})
+        host.observe(result(0, 1525))
+        self.assertEqual(host.last["api_timing"]["duration_ms"], 1525)
+        host.observe(result(1, 1662, duration_ms=151))
+        self.assertEqual(host.last["api_timing"], {"type": "host_api_timing", "session_id": session,
+                         "user_id": user, "message_ids": ["m"], "duration_ms": 137})
+        self.assertIsNone(host.api_timing(result(1, 1662)))
+        self.assertIsNone(host.api_timing(result(3, 2000)))
+        self.assertIsNone(host.api_timing(result(4, 2100, user_message_uuids=[user, "queued"])))
+        self.assertIsNone(host.api_timing(result(5, 2200, user_message_uuid=42)))
+        self.assertIsNone(host.api_timing(result(6, 2190)))
+        self.assertIsNone(host.api_timing(result(7, 4000, duration_ms=5)))
+        self.assertIsNone(host.api_timing(result(8, 4100, begun_message_ids=["m","m"])))
+        self.assertIsNone(host.api_timing(result(9, 4200, subagent_stats={"spawned": 1})))
+        self.assertIsNone(host.api_timing(result(10, 4300, queued_turn_count=1)))
+        resumed = host_type(session, {"argv": ["claude", "--resume", session]})
+        self.assertIsNone(resumed.api_timing(result(0, 1500)))
+        self.assertIsNone(resumed.api_timing(result(1, 1510, session_id="other")))
+        self.assertEqual(resumed.api_timing(result(1, 1510))["duration_ms"], 10)
+
     def test_a_silent_harness_is_not_dropped_by_a_read_timeout(self):
         scope = self.load_host()
         scope["CLIENT_SEND_TIMEOUT"] = 0.3

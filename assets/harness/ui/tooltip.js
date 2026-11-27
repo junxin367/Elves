@@ -30,17 +30,13 @@ export function installComposerTooltips() {
   function renderContent() {
     if (!node || !pending?.content) return;
     const scroll = node.scrollTop;
-    const focusClose = document.activeElement?.classList?.contains("composer-metrics-detail-close");
     node.replaceChildren();
-    pending.content.render(node, pending.pinned, () => {
-      pending?.trigger.focus?.(); close();
-    });
+    pending.content.render(node);
     node.setAttribute("role", pending.pinned ? "dialog" : "tooltip");
     node.setAttribute("aria-label", "Token 统计");
     if (pending.pinned) node.setAttribute("aria-modal", "false");
     else node.removeAttribute("aria-modal");
     node.scrollTop = scroll;
-    if (focusClose) node.querySelector(".composer-metrics-detail-close")?.focus();
   }
   function update(trigger, title, content) {
     if (content) contents.set(trigger, content);

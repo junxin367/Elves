@@ -76,7 +76,8 @@ pub(super) fn claude_parts(message: &Value) -> Value {
             }
             (Some(total), Some(five), None) if five == total => (Some(five), Some(0), Some(0)),
             (Some(total), None, Some(hour)) if hour == total => (Some(0), Some(hour), Some(0)),
-            (Some(total), None, None) => (Some(0), Some(0), Some(total)),
+            // 详情只显示一次写入总量。原生给了总量但 TTL 缺失、不齐或矛盾时仍可展示数量，未知档不计价。
+            (Some(total), _, _) if total > 0 => (Some(0), Some(0), Some(total)),
             _ => (None, None, None),
         };
         let context = input
@@ -109,13 +110,20 @@ pub(super) fn merge_claude_parts(previous: &Value, mut next: Value) -> Value {
         if old["model"] != part["model"] {
             return Value::Null;
         }
-        let resolved_write = count(&part["cacheWrite5mTokens"]).unwrap_or(0)
-            + count(&part["cacheWrite1hTokens"]).unwrap_or(0)
-            > 0
-            && part["cacheWriteTokens"] == 0;
+        // 写入三档是同一次调用的互斥分解；逐档取最大值会把先报的未知时长和后来补齐的 5m/1h 算两遍。
+        let write_keys = ["cacheWrite5mTokens", "cacheWrite1hTokens", "cacheWriteTokens"];
+        let write_total = |value: &Value| write_keys.iter().try_fold(0_u64, |sum, k| sum.checked_add(count(&value[*k])?));
+        if let Some(old_total) = write_total(old)
+            && write_total(part).is_none_or(|new| new < old_total
+                || new == old_total && count(&old["cacheWriteTokens"]) < count(&part["cacheWriteTokens"]))
+        {
+            for key in write_keys {
+                part[key] = old[key].clone();
+            }
+        }
         // Claude 同一请求可先报告输入、后报告输出；分段快照按分项接替，不丢失已确认的输入或重复算一步。
         for (field, _) in FIELDS {
-            if field == "cacheWriteTokens" && resolved_write {
+            if write_keys.contains(&field) {
                 continue;
             }
             if let Some(value) = count(&old[field]) {
@@ -567,6 +575,24 @@ mod tests {
         assert_eq!(value["billing"]["rows"][2]["kind"], "cacheWrite");
         assert_eq!(value["billing"]["rows"][2]["tokens"], 20);
         assert!(value["billing"]["totalCostUsd"].is_null());
+    }
+
+    #[test]
+    fn session_metrics_cost_preserves_native_write_total_until_both_ttl_buckets_are_known() {
+        let mut message = json!({"model":"model-b","usage":{"input_tokens":10,"output_tokens":10,
+            "cache_read_input_tokens":0,"cache_creation_input_tokens":20,"cache_creation":{"ephemeral_5m_input_tokens":8}}});
+        let partial = claude_parts(&message);
+        let unknown = metrics(partial.clone(), 40);
+        assert_eq!(unknown["billing"]["rows"][2], json!({"kind":"cacheWrite","tokens":20,"costUsd":null}));
+        assert!(unknown["billing"]["totalCostUsd"].is_null());
+        message["usage"]["cache_creation"]["ephemeral_1h_input_tokens"] = json!(12);
+        let resolved = merge_claude_parts(&partial, claude_parts(&message));
+        for snapshot in [resolved.clone(), merge_claude_parts(&resolved, partial)] {
+            let value = metrics(snapshot, 40);
+            let rows = value["billing"]["rows"].as_array().unwrap();
+            assert_eq!((rows.len(), &rows[2]["tokens"], &rows[3]["tokens"]), (4, &json!(8), &json!(12)));
+            close(&value["billing"]["totalCostUsd"], 0.000282);
+        }
     }
 
     #[test]

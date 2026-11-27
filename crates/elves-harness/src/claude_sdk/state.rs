@@ -109,6 +109,8 @@ pub(super) struct PeerState {
     message_id: String,
     preview_text: String,
     preview_user: String,
+    // 已核验请求集合的耗时回执独立于对话状态和后台任务；只经合成快照交给统计，不渲染正文。
+    api_timing: Option<Value>,
 }
 
 impl PeerState {
@@ -132,6 +134,7 @@ impl PeerState {
             message_id: String::new(),
             preview_text: String::new(),
             preview_user: String::new(),
+            api_timing: None,
         }
     }
 
@@ -201,6 +204,12 @@ impl PeerState {
     pub(super) fn observe_cli(&mut self, frame: &Value, now: u64) -> Observed {
         let mut seen = Observed::default();
         match frame["type"].as_str() {
+            Some("host_api_timing") => {
+                if self.api_timing.as_ref() != Some(frame) {
+                    self.api_timing = Some(frame.clone());
+                    seen.dirty = true;
+                }
+            }
             Some("system") => self.observe_system(frame, now, &mut seen),
             Some("command_lifecycle") => self.observe_lifecycle(frame, now, &mut seen),
             Some("control_request") => self.observe_request(frame, now, &mut seen),
@@ -622,6 +631,9 @@ impl PeerState {
     /// `changes` 是对端自己登记的设置变更（目前只有需要重启才生效的完全访问权限）。
     pub(super) fn compose(&self, reader: &Value, changes: &Value) -> Value {
         let mut frame = reader.clone();
+        if let Some(receipt) = &self.api_timing {
+            frame["api_timing"] = receipt.clone();
+        }
         frame["job_id"] = json!("");
         frame["native_status"] = self.status();
         if !self.tasks.receipts().is_empty() {

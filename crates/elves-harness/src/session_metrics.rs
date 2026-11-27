@@ -266,6 +266,49 @@ pub(super) fn observe_claude(turn: &mut Value, frame: &Value) {
         "billingParts":billing_parts});
 }
 
+/// 只接受本会话、本条原生输入、完整助手请求集合一致的计时；重放相同回执不算更新。
+pub(super) fn claude_api_timing_update(turns: &[Value], receipt: &Value, native_id: &str) -> Option<(usize, u64)> {
+    if receipt["session_id"].as_str()? != native_id {
+        return None;
+    }
+    let owner = receipt["user_id"].as_str()?;
+    let ms = count(&receipt["duration_ms"])?;
+    let ids = receipt["message_ids"].as_array()?;
+    if ids.is_empty() || ids.len() > billing::MAX_PARTS {
+        return None;
+    }
+    let (index, turn) = turns.iter().enumerate().rev().find(|(_, t)| t["_nativeUserId"] == owner)?;
+    let requests = turn["_metricsRequests"].as_object()?;
+    if requests.len() != ids.len() || count(&turn["_metricsLlmDurationMs"]) == Some(ms) {
+        return None;
+    }
+    let unique: HashSet<_> = ids.iter().filter_map(Value::as_str).collect();
+    (unique.len() == ids.len() && requests.keys().all(|id| unique.contains(id.as_str()))).then_some((index, ms))
+}
+
+pub(super) fn retain_claude_api_timings(turns: &mut [Value], previous: &[Value]) {
+    let mut saved = HashMap::new();
+    for old in previous {
+        if let (Some(ms), Some(user), Some(requests)) = (
+            count(&old["_metricsLlmDurationMs"]), old["_nativeUserId"].as_str(), old["_metricsRequests"].as_object(),
+        ) {
+            saved.insert(user, (ms, requests));
+        }
+    }
+    if saved.is_empty() {
+        return;
+    }
+    for turn in turns {
+        let (Some(user), Some(requests)) = (turn["_nativeUserId"].as_str(), turn["_metricsRequests"].as_object()) else { continue };
+        if let Some((ms, old)) = saved.get(user)
+            && old.len() == requests.len()
+            && requests.keys().all(|id| old.contains_key(id))
+        {
+            turn["_metricsLlmDurationMs"] = json!(ms);
+        }
+    }
+}
+
 pub(super) fn claude(turns: &[Value]) -> Value {
     let latest = turns.iter().rev().find(|turn| {
         turn["items"]
@@ -350,6 +393,9 @@ pub(super) fn claude(turns: &[Value]) -> Value {
         }),
         (steps > 0 && cache_known).then_some(cached_input),
     );
+    if let Some(ms) = latest.and_then(|turn| count(&turn["_metricsLlmDurationMs"])) {
+        metrics["llmDurationMs"] = json!(ms);
+    }
     if let Some((at, expiry, model)) = latest_cache {
         add_native_cache_expiry(&mut metrics, Some(at), model, expiry);
     }
@@ -820,6 +866,39 @@ mod tests {
                 "last_token_usage":{"total_tokens":last,"input_tokens":last-20,"output_tokens":20,
                     "cached_input_tokens":(last-20)/2}}}),
         )
+    }
+
+    #[test]
+    fn session_metrics_llm_duration_needs_the_same_session_user_and_complete_request_set() {
+        let mut turn = turn("web-id");
+        turn["_nativeUserId"] = json!("native-user");
+        observe_claude(&mut turn, &request("message-a", 10, 1));
+        observe_claude(&mut turn, &request("message-b", 20, 2));
+        let receipt = json!({"session_id":"session","user_id":"native-user","duration_ms":137,
+            "message_ids":["message-b","message-a"]});
+        let apply = |old: &[Value], receipt: &Value, session: &str, t: &Value| {
+            let mut current = vec![t.clone()];
+            retain_claude_api_timings(&mut current, old);
+            if let Some((index, ms)) = claude_api_timing_update(&current, receipt, session) {
+                current[index]["_metricsLlmDurationMs"] = json!(ms);
+            }
+            current
+        };
+        let ok = apply(&[], &receipt, "session", &turn);
+        assert_eq!(claude(&ok)["llmDurationMs"], 137);
+        assert_eq!(claude_api_timing_update(&ok, &receipt, "session"), None);
+        assert_eq!(claude(&apply(&ok, &Value::Null, "session", &turn))["llmDurationMs"], 137);
+        assert!(claude(&apply(&[], &receipt, "other", &turn))["llmDurationMs"].is_null());
+        for (key, value) in [
+            ("user_id", json!("other")), ("message_ids", json!(["message-b"])),
+            ("message_ids", json!(["message-a","message-a"])), ("duration_ms", json!(-1)),
+        ] {
+            let mut bad = receipt.clone();
+            bad[key] = value;
+            assert!(claude(&apply(&[], &bad, "session", &turn))["llmDurationMs"].is_null());
+        }
+        observe_claude(&mut turn, &request("new-message", 30, 3));
+        assert!(claude(&apply(&ok, &receipt, "session", &turn))["llmDurationMs"].is_null());
     }
 
     #[test]

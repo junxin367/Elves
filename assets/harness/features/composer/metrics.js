@@ -47,7 +47,7 @@ export function normalizeComposerMetrics(value, previous = null) {
   const result = { source: value.source, turnId: value.turnId };
   if (["codex-side", "antigravity-acp"].includes(value.source) && value.totalIncomplete === true)
     result.totalIncomplete = true;
-  for (const key of ["inputTokens", "outputTokens", "cachedInputTokens", "turnTokens", "steps", "totalTokens", "durationMs", "tokensPerSecond", "firstTokenMs", "cacheExpiresAtMs", "cacheObservedAtMs", "cacheTtlMs"])
+  for (const key of ["inputTokens", "outputTokens", "cachedInputTokens", "turnTokens", "steps", "totalTokens", "durationMs", "llmDurationMs", "tokensPerSecond", "firstTokenMs", "cacheExpiresAtMs", "cacheObservedAtMs", "cacheTtlMs"])
     result[key] = composerMetricsNumber(value[key])
       && (key === "tokensPerSecond" || Number.isSafeInteger(value[key])) ? value[key] : null;
   result.cacheHitRate = composerMetricsNumber(value.cacheHitRate) && value.cacheHitRate <= 1 ? value.cacheHitRate : null;
@@ -69,7 +69,8 @@ export function normalizeComposerMetrics(value, previous = null) {
 }
 function composerMetricsCompact(value) {
   if (!composerMetricsNumber(value)) return "—";
-  const divisor = value >= 1e6 ? 1e6 : value >= 1e3 ? 1e3 : 1;
+  // k 保留一位时 999,950 已进位到百万，底栏和弹窗都不显示 1000k。
+  const divisor = value >= 999950 ? 1e6 : value >= 1e3 ? 1e3 : 1;
   return `${Number((value / divisor).toFixed(divisor === 1 ? 0 : 1))}${divisor === 1e6 ? "m" : divisor === 1e3 ? "k" : ""}`;
 }
 function composerMetricsDuration(value) {
@@ -280,6 +281,12 @@ function composerMetricsTurnTimings(turn, source) {
     compaction: compactions.size && Number.isSafeInteger(compaction) ? compaction : null,
     compactionObserved: [...compactions.values()].some(entry => entry.evidence === 0) };
 }
+const composerMetricsUsd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD",
+  minimumFractionDigits: 2, maximumFractionDigits: 2 });
+function composerMetricsFee(value) {
+  if (!composerMetricsNumber(value)) return "—";
+  return value > 0 && value < .005 ? "<$0.01" : composerMetricsUsd.format(value);
+}
 function composerMetricsDetail(metrics, timings) {
   let billing = metrics.billing;
   if (!billing) {
@@ -290,62 +297,66 @@ function composerMetricsDetail(metrics, timings) {
       rows.push({ kind: "input", tokens: metrics.inputTokens - metrics.cachedInputTokens, costUsd: null });
     if (Number.isSafeInteger(metrics.outputTokens))
       rows.push({ kind: "output", tokens: metrics.outputTokens, costUsd: null });
-    if (Number.isSafeInteger(metrics.cachedInputTokens) && metrics.cachedInputTokens > 0)
-      rows.push({ kind: "cacheRead", tokens: metrics.cachedInputTokens, costUsd: null });
+    if (Number.isSafeInteger(metrics.cachedInputTokens))
+      rows.push({ kind: "cacheRead", tokens: metrics.cachedInputTokens, costUsd: metrics.cachedInputTokens === 0 ? 0 : null });
     billing = { models: [], rows, totalTokens: metrics.turnTokens, totalCostUsd: null };
   }
-  if (!billing.rows.length && !timings.length) return null;
-  const titles = { input: "输入", output: "输出", cacheRead: "缓存读取",
-    cacheWrite5m: "缓存写入 5m", cacheWrite1h: "缓存写入 1h", cacheWrite: "缓存写入" };
-  const tokens = value => Number.isSafeInteger(value) && value >= 0 ? value.toLocaleString("en-US") : "—";
-  const cost = value => !composerMetricsNumber(value) ? "—" : value > 0 && value < .0001 ? "<0.0001" : value.toFixed(4);
-  const currency = value => {
-    const amount = cost(value);
-    return amount === "—" ? amount : amount.startsWith("<") ? `<$${amount.slice(1)}` : `$${amount}`;
-  };
+  const byKind = new Map(billing.rows.map(row => [row.kind, row]));
+  const writes = ["cacheWrite5m", "cacheWrite1h", "cacheWrite"].map(kind => byKind.get(kind)).filter(row => row?.tokens > 0);
+  // 用户要求写入只占右下一个格：各档已经分别计价，只相加未舍入费用。任何实际写入缺价都不能显示部分金额。
+  const write = writes.length ? {
+    tokens: writes.reduce((sum, row) => sum + row.tokens, 0),
+    costUsd: writes.every(row => composerMetricsNumber(row.costUsd)) ? writes.reduce((sum, row) => sum + row.costUsd, 0) : null
+  } : null;
+  const read = byKind.get("cacheRead") ?? (metrics.cachedInputTokens === 0 ? { tokens: 0, costUsd: 0 } : null);
+  const fields = [["输入", byKind.get("input"), "input"], ["输出", byKind.get("output"), "output"],
+    ["缓存读取", read, "read"], ["缓存写入", write, "write"]].filter(([, row]) => row || write);
+  const hasTotal = fields.length > 0 || Number.isSafeInteger(billing.totalTokens);
+  if (hasTotal) fields.push(["合计", { tokens: billing.totalTokens, costUsd: billing.totalCostUsd }, "total"]);
+  if (!fields.length && !timings.length) return null;
+  const accessible = (label, row) => `${label} ${Number.isSafeInteger(row?.tokens) ? row.tokens.toLocaleString("en-US") : "—"} Token，费用 ${composerMetricsFee(row?.costUsd)}`;
   const model = billing.models.join(" · ") || "Token 统计";
   return {
-    key: JSON.stringify([metrics.turnId, billing, timings]),
-    label: [model, ...billing.rows.map(row => `${titles[row.kind]} ${tokens(row.tokens)} Token，费用 ${cost(row.costUsd)} 美元`)].join("。"),
-    render(node, pinned, close) {
-      // 用户确认无表格效果：名称、Token 和费用在同一文字行自然排列，不加表头、单价或介绍。
+    key: JSON.stringify([metrics.turnId, model, fields, timings]),
+    label: [model, ...fields.map(([label, row]) => accessible(label, row))].join("。"),
+    render(node) {
+      // 点击固定和悬停使用同一张无表头的详情卡；用户不需要右上关闭按钮，原触发器、外部点击和 Esc 收起。
       const header = element("div", "composer-metrics-detail-header");
       const title = element("strong", "", model);
       title.title = model;
       header.append(title);
-      if (pinned) {
-        const dismiss = element("button", "composer-metrics-detail-close", "×");
-        dismiss.type = "button"; dismiss.setAttribute("aria-label", "关闭 Token 统计");
-        dismiss.addEventListener("click", close); header.append(dismiss);
-      }
       node.append(header);
       const body = element("div", "composer-metrics-detail-body");
-      if (billing.rows.length) {
+      if (fields.length) {
         const usage = element("div", "composer-metrics-detail-usage");
         usage.setAttribute("role", "list");
         usage.setAttribute("aria-label", "本轮 Token 和估算费用");
-        const appendRow = (label, count, fee, total = false) => {
-          const row = element("p", total ? "composer-metrics-detail-total" : "");
+        for (const [label, field, slot] of fields) {
+          const row = element("div", "composer-metrics-detail-field");
+          row.dataset.slot = slot;
           row.setAttribute("role", "listitem");
-          row.setAttribute("aria-label", `${label} ${tokens(count)} Token，费用 ${cost(fee)} 美元`);
-          row.append(element("span", "composer-metrics-detail-label", label),
-            element("span", "composer-metrics-detail-count", tokens(count)),
-            element("span", "composer-metrics-detail-fee", `· ${currency(fee)}`));
+          row.setAttribute("aria-label", accessible(label, field));
+          const value = element("span", "composer-metrics-detail-value");
+          const text = element("span", "composer-metrics-detail-text", composerMetricsCompact(field?.tokens));
+          text.append(element("span", "composer-metrics-detail-fee", ` / ${composerMetricsFee(field?.costUsd)}`));
+          value.append(text);
+          row.append(element("span", "composer-metrics-detail-label", label), value);
           usage.append(row);
-        };
-        for (const row of billing.rows) appendRow(titles[row.kind], row.tokens, row.costUsd);
-        if (Number.isSafeInteger(billing.totalTokens))
-          appendRow("合计", billing.totalTokens, billing.totalCostUsd, true);
+        }
         body.append(usage);
       }
       if (timings.length) {
         const details = element("div", "composer-metrics-detail-timings");
-        // 确认稿每行两项，沿文字宽度自然排列；字号增大或窄屏时允许换行，不固定成表格列。
-        for (let index = 0; index < timings.length; index += 2) {
+        const values = new Map(timings);
+        // 确认稿的三行位置固定；缺项不把另一项挪到别行，额外的实测压缩耗时仍只在此处显示。
+        for (const pair of [["速度", "首 Token"], ["缓存命中", "本轮耗时"], ["LLM 耗时", "工具耗时"], ["压缩耗时"]]) {
+          if (!pair.some(label => values.has(label))) continue;
           const line = element("div", "composer-metrics-detail-timing-line");
-          for (const [label, value] of timings.slice(index, index + 2)) {
+          for (const [index, label] of pair.entries()) {
+            if (!values.has(label)) continue;
             const item = element("span", "composer-metrics-detail-timing-item");
-            item.append(element("span", "composer-metrics-detail-label", label), element("b", "", value));
+            if (index === 1) item.dataset.right = "true";
+            item.append(element("span", "composer-metrics-detail-label", label), element("b", "", values.get(label)));
             line.append(item);
           }
           details.append(line);
@@ -420,7 +431,10 @@ export function renderComposerMetrics() {
   if (sameTurn && composerMetricsNumber(metrics?.firstTokenMs)) timingData.push(["首 Token", shortDuration(metrics.firstTokenMs)]);
   if (sameTurn && composerMetricsNumber(metrics?.durationMs)) timingData.push(["本轮耗时", formatDuration(metrics.durationMs / 1000)]);
   if (sameTurn && composerMetricsNumber(metrics?.cacheHitRate)) timingData.push(["缓存命中", `${Number((metrics.cacheHitRate * 100).toFixed(1))}%`]);
-  if (sameTurn && composerMetricsNumber(metrics?.tokensPerSecond)) timingData.push(["输出速度", `${Math.round(metrics.tokensPerSecond)}tk/s`]);
+  if (sameTurn && composerMetricsNumber(metrics?.tokensPerSecond)) timingData.push(["速度", `${Math.round(metrics.tokensPerSecond)}tk/s`]);
+  // LLM 耗时只接受本轮明确的原生计时，不用本轮耗时减工具、审批或压缩时间反推。
+  if (sameTurn && value.turnId && composerMetricsNumber(metrics.llmDurationMs))
+    timingData.push(["LLM 耗时", shortDuration(metrics.llmDurationMs)]);
   if (sameTurn && composerMetricsNumber(metrics?.firstTokenMs)) details.push(`首 Token 时间 ${composerMetricsDuration(metrics.firstTokenMs)}`);
   if (sameTurn && composerMetricsNumber(metrics?.durationMs)) details.push(`本轮耗时 ${formatDuration(metrics.durationMs / 1000)}`);
   if (sameTurn && composerMetricsNumber(metrics?.cacheHitRate)) details.push(`缓存命中率 ${Number((metrics.cacheHitRate * 100).toFixed(1))}%`);

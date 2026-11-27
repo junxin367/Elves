@@ -328,6 +328,7 @@ impl Conversation {
         if let Some(fields) = value.as_object_mut() {
             fields.remove("_metricsRequests");
             fields.remove("_metricsFirstTokenObservedAtMs");
+            fields.remove("_metricsLlmDurationMs");
             fields.remove("_metricsVersion");
             // 任务清单的原始调用与跨轮次状态只用于合成 plan，不发给网页。
             fields.remove("_claudePlanCalls");
@@ -3610,6 +3611,15 @@ impl Claude {
                 c.queued_messages = accepted;
                 c.resumed = true;
                 restore_shared_images(&c.turns, &mut projected);
+                // 计时独立于正文：两份同源投影在比较前补同一数字，单独的耗时回执不刷新正文、侧栏和未读。
+                let receipt = &frame["api_timing"];
+                if let Some((index, ms)) = super::session_metrics::claude_api_timing_update(&c.turns, receipt, native_id) {
+                    c.turns[index]["_metricsLlmDurationMs"] = json!(ms);
+                }
+                super::session_metrics::retain_claude_api_timings(&mut projected, &c.turns);
+                if let Some((index, ms)) = super::session_metrics::claude_api_timing_update(&projected, receipt, native_id) {
+                    projected[index]["_metricsLlmDurationMs"] = json!(ms);
+                }
                 tools::retain_command_receipts(&c.turns, &mut projected);
                 let reverted = frame.get("history_head").is_some()
                     && c.turns.iter().any(|old| {

@@ -87,6 +87,9 @@ class Host:
         self.last = {}
         self.started = {}
         self.task_started_at = {}
+        # duration_api_ms 是 CLI 进程累计值。新建会话从零起；恢复进程第一份结果只作基线，不借用上次会话的累计量。
+        argv = spec.get("argv") or []
+        self.api_baseline = (-1, 0) if "--session-id" in argv and "--resume" not in argv else None
         self.requests = {}
         self.state = "idle"
         self.compacting = False
@@ -175,7 +178,13 @@ class Host:
 
     def observe(self, frame):
         kind, sub = frame.get("type"), frame.get("subtype")
-        if kind == "system":
+        if kind == "result":
+            receipt = self.api_timing(frame)
+            if receipt:
+                # 断开 Harness 不影响原生计时；重连仅补发有身份的数字，不重放 result 中的用户内容。
+                self.last["api_timing"] = receipt
+                self.forward_value(receipt)
+        elif kind == "system":
             if sub == "init":
                 self.last["init"] = frame
             elif sub == "session_state_changed":
@@ -234,6 +243,38 @@ class Host:
         elif kind == "control_cancel_request":
             self.requests.pop(frame.get("request_id"), None)
 
+    def api_timing(self, frame):
+        if frame.get("session_id") != self.session or frame.get("parent_tool_use_id") is not None:
+            return None
+        index, cumulative = frame.get("result_index"), frame.get("duration_api_ms")
+        def valid(value):
+            return type(value) is int and 0 <= value <= 9_007_199_254_740_991
+        if not valid(index) or not valid(cumulative):
+            self.api_baseline = None
+            return None
+        previous = self.api_baseline
+        if previous and index <= previous[0]:
+            return None
+        self.api_baseline = (index, cumulative)
+        # 进程累计值可能包含排队轮次或子代理工作；即使知道主消息 ID 也不能把这些用时全部归给主轮次。
+        agents = frame.get("subagent_stats")
+        if (frame.get("queued_turn_count", 0) != 0
+                or (agents is not None and (not isinstance(agents, dict)
+                    or agents.get("spawned", 0) != 0 or agents.get("completed", 0) != 0))):
+            return None
+        owner, messages = frame.get("user_message_uuid"), frame.get("begun_message_ids")
+        if (not previous or index != previous[0] + 1 or not isinstance(owner, str) or not SESSION_PATTERN.fullmatch(owner)
+                or frame.get("user_message_uuids") != [owner] or not isinstance(messages, list)
+                or not 0 < len(messages) <= 2048
+                or not all(isinstance(m, str) and 0 < len(m) <= 256 for m in messages)
+                or len(set(messages)) != len(messages)):
+            return None
+        delta, wall = cumulative - previous[1], frame.get("duration_ms")
+        if not valid(wall) or not 0 <= delta <= wall:
+            return None
+        return {"type": "host_api_timing", "session_id": self.session, "user_id": owner,
+                "message_ids": messages, "duration_ms": delta}
+
     def has_work(self):
         tasks = {task.get("task_id") for task in (self.last.get("tasks") or {}).get("tasks") or []
                  if isinstance(task, dict) and task.get("ambient") is not True}
@@ -291,7 +332,7 @@ class Host:
                 emit(connection, {"type": "host_hello", "pid": self.cli.pid, "state": self.state,
                                   "tasks": len(self.started), "requests": len(self.requests)})
                 # 补发仍然有效的状态；CLI 在断线期间发出的未决审批也一并重放。
-                for name in ("init", "state", "status", "tasks"):
+                for name in ("init", "state", "status", "tasks", "api_timing"):
                     if name in self.last:
                         emit(connection, self.last[name])
                 for frame in list(self.started.values()):

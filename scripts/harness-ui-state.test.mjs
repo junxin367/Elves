@@ -20396,7 +20396,7 @@ test("真实实例设置页、缓存与公共菜单联动：首次保存不禁�
   mounted.dispose();
 });
 
-test("Token 明细使用文字行，不显示表格、表头、单价或介绍", () => {
+test("Token 明细按双列显示整串数量与金额，合计单独一行，悬停与固定均不提供关闭按钮", () => {
   const h = composerMetricsHarness(), c = h.context;
   const billing = { models: ["model-a"], rows: [
     { kind: "input", tokens: 18400, costUsd: .0368 },
@@ -20405,28 +20405,27 @@ test("Token 明细使用文字行，不显示表格、表头、单价或介绍",
   ], totalTokens: 86400, totalCostUsd: .09744 };
   const value = c.normalizeComposerMetrics(h.value({ billing }));
   const content = c.composerMetricsDetail(value, [
-    ["首 Token", "0.42s"], ["本轮耗时", "32s"], ["缓存命中", "77.5%"],
-    ["输出速度", "150tk/s"], ["工具耗时", "31.2s"],
+    ["首 Token", "420ms"], ["本轮耗时", "32s"], ["缓存命中", "77.5%"],
+    ["速度", "150tk/s"], ["工具耗时", "31.2s"],
   ]);
   const root = c.element("div", "");
   content.render(root, false, () => {});
-  assert.match(root.textContent, /model-a输入18,400· \$0\.0368输出4,800· \$0\.0480缓存读取63,200· \$0\.0126/);
-  assert.match(root.textContent, /合计86,400· \$0\.0974/);
+  assert.match(root.textContent, /model-a输入18\.4k \/ \$0\.04输出4\.8k \/ \$0\.05缓存读取63\.2k \/ \$0\.01/);
+  assert.match(root.textContent, /合计86\.4k \/ \$0\.10/);
   assert.doesNotMatch(root.textContent, /类型|费用 \$|单价|公式|口径|未缓存|其中|每百万|会话累计/);
   const flatten = node => [node, ...node.children.flatMap(flatten)];
   const nodes = flatten(root);
   assert.ok(nodes.every(node => !["table", "thead", "tbody", "tfoot", "tr", "td", "th"].includes(node.tag)));
   assert.equal(nodes.filter(node => node.attributes.role === "listitem").length, 4);
   assert.deepEqual(nodes.filter(node => node.className === "composer-metrics-detail-timing-line")
-    .map(node => node.children.length), [2, 2, 1], "每行最多两项指标，不使用固定表格列");
+    .map(node => node.textContent), ["速度150tk/s首 Token420ms", "缓存命中77.5%本轮耗时32s", "工具耗时31.2s"]);
+  assert.deepEqual(nodes.filter(node => node.dataset.slot).map(node => node.dataset.slot), ["input", "output", "read", "total"]);
+  assert.match(nodes.find(node => node.dataset.slot === "input").attributes["aria-label"], /18,400 Token/);
   assert.equal(nodes.filter(node => node.tag === "button").length, 0, "悬停不显示关闭按钮");
-  let closed = 0;
   const pinned = c.element("div", "");
-  content.render(pinned, true, () => closed++);
-  const dismiss = flatten(pinned).find(node => node.attributes["aria-label"] === "关闭 Token 统计");
-  assert.ok(dismiss, "点击固定后保留关闭按钮");
-  dismiss.onclick();
-  assert.equal(closed, 1);
+  content.render(pinned, true);
+  assert.equal(pinned.textContent, root.textContent);
+  assert.equal(flatten(pinned).filter(node => node.tag === "button").length, 0);
 });
 
 test("Token 明细保留未知费用，极小非零费用不显示免费，非法快照不能补齐合计", () => {
@@ -20440,9 +20439,9 @@ test("Token 明细保留未知费用，极小非零费用不显示免费，非�
   assert.equal(value.billing.totalCostUsd, null);
   const root = c.element("div", "");
   c.composerMetricsDetail(value, []).render(root, false, () => {});
-  assert.match(root.textContent, /<\$0\.0001/);
-  assert.match(root.textContent, /输出5· —/);
-  assert.match(root.textContent, /合计35· —/);
+  assert.match(root.textContent, /<\$0\.01/);
+  assert.match(root.textContent, /输出5 \/ —/);
+  assert.match(root.textContent, /合计35 \/ —/);
   const invalid = structuredClone(billing);
   invalid.rows.push(invalid.rows[0]);
   assert.equal(c.normalizeComposerMetrics(h.value({ billing: invalid })).billing, null);
@@ -20462,9 +20461,48 @@ test("Token 明细保留未知费用，极小非零费用不显示免费，非�
   } }));
   const cacheRoot = c.element("div", "");
   c.composerMetricsDetail(cacheWrites, []).render(cacheRoot, false, () => {});
-  assert.match(cacheRoot.textContent, /缓存写入 5m0· \$0\.0000/);
-  assert.match(cacheRoot.textContent, /缓存写入 1h2· <\$0\.0001/);
-  assert.match(cacheRoot.textContent, /缓存写入3· —/);
+  assert.match(cacheRoot.textContent, /输入— \/ —输出— \/ —缓存读取— \/ —缓存写入5 \/ —合计5 \/ —/);
+  assert.doesNotMatch(cacheRoot.textContent, /5m|1h/);
+});
+
+test("缓存写入的三种计价档只显示一格，先合计原始费用再保留两位小数", () => {
+  const h = composerMetricsHarness(), c = h.context;
+  const rows = [
+    { kind: "cacheWrite1h", tokens: 2000, costUsd: .0041 },
+    { kind: "input", tokens: 12_800_000, costUsd: 38.4 },
+    { kind: "cacheWrite", tokens: 1000, costUsd: .0041 },
+    { kind: "output", tokens: 0, costUsd: 0 },
+    { kind: "cacheWrite5m", tokens: 100_000, costUsd: .0041 },
+  ];
+  const render = (rows, tokens) => {
+    const billing = {rows, totalTokens: tokens, totalCostUsd: rows.reduce((a,r) => a+r.costUsd, 0)};
+    const detail = c.composerMetricsDetail(c.normalizeComposerMetrics(h.value({billing, cachedInputTokens:0})), []);
+    const root = c.element("div"); detail.render(root);
+    return root.children[1].children[0].children.map(r => [r.dataset.slot, r.textContent]);
+  };
+  assert.deepEqual(render(rows, 12_903_000), [
+    ["input","输入12.8m / $38.40"], ["output","输出0 / $0.00"], ["read","缓存读取0 / $0.00"],
+    ["write","缓存写入103k / $0.01"], ["total","合计12.9m / $38.41"]
+  ]);
+  const zero = rows.filter(r => !r.kind.startsWith("cacheWrite"));
+  zero.push({kind:"cacheWrite5m",tokens:0,costUsd:0});
+  assert.deepEqual(render(zero,12_800_000).map(([k]) => k), ["input","output","read","total"]);
+  assert.equal(c.composerMetricsFee(.00499), "<$0.01");
+  assert.equal(c.composerMetricsFee(.005), "$0.01");
+  assert.equal(c.composerMetricsCompact(999950), "1m");
+});
+
+test("LLM 耗时使用本轮原生字段，缺失或换轮不以墙钟和工具耗时补算", async () => {
+  const h = composerMetricsHarness(), c = h.context; let detail;
+  c.composerTooltips = {update: (_node,_title,content) => {detail=content}};
+  const shown = () => { const root=c.element("div"); detail?.render(root); return root.textContent };
+  c.syncComposerMetrics(); h.complete(0,{llmDurationMs:137}); await h.flush();
+  assert.match(shown(), /LLM 耗时137ms/);
+  assert.doesNotMatch(h.text(), /LLM|137/);
+  h.advance(2001); c.syncComposerMetrics(); h.complete(1,{llmDurationMs:-1}); await h.flush();
+  assert.doesNotMatch(shown(), /LLM 耗时/);
+  c.turns.set("next", {id:"next",items:[]}); c.renderComposerMetrics();
+  assert.equal(detail,null);
 });
 
 test("Token 明细按当前轮次更新，切换会话和等待新轮统计时清理旧浮层", async () => {
