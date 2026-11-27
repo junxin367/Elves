@@ -2172,11 +2172,17 @@ body{font-weight:var(--ui-font-weight,400)}
 .permission-instance-target .instruction-path{flex:1 1 auto;min-width:0;margin:0;overflow:hidden;color:var(--text-secondary);font-size:.85714rem;line-height:1.4;text-align:right;text-overflow:ellipsis;white-space:nowrap}
 .permission-instance-target .instruction-path:empty{display:none}
 .permission-instance-slot .select-label,.instance-permission-field .select-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-/* 用户要求 PC 权限设置中的会话实例 Select 贴右侧、配置路径显示在其左侧；桌面保留单行省略，
- * 窄屏改为独立一行，避免路径挤压实例选择器；选择器仍与右侧控件保持 200px 对齐。 */
+/* 用户要求权限页保持“会话实例 → 文件路径 → 实例选择器”的顺序：PC 同排，手机按原 DOM 顺序纵向排列。
+ * 760px 与设置页断点一致；标签、路径、选择器相邻项各隔 8px，实例区域解除通用 65% 上限。
+ * 选择器最多使用实例档位 200px，窄屏按剩余宽度收缩；字段只保留一层 12px 内边距。 */
 @media(max-width:760px){
-  .permission-instance-target{flex:1 1 100%;width:100%;max-width:100%;flex-wrap:wrap}
-  .permission-instance-target .instruction-path{flex:1 1 100%;text-align:left;white-space:normal}
+  .instance-permissions-card .appearance-field.permission-instance-field{flex-direction:column;align-items:stretch;gap:8px}
+  .instance-permissions-card .permission-instance-field>.permission-instance-target{flex:none;width:100%;max-width:100%;flex-direction:column;align-items:flex-start;gap:8px}
+  .permission-instance-target .instruction-path{flex:none;width:100%;text-align:left;white-space:normal;overflow-wrap:anywhere}
+  .permission-instance-target .permission-instance-slot{flex:none;width:var(--settings-instance-width,200px);max-width:100%}
+  .appearance-screen .permission-instance-slot>.select-trigger{width:100%}
+  .instance-permissions-card>.permission-settings-status,
+  .instance-permissions-card>.permission-settings-actions{margin-inline:12px}
 }
 .permission-settings-status{min-height:1.5em;white-space:pre-wrap}
 .permission-settings-status:empty{display:none}
@@ -2242,7 +2248,6 @@ body{font-weight:var(--ui-font-weight,400)}
   .composer-toolbar .permission-button{flex:0 0 28px;width:28px;max-width:28px;height:36px;gap:0;padding:0}
   .permission-button>.permission-button-label{display:none}
   .composer-toolbar>.composer-send{flex:0 0 auto;flex-wrap:nowrap}
-  .instance-permissions-card{padding-inline:12px}
 }
 @media(max-width:760px){
  .appearance-panel-title{font-size:1.4rem;margin-bottom:24px}
