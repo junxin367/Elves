@@ -10,6 +10,7 @@ import { connected, nativeConnectionVersion, selectedId, selectionVersion, sessi
 import { randomId } from "../../core/util.js";
 import { api } from "../api.js";
 import { rememberDraft } from "./drafts.js";
+import { promptSelection, setPromptSelection } from "./prompt-editor.js";
 import { renderSelectedSkills } from "./selected-skills.js";
 import { scheduledTimeLabel, selectedScheduledAt, setSelectedScheduledAt } from "./scheduled-state.js";
 import { selectedGoal } from "../goal/state.js";
@@ -17,6 +18,7 @@ import { privateInputScope, threadReadOnly } from "../session/capabilities.js";
 
 let scheduledMessages = [], scheduledRequest = null, scheduledLoadedThread = null, scheduledLoadedScope = null;
 let scheduledDialog = null, scheduledEditor = null, dialogScope = null, dialogTrigger = null;
+let dialogPromptSelection = null, dialogRestorePrompt = false;
 // 已渲染状态按根元素记录：updateComposer 每次输入都会进入渲染，只比较数组引用和少量状态，
 // 不对全部定时消息（含最长 128 KiB 的正文）做 JSON 序列化；重新读取会换新数组，必然重新渲染。
 const renderedByRoot = new WeakMap(), noScheduledMessages = [];
@@ -94,12 +96,12 @@ function ensureDialog() {
       return;
     }
     setSelectedScheduledAt(value);
-    dialog.close();
     // 必须先画出编辑框标记再记录草稿：草稿快照以编辑框里的实际标记为准，没画出来时刚选的时间会被清掉。
     renderSelectedSkills();
     rememberDraft();
     updateComposer();
-    $("#prompt")?.focus({ preventScroll: true });
+    dialogRestorePrompt = true;
+    dialog.close();
   }, "primary");
   actions.append(cancel, confirm);
   body.append(content, attachments, label, hint, error);
@@ -112,9 +114,18 @@ function ensureDialog() {
   });
   dialog.addEventListener("close", () => {
     const sameScope = dialogScope === scheduledScope();
+    const restore = dialogRestorePrompt ? dialogPromptSelection : null;
     scheduledEditor = null; dialogScope = null; error.textContent = ""; prompt.value = "";
+    dialogPromptSelection = null; dialogRestorePrompt = false;
     document.body.classList?.toggle("modal-open", !!document.querySelector?.("dialog[open]"));
-    if (sameScope) (dialogTrigger?.isConnected ? dialogTrigger : $("#prompt"))?.focus({ preventScroll: true });
+    if (!sameScope) return;
+    if (restore?.prompt === $("#prompt") && restore?.prompt?.isConnected && !restore.prompt.disabled) {
+      // 用户要求空输入时光标在定时标签后，有内容时标签置顶且保留原编辑位置；复用目标的正文/Skill 边界换算。
+      // 等原生 dialog 关闭并完成默认焦点恢复后再还原选区，避免 focus 把光标重新放到标签前。
+      restore.prompt.focus({ preventScroll: true });
+      const selection = restore.selection;
+      setPromptSelection(restore.prompt, selection.start, selection.end, selection);
+    } else (dialogTrigger?.isConnected ? dialogTrigger : $("#prompt"))?.focus({ preventScroll: true });
   });
   document.body.append(dialog);
   scheduledDialog = dialog;
@@ -131,10 +142,13 @@ export function openScheduledMessagePicker() {
     notice("请先打开可编辑的已有会话。", true);
     return;
   }
+  // 时间输入框会接管焦点，必须在打开弹窗前保存正文位置，而不是确认时间后重新读取。
+  const prompt = $("#prompt"), selection = prompt ? promptSelection(prompt) : null;
   closeComposerMenus();
   closePopup();
   const dialog = ensureDialog();
   scheduledEditor = null; dialogScope = scheduledScope(); dialogTrigger = document.activeElement;
+  dialogPromptSelection = prompt ? { prompt, selection } : null; dialogRestorePrompt = false;
   const { input, content, attachments, title, confirm, close, cancel, error } = dialog.scheduleFields;
   content.hidden = attachments.hidden = true;
   title.textContent = "定时发送"; confirm.textContent = "确定";
@@ -155,6 +169,7 @@ export function openScheduledMessageEditor(message, trigger) {
   closePopup(); closeComposerMenus();
   const dialog = ensureDialog(), fields = dialog.scheduleFields;
   dialogScope = scheduledScope(); dialogTrigger = trigger || document.activeElement;
+  dialogPromptSelection = null; dialogRestorePrompt = false;
   scheduledEditor = { message, scope: dialogScope, saving: false, uncertain: false, error: "" };
   fields.title.textContent = "编辑定时发送";
   fields.content.hidden = false;

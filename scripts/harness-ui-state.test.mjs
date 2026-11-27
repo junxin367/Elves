@@ -18614,6 +18614,7 @@ function scheduledMessageHarness(overrides = {}) {
       replaceChildren: (...children) => { node.children = children; },
       setAttribute(name, value) { node[`attr:${name}`] = value; },
       addEventListener(type, listener) { listeners.set(type, listener); }, focus() {},
+      emit(type) { listeners.get(type)?.(); },
       showModal() { node.open = true; }, close() { node.open = false; listeners.get("close")?.(); },
     };
     nodes.push(node);
@@ -18678,6 +18679,65 @@ test("时间弹窗点确定后先画出编辑框标记再记录草稿，首次�
   assert.equal(dialog.open, false);
   assert.equal(remembered, Date.parse(input.value), "记录进草稿的就是所选时间");
   assert.equal(state("selectedScheduledAt"), Date.parse(input.value));
+});
+
+test("定时发送确认后恢复打开弹窗前的正文位置与 Skill 边界，原生关闭事件不能再把光标移到标签前", () => {
+  for (const [text, start, end] of [["", 0, 0], ["已有消息正文", 0, 0], ["已有消息正文", 3, 3], ["已有消息正文", 1, 5]]) {
+    const events = [], tokens = new Set(["skill-before-caret"]);
+    const saved = { start, end, startTokens: tokens, endTokens: tokens };
+    const prompt = { isConnected: true, value: text, focus() { events.push("focus"); } };
+    let current = saved;
+    const h = scheduledMessageHarness({
+      document: { activeElement: prompt, body: { append() {} } }, queueMicrotask() {},
+      $: selector => selector === "#prompt" ? prompt : null,
+      promptSelection: () => current,
+      setPromptSelection: (node, first, last, selection) => {
+        assert.equal(node, prompt);
+        current = { start: first, end: last, startTokens: selection.startTokens, endTokens: selection.endTokens };
+        events.push("selection");
+      },
+      renderSelectedSkills() { events.push("render"); current = { start: 0, end: 0 }; },
+      rememberDraft() { events.push("draft"); }, updateComposer() { events.push("update"); },
+    });
+    h.context.openScheduledMessagePicker();
+    const dialog = h.nodes.find(node => node.className === "scheduled-send-dialog");
+    current = { start: text.length, end: text.length }; // 时间输入框取得焦点后，页面选区不再代表正文原位置。
+    dialog.close = () => { dialog.open = false; };
+    h.nodes.find(node => node.ariaLabel === "确认定时发送时间").onClick();
+    current = { start: 0, end: 0 }; // 模拟原生 dialog 关闭时恢复焦点造成的默认光标。
+    dialog.emit("close");
+    assert.equal(current.start, start);
+    assert.equal(current.end, end);
+    assert.equal(current.startTokens, tokens);
+    assert.equal(current.endTokens, tokens);
+    assert.ok(events.indexOf("render") < events.indexOf("draft"));
+    assert.equal(events.at(-1), "selection", "最后恢复正文选区，而不是只调用 focus");
+  }
+});
+
+test("定时发送取消或关闭前切换会话不应用旧选区，已创建任务编辑不借用正文选区", () => {
+  let restored = 0, captured = 0;
+  const prompt = { isConnected: true, focus() {} };
+  const h = scheduledMessageHarness({
+    $: selector => selector === "#prompt" ? prompt : null,
+    promptSelection: () => { captured++; return { start: 2, end: 2 }; },
+    setPromptSelection: () => restored++,
+    renderSelectedSkills() {}, rememberDraft() {}, updateComposer() {}, queueMicrotask() {},
+  });
+  h.context.openScheduledMessagePicker();
+  const dialog = h.nodes.find(node => node.className === "scheduled-send-dialog");
+  h.nodes.find(node => node.ariaLabel === "取消定时发送设置").onClick();
+  assert.equal(restored, 0);
+  h.context.openScheduledMessagePicker();
+  dialog.close = () => { dialog.open = false; };
+  h.nodes.find(node => node.ariaLabel === "确认定时发送时间").onClick();
+  h.context.selectedId = "another-thread";
+  dialog.emit("close");
+  assert.equal(restored, 0, "迟到关闭不能恢复旧会话的光标");
+  const previous = captured;
+  h.context.selectedId = "thread-a";
+  h.context.openScheduledMessageEditor(scheduledRow("editing", "scheduled"));
+  assert.equal(captured, previous, "修改已有任务不读取当前输入框选区");
 });
 
 test("定时消息列表按状态显示标签和原因，发送中的消息不能取消", async () => {
@@ -18868,6 +18928,12 @@ test("编辑框的定时标记显示“定时发送 · 时间”，按目标标�
   assert.equal(token.contentEditable, "false");
   assert.deepEqual(token.children.map(child => child.className), ["inline-skill-icon", "inline-skill-name"]);
   assert.match(token.children[1].textContent, /^定时发送 · 今天 .*05$/);
+  let prevented = 0;
+  token.onpointerdown({ isPrimary: true, button: 0, preventDefault: () => prevented++ });
+  assert.equal(prevented, 1, "点击已有定时标签不能先移动正文光标");
+  token.onpointerdown({ isPrimary: true, button: 2, preventDefault: () => prevented++ });
+  token.onpointerdown({ isPrimary: false, button: 0, preventDefault: () => prevented++ });
+  assert.equal(prevented, 1, "只处理主指针的普通点击");
 });
 
 test("Antigravity 权限模式、无限制警示色、会话身份与图标品牌标记符合约定", async () => {

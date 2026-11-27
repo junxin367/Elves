@@ -202,6 +202,8 @@ function scheduledToken(sendAtMs) {
   node.contentEditable = "false";
   node.setAttribute("aria-label", label);
   node.title = `${label}：点击修改时间，删除此标记可取消`;
+  // 用户要求设置及修改定时时间保留原光标；标签点击仅打开时间选择，不能先把编辑器选区移到标签前。
+  node.onpointerdown = event => { if (event.isPrimary && event.button === 0) event.preventDefault(); };
   glyph.className = "inline-skill-icon";
   node.append(glyph, element("span", "inline-skill-name", label));
   return node;
