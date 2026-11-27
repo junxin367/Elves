@@ -1,6 +1,7 @@
 // 会话正文视图：调度并渲染消息列表、恢复已暂存的正文；滚动、跟随与分页按钮等视图状态在 history-state.js，正文暂存在 transcript.js，加载占位在 history.js。
 
 import { renderMessageActions } from "../../message-actions.js";
+import { visibleTaskTurn } from "../../background-tasks.js";
 import { copyText } from "../../ui/clipboard.js";
 import { $, element } from "../../ui/dom.js";
 import { icon } from "../../ui/icons.js";
@@ -124,7 +125,7 @@ export function renderMessages(keepScroll = true) {
   const children = [], itemKeys = new Set(), turnKeys = new Set(), activityKeys = new Set();
   const relatedViewKind = relatedSessionView?.kind || "";
   if (reconcileSentMessageDisplays(selectedId, currentThreadDisplay()?.queuedMessages)) renderQueueArea();
-  const sorted = withSentMessageDisplays();
+  const sorted = withSentMessageDisplays().map(visibleTaskTurn);
   const origin = currentThreadDisplay()?.forkedFrom;
   if (origin?.threadId && origin.threadId !== selectedId) {
     const source = element("button", "fork-source text-button", `继续自聊天：${origin.title || "原会话"}`);
@@ -297,7 +298,7 @@ export function renderMessages(keepScroll = true) {
       items.push(element("small", "turn-end muted", turn._nativeWithdrawn === true
         ? "已撤回：Claude 在开始回复前停止，原文已放回原版终端输入框，不会进入对话"
         : "本轮已结束，未生成回复"));
-    if (turn.status === "interrupted") {
+    if (turn.status === "interrupted" && (!turn._claudeAutoTurn || items.length || turn.nativeInterruption)) {
       // 用户要求 Claude 与 Codex 的轮次中断统一显示“已停止”；原生原文仅保留在悬浮说明，工具状态独立展示。
       // 仅使用已确认的中断状态，不伪装成用户正文，也不据此推断用户按了哪个按钮。
       const native = turn.nativeInterruption?.source === "claude";

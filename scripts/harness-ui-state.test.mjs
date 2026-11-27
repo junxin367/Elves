@@ -13,7 +13,7 @@ import { captureTransferInputs, hasTransferFiles, readTransferInputs, stageTrans
 import { marked, Renderer } from "../assets/harness/vendor/marked.esm.js";
 import { defaultSharedSettings } from "../assets/harness/features/settings/shared-state.js";
 import { messageActionState, renderMessageActions } from "../assets/harness/message-actions.js";
-import { backgroundTaskCount, normalizeBackgroundTasks, preserveBackgroundTaskSnapshot, updateSessionMenuAria } from "../assets/harness/background-tasks.js";
+import { backgroundTaskCount, normalizeBackgroundTasks, preserveBackgroundTaskSnapshot, taskNoticeText, updateSessionMenuAria, visibleTaskTurn } from "../assets/harness/background-tasks.js";
 
 async function navigationFixture(native = false, transport = native ? "desktop" : "remote",
   { mobile = false, android = false, desktopRemoteAccess = native && transport === "desktop" } = {}) {
@@ -9338,18 +9338,19 @@ test("Claude 终端回退菜单提示说明消息排队与回退后的执行位�
 
 test("Claude 自动续跑提示使用中文，recap 沿用原生前缀，未知写法保留原文", () => {
   const context = nodeVm.createContext({ nativeConnectionVersion: 1,});
-  nodeVm.runInContext(sourceSection("function claudeTaskNotificationText(", "function renderTranscriptEvent("), context);
-  const text = item => ({ ...context.claudeTaskNotificationText(item) });
-  assert.deepEqual(text({ kind: "command", status: "failed", summary: "Background command \"make\" failed with exit code 2" }),
-    { label: "后台命令失败 · Claude 自动继续", description: "Background command \"make\" failed with exit code 2" });
+  nodeVm.runInContext(sourceSection("function claudeEventText(", "function renderTranscriptEvent("), context);
+  const text = item => taskNoticeText({ type: "claudeTaskNotification", source: "claude", taskId: "id", ...item });
+  assert.equal(text({ kind: "command", status: "failed" }), null);
+  assert.equal(text({ kind: "command", status: "completed" }), null);
   assert.deepEqual(text({ kind: "monitor", summary: "Monitor event: \"等待\"", event: "EXIT=0" }),
-    { label: "监控收到事件 · Claude 自动继续", description: "Monitor event: \"等待\"\nEXIT=0" });
-  assert.equal(text({ kind: "monitor", status: "completed", summary: "Monitor stream ended" }).label, "监控已结束 · Claude 自动继续");
+    { label: "监控收到事件", description: "Monitor event: \"等待\"\nEXIT=0" });
+  assert.equal(text({ kind: "monitor", status: "completed", summary: "Monitor stream ended" }), null);
   assert.deepEqual(text({ kind: "schedule", summary: "只回复“定时触发成功”。", event: "Running scheduled task (Nov 14 12:27am)" }),
-    { label: "定时任务已触发 · Claude 自动继续", description: "只回复“定时触发成功”。\nRunning scheduled task (Nov 14 12:27am)" });
-  assert.equal(text({ kind: "agent", status: "completed" }).label, "后台子代理已完成 · Claude 自动继续");
-  assert.equal(text({ kind: "task", status: "killed" }).label, "后台任务已停止 · Claude 自动继续");
-  assert.equal(text({}).description, "原生任务通知没有提供摘要。");
+    { label: "定时任务已触发", description: "只回复“定时触发成功”。\nRunning scheduled task (Nov 14 12:27am)" });
+  assert.equal(text({ type: "backgroundTaskContinuation", kind: "agent", status: "completed" }).label,
+    "后台子代理已完成 · Claude 自动继续");
+  assert.equal(text({ kind: "task", status: "killed" }), null);
+  assert.equal(text({}), null);
   const backgroundLabel = value => normalizeBackgroundTasks(null, value).map(item => item.name).join("、");
   assert.equal(backgroundLabel("1 shell"), "1 个后台命令");
   assert.equal(backgroundLabel("2 shells, 1 monitor"), "2 个后台命令、1 个监控");
@@ -12965,6 +12966,7 @@ test("真实渲染入口过滤未确认占位，已确认正文在后续渲染�
   const originalQuery = context.$, messagesRoot = { scrollHeight: 0, scrollTop: 0 };
   Object.assign(context, {
     messageFrame: null, followMessages: true, composerScroll: null,
+    visibleTaskTurn,
     cancelAnimationFrame() {}, scheduleMermaidBlocks() {},
     renderTurnPlan() { return null; },
     $: (selector, root) => !root && selector === "#messages" ? messagesRoot : originalQuery(selector, root),
@@ -15717,7 +15719,7 @@ function claudeExecutionFeedbackHarness(turn) {
     },
     element: (_tag, _className, text = "") => makeNode(text), icon: () => makeNode(),
     cancelAnimationFrame() {}, scheduleMermaidBlocks() {}, reconcileSentMessageDisplays: () => false,
-    currentThreadDisplay: () => context.thread, withSentMessageDisplays: () => [...context.turns.values()],
+    currentThreadDisplay: () => context.thread, withSentMessageDisplays: () => [...context.turns.values()], visibleTaskTurn,
     loadMessageSkillChoices() {}, visibleMessageAnchor: () => null,
     historyGapIndex: () => 0, userMessageHasSkills: () => false, subagentsEnabled: () => false,
     isSubagentItem: () => false, transcriptEventTypes: new Set(), reasoningPreviewText: () => "",
@@ -15746,6 +15748,54 @@ function claudeExecutionFeedbackHarness(turn) {
     activities.length = 0; taskPlans.length = 0; context.renderMessages(); return activities;
   } };
 }
+
+test("后台任务只渲染原生续跑，失败与旧缓存均不切断原回复", () => {
+  for (const [source, name] of [["claude", "Claude"], ["antigravity", "AGY"], ["codex", "Codex"]]) {
+    const confirmed = { id: "notice", taskId: "task", source, type: "backgroundTaskContinuation",
+      status: "completed", kind: "command", summary: " \t原生摘要\r\n" };
+    assert.deepEqual(taskNoticeText(confirmed), {
+      label: `后台命令已完成 · ${name} 自动继续`, description: " \t原生摘要\r\n"
+    });
+    for (const status of ["running", "failed", "stopped", "killed", "canceled", "cancelled", undefined])
+      assert.equal(taskNoticeText({ ...confirmed, status }), null);
+    assert.equal(taskNoticeText({ ...confirmed, source: "unknown" }), null);
+    assert.equal(taskNoticeText({ ...confirmed, taskId: "" }), null);
+    const last = { id: "reply", type: "agentMessage", text: "  真实回复  " };
+    const error = { id: "err", type: "error", message: "  原生错误\r\n" };
+    const hidden = { ...confirmed, type: "claudeTaskNotification" };
+    const turn = { id: "t", status: "completed", items: [confirmed, error, last, hidden] };
+    const visible = visibleTaskTurn(turn);
+    assert.deepEqual(visible.items, [confirmed, error, last]);
+    assert.equal(turn.items.length, 4, "不能改写原轮次或原回复");
+    assert.equal(visibleTaskTurn(visible), visible);
+    const h = claudeExecutionFeedbackHarness(turn);
+    h.context.transcriptEventTypes.add("backgroundTaskContinuation");
+    h.render();
+    assert.ok(h.root.children[0].children.some(node => node.textContent === last.text));
+    assert.equal(h.root.children[0].children.filter(node => node.textContent === confirmed.type).length, 1);
+    assert.ok(!h.activities.some(activity => activity.work.includes("notice")));
+  }
+  const silent = claudeExecutionFeedbackHarness({ id: "silent", _claudeAutoTurn: true,
+    status: "completed", items: [{ type: "claudeTaskNotification", status: "failed", source: "claude" }] });
+  silent.render();
+  assert.equal(silent.root.children.length, 0, "不留下空轮次或完成分隔线");
+});
+
+test("迟到的工具完成回执不能撤回已核实的后台终态或跨任务覆盖", () => {
+  const { context } = messageImageRefreshHarness();
+  vm.runInContext(sourceSection("function mergeItemProjection("), context);
+  const known = { type: "commandExecution", id: "tool", backgroundTaskId: "task", status: "failed",
+    backgroundStatus: "failed", backgroundSummary: "  原生错误\r\n", exitCode: 2 };
+  const late = { type: "commandExecution", id: "tool", status: "completed", aggregatedOutput: "原工具输出" };
+  const merged = context.mergeItemProjection(known, late);
+  assert.equal(merged.backgroundStatus, "failed");
+  assert.equal(merged.status, "failed");
+  assert.equal(merged.backgroundSummary, known.backgroundSummary);
+  assert.equal(merged.aggregatedOutput, late.aggregatedOutput);
+  assert.equal(merged.exitCode, 2);
+  assert.equal(context.mergeItemProjection(known, { ...late, backgroundTaskId: "other" }).backgroundStatus, undefined);
+  assert.equal(context.mergeItemProjection(known, { ...late, status: "interrupted" }).status, "interrupted");
+});
 
 test("Codex 引导按有序原生快照纠正位置，无原生锚点时保持现状", () => {
   const { context } = sentDisplayWindowHarness();

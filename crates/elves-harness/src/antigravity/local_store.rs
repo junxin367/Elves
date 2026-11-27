@@ -303,7 +303,7 @@ fn find_transcript_file(gemini_root: &Path, native_id: &str, max_bytes: Option<u
 pub(crate) fn read_local_transcript(gemini_root: &Path, native_id: &str) -> Option<LocalTranscript> {
     let (path, mtime_ms, file_len) = find_local_transcript_file(gemini_root, native_id)?;
     let text = std::fs::read_to_string(&path).ok()?;
-    let mut parsed = parse_transcript_jsonl(&text);
+    let mut parsed = parse_transcript_jsonl(&text, native_id);
     if parsed.turns.is_empty() {
         return None;
     }
@@ -313,7 +313,7 @@ pub(crate) fn read_local_transcript(gemini_root: &Path, native_id: &str) -> Opti
 }
 
 /// 解析 Antigravity `transcript.jsonl` / `transcript_full.jsonl` 内容为 Elves 轮次。
-pub(crate) fn parse_transcript_jsonl(text: &str) -> LocalTranscript {
+pub(crate) fn parse_transcript_jsonl(text: &str, native_id: &str) -> LocalTranscript {
     let mut turns: Vec<Value> = Vec::new();
     let mut last_model = String::new();
     let mut last_effort = String::new();
@@ -322,6 +322,7 @@ pub(crate) fn parse_transcript_jsonl(text: &str) -> LocalTranscript {
     let mut cumulative_cached = 0u64;
     let mut cumulative_output = 0u64;
     let mut cumulative_thought = 0u64;
+    let mut notices = super::task_notices::TaskNotices::default();
 
     for (line_idx, raw) in text.lines().enumerate() {
         let trimmed = raw.trim();
@@ -329,6 +330,7 @@ pub(crate) fn parse_transcript_jsonl(text: &str) -> LocalTranscript {
             continue;
         }
         let Ok(entry) = serde_json::from_str::<Value>(trimmed) else {
+            notices = Default::default();
             continue;
         };
         let step_index = entry["step_index"]
@@ -342,6 +344,7 @@ pub(crate) fn parse_transcript_jsonl(text: &str) -> LocalTranscript {
         let entry_type = entry["type"].as_str().unwrap_or("");
         let source = entry["source"].as_str().unwrap_or("");
 
+        notices.observe(native_id, &entry, &mut turns);
         match entry_type {
             "USER_INPUT" => {
                 let raw_content = entry["content"].as_str().unwrap_or("");
@@ -1251,6 +1254,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn background_task_receipts_only_explain_a_verified_native_continuation() {
+        const LAUNCH: &str = "Tool is running as a background task with task id: local/task-2";
+        let receipt = |tail: &str, first: &str| format!(
+            "The following is a <SYSTEM_MESSAGE> not actually sent by the user. It is provided by the system as important information to pay attention to.\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-26T02:56:50Z sender=local/task-2 priority=MESSAGE_PRIORITY_HIGH content=Task id \"local/task-2\" {tail}\n{first}\n\nCommand output:\nCommand exited with code 0.\n</SYSTEM_MESSAGE>");
+        let rows = vec![
+            json!({"type":"USER_INPUT","step_index":0,"content":"跑测试"}),
+            json!({"type":"PLANNER_RESPONSE","source":"MODEL","status":"DONE","model":"m","step_index":1,
+                "tool_calls":[{"name":"run_command","args":{"CommandLine":"test"}}]}),
+            json!({"type":"GENERIC","source":"MODEL","status":"RUNNING","step_index":2,"content":LAUNCH}),
+            json!({"type":"PLANNER_RESPONSE","source":"MODEL","status":"DONE","model":"m","step_index":3,"content":"已转入后台"}),
+            json!({"type":"SYSTEM_MESSAGE","source":"SYSTEM","status":"DONE","step_index":4,
+                "content":receipt("finished with result:", "Command exited with code 0.")}),
+            json!({"type":"PLANNER_RESPONSE","source":"MODEL","status":"DONE","model":"m","step_index":5,"content":"原生回复"})
+        ];
+        let parse = |rows: &[Value]| parse_transcript_jsonl(&rows.iter().map(Value::to_string)
+            .collect::<Vec<_>>().join("\n"), "local").turns;
+        let count = |turns: &[Value]| turns.iter().flat_map(|turn| turn["items"].as_array().unwrap())
+            .filter(|item| item["type"] == "backgroundTaskContinuation").count();
+        assert_eq!(count(&parse(&rows[..5])), 0, "只有回执，没有续跑");
+        let projected = parse(&rows);
+        let items = projected[0]["items"].as_array().unwrap();
+        assert_eq!(items[1]["backgroundStatus"], "completed");
+        assert_eq!(items[1]["aggregatedOutput"], "Command exited with code 0.");
+        assert_eq!(items[3]["type"], "backgroundTaskContinuation");
+        assert_eq!(items[4]["text"], "原生回复");
+        let mut managed = vec![json!({"id":"agy-turn-test","error":{"message":"原错误"},"items":[
+            {"type":"commandExecution","id":"agy-tool-one","command":"test","aggregatedOutput":LAUNCH},
+            {"type":"agentMessage","id":"agy-msg-one","text":"原生回复"}]})];
+        assert!(super::super::task_notices::has_unsettled_command(&managed[0], "local"));
+        assert!(!super::super::task_notices::has_unsettled_command(&managed[0], "different"));
+        for _ in 0..2 { super::super::task_notices::merge_managed(&mut managed, &projected); }
+        assert_eq!(count(&managed), 1);
+        assert_eq!(managed[0]["items"][1]["id"], items[3]["id"]);
+        assert_eq!(managed[0]["items"][2]["id"], "agy-msg-one");
+        assert_eq!(managed[0]["items"][0]["aggregatedOutput"], "Command exited with code 0.");
+        assert_eq!(managed[0]["error"]["message"], "原错误");
+        assert!(!super::super::task_notices::has_unsettled_command(&managed[0], "local"));
+        for (tail, line, expected) in [
+            ("finished with result:", "Command exited with code 1.", "failed"),
+            ("was canceled with result:", "Tool execution was canceled", "stopped"),
+            ("finished with result:", "arbitrary tool output", "unknown"),
+        ] {
+            let mut sample = rows.clone();
+            sample[4]["content"] = json!(receipt(tail, line));
+            let result = parse(&sample);
+            assert_eq!(count(&result), 0);
+            assert_eq!(result[0]["items"][1]["backgroundStatus"], expected);
+            assert_eq!(result[0]["items"].as_array().unwrap().last().unwrap()["text"], "原生回复");
+        }
+        for (row, key, value) in [(4,"source",json!("USER")),(5,"step_index",json!(7)),
+            (3,"tool_calls",json!([{"name":"read_file"}])),(2,"content",json!("lookalike")),
+            (4,"content",json!(receipt("finished with result:","Command exited with code 0.").replace("sender=local","sender=other")))] {
+            let mut sample = rows.clone(); sample[row][key] = value;
+            assert_eq!(count(&parse(&sample)), 0, "{key}");
+        }
+    }
+
+    #[test]
     fn history_error_records_preserve_native_fields_and_record_time() {
         let raw = " \tQuota  exceeded\r\n重置：2:40pm (America/Los_Angeles)  \n";
         let detail = "  <native-detail>\r\n保留原文\t";
@@ -1262,7 +1323,7 @@ mod tests {
                 "created_at":"1970-01-01T00:00:02Z","error":raw,"content":detail}),
             json!({"type":"ERROR_MESSAGE","step_index":2,"content":detail,"created_at":"unknown"}),
         ];
-        let parsed = parse_transcript_jsonl(&entries.iter().map(Value::to_string).collect::<Vec<_>>().join("\n"));
+        let parsed = parse_transcript_jsonl(&entries.iter().map(Value::to_string).collect::<Vec<_>>().join("\n"), "test");
         let turn = &parsed.turns[0];
         assert!(turn.get("error").is_none(), "历史单条错误不是整轮终态");
         let items = turn["items"].as_array().unwrap();
@@ -1283,7 +1344,7 @@ mod tests {
             json!({"type":"ERROR_MESSAGE","step_index":3,"source":"SYSTEM","status":"DONE","error":raw}),
             json!({"type":"PLANNER_RESPONSE","step_index":4,"status":"DONE","content":"recovered reply"}),
         ];
-        let parsed = parse_transcript_jsonl(&entries.iter().map(Value::to_string).collect::<Vec<_>>().join("\n"));
+        let parsed = parse_transcript_jsonl(&entries.iter().map(Value::to_string).collect::<Vec<_>>().join("\n"), "test");
         let turn = &parsed.turns[0];
         assert_eq!(turn["status"], "completed");
         assert!(turn.get("error").is_none());
@@ -1292,7 +1353,7 @@ mod tests {
         assert!(turn["items"].as_array().unwrap().iter().all(|item| item["type"] != "userMessage"));
         let trailing = parse_transcript_jsonl(&json!({
             "type":"ERROR_MESSAGE","step_index":5,"status":"DONE","error":{"message":raw,"details":"detail"}
-        }).to_string());
+        }).to_string(), "test");
         assert!(trailing.turns[0].get("error").is_none(), "文件末尾有错误记录也不能猜测整轮已失败");
         assert_eq!(trailing.turns[0]["items"][0]["nativeMessage"], raw);
         assert_eq!(trailing.turns[0]["items"][0]["nativeDetails"], json!(["detail"]));
@@ -1308,7 +1369,7 @@ mod tests {
             r#"{"step_index":4,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-26T02:11:07Z","content":"<USER_REQUEST>\n第二个问题\n</USER_REQUEST>"}"#, "\n",
             r#"{"step_index":5,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-26T02:11:10Z","model":"gemini-4-neon-high","content":"第二个回答"}"#, "\n"
         );
-        let parsed = parse_transcript_jsonl(sample);
+        let parsed = parse_transcript_jsonl(sample, "test");
         assert_eq!(parsed.turns.len(), 2);
         assert_eq!(parsed.model, "gemini-4-neon");
         assert_eq!(parsed.effort, "high");
@@ -1339,7 +1400,7 @@ mod tests {
             r#"{"step_index":2,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-27T02:01:00Z","content":"<USER_REQUEST>\n/compact\n</USER_REQUEST>"}"#, "\n",
             r#"{"step_index":3,"source":"MODEL","type":"CHECKPOINT","status":"DONE","created_at":"2026-11-27T02:01:03Z","model":"gemini-3.8-flash-high","input_tokens":19000,"cache_read_tokens":0,"output_tokens":450}"#, "\n"
         );
-        let parsed = parse_transcript_jsonl(sample);
+        let parsed = parse_transcript_jsonl(sample, "test");
         assert_eq!(parsed.turns.len(), 2);
         assert_eq!(parsed.turns[0]["items"][0]["content"][0]["text"], "hello");
         assert_eq!(parsed.turns[1]["items"][0]["type"], "contextCompaction");

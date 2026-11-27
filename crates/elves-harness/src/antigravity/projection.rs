@@ -1419,7 +1419,7 @@ mod metrics_tests {
         let native = super::super::local_store::parse_transcript_jsonl(concat!(
             "{\"type\":\"USER_INPUT\",\"step_index\":0,\"created_at\":\"1970-01-01T00:00:01Z\",\"content\":\"history\"}\n",
             "{\"type\":\"PLANNER_RESPONSE\",\"step_index\":1,\"created_at\":\"1970-01-01T00:00:01Z\",\"model\":\"gemini-4-neon-high\",\"input_tokens\":100,\"cache_read_tokens\":20,\"output_tokens\":10}\n"
-        ));
+        ), "test");
         let metrics = compute_session_metrics(&native.turns, &native.token_usage, &native.model, 10000);
         assert_eq!(metrics["turnTokens"], 130);
         assert!(metrics["firstTokenMs"].is_null());

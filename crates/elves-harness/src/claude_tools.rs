@@ -9,6 +9,7 @@
 //! 两侧字段需同步核对。
 
 use serde_json::{Value, json};
+use std::collections::HashMap;
 
 /// 由轮次计划接管、不单独显示卡片的原生任务清单工具。
 const PLAN_TOOLS: [&str; 3] = ["TaskCreate", "TaskUpdate", "TodoWrite"];
@@ -152,10 +153,61 @@ pub(super) fn apply_result(item: &mut Value, block: &Value, frame: &Value) {
     }
 }
 
-/// 原生任务通知（后台命令结束、监控事件、后台子代理结束）开启的自动续跑轮次。
-///
-/// 用户要求这类轮次不显示成用户消息、不可编辑，以“自动继续”事件开头，随后的回复归入本轮而不是并入上一轮。
-/// 同时把通知状态写回对应的后台命令卡片；子代理卡片状态仍由 `subagents::observe_notification` 维护。
+fn write_command_result(item: &mut Value, status: &str, summary: &str) {
+    item["backgroundStatus"] = json!(status);
+    if !summary.is_empty() {
+        // 终态不再单占正文；原生摘要（尤其是失败原因）留在原命令上，不覆盖命令输出。
+        item["backgroundSummary"] = json!(summary);
+    }
+    let code = summary.trim_end().rsplit_once("exit code ").and_then(|(_, rest)| {
+        let rest = rest.trim_end_matches('.');
+        rest.strip_suffix(')').unwrap_or(rest).parse::<i64>().ok()
+    });
+    if let Some(code) = code { item["exitCode"] = json!(code); }
+    match status {
+        "failed" => item["status"] = json!("failed"),
+        "killed" | "stopped" | "canceled" | "cancelled" => item["status"] = json!("interrupted"),
+        "completed" if code.is_some_and(|code| code != 0) => {
+            item["status"] = json!("failed");
+            item["backgroundStatus"] = json!("failed");
+        }
+        "completed" => item["status"] = json!("completed"),
+        _ => {}
+    }
+}
+
+/// SDK 的 system/task_notification 只更新相同任务和调用的原命令，绝不以它创建轮次或续跑事件。
+pub(super) fn apply_command_receipts(turns: &mut [Value], receipts: &Value) {
+    let Some(receipts) = receipts.as_array().filter(|list| !list.is_empty()) else { return };
+    let by_task: HashMap<_, _> = receipts.iter().filter_map(|r| Some((r["taskId"].as_str()?, r))).collect();
+    for item in turns.iter_mut().flat_map(|t| t["items"].as_array_mut().into_iter().flatten()) {
+        if item["type"] != "commandExecution" || !matches!(item["backgroundStatus"].as_str(), Some("unknown" | "running")) { continue; }
+        let Some(receipt) = item["backgroundTaskId"].as_str().and_then(|id| by_task.get(id)) else { continue };
+        if receipt["toolUseId"].as_str().is_some_and(|id| item["id"] != id) { continue; }
+        if let Some(status @ ("completed" | "failed" | "killed" | "stopped" | "canceled" | "cancelled")) = receipt["status"].as_str() {
+            write_command_result(item, status, receipt["summary"].as_str().unwrap_or(""));
+            item["_sdkTaskResult"] = json!(true);
+        }
+    }
+}
+
+/// SDK 的终态可能不写入 JSONL；旧快照或重启不能把同一命令恢复为“已转入后台”。
+pub(super) fn retain_command_receipts(previous: &[Value], turns: &mut [Value]) {
+    let receipts: HashMap<_, _> = previous.iter().flat_map(|t| t["items"].as_array().into_iter().flatten())
+        .filter(|item| item["_sdkTaskResult"] == true)
+        .filter_map(|item| Some((item["id"].as_str()?, item))).collect();
+    if receipts.is_empty() { return; }
+    for item in turns.iter_mut().flat_map(|t| t["items"].as_array_mut().into_iter().flatten()) {
+        if item["type"] != "commandExecution" || !matches!(item["backgroundStatus"].as_str(), Some("running" | "unknown")) { continue; }
+        let Some(old) = item["id"].as_str().and_then(|id| receipts.get(id)).copied() else { continue };
+        if old["backgroundTaskId"] != item["backgroundTaskId"] { continue; }
+        for field in ["backgroundStatus", "backgroundSummary", "status", "exitCode", "_sdkTaskResult"] {
+            if let Some(value) = old.get(field) { item[field] = value.clone(); }
+        }
+    }
+}
+
+/// 保留通知对应的不可编辑轮次和回复归属。终态本身不证明续跑；子代理状态由 subagents 同步。
 pub(super) fn notification_turn(
     turns: &mut [Value],
     row: &Value,
@@ -166,6 +218,7 @@ pub(super) fn notification_turn(
     let uuid = row["uuid"].as_str()?;
     let tool = notification["toolUseId"].as_str();
     let summary = notification["summary"].as_str().unwrap_or_default();
+    let mut status = notification["status"].clone();
     // 连接端可直接给出类别（如定时任务 schedule）；否则带 event 的是监控事件，其余按所属工具卡片判断。
     let mut kind = match notification["kind"].as_str() {
         Some(kind) => kind,
@@ -182,20 +235,9 @@ pub(super) fn notification_turn(
         match item["type"].as_str() {
             Some("commandExecution") => {
                 kind = "command";
-                let Some(status) = notification["status"].as_str() else {
-                    continue;
-                };
-                item["backgroundStatus"] = json!(status);
-                // 原生摘要形如 “… completed (exit code 0)” / “… failed with exit code 1”。
-                let code = summary.rsplit_once("exit code ").and_then(|(_, rest)| {
-                    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-                    digits.parse::<i64>().ok()
-                });
-                if let Some(code) = code {
-                    item["exitCode"] = json!(code);
-                }
-                if status == "failed" || code.is_some_and(|code| code != 0) {
-                    item["status"] = json!("failed");
+                if let Some(state) = notification["status"].as_str() {
+                    write_command_result(item, state, summary);
+                    status = item["backgroundStatus"].clone();
                 }
             }
             Some("collabAgentToolCall") => kind = "agent",
@@ -209,9 +251,36 @@ pub(super) fn notification_turn(
         "_process":generation,"status":"completed","itemsView":"full","itemsComplete":true,
         "turnStartedAtMs":row["timestampMs"],
         "items":[{"id":format!("{uuid}-notification"),"type":"claudeTaskNotification","source":"claude",
-            "kind":kind,"taskId":task,"status":notification["status"],"summary":summary,
-            "event":notification["event"],"completedAtMs":row["timestampMs"]}]}),
+            "kind":kind,"taskId":task,"status":status,"summary":summary,
+            "event":notification["event"],"statusOnly":notification["statusOnly"] == true,
+            "completedAtMs":row["timestampMs"]}]}),
     )
+}
+
+/// 用户要求只有成功完成并真正唤醒原生模型才显示续跑行；不能按通知后的时间顺序认领另一分支的回复。
+pub(super) fn confirm_task_continuation(turn: &mut Value, row: &Value) {
+    if turn["_claudeAutoTurn"] != true || turn["_nativeDone"] == true
+        || row["type"] != "assistant" || row["isApiErrorMessage"] == true
+        || row["message"]["model"].as_str().is_none_or(|model| model.is_empty() || model == "<synthetic>")
+        || !row["message"]["content"].as_array().is_some_and(|blocks| blocks.iter().any(|block| {
+            match block["type"].as_str() {
+                Some("text") => block["text"].as_str().is_some_and(|s| !s.trim().is_empty()),
+                Some("thinking") => block["thinking"].as_str().is_some_and(|s| !s.trim().is_empty()),
+                Some("tool_use") => block["id"].as_str().is_some_and(|s| !s.is_empty()),
+                _ => false,
+            }
+        }))
+    {
+        return;
+    }
+    let Some(parent) = row["parentUuid"].as_str() else { return };
+    let id = format!("{parent}-notification");
+    if let Some(item) = turn["items"].as_array_mut().into_iter().flatten().find(|item|
+        item["type"] == "claudeTaskNotification" && item["id"] == id && item["status"] == "completed"
+        && item["statusOnly"] != true && item["kind"] != "schedule")
+    {
+        item["type"] = json!("backgroundTaskContinuation");
+    }
 }
 
 /// 本地斜杠命令（claudeLocalCommand：终端执行，或经 SDK 执行时带 via=sdk）与原生系统提示（claudeNotice：
@@ -877,6 +946,29 @@ mod tests {
         settle_background(&mut running, &json!({"sessionAlive":false}));
         assert_eq!(running[0]["items"][0]["backgroundStatus"], "unknown");
         assert_eq!(running[0]["items"][1]["backgroundStatus"], "completed");
+    }
+
+    #[test]
+    fn background_task_sdk_receipt_only_settles_the_matching_original_command() {
+        let source = json!({"id":"t","items":[{"id":"tool","type":"commandExecution",
+            "backgroundTaskId":"bg","backgroundStatus":"running","aggregatedOutput":"original output"}]});
+        let result = json!({"toolUseId":"tool","taskId":"bg","status":"failed",
+            "summary":" \t原生错误，exit code 2\r\n"});
+        let mut turns = vec![source.clone()];
+        let mut unrelated = result.clone();
+        unrelated["toolUseId"] = json!("other");
+        apply_command_receipts(&mut turns, &json!([unrelated]));
+        assert_eq!(turns[0], source);
+        apply_command_receipts(&mut turns, &json!([result]));
+        assert_eq!(turns[0]["items"].as_array().unwrap().len(), 1);
+        let card = &turns[0]["items"][0];
+        assert_eq!(card["status"], "failed");
+        assert_eq!(card["exitCode"], 2);
+        assert_eq!(card["aggregatedOutput"], "original output");
+        assert_eq!(card["backgroundSummary"], " \t原生错误，exit code 2\r\n");
+        let mut restored = vec![source];
+        retain_command_receipts(&turns, &mut restored);
+        assert_eq!(restored, turns);
     }
 
     #[test]

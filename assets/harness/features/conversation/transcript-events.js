@@ -5,10 +5,9 @@ import { completedItem, itemVersions } from "./history-state.js";
 import { messageImageMediaReads } from "../messages/media-state.js";
 
 export const transcriptEvents = new Map();
-// Claude 事件行（Rust claude_tools.rs 生成）：claudeTaskNotification 为后台命令、监控事件、后台子代理通知开启的
-// 自动续跑轮次起点；claudeLocalCommand 为终端或经 SDK 执行的本地斜杠命令（via=sdk）；claudeNotice 为离开期间回顾、原生提示与 Stop Hook。
+// 后台任务的原生续跑由所属适配器确认；旧 Claude 原始通知不是续跑凭证，两者只随所属轮次恢复。
 export const transcriptEventTypes = new Set(["modelChanged", "modelRerouted", "contextCompaction",
-  "claudeTaskNotification", "claudeLocalCommand", "claudeNotice"]);
+  "backgroundTaskContinuation", "claudeTaskNotification", "claudeLocalCommand", "claudeNotice"]);
 export function replaceTranscriptEvents(entries, readVersion = null) {
   // 用户要求切回/刷新不丢压缩记录；读取开始后收到的事件比这次快照新，不能被空列表清掉。
   const live = Number.isFinite(readVersion) ? [...transcriptEvents.entries()]
@@ -17,7 +16,8 @@ export function replaceTranscriptEvents(entries, readVersion = null) {
   for (const entry of entries || []) {
     const item = entry?.item;
     if (typeof entry?.turnId !== "string" || typeof item?.id !== "string"
-        || !transcriptEventTypes.has(item.type)) continue;
+        || !transcriptEventTypes.has(item.type) || item.type === "claudeTaskNotification"
+        || item.type === "backgroundTaskContinuation") continue;
     transcriptEvents.set(`${entry.turnId}:${item.id}`, {
       turnId: entry.turnId,
       item,
@@ -30,7 +30,8 @@ export function mergeTranscriptEvents(entries) {
   for (const entry of entries || []) {
     const item = entry?.item;
     if (typeof entry?.turnId !== "string" || typeof item?.id !== "string"
-        || !transcriptEventTypes.has(item.type)) continue;
+        || !transcriptEventTypes.has(item.type) || item.type === "claudeTaskNotification"
+        || item.type === "backgroundTaskContinuation") continue;
     const key = `${entry.turnId}:${item.id}`, previous = transcriptEvents.get(key);
     // 已收到的完成证据不能被迟到的进行中历史覆盖；失败和中断状态也随完成记录一起保留。
     const projected = item.type === "contextCompaction" ? mergeItemProjection(previous?.item, item) : item;
@@ -170,6 +171,15 @@ export function mergeItemProjection(previous, item) {
   // 单条状态事件也可能晚于正文到达，不能用同 ID 的 steered 把已接受的引导内容改回空状态。
   if (previous?.id === item.id && previous.type === "userMessage" && item.type === "steered") return previous;
   const projection = {};
+  // ACP 的“工具已返回”可能晚于后台终态到达。仅同一命令保留已核对的终态，不覆盖新错误或不同任务。
+  if (previous?.type === "commandExecution" && item.type === previous.type && previous.id === item.id
+      && previous.backgroundTaskId && (!item.backgroundTaskId || item.backgroundTaskId === previous.backgroundTaskId)
+      && ["completed", "failed", "stopped"].includes(previous.backgroundStatus)
+      && [undefined, null, "running", "unknown"].includes(item.backgroundStatus)
+      && (!["failed", "interrupted"].includes(item.status) || item.status === previous.status)) {
+    item = { ...item, backgroundTaskId: previous.backgroundTaskId, backgroundStatus: previous.backgroundStatus,
+      backgroundSummary: previous.backgroundSummary, exitCode: previous.exitCode ?? item.exitCode, status: previous.status };
+  }
   for (const field of ["messageMetadata", "sentAtMs", "startedAtMs", "completedAtMs", "completed",
     "remoteImages", "remoteVideos", "fileAttachments", "clientId", "remoteCompactionInput",
     "remoteHistoryContext", "remoteItemCompleted"])

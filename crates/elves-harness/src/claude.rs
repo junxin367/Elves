@@ -335,6 +335,10 @@ impl Conversation {
             fields.remove("_claudeTaskSeed");
         }
         if let Some(items) = value["items"].as_array_mut() {
+            // 原始控制记录用于轮次归属，不是可见续跑证据；历史读取和共享推送走同一出口。
+            items.retain(|item| item["type"] != "claudeTaskNotification"
+                || item["statusOnly"] != true && (item["kind"] == "schedule"
+                    || item["kind"] == "monitor" && item["status"].is_null() && item["event"].is_string()));
             for item in items
                 .iter_mut()
                 .filter(|item| item["type"] == "userMessage")
@@ -3606,6 +3610,7 @@ impl Claude {
                 c.queued_messages = accepted;
                 c.resumed = true;
                 restore_shared_images(&c.turns, &mut projected);
+                tools::retain_command_receipts(&c.turns, &mut projected);
                 let reverted = frame.get("history_head").is_some()
                     && c.turns.iter().any(|old| {
                         old["items"].as_array().is_some_and(|items| {
@@ -4747,7 +4752,7 @@ fn project_shared_history(frame: &Value, generation: &str) -> Vec<Value> {
     let mut web_image_paths = std::collections::HashSet::new();
     for row in frame["messages"].as_array().into_iter().flatten() {
         let agent_notification = subagents::observe_notification(&mut turns, row);
-        // 原生任务通知开启自动续跑轮次（见 claude_tools::push_notification），随后的回复归入该轮次。
+        // 先按通知保留后续原生回复的归属；仅通知本身不能作为正文“自动继续”的证据。
         if row["nativeTaskNotification"].is_object() {
             if let Some((index, item_id)) = tools::push_notification(&mut turns, row, generation)
                 && let Some(id) = row["uuid"].as_str()
@@ -4974,6 +4979,7 @@ fn project_shared_history(frame: &Value, generation: &str) -> Vec<Value> {
                     turn["durationMs"] = row["durationMs"].clone();
                 }
             } else if matches!(row["type"].as_str(), Some("assistant" | "user")) {
+                tools::confirm_task_continuation(turn, row);
                 let mut native_frame = row.clone();
                 native_frame["message"]["content"] = content;
                 project_frame(turn, &native_frame);
@@ -5071,6 +5077,7 @@ fn project_shared_history(frame: &Value, generation: &str) -> Vec<Value> {
             });
         }
     }
+    tools::apply_command_receipts(&mut turns, &frame["background_task_results"]);
     tools::settle_background(&mut turns, &frame["native_status"]);
     let latest = turns.len().checked_sub(1);
     for (index, turn) in turns.iter_mut().enumerate() {
@@ -8736,7 +8743,7 @@ mod tests {
             {"type":"user","uuid":"n1","timestampMs":30,"nativeTaskNotification":{"taskId":"bg1","toolUseId":"b1",
                 "status":"completed","summary":"Background command \"cargo test\" completed (exit code 0)"},
                 "message":{"content":"<task-notification><task-id>bg1</task-id></task-notification>"}},
-            {"type":"assistant","uuid":"a3","message":{"id":"m3","content":[
+            {"type":"assistant","uuid":"a3","parentUuid":"n1","message":{"id":"m3","model":"fixture-model","content":[
                 {"type":"tool_use","id":"t2","name":"TaskUpdate","input":{"taskId":"1","status":"completed"}},
                 {"type":"text","text":"测试全部通过"}]}},
             {"type":"system","subtype":"turn_duration","timestampMs":40,"durationMs":7}
@@ -8766,7 +8773,7 @@ mod tests {
         // 自动续跑轮次：不是用户气泡、不可编辑，随后的回复与耗时归入新轮次，任务清单从上一轮延续。
         assert_eq!(turns[1]["id"], "n1");
         assert_eq!(turns[1]["_nativeEditable"], false);
-        assert_eq!(turns[1]["items"][0]["type"], "claudeTaskNotification");
+        assert_eq!(turns[1]["items"][0]["type"], "backgroundTaskContinuation");
         assert_eq!(turns[1]["items"][1]["text"], "测试全部通过");
         assert_eq!(turns[1]["durationMs"], 7);
         assert_eq!(
@@ -8781,6 +8788,51 @@ mod tests {
                     && item["content"].to_string().contains("task-notification"))
         );
         assert_eq!(turns, project_shared_history(&frame, "connection"));
+    }
+
+    #[tokio::test]
+    async fn background_task_notice_requires_success_and_related_native_output() {
+        let (_dir, _service, c) = fixture();
+        let receipt = json!({"uuid":"n","type":"user","nativeTaskNotification":{
+            "taskId":"bg","toolUseId":"tool","status":"completed","summary":"原生结果"}});
+        let reply = json!({"uuid":"answer","parentUuid":"n","type":"assistant","message":{
+            "id":"msg","model":"fixture-model","content":[{"type":"text","text":"原生回复"}]}});
+        let project = |notice: Value, after: Vec<Value>| {
+            let mut rows = vec![
+                json!({"uuid":"u","type":"user","message":{"content":"test"}}),
+                json!({"uuid":"a","type":"assistant","message":{"content":[
+                    {"type":"tool_use","id":"tool","name":"Bash","input":{"command":"test"}}]}}),
+                notice
+            ];
+            rows.extend(after);
+            project_shared_history(&json!({"messages":rows}), "test").iter()
+                .map(|t| c.displayed_turn(t)).collect::<Vec<_>>()
+        };
+        assert_eq!(project(receipt.clone(), vec![])[1]["items"], json!([]));
+        for status in ["completed","failed","stopped","killed","cancelled"] {
+            let mut notice = receipt.clone();
+            notice["nativeTaskNotification"]["status"] = json!(status);
+            let result = project(notice, vec![reply.clone()]);
+            let items = result[1]["items"].as_array().unwrap();
+            assert_eq!(items.last().unwrap()["text"], "原生回复");
+            assert_eq!(items.iter().filter(|i| i["type"] == "backgroundTaskContinuation").count(),
+                       usize::from(status == "completed"));
+            assert_eq!(result[0]["items"][1]["backgroundStatus"], status);
+            assert_eq!(result[0]["items"][1]["backgroundSummary"], "原生结果");
+        }
+        let mut unrelated = reply.clone();
+        unrelated["parentUuid"] = json!("u");
+        assert_eq!(project(receipt.clone(), vec![unrelated])[1]["items"].as_array().unwrap().len(), 1);
+        let mut synthetic = reply.clone();
+        synthetic["isApiErrorMessage"] = json!(true);
+        synthetic["message"]["model"] = json!("<synthetic>");
+        synthetic["message"]["content"][0]["text"] = json!("  API Error\r\n原因  ");
+        let error_turn = &project(receipt.clone(), vec![synthetic])[1];
+        assert_eq!(error_turn["items"].as_array().unwrap().len(), 1);
+        assert_eq!(error_turn["items"][0]["text"], "  API Error\r\n原因  ");
+        let mut silent = receipt;
+        silent["nativeTaskNotification"]["statusOnly"] = json!(true);
+        assert_eq!(project(silent, vec![reply])[1]["items"].as_array().unwrap().len(), 1);
     }
 
     #[test]

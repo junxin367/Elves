@@ -624,6 +624,9 @@ impl PeerState {
         let mut frame = reader.clone();
         frame["job_id"] = json!("");
         frame["native_status"] = self.status();
+        if !self.tasks.receipts().is_empty() {
+            frame["background_task_results"] = json!(self.tasks.receipts());
+        }
         frame["requests"] = self.requests_value();
         if frame["native_control"].is_object() {
             // 权限模式、模型与等级以 CLI 刚报告的实际值为准；JSONL 要等下一条用户记录才带这些字段。
@@ -972,6 +975,23 @@ mod tests {
         assert!(state.status()["backgroundTaskItems"].as_array().unwrap().is_empty());
         state.observe_cli(&json!({"type":"system","subtype":"task_notification",
             "task_id":"foreground","status":"completed"}), 3);
+        assert!(!state.has_background_tasks());
+    }
+
+    #[test]
+    fn background_task_terminal_frame_survives_exit_without_claiming_a_wake() {
+        let mut state = state();
+        state.set_alive(true, 1);
+        let ended = json!({"type":"system","subtype":"task_notification","status":"failed",
+            "task_id":"bg","tool_use_id":"tool","summary":"  原生错误\r\n "});
+        assert!(state.observe_cli(&ended, 2).dirty);
+        assert!(!state.observe_cli(&ended, 3).dirty);
+        state.set_alive(false, 4);
+        let frame = state.compose(&json!({"messages":[]}), &Value::Null);
+        assert_eq!(frame["background_task_results"].as_array().unwrap().len(), 1);
+        assert_eq!(frame["background_task_results"][0]["summary"], "  原生错误\r\n ");
+        assert_eq!(frame["messages"], json!([]));
+        assert_eq!(frame["native_status"]["backgroundTaskItems"], json!([]));
         assert!(!state.has_background_tasks());
     }
 

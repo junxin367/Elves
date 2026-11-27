@@ -78,5 +78,10 @@ export function renderToolOutput(details, item) {
     else result.textContent = text.slice(0, shown);
     more.hidden = shown >= text.length;
   };
-  update(); body.append(output, more); details.append(body);
+  update(); body.append(output, more);
+  // 后台结束原因随原工具展开；不改写 stdout，也不把原生错误再渲染成一条会话通知。
+  if (item.type === "commandExecution" && typeof item.backgroundSummary === "string"
+      && item.backgroundSummary && item.backgroundSummary !== text)
+    body.append(element("pre", "tool-output", item.backgroundSummary));
+  details.append(body);
 }

@@ -484,6 +484,12 @@ class SharedQueueHistoryTests(unittest.TestCase):
                                           "event": "EXIT=0 & 完成"})
         self.assertEqual(parse(command), {"taskId": "bg1", "summary": "Background command \"make\" completed (exit code 0)",
                                           "status": "completed", "toolUseId": "toolu_1"})
+        raw = "  Exit code 2\r\n" + "原始错误 " * 150 + "\t"
+        failure = {**command, "shouldQuery": False, "message": {"content":
+            "<task-notification><task-id>bg1</task-id><status>failed</status><summary>"
+            + raw + "</summary></task-notification>"}}
+        self.assertEqual(parse(failure)["summary"], raw)
+        self.assertTrue(parse(failure)["statusOnly"])
         self.assertIsNone(parse(quoted), "用户引用相同 XML 仍是普通正文")
         self.assertFalse(real_user(monitor), "没有状态的监控事件也不能当作可编辑的用户消息")
         self.assertTrue(real_user(quoted))

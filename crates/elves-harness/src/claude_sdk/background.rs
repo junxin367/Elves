@@ -1,6 +1,6 @@
 //! 只依据原生任务事件维护后台任务展示，不从普通工具的运行状态推断后台任务。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use serde_json::{Value, json};
 
@@ -33,6 +33,8 @@ pub(super) struct BackgroundTasks {
     active: BTreeMap<String, Task>,
     // 前台命令稍后转入后台时仍沿用原生开始事件；前台任务本身不进入菜单和后台计数。
     starts: BTreeMap<String, Task>,
+    // 只暂存最近终态，以便任务通知先于 JSONL 的原工具记录到达；不参与菜单计数或进程保活。
+    finished: VecDeque<Value>,
     sequence: u64,
 }
 
@@ -40,6 +42,7 @@ impl BackgroundTasks {
     pub(super) fn clear(&mut self) {
         self.active.clear();
         self.starts.clear();
+        // CLI 退出会使运行列表失效，但不会撤销已收到的终态；最后两帧可能合并进同一快照。
         self.sequence = 0;
     }
 
@@ -93,6 +96,7 @@ impl BackgroundTasks {
                 let Some(id) = task_id(frame) else {
                     return false;
                 };
+                self.finished.retain(|receipt| receipt["taskId"] != id);
                 if frame["ambient"] == true {
                     self.starts.remove(id);
                     return self.active.remove(id).is_some();
@@ -154,11 +158,21 @@ impl BackgroundTasks {
                     return false;
                 };
                 self.starts.remove(id);
-                self.active.remove(id).is_some()
+                let removed = self.active.remove(id).is_some();
+                if frame["ambient"] == true { return removed; }
+                let receipt = json!({"taskId":id,"toolUseId":frame["tool_use_id"],
+                    "status":frame["status"],"summary":frame["summary"]});
+                if self.finished.iter().any(|known| known == &receipt) { return removed; }
+                self.finished.retain(|known| known["taskId"] != id);
+                if self.finished.len() == 64 { self.finished.pop_front(); }
+                self.finished.push_back(receipt);
+                true
             }
             _ => false,
         }
     }
+
+    pub(super) fn receipts(&self) -> &VecDeque<Value> { &self.finished }
 
     pub(super) fn items(&self) -> Value {
         let mut tasks: Vec<_> = self.active.iter().collect();

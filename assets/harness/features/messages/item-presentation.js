@@ -1,6 +1,7 @@
 // 条目展示：工具名称与展示文本、推理预览、Claude 事件文案、子节点复用与过程事件渲染。
 
 import { button, element } from "../../ui/dom.js";
+import { taskNoticeText } from "../../background-tasks.js";
 import { icon } from "../../ui/icons.js";
 import { composerTooltips } from "../../ui/tooltip.js";
 import { models } from "../composer/options-state.js";
@@ -10,20 +11,6 @@ import { compactionQueueSendReason } from "../conversation/compaction.js";
 export function transcriptModelName(id) {
   if (typeof id !== "string" || !id) return "未知模型";
   return models.find(model => model.model === id || model.id === id)?.displayName || id;
-}
-// 用户要求 Claude 原生任务通知触发的自动续跑显示为“自动继续”，不显示成用户消息；原生摘要放在信息提示里。
-function claudeTaskNotificationText(item) {
-  const status = String(item.status || "");
-  const subject = { command: "后台命令", agent: "后台子代理", monitor: "监控", schedule: "定时任务" }[item.kind] || "后台任务";
-  // 监控每个事件都是无状态通知；监控结束时的通知带状态（2.1.323 实测）。定时任务触发时摘要为其提示词。
-  const state = item.kind === "schedule" ? "已触发" : !status && item.kind === "monitor" ? "收到事件"
-    : status === "completed" ? item.kind === "monitor" ? "已结束" : "已完成"
-    : status === "failed" ? "失败" : ["killed", "stopped"].includes(status) ? "已停止" : "发来通知";
-  const detail = [item.summary, item.event].filter(value => typeof value === "string" && value.trim()).join("\n");
-  return {
-    label: `${subject}${state} · Claude 自动继续`,
-    description: detail || "原生任务通知没有提供摘要。"
-  };
 }
 // 用户要求终端本地命令与原生系统提示不显示成用户消息、也不静默丢弃：以紧凑事件行展示，原文放在信息提示中。
 function claudeEventText(item) {
@@ -52,7 +39,8 @@ function claudeEventText(item) {
 }
 export function renderTranscriptEvent(item, previous) {
   const node = previous || element("div");
-  const notification = item.type === "claudeTaskNotification";
+  const notification = (item.type === "claudeTaskNotification" || item.type === "backgroundTaskContinuation")
+    && taskNoticeText(item);
   const claudeEvent = ["claudeLocalCommand", "claudeNotice"].includes(item.type);
   node.className = `transcript-event muted ${item.type === "contextCompaction" ? "context-compaction"
     : notification ? "task-notification" : claudeEvent ? "claude-event" : "model-change"}`;
@@ -99,7 +87,7 @@ export function renderTranscriptEvent(item, previous) {
     }
     description = details.join("\n");
   } else if (notification) {
-    ({ label, description } = claudeTaskNotificationText(item));
+    ({ label, description } = notification);
   } else if (claudeEvent) {
     ({ label, description } = claudeEventText(item));
   } else {

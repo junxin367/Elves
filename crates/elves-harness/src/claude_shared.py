@@ -314,7 +314,7 @@ def native_agent_notification(row):
 
 
 def native_task_notification(row):
-    # 用户要求后台命令、监控事件、后台子代理触发的自动续跑显示为“自动继续”，不当成用户消息、不可编辑。
+    # 此处只识别任务回执，不推断续跑；Rust 用原生父消息身份核验是否确实产生了后续模型输出。
     # 只认原生来源（origin.kind=task-notification）且正文完整为 <task-notification> 的记录；用户引用相同 XML 仍是正文。
     # 监控事件没有 status，不能套用子代理通知的状态校验（2.1.323 实测）。
     origin = row.get("origin") or {}
@@ -331,12 +331,18 @@ def native_task_notification(row):
 
     def field(name, limit=400):
         match = re.search(rf"<{name}>([\s\S]*?)</{name}>", content)
-        return html.unescape(match[1]).strip()[:limit] if match else ""
+        if not match:
+            return ""
+        text = html.unescape(match[1])
+        # 原生摘要中的错误按原文回填工具记录，不裁剪空白、换行或长度。
+        return text if limit is None else text.strip()[:limit]
 
     identity = field("task-id")
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", identity):
         return None
-    value = {"taskId": identity, "summary": field("summary")}
+    value = {"taskId": identity, "summary": field("summary", None)}
+    if row.get("shouldQuery") is False or row.get("skip_transcript") is True or row.get("ambient") is True:
+        value["statusOnly"] = True
     status, tool, event = field("status"), field("tool-use-id"), field("event", 2000)
     if re.fullmatch(r"[a-z_]{1,32}", status):
         value["status"] = status

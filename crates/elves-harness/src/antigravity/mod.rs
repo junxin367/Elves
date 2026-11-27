@@ -5,6 +5,7 @@ pub(crate) mod acp;
 pub(crate) mod local_store;
 pub(crate) mod projection;
 pub(crate) mod queue;
+mod task_notices;
 mod transcript_metrics;
 pub(crate) mod usage;
 
@@ -192,6 +193,7 @@ impl Conversation {
             self.edit_history_head = format!("agy-head-{}", self.turns.len());
         } else {
             sync_turn_usage_from_transcript(&mut self.turns, &turns);
+            task_notices::merge_managed(&mut self.turns, &turns);
         }
     }
 
@@ -1820,6 +1822,12 @@ impl Antigravity {
             let turn_id = c.turns[idx]["id"].clone();
             let effect = projection::apply_session_update(&mut c.turns[idx], update, now);
             c.updated_at = now;
+            // ACP 空闲后送来的用量边界仅触发现有的历史刷新，不能用它伪造续跑。只核对本会话仍待收尾的后台命令。
+            if effect.token_usage.is_some() && !c.active() && task_notices::has_unsettled_command(&c.turns[idx], &c.native_id) {
+                c.local_transcript_mtime_ms = 0;
+                c.local_transcript_len = 0;
+                events.push(json!({"method":"remote/resync","params":{"threadId":thread_id}}));
+            }
             if let Some(title) = effect.title_updated
                 && (c.title.is_empty() || c.title == "Antigravity 会话" || c.title == "新会话")
             {
@@ -5266,6 +5274,7 @@ mod tests {
                 r#"{"type":"PLANNER_RESPONSE","step_index":2,"created_at":"1970-01-01T00:00:02Z","model":"gemini-4-neon-xhigh","input_tokens":1200,"cache_read_tokens":9500,"output_tokens":300,"content":"已完成"}"#,
             ]
             .join("\n"),
+            "test",
         );
         assert_eq!(parsed.token_usage["modelContextWindow"], 1_048_576);
         sync_turn_usage_from_transcript(&mut saved_turns, &parsed.turns);

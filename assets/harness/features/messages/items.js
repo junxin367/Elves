@@ -139,7 +139,8 @@ export function renderItem(item, previous, inActivity = false, running = false) 
     // Claude 后台命令：启动即返回，结束状态由原生任务通知写回；“已转入后台”只陈述启动事实，不声称仍在运行。
     const background = item.type === "commandExecution" && typeof item.backgroundStatus === "string" ? item.backgroundStatus : "";
     const backgroundLabel = { running: "已转入后台", completed: "后台已完成", failed: "后台失败",
-      killed: "后台已停止", stopped: "后台已停止", unknown: "后台结果未知" }[background] || "";
+      killed: "后台已停止", stopped: "后台已停止", canceled: "后台已停止", cancelled: "后台已停止",
+      unknown: "后台结果未知" }[background] || "";
     const label = element("strong", "", item.type === "reasoning" ? active ? "正在思考" : unknown || failed || interrupted ? "思考" : "已完成思考"
       : item.type === "commandExecution" ? active && !background ? "正在运行" : backgroundLabel || (unknown || failed || interrupted ? "执行命令" : "已运行") : titles[item.type] || item.type);
     summary.append(!active && !failed && !interrupted && !unknown && ["commandExecution", "fileChange"].includes(item.type)
