@@ -3,6 +3,7 @@
 import { isAndroidContainer } from "../../platform.js";
 import { $, button, element } from "../../ui/dom.js";
 import { notice } from "../../ui/notice.js";
+import { configureModelMenuWidth } from "../../ui/menu-parts.js";
 import { activePopup, closePopup } from "../../ui/popup.js";
 import { selectControl, setSelectOptions } from "../../ui/select.js";
 import { closeComposerMenus, updateComposer } from "../../core/actions.js";
@@ -157,6 +158,7 @@ export async function openPromptOptimizationSettings() {
     modelControl = selectControl("prompt-optimization-model", "优化模型", options, selected);
     // 用户要求“显示”不受候选数量限制；此输入同时用于手填模型，不能在目录很少或为空时隐藏。
     modelControl.searchMode = "on";
+    configureModelMenuWidth(modelControl);
     modelControl.selectSearchPlaceholder = "搜索或输入模型名称";
     modelControl.selectSearchLabel = "搜索或输入优化模型";
     modelControl.selectCustomOption = value => {

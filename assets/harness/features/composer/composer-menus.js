@@ -1,7 +1,10 @@
 // 输入区浮层：模型菜单渲染与新会话所选模型的记忆、浮层与审批区的视口适配，以及统一收起输入区菜单；模型菜单搜索词在 options-state.js。
 
 import { $ } from "../../ui/dom.js";
-import { createMenuEmpty, createMenuGroup, createMenuItem, createMenuSearch, shouldShowMenuSearch } from "../../ui/menu-parts.js";
+import {
+  MODEL_MENU_MAX_WIDTH, MODEL_MENU_MIN_WIDTH, createMenuEmpty, createMenuGroup,
+  createMenuItem, createMenuSearch, shouldShowMenuSearch
+} from "../../ui/menu-parts.js";
 import { activePopup, fitPopup } from "../../ui/popup.js";
 import { menuHorizontalLeft } from "../../ui/position.js";
 import { updateComposer } from "../../core/actions.js";
@@ -133,10 +136,11 @@ export function fitComposerMenu(menu) {
     const above = Math.max(0, box.top - top - gap - padding);
     const below = Math.max(0, top + height - box.bottom - gap - padding);
     const limit = Math.min(560, height * .8, Math.max(above, below));
-    const compact = width <= 760 || window.matchMedia("(pointer:coarse)").matches;
+    const availableWidth = Math.max(0, width - padding * 2);
+    // 用户要求全部模型菜单（含输入区、设置及任务）统一最小宽度 250px、最大 350px，按内容自适应并保留视口两侧 8px 安全边距。
     menu.style.width = "max-content";
-    menu.style.minWidth = `${Math.min(compact ? 220 : 300, width - padding * 2)}px`;
-    menu.style.maxWidth = `${Math.min(compact ? 280 : 350, width - padding * 2)}px`;
+    menu.style.minWidth = `${Math.min(MODEL_MENU_MIN_WIDTH, availableWidth)}px`;
+    menu.style.maxWidth = `${Math.min(MODEL_MENU_MAX_WIDTH, availableWidth)}px`;
     menu.style.maxHeight = `${limit}px`;
     $(".effort-options", menu)?.style.setProperty("max-height", `${Math.max(0, (limit - 80) * .45)}px`);
     const upwards = below < menu.getBoundingClientRect().height && above > below;

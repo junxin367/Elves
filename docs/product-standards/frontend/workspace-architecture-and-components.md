@@ -72,7 +72,7 @@ Elves 与 Harness 共用工作区网页，位于 `assets/harness/`。会话工�
 | --- | --- | --- |
 | `ui/dom.js` | `$`、`element`、`button`、`escape` | DOM 查询与创建 |
 | `ui/icons.js` | `icon` | 内置图标 |
-| `ui/menu-parts.js` | `createMenuSurface`、`createMenuItem`、`createMenuSearch`、`createMenuGroup`、`createMenuDescription`、`createMenuTitle`、`createMenuEmpty`、`createMenuSeparator`、`createMenuButton`、`createMenuHelp`、`shouldShowMenuSearch` | 公共菜单内容及搜索显示判断，不持有业务状态 |
+| `ui/menu-parts.js` | `MODEL_MENU_MIN_WIDTH`、`MODEL_MENU_MAX_WIDTH`、`configureModelMenuWidth`、`createMenuSurface`、`createMenuItem`、`createMenuSearch`、`createMenuGroup`、`createMenuDescription`、`createMenuTitle`、`createMenuEmpty`、`createMenuSeparator`、`createMenuButton`、`createMenuHelp`、`shouldShowMenuSearch` | 公共菜单内容、统一模型菜单宽度配置及搜索显示判断，不持有业务状态 |
 | `ui/popup.js` | `openPopup`、`togglePopup`、`closePopup`、`renderPopup`、`fitPopup`、`activePopup`、`registerAppMenuCloser`、`registerSelectCommitter` | Select 与按钮菜单共用的弹层宿主：定位、搜索、键盘导航、焦点恢复与 dialog 顶层规则 |
 | `ui/select.js` | `selectControl`、`setSelectValue`、`setSelectOptions`、`commitSelectValue`、`createSelectComponent` | 主题化 Select；页面使用默认实例，`createSelectComponent` 保留依赖注入供测试替换 DOM |
 | `ui/dialog.js` | `confirmAction` | 确认对话框，返回 `Promise<boolean>` 并恢复触发前焦点 |
@@ -94,7 +94,7 @@ Elves 与 Harness 共用工作区网页，位于 `assets/harness/`。会话工�
 - `createMenuButton` 对独立按钮的图标与文字整体居中；`createMenuHelp` 提供说明字号的帮助链接。菜单图标统一使用 `.menu-icon`，保留 SVG、图片及彩色 Emoji 的原有图案。
 - `features/appearance/apply.js` 的 `applyAppearance` 是字号计算入口，一次写入 `--menu-font-size`、`--menu-description-font-size`、`--menu-search-font-size`。内容组件只引用计算结果，外观更新沿用现有菜单重定位和各页面同步机制。
 
-`ui/popup.js` 管理弹层生命周期、宿主、键盘与焦点、主列表及子列表，保留 `selectOptions`、`menuOptions` 和专用定位回调。标题、帮助同时存在且设置 `popupHelpAfterTitle` 时，共用单行 `.popup-header`；其他帮助与说明位置按原配置排列。搜索框显隐与弹层宽度分开处理：未指定 `popupWidth` 时，声明 `auto` / `on` 的菜单沿用搜索菜单宽度，避免自动显隐导致宽度跳动。`ui/select.js` 负责选项、值和有效用户变更的单次 `change`；`ui/position.js` 提供通用水平定位。列表重绘按稳定标识恢复有效焦点，并保留选项区阅读位置。
+`ui/popup.js` 管理弹层生命周期、宿主、键盘与焦点、主列表及子列表，保留 `selectOptions`、`menuOptions` 和专用定位回调。标题、帮助同时存在且设置 `popupHelpAfterTitle` 时，共用单行 `.popup-header`；其他帮助与说明位置按原配置排列。搜索框显隐与弹层宽度分开处理：未指定 `popupWidth` 时，声明 `auto` / `on` 的菜单沿用搜索菜单宽度，避免自动显隐导致宽度跳动；开启 `popupAutoWidth` 时按 `popupWidth` 为下限随内容扩展，并支持可选 `popupMaxWidth` 上限（设置与任务中的模型菜单通过 `configureModelMenuWidth` 统一为 `250px～350px`，与输入区模型菜单共用同一常量）。`ui/select.js` 负责选项、值和有效用户变更的单次 `change`；`ui/position.js` 提供通用水平定位。列表重绘按稳定标识恢复有效焦点，并保留选项区阅读位置。
 
 模型菜单继续由 `features/composer/composer-menus.js` 管理搜索条件、模型和思考深度的选择、两组滚动及选择后返回编辑器；Slash 由 `features/composer/skills.js` 管理过滤、键盘活动项、原生命令和 Skill 插入。Slash 的 Skill 列表与底部命令分组分别保留滚动位置，空间不足时命令分组可滚动，不能截断最后的选项。
 

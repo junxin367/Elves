@@ -5,6 +5,7 @@ import { button, element } from "../ui/dom.js";
 import { icon } from "../ui/icons.js";
 import { confirmAction } from "../ui/dialog.js";
 import { notice } from "../ui/notice.js";
+import { configureModelMenuWidth } from "../ui/menu-parts.js";
 import { selectControl, setSelectOptions, setSelectValue } from "../ui/select.js";
 import { api } from "./api.js";
 import {
@@ -137,8 +138,9 @@ export function mountScheduledTasksPage(root) {
 
   const modelSelect = selectControl("scheduled-model", "选择请求模型", [], "",
     "scheduled-select", selected => [element("span", "select-label", selected?.label || "先选择实例")]);
-  // 任务模型与聊天、设置模型使用同一自动搜索门槛，实例与思考深度仍默认关闭。
+  // 任务模型与聊天、设置模型使用同一自动搜索门槛及统一菜单宽度，实例与思考深度仍默认关闭。
   modelSelect.searchMode = "auto";
+  configureModelMenuWidth(modelSelect);
   modelSelect.selectSearchPlaceholder = "搜索模型";
   modelSelect.selectSearchLabel = "搜索请求模型";
   modelSelect.selectAllowEmpty = true;

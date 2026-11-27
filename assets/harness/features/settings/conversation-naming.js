@@ -1,6 +1,7 @@
 // 用户要求所有实例共用一组命名实例与模型；配置由服务保存，页面草稿按授权隔离。
 import { button, element } from "../../ui/dom.js";
 import { icon } from "../../ui/icons.js";
+import { configureModelMenuWidth } from "../../ui/menu-parts.js";
 import { selectControl, setSelectOptions } from "../../ui/select.js";
 import { notice } from "../../ui/notice.js";
 import { confirmAction, openSettingsPrompt } from "../../ui/dialog.js";
@@ -51,7 +52,7 @@ export function mountConversationNaming(page) {
       return [glyph, element("span", "select-label", option?.label || "请选择命名实例"), icon("chevron")];
     });
   const models = selectControl("conversation-naming-model", namingLabels.model, [], "", "instance-settings-select");
-  models.searchMode = "auto"; models.selectSearchPlaceholder = "搜索命名模型";
+  models.searchMode = "auto"; configureModelMenuWidth(models); models.selectSearchPlaceholder = "搜索命名模型";
   const numberControl = (label, min, max) => {
     const input = element("input"); input.type = "number"; input.min = String(min);
     input.max = String(max); input.step = "1"; input.setAttribute("aria-label", label); return input;

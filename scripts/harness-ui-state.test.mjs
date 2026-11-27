@@ -376,9 +376,10 @@ async function instanceOptionUiFixture(settings, extraSettings, backend = "codex
   };
   const icon = name => element("svg", `icon-${name}`);
   const selections = [], saved = [], openedPopups = [];
+  const { configureModelMenuWidth } = await import(new URL("../assets/harness/ui/menu-parts.js", import.meta.url));
   const context = {
     record: { backend, settings, extraSettings, capabilityError }, name: "general", selected: "codex:local",
-    element, button, icon, content: element("div"), controls: new Set(), message: "",
+    element, button, icon, configureModelMenuWidth, content: element("div"), controls: new Set(), message: "",
     inherit: { value: "", label: "使用原生默认" },
     booleanOptions: [{ value: "", label: "使用原生默认" }, { value: "true", label: "开启" }, { value: "false", label: "关闭" }],
     boolValue: value => value == null ? "" : String(value),
@@ -6060,16 +6061,97 @@ test("权限菜单复用公共字号和选中规则，保留顶部说明边界�
   }
 });
 
-test("公共菜单统一采用紧凑行高与内边距，且不影响菜单外页面控件变量", async () => {
+test("公共菜单全端统一采用 32px 行高与 5px 10px 内边距，且不影响菜单外页面控件变量", async () => {
   const css = await readFile(new URL("../assets/harness/style.css", import.meta.url), "utf8");
   assert.match(css, /:root\{[^}]*--control-menu-height:36px/);
   assert.match(css, /@media\(hover:none\),\(pointer:coarse\),\(max-width:760px\)\{:root\{[^}]*--control-menu-height:44px/);
-  assert.match(css, /:root\{[^}]*--menu-padding:4px;--menu-item-height:32px;--menu-item-padding-block:6px;--menu-item-padding-inline:10px/);
-  assert.match(css, /@media\(hover:none\),\(pointer:coarse\),\(max-width:760px\)\{:root\{--menu-item-height:36px\}\}/);
+  assert.match(css, /:root\{[^}]*--menu-padding:4px;--menu-item-height:32px;--menu-item-padding-block:5px;--menu-item-padding-inline:10px/);
+  assert.doesNotMatch(css, /--menu-item-height:36px/, "窄屏与触屏不再将公共菜单行高撑高到 36px");
   assert.match(css, /\.menu-item\{[^}]*min-height:var\(--menu-item-height\);padding:var\(--menu-item-padding-block\) var\(--menu-item-padding-inline\)/);
   assert.match(css, /\.menu-button\{[^}]*min-height:var\(--menu-item-height\)/);
   assert.match(css, /\.popup-header>\.popup-help\{[^}]*min-height:var\(--menu-item-height\)/);
   assert.match(css, /\.menu-search\{[^}]*padding:var\(--menu-item-padding-block\) 8px;min-height:32px/);
+});
+
+test("聊天、设置及定时任务的模型菜单统一最小宽度 250px 与 350px 自适应上限", async () => {
+  const menuParts = await import(new URL("../assets/harness/ui/menu-parts.js", import.meta.url));
+  assert.equal(menuParts.MODEL_MENU_MIN_WIDTH, 250);
+  assert.equal(menuParts.MODEL_MENU_MAX_WIDTH, 350);
+
+  // 1) 输入区模型菜单（桌面、手机与极窄视口）
+  const runFitComposer = viewportWidth => {
+    const effort = { style: { setProperty() {} } };
+    const menu = {
+      id: "model-settings", hidden: false, style: {}, dataset: {},
+      getBoundingClientRect: () => ({ width: 250, height: 260 }),
+    };
+    const anchor = { getBoundingClientRect: () => ({ top: 400, bottom: 432, left: 20, right: 120, width: 100, height: 32 }) };
+    const context = vm.createContext({
+      MODEL_MENU_MIN_WIDTH: menuParts.MODEL_MENU_MIN_WIDTH,
+      MODEL_MENU_MAX_WIDTH: menuParts.MODEL_MENU_MAX_WIDTH,
+      $: (selector, root) => selector === "#model-button" ? anchor : selector === ".effort-options" && root === menu ? effort : null,
+      menuHorizontalLeft: () => 20,
+      window: { innerWidth: viewportWidth, innerHeight: 800, visualViewport: null },
+    });
+    vm.runInContext(sourceSection("function fitComposerMenu(", "function fitApprovalArea("), context);
+    context.fitComposerMenu(menu);
+    return menu.style;
+  };
+  for (const vw of [1280, 390]) {
+    const style = runFitComposer(vw);
+    assert.equal(style.width, "max-content", `vw=${vw} 应按内容自适应`);
+    assert.equal(style.minWidth, "250px", `vw=${vw} 模型菜单最小宽度应为 250px`);
+    assert.equal(style.maxWidth, "350px", `vw=${vw} 模型菜单最大宽度应为 350px`);
+  }
+  const narrowStyle = runFitComposer(240);
+  assert.equal(narrowStyle.minWidth, "224px", "极窄视口须保留两侧各 8px 安全边距");
+  assert.equal(narrowStyle.maxWidth, "224px");
+
+  // 2) 公共 Popup（设置/定时任务模型菜单使用 configureModelMenuWidth）
+  const runFitPopup = (triggerConfig, viewportWidth) => {
+    const node = { style: {}, dataset: {}, getBoundingClientRect: () => ({ width: 250, height: 200 }) };
+    const trigger = {
+      isConnected: true, hidden: false, disabled: false,
+      closest: () => null,
+      getBoundingClientRect: () => ({ top: 100, bottom: 136, left: 40, right: 280, width: 240, height: 36 }),
+      ...triggerConfig,
+    };
+    const context = vm.createContext({
+      activePopup: { node, trigger, position: null, submenu: null },
+      closePopup() {},
+      fitPopupSubmenu() {},
+      menuHorizontalLeft: () => 40,
+      window: { innerWidth: viewportWidth, innerHeight: 800, visualViewport: null },
+    });
+    vm.runInContext(sourceSection("function fitPopup(", "function closePopupSubmenu("), context);
+    context.fitPopup();
+    return node.style;
+  };
+  const modelTrigger = menuParts.configureModelMenuWidth({ searchMode: "auto" });
+  const popupDesktop = runFitPopup(modelTrigger, 1280);
+  assert.equal(popupDesktop.width, "max-content");
+  assert.equal(popupDesktop.minWidth, "250px");
+  assert.equal(popupDesktop.maxWidth, "350px");
+  const popupUltraNarrow = runFitPopup(modelTrigger, 240);
+  assert.equal(popupUltraNarrow.minWidth, "224px");
+  assert.equal(popupUltraNarrow.maxWidth, "224px");
+  // 未设 popupMaxWidth 的自适应菜单（如会话类型）仍保持原视口可用上限
+  const backendPopup = runFitPopup({ popupWidth: 200, popupAutoWidth: true }, 1280);
+  assert.equal(backendPopup.minWidth, "200px");
+  assert.equal(backendPopup.maxWidth, "1264px");
+
+  // 3) 核对设置与定时任务全部 5 处模型菜单均已接入统一宽度配置
+  const [instanceSettings, naming, promptOpt, scheduledTasks] = await Promise.all([
+    readFile(new URL("../assets/harness/features/settings/instance-settings.js", import.meta.url), "utf8"),
+    readFile(new URL("../assets/harness/features/settings/conversation-naming.js", import.meta.url), "utf8"),
+    readFile(new URL("../assets/harness/features/composer/prompt-optimization.js", import.meta.url), "utf8"),
+    readFile(new URL("../assets/harness/features/scheduled-tasks.js", import.meta.url), "utf8"),
+  ]);
+  assert.match(instanceSettings, /configureModelMenuWidth\(visibilityTrigger\)/);
+  assert.match(instanceSettings, /configureModelMenuWidth\(modelSelect\)/);
+  assert.match(naming, /configureModelMenuWidth\(models\)/);
+  assert.match(promptOpt, /configureModelMenuWidth\(modelControl\)/);
+  assert.match(scheduledTasks, /configureModelMenuWidth\(modelSelect\)/);
 });
 
 test("Claude 权限待生效时说明实际权限和原因，不阻断消息或继续选择", () => {

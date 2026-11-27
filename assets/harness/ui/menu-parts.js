@@ -3,6 +3,18 @@
 import { button, element } from "./dom.js";
 import { icon } from "./icons.js";
 
+// 用户要求聊天输入区、设置及定时任务中的全部模型菜单统一最小宽度 250px，按内容自适应且不超过 350px；
+// 窄视口仍由定位逻辑按视口宽度减两侧各 8px 安全边距收窄。
+export const MODEL_MENU_MIN_WIDTH = 250;
+export const MODEL_MENU_MAX_WIDTH = 350;
+
+export function configureModelMenuWidth(trigger) {
+  trigger.popupWidth = MODEL_MENU_MIN_WIDTH;
+  trigger.popupMaxWidth = MODEL_MENU_MAX_WIDTH;
+  trigger.popupAutoWidth = true;
+  return trigger;
+}
+
 export function createMenuSurface(className = "") {
   return element("div", `ui-menu ${className}`.trim());
 }

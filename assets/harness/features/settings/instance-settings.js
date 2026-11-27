@@ -2,6 +2,7 @@
 import { button, element } from "../../ui/dom.js";
 import { openSettingsPrompt } from "../../ui/dialog.js";
 import { icon } from "../../ui/icons.js";
+import { configureModelMenuWidth } from "../../ui/menu-parts.js";
 import { selectControl, setSelectOptions } from "../../ui/select.js";
 import { activePopup, closePopup, openPopup, renderPopup, togglePopup } from "../../ui/popup.js";
 import { connected, session } from "../../core/state.js";
@@ -145,6 +146,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
   visibilityTrigger.setAttribute("aria-haspopup", "menu");
   visibilityTrigger.setAttribute("aria-expanded", "false");
   visibilityTrigger.searchMode = "auto";
+  configureModelMenuWidth(visibilityTrigger);
   visibilityTrigger.selectSearchLabel = "搜索模型";
   visibilityTrigger.selectSearchPlaceholder = "搜索模型";
   visibilityTrigger.popupEmptyText = "尚未取得当前实例的完整模型目录";
@@ -570,6 +572,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
         );
         modelSelect.classList.add("instance-setting-compaction-model-select");
         modelSelect.searchMode = "auto";
+        configureModelMenuWidth(modelSelect);
         modelSelect.selectSearchLabel = "搜索手动压缩模型";
         modelSelect.selectSearchPlaceholder = "搜索手动压缩模型";
         controls.add(modeTrigger);

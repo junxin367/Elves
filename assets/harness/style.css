@@ -783,9 +783,9 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .ui-popup[popover]:not(:popover-open){display:none}
 /* 用户确认九类弹出菜单共用更紧凑的尺寸与字号；常驻分组菜单、额度、用量及取色器不接入 ui-menu。
  * 默认字号对应界面 14px；实际整数结果由 appearance/apply.js 按 92.86% / 78.57% / 85.71% 四舍五入写入。
- * 菜单行使用独立变量 --menu-item-height（桌面 32px，触屏及窄屏 36px）与 6px 10px 内边距，避免改动 --control-menu-height 影响菜单外按钮；大字号与多行说明仍允许自然撑高。 */
-:root{--menu-font-size:13px;--menu-description-font-size:11px;--menu-search-font-size:12px;--menu-padding:4px;--menu-item-height:32px;--menu-item-padding-block:6px;--menu-item-padding-inline:10px;--menu-item-gap:8px;--menu-label-gap:4px;--menu-shadow:0 8px 28px #0002}
-@media(hover:none),(pointer:coarse),(max-width:760px){:root{--menu-item-height:36px}}
+ * 菜单行使用独立变量 --menu-item-height（桌面、窄窗与触屏统一 32px，满足 32×32px 触摸底线）与 5px 10px 内边距，
+ * 避免改动 --control-menu-height 影响菜单外按钮；大字号与多行说明仍允许自然撑高。 */
+:root{--menu-font-size:13px;--menu-description-font-size:11px;--menu-search-font-size:12px;--menu-padding:4px;--menu-item-height:32px;--menu-item-padding-block:5px;--menu-item-padding-inline:10px;--menu-item-gap:8px;--menu-label-gap:4px;--menu-shadow:0 8px 28px #0002}
 .ui-menu{padding:var(--menu-padding);background:var(--control-bg,var(--side));color:var(--text);border:1px solid var(--line);border-radius:var(--radius-popup);box-shadow:var(--menu-shadow);font-family:var(--ui-font-family);font-size:var(--menu-font-size);font-weight:var(--ui-font-weight,400);line-height:1.4;z-index:var(--layer-menu)}
 .menu-group{min-width:0}
 .menu-item{display:flex;align-items:center;gap:var(--menu-item-gap);width:100%;min-width:0;min-height:var(--menu-item-height);padding:var(--menu-item-padding-block) var(--menu-item-padding-inline);border:0;border-radius:var(--radius-control);background:transparent;color:var(--text);font-family:var(--ui-font-family);font-size:var(--menu-font-size);font-weight:var(--ui-font-weight,400);line-height:1.4;text-align:left;cursor:pointer}

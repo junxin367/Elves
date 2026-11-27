@@ -270,14 +270,19 @@ export function fitPopup() {
   const availableAbove = Math.max(0, originTop - (position ? 0 : gap) - top - padding);
   // 宽度按业务声明的搜索能力保持稳定，不随自动模式的输入框显隐反复跳动。
   const preferredWidth = trigger.popupWidth || (["auto", "on"].includes(trigger.searchMode) ? 300 : 200);
+  const availableWidth = Math.max(0, width - padding * 2);
   const maxHeight = Math.min(trigger.popupMaxHeight || 360, height * .8);
   if (trigger.popupAutoWidth) {
-    // 用户要求类型菜单以旧宽度为下限、随内容自适应；窄屏仍保留两侧各 8px，不改变其他菜单的宽度规则。
+    // 自适应菜单以配置下限随内容扩展，窄屏保留两侧各 8px；模型类菜单另设 popupMaxWidth（350px）与输入区模型菜单统一上限。
+    const minWidth = Math.min(preferredWidth, availableWidth);
+    const maxWidth = trigger.popupMaxWidth
+      ? Math.min(Math.max(trigger.popupMaxWidth, minWidth), availableWidth)
+      : availableWidth;
     node.style.width = "max-content";
-    node.style.minWidth = `${Math.min(preferredWidth, width - padding * 2)}px`;
-    node.style.maxWidth = `${width - padding * 2}px`;
+    node.style.minWidth = `${minWidth}px`;
+    node.style.maxWidth = `${maxWidth}px`;
   } else {
-    node.style.width = `${Math.min(Math.max(box.width, preferredWidth), width - padding * 2)}px`;
+    node.style.width = `${Math.min(Math.max(box.width, preferredWidth), availableWidth)}px`;
   }
   node.style.maxHeight = `${Math.min(maxHeight, Math.max(availableAbove, availableBelow))}px`;
   const menuHeight = node.getBoundingClientRect().height;
