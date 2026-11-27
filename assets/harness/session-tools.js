@@ -387,8 +387,6 @@ export function mountSessionTools(options) {
       // 用户要求侧边正文文件打开在外层同级标签，保留原 iframe、输入草稿和阅读位置。
       if (ownsTab() && desktop() && context.active === key)
         openTab({ kind: "file", path, line, sourceThreadId: item.threadId });
-    }, () => {
-      if (ownsTab() && desktop() && context.active === key) hidePanel();
     }, threadId => {
       // 隐藏标签的 iframe 也会确认已读，只要标签还保留就同步外层菜单和侧栏。
       if (retainsTab()) options.onSideThreadRead?.(threadId);
@@ -528,7 +526,12 @@ export function mountSessionTools(options) {
     else if (event.key === "Delete") { event.preventDefault(); closeTab(records[index].key); }
   });
   dock.addEventListener("keydown", event => {
-    if (event.key !== "Escape" || event.isComposing || document.querySelector("dialog[open]")) return;
+    if (event.key !== "Escape" || event.defaultPrevented || event.isComposing || document.querySelector("dialog[open]")) return;
+    // 用户取消会话标签的 Esc 收起；标签栏聚焦时也保持原页面，并阻止冒泡误操作主会话。
+    if (["side", "subagent"].includes(currentContext?.tabs.get(currentContext.active)?.item.kind)) {
+      event.stopPropagation();
+      return;
+    }
     event.preventDefault(); event.stopPropagation(); hidePanel();
   });
   const observer = typeof ResizeObserver === "function" ? new ResizeObserver(() => {
@@ -586,7 +589,7 @@ function mountWorkspaceSideCreation(workspace) {
 }
 
 function mountWorkspaceSideThread(workspace, item, createSideThread, updateThreadState, openMediaPreview, openFile,
-  requestHidePanel, onThreadRead) {
+  onThreadRead) {
   // 每个侧边会话/子智能体使用独立页面上下文，隔离输入、选中会话、滚动和实时连接，不能借用主聊天的全局发送状态。
   // 子智能体沿用原生读取返回的只读身份，不创建会话副本或开放发送。
   // 专用入口仅允许同源嵌入，不修改普通首页的禁止嵌入策略；关闭标签只卸载页面，不关闭服务端会话。
@@ -637,8 +640,6 @@ function mountWorkspaceSideThread(workspace, item, createSideThread, updateThrea
       openFile?.(event.data.path, event.data.line);
     }
     else if (visible && event.data?.type === "codex-elves-create-side-thread") createSideThread?.();
-    else if (visible && event.data?.type === "codex-elves-hide-side-panel"
-        && event.data.threadId === item.threadId) requestHidePanel?.();
     else if (visible && event.data?.type === "codex-elves-workspace-media-preview"
         && ["image", "video"].includes(event.data.kind) && typeof event.data.source === "string"
         && typeof event.data.name === "string"

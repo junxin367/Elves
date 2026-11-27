@@ -3336,7 +3336,7 @@ test("全局 Escape 只在 computer-use 活跃时发送 turn interrupt", () => {
     activePopup: null, contextUsageTip: null, claudeUsageState: null, queueDrag: null,
     closeComposerMenus() {}, closeContextUsageTip() {}, closeClaudeUsageTip() {},
     closePopup() {}, closeMobileSidebar() {}, handleSideThreadShortcut: () => false,
-    workspaceSidePanel: false, requestSidePanelClose: () => false,
+    workspaceSidePanel: false, requestSidePanelClose: () => assert.fail("侧边 Esc 不得请求关闭面板"),
     relatedSessionView: null, sideCreationView: null,
     isComputerUseActive: () => context.computerUse,
     stopGeneration: () => { stops.push(true); return Promise.resolve(); },
@@ -3347,7 +3347,7 @@ test("全局 Escape 只在 computer-use 活跃时发送 turn interrupt", () => {
   context.installGlobalInputHandlers();
   const pressEscape = () => {
     const event = { key: "Escape", isComposing: false, defaultPrevented: false,
-      preventDefault() { this.defaultPrevented = true; } };
+      preventDefault() { this.defaultPrevented = true; }, stopPropagation() {} };
     listeners.get("keydown")(event);
     return event;
   };
@@ -3356,6 +3356,24 @@ test("全局 Escape 只在 computer-use 活跃时发送 turn interrupt", () => {
   context.computerUse = false;
   assert.equal(pressEscape().defaultPrevented, false);
   assert.equal(stops.length, 1);
+  let returned = 0, popupClosed = 0;
+  context.workspaceSidePanel = true;
+  context.relatedSessionView = { kind: "side", threadId: "side-a" };
+  context.returnToParentSession = async () => returned++;
+  assert.equal(pressEscape().defaultPrevented, false, "侧边 Esc 不拦截默认操作，也不关闭或返回");
+  assert.equal(returned, 0);
+  assert.equal(stops.length, 1);
+  context.activePopup = {};
+  context.closePopup = () => { popupClosed++; context.activePopup = null; };
+  assert.equal(pressEscape().defaultPrevented, true);
+  assert.equal(popupClosed, 1, "侧边菜单仍优先响应 Esc");
+  context.document.querySelector = () => ({ open: true });
+  assert.equal(pressEscape().defaultPrevented, false, "弹窗原生 Escape 取消不能被侧边标签阻止");
+  assert.equal(returned, 0);
+  context.document.querySelector = () => null;
+  context.workspaceSidePanel = false;
+  assert.equal(pressEscape().defaultPrevented, true);
+  assert.equal(returned, 1, "手机整页关联会话的返回行为保持");
 });
 
 test("会话菜单分离子智能体读取和侧边写入，并按连接代次退役旧请求", () => {
@@ -13753,10 +13771,7 @@ test("侧边页面只接受同源父页面的显隐和聚焦请求，只聚焦�
   context.installSidePanelMessageListener();
   const listener = handlers.get("message"), data = { type: "codex-elves-side-panel-visibility", visible: true };
   const focus = { type: "codex-elves-side-panel-focus", threadId: "side-a" };
-  assert.equal(context.requestSidePanelClose(), true);
-  assert.equal(messages.at(-1)[0].type, "codex-elves-hide-side-panel");
-  assert.equal(messages.at(-1)[0].threadId, "side-a");
-  assert.equal(messages.at(-1)[1], context.location.origin);
+  assert.equal(messages.length, 0);
   listener({ source: parent, origin: context.location.origin, data: focus });
   assert.equal(focused.length, 0, "不可见时不能索取输入焦点");
   listener({ source: {}, origin: context.location.origin, data });

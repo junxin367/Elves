@@ -21,7 +21,7 @@ import {
 } from "./session/related.js";
 import { isComputerUseActive } from "./session/capabilities.js";
 import { closeMobileSidebar } from "./shell-state.js";
-import { requestSidePanelClose, workspaceSidePanel } from "./session/side-panel.js";
+import { workspaceSidePanel } from "./session/side-panel.js";
 
 // 点击、焦点切换与键盘输入时收起弹层和提示，并处理 Tab 输入模式与 Esc 分层关闭。
 export function installGlobalInputHandlers() {
@@ -61,10 +61,8 @@ export function installGlobalInputHandlers() {
         event.preventDefault(); closeMobileSidebar();
         return;
       }
-      if (workspaceSidePanel && requestSidePanelClose()) {
-        event.preventDefault();
-        return;
-      }
+      // 用户要求侧边会话标签不再响应 Esc 关闭/隐藏，也不能在 iframe 内返回主会话；菜单关闭和弹窗原生取消保持原样。
+      if (workspaceSidePanel) return;
       if (!event.defaultPrevented && !relatedSessionView && isComputerUseActive()
           && !document.querySelector("dialog[open]")) {
         // Codex App 的 Escape 会中断当前 computer-use 轮次；已有 stop action 会发送 turn/interrupt，

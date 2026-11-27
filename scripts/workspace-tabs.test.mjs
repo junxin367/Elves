@@ -586,7 +586,7 @@ test("侧边标签向独立页面同步显示状态，隐藏标签不会继续�
   assert.equal(frame.events.has("load"), false);
 });
 
-test("侧边 iframe 的 Escape 请求只隐藏外层面板，不在 iframe 内切回主会话", () => {
+test("侧边 iframe 的旧 Escape 请求不再隐藏面板或关闭标签，手动开关仍可使用", () => {
   const h = harness();
   h.api.openSideThread({ id: "side-a", title: "侧边 A" });
   const frame = h.views.children[0].children[0];
@@ -601,12 +601,35 @@ test("侧边 iframe 的 Escape 请求只隐藏外层面板，不在 iframe 内�
   h.message({ ...event, data: { ...event.data, threadId: "side-b" } });
   assert.equal(h.dock.hidden, false);
   h.message(event);
-  assert.equal(h.dock.hidden, true);
-  assert.equal(h.state.threadId, "thread-a", "关闭侧边标签不能在 iframe 内切换到主会话");
-  assert.equal(frame.isConnected, true, "隐藏面板必须保留侧边 iframe 和草稿");
+  assert.equal(h.dock.hidden, false, "旧页面的 Esc 消息不能再隐藏标签面板");
+  assert.equal(h.state.threadId, "thread-a", "Esc 不能在 iframe 内切换到主会话");
+  assert.equal(frame.isConnected, true, "Esc 保留侧边 iframe 和草稿");
+  h.toggle.emit("click");
+  assert.equal(h.dock.hidden, true, "主动点击开关仍可隐藏面板");
   h.toggle.emit("click");
   assert.equal(h.dock.hidden, false);
   assert.equal(h.views.children[0].children[0], frame);
+  h.api.dispose();
+});
+
+test("会话标签栏和面板内按 Escape 保持展开，文件标签仍沿用原快捷键", () => {
+  const h = harness();
+  for (const open of [
+    () => h.api.openSideThread({ id: "side-a", title: "侧边 A" }),
+    () => h.api.openSubagent({ id: "agent-a", name: "子智能体 A" })
+  ]) {
+    open();
+    const selected = h.selected(), frame = h.visibleViews()[0].children[0];
+    const escape = h.dock.emit("keydown", { key: "Escape", target: selected.children[0],
+      stopPropagation() { this.stopped = true; } });
+    assert.equal(h.dock.hidden, false);
+    assert.equal(h.selected(), selected);
+    assert.equal(frame.isConnected, true);
+    assert.equal(escape.stopped, true, "外层 Esc 不再冒泡影响主会话");
+  }
+  h.api.openFile("readme.md");
+  h.dock.emit("keydown", { key: "Escape" });
+  assert.equal(h.dock.hidden, true, "文件标签原有 Esc 隐藏行为保持");
   h.api.dispose();
 });
 
