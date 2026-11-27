@@ -308,7 +308,7 @@ export function mountSessionTools(options) {
     const side = threadTab || item.kind === "side-creation";
     const label = side ? item.title : item.kind === "changes" ? "变更" : item.kind === "files" ? "打开文件"
       : `${displayWorkspaceName((item.path || item.file.path).split(/[\\/]/).at(-1))}${item.kind === "change" ? " · 变更" : ""}`;
-    const title = item.kind === "change" ? `${sections.find(([name]) => name === item.file.section)?.[1] || "变更"}：${displayedPath(item.file)}`
+    let title = item.kind === "change" ? `${sections.find(([name]) => name === item.file.section)?.[1] || "变更"}：${displayedPath(item.file)}`
       : item.path ? displayWorkspacePath(item.path) : label;
     const tab = node("div", "workspace-reader-tab");
     tab.setAttribute("role", "presentation");
@@ -328,6 +328,7 @@ export function mountSessionTools(options) {
         : '<path d="M11.5 2.5H5a1 1 0 0 0-1 1v13a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V7z"/><path d="M11 2.5V7h5"/>'}</svg>`;
     symbol.setAttribute("aria-hidden", "true");
     let threadRunning = false, threadUnread = false;
+    const observedTitles = new Map([["iframe", title], ["related", title]]);
     const updateThreadState = state => {
       if (typeof state.running === "boolean") threadRunning = state.running;
       if (typeof state.unread === "boolean") threadUnread = state.unread;
@@ -339,7 +340,8 @@ export function mountSessionTools(options) {
       button.setAttribute("aria-label", button.title);
     };
     if (threadTab) updateThreadState({ running: item.running === true, unread: item.unread === true });
-    button.append(symbol, node("span", "workspace-reader-tab-label", label));
+    const labelNode = node("span", "workspace-reader-tab-label", label);
+    button.append(symbol, labelNode);
     const remove = control("×", `关闭${label}`, () => { if (ownsTab()) closeTab(key); }, "workspace-reader-tab-close");
     tab.append(button, remove);
     const view = node("section", "workspace-reader-view");
@@ -371,7 +373,11 @@ export function mountSessionTools(options) {
       // 仅可写侧边 iframe 的快捷键可从当前主会话创建；子智能体复用标签不能获得新建会话写入能力。
       if (item.kind === "side" && ownsTab() && desktop() && context.active === key) options.createSideThread?.();
     }, state => {
-      if (retainsTab()) updateThreadState(state);
+      if (!retainsTab()) return;
+      // 用户要求侧边确认关闭后移除对应标签；后台标签也释放，保留其他会话、文件及当前焦点。
+      if (item.kind === "side" && state.closed === true) { closeTab(key, false, context); return; }
+      record.updateTitle(state.title, "iframe");
+      updateThreadState(state);
     }, (trigger, resource) => {
       if (!ownsTab() || !desktop() || context.active !== key) return;
       return resource.kind === "video"
@@ -391,7 +397,24 @@ export function mountSessionTools(options) {
       : item.kind === "changes" || item.kind === "change"
       ? mountSessionToolPages({ ...rendererOptions, cache: item.kind === "changes" ? options.cache : null })
       : mountSessionFiles(rendererOptions);
-    const record = { key, item, tab, button, view, renderer };
+    const record = { key, item, tab, button, view, renderer,
+      updateTitle(value, source) {
+        if (item.kind !== "side" || !retainsTab() || typeof value !== "string") return false;
+        const next = value.trim();
+        if (!next || Array.from(next).length > 200) return false;
+        if (observedTitles.has(source)) {
+          // 只同步该来源自身变化的名称；重复的 iframe 状态或菜单缓存不能回退另一来源已确认的新名称。
+          if (observedTitles.get(source) === next) return false;
+          observedTitles.set(source, next);
+        }
+        if (next === title) return false;
+        // 命名只更新原标签及其辅助说明，不重建 iframe，保留侧边草稿、阅读位置和执行/未读标记。
+        title = item.title = next; labelNode.textContent = next;
+        remove.title = `关闭${next}`; remove.setAttribute("aria-label", remove.title);
+        renderer.updateTitle?.(next);
+        updateThreadState({});
+        return true;
+      } };
     tabs.set(key, record); selectTab(record);
     if (side) {
       renderer.open();
@@ -518,12 +541,23 @@ export function mountSessionTools(options) {
   updateContext();
   return {
     open, openFile, openSideThread, openSubagent, openSideCreation, updateContext,
+    updateThreadTitle(threadId, title, source) {
+      if (disposed || authorizationKey !== authorizationIdentity()) return false;
+      let changed = false;
+      for (const context of contexts.values()) {
+        if (authorizationIdentity(context.value) !== authorizationKey) continue;
+        changed = context.tabs.get(tabKey({ kind: "side", threadId }))?.updateTitle(title, source) || changed;
+      }
+      return changed;
+    },
     closeThread(threadId, kind = "side", parentThreadId = getContext()?.threadId) {
       if (disposed || authorizationKey !== authorizationIdentity()) return;
       // 关闭回执可能在用户切换主会话后到达，只释放原所属主会话的标签，不能借用当前上下文。
+      // 原生确认关闭传 null，按会话 ID 清理当前授权下所有保留标签，不依赖菜单是否已登记父关联。
       for (const context of contexts.values())
-        if (context.value.threadId === parentThreadId && authorizationIdentity(context.value) === authorizationKey)
-          closeTab(tabKey({ kind, threadId }), context === currentContext, context);
+        if ((parentThreadId === null || context.value.threadId === parentThreadId)
+            && authorizationIdentity(context.value) === authorizationKey)
+          closeTab(tabKey({ kind, threadId }), parentThreadId !== null && context === currentContext, context);
     },
     close: () => desktop() ? hidePanel() : mobile?.close(),
     dispose() {
@@ -582,8 +616,11 @@ function mountWorkspaceSideThread(workspace, item, createSideThread, updateThrea
     if (event.source !== frame.contentWindow || event.origin !== address.origin) return;
     if (event.data?.type === "codex-elves-side-panel-state" && event.data.threadId === item.threadId
         && typeof event.data.running === "boolean"
-        && (event.data.unread === undefined || typeof event.data.unread === "boolean")) {
+        && (event.data.unread === undefined || typeof event.data.unread === "boolean")
+        && (event.data.title === undefined || typeof event.data.title === "string")
+        && (event.data.closed === undefined || typeof event.data.closed === "boolean")) {
       updateThreadState?.(event.data);
+      if (event.data.closed === true) return;
       composerReady = event.data.composerReady === true;
       transferFocus();
     }
@@ -616,6 +653,7 @@ function mountWorkspaceSideThread(workspace, item, createSideThread, updateThrea
   workspace.append(frame);
   return {
     open() {},
+    updateTitle(title) { frame.title = title; },
     focusComposer() {
       if (!visible || item.kind !== "side") return;
       // 新 iframe 等输入框可写再转移焦点；等待期间用户在主页面继续操作即取消这一次请求。

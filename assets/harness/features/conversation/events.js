@@ -50,6 +50,7 @@ import { stream, withRecoveryErrorSilence } from "../session/connection-state.js
 import { refreshConnectedSession, setConnection } from "../session/connection.js";
 import { relatedMenuTimer, relatedSessionView, setRelatedMenuTimer } from "../session/related-state.js";
 import { retireNativeSideThreads } from "../session/related.js";
+import { syncWorkspaceSidePanelState } from "../session/side-panel.js";
 import { currentThreadDisplay, readScope, threadDisplayKey, threadDisplays } from "../session/thread-cache.js";
 import {
   applySidebarThreadOutcome, applySidebarThreadReadState, applySidebarThreadStarted, applySidebarThreadTitle,
@@ -57,7 +58,7 @@ import {
   sidebarReadRefreshSuppressions
 } from "../sidebar/list-state.js";
 import { rememberBackgroundThreadDisplay, rememberThreadDisplay, renderOutcomeMarker } from "../session/thread-display.js";
-import { sessionMenu } from "../shell-state.js";
+import { sessionMenu, sessionTools } from "../shell-state.js";
 import { threadDeleted } from "../sidebar/deletion-state.js";
 import { applyThreadDeletion } from "../sidebar/thread-deletion.js";
 
@@ -291,6 +292,7 @@ export function receive(event) {
   }
   if (event.method === "thread/name/updated" && typeof eventThreadId === "string"
       && typeof params.name === "string") {
+    sessionTools?.updateThreadTitle?.(eventThreadId, params.name);
     sidebarChanged = applySidebarThreadTitle(eventThreadId, params.name) || sidebarChanged;
     if (eventThreadId === selectedId && thread) {
       thread.title = params.name;
@@ -298,6 +300,7 @@ export function receive(event) {
       if (title) title.textContent = thread.viewKind === "subagent"
         ? thread.agentName || params.name : params.name;
       rememberThreadDisplay({ id: eventThreadId, title: params.name });
+      syncWorkspaceSidePanelState();
     }
   }
   if (["thread/readState/updated", "thread/readState/changed"].includes(event.method)

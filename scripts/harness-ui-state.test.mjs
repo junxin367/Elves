@@ -13412,6 +13412,74 @@ test("侧边关联读取不完整时保留持久标签，完整列表才确认�
   assert.ok(retired.includes("saved"));
 });
 
+test("关联列表和名称事件同步侧边标签标题，不依赖当前选中的会话", () => {
+  const h = sideCreationNavigationHarness(), c = h.context, titles = [], panelUpdates = [];
+  c.sessionTools = { updateThreadTitle: (...values) => titles.push(values) };
+  c.discardPersistentThreadDisplay = () => {};
+  c.retireNativeSideThreads = async () => {};
+  vm.runInContext(sourceSection("function adoptRelatedMenu(", "async function retireNativeSideThreads("), c);
+  c.adoptRelatedMenu({ threadId: "main", subagents: [], sideThreads: [
+    { id: "side-a", title: "列表中的新名称", ephemeral: true }
+  ] });
+  assert.deepEqual(titles, [["side-a", "列表中的新名称", "related"]]);
+  c.applySidebarThreadTitle = () => false;
+  c.syncWorkspaceSidePanelState = () => panelUpdates.push(true);
+  c.document.getElementById = () => null;
+  vm.runInContext(`function receiveTitle(event) {
+    const params = event.params, eventThreadId = params.threadId; let sidebarChanged = false;
+    ${sourceSection('  if (event.method === "thread/name/updated"', '  if (["thread/readState/updated",')}
+  }`, c);
+  c.receiveTitle({ method: "thread/name/updated", params: { threadId: "side-a", name: "命名事件的新名称" } });
+  assert.deepEqual(titles.at(-1), ["side-a", "命名事件的新名称"]);
+  assert.equal(c.selectedId, "main");
+  c.selectedId = "side-a"; c.thread = { id: "side-a", viewKind: "side", title: "旧名称" };
+  c.receiveTitle({ method: "thread/name/updated", params: { threadId: "side-a", name: "当前侧边新名称" } });
+  assert.equal(c.thread.title, "当前侧边新名称");
+  assert.equal(panelUpdates.length, 1, "名称变化立即通知外层，不能等待运行状态变化");
+});
+
+test("临时侧边关闭回执确认后清理对应标签，未确认关闭时保留", async () => {
+  const h = sideCreationNavigationHarness(), c = h.context, closed = [];
+  c.sessionTools = { closeThread: (...values) => closed.push(values) };
+  c.sessionMenu.removeThread = () => {};
+  c.transcriptCache = { remove() {} }; c.threadDisplays = new Map();
+  c.threadDisplayKey = id => id; c.discardPersistentThreadDisplay = () => {};
+  c.syncSideThreadUnread = () => {};
+  vm.runInContext(sourceSection("async function retireNativeSideThreads(", "async function openRelatedThread("), c);
+  const record = { id: "close-temporary", action: "closeSideThread", parentThreadId: "main",
+    threadId: "temporary-side", scope: c.privateInputScope(c.session) };
+  c.relatedThreadOperations.set(c.relatedOperationKey(record), record);
+  c.selectedId = "other";
+  await assert.rejects(c.finishRelatedOperation(record, { ok: true, threadId: record.threadId,
+    parentThreadId: "main", closed: false }), /回执内容无效/);
+  assert.equal(closed.length, 0);
+  await c.finishRelatedOperation(record, { ok: true, threadId: record.threadId,
+    parentThreadId: "main", closed: true, ephemeral: true });
+  assert.deepEqual(closed, [["temporary-side", "side", null]]);
+  assert.equal(c.selectedId, "other");
+});
+
+test("嵌入侧边收到确认关闭后通知外层，不把主会话导航进原标签", async () => {
+  const h = sideCreationNavigationHarness(), c = h.context, sent = [];
+  let returned = 0;
+  c.selectedId = "temporary-side"; c.workspaceSidePanel = true;
+  c.relatedSessionView = { threadId: c.selectedId, kind: "side", parentThreadId: "main",
+    ephemeral: true, scope: c.privateInputScope(c.session) };
+  c.thread = { id: c.selectedId, viewKind: "side" };
+  c.sessionMenu.removeThread = () => {};
+  c.transcriptCache = { remove() {} }; c.threadDisplays = new Map();
+  c.threadDisplayKey = id => id; c.discardPersistentThreadDisplay = () => {};
+  c.syncSideThreadUnread = () => {}; c.updateComposer = () => {};
+  c.syncWorkspaceSidePanelState = () => sent.push(c.thread.sideThreadClosed);
+  c.returnToParentSession = async () => returned++;
+  vm.runInContext(sourceSection("async function retireNativeSideThreads(", "async function openRelatedThread("), c);
+  await c.retireNativeSideThreads(["temporary-side"]);
+  assert.equal(c.thread.sideThreadClosed, true);
+  assert.deepEqual(sent, [true]);
+  assert.equal(returned, 0);
+  assert.equal(c.selectedId, "temporary-side", "等待外层移除 iframe，不在原 iframe 切换会话");
+});
+
 test("菜单失败快照保留上次持久侧边行，临时侧边不由旧快照复活", () => {
   const entry = { snapshot: { data: { sideThreads: [
     { id: "saved", ephemeral: false }, { id: "temporary", ephemeral: true }
@@ -13877,6 +13945,17 @@ test("侧边标签执行状态沿用原生状态并去重，排队占位和等�
   context.thread.priority = { attentionState: "unread" };
   context.syncWorkspaceSidePanelState();
   assert.equal(sent.at(-1).unread, false, "明确的已读回执优先于尚未更新的 priority");
+  const beforeRename = sent.length;
+  context.thread.title = "自动命名后的侧边";
+  context.syncWorkspaceSidePanelState();
+  assert.equal(sent.length, beforeRename + 1, "仅名称变化也必须推送");
+  assert.equal(sent.at(-1).title, "自动命名后的侧边");
+  context.thread.sideThreadExpired = true;
+  context.syncWorkspaceSidePanelState();
+  assert.equal(sent.at(-1).closed, false, "过期或不可读取不能充当确认关闭");
+  context.thread.sideThreadClosed = true;
+  context.syncWorkspaceSidePanelState();
+  assert.equal(sent.at(-1).closed, true);
   const count = sent.length;
   context.syncWorkspaceSidePanelState(true);
   assert.equal(sent.length, count + 1, "父页面握手后补发当前状态，不依赖之前的推送是否到达");

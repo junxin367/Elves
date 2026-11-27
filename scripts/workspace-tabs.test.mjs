@@ -457,6 +457,113 @@ test("手机、Android 和嵌入面板拒绝打开子智能体标签，保留关
   }
 });
 
+test("侧边名称变化原位同步标签、提示与 iframe 标题，后台标签不重载或抢焦点", () => {
+  const h = harness();
+  h.api.openSideThread({ id: "side-a", title: "旧名称", unread: true });
+  const tab = h.tablist.children[0], view = h.views.children[0], frame = view.children[0];
+  frame.contentWindow = { postMessage() {} };
+  frame.savedDraft = "未发送草稿"; frame.savedScrollTop = 321;
+  const originalSrc = frame.src;
+  const event = { source: frame.contentWindow, origin: "http://127.0.0.1:45222",
+    data: { type: "codex-elves-side-panel-state", threadId: "side-a",
+      running: false, unread: true, title: "命名后的侧边" } };
+  h.message({ ...event, source: {} });
+  h.message({ ...event, origin: "https://other.example" });
+  assert.equal(tab.children[0].children[1].textContent, "旧名称");
+  h.message(event);
+  assert.equal(tab.children[0].children[1].textContent, "命名后的侧边");
+  assert.equal(tab.children[0].getAttribute("aria-label"), "命名后的侧边，有未读消息或待处理请求");
+  assert.equal(tab.children[1].getAttribute("aria-label"), "关闭命名后的侧边");
+  assert.equal(frame.title, "命名后的侧边");
+  h.state.threadId = "thread-b"; h.api.updateContext(); h.api.openFile("other.md");
+  const selected = h.selected();
+  h.message({ ...event, data: { ...event.data, title: "后台新名称", unread: false, running: true } });
+  assert.equal(tab.children[0].getAttribute("aria-label"), "后台新名称，正在执行");
+  assert.equal(h.selected(), selected);
+  h.state.threadId = "thread-a"; h.api.updateContext();
+  assert.equal(view.children[0], frame);
+  assert.equal(frame.src, originalSrc);
+  assert.equal(frame.savedDraft, "未发送草稿");
+  assert.equal(frame.savedScrollTop, 321);
+  h.message({ ...event, data: { ...event.data, title: "", unread: false, running: false } });
+  assert.equal(tab.children[0].getAttribute("aria-label"), "后台新名称", "空名称不覆盖已有有效名称");
+  h.api.dispose();
+});
+
+test("侧边名称事件能更新其他主会话下的标签，旧授权与子智能体不受影响", () => {
+  const h = harness();
+  h.api.openSideThread({ id: "side-a", title: "原名称" });
+  const tab = h.tablist.children[0], frame = h.views.children[0].children[0];
+  frame.contentWindow = { postMessage() {} };
+  const stateEvent = { source: frame.contentWindow, origin: "http://127.0.0.1:45222",
+    data: { type: "codex-elves-side-panel-state", threadId: "side-a", running: false, title: "原名称" } };
+  h.message(stateEvent);
+  h.api.openSubagent({ id: "agent-a", name: "原子智能体" });
+  const agent = h.tablist.children[1];
+  h.state.threadId = "thread-b"; h.api.updateContext();
+  assert.equal(h.api.updateThreadTitle("side-a", "事件名称"), true);
+  assert.equal(tab.children[0].children[1].textContent, "事件名称");
+  assert.equal(h.api.updateThreadTitle("side-a", "原名称", "related"), false,
+    "切回主会话时重复的菜单缓存名称不能回退已收到的命名事件");
+  h.message({ ...stateEvent, data: { ...stateEvent.data, running: true } });
+  assert.equal(tab.children[0].getAttribute("aria-label"), "事件名称，正在执行",
+    "只变化执行状态的旧标题快照不能回退新名称");
+  h.message({ ...stateEvent, data: { ...stateEvent.data, title: "事件名称" } });
+  h.message({ ...stateEvent, data: { ...stateEvent.data, title: "后续名称" } });
+  assert.equal(tab.children[0].children[1].textContent, "后续名称", "后续真实改名仍须同步");
+  assert.equal(h.api.updateThreadTitle("side-a", "后续列表名称", "related"), true);
+  h.message({ ...stateEvent, data: { ...stateEvent.data, title: "后续名称", running: true } });
+  assert.equal(tab.children[0].getAttribute("aria-label"), "后续列表名称，正在执行");
+  assert.equal(h.visibleTabs().length, 0);
+  assert.equal(h.api.updateThreadTitle("agent-a", "不应修改"), false);
+  assert.equal(agent.children[0].children[1].textContent, "原子智能体");
+  h.state.cacheScope = "other-authorization";
+  assert.equal(h.api.updateThreadTitle("side-a", "旧授权迟到名称"), false);
+  assert.equal(frame.title, "后续列表名称");
+  h.api.updateContext();
+  assert.equal(frame.isConnected, false);
+  h.api.dispose();
+});
+
+test("确认关闭的侧边只移除所属标签与监听，背景关闭不影响当前主会话", () => {
+  const h = harness();
+  h.api.openSideThread({ id: "side-a", title: "侧边 A" });
+  const frame = h.views.children[0].children[0]; frame.contentWindow = { postMessage() {} };
+  h.api.openSubagent({ id: "agent-a", name: "子智能体" });
+  h.state.threadId = "thread-b"; h.api.updateContext(); h.api.openFile("other.md");
+  const selected = h.selected(), listeners = h.messageListeners.size;
+  const event = { source: frame.contentWindow, origin: "http://127.0.0.1:45222",
+    data: { type: "codex-elves-side-panel-state", threadId: "side-a", running: false, closed: true } };
+  h.message({ ...event, data: { ...event.data, threadId: "side-b" } });
+  h.message({ ...event, source: {} });
+  h.message({ ...event, data: { ...event.data, closed: "true" } });
+  assert.equal(frame.isConnected, true);
+  h.message(event);
+  assert.equal(frame.isConnected, false);
+  assert.equal(h.messageListeners.size, listeners - 1);
+  assert.equal(h.selected(), selected);
+  assert.equal(h.state.threadId, "thread-b");
+  h.message(event);
+  h.state.threadId = "thread-a"; h.api.updateContext();
+  assert.equal(h.visibleTabs().length, 1);
+  assert.equal(h.visibleTabs()[0].children[0].children[1].textContent, "子智能体");
+  h.api.dispose();
+});
+
+test("原生关闭事件按会话身份清理保留标签，不依赖当前选中的主会话", () => {
+  const h = harness();
+  h.api.openSideThread({ id: "side-a", title: "侧边 A" });
+  const frame = h.views.children[0].children[0];
+  h.state.threadId = "thread-b"; h.api.updateContext(); h.api.openSideThread({ id: "side-b", title: "侧边 B" });
+  const selected = h.selected();
+  h.api.closeThread("side-a", "side", null);
+  assert.equal(frame.isConnected, false);
+  assert.equal(h.selected(), selected);
+  h.state.threadId = "thread-a"; h.api.updateContext();
+  assert.equal(h.visibleTabs().length, 0);
+  h.api.dispose();
+});
+
 test("侧边标签向独立页面同步显示状态，隐藏标签不会继续作为可见页面", () => {
   const h = harness();
   h.api.openSideThread({ id: "side-a" });

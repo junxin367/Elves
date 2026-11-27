@@ -1,4 +1,4 @@
-// PC 侧边会话/子智能体面板与独立会话窗口的页面模式，以及向外层标签同步执行与未读状态。
+// PC 侧边会话/子智能体面板与独立会话窗口的页面模式，以及向外层标签同步名称、关闭、执行与未读状态。
 
 import { connected, creating, pageLeaving, selectedId, selectionVersion, session, thread } from "../../core/state.js";
 import { reloadThread, updateComposer } from "../../core/actions.js";
@@ -111,14 +111,18 @@ export function syncWorkspaceSidePanelState(force = false) {
   const attention = sidebarAttentionState(thread);
   // 用户要求侧边有审批或问答时显示未读蓝点；待处理请求不能因查看正文的已读回执而消失。
   const unread = sidePanelUnread(attention);
+  const title = typeof thread.title === "string" ? thread.title : undefined;
+  const closed = thread.sideThreadClosed === true;
   // 用户要求侧边标签显示真实执行状态：沿用原生状态及等待判断，不把发送中、排队或待确认占位当成执行中。
-  const running = connected && !pageLeaving && ["active", "inProgress", "running"].includes(type)
+  const running = connected && !pageLeaving && !closed && ["active", "inProgress", "running"].includes(type)
     && attention !== "waiting";
   const composerReady = !!sideComposerEditor(selectedId);
-  const signature = JSON.stringify([selectedId, running, unread, composerReady]);
+  // 用户要求命名和确认关闭同步外层标签；这些变化即使没有伴随运行/未读变化，也不能被去重丢弃。
+  const signature = JSON.stringify([selectedId, running, unread, composerReady, title, closed]);
   if (!force && signature === workspaceSidePanelStateSignature) return;
   workspaceSidePanelStateSignature = signature;
-  window.parent.postMessage({ type: "codex-elves-side-panel-state", threadId: selectedId, running, unread, composerReady }, location.origin);
+  window.parent.postMessage({ type: "codex-elves-side-panel-state", threadId: selectedId,
+    running, unread, composerReady, title, closed }, location.origin);
 }
 // PC 侧边面板接收外层标签的显隐通知，只对实际显示的标签确认已读。
 export function installSidePanelMessageListener() {

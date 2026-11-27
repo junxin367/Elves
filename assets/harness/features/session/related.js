@@ -39,7 +39,7 @@ import {
   sideCreationHistoryKey, sideCreationView, stopRelatedSessionTimers, syncSideThreadUnread,
   transientHistoryView
 } from "./related-state.js";
-import { syncSideThreadPresence, workspaceSidePanel } from "./side-panel.js";
+import { syncSideThreadPresence, syncWorkspaceSidePanelState, workspaceSidePanel } from "./side-panel.js";
 import { discardPersistentThreadDisplay, readScope, threadDisplayKey, threadDisplays } from "./thread-cache.js";
 import { syncRelatedModelDisplay } from "./thread-display.js";
 import { sessionMenu, sessionTools, setSessionMenu, syncRelatedSidebarLayout } from "../shell-state.js";
@@ -388,8 +388,12 @@ export function adoptRelatedMenu(result) {
   for (const item of [...result.subagents, ...(result.completedSubagents || [])])
     rememberRelatedView(item.id, "subagent", item.parentThreadId ?? null, item.name,
       { openedFromThreadId: parentThreadId, ephemeral: item.ephemeral });
-  for (const item of result.sideThreads) rememberRelatedView(item.id, "side", null, item.title,
-    { openedFromThreadId: parentThreadId, ephemeral: item.ephemeral });
+  for (const item of result.sideThreads) {
+    rememberRelatedView(item.id, "side", null, item.title,
+      { openedFromThreadId: parentThreadId, ephemeral: item.ephemeral });
+    // 关联列表补齐的名称也同步已打开标签，不必关闭重开侧边页面。
+    sessionTools?.updateThreadTitle?.(item.id, item.title, "related");
+  }
   filterSideThreadSidebar(sidebar);
   renderSidebar();
 }
@@ -397,6 +401,8 @@ export async function retireNativeSideThreads(ids, { notify = true, reason = "cl
   const closed = new Set(ids.filter(validRelatedThreadId));
   const current = normalizeRelatedView(relatedSessionView, selectedId);
   for (const id of closed) {
+    // 确认关闭与持久侧边的关闭回执一样，必须释放对应标签；不能仅清理目录和正文缓存。
+    sessionTools?.closeThread?.(id, "side", null);
     sessionMenu?.removeThread(id);
     relatedThreadViews.delete(id);
     transcriptCache.remove(session?.device.id, id);
@@ -411,6 +417,11 @@ export async function retireNativeSideThreads(ids, { notify = true, reason = "cl
     if (thread?.id === current.threadId) setThread({ ...thread, readOnly: true, sideThreadClosed: true });
     setHistoryInitialized(false);
     updateComposer();
+    if (workspaceSidePanel) {
+      // 嵌入页通知外层卸载自身，不能把父会话导航进已关闭的侧边标签。
+      syncWorkspaceSidePanelState();
+      return;
+    }
     if (notify) notice(reason === "expired" ? "侧边会话已过期，已返回主会话" : "此侧边会话已在 Codex 关闭");
     await returnToParentSession();
   }
