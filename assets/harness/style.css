@@ -781,13 +781,14 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 #appearance-button{font-weight:500}
 .ui-popup{position:fixed;inset:auto;margin:0;display:flex;flex-direction:column;max-width:calc(100vw - 16px);max-height:var(--popup-max-height);min-width:0;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:var(--radius-popup);padding:4px;box-shadow:0 8px 28px #0002;z-index:var(--layer-menu);overflow:hidden;animation:popup-appear var(--duration-popup) ease-out}
 .ui-popup[popover]:not(:popover-open){display:none}
-/* 用户确认九类弹出菜单共用尺寸和字号；常驻分组菜单、额度、用量及取色器不接入 ui-menu。
+/* 用户确认九类弹出菜单共用更紧凑的尺寸与字号；常驻分组菜单、额度、用量及取色器不接入 ui-menu。
  * 默认字号对应界面 14px；实际整数结果由 appearance/apply.js 按 92.86% / 78.57% / 85.71% 四舍五入写入。
- * 菜单行沿用 --control-menu-height：桌面 36px，触屏及窄屏 44px；大字号与多行说明允许自然增高。 */
-:root{--menu-font-size:13px;--menu-description-font-size:11px;--menu-search-font-size:12px;--menu-padding:4px;--menu-item-padding-block:8px;--menu-item-padding-inline:12px;--menu-item-gap:8px;--menu-label-gap:4px;--menu-shadow:0 8px 28px #0002}
+ * 菜单行使用独立变量 --menu-item-height（桌面 32px，触屏及窄屏 36px）与 6px 10px 内边距，避免改动 --control-menu-height 影响菜单外按钮；大字号与多行说明仍允许自然撑高。 */
+:root{--menu-font-size:13px;--menu-description-font-size:11px;--menu-search-font-size:12px;--menu-padding:4px;--menu-item-height:32px;--menu-item-padding-block:6px;--menu-item-padding-inline:10px;--menu-item-gap:8px;--menu-label-gap:4px;--menu-shadow:0 8px 28px #0002}
+@media(hover:none),(pointer:coarse),(max-width:760px){:root{--menu-item-height:36px}}
 .ui-menu{padding:var(--menu-padding);background:var(--control-bg,var(--side));color:var(--text);border:1px solid var(--line);border-radius:var(--radius-popup);box-shadow:var(--menu-shadow);font-family:var(--ui-font-family);font-size:var(--menu-font-size);font-weight:var(--ui-font-weight,400);line-height:1.4;z-index:var(--layer-menu)}
 .menu-group{min-width:0}
-.menu-item{display:flex;align-items:center;gap:var(--menu-item-gap);width:100%;min-width:0;min-height:var(--control-menu-height);padding:var(--menu-item-padding-block) var(--menu-item-padding-inline);border:0;border-radius:var(--radius-control);background:transparent;color:var(--text);font-family:var(--ui-font-family);font-size:var(--menu-font-size);font-weight:var(--ui-font-weight,400);line-height:1.4;text-align:left;cursor:pointer}
+.menu-item{display:flex;align-items:center;gap:var(--menu-item-gap);width:100%;min-width:0;min-height:var(--menu-item-height);padding:var(--menu-item-padding-block) var(--menu-item-padding-inline);border:0;border-radius:var(--radius-control);background:transparent;color:var(--text);font-family:var(--ui-font-family);font-size:var(--menu-font-size);font-weight:var(--ui-font-weight,400);line-height:1.4;text-align:left;cursor:pointer}
 .menu-item-label{display:flex;flex-direction:column;gap:var(--menu-label-gap);flex:1;min-width:0;overflow-wrap:anywhere}
 .menu-item-name{font-weight:inherit}
 .menu-description{font-size:var(--menu-description-font-size);font-weight:var(--ui-font-weight,400);line-height:1.5;color:var(--muted);overflow-wrap:anywhere}
@@ -797,7 +798,7 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .menu-item-label-inline>.menu-description{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .menu-title{flex-shrink:0;padding:var(--menu-item-padding-block) var(--menu-item-padding-inline);font-size:var(--menu-font-size);font-weight:inherit;line-height:1.4}
 .menu-empty{margin:0;padding:var(--menu-item-padding-block) var(--menu-item-padding-inline)}
-.menu-search{width:calc(100% - 8px);flex-shrink:0;margin:var(--menu-padding);padding:var(--menu-item-padding-block);min-height:32px;border:1px solid var(--line);border-radius:var(--radius-control);background:var(--composer-bg,var(--side));color:var(--text);font-family:var(--ui-font-family);font-size:var(--menu-search-font-size);font-weight:var(--ui-font-weight,400)}
+.menu-search{width:calc(100% - 8px);flex-shrink:0;margin:var(--menu-padding);padding:var(--menu-item-padding-block) 8px;min-height:32px;border:1px solid var(--line);border-radius:var(--radius-control);background:var(--composer-bg,var(--side));color:var(--text);font-family:var(--ui-font-family);font-size:var(--menu-search-font-size);font-weight:var(--ui-font-weight,400)}
 .menu-search::placeholder{color:var(--muted)}
 .menu-search:focus{outline:1px solid var(--focus-ring);outline-offset:-1px;border-color:transparent}
 /* 图标与所属文字为同一个 1em；只缩放菜单内的图标框，保留品牌图案、彩色 Emoji 和外部入口尺寸。 */
@@ -806,8 +807,8 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .menu-check{display:inline-flex;align-items:center;justify-content:center;flex:0 0 1em;width:1em;height:1em;font-size:inherit;line-height:1;color:inherit}
 .menu-submenu-arrow{transform:rotate(-90deg);color:var(--muted)}
 .menu-separator{flex-shrink:0;height:1px;margin:var(--menu-padding) 0;background:var(--menu-divider,var(--line))}
-/* 独立按钮按普通 Button 的 5px 图文间距、左右 10px 内边距整体居中；普通菜单项继续左对齐。 */
-.menu-button{display:inline-flex;align-items:center;justify-content:center;gap:5px;min-height:var(--control-menu-height);padding:5px 10px;border:0;border-radius:var(--radius-control);background:transparent;color:var(--text);font-family:var(--ui-font-family);font-size:var(--menu-font-size);font-weight:var(--ui-font-weight,400);line-height:1.4;text-align:center}
+/* 独立按钮按普通 Button 的 5px 图文间距、左右 10px 内边距整体居中；高度沿用公共菜单行高，普通菜单项继续左对齐。 */
+.menu-button{display:inline-flex;align-items:center;justify-content:center;gap:5px;min-height:var(--menu-item-height);padding:5px 10px;border:0;border-radius:var(--radius-control);background:transparent;color:var(--text);font-family:var(--ui-font-family);font-size:var(--menu-font-size);font-weight:var(--ui-font-weight,400);line-height:1.4;text-align:center}
 .menu-help{display:flex;align-items:center;gap:5px;text-decoration:none}
 /* 用户要求菜单键盘焦点保留 1px 内描边；原生 focus-visible 判定不能被全局 pointer 模式的清除规则覆盖。 */
 :root .ui-menu :is(.menu-item,.menu-button,.menu-help,.menu-search):focus-visible{outline:1px solid var(--focus-ring);outline-offset:-1px}
@@ -822,7 +823,7 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 /* 用户要求 Codex 顶部标题和帮助只占一行；窄屏优先保留帮助入口，标题省略但完整文字仍可通过提示读取。 */
 .popup-header{display:flex;align-items:center;gap:var(--menu-item-gap);flex-shrink:0;min-width:0;border-bottom:1px solid var(--menu-divider,var(--line))}
 .popup-header>.popup-title{flex:1;min-width:0;padding-right:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.popup-header>.popup-help{flex-shrink:0;min-height:var(--control-menu-height);padding:var(--menu-item-padding-block) var(--menu-item-padding-inline) var(--menu-item-padding-block) 0;white-space:nowrap}
+.popup-header>.popup-help{flex-shrink:0;min-height:var(--menu-item-height);padding:var(--menu-item-padding-block) var(--menu-item-padding-inline) var(--menu-item-padding-block) 0;white-space:nowrap}
 /* 用户确认权限菜单按公共主文字/说明/搜索三档计算，图标 1em、选中仅勾选；入口尺寸及权限风险色保留。 */
 .composer-permissions-popup .popup-title{color:var(--muted)}
 .composer-permissions-popup .popup-option-label small{text-wrap:pretty}

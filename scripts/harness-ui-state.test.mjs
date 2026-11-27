@@ -6060,6 +6060,18 @@ test("权限菜单复用公共字号和选中规则，保留顶部说明边界�
   }
 });
 
+test("公共菜单统一采用紧凑行高与内边距，且不影响菜单外页面控件变量", async () => {
+  const css = await readFile(new URL("../assets/harness/style.css", import.meta.url), "utf8");
+  assert.match(css, /:root\{[^}]*--control-menu-height:36px/);
+  assert.match(css, /@media\(hover:none\),\(pointer:coarse\),\(max-width:760px\)\{:root\{[^}]*--control-menu-height:44px/);
+  assert.match(css, /:root\{[^}]*--menu-padding:4px;--menu-item-height:32px;--menu-item-padding-block:6px;--menu-item-padding-inline:10px/);
+  assert.match(css, /@media\(hover:none\),\(pointer:coarse\),\(max-width:760px\)\{:root\{--menu-item-height:36px\}\}/);
+  assert.match(css, /\.menu-item\{[^}]*min-height:var\(--menu-item-height\);padding:var\(--menu-item-padding-block\) var\(--menu-item-padding-inline\)/);
+  assert.match(css, /\.menu-button\{[^}]*min-height:var\(--menu-item-height\)/);
+  assert.match(css, /\.popup-header>\.popup-help\{[^}]*min-height:var\(--menu-item-height\)/);
+  assert.match(css, /\.menu-search\{[^}]*padding:var\(--menu-item-padding-block\) 8px;min-height:32px/);
+});
+
 test("Claude 权限待生效时说明实际权限和原因，不阻断消息或继续选择", () => {
   const h = composerPermissionHarness({ backend: "claude" });
   h.context.thread.permissionMode = "plan";
