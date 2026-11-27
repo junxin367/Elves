@@ -45,7 +45,8 @@ export function normalizeComposerMetrics(value, previous = null) {
   if (!value || !["codex-rollout", "codex-side", "claude-native", "antigravity-acp"].includes(value.source)
       || typeof value.turnId !== "string" || value.turnId.length > 120) return null;
   const result = { source: value.source, turnId: value.turnId };
-  if (value.source === "codex-side" && value.totalIncomplete === true) result.totalIncomplete = true;
+  if (["codex-side", "antigravity-acp"].includes(value.source) && value.totalIncomplete === true)
+    result.totalIncomplete = true;
   for (const key of ["inputTokens", "outputTokens", "cachedInputTokens", "turnTokens", "steps", "totalTokens", "durationMs", "tokensPerSecond", "firstTokenMs", "cacheExpiresAtMs", "cacheObservedAtMs", "cacheTtlMs"])
     result[key] = composerMetricsNumber(value[key])
       && (key === "tokensPerSecond" || Number.isSafeInteger(value[key])) ? value[key] : null;
@@ -204,6 +205,8 @@ export function resetComposerMetrics() {
   const node = $("#session-metrics");
   if (node) {
     node.hidden = true;
+    // 切换/重开后旧数字状态已释放，即使缓存文本相同也须重新绑定，后续实测更新才能继续滚动。
+    delete node.dataset.metrics;
     composerTooltips?.clearContent?.(node);
   }
 }
@@ -369,7 +372,7 @@ export function renderComposerMetrics() {
   const cache = composerMetricsNumber(value.totalTokens) ? composerMetricsCacheCountdown(value) : null;
   if (cache) labels.push(cache.label);
   node.hidden = !labels.length;
-  if (node.hidden) return;
+  if (node.hidden) { composerTooltips?.clearContent?.(node); return; }
   const signature = JSON.stringify([labels, cache ? value.cacheExpirySource : null]);
   if (node.dataset.metrics !== signature) {
     node.dataset.metrics = signature;

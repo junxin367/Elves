@@ -17351,8 +17351,8 @@ test("会话底栏统计空数据保持隐藏，部分数据仅展示已知项�
   assert.equal(h.text(), "0tk/s  本轮 0步 0  总 0");
 });
 
-test("Codex 和 Claude 新轮次的空响应及失败都保留上一轮统计，不写入空快照", async () => {
-  for (const [backend, source] of [["codex", "codex-rollout"], ["claude", "claude-native"]]) {
+test("Codex、Claude 和 AGY 新轮次的空响应及失败都保留上一轮统计，不写入空快照", async () => {
+  for (const [backend, source] of [["codex", "codex-rollout"], ["claude", "claude-native"], ["antigravity", "antigravity-acp"]]) {
     const h = composerMetricsHarness(), c = h.context;
     c.backend = backend; c.instance = `${backend}:fixture`;
     c.syncComposerMetrics(); h.complete(0, { source }); await h.flush();
@@ -17367,6 +17367,54 @@ test("Codex 和 Claude 新轮次的空响应及失败都保留上一轮统计，
     assert.equal(h.text(), "48tk/s  本轮 20步 1m  总 5m");
     assert.equal(c.composerMetricsState.value.turnId, "turn-current");
   }
+});
+
+test("AGY Token 逐步更新复用数字动画与 hover，结束后降频，重新打开先恢复缓存", async () => {
+  const h = composerMetricsHarness({ animate: true }), c = h.context, details = [];
+  c.backend = "antigravity"; c.instance = "antigravity:local";
+  c.composerTooltips = { update: (_node, _title, content) => details.push(content), clearContent() {} };
+  const first = { source: "antigravity-acp", inputTokens: 120, outputTokens: 10, cachedInputTokens: 20,
+    turnTokens: 130, totalTokens: 130, steps: 1, tokensPerSecond: 5, durationMs: 2000, cacheHitRate: 1 / 6 };
+  const second = { ...first, inputTokens: 255, outputTokens: 25, cachedInputTokens: 45,
+    turnTokens: 280, totalTokens: 280, steps: 2, tokensPerSecond: 6.25, durationMs: 4000, cacheHitRate: 45 / 255 };
+  c.syncComposerMetrics(); h.complete(0, first); await h.flush();
+  assert.equal(h.text(), "5tk/s  本轮 1步 130  总 130");
+  assert.equal(h.animations.length, 0, "首次实际值不从虚构的零滚动");
+  assert.ok([...h.timers.values()].some(timer => timer.delay === 2000));
+  const number = c.composerMetricsState.metricNumbers.get("turnTokens").node;
+  const oldDetails = details.at(-1).key;
+  h.advance(2000); c.syncComposerMetrics(); h.complete(1, second); await h.flush();
+  assert.equal(h.text(), "6tk/s  本轮 2步 280  总 280");
+  assert.equal(c.composerMetricsState.metricNumbers.get("turnTokens").node, number);
+  assert.ok(h.animations.length > 0, "实际新用量驱动共用数字动画");
+  assert.notEqual(details.at(-1).key, oldDetails, "已打开的明细跟随用量更新");
+  c.active = false; c.syncComposerMetrics(); h.complete(2, second); await h.flush();
+  assert.ok([...h.timers.values()].some(timer => timer.delay === 15000));
+  c.resetComposerMetrics(); c.syncComposerMetrics();
+  assert.equal(h.text(), "6tk/s  本轮 2步 280  总 280", "重新打开先复用同会话缓存");
+  const beforeRefresh = h.animations.length;
+  h.complete(3, { ...second, outputTokens: 26, turnTokens: 281, totalTokens: 281, tokensPerSecond: 6.5 });
+  await h.flush();
+  assert.ok(h.animations.length > beforeRefresh, "缓存恢复后收到新值仍使用数字动画");
+  c.resetComposerMetrics();
+});
+
+test("AGY 不完整统计不显示尾部小计为总量，全部未知时关闭旧明细", async () => {
+  const h = composerMetricsHarness(), c = h.context, cleared = [];
+  c.backend = "antigravity"; c.instance = "antigravity:local";
+  c.composerTooltips = { update() {}, clearContent: node => cleared.push(node) };
+  c.syncComposerMetrics(); h.complete(0, { source: "antigravity-acp" }); await h.flush();
+  h.advance(2000); c.syncComposerMetrics();
+  h.complete(1, { source: "antigravity-acp", totalIncomplete: true,
+    inputTokens: null, outputTokens: null, turnTokens: null, totalTokens: null, steps: null, tokensPerSecond: null });
+  await h.flush();
+  assert.equal(h.node.hidden, true);
+  assert.equal(cleared.at(-1), h.node);
+  h.advance(2000); c.syncComposerMetrics();
+  h.complete(2, { source: "antigravity-acp", totalIncomplete: true,
+    inputTokens: 90, outputTokens: 10, cachedInputTokens: 0, turnTokens: 100, totalTokens: null, steps: 1, tokensPerSecond: null });
+  await h.flush();
+  assert.equal(h.text(), "本轮 1步 100");
 });
 
 test("会话底栏统计读取失败保留最后实测值，离页停止轮询且旧服务不请求新接口", async () => {

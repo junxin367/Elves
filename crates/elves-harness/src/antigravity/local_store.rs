@@ -252,6 +252,15 @@ print("FREE")
 
 /// 查找某原生会话 ID 对应的本地 JSONL 转录文件（优先完整版 `transcript_full.jsonl`，超限时回退紧凑版）。
 pub(crate) fn find_local_transcript_file(gemini_root: &Path, native_id: &str) -> Option<(PathBuf, u64, u64)> {
+    find_transcript_file(gemini_root, native_id, Some(MAX_TRANSCRIPT_BYTES))
+}
+
+pub(super) fn find_metrics_transcript_file(gemini_root: &Path, native_id: &str) -> Option<(PathBuf, u64, u64)> {
+    // 统计采用有界尾读，不因完整历史超过 32 MiB 就停止更新。
+    find_transcript_file(gemini_root, native_id, None)
+}
+
+fn find_transcript_file(gemini_root: &Path, native_id: &str, max_bytes: Option<u64>) -> Option<(PathBuf, u64, u64)> {
     if !valid_native_id(native_id) || !gemini_root.is_absolute() {
         return None;
     }
@@ -271,7 +280,7 @@ pub(crate) fn find_local_transcript_file(gemini_root: &Path, native_id: &str) ->
             if meta.file_type().is_symlink() || !meta.is_file() || meta.len() == 0 {
                 continue;
             }
-            if meta.len() > MAX_TRANSCRIPT_BYTES {
+            if max_bytes.is_some_and(|limit| meta.len() > limit) {
                 continue;
             }
             let mtime_ms = meta
@@ -347,6 +356,7 @@ pub(crate) fn parse_transcript_jsonl(text: &str) -> LocalTranscript {
                     "completedAt": ts_ms,
                     "turnStartedAtMs": ts_ms,
                     "turnCompletedAtMs": ts_ms,
+                    "_nativeRequestTimestamps": true,
                     "items": [{
                         "type": "userMessage",
                         "id": format!("agy-local-user-{step_index}"),
@@ -428,14 +438,13 @@ pub(crate) fn parse_transcript_jsonl(text: &str) -> LocalTranscript {
                         "completedAt": ts_ms,
                         "turnStartedAtMs": ts_ms,
                         "turnCompletedAtMs": ts_ms,
+                        "_nativeRequestTimestamps": true,
                         "items": [],
                     }));
                 }
                 let turn = turns.last_mut().unwrap();
                 if ts_ms > 0 {
-                    if turn["firstTokenAtMs"].is_null() {
-                        turn["firstTokenAtMs"] = json!(ts_ms);
-                    }
+                    // PLANNER_RESPONSE.created_at 是请求开始时间，不能倒推首 Token 或实际完成时间。
                     turn["completedAt"] = json!(ts_ms);
                     turn["turnCompletedAtMs"] = json!(ts_ms);
                 }
@@ -475,6 +484,9 @@ pub(crate) fn parse_transcript_jsonl(text: &str) -> LocalTranscript {
                     "thoughtTokens": prev_thought.saturating_add(thought_tokens),
                     "totalTokens": prev_total.saturating_add(step_total),
                     "lastObservedAtMs": if ts_ms > 0 { json!(ts_ms) } else { prev["lastObservedAtMs"].clone() },
+                    "lastStepTokens": step_total,
+                    "lastStepIndex": step_index,
+                    "source": "transcript",
                     "model": if !last_model.is_empty() { json!(last_model) } else { prev["model"].clone() },
                     "billingParts": billing_parts,
                     "billingComplete": billing_complete,
@@ -525,6 +537,7 @@ pub(crate) fn parse_transcript_jsonl(text: &str) -> LocalTranscript {
                         "completedAt": ts_ms,
                         "turnStartedAtMs": ts_ms,
                         "turnCompletedAtMs": ts_ms,
+                        "_nativeRequestTimestamps": true,
                         "items": [{
                             "type": "userMessage",
                             "id": format!("agy-local-user-{step_index}"),
@@ -547,7 +560,7 @@ pub(crate) fn parse_transcript_jsonl(text: &str) -> LocalTranscript {
     }
 }
 
-fn extract_user_request_text(raw: &str) -> String {
+pub(super) fn extract_user_request_text(raw: &str) -> String {
     if let Some(start) = raw.find("<USER_REQUEST>") {
         let after = &raw[start + "<USER_REQUEST>".len()..];
         let body = after

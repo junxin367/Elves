@@ -5,6 +5,7 @@ pub(crate) mod acp;
 pub(crate) mod local_store;
 pub(crate) mod projection;
 pub(crate) mod queue;
+mod transcript_metrics;
 pub(crate) mod usage;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -128,6 +129,8 @@ impl Conversation {
             obj.remove("_promptError");
             obj.remove("_promptUsage");
             obj.remove("_promptStop");
+            obj.remove("_acpUsageObservations");
+            obj.remove("_nativeRequestTimestamps");
         }
         if let Some(items) = value["items"].as_array_mut() {
             for item in items.iter_mut() {
@@ -1097,14 +1100,59 @@ impl Antigravity {
     }
 
     pub(crate) async fn session_metrics(&self, id: &str) -> anyhow::Result<Value> {
-        self.sync_local_transcript_if_available(id).await;
         let c = self.conversation(id).await?;
-        Ok(projection::compute_session_metrics(
+        let root = self.resolve_gemini_root(&c.config).await;
+        self.session_metrics_from_root(c, root).await
+    }
+
+    async fn session_metrics_from_root(
+        &self, mut c: Conversation, root: Option<PathBuf>,
+    ) -> anyhow::Result<Value> {
+        // 与其他实例共用 2 秒刷新：执行中只读当前会话追加的统计记录，不同步正文、不取得发送锁。
+        let snapshot = if let Some(root) = root {
+            let native_id = c.native_id.clone();
+            tokio::task::spawn_blocking(move || transcript_metrics::read(&root, &native_id))
+                .await.ok().and_then(Result::ok).flatten()
+        } else { None };
+        if let Some(snapshot) = &snapshot {
+            if c.turns.is_empty() {
+                c.turns = snapshot.turns.clone();
+            } else {
+                sync_turn_usage_from_transcript(&mut c.turns, &snapshot.turns);
+            }
+        }
+        // 历史编辑/新轮次在读取期间改变身份时丢弃旧快照；前端会按当前轮次立即再读。
+        if !self.saved.lock().await.conversations.get(&c.id).is_some_and(|current|
+            !current.deleted && current.native_id == c.native_id && current.edit_history_head == c.edit_history_head) {
+            return Ok(Value::Null);
+        }
+        let mut metrics = projection::compute_session_metrics(
             &c.turns,
             &c.token_usage,
             &c.model,
             now_ms(),
-        ))
+        );
+        if metrics.is_object() && let Some(snapshot) = snapshot {
+            if snapshot.complete {
+                if let Some(total) = transcript_metrics::total(&snapshot.usage)
+                    && metrics["totalTokens"].as_u64().is_none_or(|known| total >= known) {
+                    // 最终 ACP 回执可能先于 JSONL 落盘，迟到快照不能回退已经确认的会话累计。
+                    metrics["totalTokens"] = json!(total);
+                    metrics.as_object_mut().unwrap().remove("totalIncomplete");
+                    metrics["sessionTokens"] = json!({
+                        "inputTokens":snapshot.usage["inputTokens"],
+                        "outputTokens":snapshot.usage["outputTokens"],
+                        "cachedInputTokens":snapshot.usage["cachedReadTokens"],
+                        "reasoningTokens":snapshot.usage["thoughtTokens"],
+                    });
+                }
+            } else {
+                // 首次尾读未覆盖完整会话时，累计量保持未知，不能把尾部小计显示成“总”。
+                metrics["totalTokens"] = Value::Null;
+                metrics["totalIncomplete"] = json!(true);
+            }
+        }
+        Ok(metrics)
     }
 
     pub(crate) async fn workspace(&self, id: &str) -> anyhow::Result<Value> {
@@ -1245,6 +1293,8 @@ impl Antigravity {
         if let Some(conv) = saved.conversations.get_mut(id)
             && !conv.deleted
             && !conv.active()
+            && conv.native_id == c.native_id
+            && conv.edit_history_head == c.edit_history_head
         {
             if conv.discovered || conv.turns.is_empty() {
                 conv.turns = parsed.turns;
@@ -1738,21 +1788,24 @@ impl Antigravity {
                 let merged = projection::merge_token_usage(&c.token_usage, &usage, &c.model);
                 c.token_usage = merged.clone();
                 // 仅当通知携带真实输入/输出 Token 明细时更新 `_acpUsage`；纯上下文窗口通知（`{used, size}`）不得将轮次 Token 置零。
-                if let Some(last) = usage.get("last") {
-                    let in_tok = last["inputTokens"].as_u64().unwrap_or(0);
-                    let out_tok = last["outputTokens"].as_u64().unwrap_or(0);
-                    if in_tok > 0 || out_tok > 0 {
-                        let cached_tok = last["cachedInputTokens"].as_u64().unwrap_or(0);
-                        let thought_tok = last["reasoningOutputTokens"].as_u64().unwrap_or(0);
-                        c.turns[idx]["_acpUsage"] = json!({
-                            "inputTokens": in_tok,
-                            "outputTokens": out_tok,
-                            "cachedReadTokens": cached_tok,
-                            "thoughtTokens": thought_tok,
-                            "lastObservedAtMs": now,
-                            "model": c.model,
-                        });
+                if let Some(used) = update["used"].as_u64() {
+                    let turn = &mut c.turns[idx];
+                    if !turn["_acpUsageObservations"].is_array() {
+                        turn["_acpUsageObservations"] = json!([]);
                     }
+                    let observations = turn["_acpUsageObservations"].as_array_mut().unwrap();
+                    if observations.last().is_none_or(|previous| previous["tokens"] != used) {
+                        // 每轮只保留最近 64 次原生上下文通知，用于匹配末次模型调用的实测完成时间。
+                        if observations.len() == 64 { observations.remove(0); }
+                        observations.push(json!({"tokens":used,"atMs":now}));
+                    }
+                }
+                if update["inputTokens"].is_u64() || update["outputTokens"].is_u64() {
+                    let mut actual = update.clone();
+                    actual["lastObservedAtMs"] = json!(now);
+                    actual["model"] = json!(c.model);
+                    // 原生缺少缓存字段时保留未知；不能把 normalizer 的占位零写入计费明细。
+                    c.turns[idx]["_acpUsage"] = actual;
                 }
                 events.push(json!({
                     "method": "thread/tokenUsage/updated",
@@ -3281,18 +3334,57 @@ fn exposed_permission_modes(raw: &[String]) -> Vec<String> {
     modes
 }
 
-/// 将本地转录中记录的多步规划步数与真实输入/缓存/输出明细同步到已完成轮次，不修改用户消息或轮次 ID。
+/// 按原生输入的文本和时间归属匹配统计，不以数组长度或“最后一轮”猜测所属轮次。
 fn sync_turn_usage_from_transcript(saved_turns: &mut [Value], parsed_turns: &[Value]) {
-    if saved_turns.len() == parsed_turns.len() {
-        for (saved, parsed) in saved_turns.iter_mut().zip(parsed_turns.iter()) {
-            if !parsed["_acpUsage"].is_null() {
-                saved["_acpUsage"] = parsed["_acpUsage"].clone();
+    let mut inputs: HashMap<String, Vec<(u64, usize)>> = HashMap::new();
+    for (index, turn) in saved_turns.iter().enumerate() {
+        for item in turn["items"].as_array().into_iter().flatten().filter(|i| i["type"] == "userMessage") {
+            let at = item["sentAtMs"].as_u64().or_else(|| turn["turnStartedAtMs"].as_u64())
+                .or_else(|| turn["createdAt"].as_u64()).unwrap_or(0);
+            if at == 0 { continue; }
+            let text = item["content"].as_array().into_iter().flatten()
+                .filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("\n").trim().to_owned();
+            // 原生 created_at 精度为秒；同秒相同文本若对应多个轮次则保持未知，不串用。
+            inputs.entry(crate::hash(&text)).or_default().push((at / 1000 * 1000, index));
+        }
+    }
+    let mut matched: BTreeMap<usize, Vec<Value>> = BTreeMap::new();
+    for native in parsed_turns {
+        if !native["_acpUsage"].is_object() { continue; }
+        let at = native["turnStartedAtMs"].as_u64().unwrap_or(0);
+        // 统计缓存只保留输入指纹，完整历史读取仍使用原生正文；不在 2 秒热路径长期复制用户消息。
+        let fingerprint = native["_metricsUserHash"].as_str().map(str::to_owned).unwrap_or_else(|| {
+            let text = native["items"].as_array().into_iter().flatten()
+                .find(|i| i["type"] == "userMessage")
+                .and_then(|i| i["content"].as_array())
+                .map(|parts| parts.iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("\n"))
+                .unwrap_or_default();
+            crate::hash(text.trim())
+        });
+        let Some(candidates) = inputs.get(&fingerprint) else { continue };
+        let Some(latest) = candidates.iter().filter(|(start,_)| *start <= at).map(|(start,_)|*start).max() else { continue };
+        let owners: HashSet<_> = candidates.iter().filter(|(start,_)| *start == latest).map(|(_,index)|*index).collect();
+        if owners.len() == 1 {
+            matched.entry(*owners.iter().next().unwrap()).or_default().push(native["_acpUsage"].clone());
+        }
+    }
+    for (index, usages) in matched {
+        let turn = &mut saved_turns[index];
+        let mut incoming = transcript_metrics::combine(&usages);
+        let previous = &turn["_acpUsage"];
+        if let Some(previous_total) = transcript_metrics::total(previous)
+            && transcript_metrics::total(&incoming).is_none_or(|total| total < previous_total) {
+            continue;
+        }
+        if let (Some(tokens), Some(started)) = (incoming["lastStepTokens"].as_u64(), incoming["lastObservedAtMs"].as_u64()) {
+            if let Some(at) = turn["_acpUsageObservations"].as_array().into_iter().flatten()
+                .rev().find(|o| o["tokens"] == tokens && o["atMs"].as_u64().is_some_and(|at| at >= started.saturating_add(1000)))
+                .and_then(|o| o["atMs"].as_u64()) {
+                // 只在用量一致且排除秒级时间歧义时采用真实通知时间；created_at 是请求开始时间，不当作响应完成时间。
+                incoming["lastResponseObservedAtMs"] = json!(at);
             }
         }
-    } else if let (Some(saved_last), Some(parsed_last)) = (saved_turns.last_mut(), parsed_turns.last())
-        && !parsed_last["_acpUsage"].is_null()
-    {
-        saved_last["_acpUsage"] = parsed_last["_acpUsage"].clone();
+        turn["_acpUsage"] = incoming;
     }
 }
 
@@ -3316,6 +3408,189 @@ pub(crate) fn saved_execution_active(directory: &Path) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn agy_metrics_delayed_transcript_does_not_fill_the_next_turn() {
+        let mut saved = vec![
+            json!({"id":"first","turnStartedAtMs":1000,"items":[{"type":"userMessage","content":[{"type":"text","text":"first"}]}]}),
+            json!({"id":"second","turnStartedAtMs":5000,"status":"inProgress",
+                "items":[{"type":"userMessage","content":[{"type":"text","text":"second"}]}]}),
+        ];
+        let parsed = vec![json!({"id":"agy-local-turn-0","turnStartedAtMs":1100,
+            "items":[{"type":"userMessage","content":[{"type":"text","text":"first"}]}],
+            "_acpUsage":{"inputTokens":100,"outputTokens":10,"totalTokens":110}})];
+        sync_turn_usage_from_transcript(&mut saved, &parsed);
+        assert_eq!(saved[0]["_acpUsage"]["totalTokens"], 110);
+        assert!(saved[1]["_acpUsage"].is_null(), "迟到的上一轮日志不能填进本轮");
+    }
+
+    #[test]
+    fn agy_metrics_same_length_transcript_still_checks_message_identity() {
+        let mut saved = vec![json!({"id":"current","turnStartedAtMs":5000,
+            "items":[{"type":"userMessage","content":[{"type":"text","text":"new"}]}]})];
+        let parsed = vec![json!({"id":"agy-local-turn-0","turnStartedAtMs":1000,
+            "items":[{"type":"userMessage","content":[{"type":"text","text":"old"}]}],
+            "_acpUsage":{"inputTokens":100,"outputTokens":10,"totalTokens":110}})];
+        sync_turn_usage_from_transcript(&mut saved, &parsed);
+        assert!(saved[0]["_acpUsage"].is_null());
+    }
+
+    #[tokio::test]
+    async fn agy_metrics_reads_model_steps_while_running_without_replacing_messages() {
+        use std::io::Write;
+        let (dir, ag, _auth, rt) = audit_fixture(AUDIT_ACCEPT, true, true).await;
+        let logs = dir.path().join("antigravity-cli/brain/audit/.system_generated/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let path = logs.join("transcript_full.jsonl");
+        let first = concat!(
+            "{\"type\":\"USER_INPUT\",\"step_index\":0,\"created_at\":\"1970-01-01T00:00:01Z\",\"content\":\"first\"}\n",
+            "{\"type\":\"PLANNER_RESPONSE\",\"step_index\":1,\"created_at\":\"1970-01-01T00:00:01Z\",\"model\":\"gemini-4-neon-high\",\"input_tokens\":100,\"cache_read_tokens\":20,\"output_tokens\":10}\n"
+        );
+        std::fs::write(&path, first).unwrap();
+        {
+            let mut saved = ag.saved.lock().await;
+            let turn = &mut saved.conversations.get_mut("antigravity-audit").unwrap().turns[0];
+            turn["turnStartedAtMs"] = json!(1000);
+            turn["firstTokenAtMs"] = json!(1200);
+            turn["items"] = json!([{"id":"live-user","type":"userMessage","content":[{"type":"text","text":"first"}]}]);
+            turn["_acpUsageObservations"] = json!([{"tokens":130,"atMs":3000},{"tokens":150,"atMs":5000}]);
+        }
+        let c = ag.conversation("antigravity-audit").await.unwrap();
+        let first_metrics = ag.session_metrics_from_root(c, Some(dir.path().to_owned())).await.unwrap();
+        assert_eq!(first_metrics["turnTokens"], 130);
+        assert_eq!(first_metrics["steps"], 1);
+        assert_eq!(first_metrics["tokensPerSecond"], 5.0);
+        assert_eq!(first_metrics["cacheObservedAtMs"], 3000);
+        let mut completed = ag.conversation("antigravity-audit").await.unwrap();
+        completed.turns[0]["_acpUsage"] = json!({
+            "inputTokens":210,"cachedReadTokens":45,"outputTokens":25,"totalTokens":280
+        });
+        let before_log_flush = ag.session_metrics_from_root(completed, Some(dir.path().to_owned())).await.unwrap();
+        assert_eq!(before_log_flush["turnTokens"], 280);
+        assert_eq!(before_log_flush["totalTokens"], 280, "最终回执先于日志落盘时不能回退已确认累计");
+        assert_eq!(before_log_flush["sessionTokens"]["inputTokens"], 255);
+        let second = "{\"type\":\"PLANNER_RESPONSE\",\"step_index\":3,\"created_at\":\"1970-01-01T00:00:03Z\",\"model\":\"gemini-4-neon-high\",\"input_tokens\":110,\"cache_read_tokens\":25,\"output_tokens\":15}\n";
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(second.as_bytes()).unwrap();
+        let c = ag.conversation("antigravity-audit").await.unwrap();
+        let second_metrics = ag.session_metrics_from_root(c, Some(dir.path().to_owned())).await.unwrap();
+        assert_eq!(second_metrics["turnTokens"], 280);
+        assert_eq!(second_metrics["totalTokens"], 280);
+        assert_eq!(second_metrics["cachedInputTokens"], 45);
+        assert_eq!(second_metrics["steps"], 2);
+        assert_eq!(second_metrics["tokensPerSecond"], 6.25);
+        assert_eq!(second_metrics["cacheObservedAtMs"], 5000);
+        assert_eq!(second_metrics["_billingParts"].as_array().unwrap().len(), 2);
+        file.write_all(second.as_bytes()).unwrap();
+        let c = ag.conversation("antigravity-audit").await.unwrap();
+        let repeated = ag.session_metrics_from_root(c, Some(dir.path().to_owned())).await.unwrap();
+        let saved = ag.conversation("antigravity-audit").await.unwrap();
+        rt.client.close().await;
+        assert_eq!(repeated["totalTokens"], 280);
+        assert_eq!(repeated["steps"], 2);
+        assert!(saved.active());
+        assert_eq!(saved.turns[0]["items"].as_array().unwrap().len(), 1);
+        assert_eq!(saved.turns[0]["items"][0]["id"], "live-user");
+        assert!(saved.turns[0]["_acpUsage"].is_null(), "统计读取不写回正文或伪造完成状态");
+    }
+
+    #[test]
+    fn agy_metrics_incremental_reader_waits_for_newline_and_detects_rewrite() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let user = "{\"type\":\"USER_INPUT\",\"step_index\":0,\"created_at\":\"1970-01-01T00:00:01Z\",\"content\":\"first\"}\n";
+        let call = "{\"type\":\"PLANNER_RESPONSE\",\"step_index\":1,\"created_at\":\"1970-01-01T00:00:01Z\",\"model\":\"gemini-4-neon-high\",\"input_tokens\":100,\"cache_read_tokens\":20,\"output_tokens\":10}";
+        std::fs::write(&path, format!("{user}{call}")).unwrap();
+        let pending = transcript_metrics::read_file(&path).unwrap();
+        assert!(pending.usage.is_null());
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"\n").unwrap();
+        let complete = transcript_metrics::read_file(&path).unwrap();
+        assert_eq!(complete.usage["totalTokens"], 130);
+        assert!(complete.turns[0].get("items").is_none(), "统计缓存只存输入指纹，不复制正文");
+        let cached = transcript_metrics::read_file(&path).unwrap();
+        assert!(Arc::ptr_eq(&complete, &cached), "未变化文件复用统计快照");
+        writeln!(file, "{}", json!({"type":"USER_INPUT","step_index":2,
+            "created_at":"1970-01-01T00:00:03Z","content":"second"})).unwrap();
+        writeln!(file, "{call}").unwrap();
+        let repeated = transcript_metrics::read_file(&path).unwrap();
+        assert_eq!(repeated.turns[0]["_acpUsage"]["totalTokens"], 130, "迟到旧步骤仍属于原输入");
+        assert!(repeated.turns[1]["_acpUsage"].is_null(), "旧步骤重复写入不能转移到新轮次");
+        assert_eq!(repeated.usage["totalTokens"], 130);
+        drop(file);
+        std::fs::write(&path, user).unwrap();
+        let rewritten = transcript_metrics::read_file(&path).unwrap();
+        assert!(rewritten.usage.is_null(), "截断后的原文件不能沿用旧累计");
+    }
+
+    #[test]
+    fn agy_metrics_large_transcript_tail_does_not_claim_a_session_total() {
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("antigravity-cli/brain/audit/.system_generated/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let path = logs.join("transcript_full.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.set_len(33 * 1024 * 1024).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        file.write_all(concat!("\n",
+            "{\"type\":\"USER_INPUT\",\"step_index\":100,\"created_at\":\"1970-01-01T00:00:01Z\",\"content\":\"tail\"}\n",
+            "{\"type\":\"PLANNER_RESPONSE\",\"step_index\":101,\"created_at\":\"1970-01-01T00:00:01Z\",\"input_tokens\":10,\"cache_read_tokens\":5,\"output_tokens\":2}\n"
+        ).as_bytes()).unwrap();
+        let snapshot = transcript_metrics::read(dir.path(), "audit").unwrap().unwrap();
+        assert!(!snapshot.complete);
+        assert_eq!(snapshot.turns[0]["_acpUsage"]["totalTokens"], 17);
+    }
+
+    #[test]
+    fn agy_metrics_retiring_call_details_keeps_totals_and_deduplicates_old_steps() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "{}", json!({"type":"USER_INPUT","step_index":0,
+            "created_at":"1970-01-01T00:00:01Z","content":"long"})).unwrap();
+        let count = crate::session_metrics_cost::MAX_PARTS as u64 + 2;
+        for step in 1..=count {
+            writeln!(file, "{}", json!({"type":"PLANNER_RESPONSE","step_index":step,
+                "created_at":"1970-01-01T00:00:02Z","model":"gemini-4-neon-high",
+                "input_tokens":1,"cache_read_tokens":1,"output_tokens":1})).unwrap();
+        }
+        let before = transcript_metrics::read_file(&path).unwrap();
+        assert!(before.complete);
+        assert_eq!(before.usage["totalTokens"], count * 3);
+        assert_eq!(before.turns[0]["_acpUsage"]["steps"], count);
+        assert_eq!(before.turns[0]["_acpUsage"]["billingComplete"], false);
+        writeln!(file, "{}", json!({"type":"PLANNER_RESPONSE","step_index":1,
+            "created_at":"1970-01-01T00:00:02Z","model":"gemini-4-neon-high",
+            "input_tokens":1,"cache_read_tokens":1,"output_tokens":1})).unwrap();
+        let repeated = transcript_metrics::read_file(&path).unwrap();
+        assert_eq!(repeated.usage["totalTokens"], count * 3);
+        assert_eq!(repeated.turns[0]["_acpUsage"]["steps"], count);
+    }
+
+    #[tokio::test]
+    async fn agy_metrics_rejects_snapshot_after_native_session_changes() {
+        let (dir, ag, _auth, rt) = audit_fixture(AUDIT_ACCEPT, false, true).await;
+        let old = ag.conversation("antigravity-audit").await.unwrap();
+        ag.saved.lock().await.conversations.get_mut("antigravity-audit").unwrap().native_id = "changed".into();
+        let stale = ag.session_metrics_from_root(old, Some(dir.path().to_owned())).await.unwrap();
+        rt.client.close().await;
+        assert!(stale.is_null());
+    }
+
+    #[test]
+    fn agy_metrics_ambiguous_repeated_input_does_not_cross_turns() {
+        let mut turns = vec![json!({"id":"one","turnStartedAtMs":1100,
+            "items":[{"type":"userMessage","content":[{"type":"text","text":"same"}]}]}),
+            json!({"id":"two","turnStartedAtMs":1500,
+            "items":[{"type":"userMessage","content":[{"type":"text","text":"same"}]}]})];
+        let parsed = vec![json!({"turnStartedAtMs":1000,
+            "items":[{"type":"userMessage","content":[{"type":"text","text":"same"}]}],
+            "_acpUsage":{"inputTokens":10,"uncachedInputTokens":5,"cachedReadTokens":5,"outputTokens":2,"totalTokens":12}})];
+        sync_turn_usage_from_transcript(&mut turns, &parsed);
+        assert!(turns.iter().all(|t| t["_acpUsage"].is_null()));
+    }
 
     // Windows 并行用例的进程启动和首次写盘不计入动作死锁判断；5 秒仍可检测锁重入，避免 2 秒调度抖动误报。
     const AUDIT_ACTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -3484,6 +3759,17 @@ mod tests {
         c.turns = vec![json!({"plan":[{"step":"old","status":"completed"}]}), json!({"plan":[]})];
         rt.client.close().await;
         assert!(c.session_plan().is_empty());
+    }
+
+    #[test]
+    fn audit_zero_cache_is_known_but_missing_cache_is_unknown() {
+        let base = json!({"id":"t","_acpUsage":{"inputTokens":100,"outputTokens":10,"cachedReadTokens":0}});
+        let metrics = projection::compute_session_metrics(&[base.clone()], &Value::Null, "", 1);
+        assert_eq!(metrics["cacheHitRate"], 0.0);
+        let mut missing = base;
+        missing["_acpUsage"].as_object_mut().unwrap().remove("cachedReadTokens");
+        let metrics = projection::compute_session_metrics(&[missing], &Value::Null, "", 1);
+        assert!(metrics["cacheHitRate"].is_null());
     }
 
     #[test]
@@ -4123,15 +4409,15 @@ mod tests {
         })];
         let parsed = local_store::parse_transcript_jsonl(
             &[
-                r#"{"type":"USER_INPUT","step_index":0,"created_at":"2026-11-26T12:00:01Z","content":"<USER_REQUEST>排查问题</USER_REQUEST>"}"#,
-                r#"{"type":"PLANNER_RESPONSE","step_index":1,"created_at":"2026-11-26T12:00:02Z","model":"gemini-4-neon-xhigh","input_tokens":1000,"cache_read_tokens":9000,"output_tokens":200,"thinking":"step1","tool_calls":[{"name":"read_file","args":{"Path":"a.rs"}}]}"#,
-                r#"{"type":"PLANNER_RESPONSE","step_index":2,"created_at":"2026-11-26T12:00:04Z","model":"gemini-4-neon-xhigh","input_tokens":1200,"cache_read_tokens":9500,"output_tokens":300,"content":"已完成"}"#,
+                r#"{"type":"USER_INPUT","step_index":0,"created_at":"1970-01-01T00:00:01Z","content":"<USER_REQUEST>排查问题</USER_REQUEST>"}"#,
+                r#"{"type":"PLANNER_RESPONSE","step_index":1,"created_at":"1970-01-01T00:00:01Z","model":"gemini-4-neon-xhigh","input_tokens":1000,"cache_read_tokens":9000,"output_tokens":200,"thinking":"step1","tool_calls":[{"name":"read_file","args":{"Path":"a.rs"}}]}"#,
+                r#"{"type":"PLANNER_RESPONSE","step_index":2,"created_at":"1970-01-01T00:00:02Z","model":"gemini-4-neon-xhigh","input_tokens":1200,"cache_read_tokens":9500,"output_tokens":300,"content":"已完成"}"#,
             ]
             .join("\n"),
         );
         assert_eq!(parsed.token_usage["modelContextWindow"], 1_048_576);
         sync_turn_usage_from_transcript(&mut saved_turns, &parsed.turns);
-        let now = chrono::DateTime::parse_from_rfc3339("2026-11-26T12:01:04Z")
+        let now = chrono::DateTime::parse_from_rfc3339("1970-01-01T00:01:04Z")
             .unwrap()
             .timestamp_millis() as u64;
         let metrics = projection::compute_session_metrics(
@@ -4147,9 +4433,10 @@ mod tests {
         assert_eq!(metrics["totalTokens"], 21_200);
         assert_eq!(metrics["firstTokenMs"], 400);
         assert_eq!(metrics["durationMs"], 2_400);
-        assert!((metrics["tokensPerSecond"].as_f64().unwrap() - 250.0).abs() < 1e-6);
+        assert!((metrics["tokensPerSecond"].as_f64().unwrap() - 500.0 / 2.4).abs() < 1e-6);
         assert!(metrics["cacheHitRate"].as_f64().unwrap() <= 1.0);
         assert_eq!(metrics["cacheExpirySource"], "model-default");
+        assert_eq!(metrics["cacheObservedAtMs"], 3_400, "缓存依据实际结束时间，不采用原生请求开始时间");
         assert!(metrics["cacheRemainingMs"].as_u64().unwrap() > 0);
     }
 

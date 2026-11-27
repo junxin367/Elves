@@ -839,8 +839,8 @@ pub(crate) fn normalize_usage_update(value: &Value) -> Option<Value> {
     let total = value["totalTokens"]
         .as_u64()
         .or(used)
-        .or_else(|| match (input, output) {
-            (Some(i), Some(o)) => Some(i.saturating_add(cached.unwrap_or(0)).saturating_add(o)),
+        .or_else(|| match (input, cached, output) {
+            (Some(i), Some(c), Some(o)) => i.checked_add(c)?.checked_add(o),
             _ => None,
         });
     if total.is_none() && size.is_none() && input.is_none() && output.is_none() {
@@ -848,18 +848,18 @@ pub(crate) fn normalize_usage_update(value: &Value) -> Option<Value> {
     }
     let mut usage = json!({
         "last": {
-            "totalTokens": total.unwrap_or(0),
-            "inputTokens": input.unwrap_or(0),
-            "outputTokens": output.unwrap_or(0),
-            "cachedInputTokens": cached.unwrap_or(0),
-            "reasoningOutputTokens": thought.unwrap_or(0),
+            "totalTokens": total,
+            "inputTokens": input,
+            "outputTokens": output,
+            "cachedInputTokens": cached,
+            "reasoningOutputTokens": thought,
         },
         "total": {
-            "totalTokens": total.unwrap_or(0),
-            "inputTokens": input.unwrap_or(0),
-            "outputTokens": output.unwrap_or(0),
-            "cachedInputTokens": cached.unwrap_or(0),
-            "reasoningOutputTokens": thought.unwrap_or(0),
+            "totalTokens": total,
+            "inputTokens": input,
+            "outputTokens": output,
+            "cachedInputTokens": cached,
+            "reasoningOutputTokens": thought,
         }
     });
     if let Some(window) = size.filter(|&w| w > 0) {
@@ -884,7 +884,7 @@ pub(crate) fn merge_token_usage(existing: &Value, incoming: &Value, fallback_mod
             merged["modelContextWindowSource"] = json!({"kind": "model-default", "key": fallback_model});
         }
     }
-    if merged["last"]["totalTokens"].as_u64().unwrap_or(0) == 0
+    if merged["last"]["totalTokens"].as_u64().is_none()
         && existing["last"]["totalTokens"].as_u64().unwrap_or(0) > 0
     {
         merged["last"] = existing["last"].clone();
@@ -1178,41 +1178,8 @@ pub(crate) fn collect_replay_turns(updates: &[Value], now_ms: u64) -> Vec<Value>
 }
 
 fn estimate_turn_steps(turn: &Value) -> Option<u64> {
-    if let Some(steps) = turn["_acpUsage"]["steps"].as_u64().filter(|&s| s > 0) {
-        return Some(steps);
-    }
-    let items = turn["items"].as_array()?;
-    let mut steps = 0u64;
-    let mut in_planner_step = false;
-    for item in items {
-        match item["type"].as_str() {
-            Some("userMessage") => {
-                in_planner_step = false;
-            }
-            Some("reasoning" | "agentMessage") => {
-                if !in_planner_step {
-                    steps = steps.saturating_add(1);
-                    in_planner_step = true;
-                }
-            }
-            Some("commandExecution" | "fileChange" | "mcpToolCall" | "dynamicToolCall" | "webSearch") => {
-                if !in_planner_step {
-                    steps = steps.saturating_add(1);
-                }
-                // 工具执行结束后，后续思考或正文属于下一轮规划步。
-                in_planner_step = false;
-            }
-            _ => {}
-        }
-    }
-    (steps > 0).then_some(steps)
-}
-
-fn turn_has_observable_activity(turn: &Value) -> bool {
-    turn.get("_acpUsage").is_some_and(Value::is_object)
-        || turn["items"]
-            .as_array()
-            .is_some_and(|items| items.iter().any(|item| item["type"] != "userMessage"))
+    // 与 Codex/Claude 一致，“步”只取真实模型调用次数，不从工具或正文片段推算。
+    turn["_acpUsage"]["steps"].as_u64()
 }
 
 /// 计算单会话累计统计指标，完整对齐 Elves 输入区左下 `#session-metrics` 字段契约。
@@ -1222,67 +1189,49 @@ pub(crate) fn compute_session_metrics(
     fallback_model: &str,
     now_ms: u64,
 ) -> Value {
-    let mut total_input = 0u64;
-    let mut total_output = 0u64;
-    let mut total_cached = 0u64;
-    let mut total_thought = 0u64;
+    let mut total_input = Some(0u64);
+    let mut total_output = Some(0u64);
+    let mut total_cached = Some(0u64);
+    let mut total_thought = Some(0u64);
+    let mut cumulative_total = Some(0u64);
     let mut has_turn_usage = false;
     for turn in turns {
         if let Some(u) = turn.get("_acpUsage").filter(|v| v.is_object()) {
-            let uncached_or_in = u["inputTokens"].as_u64().unwrap_or(0);
+            let step_in = super::transcript_metrics::input(u);
             let cached = u["cachedReadTokens"]
                 .as_u64()
-                .or_else(|| u["cachedInputTokens"].as_u64())
-                .unwrap_or(0);
-            // 若来源未预合并 cachedReadTokens（如直接来自 PromptResponse.usage），补齐总输入口径。
-            let step_in = if u.get("uncachedInputTokens").is_some() {
-                uncached_or_in
-            } else {
-                uncached_or_in.saturating_add(cached)
-            };
-            let step_out = u["outputTokens"].as_u64().unwrap_or(0);
-            if step_in > 0 || step_out > 0 || u["totalTokens"].as_u64().unwrap_or(0) > 0 {
-                has_turn_usage = true;
-            }
-            total_input = total_input.saturating_add(step_in);
-            total_output = total_output.saturating_add(step_out);
-            total_cached = total_cached.saturating_add(cached);
-            total_thought = total_thought.saturating_add(u["thoughtTokens"].as_u64().unwrap_or(0));
+                .or_else(|| u["cachedInputTokens"].as_u64());
+            has_turn_usage = true;
+            let add = |sum: Option<u64>, value: Option<u64>| sum.zip(value).and_then(|(s,v)|s.checked_add(v));
+            cumulative_total = add(cumulative_total, super::transcript_metrics::total(u));
+            total_input = add(total_input, step_in);
+            total_output = add(total_output, u["outputTokens"].as_u64());
+            total_cached = add(total_cached, cached);
+            total_thought = add(total_thought, u["thoughtTokens"].as_u64());
         }
     }
-    // 新轮次刚发起且尚无实测活动时保留上一轮完整统计（保留上一轮真实 turnId）。
-    let scored_turn = turns
-        .iter()
-        .rev()
-        .find(|t| turn_has_observable_activity(t))
-        .or_else(|| turns.last());
-    let Some(turn) = scored_turn else {
+    // 新轮次只返回已确认的数据；共享前端在尚无本轮实测值时保留上一轮显示及其原 turnId。
+    let Some(turn) = turns.last() else {
         return Value::Null;
     };
     let Some(turn_id) = turn["id"].as_str().filter(|s| !s.is_empty()) else {
         return Value::Null;
     };
 
-    let cumulative_total = if has_turn_usage {
-        Some(total_input.saturating_add(total_output))
-    } else {
-        token_usage["total"]["totalTokens"]
-            .as_u64()
-            .or_else(|| token_usage["last"]["totalTokens"].as_u64())
-            .filter(|&n| n > 0)
-    };
-
     let mut metrics = json!({
         "source": "antigravity-acp",
         "turnId": turn_id,
     });
-    if let Some(total) = cumulative_total {
+    if let Some(total) = cumulative_total.filter(|_| has_turn_usage) {
         metrics["totalTokens"] = json!(total);
         // 账号页使用会话累计，输入区使用本轮；分开保存，避免修正本轮缓存时改变账号页统计口径。
         if has_turn_usage {
             metrics["sessionTokens"] = json!({"inputTokens":total_input,"outputTokens":total_output,
                 "cachedInputTokens":total_cached,"reasoningTokens":total_thought});
         }
+    }
+    if has_turn_usage && cumulative_total.is_none() {
+        metrics["totalIncomplete"] = json!(true);
     }
     if let Some(steps) = estimate_turn_steps(turn) {
         metrics["steps"] = json!(steps);
@@ -1291,33 +1240,18 @@ pub(crate) fn compute_session_metrics(
     let last_usage = turn.get("_acpUsage").filter(|v| v.is_object());
     let mut turn_out_for_speed = 0u64;
     if let Some(u) = last_usage {
-        let raw_in = u["inputTokens"].as_u64().unwrap_or(0);
         let turn_cached = u["cachedReadTokens"]
             .as_u64()
-            .or_else(|| u["cachedInputTokens"].as_u64())
-            .unwrap_or(0);
-        let turn_in = if u.get("uncachedInputTokens").is_some() {
-            raw_in
-        } else {
-            raw_in.saturating_add(turn_cached)
-        };
-        let turn_out = u["outputTokens"].as_u64().unwrap_or(0);
-        let turn_total = u["totalTokens"]
-            .as_u64()
-            .filter(|&t| t > 0)
-            .unwrap_or_else(|| turn_in.saturating_add(turn_out));
-        turn_out_for_speed = turn_out;
-        if turn_total > 0 {
-            metrics["turnTokens"] = json!(turn_total);
-            metrics["inputTokens"] = json!(turn_in);
-            metrics["outputTokens"] = json!(turn_out);
-            // 明细属于当前轮次，不能把整个会话的缓存累计量放入本轮表格。
-            metrics["cachedInputTokens"] = u.get("cachedReadTokens")
-                .or_else(|| u.get("cachedInputTokens")).cloned().unwrap_or(Value::Null);
-        }
-        if turn_in > 0 && turn_cached > 0 {
-            let denom = turn_in.max(turn_cached) as f64;
-            metrics["cacheHitRate"] = json!(((turn_cached as f64) / denom).clamp(0.0, 1.0));
+            .or_else(|| u["cachedInputTokens"].as_u64());
+        let turn_in = super::transcript_metrics::input(u);
+        let turn_out = u["outputTokens"].as_u64();
+        turn_out_for_speed = turn_out.unwrap_or(0);
+        metrics["turnTokens"] = json!(super::transcript_metrics::total(u));
+        metrics["inputTokens"] = json!(turn_in);
+        metrics["outputTokens"] = json!(turn_out);
+        metrics["cachedInputTokens"] = json!(turn_cached);
+        if let Some((input,cached)) = turn_in.zip(turn_cached).filter(|(i,c)| *i > 0 && c <= i) {
+            metrics["cacheHitRate"] = json!(cached as f64 / input as f64);
         }
     }
 
@@ -1325,12 +1259,16 @@ pub(crate) fn compute_session_metrics(
         .as_u64()
         .or_else(|| turn["createdAt"].as_u64())
         .filter(|&t| t > 0);
-    let first_ms = turn["firstTokenAtMs"].as_u64().filter(|&t| t > 0);
+    let historical = turn["_nativeRequestTimestamps"] == true
+        || turn_id.starts_with("agy-local-turn-");
+    let first_ms = turn["firstTokenAtMs"].as_u64().filter(|&t| t > 0 && !historical);
+    let observed = last_usage.and_then(|u| u["lastResponseObservedAtMs"].as_u64()
+        .or_else(|| (u["source"] != "transcript").then(|| u["lastObservedAtMs"].as_u64()).flatten()));
     let end_ms = turn["turnCompletedAtMs"]
         .as_u64()
         .or_else(|| turn["completedAt"].as_u64())
-        .filter(|&t| t > 0)
-        .or_else(|| (turn["status"] == "inProgress").then_some(now_ms));
+        .filter(|&t| t > 0 && !historical)
+        .or(observed);
 
     if let (Some(start), Some(first)) = (start_ms, first_ms)
         && first >= start
@@ -1345,8 +1283,8 @@ pub(crate) fn compute_session_metrics(
             metrics["durationMs"] = json!(duration);
         }
         if turn_out_for_speed > 0 {
-            let gen_start = first_ms.filter(|&f| f >= start && f < end).unwrap_or(start);
-            let gen_ms = end.saturating_sub(gen_start);
+            // 与共享统计同口径：输出量除以轮次开始至用量实际观测/结束的耗时，轮询不推进分母。
+            let gen_ms = duration;
             if gen_ms > 0 {
                 let speed = (turn_out_for_speed as f64) * 1000.0 / (gen_ms as f64);
                 if speed.is_finite() && speed > 0.0 {
@@ -1362,15 +1300,8 @@ pub(crate) fn compute_session_metrics(
             .as_str()
             .filter(|s| !s.is_empty())
             .unwrap_or(fallback_model);
-        let observed_at = u["lastObservedAtMs"]
-            .as_u64()
-            .filter(|&t| t > 0)
-            .or_else(|| {
-                turn["turnCompletedAtMs"]
-                    .as_u64()
-                    .or_else(|| turn["completedAt"].as_u64())
-                    .filter(|&t| t > 0)
-            });
+        // 与速度使用同一次真实用量观测；原生请求开始时间不能充当缓存完成时间。
+        let observed_at = observed.or(end_ms).filter(|&t| t > 0 && !historical);
         if let Some(at) = observed_at
             && !model.is_empty()
         {
@@ -1443,6 +1374,59 @@ pub(crate) fn aggregate_instance_acp_tokens(
 #[cfg(test)]
 mod metrics_tests {
     use super::*;
+
+    #[test]
+    fn agy_metrics_context_updates_are_not_billable_tokens_or_model_steps() {
+        let usage = normalize_usage_update(&json!({"used": 12000, "size": 100000})).unwrap();
+        let turns = vec![json!({"id":"current","status":"inProgress","turnStartedAtMs":1000,
+            "items":[{"type":"agentMessage","text":"native output"},{"type":"commandExecution","id":"tool"}]})];
+        let metrics = compute_session_metrics(&turns, &usage, "gemini-4-neon", 3000);
+        assert!(metrics["totalTokens"].is_null(), "上下文占用不能充当累计 Token");
+        assert!(metrics["steps"].is_null(), "正文和工具数量不能推算模型调用次数");
+    }
+
+    #[test]
+    fn agy_metrics_live_speed_uses_observed_usage_time_instead_of_poll_time() {
+        let turn = json!({"id":"current","status":"inProgress","turnStartedAtMs":1000,
+            "firstTokenAtMs":1200,"_acpUsage":{"inputTokens":100,"outputTokens":60,
+                "cachedReadTokens":20,"lastObservedAtMs":3000,"model":"gemini-4-neon","steps":1}});
+        let first = compute_session_metrics(&[turn.clone()], &Value::Null, "", 4000);
+        let later = compute_session_metrics(&[turn], &Value::Null, "", 9000);
+        assert_eq!(first["tokensPerSecond"], 30.0);
+        assert_eq!(later["tokensPerSecond"], first["tokensPerSecond"], "等待工具或轮询不能改变已观测速度");
+        assert_eq!(first["cacheObservedAtMs"], 3000);
+        assert_eq!(later["cacheExpiresAtMs"], first["cacheExpiresAtMs"], "轮询不能延长缓存倒计时");
+    }
+
+    #[test]
+    fn agy_metrics_partial_usage_does_not_invent_cache_hits() {
+        let normalized = normalize_usage_update(&json!({"inputTokens":100,"outputTokens":10})).unwrap();
+        assert!(normalized["last"]["cachedInputTokens"].is_null());
+        assert!(normalized["last"]["totalTokens"].is_null(), "缺失缓存量时不能把输入输出之和当完整总量");
+    }
+
+    #[test]
+    fn agy_metrics_explicit_zero_context_replaces_the_previous_usage() {
+        let old = normalize_usage_update(&json!({"used":1200,"size":10000})).unwrap();
+        let zero = normalize_usage_update(&json!({"used":0,"size":10000})).unwrap();
+        assert_eq!(merge_token_usage(&old, &zero, "")["last"]["totalTokens"], 0);
+        let window_only = normalize_usage_update(&json!({"size":20000})).unwrap();
+        assert_eq!(merge_token_usage(&old, &window_only, "")["last"]["totalTokens"], 1200);
+    }
+
+    #[test]
+    fn agy_metrics_history_timestamps_do_not_claim_stream_latency() {
+        let native = super::super::local_store::parse_transcript_jsonl(concat!(
+            "{\"type\":\"USER_INPUT\",\"step_index\":0,\"created_at\":\"1970-01-01T00:00:01Z\",\"content\":\"history\"}\n",
+            "{\"type\":\"PLANNER_RESPONSE\",\"step_index\":1,\"created_at\":\"1970-01-01T00:00:01Z\",\"model\":\"gemini-4-neon-high\",\"input_tokens\":100,\"cache_read_tokens\":20,\"output_tokens\":10}\n"
+        ));
+        let metrics = compute_session_metrics(&native.turns, &native.token_usage, &native.model, 10000);
+        assert_eq!(metrics["turnTokens"], 130);
+        assert!(metrics["firstTokenMs"].is_null());
+        assert!(metrics["durationMs"].is_null());
+        assert!(metrics["tokensPerSecond"].is_null());
+        assert!(metrics["cacheObservedAtMs"].is_null(), "请求开始时间不能当作缓存写入或读取完成时间");
+    }
 
     #[test]
     fn session_metrics_antigravity_separates_current_turn_and_session_totals() {
