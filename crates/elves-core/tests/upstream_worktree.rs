@@ -35,7 +35,7 @@ fn default_remote_prefers_upstream_then_origin_then_first_remote() {
 }
 
 use std::path::Path;
-use std::process::Command;
+use elves_core::process::hidden_command;
 
 use serde_json::json;
 
@@ -45,7 +45,7 @@ use elves_core::upstream_worktree::{
 };
 
 fn git(dir: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = hidden_command("git")
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -62,7 +62,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 fn git_no_repo(args: &[&str]) {
-    let output = Command::new("git")
+    let output = hidden_command("git")
         .args(args)
         .output()
         .expect("git should run");

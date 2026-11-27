@@ -130,6 +130,8 @@ const linkCheck = spawnSync(process.execPath, ["--experimental-vm-modules", "--n
   }
   if (failures.length) { console.log(failures.join("\\n")); process.exitCode = 1; }
 `], {
+  // 构建检查可能由无控制台的客户端启动，子 Node 进程也必须无窗口运行。
+  windowsHide: true,
   // 源码通过 stdin 传递，使用父进程已读取的同一份内容，避免重复 IO 及 Windows 命令行长度限制。
   input: JSON.stringify([...sources].map(([file, source]) => [pathToFileURL(resolve(assetRoot, file)).href, source])),
   encoding: "utf8",

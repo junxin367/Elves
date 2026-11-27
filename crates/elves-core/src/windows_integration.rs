@@ -581,7 +581,6 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
 
     #[test]
@@ -604,7 +603,12 @@ mod tests {
             std::process::exit(23);
         }
 
-        let mut command = Command::new(std::env::current_exe().unwrap());
+        let executable = std::env::current_exe().unwrap();
+        let mut command = if stage == "relay" {
+            Command::new(executable)
+        } else {
+            crate::process::hidden_command(executable)
+        };
         command
             .args(["--exact", TEST, "--nocapture"])
             .env(STAGE, if stage == "relay" { "leaf" } else { "relay" })
@@ -613,9 +617,6 @@ mod tests {
             .stderr(Stdio::piped());
         // The CLI wrapper's child uses the default creation flags. It must
         // inherit the parent's windowless console rather than allocate one.
-        if stage != "relay" {
-            command.creation_flags(HIDDEN_PROCESS_FLAGS);
-        }
         let mut child = command.spawn().unwrap();
         let mut input = String::from("hidden-stdin");
         if stage == "relay" {

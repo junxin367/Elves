@@ -419,8 +419,9 @@ pub(crate) fn parse_agy_models_stdout(stdout: &str) -> Option<Value> {
 
 fn build_isolated_cli_command(config: &EnvConfig) -> anyhow::Result<Command> {
     config.validate()?;
+    // 用户要求额度、模型查询全程无闪窗；本机 CLI 与 WSL 包装入口共用创建时隐藏配置。
     if config.is_local() {
-        let mut cmd = Command::new(&config.executable);
+        let mut cmd = Command::from(elves_core::process::hidden_command(&config.executable));
         if let Some(base) = directories::BaseDirs::new() {
             let home = base.home_dir();
             if home.is_dir() {
@@ -430,7 +431,7 @@ fn build_isolated_cli_command(config: &EnvConfig) -> anyhow::Result<Command> {
         Ok(cmd)
     } else {
         anyhow::ensure!(cfg!(windows), "WSL Antigravity 实例需要 Windows WSL2");
-        let mut cmd = Command::new("wsl.exe");
+        let mut cmd = Command::from(elves_core::process::hidden_command("wsl.exe"));
         cmd.args([
             "--distribution",
             &config.distribution,
@@ -1031,7 +1032,8 @@ async fn native_wsl_time_zone(config: &EnvConfig) -> Option<String> {
     if config.is_local() || !cfg!(windows) {
         return None;
     }
-    let mut command = Command::new("wsl.exe");
+    // 时区补读同样是后台命令，不能因仅调用 sh/date 就遗漏 WSL 宿主的隐藏设置。
+    let mut command = Command::from(elves_core::process::hidden_command("wsl.exe"));
     command.args([
         "--distribution",
         &config.distribution,
@@ -1061,6 +1063,79 @@ async fn native_wsl_time_zone(config: &EnvConfig) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn isolated_cli_commands_preserve_program_and_wsl_login_environment() {
+        let executable = std::env::current_exe().unwrap();
+        let local = EnvConfig {
+            executable: executable.to_string_lossy().into_owned(),
+            ..EnvConfig::default()
+        };
+        let command = build_isolated_cli_command(&local).unwrap();
+        assert_eq!(command.as_std().get_program(), executable.as_os_str());
+        assert_eq!(command.as_std().get_args().count(), 0);
+        if let Some(base) = directories::BaseDirs::new() {
+            assert_eq!(command.as_std().get_current_dir(), Some(base.home_dir()));
+        }
+        #[cfg(windows)]
+        {
+            let config = EnvConfig {
+                distribution: "fixture-distro".into(),
+                user: "fixture-user".into(),
+                executable: "/fixture/bin/agy".into(),
+            };
+            let command = build_isolated_cli_command(&config).unwrap();
+            assert_eq!(command.as_std().get_program(), "wsl.exe");
+            assert_eq!(
+                command.as_std().get_args().collect::<Vec<_>>(),
+                [
+                    "--distribution", "fixture-distro", "--user", "fixture-user",
+                    "--cd", "~", "--exec", "/bin/bash", "-lc", "exec \"$@\"", "--",
+                    "/fixture/bin/agy"
+                ].map(std::ffi::OsStr::new)
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn isolated_cli_is_windowless_and_preserves_stdio_and_failure_status() {
+        use std::io::Read;
+        use tokio::io::AsyncWriteExt;
+
+        const STAGE: &str = "ELVES_AGY_HIDDEN_QUERY_TEST";
+        const TEST: &str = "antigravity::usage::tests::isolated_cli_is_windowless_and_preserves_stdio_and_failure_status";
+        if std::env::var(STAGE).as_deref() == Ok("leaf") {
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn GetConsoleWindow() -> isize;
+            }
+            assert_eq!(unsafe { GetConsoleWindow() }, 0, "后台查询不应创建控制台");
+            let mut input = String::new();
+            std::io::stdin().read_to_string(&mut input).unwrap();
+            println!("hidden-query:{input}");
+            eprintln!("hidden-query-error");
+            std::process::exit(17);
+        }
+        let config = EnvConfig {
+            executable: std::env::current_exe().unwrap().to_string_lossy().into_owned(),
+            ..EnvConfig::default()
+        };
+        let mut child = build_isolated_cli_command(&config).unwrap()
+            .args(["--exact", TEST, "--nocapture"])
+            .env(STAGE, "leaf")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn().unwrap();
+        child.stdin.take().unwrap().write_all(b"query-payload").await.unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(15), child.wait_with_output())
+            .await.unwrap().unwrap();
+        assert_eq!(output.status.code(), Some(17));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("hidden-query:query-payload"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("hidden-query-error"));
+    }
 
     #[test]
     fn normalizes_cli_usage_groups_and_epoch_zero_reset_times() {

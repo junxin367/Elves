@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde_json::{Value, json};
 
+use crate::process::hidden_command;
 use super::defaults::{default_remote_name, refs_from_output, worktree_branches_from_output};
 use super::git::{qualified_remote_ref, source_ref, string_field};
 use super::types::{
@@ -90,7 +90,8 @@ fn remote_git_command(
 }
 
 fn spawn_remote_git(command_spec: &RemoteGitCommand) -> Result<GitOutput, std::io::Error> {
-    let mut command = Command::new("ssh");
+    // 这是后台执行远端 Git 的 SSH 调用，保留 BatchMode 与错误回传，不打开交互终端。
+    let mut command = hidden_command("ssh");
     command.arg("-o").arg("BatchMode=yes");
     command.arg("-o").arg("ConnectTimeout=8");
     if let Some(port) = command_spec.port {

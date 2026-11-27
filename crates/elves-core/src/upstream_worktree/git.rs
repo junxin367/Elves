@@ -1,9 +1,9 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde_json::{Value, json};
 
+use crate::process::hidden_command;
 use super::types::{
     GitOutput, UpstreamWorktreeCode, UpstreamWorktreeError, UpstreamWorktreeRequest,
     UpstreamWorktreeResult, UpstreamWorktreeSourceRequest,
@@ -18,7 +18,7 @@ pub fn validate_branch_name(branch: &str) -> UpstreamWorktreeResult<()> {
         ));
     }
 
-    let output = Command::new("git")
+    let output = hidden_command("git")
         .args(["check-ref-format", "--branch", branch])
         .output()
         .map_err(|_| {
@@ -152,7 +152,7 @@ pub(crate) fn source_request_from_payload(
 }
 
 pub(crate) fn git_output(args: Vec<OsString>) -> Result<GitOutput, std::io::Error> {
-    let output = Command::new("git").args(args).output()?;
+    let output = hidden_command("git").args(args).output()?;
     Ok(GitOutput {
         status_success: output.status.success(),
         stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
@@ -171,7 +171,7 @@ pub(crate) fn failed_response(error: UpstreamWorktreeError) -> Value {
 }
 
 fn git_available() -> bool {
-    Command::new("git")
+    hidden_command("git")
         .arg("--version")
         .output()
         .map(|output| output.status.success())

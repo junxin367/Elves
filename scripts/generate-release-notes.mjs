@@ -176,5 +176,6 @@ function dedupeNotes(items) {
 }
 
 function git(args) {
-  return execFileSync("git", args, { encoding: "utf8" });
+  // 发布说明的后台 Git 读取不应弹出控制台，仍按原逻辑返回输出或抛出执行错误。
+  return execFileSync("git", args, { encoding: "utf8", windowsHide: true });
 }
