@@ -1,4 +1,4 @@
-// Claude 控制提示：目标、计划与后台任务等原生控制提示。
+// Claude 控制提示：目标、计划等原生控制提示；后台任务统一进入会话菜单。
 
 import { button, element } from "../ui/dom.js";
 import { notice } from "../ui/notice.js";
@@ -25,23 +25,9 @@ export function claudePlanOptionLabel(label) {
   if (/manually approve edits/i.test(text)) return "批准，编辑逐项确认";
   return `批准：${text}`;
 }
-// 原生底栏摘要（如 “1 shell”、“2 shells”）翻译为中文；未知写法保留原文，不猜测数量或类型。
-function claudeBackgroundLabel(value) {
-  const text = String(value || "").trim();
-  const names = { shell: "后台命令", monitor: "监控", agent: "后台子代理", task: "后台任务" };
-  const parts = text.split(/\s*,\s*/).map(part => {
-    const match = /^(\d+)\s+(?:local\s+|background\s+)?(shell|monitor|agent|task)s?$/i.exec(part);
-    return match ? `${match[1]} 个${names[match[2].toLowerCase()]}` : null;
-  });
-  return parts.length && parts.every(Boolean) ? parts.join("、") : text === "background" ? "后台任务" : text;
-}
 export function renderClaudeControlNotices(root) {
   if (!isClaude()) return;
-  // 用户要求网页能看到原版 Claude 仍在运行的后台任务（后台命令、监控、后台子代理）；数据取自原生底栏，
-  // 仅在会话在线且画面可读时由 Rust 视图 backgroundTasks 提供。任务结束后原版会以新一轮自动继续回复。
-  const background = typeof thread?.backgroundTasks === "string" ? thread.backgroundTasks.trim() : "";
-  if (background) root.append(element("div", "pending-banner",
-    `后台任务运行中：${claudeBackgroundLabel(background)}。任务结束后 Claude 会自动继续回复。`));
+  // 用户确认后台任务放在会话菜单的子智能体上方，输入框不再重复展示后台任务横幅。
   // 压缩运行及终态统一进入正文；等待/待确认只走 renderCompactionBanner，避免输入区双重提示。
   for (const command of thread?.nativeCommands || []) {
     if (command.name !== "goal" || !["pending", "unknown", "failed"].includes(command.state)) continue;

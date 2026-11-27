@@ -2050,6 +2050,42 @@ class SdkHostConnectionTests(unittest.TestCase):
         exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), scope)
         return scope
 
+    def test_background_start_time_survives_replay_and_completion_clears_cached_registry(self):
+        scope = self.load_host()
+        host = scope["Host"]("00000000-0000-4000-8000-000000000002", {})
+        with patch("time.time", return_value=100):
+            started = {"type": "system", "subtype": "task_started", "task_id": "a",
+                       "task_type": "local_bash", "description": "等待结束"}
+            host.observe(started)
+        self.assertEqual(started["_elvesTaskStartedAtMs"], 100_000)
+        with patch("time.time", return_value=200):
+            repeated = {"type": "system", "subtype": "task_started", "task_id": "a"}
+            host.observe(repeated)
+        self.assertEqual(repeated["_elvesTaskStartedAtMs"], 100_000)
+        host.observe({"type": "system", "subtype": "background_tasks_changed",
+                      "tasks": [{"task_id": "a", "task_type": "local_bash"}]})
+        host.observe({"type": "system", "subtype": "task_notification", "task_id": "a", "status": "running"})
+        self.assertIn("a", host.started)
+        host.observe({"type": "system", "subtype": "task_notification", "task_id": "a", "status": "completed"})
+        self.assertNotIn("a", host.started)
+        self.assertEqual(host.last["tasks"]["tasks"], [])
+
+    def test_foreground_start_time_is_replayed_when_the_command_later_moves_to_background(self):
+        scope = self.load_host()
+        host = scope["Host"]("00000000-0000-4000-8000-000000000003", {})
+        with patch("time.time", return_value=100):
+            host.observe({"type": "system", "subtype": "task_started", "task_id": "a",
+                          "task_type": "local_bash", "is_backgrounded": False})
+        host.observe({"type": "system", "subtype": "background_tasks_changed", "tasks": []})
+        self.assertNotIn("a", host.started)
+        registry = {"type": "system", "subtype": "background_tasks_changed",
+                    "tasks": [{"task_id": "a", "task_type": "local_bash", "description": "命令"}]}
+        host.observe(registry)
+        self.assertEqual(registry["tasks"][0]["_elvesTaskStartedAtMs"], 100_000)
+        self.assertEqual(host.last["tasks"]["tasks"][0]["_elvesTaskStartedAtMs"], 100_000)
+        host.observe({"type": "system", "subtype": "task_notification", "task_id": "a", "status": "completed"})
+        self.assertNotIn("a", host.task_started_at)
+
     def test_a_silent_harness_is_not_dropped_by_a_read_timeout(self):
         scope = self.load_host()
         scope["CLIENT_SEND_TIMEOUT"] = 0.3

@@ -405,6 +405,10 @@ impl Conversation {
     }
 
     fn view(&self) -> Value {
+        self.view_at(now_ms())
+    }
+
+    fn view_at(&self, sampled_at_ms: u64) -> Value {
         // 用户要求实例显示名统一简化；wslUser、实例 ID 和实际运行用户保持原用途。
         // 子代理沿用原生身份和只读详情，侧边会话仍独立保持未适配；不能据此开放子代理写操作。
         let capabilities = json!({"sideThreads":false,"subagents":true,
@@ -443,6 +447,10 @@ impl Conversation {
             "versionRecovery":self.native_control["versionRecovery"],
             // CLI 汇报的后台任务摘要（如 “1 shell”），仅会话在线且有后台任务时存在，网页负责翻译展示。
             "backgroundTasks":if self.shared {self.native_status["background"].clone()} else {Value::Null},
+            // 用户要求菜单显示原生任务名称和执行时间；保留旧摘要字段，不把普通工具调用当作后台任务。
+            "backgroundTaskItems":if self.shared {
+                background_task_items(&self.native_status, sampled_at_ms)
+            } else {json!([])},
             "nativeId":self.native_id,
             "wslDistribution":self.config.distribution,
             "instanceId":self.config.instance_id(),
@@ -450,6 +458,31 @@ impl Conversation {
             "wslUser":self.config.user,
             "capabilities":capabilities})
     }
+}
+
+fn background_task_items(status: &Value, now: u64) -> Value {
+    if status["sessionAlive"] != true {
+        return json!([]);
+    }
+    let Some(items) = status["backgroundTaskItems"].as_array() else {
+        return Value::Null;
+    };
+    json!(items.iter().filter(|item| item.is_object() && item["id"].is_string()).map(|item| {
+        let mut item = item.clone();
+        // 在宿主时钟上计算基准时长，网页只续加收到快照之后的时间，避免跨设备时钟偏差。
+        // 没有开始事件或原生用时证据时保留 null；不能把首次打开菜单当成任务开始。
+        let elapsed = item["startedAtMs"].as_u64().and_then(|start| now.checked_sub(start))
+            .or_else(|| {
+                let elapsed = item["elapsedMs"].as_u64()?;
+                let sampled = item["sampledAtMs"].as_u64()?;
+                now.checked_sub(sampled).map(|delta| elapsed.saturating_add(delta))
+            });
+        item["elapsedMs"] = json!(elapsed);
+        if let Some(fields) = item.as_object_mut() {
+            fields.remove("sampledAtMs");
+        }
+        item
+    }).collect::<Vec<_>>())
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
@@ -3543,7 +3576,9 @@ impl Claude {
                     "原生会话 UUID 不匹配，未替换原历史"
                 );
                 let initial_import = c.discovered && c.turns.is_empty();
-                let previous_view = c.view();
+                // 同一次快照前后使用同一计时基准，不能仅因后台任务多运行了几毫秒就重发整段历史。
+                let view_time = now_ms();
+                let previous_view = c.view_at(view_time);
                 if frame["native_control"].is_object() {
                     c.native_control = frame["native_control"].clone();
                     c.apply_native_settings(&frame["native_control"]["settings"]);
@@ -3690,7 +3725,7 @@ impl Claude {
                         Some("pending" | "running")
                     )
                     && !c.remote_queue.is_awaiting_compaction();
-                let mut view = c.view();
+                let mut view = c.view_at(view_time);
                 let changed = history_changed
                     || previous_view != view
                     || previous_queue != c.queue_snapshot(&self.epoch);
@@ -5559,6 +5594,24 @@ fn project_frame(turn: &mut Value, frame: &Value) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_task_view_uses_server_time_and_keeps_missing_time_unknown() {
+        let status = json!({"sessionAlive":true,"backgroundTaskItems":[
+            {"id":"start","startedAtMs":1000},
+            {"id":"progress","elapsedMs":2500,"sampledAtMs":4000},
+            {"id":"unknown"},
+            {"id":"future","startedAtMs":9000}
+        ]});
+        let items = background_task_items(&status, 5000);
+        assert_eq!(items[0]["elapsedMs"], 4000);
+        assert_eq!(items[1]["elapsedMs"], 3500);
+        assert!(items[2]["elapsedMs"].is_null());
+        assert!(items[3]["elapsedMs"].is_null());
+        assert!(background_task_items(&json!({"sessionAlive":false}), 5000)
+            .as_array().unwrap().is_empty());
+        assert!(background_task_items(&json!({"sessionAlive":true}), 5000).is_null());
+    }
 
     #[test]
     fn configured_and_saved_wsl_environments_share_the_same_validation_rules() {

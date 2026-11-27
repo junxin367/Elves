@@ -9,6 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Value, json};
 
+use super::background::BackgroundTasks;
+
 /// 会话执行状态；与旧共享对端快照里的 `native_status.tempo` 取值相同，上层队列与视图不需改动。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Tempo {
@@ -60,11 +62,6 @@ pub(super) struct Request {
     pub plan_modes: BTreeMap<u64, Option<String>>,
 }
 
-#[derive(Clone, Debug)]
-struct Task {
-    kind: String,
-}
-
 /// 状态折算后需要对端额外处理的事项；纯状态机本身不执行它们。
 #[derive(Default, Debug, PartialEq)]
 pub(super) struct Observed {
@@ -104,7 +101,8 @@ pub(super) struct PeerState {
     pub actual: Actual,
     sent: BTreeMap<String, Sent>,
     requests: BTreeMap<String, Request>,
-    tasks: BTreeMap<String, Task>,
+    tasks: BackgroundTasks,
+    native_task_work: BTreeSet<String>,
     turn_users: Vec<String>,
     /// 当前流式消息的各内容块文字；只用于临时预览，正式正文以 JSONL 为准。
     streaming: BTreeMap<u64, String>,
@@ -127,7 +125,8 @@ impl PeerState {
             actual: Actual::default(),
             sent: BTreeMap::new(),
             requests: BTreeMap::new(),
-            tasks: BTreeMap::new(),
+            tasks: BackgroundTasks::default(),
+            native_task_work: BTreeSet::new(),
             turn_users: Vec::new(),
             streaming: BTreeMap::new(),
             message_id: String::new(),
@@ -154,7 +153,8 @@ impl PeerState {
     }
 
     pub(super) fn has_background_tasks(&self) -> bool {
-        !self.tasks.is_empty()
+        // 本次只调整展示；前台任务不进入菜单，但原有原生任务保活保护不能随之取消。
+        !self.native_task_work.is_empty() || self.tasks.has_tasks()
     }
 
     pub(super) fn set_alive(&mut self, alive: bool, now: u64) {
@@ -168,6 +168,7 @@ impl PeerState {
             self.compacting = false;
             self.requests.clear();
             self.tasks.clear();
+            self.native_task_work.clear();
             self.turn_users.clear();
             self.streaming.clear();
             self.preview_text.clear();
@@ -304,40 +305,23 @@ impl PeerState {
                 }
                 seen.dirty = true;
             }
-            Some("background_tasks_changed") => {
-                self.tasks = frame["tasks"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter(|task| task["ambient"] != true)
-                    .filter_map(|task| {
-                        Some((
-                            task["task_id"].as_str()?.to_owned(),
-                            Task {
-                                kind: task["task_type"].as_str().unwrap_or("").to_owned(),
-                            },
-                        ))
-                    })
-                    .collect();
-                seen.dirty = true;
-            }
-            Some("task_started") => {
-                if let Some(id) = frame["task_id"].as_str() {
-                    self.tasks.insert(
-                        id.to_owned(),
-                        Task {
-                            kind: frame["task_type"].as_str().unwrap_or("").to_owned(),
-                        },
-                    );
-                    seen.dirty = true;
-                }
-            }
-            Some("task_notification") => {
-                if let Some(id) = frame["task_id"].as_str()
-                    && self.tasks.remove(id).is_some()
-                {
-                    seen.dirty = true;
-                }
+            Some("background_tasks_changed" | "task_started" | "task_progress" | "task_notification") => {
+                let work_changed = match frame["subtype"].as_str() {
+                    Some("background_tasks_changed") => {
+                        let next = frame["tasks"].as_array().into_iter().flatten()
+                            .filter(|task| task["ambient"] != true)
+                            .filter_map(|task| task["task_id"].as_str().map(str::to_owned)).collect();
+                        let changed = self.native_task_work != next;
+                        self.native_task_work = next;
+                        changed
+                    }
+                    Some("task_started") => frame["task_id"].as_str()
+                        .is_some_and(|id| self.native_task_work.insert(id.to_owned())),
+                    Some("task_notification") => frame["task_id"].as_str()
+                        .is_some_and(|id| self.native_task_work.remove(id)),
+                    _ => false,
+                };
+                seen.dirty |= self.tasks.observe(frame, now) || work_changed;
             }
             _ => {}
         }
@@ -616,41 +600,12 @@ impl PeerState {
             });
             status["sessionStatusAtMs"] = json!(self.since_ms);
         }
-        if self.alive && !self.tasks.is_empty() {
-            status["background"] = json!(self.background_summary());
+        // 用户要求后台任务进入会话菜单；明细只来自当前在线 CLI，不缓存成历史运行状态。
+        status["backgroundTaskItems"] = if self.alive { self.tasks.items() } else { json!([]) };
+        if self.alive && self.tasks.has_tasks() {
+            status["background"] = json!(self.tasks.summary());
         }
         status
-    }
-
-    /// 与原版底栏摘要同样的写法（“1 shell”“2 agents”），网页负责翻译成中文；按任务首次出现的顺序排列。
-    fn background_summary(&self) -> String {
-        let mut counts: Vec<(&str, usize)> = Vec::new();
-        for task in self.tasks.values() {
-            let name = match task.kind.as_str() {
-                kind if kind.contains("bash") || kind.contains("shell") => "shell",
-                kind if kind.contains("monitor") => "monitor",
-                kind if kind.contains("agent") => "agent",
-                _ => "task",
-            };
-            match counts.iter_mut().find(|(known, _)| *known == name) {
-                Some((_, count)) => *count += 1,
-                None => counts.push((name, 1)),
-            }
-        }
-        counts
-            .into_iter()
-            .map(|(name, count)| {
-                format!(
-                    "{count} {name}{}",
-                    if count > 1 && name != "monitor" {
-                        "s"
-                    } else {
-                        ""
-                    }
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
     }
 
     pub(super) fn requests_value(&self) -> Value {
@@ -1005,6 +960,19 @@ mod tests {
             3,
         );
         assert!(state.status().get("background").is_none());
+    }
+
+    #[test]
+    fn foreground_task_is_hidden_without_removing_native_lifetime_protection() {
+        let mut state = state();
+        state.set_alive(true, 1);
+        state.observe_cli(&json!({"type":"system","subtype":"task_started",
+            "task_id":"foreground","task_type":"local_bash","is_backgrounded":false}), 2);
+        assert!(state.has_background_tasks(), "只调整显示，仍保留原生任务保活保护");
+        assert!(state.status()["backgroundTaskItems"].as_array().unwrap().is_empty());
+        state.observe_cli(&json!({"type":"system","subtype":"task_notification",
+            "task_id":"foreground","status":"completed"}), 3);
+        assert!(!state.has_background_tasks());
     }
 
     #[test]

@@ -13,6 +13,7 @@ import { captureTransferInputs, hasTransferFiles, readTransferInputs, stageTrans
 import { marked, Renderer } from "../assets/harness/vendor/marked.esm.js";
 import { defaultSharedSettings } from "../assets/harness/features/settings/shared-state.js";
 import { messageActionState, renderMessageActions } from "../assets/harness/message-actions.js";
+import { backgroundTaskCount, normalizeBackgroundTasks, preserveBackgroundTaskSnapshot, updateSessionMenuAria } from "../assets/harness/background-tasks.js";
 
 async function navigationFixture(native = false, transport = native ? "desktop" : "remote",
   { mobile = false, android = false, desktopRemoteAccess = native && transport === "desktop" } = {}) {
@@ -837,6 +838,8 @@ function sharedFixtureServer(context) {
   return settings;
 }
 function installSharedFixture(context, code) {
+  if (/\bpreserveBackgroundTaskSnapshot\b/.test(code))
+    context.preserveBackgroundTaskSnapshot ??= preserveBackgroundTaskSnapshot;
   if (!/\bsharedSettingsState\b|\bsaveSharedSettings\(/.test(code)) return;
   context.sharedSettingsState ??= {
     ready: true, saving: false,
@@ -887,6 +890,114 @@ const popupSource = await readFile(new URL("../assets/harness/ui/popup.js", impo
 const markdownRendererSource = await readFile(new URL("../assets/harness/markdown-renderer.js", import.meta.url), "utf8");
 const devServerSource = await readFile(new URL("./dev-harness.mjs", import.meta.url), "utf8");
 const markdownSource = await readFile(new URL("../assets/harness/markdown.js", import.meta.url), "utf8");
+
+test("后台任务只接受当前运行记录，明确空列表优先于旧摘要，不编造时长", () => {
+  const items = normalizeBackgroundTasks([
+    { id: "a", kind: "local_bash", name: "<原生命令>", status: "running", elapsedMs: 0 },
+    { id: "a", name: "重复" }, { id: "done", status: "completed" },
+    { id: "ambient", ambient: true }, { id: "" },
+    { id: "b", kind: "monitor", name: "", elapsedMs: -1 }
+  ]);
+  assert.deepEqual(items, [
+    { id: "a", kind: "shell", name: "<原生命令>", icon: "terminal", count: 1, elapsedMs: 0 },
+    { id: "b", kind: "monitor", name: "监控", icon: "eye", count: 1, elapsedMs: null }
+  ]);
+  assert.equal(backgroundTaskCount(items), 2);
+  assert.deepEqual(normalizeBackgroundTasks([], "2 shells"), []);
+  assert.equal(backgroundTaskCount(normalizeBackgroundTasks(null, "2 shells, 1 monitor")), 3);
+  assert.equal(backgroundTaskCount(normalizeBackgroundTasks(null, "background")), null);
+  assert.deepEqual(normalizeBackgroundTasks(null, "0 shells"), []);
+});
+
+test("后台任务的菜单提示与侧边未读独立组合，归零恢复原说明", () => {
+  const classes = new Set(), attrs = new Map();
+  const trigger = { classList: { contains: name => classes.has(name) },
+    getAttribute: name => attrs.get(name), setAttribute: (name, value) => attrs.set(name, value) };
+  classes.add("has-unread-side-thread");
+  updateSessionMenuAria(trigger);
+  assert.equal(trigger.title, "会话菜单，有未读的侧边会话");
+  classes.add("has-background-tasks"); attrs.set("data-background-task-count", "2");
+  updateSessionMenuAria(trigger);
+  assert.equal(trigger.title, "会话菜单，2 个后台任务正在执行，有未读的侧边会话");
+  classes.delete("has-background-tasks");
+  updateSessionMenuAria(trigger);
+  assert.equal(attrs.get("aria-label"), "会话菜单，有未读的侧边会话");
+});
+
+test("后台任务结束的实时快照优先于迟到读取，不能跨会话覆盖", () => {
+  const stale = { id: "a", backgroundTasks: "1 shell", backgroundTaskItems: [{ id: "old" }] };
+  preserveBackgroundTaskSnapshot(stale, { id: "a", backgroundTasks: null, backgroundTaskItems: [] });
+  assert.deepEqual(stale.backgroundTaskItems, []);
+  assert.equal(stale.backgroundTasks, null);
+  const other = { id: "b", backgroundTaskItems: [{ id: "own" }] };
+  preserveBackgroundTaskSnapshot(other, stale);
+  assert.deepEqual(other.backgroundTaskItems, [{ id: "own" }]);
+});
+
+test("后台任务稍后补齐时间时原位更新文字与说明，零用时有效", () => {
+  const node = { textContent: "", title: "" };
+  const context = rawVm.createContext({
+    backgroundItems: [{ id: "a", elapsedMs: null }], backgroundTimes: [{ node, id: "a" }],
+    backgroundSampledAtMs: 0, backgroundClock: () => 0,
+    finiteTime: value => Number.isFinite(value) && value >= 0
+  });
+  rawVm.runInContext(sessionMenuSource.slice(sessionMenuSource.indexOf("function duration("),
+    sessionMenuSource.indexOf("function menuResponse(")) + sessionMenuSource.slice(
+      sessionMenuSource.indexOf("  function updateBackgroundTimes("),
+      sessionMenuSource.indexOf("  function syncBackgroundTasks(")), context);
+  context.updateBackgroundTimes();
+  assert.equal(node.textContent, "—");
+  assert.equal(node.title, "未获取到任务开始时间");
+  context.backgroundItems = [{ id: "a", elapsedMs: 0 }];
+  context.updateBackgroundTimes();
+  assert.equal(node.textContent, "0秒");
+  assert.equal(node.title, "执行时间");
+});
+
+test("后台任务同步不因菜单轮询重置计时，断线和会话切换清除运行提示", () => {
+  let clock = 1000, renders = 0, timeUpdates = 0;
+  let snapshot = { scope: "device:a", connected: true,
+    items: [{ id: "task", kind: "local_bash", name: "任务", elapsedMs: 5000 }] };
+  const classes = new Set(), attrs = new Map();
+  const trigger = { classList: {
+    contains: name => classes.has(name),
+    toggle(name, enabled) { enabled ? classes.add(name) : classes.delete(name); }
+  }, getAttribute: name => attrs.get(name), setAttribute: (name, value) => attrs.set(name, value),
+  removeAttribute: name => attrs.delete(name) };
+  const context = rawVm.createContext({
+    backgroundSource: null, backgroundScope: "", backgroundSummary: "", backgroundConnected: false,
+    backgroundItems: [], backgroundSampledAtMs: 0, backgroundSignature: "", opened: true,
+    retiredBackgroundSources: new WeakSet(),
+    trigger, getBackgroundTasks: () => snapshot, backgroundClock: () => clock,
+    normalizeBackgroundTasks, backgroundTaskCount, updateSessionMenuAria,
+    renderBackgroundTasks: () => ++renders, updateBackgroundTimes: () => ++timeUpdates
+  });
+  rawVm.runInContext(sessionMenuSource.slice(sessionMenuSource.indexOf("  function syncBackgroundTasks("),
+    sessionMenuSource.indexOf("  function renderBackgroundTasks(")), context);
+  context.syncBackgroundTasks();
+  assert.equal(context.backgroundSampledAtMs, 1000);
+  assert.equal(renders, 1);
+  clock = 3000; context.syncBackgroundTasks();
+  assert.equal(context.backgroundSampledAtMs, 1000, "相同快照只续计，不重置基准");
+  snapshot = { ...snapshot, items: [{ ...snapshot.items[0], elapsedMs: 7000 }] };
+  context.syncBackgroundTasks();
+  assert.equal(renders, 1, "仅执行时间变化不重建菜单");
+  assert.equal(timeUpdates, 1);
+  snapshot = { ...snapshot, connected: false };
+  context.syncBackgroundTasks();
+  assert.equal(classes.has("has-background-tasks"), false);
+  assert.equal(context.backgroundItems.length, 0);
+  snapshot = { ...snapshot, connected: true };
+  context.syncBackgroundTasks();
+  assert.equal(context.backgroundItems.length, 0, "连接恢复不能让断线前的同一份任务快照复活");
+  snapshot = { ...snapshot, items: [{ ...snapshot.items[0], elapsedMs: 9000 }] };
+  context.syncBackgroundTasks();
+  assert.equal(context.backgroundItems.length, 1, "重新读取到任务后再恢复运行提示");
+  snapshot = { scope: "device:b", connected: true, items: [] };
+  context.syncBackgroundTasks();
+  assert.equal(context.backgroundItems.length, 0);
+  assert.equal(trigger.title, "会话菜单");
+});
 
 test("正文文件引用接受相对和绝对路径，纯文件名及文件名行号保持普通内容", () => {
   for (const value of ["README.md", "app.ts", "app.ts:12", "README.md#L10", "LICENSE", "README%2Emd"])
@@ -3892,6 +4003,7 @@ test("服务菜单实际展示子智能体并继续禁用侧边会话，旧侧�
   };
   const context = vm.createContext({ nativeConnectionVersion: 1,
     menu, groups, mutationButtons, element, itemButton, section, times: [], document: { activeElement: null },
+    backgroundGroup: null, backgroundTimes: [], syncBackgroundTasks() {}, renderBackgroundTasks() {},
     layer: { classList: { toggle() {} } }, pinned: () => false, desktop: () => false,
     context: { subagentsEnabled: true, sideThreadsEnabled: false, connected: true, threadId: "parent" },
     cached: { loadedAtMs: 1, data: { subagents: [{ id: "child", name: "工作中的子智能体", status: "active" }],
@@ -9227,7 +9339,6 @@ test("Claude 终端回退菜单提示说明消息排队与回退后的执行位�
 test("Claude 自动续跑提示使用中文，recap 沿用原生前缀，未知写法保留原文", () => {
   const context = nodeVm.createContext({ nativeConnectionVersion: 1,});
   nodeVm.runInContext(sourceSection("function claudeTaskNotificationText(", "function renderTranscriptEvent("), context);
-  nodeVm.runInContext(sourceSection("function claudeBackgroundLabel(", "function renderClaudeControlNotices("), context);
   const text = item => ({ ...context.claudeTaskNotificationText(item) });
   assert.deepEqual(text({ kind: "command", status: "failed", summary: "Background command \"make\" failed with exit code 2" }),
     { label: "后台命令失败 · Claude 自动继续", description: "Background command \"make\" failed with exit code 2" });
@@ -9239,11 +9350,12 @@ test("Claude 自动续跑提示使用中文，recap 沿用原生前缀，未知�
   assert.equal(text({ kind: "agent", status: "completed" }).label, "后台子代理已完成 · Claude 自动继续");
   assert.equal(text({ kind: "task", status: "killed" }).label, "后台任务已停止 · Claude 自动继续");
   assert.equal(text({}).description, "原生任务通知没有提供摘要。");
-  assert.equal(context.claudeBackgroundLabel("1 shell"), "1 个后台命令");
-  assert.equal(context.claudeBackgroundLabel("2 shells, 1 monitor"), "2 个后台命令、1 个监控");
-  assert.equal(context.claudeBackgroundLabel("1 local agent"), "1 个后台子代理");
-  assert.equal(context.claudeBackgroundLabel("background"), "后台任务");
-  assert.equal(context.claudeBackgroundLabel("3 bashes running"), "3 bashes running");
+  const backgroundLabel = value => normalizeBackgroundTasks(null, value).map(item => item.name).join("、");
+  assert.equal(backgroundLabel("1 shell"), "1 个后台命令");
+  assert.equal(backgroundLabel("2 shells, 1 monitor"), "2 个后台命令、1 个监控");
+  assert.equal(backgroundLabel("1 local agent"), "1 个后台子代理");
+  assert.equal(backgroundLabel("background"), "后台任务");
+  assert.equal(backgroundLabel("3 bashes running"), "3 bashes running");
   const event = item => ({ ...context.claudeEventText(item) });
   assert.deepEqual(event({ type: "claudeLocalCommand", name: "/resume", args: "", output: "已在后台运行" }),
     { label: "终端执行了 /resume", description: "已在后台运行" });
@@ -11459,8 +11571,15 @@ const expiredSideProbe = {
 
 function sideExpiryHarness(response) {
   const { context, calls } = transportClient(response), scheduled = new Map(), menuChanges = [], notices = [];
-  const node = () => ({ hidden: false, attributes: {}, classList: { toggle() {}, remove() {} },
-    setAttribute(name, value) { this.attributes[name] = value; } });
+  const node = () => {
+    const classes = new Set();
+    return { hidden: false, attributes: {}, classList: {
+      contains: name => classes.has(name),
+      toggle(name, enabled) { enabled ? classes.add(name) : classes.delete(name); },
+      remove(name) { classes.delete(name); }
+    }, getAttribute(name) { return this.attributes[name] ?? null; },
+    setAttribute(name, value) { this.attributes[name] = value; } };
+  };
   const nodes = new Map([".workspace", "#composer", "#side-thread-expired", "#open-sidebar", "#connection-state",
     "#open-session-tools", "#related-session-back", "#pending-area"].map(selector => [selector, node()]));
   const id = expiredSideProbe.threadId, parent = "test-parent";
@@ -11478,6 +11597,7 @@ function sideExpiryHarness(response) {
     sessionMenu: { markSideThreadRead: value => menuChanges.push(["read", value]),
       removeThread: value => menuChanges.push(["remove", value]), updateContext() {}, reposition() {} },
     syncRelatedModelDisplay() {}, syncSideThreadPresence() {}, syncRelatedSidebarLayout: null, markSidebarThreadReadLocally() {},
+    updateSessionMenuAria,
     $: selector => nodes.get(selector), renderMessages() {}, renderSidebar() {},
     resetRelatedSessions() { assert.fail("缺失识别不得清除当前侧边关系"); },
     showWelcome() { assert.fail("侧边过期或暂未加载不得跳到欢迎页"); },

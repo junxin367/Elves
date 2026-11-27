@@ -1,6 +1,7 @@
 // 关联会话共享状态：关联与侧边会话视图、操作记录与计时器、侧边新建与返回状态。
 
 import { $ } from "../../ui/dom.js";
+import { updateSessionMenuAria } from "../../background-tasks.js";
 import { creating, selectedId, sidebar } from "../../core/state.js";
 import { randomId } from "../../core/util.js";
 import { sessionMenu } from "../shell-state.js";
@@ -31,8 +32,8 @@ export function syncSideThreadUnread() {
   const unread = !creating && !relatedSessionView && (sidebar?.unreadSideThreads || [])
     .some(item => item.parentThreadId === selectedId);
   trigger.classList.toggle("has-unread-side-thread", unread);
-  const label = unread ? "会话菜单，有未读的侧边会话" : "会话菜单";
-  trigger.setAttribute("aria-label", label); trigger.title = label;
+  // 侧边未读和后台任务是两个独立状态；更新左下角时保留右上角任务提示及无障碍说明。
+  updateSessionMenuAria(trigger);
 }
 export function sessionMenuIsOpen() {
   if (relatedSessionView) return false;

@@ -1,6 +1,7 @@
 // 会话切换：选择会话、新建会话、显示欢迎页，判断所选会话是否读取完整；读取版本与地址栏同步等状态在 selection-state.js。
 
 import { clearComposerAttachments } from "../../attachments.js";
+import { preserveBackgroundTaskSnapshot } from "../../background-tasks.js";
 import { $ } from "../../ui/dom.js";
 import { notice } from "../../ui/notice.js";
 import { closePopup } from "../../ui/popup.js";
@@ -285,6 +286,7 @@ export async function selectThread(id, { closeSidebar = true, force = false, rel
   try {
     const result = await api("/api/read/thread", { threadId: id }, undefined, controller.signal);
     if (version !== selectionVersion || read !== threadReadVersion || selectedId !== id || threadDeleted(id)) return;
+    if (runtimeVersion !== statusVersion) preserveBackgroundTaskSnapshot(result.thread, thread);
     setThread(reconcileRemoteFastPreference(result.thread, fastReadVersion));
     if (thread?.id !== id) throw new Error("会话返回内容与当前会话不一致");
     setThreadReadFailed(false);

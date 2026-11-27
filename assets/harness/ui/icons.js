@@ -79,7 +79,8 @@ export function icon(name) {
     retry: '<path d="M3 10a9 9 0 1 1 2.4 8"/><path d="M3 4v6h6"/>',
     terminal: '<rect x="3" y="4" width="18" height="16" rx="3"/><path d="m7 9 3 3-3 3m6 0h4"/>',
     globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c5 5 5 13 0 18-5-5-5-13 0-18Z"/>',
-    tools: '<rect x="3" y="3" width="6" height="6" rx="2"/><rect x="15" y="3" width="6" height="6" rx="2"/><rect class="session-tools-lower-left" x="3" y="15" width="6" height="6" rx="2"/><rect x="15" y="15" width="6" height="6" rx="2"/><circle class="session-tools-unread-dot" cx="6" cy="18" r="3"/>',
+    // 用户确认右上格换为后台命令图标并柔和呼吸；9/24 的缩放只作用于该格，左下侧边未读独立保留。
+    tools: '<rect x="3" y="3" width="6" height="6" rx="2"/><rect class="session-tools-upper-right" x="15" y="3" width="6" height="6" rx="2"/><g class="session-tools-background-task"><g transform="translate(13.5 1.5) scale(.375)" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="m7 9 3 3-3 3m6 0h4"/></g></g><rect class="session-tools-lower-left" x="3" y="15" width="6" height="6" rx="2"/><rect x="15" y="15" width="6" height="6" rx="2"/><circle class="session-tools-unread-dot" cx="6" cy="18" r="3"/>',
     laptop: '<path d="M5 4h14v12H5ZM2 20h20l-3-4H5Z"/>',
     smartphone: '<rect x="6" y="2" width="12" height="20" rx="2"/><path d="M12 18h.01"/>',
     copy: '<rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h3"/>',

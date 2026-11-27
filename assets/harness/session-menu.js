@@ -1,4 +1,6 @@
 import { menuHorizontalLeft } from "./ui/position.js";
+import { icon } from "./ui/icons.js";
+import { backgroundTaskCount, normalizeBackgroundTasks, updateSessionMenuAria } from "./background-tasks.js";
 
 let menuSequence = 0;
 
@@ -42,13 +44,18 @@ function menuSignature(data) {
 }
 
 export function mountSessionMenu({
-  trigger, getContext, load, openChanges, openBrowser, openFiles, openSubagent, createSideThread, openSideThread,
+  trigger, getContext, getBackgroundTasks, load, openChanges, openBrowser, openFiles, openSubagent, createSideThread, openSideThread,
   closeSideThread, beforeOpen, onError, onData, cache, renderSubagentIcon
 }) {
   let disposed = false, opened = false, owner = "", authorization = "", context = null, cached = null;
   let suspended = false;
   let ticker = null, press = null, suppressedClick = null, blockedContext = null;
   let positionFrame = null, positionSignature = "";
+  let backgroundSource = null, backgroundScope = "", backgroundSummary = "", backgroundConnected = false;
+  let backgroundItems = [], backgroundSampledAtMs = 0, backgroundSignature = "", backgroundGroup = null;
+  const backgroundTimes = [];
+  const retiredBackgroundSources = new WeakSet();
+  const backgroundClock = () => globalThis.performance?.now?.() ?? Date.now();
   const entries = new Map(), maxEntries = 32, refreshAgeMs = 30000;
   let contextSource = null, contextItem = null, contextPosition = null, message = "";
   const times = [], mutationButtons = new Map(), listeners = [];
@@ -276,6 +283,74 @@ export function mountSessionMenu({
         : item.status === "waiting" ? `等待 · ${duration(elapsed)}` : duration(elapsed);
       if (node.textContent !== text) node.textContent = text;
     }
+    updateBackgroundTimes();
+  }
+  function updateBackgroundTimes() {
+    const delta = Math.max(0, backgroundClock() - backgroundSampledAtMs);
+    const byId = new Map(backgroundItems.map(item => [item.id, item]));
+    for (const { node, id } of backgroundTimes) {
+      const item = byId.get(id);
+      const known = item && finiteTime(item.elapsedMs);
+      const text = known ? duration(item.elapsedMs + delta) : "—";
+      const title = known ? "执行时间" : "未获取到任务开始时间";
+      if (node.textContent !== text) node.textContent = text;
+      if (node.title !== title) node.title = title;
+    }
+  }
+  function syncBackgroundTasks(renderChanges = true) {
+    let value = null;
+    try { value = getBackgroundTasks?.() || null; } catch {}
+    const scope = typeof value?.scope === "string" ? value.scope : "";
+    const live = !!scope && value?.connected === true;
+    const source = live ? Array.isArray(value.items) ? value.items : value.snapshot || null : null;
+    const summary = live ? value.summary : "";
+    if ((!live || backgroundScope !== scope) && backgroundSource && typeof backgroundSource === "object")
+      retiredBackgroundSources.add(backgroundSource);
+    if (backgroundSource === source && backgroundScope === scope
+        && backgroundSummary === summary && backgroundConnected === live) return;
+    backgroundSource = source; backgroundScope = scope; backgroundSummary = summary; backgroundConnected = live;
+    // 重新连上事件通道不等于已取得新快照；断线/会话切换前的同一份记录不得重新点亮运行提示。
+    const fresh = !source || typeof source !== "object" || !retiredBackgroundSources.has(source);
+    backgroundItems = live && fresh ? normalizeBackgroundTasks(value.items, summary) : [];
+    backgroundSampledAtMs = backgroundClock();
+    const count = backgroundTaskCount(backgroundItems);
+    trigger.classList.toggle("has-background-tasks", backgroundItems.length > 0);
+    if (count == null) trigger.removeAttribute("data-background-task-count");
+    else trigger.setAttribute("data-background-task-count", String(count));
+    updateSessionMenuAria(trigger);
+    const signature = JSON.stringify(backgroundItems.map(({ elapsedMs, ...item }) => item));
+    const changed = backgroundSignature !== signature;
+    backgroundSignature = signature;
+    // 任务快照不进入关联会话持久缓存；更新执行时间不重建菜单，保留焦点与阅读位置。
+    if (opened && renderChanges && changed) renderBackgroundTasks();
+    else if (opened) updateBackgroundTimes();
+  }
+  function renderBackgroundTasks() {
+    backgroundGroup?.remove(); backgroundGroup = null; backgroundTimes.length = 0;
+    // 用户确认：无后台任务时整个分组不出现；只读列表固定在子智能体之前，不提供停止或详情入口。
+    if (!backgroundItems.length) { if (opened) fit(); return; }
+    const group = section("后台任务");
+    backgroundGroup = group;
+    group.classList.add("session-related-menu-background");
+    const count = backgroundTaskCount(backgroundItems);
+    if (count != null) group.querySelector(".session-related-menu-group-header")
+      .append(element("span", "session-related-menu-background-count", String(count)));
+    const list = element("div", "session-related-menu-background-list");
+    list.setAttribute("role", "list"); list.setAttribute("aria-label", "后台任务");
+    for (const item of backgroundItems) {
+      const row = element("div", "session-related-menu-item session-related-menu-background-task");
+      row.setAttribute("role", "listitem");
+      row.append(icon(item.icon));
+      const name = element("span", "session-related-menu-name", item.name);
+      name.title = item.name;
+      const time = element("span", "session-related-menu-time");
+      time.title = finiteTime(item.elapsedMs) ? "执行时间" : "未获取到任务开始时间";
+      row.append(name, time); list.append(row); backgroundTimes.push({ node: time, id: item.id });
+    }
+    group.append(list);
+    menu.insertBefore(group, menu.children[1] || null);
+    updateBackgroundTimes();
+    if (opened) fit();
   }
   function invoke(callback, args, expected, mutation = false, onSuccess, { keepMenu = false } = {}) {
     if (!owns(expected) || mutation && !canMutate(context) || typeof callback !== "function") return;
@@ -322,6 +397,8 @@ export function mountSessionMenu({
     // 手机转为 PC 布局时，浏览器入口会移除；原焦点回到相邻的文件入口，避免键盘焦点落到页面外。
     const focusedKey = previousKey === "browser" && desktop() ? "files" : previousKey;
     cancelPress(); hideContext(); times.length = 0; mutationButtons.clear(); menu.replaceChildren();
+    backgroundGroup = null; backgroundTimes.length = 0;
+    syncBackgroundTasks(false);
     const tools = element("div", "session-related-menu-group");
     menu.append(tools);
     layer.classList.toggle("session-menu-pinned", pinned());
@@ -334,6 +411,7 @@ export function mountSessionMenu({
       const browser = itemButton("浏览器", openBrowser, []);
       browser.dataset.menuKey = "browser"; tools.append(browser);
     }
+    renderBackgroundTasks();
     // 旧后台未声明独立能力时继续置灰；新后台的子智能体和侧边会话分别受控，不展示禁用能力的旧缓存。
     if (context?.subagentsEnabled === false && context?.sideThreadsEnabled === false) {
       const subagents = section("子智能体");
@@ -682,6 +760,7 @@ export function mountSessionMenu({
     ticker = setInterval(() => {
       syncContext();
       if (opened) {
+        syncBackgroundTasks();
         updatePermissions(); updateTimes();
         if (context?.connected && !document.hidden && !suspended)
           void refresh({ background: true });
@@ -783,6 +862,7 @@ export function mountSessionMenu({
     else if (opened && !suspended) { fit(); startPositionTracking(); }
   });
   syncContext();
+  syncBackgroundTasks();
   return { toggle, open, close, suspend, resume, refresh, reposition: fit,
     isOpen: () => opened && !suspended, isSuspended: () => opened && suspended,
     canCreateSideThread() {
@@ -790,6 +870,7 @@ export function mountSessionMenu({
     },
     updateContext() {
       const value = syncContext(), entry = entryFor(value);
+      syncBackgroundTasks();
       restore(entry);
       if (entry && value.connected && (!entry.snapshot || entry.dirty
           || Date.now() - entry.snapshot.loadedAtMs >= refreshAgeMs))
@@ -843,7 +924,10 @@ export function mountSessionMenu({
       for (const [name, value] of originalAria) {
         if (value == null) trigger.removeAttribute(name); else trigger.setAttribute(name, value);
       }
-      times.length = 0; mutationButtons.clear(); layer.remove();
+      times.length = 0; backgroundTimes.length = 0; mutationButtons.clear(); layer.remove();
+      trigger.classList.remove("has-background-tasks");
+      trigger.removeAttribute("data-background-task-count");
+      updateSessionMenuAria(trigger);
     }
   };
 }

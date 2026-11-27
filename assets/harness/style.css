@@ -1641,6 +1641,16 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .session-tools-trigger .session-tools-unread-dot{display:none;fill:var(--accent-indicator);stroke:none}
 .session-tools-trigger.has-unread-side-thread .session-tools-lower-left{display:none}
 .session-tools-trigger.has-unread-side-thread .session-tools-unread-dot{display:block}
+/* 用户确认方案 1：只有当前会话存在已确认的后台任务时，右上角显示命令图标并按 2 秒周期柔和呼吸。
+ * 不旋转整枚菜单图标、不影响左下角侧边未读；任务清零后恢复原方块，减少动画模式只保留静态图标。 */
+.ui-icon .session-tools-background-task{display:none}
+.session-tools-trigger.has-background-tasks .session-tools-upper-right{display:none}
+.session-tools-trigger.has-background-tasks .session-tools-background-task{display:inline;color:var(--accent-indicator);animation:session-background-breathe 2s ease-in-out infinite}
+@keyframes session-background-breathe{
+  0%,100%{filter:brightness(1) drop-shadow(0 0 0 transparent)}
+  50%{filter:brightness(1.35) drop-shadow(0 0 .6px var(--accent-indicator))}
+}
+@media(prefers-reduced-motion:reduce){.session-tools-trigger.has-background-tasks .session-tools-background-task{animation:none}}
 .session-tools-menu-dismiss{position:fixed;inset:0;z-index:calc(var(--layer-menu) - 1);background:transparent}
 .session-tools-screen{position:fixed;inset:0;z-index:300;display:flex;flex-direction:column;width:100%;height:100dvh;min-width:0;min-height:0;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);background:var(--bg);overflow:hidden;transform:translate3d(100%,0,0);transition:transform .22s ease-out;will-change:transform}
 .session-tools-screen.session-tools-visible{transform:translate3d(0,0,0)}
@@ -1849,6 +1859,11 @@ html[data-session-window=true] .workspace>.sidebar,html[data-session-window=true
 .session-related-menu-subagents[hidden]{display:none}
 .session-related-menu-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .session-related-menu-time{flex-shrink:0;color:var(--muted);font-size:inherit;font-variant-numeric:tabular-nums;white-space:nowrap}
+/* 用户要求任务名称前有图标、右侧仅显示执行时间；任务行是只读列表，不显示点击、停止或详情操作。 */
+.session-related-menu-background-count{flex-shrink:0;color:var(--muted);font-size:var(--menu-description-font-size);font-variant-numeric:tabular-nums}
+.session-related-menu-item.session-related-menu-background-task{min-height:32px;padding:4px 9px;gap:8px;cursor:default;user-select:text}
+.session-related-menu-item.session-related-menu-background-task:hover{background:transparent}
+.session-related-menu-background-task>.ui-icon{flex:0 0 1em;width:1em;height:1em;color:var(--muted)}
 .session-related-menu-unread{flex:0 0 auto;width:.45em;height:.45em;border-radius:50%;background:var(--accent-indicator)}
 .session-related-menu-running{width:.85em;height:.85em}
 @media(prefers-reduced-motion:reduce){.session-related-menu-running{animation:none}}

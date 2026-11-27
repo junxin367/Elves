@@ -86,6 +86,7 @@ class Host:
         self.stop_at = None
         self.last = {}
         self.started = {}
+        self.task_started_at = {}
         self.requests = {}
         self.state = "idle"
         self.compacting = False
@@ -160,7 +161,11 @@ class Host:
                 frame = None
             if isinstance(frame, dict):
                 self.observe(frame)
-            self.forward(raw if raw.endswith(b"\n") else raw + b"\n")
+            if isinstance(frame, dict) and frame.get("type") == "system" \
+                    and frame.get("subtype") in ("task_started", "background_tasks_changed"):
+                self.forward_value(frame)
+            else:
+                self.forward(raw if raw.endswith(b"\n") else raw + b"\n")
 
     def pump_stderr(self):
         for raw in self.cli.stderr:
@@ -182,15 +187,40 @@ class Host:
             elif sub == "status":
                 self.compacting = frame.get("status") == "compacting"
                 self.last["status"] = frame
-            elif sub == "background_tasks_changed":
+            elif sub == "background_tasks_changed" and isinstance(frame.get("tasks"), list):
+                # 前台开始事件可以早于首次后台快照；连上新 Harness 时仍补发原始计时基准。
+                frame["tasks"] = [
+                    {**task, "_elvesTaskStartedAtMs": self.task_started_at[task["task_id"]]}
+                    if isinstance(task, dict) and task.get("task_id") in self.task_started_at else task
+                    for task in frame["tasks"]]
                 self.last["tasks"] = frame
                 live = {task.get("task_id") for task in frame.get("tasks") or []
                         if isinstance(task, dict) and task.get("ambient") is not True}
                 self.started = {key: value for key, value in self.started.items() if key in live}
             elif sub == "task_started" and isinstance(frame.get("task_id"), str):
+                # 用户要求显示执行时间：宿主首次收到原生开始事件时留存基准，重连重放沿用它，
+                # 不把 Harness 重连或网页首次打开的时间冒充开始时间；原生字段保持原样。
+                task_id = frame["task_id"]
+                self.task_started_at.setdefault(task_id, int(time.time() * 1000))
+                frame["_elvesTaskStartedAtMs"] = self.task_started_at[task_id]
                 self.started[frame["task_id"]] = frame
-            elif sub == "task_notification":
-                self.started.pop(frame.get("task_id"), None)
+                # 仅保留有限的前台计时元数据，不把它用于 has_work 或修改原有宿主回收规则。
+                while len(self.task_started_at) > 512:
+                    oldest = next((key for key in self.task_started_at if key not in self.started), None)
+                    if oldest is None:
+                        break
+                    self.task_started_at.pop(oldest, None)
+            elif sub == "task_notification" and frame.get("status") in (
+                    "completed", "failed", "stopped", "killed", "cancelled", "canceled"):
+                task_id = frame.get("task_id")
+                self.started.pop(task_id, None)
+                self.task_started_at.pop(task_id, None)
+                # 结束事件后即使列表快照尚未到达，重连也不能重放已知结束的任务。
+                tasks = self.last.get("tasks")
+                if tasks is not None:
+                    self.last["tasks"] = {**tasks, "tasks": [
+                        task for task in tasks.get("tasks") or []
+                        if not isinstance(task, dict) or task.get("task_id") != task_id]}
         elif kind == "command_lifecycle" and isinstance(frame.get("command_uuid"), str):
             if frame.get("state") in ("queued", "started"):
                 self.flight.add(frame["command_uuid"])

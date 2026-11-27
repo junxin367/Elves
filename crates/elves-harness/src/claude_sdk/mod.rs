@@ -13,6 +13,7 @@
 //! 用户要求：不使用 bare、替代系统提示词或跳过审批参数，保持原生系统提示、MCP、Skills、Hooks 和权限；
 //! 通过 WSL 登录 shell 启动，使 Claude 进程继承目标 WSL 用户的时区；账号、额度等官方信息仍只经同一 WSL 的 CLI 获取。
 
+mod background;
 mod peer;
 mod state;
 

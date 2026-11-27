@@ -21,7 +21,7 @@ import { composerTooltips, installComposerTooltips, setComposerTooltips } from "
 import {
   closeComposerMenus, loadModels, renderSidebar, requireAuthentication, updateComposer
 } from "../core/actions.js";
-import { app, connected, creating, nativeConnectionVersion, selectedId, session, sidebar } from "../core/state.js";
+import { app, connected, creating, nativeConnectionVersion, selectedId, session, sidebar, thread } from "../core/state.js";
 import { api } from "./api.js";
 import { disposeMainNavigation, isElvesClient, mountMainNavigation } from "./main-navigation.js";
 import { mountSettingsPage } from "./appearance/dialog.js";
@@ -464,6 +464,14 @@ export function shell() {
   }));
   setSessionMenu(mountSessionMenu({
     trigger: toolsTrigger,
+    // 用户要求只展示所属会话的实时后台任务；侧边菜单虽可读取父关联列表，也不能借用父会话任务。
+    getBackgroundTasks: () => ({
+      scope: !creating && thread?.id === selectedId
+        ? JSON.stringify([privateInputScope(session), selectedId, nativeConnectionVersion]) : "",
+      connected, snapshot: thread?.id === selectedId ? thread : null,
+      items: thread?.id === selectedId ? thread.backgroundTaskItems : null,
+      summary: thread?.id === selectedId ? thread.backgroundTasks : ""
+    }),
     getContext: () => {
       const parentThreadId = relatedSessionView?.kind === "side"
         ? relatedSessionView.openedFromThreadId || relatedSessionView.parentThreadId : null;

@@ -1,6 +1,7 @@
 // 历史读取：分页读取、Claude 历史排序、增量合并、重新读取会话，以及历史加载占位与调度；读取进度与正文视图状态在 history-state.js。
 
 import { recordDiagnostic } from "../../diagnostics.js";
+import { preserveBackgroundTaskSnapshot } from "../../background-tasks.js";
 import { $, button, element } from "../../ui/dom.js";
 import { notice } from "../../ui/notice.js";
 import { renderApprovals, renderMessages, updateComposer } from "../../core/actions.js";
@@ -483,6 +484,7 @@ export async function reloadThread() {
       }
       if (usageVersion !== tokenUsageVersion) latest.tokenUsage = notifiedTokenUsage;
       if (runtimeVersion !== statusVersion && notifiedStatus) latest.status = notifiedStatus;
+      if (runtimeVersion !== statusVersion) preserveBackgroundTaskSnapshot(latest, thread);
       if (goalReadVersion !== goalVersion) latest.goal = notifiedGoal;
       applyQueueRead(id, latest, queueReadVersion);
       if (notifiedQueue) {
