@@ -518,13 +518,48 @@ pub(crate) fn parse_transcript_jsonl(text: &str) -> LocalTranscript {
                 }
             }
             "ERROR_MESSAGE" => {
-                if let Some(msg) = entry["content"]
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    && let Some(turn) = turns.last_mut()
-                {
-                    turn["error"] = json!({ "message": msg });
+                // 用户要求历史错误也逐字保留；原生实际将错误写在 error 字段，部分记录使用 content。
+                // ERROR_MESSAGE.status=DONE 只说明该记录完成，后面仍可能重试成功，不能据此设置 turn.error / failed。
+                let mut texts = Vec::new();
+                for text in [
+                    entry["error"].as_str(),
+                    entry["error"]["message"].as_str(),
+                    entry["content"].as_str(),
+                    entry["error"]["details"].as_str(),
+                ].into_iter().flatten() {
+                    if !text.is_empty() && !texts.contains(&text) {
+                        texts.push(text);
+                    }
+                }
+                if texts.is_empty() {
+                    continue;
+                }
+                if turns.is_empty() {
+                    turns.push(json!({
+                        "id": format!("agy-local-turn-{step_index}"),
+                        "status": "completed",
+                        "_nativeRequestTimestamps": true,
+                        "items": [],
+                    }));
+                }
+                let mut item = json!({
+                    "id": format!("agy-local-error-{step_index}"),
+                    "type": "error",
+                    "source": "antigravity",
+                    "message": texts[0],
+                    "nativeMessage": texts[0],
+                });
+                if texts.len() > 1 {
+                    item["nativeDetails"] = json!(&texts[1..]);
+                }
+                if ts_ms > 0 {
+                    item["recordedAtMs"] = json!(ts_ms);
+                }
+                let items = turns.last_mut().unwrap()["items"].as_array_mut().unwrap();
+                if let Some(existing) = items.iter_mut().find(|known| known["id"] == item["id"]) {
+                    *existing = item;
+                } else {
+                    items.push(item);
                 }
             }
             _ if source == "USER" => {
@@ -1173,6 +1208,54 @@ fn format_json_preserving_style(original: &str, document: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_error_records_preserve_native_fields_and_record_time() {
+        let raw = " \tQuota  exceeded\r\n重置：2:40pm (America/Los_Angeles)  \n";
+        let detail = "  <native-detail>\r\n保留原文\t";
+        let entries = [
+            json!({"type":"USER_INPUT","step_index":0,"content":"question"}),
+            json!({"type":"ERROR_MESSAGE","step_index":1,"source":"SYSTEM","status":"DONE",
+                "created_at":"1970-01-01T00:00:02Z","error":raw,"content":detail}),
+            json!({"type":"ERROR_MESSAGE","step_index":1,"source":"SYSTEM","status":"DONE",
+                "created_at":"1970-01-01T00:00:02Z","error":raw,"content":detail}),
+            json!({"type":"ERROR_MESSAGE","step_index":2,"content":detail,"created_at":"unknown"}),
+        ];
+        let parsed = parse_transcript_jsonl(&entries.iter().map(Value::to_string).collect::<Vec<_>>().join("\n"));
+        let turn = &parsed.turns[0];
+        assert!(turn.get("error").is_none(), "历史单条错误不是整轮终态");
+        let items = turn["items"].as_array().unwrap();
+        assert_eq!(items.len(), 3, "重复步骤按原生身份去重，不能生成重复错误记录");
+        assert_eq!(items[1]["type"], "error");
+        assert_eq!(items[1]["source"], "antigravity");
+        assert_eq!(items[1]["nativeMessage"], raw);
+        assert_eq!(items[1]["nativeDetails"], json!([detail]));
+        assert_eq!(items[1]["recordedAtMs"], 2000);
+        assert_eq!(items[2]["nativeMessage"], detail, "content 原文也不能裁剪");
+        assert!(items[2].get("recordedAtMs").is_none(), "未知时间不能借用轮次结束时间");
+    }
+
+    #[test]
+    fn history_error_does_not_override_a_later_success_or_invent_a_user_message() {
+        let raw = "  temporary upstream failure\r\n";
+        let entries = [
+            json!({"type":"ERROR_MESSAGE","step_index":3,"source":"SYSTEM","status":"DONE","error":raw}),
+            json!({"type":"PLANNER_RESPONSE","step_index":4,"status":"DONE","content":"recovered reply"}),
+        ];
+        let parsed = parse_transcript_jsonl(&entries.iter().map(Value::to_string).collect::<Vec<_>>().join("\n"));
+        let turn = &parsed.turns[0];
+        assert_eq!(turn["status"], "completed");
+        assert!(turn.get("error").is_none());
+        assert_eq!(turn["items"][0]["nativeMessage"], raw);
+        assert_eq!(turn["items"][1]["text"], "recovered reply");
+        assert!(turn["items"].as_array().unwrap().iter().all(|item| item["type"] != "userMessage"));
+        let trailing = parse_transcript_jsonl(&json!({
+            "type":"ERROR_MESSAGE","step_index":5,"status":"DONE","error":{"message":raw,"details":"detail"}
+        }).to_string());
+        assert!(trailing.turns[0].get("error").is_none(), "文件末尾有错误记录也不能猜测整轮已失败");
+        assert_eq!(trailing.turns[0]["items"][0]["nativeMessage"], raw);
+        assert_eq!(trailing.turns[0]["items"][0]["nativeDetails"], json!(["detail"]));
+    }
 
     #[test]
     fn parses_real_antigravity_transcript_jsonl_into_elves_turns() {

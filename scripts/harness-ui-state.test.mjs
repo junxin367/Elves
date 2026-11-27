@@ -15340,6 +15340,35 @@ test("AGY 原生正文已包含相同提示时不重复展示最终错误", () =
   assert.deepEqual(notices[2], [original, "  Additional native details\r\n"], "不同正文必须保留原文限额提示");
 });
 
+test("AGY 历史错误按原文活动记录展示，不把记录时间替换为轮次结束时间", () => {
+  const raw = " \tQuota exceeded\r\n(America/Los_Angeles)  ";
+  for (const afterReply of [false, true]) for (const recordedAtMs of [2000, undefined]) {
+    const record = { id: "native-error", type: "error", source: "antigravity",
+      message: raw, nativeMessage: raw, recordedAtMs };
+    const reply = { id: "reply", type: "agentMessage", text: "随后恢复的回复" };
+    const turn = { id: "agy-local-turn", status: "completed", turnCompletedAtMs: 9000,
+      items: afterReply ? [reply, record] : [record, reply] };
+    const h = claudeExecutionFeedbackHarness(turn), errors = [];
+    h.context.renderTurnError = (error, clock, texts) => {
+      errors.push({ error, clock, texts: Array.from(texts) });
+      return { dataset: {}, children: [], textContent: texts[0] };
+    };
+    h.context.renderActivity = (value, work, _running, _collapsible, render) => ({
+      dataset: { activityKey: value.id }, children: work.map(item => render(item, true)), textContent: ""
+    });
+    h.render();
+    assert.equal(errors.length, 1);
+    assert.equal(errors[0].error, record);
+    assert.deepEqual(errors[0].texts, [raw]);
+    assert.equal(errors[0].clock.turnCompletedAtMs, recordedAtMs);
+    assert.equal(turn.error, undefined);
+    assert.equal(turn.status, "completed", "展示历史记录不得更改整轮结果");
+    const content = node => [node.textContent || "", ...(node.children || []).map(content)].join("");
+    const visible = content(h.root);
+    assert.equal(visible.indexOf(raw) > visible.indexOf(reply.text), afterReply, "错误必须保留原始先后顺序");
+  }
+});
+
 test("Codex turn/completed 通过真实事件入口纠正引导位置", () => {
   const outcomes = [], markReads = [];
   const context = nodeVm.createContext({ nativeConnectionVersion: 1,

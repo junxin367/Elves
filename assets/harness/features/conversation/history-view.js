@@ -164,10 +164,12 @@ export function renderMessages(keepScroll = true) {
     for (const item of turnItems) itemKeys.add(`${turn.id}:${item.id}`);
     const renderMessage = (item, inActivity = false) => {
       const key = `${turn.id}:${item.id}`, cached = renderedItems.get(key);
+      // 历史 ERROR_MESSAGE 是过程记录；原样展示并使用该条记录自己的时间，不冒充整轮失败或结束时间。
+      const recordedErrorTexts = item.type === "error" ? nativeTurnErrorTexts(item) : null;
       // 原生已把同一错误作为正文返回时也按纯文本展示，不能因 Markdown 渲染改变空格、换行或标签内容。
       const nativeErrorText = item.type === "agentMessage" && nativeErrorTexts?.includes(textContent(item))
         ? textContent(item) : null;
-      const nativeError = nativeErrorText !== null;
+      const nativeError = recordedErrorTexts !== null || nativeErrorText !== null;
       const running = turnRunning && (["inProgress", "running"].includes(item.status) || item.type === "reasoning" && item === turnItems.at(-1));
       const editing = item.type === "userMessage" && editingMessage?.threadId === selectedId && editingMessage.messageId === item.id;
       const skillKey = userMessageHasSkills(item)
@@ -177,7 +179,10 @@ export function renderMessages(keepScroll = true) {
         && cached.inActivity === inActivity && cached.running === running
         && cached.editing === editing && cached.skillKey === skillKey && cached.markdownVersion === markdownRenderVersion
         && cached.relatedViewKind === relatedViewKind && cached.relatedEnabled === relatedEnabled
-        ? cached.node : nativeError ? renderTurnError(turn.error, turn, [nativeErrorText])
+        ? cached.node : nativeError ? renderTurnError(
+          recordedErrorTexts ? item : turn.error,
+          recordedErrorTexts ? { turnCompletedAtMs: item.recordedAtMs } : turn,
+          recordedErrorTexts || [nativeErrorText])
           : renderItem(item, cached?.item.type === item.type && !cached.nativeError ? cached.node : null, inActivity, running);
       node.dataset.key = key;
       renderedItems.set(key, { item, node, nativeError, inActivity, running, editing, skillKey, relatedViewKind, relatedEnabled, markdownVersion: markdownRenderVersion });
