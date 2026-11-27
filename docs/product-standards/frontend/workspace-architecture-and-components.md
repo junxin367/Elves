@@ -92,7 +92,7 @@ Elves 与 Harness 共用工作区网页，位于 `assets/harness/`。会话工�
 - `shouldShowMenuSearch(mode, candidateCount, wasVisible)` 是搜索显示的统一判断入口，参数值和数量规则见[菜单搜索框](../core/product-behavior.md#菜单搜索框)。调用方在触发器上显式设置 `searchMode`，普通 Select 默认 `off`；候选数使用查询过滤之前的列表，本次展开状态由弹层宿主管理。
 - `createMenuSearch` 只提供搜索结构与输入事件，输入法组合完成后通知 `onQuery`，合并组合结束及随后的重复输入事件。Popup 在原列表/说明前动态插入搜索框，模型菜单复用相同显示判断；调用方仍须核对输入节点属于当前菜单，避免旧节点更新新的查询。
 - `createMenuButton` 对独立按钮的图标与文字整体居中；`createMenuHelp` 提供说明字号的帮助链接。菜单图标统一使用 `.menu-icon`，保留 SVG、图片及彩色 Emoji 的原有图案。
-- `features/appearance/apply.js` 的 `applyAppearance` 是字号计算入口，一次写入 `--menu-font-size`、`--menu-description-font-size`、`--menu-search-font-size`。内容组件只引用计算结果，外观更新沿用现有菜单重定位和各页面同步机制。
+- `features/appearance/apply.js` 的 `applyAppearance` 是字号计算入口，一次写入 `--control-font-size-lg`、`--control-font-size-md`、`--control-font-size-sm` 与 `--menu-font-size`、`--menu-description-font-size`、`--menu-search-font-size`。控件与菜单组件只引用计算结果，外观更新沿用现有菜单重定位和各页面同步机制。
 
 `ui/popup.js` 管理弹层生命周期、宿主、键盘与焦点、主列表及子列表，保留 `selectOptions`、`menuOptions` 和专用定位回调。标题、帮助同时存在且设置 `popupHelpAfterTitle` 时，共用单行 `.popup-header`；其他帮助与说明位置按原配置排列。搜索框显隐与弹层宽度分开处理：未指定 `popupWidth` 时，声明 `auto` / `on` 的菜单沿用搜索菜单宽度，避免自动显隐导致宽度跳动；开启 `popupAutoWidth` 时按 `popupWidth` 为下限随内容扩展，并支持可选 `popupMaxWidth` 上限（设置与任务中的模型菜单通过 `configureModelMenuWidth` 统一为 `250px～350px`，与输入区模型菜单共用同一常量）。`ui/select.js` 负责选项、值和有效用户变更的单次 `change`；`ui/position.js` 提供通用水平定位。列表重绘按稳定标识恢复有效焦点，并保留选项区阅读位置。
 

@@ -6007,7 +6007,7 @@ test("弹层标题与顶部帮助同行，说明位置及帮助唯一性保持�
     ["popup-title", "popup-list", "popup-note", "popup-help"], "未启用顶部定位的普通弹层保持原布局");
 });
 
-test("菜单字号从界面设置统一取整，外观变化后重新定位已打开菜单", () => {
+test("控件与菜单字号从界面设置统一取整，外观变化后重新定位已打开菜单", () => {
   const values = new Map();
   let refits = 0;
   const context = vm.createContext({
@@ -6029,6 +6029,9 @@ test("菜单字号从界面设置统一取整，外观变化后重新定位已�
     context.appearance.fontSize = base;
     context.applyAppearance();
     assert.equal(values.get("--font-size"), `${base}px`);
+    assert.equal(values.get("--control-font-size-lg"), `${base}px`);
+    assert.equal(values.get("--control-font-size-md"), `${main}px`);
+    assert.equal(values.get("--control-font-size-sm"), `${search}px`);
     assert.equal(values.get("--menu-font-size"), `${main}px`);
     assert.equal(values.get("--menu-description-font-size"), `${detail}px`);
     assert.equal(values.get("--menu-search-font-size"), `${search}px`);
@@ -6071,6 +6074,59 @@ test("公共菜单全端统一采用 32px 行高与 5px 10px 内边距，且不�
   assert.match(css, /\.menu-button\{[^}]*min-height:var\(--menu-item-height\)/);
   assert.match(css, /\.popup-header>\.popup-help\{[^}]*min-height:var\(--menu-item-height\)/);
   assert.match(css, /\.menu-search\{[^}]*padding:var\(--menu-item-padding-block\) 8px;min-height:32px/);
+});
+
+test("触发按钮、标准按钮、输入框与工具栏字号对齐 Codex App 视觉层级且保留正文与代码字号边界", async () => {
+  const css = await readFile(new URL("../assets/harness/style.css", import.meta.url), "utf8");
+  assert.match(css, /:root\{--control-font-size-lg:14px;--control-font-size-md:13px;--control-font-size-sm:12px;--menu-font-size:13px;--menu-description-font-size:11px;--menu-search-font-size:12px/);
+  // 标准控件与触发器：92.86% 取整，与下拉菜单主文字同档
+  for (const pattern of [
+    /\.select-trigger\{[^}]*font-size:var\(--control-font-size-md\)/,
+    /\.appearance-screen :is\(input:not\(\[type=range\],\[type=checkbox\],\[type=radio\],\[type=file\],\[type=color\],\[type=hidden\],\.popup-search\),\.select-trigger\)\{[^}]*font-size:var\(--control-font-size-md\)/,
+    /:is\(\.appearance-screen,\.settings-prompt-dialog\) button:not\([^)]+\)\{[^}]*font-size:var\(--control-font-size-md\)/,
+    /\.composer-toolbar \.model-button\{[^}]*font-size:var\(--control-font-size-md\)/,
+    /\.composer-toolbar \.permission-button\{[^}]*font-size:var\(--control-font-size-md\)/,
+    /#project-select\.new-chat-project-select\{[^}]*font-size:var\(--control-font-size-md\)/,
+    /\.new-chat-project>\.new-chat-backend\{[^}]*font-size:var\(--control-font-size-md\)/,
+    /\.remote-action-button,\.remote-secondary-button\{[^}]*font-size:var\(--control-font-size-md\)/,
+    /\.remote-input\{[^}]*font-size:var\(--control-font-size-md\)/,
+    /\.scheduled-primary-button,\.scheduled-editor-actions \.primary-button\{[^}]*font-size:var\(--control-font-size-md\)/,
+    /\.scheduled-input,\.scheduled-textarea\{[^}]*font-size:var\(--control-font-size-md\)/,
+    /\.scheduled-select\{[^}]*font-size:var\(--control-font-size-md\)/,
+    /\.scheduled-editor-actions button\{[^}]*font-size:var\(--control-font-size-md\)/,
+    /\.confirmation-actions button,\.goal-edit-actions button,\.approval-actions button\{[^}]*font-size:var\(--control-font-size-md\)/,
+    /\.prompt-optimization-settings-footer button\{[^}]*font-size:var\(--control-font-size-md\)/,
+    /\.new-chat\{[^}]*font-size:var\(--control-font-size-md\)/,
+    /\.thread-link\{[^}]*font-size:var\(--control-font-size-md\)/,
+    /\.message-editor-actions>button\{[^}]*font-size:var\(--control-font-size-md\)/,
+    /\.thread-rename-field input\{[^}]*font-size:var\(--control-font-size-md\)/,
+    /\.scheduled-send-input\{[^}]*font-size:var\(--control-font-size-md\)/,
+    /\.scheduled-send-actions button\{[^}]*font-size:var\(--control-font-size-md\)/,
+    /\.goal-edit-input\{[^}]*font-size:var\(--control-font-size-md\)/,
+  ]) assert.match(css, pattern);
+  // 紧凑控件与搜索框：85.71% 取整，与菜单搜索框同档
+  for (const pattern of [
+    /\.search\{[^}]*font-size:var\(--control-font-size-sm\)/,
+    /\.session-tools-file-search\{[^}]*font-size:var\(--control-font-size-sm\)/,
+    /#related-session-back\{[^}]*font-size:var\(--control-font-size-sm\)/,
+    /\.session-tools-back\{[^}]*font-size:var\(--control-font-size-sm\)/,
+    /\.workspace-reader-tab-select\{[^}]*font-size:var\(--control-font-size-sm\)/,
+    /\.queued-steer-button\{[^}]*font-size:var\(--control-font-size-sm\)/,
+    /\.question-card \.question-options button,\.question-card \.approval-actions button\{[^}]*font-size:var\(--control-font-size-sm\)/,
+    /\.composer-tooltip\{[^}]*font-size:var\(--control-font-size-sm\)/,
+  ]) assert.match(css, pattern);
+  // 大号登录控件保留 100%，正文、代码与设置控件高度边界不变
+  assert.match(css, /\.pair-key-field input\{[^}]*font-size:var\(--control-font-size-lg\)/);
+  assert.match(css, /\.pair-submit\{[^}]*font-size:var\(--control-font-size-lg\)/);
+  assert.match(css, /\.composer \.prompt-editor\{font-size:var\(--font-size\)/);
+  assert.match(css, /\.instruction-content\{[^}]*font-size:var\(--code-font-size,12px\)/);
+  assert.match(css, /\.appearance-screen \.appearance-reading-font-hint>\.text-button\{font-size:inherit\}/);
+  assert.match(css, /--settings-control-height:36px/);
+  // 右上角常驻会话菜单同样按统一比例取整缩放：条目用 --menu-font-size，分组名称与标题动作按最小比例 --menu-description-font-size
+  assert.match(css, /\.session-related-menu\{[^}]*font-size:var\(--menu-font-size\)/);
+  assert.match(css, /\.session-related-menu-heading\{[^}]*font-size:var\(--menu-description-font-size\)/);
+  assert.match(css, /\.session-related-menu-item\.session-related-menu-heading-action\{[^}]*font-size:var\(--menu-description-font-size\)/);
+  assert.doesNotMatch(css, /\.session-related-menu-item\.session-related-menu-thread[^{]*\{font-size:calc\(var\(--font-size\) - 1px\)\}/);
 });
 
 test("聊天、设置及定时任务的模型菜单统一最小宽度 250px 与 350px 自适应上限", async () => {

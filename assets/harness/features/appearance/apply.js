@@ -152,7 +152,11 @@ export function applyAppearance(save = false) {
     // 所有入口、侧边页面及管理页继承同一套派生色；每次完整写入，不能残留上一主题的强调色或主按钮色。
     ...appearanceThemeColors(appearance.theme, palette),
     "font-size": `${appearance.fontSize}px`,
-    // 用户要求以界面字号分别按 92.86% / 78.57% / 85.71% 四舍五入；所有菜单共享整数结果，不能嵌套再缩放。
+    // 用户要求控件视觉层级对齐 Codex App：以界面字号 S 按 100% / 92.86% / 85.71% / 78.57% 一次四舍五入取整，
+    // Select 触发器、普通按钮、输入框、输入区工具栏及菜单主文字共用 92.86%，紧凑控件与搜索框共用 85.71%，不得嵌套二次缩放。
+    "control-font-size-lg": `${appearance.fontSize}px`,
+    "control-font-size-md": `${Math.round(appearance.fontSize * .9286)}px`,
+    "control-font-size-sm": `${Math.round(appearance.fontSize * .8571)}px`,
     "menu-font-size": `${Math.round(appearance.fontSize * .9286)}px`,
     "menu-description-font-size": `${Math.round(appearance.fontSize * .7857)}px`,
     "menu-search-font-size": `${Math.round(appearance.fontSize * .8571)}px`,
