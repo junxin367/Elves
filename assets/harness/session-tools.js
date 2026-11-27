@@ -172,10 +172,11 @@ export function mountSessionTools(options) {
   }
   function widthBounds() {
     const sidebar = workspace.querySelector(":scope > .sidebar");
-    const available = Math.max(0, workspace.clientWidth - (sidebar?.getBoundingClientRect().width || 0));
-    // 用户要求右侧可拖宽；通常至少 320px、给会话保留 360px，窄窗口则各占一半，不能撑出横向整页滚动。
-    const minimum = Math.min(320, Math.floor(available / 2));
-    return { minimum, maximum: Math.max(minimum, available - 360) };
+    const available = workspace.clientWidth - (sidebar?.getBoundingClientRect().width || 0);
+    // 桌面标签面板至少 320px，供新标签入口排两列；拖动、键盘与恢复均用同一下限。
+    // 空间充足时给主会话留 360px，不足时面板停在下限，主会话使用剩余宽度。
+    const minimum = 320;
+    return { minimum, maximum: Math.max(minimum, Math.floor(available - 360)) };
   }
   function resize(width = currentContext?.width ?? preferredWidth, persist = false) {
     const { minimum, maximum } = widthBounds();
