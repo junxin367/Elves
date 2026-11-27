@@ -18,10 +18,22 @@ use super::{ApiError, HarnessAuthorization, WebState};
 mod options;
 
 const PREFERENCES_FILE: &str = "remote-instance-preferences.json";
+// 用户要求三端统一用百分比设置自动压缩阈值，范围统一为 50～98%（留空恢复原生默认）。
+const AUTO_COMPACT_MIN_PERCENT: u64 = 50;
+const AUTO_COMPACT_MAX_PERCENT: u64 = 98;
+const CLAUDE_AUTOCOMPACT_BUFFER_TOKENS: u64 = 33_000;
+// 用户要求在「缓存与压缩」加入上下文大小与缓存时间：Codex 写 model_context_window，Claude 写 env.CLAUDE_CODE_AUTO_COMPACT_WINDOW（≥100k）与 env.CLAUDE_CODE_PROMPT_CACHE_TTL。
+const CODEX_CONTEXT_WINDOW_MIN: u64 = 32_000;
+const CLAUDE_CONTEXT_WINDOW_MIN: u64 = 100_000;
+const CONTEXT_WINDOW_MAX: u64 = 10_000_000;
+const ANTIGRAVITY_MIN_AUTO_COMPACT_VERSION: (u64, u64, u64) = (1, 5, 15);
+const MAX_CODEX_CATALOG_BYTES: usize = 4 * 1024 * 1024;
 type HelpCache = BTreeMap<String, (Instant, String)>;
 static CLAUDE_HELP: OnceLock<Mutex<HelpCache>> = OnceLock::new();
 type CapabilityCache = BTreeMap<String, (Instant, Value)>;
 static CLAUDE_OPTIONS: OnceLock<Mutex<CapabilityCache>> = OnceLock::new();
+type AgyVersionCache = BTreeMap<String, (Instant, Result<(u64, u64, u64), String>)>;
+static ANTIGRAVITY_VERSION: OnceLock<Mutex<AgyVersionCache>> = OnceLock::new();
 
 // 用户要求核对真实 Claude 实例；与 WSL 配置写入程序的布尔键白名单保持一致，不探测任意用户键。
 const CLAUDE_BOOLEAN_OPTIONS: &[&str] = &[
@@ -64,14 +76,6 @@ fn hidden_model_ids(value: &Value) -> Result<Vec<String>, ApiError> {
     }).collect()
 }
 
-fn claude_default_effort(value: &Value) -> Result<Option<&str>, ApiError> {
-    if value.is_null() {
-        return Ok(None);
-    }
-    value.as_str().filter(|effort| ["low", "medium", "high", "xhigh", "max"].contains(effort))
-        .map(Some).ok_or_else(|| ApiError::new(400, "Claude 默认思考深度必须是当前模型支持的原生等级，或使用模型默认"))
-}
-
 fn apply_hidden_model_visibility(catalog: &mut Value, hidden: &[String]) {
     // 用户要求所有会话实例（Codex、Claude、Antigravity）统一默认显示全部模型并允许按实例隐藏；
     // 仅在返回视图上叠加 hiddenByInstance，保留原生完整目录及能力，隐藏不能改变已有会话的执行模型。
@@ -102,41 +106,9 @@ pub(super) fn decorate_claude_model_visibility(
 ) -> Result<Value, ApiError> {
     let (preference, _) = preferences(directory)?;
     let hidden = hidden_model_ids(&preference["instances"][instance]["hiddenModelIds"])?;
+    // 用户要求移除设置页「实例默认值」；仅叠加显示模型偏好，不再覆写原生默认深度。
     apply_hidden_model_visibility(&mut catalog, &hidden);
-    // 用户要求在会话实例设置 Claude 默认深度；只叠加完整目录的默认值，历史会话快照仍保留自身等级。
-    if catalog["catalogComplete"] != false {
-        let effort = claude_default_effort(&preference["instances"][instance]["defaultReasoningEffort"])?;
-        let supported = effort.is_some_and(|effort| catalog["data"].as_array().is_some_and(|rows| rows.iter().any(|row| {
-            row["supportedReasoningEfforts"].as_array().is_some_and(|efforts| {
-                efforts.iter().any(|value| value["reasoningEffort"] == effort)
-            })
-        })));
-        // 保存回执可能带有保存前的展示默认值；恢复“使用模型默认”时同样必须清除该旧值。
-        catalog["defaultReasoningEffort"] = json!(if supported { effort.unwrap() } else { "" });
-    }
     Ok(catalog)
-}
-
-fn antigravity_default_effort(value: &Value) -> Result<Option<&str>, ApiError> {
-    if value.is_null() {
-        return Ok(None);
-    }
-    value
-        .as_str()
-        .filter(|effort| ["minimal", "low", "medium", "high", "xhigh", "max"].contains(effort))
-        .map(Some)
-        .ok_or_else(|| ApiError::new(400, "Antigravity 默认思考深度必须是当前模型支持的原生等级，或使用模型默认"))
-}
-
-fn antigravity_default_model(value: &Value) -> Result<Option<&str>, ApiError> {
-    if value.is_null() {
-        return Ok(None);
-    }
-    value
-        .as_str()
-        .filter(|id| !id.is_empty() && id.len() <= 200 && !id.chars().any(char::is_control))
-        .map(Some)
-        .ok_or_else(|| ApiError::new(400, "Antigravity 默认模型名称无效"))
 }
 
 pub(super) fn antigravity_permission_view(
@@ -195,20 +167,7 @@ pub(super) async fn save_antigravity_permission_mode(
     .await
 }
 
-pub(super) fn antigravity_default_model_and_effort(
-    directory: &Path,
-    instance: &str,
-) -> Result<(Option<String>, Option<String>), ApiError> {
-    let (preference, _) = preferences(directory)?;
-    let model = antigravity_default_model(&preference["instances"][instance]["defaultModel"])?
-        .map(str::to_owned);
-    let effort =
-        antigravity_default_effort(&preference["instances"][instance]["defaultReasoningEffort"])?
-            .map(str::to_owned);
-    Ok((model, effort))
-}
-
-/// 为 Antigravity 官方 ACP 模型目录叠加当前实例的显示名单与默认模型/思考深度偏好，不修改 ACP 原始缓存。
+/// 为 Antigravity 官方 ACP 模型目录叠加当前实例的显示名单，不修改 ACP 原始缓存或原生默认值。
 pub(super) fn decorate_antigravity_model_visibility(
     directory: &Path,
     instance: &str,
@@ -216,36 +175,7 @@ pub(super) fn decorate_antigravity_model_visibility(
 ) -> Result<Value, ApiError> {
     let (preference, _) = preferences(directory)?;
     let hidden = hidden_model_ids(&preference["instances"][instance]["hiddenModelIds"])?;
-    let configured_model =
-        antigravity_default_model(&preference["instances"][instance]["defaultModel"])?;
-    let configured_effort =
-        antigravity_default_effort(&preference["instances"][instance]["defaultReasoningEffort"])?;
     apply_hidden_model_visibility(&mut catalog, &hidden);
-    if let Some(model) = configured_model
-        && catalog["data"]
-            .as_array()
-            .is_some_and(|rows| rows.iter().any(|row| row["model"] == model))
-    {
-        catalog["defaultModel"] = json!(model);
-    }
-    let effective_model = catalog["defaultModel"].as_str().unwrap_or("").to_owned();
-    if let Some(effort) = configured_effort {
-        let supported = catalog["data"].as_array().is_some_and(|rows| {
-            rows.iter().any(|row| {
-                (effective_model.is_empty() || row["model"] == effective_model.as_str())
-                    && row["supportedReasoningEfforts"]
-                        .as_array()
-                        .is_some_and(|efforts| {
-                            efforts
-                                .iter()
-                                .any(|value| value["reasoningEffort"] == effort)
-                        })
-            })
-        });
-        if supported {
-            catalog["defaultReasoningEffort"] = json!(effort);
-        }
-    }
     Ok(catalog)
 }
 
@@ -326,34 +256,912 @@ pub(super) fn filter_models(value: &mut Value, enabled: bool) {
     }
 }
 
-pub(super) fn claude_auto_compact(
+fn validate_auto_compact_percent(backend: &str, value: &Value) -> Result<Option<u64>, ApiError> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    if let Some(percent) = value.as_u64()
+        && (AUTO_COMPACT_MIN_PERCENT..=AUTO_COMPACT_MAX_PERCENT).contains(&percent)
+    {
+        return Ok(Some(percent));
+    }
+    let label = match backend {
+        "codex" => "Codex",
+        "antigravity" => "Antigravity",
+        _ => "Claude",
+    };
+    Err(ApiError::new(
+        400,
+        format!(
+            "{label} 自动压缩阈值必须为 {AUTO_COMPACT_MIN_PERCENT}～{AUTO_COMPACT_MAX_PERCENT} 的整数，或留空使用原生默认"
+        ),
+    ))
+}
+
+fn format_tokens_with_commas(tokens: u64) -> String {
+    let digits = tokens.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn read_codex_catalog_entries(codex_home: &Path, config: &Value) -> Vec<(String, u64)> {
+    let effective = config.get("config").unwrap_or(config);
+    let override_window = effective["model_context_window"]
+        .as_u64()
+        .filter(|&value| value > 0);
+    let mut candidates = Vec::new();
+    if let Some(catalog_path) = effective["model_catalog_json"]
+        .as_str()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        let path = Path::new(catalog_path);
+        candidates.push(if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            codex_home.join(path)
+        });
+    }
+    candidates.push(codex_home.join("models_cache.json"));
+    for candidate in candidates {
+        let Ok(metadata) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.len() as usize > MAX_CODEX_CATALOG_BYTES {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&candidate) else {
+            continue;
+        };
+        let Ok(parsed) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        let Some(models) = parsed["models"].as_array() else {
+            continue;
+        };
+        let mut rows = Vec::new();
+        for entry in models {
+            let Some(slug) = entry["slug"].as_str().filter(|slug| !slug.is_empty()) else {
+                continue;
+            };
+            let base = entry["context_window"]
+                .as_u64()
+                .filter(|&value| value > 0)
+                .or_else(|| entry["max_context_window"].as_u64().filter(|&value| value > 0));
+            let max_window = entry["max_context_window"].as_u64().filter(|&value| value > 0);
+            // 与 openai/codex models-manager `with_config_overrides` 保持一致：model_context_window 不超过模型 max_context_window。
+            let resolved = match override_window {
+                Some(cfg) => Some(max_window.map_or(cfg, |max| cfg.min(max))),
+                None => base,
+            };
+            if let Some(window) = resolved {
+                rows.push((slug.to_owned(), window));
+            }
+        }
+        if !rows.is_empty() {
+            return rows;
+        }
+    }
+    Vec::new()
+}
+
+fn codex_window_summary(codex_home: &Path, config: &Value) -> (Option<u64>, usize) {
+    let entries = read_codex_catalog_entries(codex_home, config);
+    if !entries.is_empty() {
+        let mut counts: BTreeMap<u64, usize> = BTreeMap::new();
+        for (_, window) in entries {
+            *counts.entry(window).or_insert(0) += 1;
+        }
+        let primary = counts
+            .iter()
+            .max_by_key(|&(window, count)| (*count, *window))
+            .map(|(window, _)| *window);
+        return (primary, counts.len());
+    }
+    let effective = config.get("config").unwrap_or(config);
+    match effective["model_context_window"]
+        .as_u64()
+        .filter(|&value| value > 0)
+    {
+        Some(window) => (Some(window), 1),
+        None => (None, 0),
+    }
+}
+
+pub(super) fn codex_model_context_window(
+    codex_home: &Path,
+    config: &Value,
+    model: Option<&str>,
+) -> Option<u64> {
+    let effective = config.get("config").unwrap_or(config);
+    let target = model
+        .filter(|value| !value.is_empty())
+        .or_else(|| effective["model"].as_str().filter(|value| !value.is_empty()));
+    let entries = read_codex_catalog_entries(codex_home, effective);
+    if let Some(target) = target {
+        if let Some((_, window)) = entries
+            .iter()
+            .find(|(slug, _)| slug == target || slug.eq_ignore_ascii_case(target))
+        {
+            return Some(*window);
+        }
+    }
+    if let Some(window) = effective["model_context_window"]
+        .as_u64()
+        .filter(|&value| value > 0)
+    {
+        return Some(window);
+    }
+    codex_window_summary(codex_home, effective).0
+}
+
+pub(super) fn apply_codex_auto_compact(
+    directory: &Path,
+    instance: &str,
+    codex_home: &Path,
+    config: &Value,
+    model: Option<&str>,
+    params: &mut Value,
+) {
+    // 用户要求 Codex 使用原生 model_auto_compact_token_limit（自动触发而非轮末），
+    // 按 Elves 实例偏好保存的百分比（50%～98%）结合当前会话模型上下文窗口动态换算下发。
+    let Ok((preference, _)) = preferences(directory) else {
+        return;
+    };
+    let Ok(Some(percent)) = validate_auto_compact_percent(
+        "codex",
+        &preference["instances"][instance]["autoCompactPercent"],
+    ) else {
+        return;
+    };
+    let Some(window) = codex_model_context_window(codex_home, config, model) else {
+        return;
+    };
+    let limit = ((window as u128 * percent as u128) / 100).max(1) as u64;
+    if !params["config"].is_object() {
+        params["config"] = json!({});
+    }
+    params["config"]["model_auto_compact_token_limit"] = json!(limit);
+}
+
+pub(super) fn antigravity_auto_compact_override(
     directory: &Path,
     instance: &str,
 ) -> Result<Option<String>, ApiError> {
-    let (value, _) = preferences(directory)?;
-    let value = &value["instances"][instance]["autoCompactWindow"];
-    validate_compact(value)?;
-    Ok(match value {
-        Value::Null => None,
-        Value::String(value) => Some(value.clone()),
-        value => Some(value.to_string()),
+    let (preference, _) = preferences(directory)?;
+    let percent = validate_auto_compact_percent(
+        "antigravity",
+        &preference["instances"][instance]["autoCompactPercent"],
+    )?;
+    Ok(percent.map(|value| format!("{value}%")))
+}
+
+fn parse_semver(text: &str) -> Option<(u64, u64, u64)> {
+    for token in text.split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | '(' | ')')) {
+        let candidate = token.trim().trim_start_matches(['v', 'V']);
+        let core = candidate.split(['-', '+']).next().unwrap_or("");
+        let mut parts = core.split('.');
+        let (Some(a), Some(b), Some(c), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if let (Ok(major), Ok(minor), Ok(patch)) =
+            (a.parse::<u64>(), b.parse::<u64>(), c.parse::<u64>())
+        {
+            return Some((major, minor, patch));
+        }
+    }
+    None
+}
+
+async fn antigravity_version(
+    config: &super::antigravity::acp::EnvConfig,
+) -> Result<(u64, u64, u64), String> {
+    let key = format!("{}:{}", config.instance_id(), config.executable);
+    let cache = ANTIGRAVITY_VERSION.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Some((at, result)) = cache.lock().await.get(&key)
+        && at.elapsed() < Duration::from_secs(60)
+    {
+        return result.clone();
+    }
+    if let Err(err) = config.validate() {
+        return Err(err.to_string());
+    }
+    #[cfg(test)]
+    if config.executable == "/fixture/agy" {
+        return Ok(ANTIGRAVITY_MIN_AUTO_COMPACT_VERSION);
+    }
+    let command = if config.is_local() {
+        let mut cmd = tokio::process::Command::new(&config.executable);
+        cmd.arg("--version");
+        cmd
+    } else {
+        let mut cmd = tokio::process::Command::new("wsl.exe");
+        cmd.args([
+            "--distribution",
+            &config.distribution,
+            "--user",
+            &config.user,
+            "--cd",
+            "~",
+            "--exec",
+            "/bin/bash",
+            "-lc",
+            "exec \"$@\"",
+            "--",
+            &config.executable,
+            "--version",
+        ]);
+        cmd
+    };
+    let result = match super::preferences::output(command).await {
+        Ok(bytes) => {
+            let text = String::from_utf8_lossy(&bytes);
+            parse_semver(&text).ok_or_else(|| "Antigravity CLI 版本输出无法识别".to_owned())
+        }
+        Err(err) => Err(err.message),
+    };
+    cache
+        .lock()
+        .await
+        .insert(key, (Instant::now(), result.clone()));
+    result
+}
+
+fn parse_env_u64(env: &Value, key: &str) -> Option<u64> {
+    env[key]
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|text| text.parse::<u64>().ok())
+        .filter(|&value| value > 0)
+}
+
+fn parse_claude_token_count(value: &Value) -> Option<u64> {
+    if let Some(number) = value.as_u64().filter(|&n| n > 0) {
+        return Some(number);
+    }
+    let raw = value.as_str()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return raw.parse::<u64>().ok().filter(|&n| n > 0);
+    }
+    let lower = raw.to_ascii_lowercase();
+    let (prefix, multiplier) = if let Some(p) = lower.strip_suffix('k') {
+        (p, 1_000.0_f64)
+    } else if let Some(p) = lower.strip_suffix('m') {
+        (p, 1_000_000.0_f64)
+    } else {
+        return None;
+    };
+    let num: f64 = prefix.trim().parse().ok()?;
+    if !num.is_finite() || num <= 0.0 {
+        return None;
+    }
+    let scaled = (num * multiplier).round();
+    if !scaled.is_finite() || scaled < 1.0 || scaled > u64::MAX as f64 {
+        return None;
+    }
+    Some(scaled as u64)
+}
+
+fn validate_context_window(backend: &str, value: &Value) -> Result<Option<u64>, ApiError> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let min = if backend == "claude" {
+        CLAUDE_CONTEXT_WINDOW_MIN
+    } else {
+        CODEX_CONTEXT_WINDOW_MIN
+    };
+    if let Some(tokens) = value.as_u64()
+        && (min..=CONTEXT_WINDOW_MAX).contains(&tokens)
+    {
+        return Ok(Some(tokens));
+    }
+    let label = if backend == "claude" { "Claude" } else { "Codex" };
+    Err(ApiError::new(
+        400,
+        format!("{label} 上下文大小必须为 {min}～{CONTEXT_WINDOW_MAX} 的整数，或留空使用原生默认"),
+    ))
+}
+
+fn validate_prompt_cache_ttl(value: &Value) -> Result<Option<&'static str>, ApiError> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    match value.as_str().map(str::trim) {
+        Some("") => Ok(None),
+        Some("5m") => Ok(Some("5m")),
+        Some("1h") => Ok(Some("1h")),
+        _ => Err(ApiError::new(
+            400,
+            "Claude 缓存时间仅支持 5 分钟（5m）、1 小时（1h）或留空使用原生默认",
+        )),
+    }
+}
+
+fn codex_context_window_row(
+    codex_home: &Path,
+    document: &Value,
+    adapter_read_only: bool,
+) -> (Value, Value) {
+    // 用户要求 Codex 上下文大小未覆写时，输入框左侧直接显示从模型目录读取到的上下文数值（与下方自动压缩阈值保持一致），不展示描述性介绍。
+    let raw = &document["model_context_window"];
+    let mut catalog_doc = document.clone();
+    if let Some(obj) = catalog_doc.as_object_mut() {
+        obj.remove("model_context_window");
+    }
+    let default_window = codex_model_context_window(codex_home, &catalog_doc, None);
+    let default_preview = default_window
+        .map(format_tokens_with_commas)
+        .unwrap_or_default();
+    // 用户要求输入框左侧只显示数值或默认状态，不附带原生配置 key。
+    let (value, cli_preview, value_invalid) = if raw.is_null() {
+        (Value::Null, default_preview, false)
+    } else if let Some(tokens) = raw.as_u64()
+        && (CODEX_CONTEXT_WINDOW_MIN..=CONTEXT_WINDOW_MAX).contains(&tokens)
+    {
+        (json!(tokens), format_tokens_with_commas(tokens), false)
+    } else if let Some(tokens) = raw.as_u64()
+        && tokens > 0
+        && tokens < CODEX_CONTEXT_WINDOW_MIN
+    {
+        (
+            Value::Null,
+            format!(
+                "原生配置：{}（低于 {}）",
+                format_tokens_with_commas(tokens),
+                format_tokens_with_commas(CODEX_CONTEXT_WINDOW_MIN)
+            ),
+            false,
+        )
+    } else {
+        (Value::Null, "原生配置值无效".into(), true)
+    };
+    // 用户要求精简设置项描述：功能本身可自解释时不赘述，仅保留影响范围与约束，单位在输入框右侧显示为 TK。
+    let row = json!({
+        "id": "contextWindow",
+        "kind": "integer",
+        "label": "上下文大小",
+        "group": "缓存与压缩",
+        "description": "覆盖所有模型。",
+        "value": value,
+        "min": CODEX_CONTEXT_WINDOW_MIN,
+        "max": CONTEXT_WINDOW_MAX,
+        "unit": "TK",
+        "cliPreview": cli_preview,
+        "defaultLabel": "原生默认",
+        "readOnly": adapter_read_only,
+        "readOnlyReason": if adapter_read_only {
+            json!("该 Codex 实例的独立执行适配器尚未接入，上下文大小仅供查看。")
+        } else {
+            Value::Null
+        },
+        "valueInvalid": value_invalid,
+        "options": []
+    });
+    (value, row)
+}
+
+fn claude_context_window_row(document: &Value) -> (Value, Value) {
+    let raw = &document["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"];
+    // 用户要求输入框左侧只显示数值或默认状态，不附带原生配置 key。
+    let (value, cli_preview, value_invalid) = if raw.is_null() {
+        (Value::Null, "原生默认（随模型）".into(), false)
+    } else if let Some(tokens) = parse_claude_token_count(raw)
+        && (CLAUDE_CONTEXT_WINDOW_MIN..=CONTEXT_WINDOW_MAX).contains(&tokens)
+    {
+        (json!(tokens), format_tokens_with_commas(tokens), false)
+    } else if let Some(tokens) = parse_claude_token_count(raw)
+        && tokens < CLAUDE_CONTEXT_WINDOW_MIN
+    {
+        (
+            Value::Null,
+            format!(
+                "原生配置：{}（低于 100,000）",
+                format_tokens_with_commas(tokens)
+            ),
+            false,
+        )
+    } else {
+        (Value::Null, "原生配置值无效".into(), true)
+    };
+    // 用户要求精简设置项描述：功能本身可自解释时不赘述，仅保留下限约束，单位在输入框右侧显示为 TK。
+    let row = json!({
+        "id": "contextWindow",
+        "kind": "integer",
+        "label": "上下文大小",
+        "group": "缓存与压缩",
+        "description": "最低 100,000。",
+        "value": value,
+        "min": CLAUDE_CONTEXT_WINDOW_MIN,
+        "max": CONTEXT_WINDOW_MAX,
+        "unit": "TK",
+        "cliPreview": cli_preview,
+        "defaultLabel": "原生默认",
+        "readOnly": false,
+        "readOnlyReason": Value::Null,
+        "valueInvalid": value_invalid,
+        "options": []
+    });
+    (value, row)
+}
+
+fn unsupported_context_window_row(reason: &str) -> Value {
+    // 用户要求所有实例均展示「上下文大小」，原生不支持的实例右侧改为纯文字「不支持」。
+    json!({
+        "id": "contextWindow",
+        "kind": "integer",
+        "label": "上下文大小",
+        "group": "缓存与压缩",
+        "description": "",
+        "value": Value::Null,
+        "min": Value::Null,
+        "max": Value::Null,
+        "cliPreview": "不支持",
+        "readOnly": true,
+        "readOnlyReason": reason,
+        "valueInvalid": false,
+        "options": []
     })
 }
 
-fn validate_compact(value: &Value) -> Result<(), ApiError> {
-    if value.is_null()
-        || value == "auto"
-        || value
-            .as_u64()
-            .is_some_and(|tokens| (100_000..=1_000_000).contains(&tokens))
-    {
-        Ok(())
+fn claude_prompt_cache_ttl_row(document: &Value) -> (Value, Value) {
+    // env.CLAUDE_CODE_PROMPT_CACHE_TTL 优先于顶层 promptCacheTtl；两者均未配置时使用原生默认。
+    let raw = if !document["env"]["CLAUDE_CODE_PROMPT_CACHE_TTL"].is_null() {
+        &document["env"]["CLAUDE_CODE_PROMPT_CACHE_TTL"]
     } else {
-        Err(ApiError::new(
-            400,
-            "自动压缩窗口必须为自动或 100000～1000000 Token",
-        ))
+        &document["promptCacheTtl"]
+    };
+    let (value, read_only, read_only_reason, value_invalid) = if raw.is_null() {
+        (Value::Null, false, Value::Null, false)
+    } else if let Some(ttl) = raw.as_str().map(str::trim)
+        && matches!(ttl, "5m" | "1h")
+    {
+        (json!(ttl), false, Value::Null, false)
+    } else {
+        (
+            Value::Null,
+            true,
+            json!("原配置中的 CLAUDE_CODE_PROMPT_CACHE_TTL 取值无效，请在原生配置中核对；未覆盖原文件。"),
+            true,
+        )
+    };
+    // 用户要求精简设置项描述：缓存时间下拉选项已自解释，不额外增加冗余介绍。
+    let row = json!({
+        "id": "promptCacheTtl",
+        "kind": "enum",
+        "label": "缓存时间",
+        "group": "缓存与压缩",
+        "description": "",
+        "value": value,
+        "readOnly": read_only,
+        "readOnlyReason": read_only_reason,
+        "valueInvalid": value_invalid,
+        "options": [
+            {"value": "5m", "label": "5 分钟"},
+            {"value": "1h", "label": "1 小时"}
+        ]
+    });
+    (value, row)
+}
+
+fn unsupported_prompt_cache_ttl_row(reason: &str) -> Value {
+    // 用户要求所有实例均展示「缓存时间」，原生不支持的实例右侧改为纯文字「不支持」。
+    json!({
+        "id": "promptCacheTtl",
+        "kind": "enum",
+        "label": "缓存时间",
+        "group": "缓存与压缩",
+        "description": "",
+        "value": Value::Null,
+        "cliPreview": "不支持",
+        "readOnly": true,
+        "readOnlyReason": reason,
+        "valueInvalid": false,
+        "options": []
+    })
+}
+
+fn codex_auto_compact_row(
+    codex_home: &Path,
+    document: &Value,
+    preference_value: &Value,
+    adapter_read_only: bool,
+) -> Result<(Value, Value), ApiError> {
+    let percent = validate_auto_compact_percent("codex", preference_value)?;
+    let effective_window = codex_model_context_window(codex_home, document, None);
+    let native_limit = document["model_auto_compact_token_limit"]
+        .as_u64()
+        .filter(|&value| value > 0);
+    // 用户要求 Codex 自动压缩阈值输入框左侧只显示对应数值，不附带配置 key 或描述性介绍。
+    let cli_preview = if let Some(pct) = percent {
+        match effective_window {
+            Some(window) => format_tokens_with_commas(
+                ((window as u128 * pct as u128) / 100).max(1) as u64,
+            ),
+            None => format!("{pct}%"),
+        }
+    } else if let Some(limit) = native_limit {
+        format_tokens_with_commas(limit)
+    } else if let Some(window) = effective_window {
+        format_tokens_with_commas(((window as u128 * 90) / 100).max(1) as u64)
+    } else {
+        "90%".into()
+    };
+    let value = percent.map(Value::from).unwrap_or(Value::Null);
+    let row = json!({
+        "id": "autoCompactPercent",
+        "kind": "integer",
+        "label": "自动压缩阈值",
+        "group": "缓存与压缩",
+        "description": "50～98%",
+        "value": value,
+        "min": AUTO_COMPACT_MIN_PERCENT,
+        "max": AUTO_COMPACT_MAX_PERCENT,
+        "unit": "%",
+        "cliPreview": cli_preview,
+        "defaultLabel": "90%",
+        "readOnly": adapter_read_only,
+        "readOnlyReason": if adapter_read_only {
+            json!("该 Codex 实例的独立执行适配器尚未接入，自动压缩阈值仅供查看。")
+        } else {
+            Value::Null
+        },
+        "valueInvalid": false,
+        "options": []
+    });
+    Ok((value, row))
+}
+
+fn claude_auto_compact_row(document: &Value) -> (Value, Value) {
+    let env = &document["env"];
+    let window = parse_claude_token_count(&env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"])
+        .or_else(|| parse_claude_token_count(&env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"]))
+        .filter(|&value| value > CLAUDE_AUTOCOMPACT_BUFFER_TOKENS);
+    let (default_preview, default_label) = match window {
+        Some(tokens) => {
+            let approx = (tokens - CLAUDE_AUTOCOMPACT_BUFFER_TOKENS) as f64 * 100.0 / tokens as f64;
+            (
+                format!("原生默认：预留 33k（约 {approx:.1}%）"),
+                format!("{approx:.0}%"),
+            )
+        }
+        None => ("原生默认：预留 33k".into(), "默认".into()),
+    };
+    let raw = &env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"];
+    let (value, cli_preview, placeholder, value_invalid) = if raw.is_null() {
+        (Value::Null, default_preview, default_label, false)
+    } else if let Some(parsed) = parse_env_u64(env, "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE")
+        && (1..=100).contains(&parsed)
+    {
+        // 用户要求输入框左侧只显示数值，不附带配置 key；原生配置超出 50～98% 时按原值提示而不标成格式无效。
+        if (AUTO_COMPACT_MIN_PERCENT..=AUTO_COMPACT_MAX_PERCENT).contains(&parsed) {
+            (json!(parsed), format!("{parsed}%"), default_label, false)
+        } else if parsed < AUTO_COMPACT_MIN_PERCENT {
+            (
+                Value::Null,
+                format!("原生配置：{parsed}%（低于 {AUTO_COMPACT_MIN_PERCENT}%）"),
+                format!("{parsed}%"),
+                false,
+            )
+        } else {
+            (
+                Value::Null,
+                format!("原生配置：{parsed}%（高于 {AUTO_COMPACT_MAX_PERCENT}%）"),
+                format!("{parsed}%"),
+                false,
+            )
+        }
+    } else {
+        (Value::Null, "原生配置值无效".into(), default_label, true)
+    };
+    let row = json!({
+        "id": "autoCompactPercent",
+        "kind": "integer",
+        "label": "自动压缩阈值",
+        "group": "缓存与压缩",
+        "description": "50～98%",
+        "value": value,
+        "min": AUTO_COMPACT_MIN_PERCENT,
+        "max": AUTO_COMPACT_MAX_PERCENT,
+        "unit": "%",
+        "cliPreview": cli_preview,
+        "defaultLabel": placeholder,
+        "readOnly": false,
+        "readOnlyReason": Value::Null,
+        "valueInvalid": value_invalid,
+        "options": []
+    });
+    (value, row)
+}
+
+fn antigravity_auto_compact_row(
+    preference_value: &Value,
+    version_result: &Result<(u64, u64, u64), String>,
+) -> Result<(Value, Value), ApiError> {
+    let percent = validate_auto_compact_percent("antigravity", preference_value)?;
+    let (read_only, read_only_reason) = match version_result {
+        Ok(version) if *version >= ANTIGRAVITY_MIN_AUTO_COMPACT_VERSION => (false, None),
+        Ok((major, minor, patch)) => (
+            true,
+            Some(format!(
+                "当前 Antigravity CLI 版本为 {major}.{minor}.{patch}，需升级到 1.5.15 及以上才支持自动压缩阈值。"
+            )),
+        ),
+        Err(reason) => (
+            true,
+            Some(format!(
+                "未能确认当前 Antigravity CLI 版本（需 1.5.15 及以上）：{reason}"
+            )),
+        ),
+    };
+    // 用户要求输入框左侧只显示数值或默认状态，不附带配置 key。
+    let cli_preview = match percent {
+        Some(pct) => format!("{pct}%"),
+        None => "原生默认（随模型）".into(),
+    };
+    let value = percent.map(Value::from).unwrap_or(Value::Null);
+    let row = json!({
+        "id": "autoCompactPercent",
+        "kind": "integer",
+        "label": "自动压缩阈值",
+        "group": "缓存与压缩",
+        "description": "50～98%",
+        "value": value,
+        "min": AUTO_COMPACT_MIN_PERCENT,
+        "max": AUTO_COMPACT_MAX_PERCENT,
+        "unit": "%",
+        "cliPreview": cli_preview,
+        "defaultLabel": "默认",
+        "readOnly": read_only,
+        "readOnlyReason": read_only_reason,
+        "valueInvalid": false,
+        "options": []
+    });
+    Ok((value, row))
+}
+
+// 用户要求「手动压缩模型」提供独立开关（默认关闭，避免默认就生效）与策略菜单（未设置时默认「默认使用」，可选「缓存失效使用」）；
+// 开关、模型和策略三者独立保存，选择「跟随会话模型」或关闭开关不得改写已设置的策略。
+pub(crate) const COMPACTION_MODEL_MODE_CACHE_EXPIRED: &str = "cache_expired";
+pub(crate) const COMPACTION_MODEL_MODE_ALWAYS: &str = "always";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompactionModelMode {
+    CacheExpired,
+    Always,
+}
+
+impl CompactionModelMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::CacheExpired => COMPACTION_MODEL_MODE_CACHE_EXPIRED,
+            Self::Always => COMPACTION_MODEL_MODE_ALWAYS,
+        }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CompactionModelPreference {
+    pub enabled: bool,
+    pub model: Option<String>,
+    pub mode: CompactionModelMode,
+}
+
+fn parse_compaction_model_enabled(value: &Value) -> Result<bool, ApiError> {
+    if value.is_null() {
+        return Ok(false);
+    }
+    value
+        .as_bool()
+        .ok_or_else(|| ApiError::new(400, "手动压缩模型开关必须为布尔值"))
+}
+
+fn parse_compaction_model(value: &Value) -> Result<Option<String>, ApiError> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let text = value
+        .as_str()
+        .map(str::trim)
+        .ok_or_else(|| ApiError::new(400, "手动压缩模型需为模型 ID 或留空跟随会话模型"))?;
+    if text.is_empty() || text == "session" {
+        return Ok(None);
+    }
+    if text.len() > 200 || text.chars().any(char::is_control) {
+        return Err(ApiError::new(400, "手动压缩模型标识无效"));
+    }
+    Ok(Some(text.to_owned()))
+}
+
+fn parse_compaction_model_mode(value: &Value) -> Result<CompactionModelMode, ApiError> {
+    if value.is_null() {
+        return Ok(CompactionModelMode::Always);
+    }
+    match value.as_str().map(str::trim) {
+        Some(COMPACTION_MODEL_MODE_ALWAYS) | Some("") => Ok(CompactionModelMode::Always),
+        Some(COMPACTION_MODEL_MODE_CACHE_EXPIRED) => Ok(CompactionModelMode::CacheExpired),
+        _ => Err(ApiError::new(
+            400,
+            "手动压缩模型策略仅支持“默认使用”或“缓存失效使用”",
+        )),
+    }
+}
+
+fn validate_compaction_model_choice(
+    model: Option<&str>,
+    catalog: Option<&Value>,
+) -> Result<(), ApiError> {
+    let Some(model) = model else {
+        return Ok(());
+    };
+    let rows = catalog
+        .and_then(|value| value["data"].as_array())
+        .ok_or_else(|| {
+            ApiError::new(
+                409,
+                "尚未取得当前实例的模型目录，请先重新读取后再选择手动压缩模型",
+            )
+        })?;
+    if !rows.iter().any(|row| row["model"].as_str() == Some(model)) {
+        return Err(ApiError::new(
+            400,
+            format!("模型 {model} 不在当前实例的模型目录中"),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn compaction_model_preference(
+    directory: &Path,
+    instance: &str,
+) -> Result<CompactionModelPreference, ApiError> {
+    let (document, _) = preferences(directory)?;
+    let entry = &document["instances"][instance];
+    Ok(CompactionModelPreference {
+        enabled: parse_compaction_model_enabled(&entry["compactionModelEnabled"])?,
+        model: parse_compaction_model(&entry["compactionModel"])?,
+        mode: parse_compaction_model_mode(&entry["compactionModelMode"])?,
+    })
+}
+
+/// 根据实例手动压缩模型开关、策略与当前模型缓存状态，决定本次手动压缩是否需要临时切换到手动压缩模型。
+/// 开关关闭时始终不切换；仅用于手动压缩（执行中由原生处理且通常存在热缓存，不触发切换）；
+/// 选“默认使用”时始终切换，选“缓存失效使用”时仅在当前模型缓存已过期或无有效缓存时切换。
+pub(crate) fn resolve_manual_compaction_model(
+    preference: &CompactionModelPreference,
+    current_model: &str,
+    cache_valid: bool,
+) -> Option<String> {
+    if !preference.enabled {
+        return None;
+    }
+    let target = preference
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())?;
+    let current = current_model.trim();
+    if !current.is_empty() && target.eq_ignore_ascii_case(current) {
+        return None;
+    }
+    match preference.mode {
+        CompactionModelMode::Always => Some(target.to_owned()),
+        CompactionModelMode::CacheExpired => (!cache_valid).then(|| target.to_owned()),
+    }
+}
+
+fn compaction_model_row(
+    catalog: Option<&Value>,
+    enabled: bool,
+    current_model: Option<&str>,
+    mode: CompactionModelMode,
+    read_only: bool,
+    read_only_reason: Option<String>,
+) -> Value {
+    // 用户要求所有会话实例的「缓存与压缩」统一提供「手动压缩模型」：
+    // 独立开关默认关闭（避免默认就生效），关闭时禁用模型与策略选择并保留原值；
+    // 未设置过时模型默认「跟随会话模型」、策略默认「默认使用」，已设置过的策略不因改选模型而被重置。
+    let mut options = vec![json!({"value": "session", "label": "跟随会话模型"})];
+    let mut seen = BTreeSet::from(["session".to_owned()]);
+    if let Some(rows) = catalog.and_then(|value| value["data"].as_array()) {
+        for row in rows {
+            let Some(id) = row["model"]
+                .as_str()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            else {
+                continue;
+            };
+            if !seen.insert(id.to_owned()) {
+                continue;
+            }
+            let label = row["displayName"]
+                .as_str()
+                .map(str::trim)
+                .filter(|label| !label.is_empty())
+                .unwrap_or(id);
+            options.push(json!({"value": id, "label": label}));
+        }
+    }
+    let selected = current_model.unwrap_or("session");
+    if selected != "session" && !seen.contains(selected) {
+        options.push(json!({
+            "value": selected,
+            "label": format!("{selected}（当前配置）"),
+            "disabled": true
+        }));
+    }
+    json!({
+        "id": "compactionModel",
+        "kind": "enum",
+        "label": "手动压缩模型",
+        "group": "缓存与压缩",
+        "description": "仅用于手动压缩，完成后自动切回原模型。",
+        "value": selected,
+        "enabledKey": "compactionModelEnabled",
+        "enabledValue": enabled,
+        "modeKey": "compactionModelMode",
+        "modeValue": mode.as_str(),
+        // 用户要求策略下拉菜单描述保持简短，在窄弹层中单行显示，不重复外层说明。
+        "modeOptions": [
+            {
+                "value": COMPACTION_MODEL_MODE_ALWAYS,
+                "label": "默认使用",
+                "description": "手动压缩时始终切换"
+            },
+            {
+                "value": COMPACTION_MODEL_MODE_CACHE_EXPIRED,
+                "label": "缓存失效使用",
+                "description": "无有效缓存时切换"
+            }
+        ],
+        "readOnly": read_only,
+        "readOnlyReason": read_only_reason,
+        "options": options
+    })
+}
+
+fn unsupported_compaction_prompt_row(reason: &str) -> Value {
+    // 用户要求所有实例均展示「压缩提示词」，不支持的实例不渲染“设置”按钮，改为右侧文字说明“不支持”。
+    json!({
+        "id": "compactionPrompt",
+        "kind": "text",
+        "label": "压缩提示词",
+        "group": "缓存与压缩",
+        "description": "",
+        "value": Value::Null,
+        "readOnly": true,
+        "readOnlyReason": reason,
+        "cliPreview": "不支持",
+        "options": [],
+        "min": Value::Null,
+        "max": 20000,
+        "defaultValue": Value::Null
+    })
+}
+
+fn clear_codex_static_auto_compact(text: &str) -> Result<String, ApiError> {
+    let mut document = text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|_| ApiError::new(422, "Codex 配置格式无效，未覆盖原文件"))?;
+    set_toml(
+        document.as_item_mut(),
+        &["model_auto_compact_token_limit"],
+        None,
+    )?;
+    Ok(toml_output(text, &document))
 }
 
 async fn save_preference(
@@ -611,32 +1419,6 @@ fn optional_bool(value: &Value) -> Result<Value, ApiError> {
     }
 }
 
-fn validate_compaction_prompt(value: &Value) -> Result<(), ApiError> {
-    if value.is_null()
-        || value.as_str().is_some_and(|text| {
-            !text.trim().is_empty()
-                && text.chars().count() <= 20_000
-                && !text.chars().any(|character| {
-                    character.is_control() && !matches!(character, '\n' | '\r' | '\t')
-                })
-        })
-    {
-        Ok(())
-    } else {
-        Err(ApiError::new(400, "压缩提示词需为 1～20000 个字符，或恢复默认"))
-    }
-}
-
-pub(super) fn claude_compaction_prompt(
-    directory: &Path,
-    instance: &str,
-) -> Result<String, ApiError> {
-    let (preference, _) = preferences(directory)?;
-    let value = &preference["instances"][instance]["compactionPrompt"];
-    validate_compaction_prompt(value)?;
-    Ok(value.as_str().unwrap_or("").to_owned())
-}
-
 pub(super) fn apply_codex_compaction_default(config: &Value, params: &mut Value) {
     // 用户指定 Codex 默认压缩提示词沿用旧管理器；显式原生提示词或文件配置继续优先，不能改写代理全局设置。
     // 文件路径可能只出现在原生配置层，不能因顶层序列化没有该字段就覆盖用户的提示词文件。
@@ -746,45 +1528,32 @@ fn updated_native(
         let mut document = text
             .parse::<toml_edit::DocumentMut>()
             .map_err(|_| ApiError::new(422, "Codex 配置格式无效，未覆盖原文件"))?;
-        if matches!(section, "general" | "models")
-            && changes.contains_key("model")
-            && !changes.contains_key("reasoningEffort")
-        {
-            // 切换默认模型时同步撤销旧模型深度；独立 API 调用也遵守页面的同一约定。
-            set_toml(document.as_item_mut(), &["model_reasoning_effort"], None)?;
-        }
         for (key, value) in changes {
             if options::apply_codex(&mut document, section, key, value)? {
                 continue;
             }
+            if section == "general" && key == "contextWindow" {
+                let window = validate_context_window("codex", value)?;
+                let replacement = window.map(|tokens| toml_edit::Value::from(tokens as i64));
+                set_toml(document.as_item_mut(), &["model_context_window"], replacement)?;
+                continue;
+            }
+            // 用户要求移除设置页「实例默认值」，不再通过实例设置改写原生 model / model_reasoning_effort。
             let path: &[&str] = match (section, key.as_str()) {
                 ("general", "todo") => &["tools", "update_plan", "enabled"],
                 ("general", "memories") => &["features", "memories"],
                 ("general", "multiAgent") => &["features", "multi_agent_v2", "enabled"],
                 ("general", "goals") => &["features", "goals"],
-                ("general" | "models", "model") => &["model"],
-                ("general" | "models", "reasoningEffort") => &["model_reasoning_effort"],
                 ("hooks", "enabled") => &["features", "hooks"],
                 _ => return Err(ApiError::new(400, "不支持的 Codex 实例设置")),
             };
             let replacement = if value.is_null() {
                 None
-            } else if matches!(key.as_str(), "todo" | "memories" | "multiAgent" | "goals" | "enabled") {
+            } else {
                 Some(toml_edit::Value::from(
                     value
                         .as_bool()
                         .ok_or_else(|| ApiError::new(400, "开关必须为布尔值"))?,
-                ))
-            } else {
-                Some(toml_edit::Value::from(
-                    value
-                        .as_str()
-                        .filter(|value| {
-                            !value.is_empty()
-                                && value.len() <= 200
-                                && !value.chars().any(char::is_control)
-                        })
-                        .ok_or_else(|| ApiError::new(400, "模型或思考深度无效"))?,
                 ))
             };
             // 用户要求 Todo、记忆、子智能体和目标模式按实例控制；保留原文件注释及所有其他配置。
@@ -802,24 +1571,112 @@ fn updated_native(
     } else {
         let mut document = native_document(backend, text)?;
         let root = document.as_object_mut().unwrap();
+        if (changes.contains_key("autoCompactPercent")
+            || changes.contains_key("contextWindow")
+            || changes.contains_key("promptCacheTtl"))
+            && changes.len() != 1
+        {
+            return Err(ApiError::new(400, "该缓存与压缩设置需要单独保存"));
+        }
         for (key, value) in changes {
             if !options::claude_boolean(section, key, value) {
                 match (section, key.as_str()) {
                     ("general", "awaySummaryEnabled") if value.is_boolean() => {}
                     ("general", "promptSuggestionEnabled")
                         if value.is_null() || value.is_boolean() => {}
+                    ("general", "autoCompactPercent") => {
+                        let percent = validate_auto_compact_percent("claude", value)?;
+                        match percent {
+                            None => {
+                                if let Some(env_value) = root.get_mut("env") {
+                                    let env = env_value.as_object_mut().ok_or_else(|| {
+                                        ApiError::new(422, "Claude env 配置格式无效，未覆盖原文件")
+                                    })?;
+                                    env.remove("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE");
+                                    if env.is_empty() {
+                                        root.remove("env");
+                                    }
+                                }
+                            }
+                            Some(pct) => {
+                                let env = root
+                                    .entry("env")
+                                    .or_insert_with(|| json!({}))
+                                    .as_object_mut()
+                                    .ok_or_else(|| {
+                                        ApiError::new(422, "Claude env 配置格式无效，未覆盖原文件")
+                                    })?;
+                                env.insert(
+                                    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE".into(),
+                                    json!(pct.to_string()),
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                    ("general", "contextWindow") => {
+                        let window = validate_context_window("claude", value)?;
+                        match window {
+                            None => {
+                                if let Some(env_value) = root.get_mut("env") {
+                                    let env = env_value.as_object_mut().ok_or_else(|| {
+                                        ApiError::new(422, "Claude env 配置格式无效，未覆盖原文件")
+                                    })?;
+                                    env.remove("CLAUDE_CODE_AUTO_COMPACT_WINDOW");
+                                    if env.is_empty() {
+                                        root.remove("env");
+                                    }
+                                }
+                            }
+                            Some(tokens) => {
+                                let env = root
+                                    .entry("env")
+                                    .or_insert_with(|| json!({}))
+                                    .as_object_mut()
+                                    .ok_or_else(|| {
+                                        ApiError::new(422, "Claude env 配置格式无效，未覆盖原文件")
+                                    })?;
+                                env.insert(
+                                    "CLAUDE_CODE_AUTO_COMPACT_WINDOW".into(),
+                                    json!(tokens.to_string()),
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                    ("general", "promptCacheTtl") => {
+                        let ttl = validate_prompt_cache_ttl(value)?;
+                        // 清理顶层同名 promptCacheTtl，防止清空 env 后旧顶层键继续生效。
+                        root.remove("promptCacheTtl");
+                        match ttl {
+                            None => {
+                                if let Some(env_value) = root.get_mut("env") {
+                                    let env = env_value.as_object_mut().ok_or_else(|| {
+                                        ApiError::new(422, "Claude env 配置格式无效，未覆盖原文件")
+                                    })?;
+                                    env.remove("CLAUDE_CODE_PROMPT_CACHE_TTL");
+                                    if env.is_empty() {
+                                        root.remove("env");
+                                    }
+                                }
+                            }
+                            Some(ttl) => {
+                                let env = root
+                                    .entry("env")
+                                    .or_insert_with(|| json!({}))
+                                    .as_object_mut()
+                                    .ok_or_else(|| {
+                                        ApiError::new(422, "Claude env 配置格式无效，未覆盖原文件")
+                                    })?;
+                                env.insert("CLAUDE_CODE_PROMPT_CACHE_TTL".into(), json!(ttl));
+                            }
+                        }
+                        continue;
+                    }
                     ("hooks", "enabled") if value.is_boolean() => {
                         root.insert("disableAllHooks".into(), json!(!value.as_bool().unwrap()));
                         continue;
                     }
-                    // CLI 仅确认 model 是可持久化的原生设置；effortLevel 未获确认，不能写入后显示假成功。
-                    ("general" | "models", "model")
-                        if value.is_null()
-                            || value.as_str().is_some_and(|value| {
-                                !value.is_empty()
-                                    && value.len() <= 200
-                                    && !value.chars().any(char::is_control)
-                            }) => {}
                     _ => return Err(ApiError::new(400, "不支持的 Claude 实例设置")),
                 }
             }
@@ -1024,63 +1881,6 @@ async fn model_catalog(
     super::native_result(value)
 }
 
-fn validate_models(
-    backend: &str,
-    document: &Value,
-    changes: &Value,
-    catalog: &Value,
-    ultra: bool,
-) -> Result<(), ApiError> {
-    if backend == "claude" && changes.get("effortLevel").is_some() {
-        return Err(ApiError::new(
-            400,
-            "Claude 默认思考深度请使用会话实例的 reasoningEffort 设置，不写入原生 effortLevel 字段。",
-        ));
-    }
-    let model = changes
-        .get("model")
-        .unwrap_or(&document["model"])
-        .as_str()
-        .or_else(|| catalog["defaultModel"].as_str());
-    let effort = changes.get("reasoningEffort").and_then(Value::as_str);
-    if changes["model"].is_null() && changes.get("model").is_some() && effort.is_some() {
-        return Err(ApiError::new(
-            400,
-            "默认模型选择“使用原生默认”时，默认思考深度需选择“使用模型默认”。",
-        ));
-    }
-    let selected = model.and_then(|model| {
-        catalog["data"]
-            .as_array()?
-            .iter()
-            .find(|row| row["model"] == model)
-            .or_else(|| (backend == "claude").then(|| {
-                catalog["data"].as_array()?.iter().find(|row| row["resolvedModel"] == model)
-            }).flatten())
-    });
-    // 移除失效的模型覆盖不依赖旧模型仍在目录中；只有明确选择新模型时才要求目录命中。
-    if changes.get("model").is_some_and(|value| !value.is_null()) && selected.is_none() {
-        return Err(ApiError::new(409, "模型已不在当前实例目录中，请重新读取"));
-    }
-    if let Some(effort) = effort {
-        if effort == "ultra" && (backend != "codex" || !ultra) {
-            return Err(ApiError::new(409, "当前实例未开放 Ultra 思考深度"));
-        }
-        if !selected.is_some_and(|model| {
-            model["supportedReasoningEfforts"]
-                .as_array()
-                .is_some_and(|values| {
-                    values
-                        .iter()
-                        .any(|value| value["reasoningEffort"] == effort)
-                })
-        }) {
-            return Err(ApiError::new(409, "当前模型不支持该思考深度，请重新选择"));
-        }
-    }
-    Ok(())
-}
-
 async fn save_native(
     target: &ConfigFile,
     text: &str,
@@ -1134,9 +1934,7 @@ async fn settings_capabilities(
             }
         };
         capabilities = json!({
-            "promptSuggestions":help.contains("--prompt-suggestions"),
-            "autoCompactWindow":help.contains("--autocompact"),
-            "defaultReasoningEffort":help.contains("--effort <")
+            "promptSuggestions":help.contains("--prompt-suggestions")
         });
         if section == "general" && help.contains("--settings") && help.contains("doctor") {
             match claude_option_capabilities(config).await {
@@ -1162,39 +1960,6 @@ async fn settings_capabilities(
     (capabilities, native_features, capability_error)
 }
 
-async fn save_preferences_patch(
-    directory: &Path,
-    instance: &str,
-    updates: &[(&str, Value)],
-    expected: &str,
-    authorization: &HarnessAuthorization,
-) -> Result<(), ApiError> {
-    let (mut document, revision) = preferences(directory)?;
-    if revision != expected {
-        return Err(ApiError::new(409, "实例偏好已变化，请重新读取后再保存"));
-    }
-    let instances = document["instances"].as_object_mut().unwrap();
-    let entry = instances.entry(instance).or_insert_with(|| json!({}));
-    let entry = entry
-        .as_object_mut()
-        .ok_or_else(|| ApiError::new(422, "实例偏好格式无效，未覆盖原文件"))?;
-    for (key, value) in updates {
-        if value.is_null() {
-            entry.remove(*key);
-        } else {
-            entry.insert((*key).to_owned(), value.clone());
-        }
-    }
-    let output = serde_json::to_string_pretty(&document).unwrap() + "\n";
-    let permit = authorization
-        .prepare_dispatch()
-        .await
-        .map_err(super::authorization_error)?;
-    permit
-        .commit(|| permissions::save_file(&directory.join(PREFERENCES_FILE), &output, expected))
-        .map_err(super::authorization_error)
-}
-
 async fn antigravity_settings(
     state: &WebState,
     target: &ConfigFile,
@@ -1211,17 +1976,41 @@ async fn antigravity_settings(
     let directory = &state.controller.state_dir;
     let model_settings = matches!(section, "general" | "models");
     let mut capability_error = String::new();
-    let mut catalog = if model_settings {
-        match model_catalog(state, instance, authorization, payload["forceReload"] == true).await {
-            Ok(value) => Some(value),
-            Err(failure) if section == "general" => {
-                capability_error = format!("无法读取当前 Antigravity 实例模型目录：{}", failure.message);
+    let (catalog_result, version_result) = tokio::join!(
+        async {
+            if model_settings {
+                Some(
+                    model_catalog(
+                        state,
+                        instance,
+                        authorization,
+                        payload["forceReload"] == true,
+                    )
+                    .await,
+                )
+            } else {
                 None
             }
-            Err(failure) => return Err(failure),
+        },
+        async {
+            if section == "general" {
+                match target.antigravity_config.as_ref() {
+                    Some(config) => Some(antigravity_version(config).await),
+                    None => Some(Err("未找到当前 Antigravity CLI 可执行路径".to_owned())),
+                }
+            } else {
+                None
+            }
         }
-    } else {
-        None
+    );
+    let catalog = match catalog_result {
+        Some(Ok(value)) => Some(value),
+        Some(Err(failure)) if section == "general" => {
+            capability_error = format!("无法读取当前 Antigravity 实例模型目录：{}", failure.message);
+            None
+        }
+        Some(Err(failure)) => return Err(failure),
+        None => None,
     };
 
     let _serial = permissions::CONFIG_WRITE
@@ -1260,40 +2049,89 @@ async fn antigravity_settings(
                         authorization,
                     )
                     .await?;
-                } else if changes
-                    .keys()
-                    .all(|k| matches!(k.as_str(), "model" | "reasoningEffort"))
-                {
-                    let Some(cat) = catalog.as_ref() else {
-                        return Err(ApiError::new(
-                            409,
-                            "未取得当前 Antigravity 实例模型目录，请重新读取后再保存模型设置",
-                        ));
-                    };
-                    let (current_model, _) =
-                        antigravity_default_model_and_effort(directory, instance)?;
-                    let effective_doc = json!({ "model": current_model });
-                    if let Some(m) = changes.get("model") {
-                        antigravity_default_model(m)?;
+                } else if changes.contains_key("autoCompactPercent") {
+                    if section != "general" || changes.len() != 1 {
+                        return Err(ApiError::new(400, "自动压缩阈值需要单独保存"));
                     }
-                    if let Some(e) = changes.get("reasoningEffort") {
-                        antigravity_default_effort(e)?;
-                    }
-                    validate_models("antigravity", &effective_doc, &payload["settings"], cat, false)?;
-                    let mut patch: Vec<(&str, Value)> = Vec::new();
-                    if let Some(m) = changes.get("model") {
-                        patch.push(("defaultModel", m.clone()));
-                        if !changes.contains_key("reasoningEffort") {
-                            patch.push(("defaultReasoningEffort", Value::Null));
+                    match version_result.as_ref() {
+                        Some(Ok(ver)) if *ver >= ANTIGRAVITY_MIN_AUTO_COMPACT_VERSION => {}
+                        Some(Ok((major, minor, patch))) => {
+                            return Err(ApiError::new(
+                                409,
+                                format!(
+                                    "当前 Antigravity CLI 版本为 {major}.{minor}.{patch}，需升级到 1.5.15 及以上才支持自动压缩阈值"
+                                ),
+                            ));
+                        }
+                        Some(Err(reason)) => {
+                            return Err(ApiError::new(
+                                409,
+                                format!("未能确认当前 Antigravity CLI 版本（需 1.5.15 及以上）：{reason}"),
+                            ));
+                        }
+                        None => {
+                            return Err(ApiError::new(409, "当前 Antigravity 实例不支持自动压缩阈值"));
                         }
                     }
-                    if let Some(e) = changes.get("reasoningEffort") {
-                        patch.push(("defaultReasoningEffort", e.clone()));
-                    }
-                    save_preferences_patch(
+                    validate_auto_compact_percent("antigravity", &changes["autoCompactPercent"])?;
+                    save_preference(
                         directory,
                         instance,
-                        &patch,
+                        "autoCompactPercent",
+                        &changes["autoCompactPercent"],
+                        payload["expectedPreferenceRevision"]
+                            .as_str()
+                            .unwrap_or(""),
+                        authorization,
+                    )
+                    .await?;
+                } else if changes.contains_key("compactionModelEnabled") {
+                    if section != "general" || changes.len() != 1 {
+                        return Err(ApiError::new(400, "手动压缩模型开关需要单独保存"));
+                    }
+                    let enabled = changes["compactionModelEnabled"]
+                        .as_bool()
+                        .ok_or_else(|| ApiError::new(400, "手动压缩模型开关必须为布尔值"))?;
+                    save_preference(
+                        directory,
+                        instance,
+                        "compactionModelEnabled",
+                        &json!(enabled),
+                        payload["expectedPreferenceRevision"]
+                            .as_str()
+                            .unwrap_or(""),
+                        authorization,
+                    )
+                    .await?;
+                } else if changes.contains_key("compactionModel") {
+                    if section != "general" || changes.len() != 1 {
+                        return Err(ApiError::new(400, "手动压缩模型需要单独保存"));
+                    }
+                    let parsed = parse_compaction_model(&changes["compactionModel"])?;
+                    validate_compaction_model_choice(parsed.as_deref(), catalog.as_ref())?;
+                    let stored = parsed.map(Value::from).unwrap_or(Value::Null);
+                    save_preference(
+                        directory,
+                        instance,
+                        "compactionModel",
+                        &stored,
+                        payload["expectedPreferenceRevision"]
+                            .as_str()
+                            .unwrap_or(""),
+                        authorization,
+                    )
+                    .await?;
+                } else if changes.contains_key("compactionModelMode") {
+                    if section != "general" || changes.len() != 1 {
+                        return Err(ApiError::new(400, "手动压缩模型策略需要单独保存"));
+                    }
+                    let mode = parse_compaction_model_mode(&changes["compactionModelMode"])?;
+                    // 显式保存用户选定的策略，避免后续调整模型或开关时覆盖已设置的策略。
+                    save_preference(
+                        directory,
+                        instance,
+                        "compactionModelMode",
+                        &json!(mode.as_str()),
                         payload["expectedPreferenceRevision"]
                             .as_str()
                             .unwrap_or(""),
@@ -1344,33 +2182,56 @@ async fn antigravity_settings(
         updated = true;
     }
 
-    if updated
-        && model_settings
-        && catalog.is_some()
-        && ["model", "reasoningEffort"]
-            .iter()
-            .any(|key| payload["settings"].get(*key).is_some())
-    {
-        catalog = Some(model_catalog(state, instance, authorization, false).await?);
-    }
-
     let (preference, preference_revision) = preferences(directory)?;
+    let mut extra_settings = Vec::new();
     let (values, revision, path_display, inventory) = match section {
         "general" | "models" => {
             let (_, rev) = permissions::read_file(&target.path)?;
-            let (default_model, default_effort) =
-                antigravity_default_model_and_effort(directory, instance)?;
             let hidden = hidden_model_ids(&preference["instances"][instance]["hiddenModelIds"])?;
-            (
-                json!({
-                    "model": default_model,
-                    "reasoningEffort": default_effort,
-                    "hiddenModelIds": hidden,
-                }),
-                rev,
-                target.display.clone(),
-                None,
-            )
+            let mut map = json!({
+                "hiddenModelIds": hidden,
+            });
+            if section == "general" {
+                let version = version_result
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| Err("未检测到 Antigravity CLI 版本".to_owned()));
+                let (value, row) = antigravity_auto_compact_row(
+                    &preference["instances"][instance]["autoCompactPercent"],
+                    &version,
+                )?;
+                let comp_enabled = parse_compaction_model_enabled(
+                    &preference["instances"][instance]["compactionModelEnabled"],
+                )?;
+                let comp_model =
+                    parse_compaction_model(&preference["instances"][instance]["compactionModel"])?;
+                let comp_mode = parse_compaction_model_mode(
+                    &preference["instances"][instance]["compactionModelMode"],
+                )?;
+                // 缓存与压缩 5 项顺序统一：上下文大小 → 自动压缩阈值 → 缓存时间 → 手动压缩模型 → 压缩提示词。
+                map["contextWindow"] = Value::Null;
+                map["autoCompactPercent"] = value;
+                map["promptCacheTtl"] = Value::Null;
+                map["compactionModelEnabled"] = json!(comp_enabled);
+                map["compactionModel"] = json!(comp_model.as_deref().unwrap_or("session"));
+                map["compactionModelMode"] = json!(comp_mode.as_str());
+                map["compactionPrompt"] = Value::Null;
+                extra_settings.push(unsupported_context_window_row(
+                    "建议调小下方“自动压缩阈值”。",
+                ));
+                extra_settings.push(row);
+                extra_settings.push(unsupported_prompt_cache_ttl_row(""));
+                extra_settings.push(compaction_model_row(
+                    catalog.as_ref(),
+                    comp_enabled,
+                    comp_model.as_deref(),
+                    comp_mode,
+                    false,
+                    None,
+                ));
+                extra_settings.push(unsupported_compaction_prompt_row(""));
+            }
+            (map, rev, target.display.clone(), None)
         }
         "skills" => {
             let (_, rev) = permissions::read_file(&target.path)?;
@@ -1441,7 +2302,7 @@ async fn antigravity_settings(
         "settings": values,
         "capabilities": {},
         "capabilityError": capability_error,
-        "extraSettings": [],
+        "extraSettings": extra_settings,
         "readOnly": state.settings.read_only,
         "readOnlyReason": "",
         "updated": updated,
@@ -1449,7 +2310,6 @@ async fn antigravity_settings(
     if let Some(cat) = catalog {
         let decorated = decorate_antigravity_model_visibility(directory, instance, cat)?;
         response["models"] = decorated["data"].clone();
-        response["effectiveModel"] = decorated["defaultModel"].clone();
     } else if matches!(section, "general" | "models") {
         response["models"] = json!([]);
     }
@@ -1556,11 +2416,6 @@ pub(super) async fn settings(
             .as_object()
             .filter(|changes| !changes.is_empty())
             .ok_or_else(|| ApiError::new(400, "请选择需要保存的设置"))?;
-        if changes.keys().any(|key| matches!(key.as_str(), "model" | "reasoningEffort" | "effortLevel"))
-            && catalog.is_none()
-        {
-            return Err(ApiError::new(409, "未取得当前实例模型目录，请重新读取后再保存模型设置"));
-        }
         options::validate_changes(
             &target.backend,
             section,
@@ -1583,18 +2438,6 @@ pub(super) async fn settings(
             let previous = hidden_model_ids(&preference["instances"][instance]["hiddenModelIds"])?;
             validate_hidden_model_selection(&ids, &previous, catalog.as_ref())?;
             save_preference(directory, instance, "hiddenModelIds", &json!(ids),
-                payload["expectedPreferenceRevision"].as_str().unwrap_or(""), &authorization).await?;
-        } else if target.backend == "claude" && changes.contains_key("reasoningEffort") {
-            if !matches!(section, "general" | "models") || changes.len() != 1 {
-                return Err(ApiError::new(400, "Claude 默认思考深度需要单独保存"));
-            }
-            let value = &changes["reasoningEffort"];
-            if claude_default_effort(value)?.is_some() && capabilities["defaultReasoningEffort"] != true {
-                return Err(ApiError::new(409, "所选实例的 Claude CLI 未提供 --effort，无法设置默认思考深度"));
-            }
-            validate_models("claude", &document, &payload["settings"], catalog.as_ref().unwrap(), false)?;
-            // 默认深度属于 Harness 实例偏好，后续新会话经原生控制接口交给 CLI 的 --effort；不伪造 settings.json 键。
-            save_preference(directory, instance, "defaultReasoningEffort", value,
                 payload["expectedPreferenceRevision"].as_str().unwrap_or(""), &authorization).await?;
         } else if changes.contains_key("persistentSideThreads") {
             if section != "general" || target.backend != "codex" || changes.len() != 1
@@ -1625,31 +2468,93 @@ pub(super) async fn settings(
                 &authorization,
             )
             .await?;
-        } else if changes.contains_key("compactionPrompt") && target.backend == "claude" {
+        } else if changes.contains_key("compactionModelEnabled") {
             if section != "general" || changes.len() != 1 {
-                return Err(ApiError::new(400, "压缩提示词需要单独保存"));
+                return Err(ApiError::new(400, "手动压缩模型开关需要单独保存"));
             }
-            validate_compaction_prompt(&changes["compactionPrompt"])?;
-            // Claude 只给所选实例的原生 /compact 传附加说明，不伪造 CLI 配置键或改变正常对话的系统提示词。
-            save_preference(
-                directory, instance, "compactionPrompt", &changes["compactionPrompt"],
-                payload["expectedPreferenceRevision"].as_str().unwrap_or(""), &authorization,
-            ).await?;
-        } else if changes.contains_key("autoCompactWindow") {
-            if section != "general"
-                || target.backend != "claude"
-                || changes.len() != 1
-                || capabilities["autoCompactWindow"] != true
-            {
-                return Err(ApiError::new(400, "当前 Claude CLI 不支持自动压缩窗口设置"));
-            }
-            validate_compact(&changes["autoCompactWindow"])?;
+            let enabled = changes["compactionModelEnabled"]
+                .as_bool()
+                .ok_or_else(|| ApiError::new(400, "手动压缩模型开关必须为布尔值"))?;
             save_preference(
                 directory,
                 instance,
-                "autoCompactWindow",
-                &changes["autoCompactWindow"],
-                payload["expectedPreferenceRevision"].as_str().unwrap_or(""),
+                "compactionModelEnabled",
+                &json!(enabled),
+                payload["expectedPreferenceRevision"]
+                    .as_str()
+                    .unwrap_or(""),
+                &authorization,
+            )
+            .await?;
+        } else if changes.contains_key("compactionModel") {
+            if section != "general" || changes.len() != 1 {
+                return Err(ApiError::new(400, "手动压缩模型需要单独保存"));
+            }
+            let parsed = parse_compaction_model(&changes["compactionModel"])?;
+            validate_compaction_model_choice(parsed.as_deref(), catalog.as_ref())?;
+            let stored = parsed.map(Value::from).unwrap_or(Value::Null);
+            save_preference(
+                directory,
+                instance,
+                "compactionModel",
+                &stored,
+                payload["expectedPreferenceRevision"]
+                    .as_str()
+                    .unwrap_or(""),
+                &authorization,
+            )
+            .await?;
+        } else if changes.contains_key("compactionModelMode") {
+            if section != "general" || changes.len() != 1 {
+                return Err(ApiError::new(400, "手动压缩模型策略需要单独保存"));
+            }
+            let mode = parse_compaction_model_mode(&changes["compactionModelMode"])?;
+            // 显式保存用户选定的策略，避免后续调整模型或开关时覆盖已设置的策略。
+            save_preference(
+                directory,
+                instance,
+                "compactionModelMode",
+                &json!(mode.as_str()),
+                payload["expectedPreferenceRevision"]
+                    .as_str()
+                    .unwrap_or(""),
+                &authorization,
+            )
+            .await?;
+        } else if changes.contains_key("autoCompactPercent") && target.backend == "codex" {
+            if section != "general" || changes.len() != 1 {
+                return Err(ApiError::new(400, "自动压缩阈值需要单独保存"));
+            }
+            validate_auto_compact_percent("codex", &changes["autoCompactPercent"])?;
+            let expected_pref = payload["expectedPreferenceRevision"]
+                .as_str()
+                .unwrap_or("");
+            let (_, current_pref_revision) = preferences(directory)?;
+            if current_pref_revision != expected_pref {
+                return Err(ApiError::new(409, "实例偏好已变化，请重新读取后再保存"));
+            }
+            let has_static_limit = !document["model_auto_compact_token_limit"].is_null();
+            if has_static_limit {
+                if payload["expectedRevision"] != revision {
+                    return Err(ApiError::new(409, "实例配置已变化，请重新读取后再保存"));
+                }
+                // 清理原生 config.toml 旧静态 model_auto_compact_token_limit，避免与百分比动态换算冲突。
+                let cleared = clear_codex_static_auto_compact(&text)?;
+                permissions::save_settings_file(
+                    &target,
+                    &cleared,
+                    &json!({"model_auto_compact_token_limit": null}),
+                    &revision,
+                    &authorization,
+                )
+                .await?;
+            }
+            save_preference(
+                directory,
+                instance,
+                "autoCompactPercent",
+                &changes["autoCompactPercent"],
+                expected_pref,
                 &authorization,
             )
             .await?;
@@ -1719,25 +2624,15 @@ pub(super) async fn settings(
             {
                 return Err(ApiError::new(409, "当前 Claude CLI 尚未确认支持输入建议"));
             }
-            if let Some(catalog) = &catalog
-                && changes.keys().any(|key| matches!(key.as_str(), "model" | "reasoningEffort" | "effortLevel"))
-            {
-                validate_models(
-                    &target.backend,
-                    &document,
-                    &payload["settings"],
-                    catalog,
-                    ultra_enabled(directory, instance)?,
-                )?;
-            }
             save_native(&target, &text, &revision, &payload, &authorization).await?;
         }
         if changes.contains_key("ultraReasoningEnabled")
             || changes.contains_key("persistentSideThreads")
-            || changes.contains_key("autoCompactWindow")
-            || changes.contains_key("compactionPrompt") && target.backend == "claude"
+            || changes.contains_key("autoCompactPercent") && target.backend == "codex"
+            || changes.contains_key("compactionModelEnabled")
+            || changes.contains_key("compactionModel")
+            || changes.contains_key("compactionModelMode")
             || changes.contains_key("hiddenModelIds")
-            || target.backend == "claude" && changes.contains_key("reasoningEffort")
         {
             state
                 .controller
@@ -1747,7 +2642,7 @@ pub(super) async fn settings(
         updated = true;
     }
     if updated && model_settings && catalog.is_some()
-        && ["model", "reasoningEffort", "ultraReasoningEnabled"].iter().any(|key| payload["settings"].get(*key).is_some())
+        && payload["settings"].get("ultraReasoningEnabled").is_some()
     {
         catalog = Some(model_catalog(&state, instance, &authorization, true).await?);
     }
@@ -1757,10 +2652,6 @@ pub(super) async fn settings(
     let mut values = match section {
         "general" => general_view(&target.backend, &document)?,
         "models" => json!({
-            "model":document["model"],
-            "reasoningEffort":if target.backend == "codex" {
-                document["model_reasoning_effort"].clone()
-            } else {Value::Null},
             "ultraReasoningEnabled":ultra_enabled(directory, instance)?
         }),
         _ => json!({}),
@@ -1769,27 +2660,11 @@ pub(super) async fn settings(
         values["persistentSideThreads"] = json!(persistent_sides_enabled(directory, instance)?);
     }
     if section == "general" && model_settings {
-        let defaults = json!({
-            "model":document["model"],
-            "reasoningEffort":if target.backend == "codex" {
-                document["model_reasoning_effort"].clone()
-            } else {Value::Null},
-            "ultraReasoningEnabled":ultra_enabled(directory, instance)?
-        });
-        values.as_object_mut().unwrap().extend(defaults.as_object().unwrap().clone());
-    }
-    if target.backend == "claude" && section == "general" {
-        let window = &preference["instances"][instance]["autoCompactWindow"];
-        validate_compact(window)?;
-        values["autoCompactWindow"] = window.clone();
+        values["ultraReasoningEnabled"] = json!(ultra_enabled(directory, instance)?);
     }
     if model_settings {
         values["hiddenModelIds"] = json!(hidden_model_ids(
             &preference["instances"][instance]["hiddenModelIds"])?);
-    }
-    if target.backend == "claude" && matches!(section, "general" | "models") {
-        values["reasoningEffort"] = json!(claude_default_effort(
-            &preference["instances"][instance]["defaultReasoningEffort"])?);
     }
     let mut extra_settings = options::append_view(
         &target.backend,
@@ -1803,25 +2678,61 @@ pub(super) async fn settings(
         },
     );
     if section == "general" {
-        // 先按实例暴露真实能力边界：当前两个原生引擎均未确认独立压缩模型接口，不能借用旧代理模型配置。
-        values["compactionModel"] = json!("session");
-        extra_settings.push(json!({
-            "id":"compactionModel","kind":"enum","label":"压缩模型","group":"缓存与压缩",
-            "description":"","value":"session","readOnly":true,
-            "readOnlyReason":"当前尚未确认该实例的独立压缩模型接口，暂跟随会话模型；未借用代理的全局设置。",
-            "options":[{"value":"session","label":"跟随会话模型"}]
-        }));
+        let ((context_value, context_row), (compact_value, compact_row), (cache_ttl_value, cache_ttl_row)) =
+            if target.backend == "codex" {
+                let codex_home = target.path.parent().unwrap_or(Path::new(""));
+                let ctx = codex_context_window_row(codex_home, &document, adapter_read_only);
+                let cmp = codex_auto_compact_row(
+                    codex_home,
+                    &document,
+                    &preference["instances"][instance]["autoCompactPercent"],
+                    adapter_read_only,
+                )?;
+                let ttl = (Value::Null, unsupported_prompt_cache_ttl_row(""));
+                (ctx, cmp, ttl)
+            } else {
+                (
+                    claude_context_window_row(&document),
+                    claude_auto_compact_row(&document),
+                    claude_prompt_cache_ttl_row(&document),
+                )
+            };
+        let comp_enabled = parse_compaction_model_enabled(
+            &preference["instances"][instance]["compactionModelEnabled"],
+        )?;
+        let comp_model =
+            parse_compaction_model(&preference["instances"][instance]["compactionModel"])?;
+        let comp_mode = parse_compaction_model_mode(
+            &preference["instances"][instance]["compactionModelMode"],
+        )?;
+        values["contextWindow"] = context_value;
+        values["autoCompactPercent"] = compact_value;
+        values["promptCacheTtl"] = cache_ttl_value;
+        values["compactionModelEnabled"] = json!(comp_enabled);
+        values["compactionModel"] = json!(comp_model.as_deref().unwrap_or("session"));
+        values["compactionModelMode"] = json!(comp_mode.as_str());
+        let compaction_model_row = compaction_model_row(
+            catalog.as_ref(),
+            comp_enabled,
+            comp_model.as_deref(),
+            comp_mode,
+            adapter_read_only,
+            adapter_read_only
+                .then(|| "该 Codex 实例的独立执行适配器尚未接入，手动压缩模型仅供查看。".to_owned()),
+        );
+        let (mut cache_rows, other_rows): (Vec<Value>, Vec<Value>) = extra_settings
+            .into_iter()
+            .partition(|row| row["group"] == "缓存与压缩");
+        // 缓存与压缩 5 项顺序统一：上下文大小 → 自动压缩阈值 → 缓存时间 → 手动压缩模型 → 压缩提示词。
+        let mut ordered_cache = vec![context_row, compact_row, cache_ttl_row, compaction_model_row];
+        ordered_cache.append(&mut cache_rows);
         if target.backend == "claude" {
-            let prompt = &preference["instances"][instance]["compactionPrompt"];
-            validate_compaction_prompt(prompt)?;
-            values["compactionPrompt"] = prompt.clone();
-            extra_settings.push(json!({
-                "id":"compactionPrompt","kind":"text","label":"压缩提示词","group":"缓存与压缩",
-                "description":"作为所选实例原生 /compact 的附加说明，仅用于手动压缩；自动压缩继续使用原生规则。",
-                "value":prompt,"readOnly":false,"readOnlyReason":null,"options":[],
-                "min":null,"max":20000,"defaultValue":null
-            }));
+            // 用户要求 Claude 的「压缩提示词」改为不支持，右侧展示纯文字「不支持」且不保留冗余描述。
+            values["compactionPrompt"] = Value::Null;
+            ordered_cache.push(unsupported_compaction_prompt_row(""));
         }
+        ordered_cache.extend(other_rows);
+        extra_settings = ordered_cache;
     }
     authorization
         .check()
@@ -1848,7 +2759,6 @@ pub(super) async fn settings(
             catalog = decorate_codex_model_visibility(directory, instance, catalog)?;
         }
         response["models"] = catalog["data"].clone();
-        response["effectiveModel"] = catalog["defaultModel"].clone();
     }
     drop(_serial);
     if ["skills", "mcp", "hooks"].contains(&section) {
@@ -2058,49 +2968,24 @@ mod tests {
     }
 
     #[test]
-    fn claude_instance_default_effort_is_scoped_supported_and_resettable() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join(PREFERENCES_FILE);
-        std::fs::write(&path, r#"{"instances":{"claude:wsl:one":{"defaultReasoningEffort":"max"}}}"#).unwrap();
-        let catalog = json!({"catalogComplete":true,"defaultModel":"model-a","defaultReasoningEffort":"",
-            "data":[{"model":"model-a","supportedReasoningEfforts":[{"reasoningEffort":"max"}]}]});
-        let shown = decorate_claude_model_visibility(directory.path(), "claude:wsl:one", catalog.clone()).unwrap();
-        assert_eq!(shown["defaultReasoningEffort"], "max");
-        let other = decorate_claude_model_visibility(directory.path(), "claude:wsl:two", catalog.clone()).unwrap();
-        assert_eq!(other["defaultReasoningEffort"], "");
-        let mut unsupported = catalog.clone();
-        unsupported["data"][0]["supportedReasoningEfforts"] = json!([]);
-        assert_eq!(decorate_claude_model_visibility(directory.path(), "claude:wsl:one", unsupported).unwrap()["defaultReasoningEffort"], "");
-        let mut history = catalog.clone();
-        history["catalogComplete"] = json!(false);
-        history["defaultReasoningEffort"] = json!("low");
-        assert_eq!(decorate_claude_model_visibility(directory.path(), "claude:wsl:one", history).unwrap()["defaultReasoningEffort"], "low");
-        std::fs::write(&path, r#"{"instances":{"claude:wsl:one":{}}}"#).unwrap();
-        assert_eq!(decorate_claude_model_visibility(directory.path(), "claude:wsl:one", shown).unwrap()["defaultReasoningEffort"], "");
-        assert!(claude_default_effort(&json!("ultra")).is_err());
-        assert!(claude_default_effort(&json!(true)).is_err());
-        assert!(validate_models("claude", &json!({"model":"model-a"}), &json!({"reasoningEffort":"max"}), &catalog, false).is_ok());
-        assert!(validate_models("claude", &json!({"model":"model-a"}), &json!({"reasoningEffort":"high"}), &catalog, false).is_err());
-        assert!(updated_native("claude", "general", "{}", &json!({"reasoningEffort":"max"})).is_err());
-    }
-
-    #[test]
-    fn merged_instance_settings_preserve_model_and_compaction_native_contracts() {
+    fn merged_instance_settings_preserve_extra_and_compaction_native_contracts() {
         let before = "# 保留配置\nmodel = \"old\"\nmodel_reasoning_effort = \"high\"\n[features]\ngoals = true\n";
-        let updated = updated_native("codex", "general", before, &json!({"model":"new"})).unwrap();
-        let updated = updated_native("codex", "general", &updated,
-            &json!({"autoCompactTokenLimit":600000,"reasoningSummary":"detailed","defaultServiceTier":"priority"})).unwrap();
+        // 用户要求移除设置页「实例默认值」，不再允许通过实例设置改写 Codex/Claude 默认模型与默认思考深度。
+        assert!(updated_native("codex", "general", before, &json!({"model":"new"})).is_err());
+        assert!(updated_native("codex", "general", before, &json!({"reasoningEffort":"low"})).is_err());
+        assert!(updated_native("claude", "general", "{}", &json!({"model":"selected-model"})).is_err());
+        assert!(updated_native("claude", "general", "{}", &json!({"reasoningEffort":"max"})).is_err());
+        let updated = updated_native("codex", "general", before,
+            &json!({"reasoningSummary":"detailed","defaultServiceTier":"priority"})).unwrap();
         let saved = native_document("codex", &updated).unwrap();
-        assert_eq!(saved["model"], "new");
-        assert!(saved["model_reasoning_effort"].is_null());
-        assert_eq!(saved["model_auto_compact_token_limit"], 600000);
+        assert_eq!(saved["model"], "old");
+        assert_eq!(saved["model_reasoning_effort"], "high");
         assert_eq!(saved["model_reasoning_summary"], "detailed");
         assert_eq!(saved["service_tier"], "priority");
         assert_eq!(saved["features"]["goals"], true);
         assert!(updated.contains("# 保留配置"));
-        assert_eq!(native_document("claude",
-            &updated_native("claude", "general", "{}", &json!({"model":"selected-model"})).unwrap()).unwrap()["model"], "selected-model");
         assert!(updated_native("codex", "general", before, &json!({"compactionModel":"invented"})).is_err());
+        assert!(updated_native("codex", "general", before, &json!({"autoCompactTokenLimit":600000})).is_err());
     }
 
     #[test]
@@ -2134,20 +3019,14 @@ mod tests {
     }
 
     #[test]
-    fn claude_compaction_prompt_is_scoped_to_the_exact_instance() {
-        let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join(PREFERENCES_FILE),
-            serde_json::to_string(&json!({"instances":{
-                "claude:wsl:one":{"compactionPrompt":"实例一说明"},
-                "claude:wsl:two":{"compactionPrompt":"实例二说明"}
-            }})).unwrap()).unwrap();
-        assert_eq!(claude_compaction_prompt(directory.path(), "claude:wsl:one").unwrap(), "实例一说明");
-        assert_eq!(claude_compaction_prompt(directory.path(), "claude:wsl:two").unwrap(), "实例二说明");
-        assert_eq!(claude_compaction_prompt(directory.path(), "claude:wsl:missing").unwrap(), "");
-        assert!(validate_compaction_prompt(&json!(" \n\t")).is_err());
-        assert!(validate_compaction_prompt(&json!("invalid\u{0000}")).is_err());
-        assert!(validate_compaction_prompt(&json!("x".repeat(20001))).is_err());
-        assert!(validate_compaction_prompt(&Value::Null).is_ok());
+    fn claude_compaction_prompt_is_unsupported_and_rejected() {
+        let row = unsupported_compaction_prompt_row("");
+        assert_eq!(row["id"], "compactionPrompt");
+        assert_eq!(row["group"], "缓存与压缩");
+        assert_eq!(row["readOnly"], true);
+        assert_eq!(row["cliPreview"], "不支持");
+        assert_eq!(row["readOnlyReason"], "");
+        assert!(updated_native("claude", "general", "{}", &json!({"compactionPrompt":"自定义"})).is_err());
     }
 
     fn features() -> Value {
@@ -2173,7 +3052,7 @@ mod tests {
         let second = updated_native("codex", "general", &first,
             &json!({"chronicle":false,"experimentalContextManagement":true,"threadStoreCompression":true})).unwrap();
         let after = updated_native("codex", "models", &second,
-            &json!({"autoCompactTokenLimit":900000,"reasoningSummary":"detailed","defaultServiceTier":"priority"})).unwrap();
+            &json!({"reasoningSummary":"detailed","defaultServiceTier":"priority"})).unwrap();
         assert!(after.starts_with('\u{feff}'));
         assert!(after.contains("# 模型注释\r\n"));
         assert!(!after.replace("\r\n", "").contains('\n'));
@@ -2187,7 +3066,6 @@ mod tests {
             saved["features"]["context_management"]["experimental_mode"],
             true
         );
-        assert_eq!(saved["model_auto_compact_token_limit"], 900000);
         assert_eq!(saved["model_reasoning_summary"], "detailed");
         let reset = updated_native("codex", "general", &after,
             &json!({"generateMemories":null,"maxConcurrentThreads":null,"experimentalContextManagement":null})).unwrap();
@@ -2297,7 +3175,7 @@ mod tests {
                 "codex",
                 "models",
                 "",
-                &json!({"autoCompactTokenLimit":9007199254740992_u64})
+                &json!({"autoCompactTokenLimit":900000})
             )
             .is_err()
         );
@@ -2370,20 +3248,14 @@ mod tests {
             "modelSettings":{"claude-fixture":{"effortLevel":"xhigh"},"invalid model":{"effortLevel":"fixture-secret"}}});
         let mut values = general_view("claude", &document).unwrap();
         let rows = options::append_view("claude", "general", &document, &mut values, &json!({}));
-        assert_eq!(values["nativePromptCacheTtl"], "1h");
         for key in [
             "nativePromptCacheTtl",
             "nativeAutoCompactWindow",
             "nativeAutoCompactPercent",
         ] {
             assert!(
-                rows.iter()
-                    .any(|row| row["id"] == key && row["readOnly"] == true)
-            );
-            assert!(updated_native("claude", "general", "{}", &json!({key:null})).is_err());
-            assert!(
-                options::validate_changes("claude", "general", &json!({key:null}), &json!({}))
-                    .is_err()
+                !rows.iter().any(|row| row["id"] == key),
+                "{key} 已提升至「缓存与压缩」正式配置项，不再重复作为只读诊断项展示"
             );
         }
         let models = options::append_view("claude", "models", &document, &mut values, &json!({}));
@@ -2452,8 +3324,9 @@ mod tests {
             catalog.clone(),
         )
         .unwrap();
-        assert_eq!(local["defaultModel"], "claude-opus-5-5");
-        assert_eq!(local["defaultReasoningEffort"], "high");
+        // 移除「实例默认值」后，仅叠加显示模型标记，不再用旧偏好覆盖 ACP 原生 defaultModel / defaultReasoningEffort。
+        assert_eq!(local["defaultModel"], "gemini-4-neon");
+        assert_eq!(local["defaultReasoningEffort"], "xhigh");
         assert_eq!(local["data"][0]["hiddenByInstance"], false);
         assert_eq!(local["data"][1]["hiddenByInstance"], false);
         assert_eq!(local["data"][2]["hiddenByInstance"], true);
@@ -2479,5 +3352,339 @@ mod tests {
             antigravity_default_permission_mode(directory.path(), "antigravity:wsl:unset").unwrap(),
             "default"
         );
+    }
+
+    #[test]
+    fn unified_auto_compact_percent_rules_cover_codex_claude_and_antigravity() {
+        // 1. 通用校验：三端统一范围 50～98%。
+        assert!(validate_auto_compact_percent("codex", &json!(49)).is_err());
+        assert_eq!(validate_auto_compact_percent("codex", &json!(50)).unwrap(), Some(50));
+        assert_eq!(validate_auto_compact_percent("codex", &json!(98)).unwrap(), Some(98));
+        assert!(validate_auto_compact_percent("codex", &json!(99)).is_err());
+        assert_eq!(validate_auto_compact_percent("codex", &Value::Null).unwrap(), None);
+
+        assert!(validate_auto_compact_percent("claude", &json!(49)).is_err());
+        assert_eq!(validate_auto_compact_percent("claude", &json!(50)).unwrap(), Some(50));
+        assert_eq!(validate_auto_compact_percent("claude", &json!(98)).unwrap(), Some(98));
+        assert!(validate_auto_compact_percent("claude", &json!(99)).is_err());
+
+        assert!(validate_auto_compact_percent("antigravity", &json!(49)).is_err());
+        assert_eq!(validate_auto_compact_percent("antigravity", &json!(50)).unwrap(), Some(50));
+        assert_eq!(validate_auto_compact_percent("antigravity", &json!(98)).unwrap(), Some(98));
+        assert!(validate_auto_compact_percent("antigravity", &json!(99)).is_err());
+
+        // 2. Codex：按实例模型目录动态换算 model_auto_compact_token_limit，不写死 1M。
+        let dir = tempfile::tempdir().unwrap();
+        let codex_home = dir.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::write(
+            codex_home.join("custom-catalog.json"),
+            serde_json::to_string(&json!({
+                "models": [
+                    {"slug": "gpt-6.1-sol", "context_window": 600000, "max_context_window": 600000},
+                    {"slug": "gpt-6-luna", "context_window": 372000, "max_context_window": 372000}
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(PREFERENCES_FILE),
+            serde_json::to_string(&json!({
+                "instances": {
+                    "codex:local": { "autoCompactPercent": 85 },
+                    "antigravity:local": { "autoCompactPercent": 88 }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let codex_doc = json!({"model_catalog_json": "custom-catalog.json", "model": "gpt-6.1-sol"});
+        let mut params_sol = json!({"model": "gpt-6.1-sol"});
+        apply_codex_auto_compact(
+            dir.path(),
+            "codex:local",
+            &codex_home,
+            &codex_doc,
+            Some("gpt-6.1-sol"),
+            &mut params_sol,
+        );
+        assert_eq!(params_sol["config"]["model_auto_compact_token_limit"], 510_000);
+        let mut params_luna = json!({"model": "gpt-6-luna"});
+        apply_codex_auto_compact(
+            dir.path(),
+            "codex:local",
+            &codex_home,
+            &codex_doc,
+            Some("gpt-6-luna"),
+            &mut params_luna,
+        );
+        assert_eq!(params_luna["config"]["model_auto_compact_token_limit"], 316_200);
+
+        // Codex 读取视图：输入框左侧只显示数值，不附带配置 key 或描述介绍。
+        let (v_set, row_set) =
+            codex_auto_compact_row(&codex_home, &codex_doc, &json!(85), false).unwrap();
+        assert_eq!(v_set, 85);
+        assert_eq!(row_set["cliPreview"], "510,000");
+        assert_eq!(row_set["unit"], "%");
+        let (v_native, row_native) = codex_auto_compact_row(
+            &codex_home,
+            &json!({"model_catalog_json":"custom-catalog.json","model_auto_compact_token_limit":900000}),
+            &Value::Null,
+            false,
+        )
+        .unwrap();
+        assert!(v_native.is_null());
+        assert_eq!(row_native["cliPreview"], "900,000");
+        let (_, row_default) =
+            codex_auto_compact_row(&codex_home, &codex_doc, &Value::Null, false).unwrap();
+        assert_eq!(row_default["cliPreview"], "540,000");
+
+        // 清理 Codex 静态 model_auto_compact_token_limit 时保留注释和无关配置。
+        let cleaned = clear_codex_static_auto_compact(
+            "# 注释\nmodel = \"gpt-6.1-sol\"\nmodel_auto_compact_token_limit = 900000\n",
+        )
+        .unwrap();
+        assert!(cleaned.contains("# 注释"));
+        assert!(native_document("codex", &cleaned).unwrap()["model_auto_compact_token_limit"].is_null());
+
+        // 3. Claude：直接读写 settings.json 的 env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE，保留其他 env 键。
+        let claude_before = "{\n  \"env\": {\n    \"ANTHROPIC_BASE_URL\": \"https://fixture.invalid\",\n    \"CLAUDE_CODE_MAX_CONTEXT_TOKENS\": \"600000\"\n  }\n}\n";
+        let claude_saved = updated_native(
+            "claude",
+            "general",
+            claude_before,
+            &json!({"autoCompactPercent": 85}),
+        )
+        .unwrap();
+        let claude_doc = native_document("claude", &claude_saved).unwrap();
+        assert_eq!(claude_doc["env"]["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], "85");
+        assert_eq!(claude_doc["env"]["ANTHROPIC_BASE_URL"], "https://fixture.invalid");
+        let (c_val, c_row) = claude_auto_compact_row(&claude_doc);
+        assert_eq!(c_val, 85);
+        assert_eq!(c_row["cliPreview"], "85%");
+        let (_, c_low_row) = claude_auto_compact_row(&json!({"env":{"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE":"40"}}));
+        assert_eq!(c_low_row["cliPreview"], "原生配置：40%（低于 50%）");
+        let (_, c_high_row) = claude_auto_compact_row(&json!({"env":{"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE":"99"}}));
+        assert_eq!(c_high_row["cliPreview"], "原生配置：99%（高于 98%）");
+        let claude_cleared = updated_native(
+            "claude",
+            "general",
+            &claude_saved,
+            &json!({"autoCompactPercent": null}),
+        )
+        .unwrap();
+        let claude_cleared_doc = native_document("claude", &claude_cleared).unwrap();
+        assert!(claude_cleared_doc["env"]["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"].is_null());
+        assert_eq!(claude_cleared_doc["env"]["ANTHROPIC_BASE_URL"], "https://fixture.invalid");
+        let (c_def_val, c_def_row) = claude_auto_compact_row(&claude_cleared_doc);
+        assert!(c_def_val.is_null());
+        assert_eq!(c_def_row["cliPreview"], "原生默认：预留 33k（约 94.5%）");
+        assert!(
+            updated_native("claude", "general", claude_before, &json!({"autoCompactPercent": 49}))
+                .is_err()
+        );
+        assert!(
+            updated_native("claude", "general", claude_before, &json!({"autoCompactPercent": 99}))
+                .is_err()
+        );
+        assert!(
+            updated_native("claude", "general", claude_before, &json!({"autoCompactWindow": 600000}))
+                .is_err()
+        );
+
+        // 4. Antigravity：版本 >= 1.5.15 可写，低于 1.5.15 只读；环境变量返回 "88%"。
+        assert_eq!(parse_semver("1.5.18"), Some((1, 5, 18)));
+        assert_eq!(parse_semver("agy v1.5.15-beta.1"), Some((1, 5, 15)));
+        assert_eq!(
+            antigravity_auto_compact_override(dir.path(), "antigravity:local").unwrap(),
+            Some("88%".into())
+        );
+        let (a_val, a_row) =
+            antigravity_auto_compact_row(&json!(88), &Ok((1, 5, 18))).unwrap();
+        assert_eq!(a_val, 88);
+        assert_eq!(a_row["readOnly"], false);
+        assert_eq!(a_row["cliPreview"], "88%");
+        let (_, a_old) = antigravity_auto_compact_row(&Value::Null, &Ok((1, 5, 14))).unwrap();
+        assert_eq!(a_old["readOnly"], true);
+        assert!(a_old["readOnlyReason"].as_str().unwrap().contains("1.5.15"));
+        assert_eq!(a_old["cliPreview"], "原生默认（随模型）");
+
+        let model_catalog = json!({"data":[
+            {"model":"gpt-6.1-sol","displayName":"GPT-6.1 Sol"},
+            {"model":"gpt-6.1-terra","displayName":"GPT-6.1 Terra"}
+        ]});
+        // 未设置过偏好时：开关默认关闭、模型默认跟随会话模型、策略默认「默认使用」。
+        let unset_pref = compaction_model_preference(dir.path(), "codex:unset").unwrap();
+        assert_eq!(
+            unset_pref,
+            CompactionModelPreference {
+                enabled: false,
+                model: None,
+                mode: CompactionModelMode::Always,
+            }
+        );
+        let model_row = compaction_model_row(
+            Some(&model_catalog),
+            false,
+            Some("gpt-6.1-sol"),
+            CompactionModelMode::Always,
+            false,
+            None,
+        );
+        assert_eq!(model_row["id"], "compactionModel");
+        assert_eq!(model_row["label"], "手动压缩模型");
+        assert_eq!(model_row["group"], "缓存与压缩");
+        assert_eq!(model_row["readOnly"], false);
+        assert_eq!(model_row["enabledKey"], "compactionModelEnabled");
+        assert_eq!(model_row["enabledValue"], false);
+        assert_eq!(model_row["value"], "gpt-6.1-sol");
+        assert_eq!(model_row["modeKey"], "compactionModelMode");
+        assert_eq!(model_row["modeValue"], "always");
+        assert_eq!(model_row["modeOptions"].as_array().unwrap().len(), 2);
+        assert_eq!(model_row["modeOptions"][0]["value"], "always");
+        assert_eq!(model_row["modeOptions"][0]["description"], "手动压缩时始终切换");
+        assert_eq!(model_row["modeOptions"][1]["value"], "cache_expired");
+        assert_eq!(model_row["modeOptions"][1]["description"], "无有效缓存时切换");
+        assert_eq!(model_row["options"].as_array().unwrap().len(), 3);
+
+        // 压缩模型开关与策略解析：关闭时绝不切换；开启后缓存失效使用仅在 cache_valid == false 时切换；默认使用始终切换；同模型不切换。
+        let pref_disabled = CompactionModelPreference {
+            enabled: false,
+            model: Some("gpt-6.1-sol".into()),
+            mode: CompactionModelMode::Always,
+        };
+        assert_eq!(resolve_manual_compaction_model(&pref_disabled, "gpt-6.1-terra", false), None);
+        let pref_expired = CompactionModelPreference {
+            enabled: true,
+            model: Some("gpt-6.1-sol".into()),
+            mode: CompactionModelMode::CacheExpired,
+        };
+        assert_eq!(resolve_manual_compaction_model(&pref_expired, "gpt-6.1-terra", true), None);
+        assert_eq!(
+            resolve_manual_compaction_model(&pref_expired, "gpt-6.1-terra", false).as_deref(),
+            Some("gpt-6.1-sol")
+        );
+        assert_eq!(resolve_manual_compaction_model(&pref_expired, "gpt-6.1-sol", false), None);
+        let pref_always = CompactionModelPreference {
+            enabled: true,
+            model: Some("gpt-6.1-sol".into()),
+            mode: CompactionModelMode::Always,
+        };
+        assert_eq!(
+            resolve_manual_compaction_model(&pref_always, "gpt-6.1-terra", true).as_deref(),
+            Some("gpt-6.1-sol")
+        );
+        // 已有策略在模型切回「跟随会话模型」或关闭开关后仍独立保留，不被重置。
+        std::fs::write(
+            dir.path().join(PREFERENCES_FILE),
+            serde_json::to_string(&json!({
+                "instances": {
+                    "codex:saved": {
+                        "compactionModelEnabled": false,
+                        "compactionModelMode": "cache_expired"
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let preserved = compaction_model_preference(dir.path(), "codex:saved").unwrap();
+        assert!(!preserved.enabled);
+        assert_eq!(preserved.model, None);
+        assert_eq!(preserved.mode, CompactionModelMode::CacheExpired);
+        assert!(validate_compaction_model_choice(Some("gpt-6.1-sol"), Some(&model_catalog)).is_ok());
+        assert!(validate_compaction_model_choice(Some("unknown-model"), Some(&model_catalog)).is_err());
+
+        let prompt_row = unsupported_compaction_prompt_row("");
+        assert_eq!(prompt_row["id"], "compactionPrompt");
+        assert_eq!(prompt_row["group"], "缓存与压缩");
+        assert_eq!(prompt_row["readOnly"], true);
+        assert_eq!(prompt_row["cliPreview"], "不支持");
+        assert_eq!(prompt_row["readOnlyReason"], "");
+    }
+
+    #[test]
+    fn context_window_and_prompt_cache_ttl_cover_codex_claude_and_antigravity() {
+        // 1. Codex 上下文大小读写 config.toml 的 model_context_window，缓存时间标为不支持。
+        let before_codex = "\u{feff}# 保留注释\r\nmodel = \"gpt-6.1-sol\"\r\n";
+        assert!(updated_native("codex", "general", before_codex, &json!({"contextWindow": 10_000})).is_err());
+        let codex_saved = updated_native("codex", "general", before_codex, &json!({"contextWindow": 600_000})).unwrap();
+        assert!(codex_saved.starts_with('\u{feff}'));
+        assert!(codex_saved.contains("# 保留注释\r\n"));
+        let codex_doc = native_document("codex", &codex_saved).unwrap();
+        assert_eq!(codex_doc["model_context_window"], 600_000);
+        let dir = tempfile::tempdir().unwrap();
+        let (cv, crow) = codex_context_window_row(dir.path(), &codex_doc, false);
+        assert_eq!(cv, 600_000);
+        assert_eq!(crow["cliPreview"], "600,000");
+        assert_eq!(crow["unit"], "TK");
+        assert_eq!(crow["readOnly"], false);
+        let codex_cleared = updated_native("codex", "general", &codex_saved, &json!({"contextWindow": null})).unwrap();
+        let codex_cleared_doc = native_document("codex", &codex_cleared).unwrap();
+        assert!(codex_cleared_doc["model_context_window"].is_null());
+        let (cv_def, crow_def) = codex_context_window_row(dir.path(), &codex_cleared_doc, false);
+        assert!(cv_def.is_null());
+        assert_eq!(crow_def["cliPreview"], "");
+        std::fs::write(
+            dir.path().join("models_cache.json"),
+            serde_json::to_string(&json!({
+                "models": [{"slug": "gpt-6.1-sol", "context_window": 600000, "max_context_window": 600000}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let (cv_cat, crow_cat) = codex_context_window_row(dir.path(), &codex_cleared_doc, false);
+        assert!(cv_cat.is_null());
+        assert_eq!(crow_cat["cliPreview"], "600,000");
+        assert!(updated_native("codex", "general", before_codex, &json!({"promptCacheTtl": "1h"})).is_err());
+
+        // 2. Claude 上下文大小读写 env.CLAUDE_CODE_AUTO_COMPACT_WINDOW，缓存时间读写 env.CLAUDE_CODE_PROMPT_CACHE_TTL。
+        let before_claude = "{\n  \"promptCacheTtl\": \"5m\",\n  \"env\": {\n    \"ANTHROPIC_BASE_URL\": \"https://fixture.invalid\"\n  }\n}\n";
+        assert!(updated_native("claude", "general", before_claude, &json!({"contextWindow": 99_999})).is_err());
+        let claude_ctx_saved = updated_native("claude", "general", before_claude, &json!({"contextWindow": 500_000})).unwrap();
+        let claude_ctx_doc = native_document("claude", &claude_ctx_saved).unwrap();
+        assert_eq!(claude_ctx_doc["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "500000");
+        assert_eq!(claude_ctx_doc["env"]["ANTHROPIC_BASE_URL"], "https://fixture.invalid");
+        let (cl_v, cl_row) = claude_context_window_row(&claude_ctx_doc);
+        assert_eq!(cl_v, 500_000);
+        assert_eq!(cl_row["cliPreview"], "500,000");
+        assert_eq!(cl_row["unit"], "TK");
+        let (_, cl_low_row) = claude_context_window_row(&json!({"env":{"CLAUDE_CODE_AUTO_COMPACT_WINDOW":"50000"}}));
+        assert_eq!(cl_low_row["cliPreview"], "原生配置：50,000（低于 100,000）");
+        let (_, suffix_row) = claude_context_window_row(&json!({"env":{"CLAUDE_CODE_AUTO_COMPACT_WINDOW":"600k"}}));
+        assert_eq!(suffix_row["value"], 600_000);
+        assert_eq!(parse_claude_token_count(&json!("1m")), Some(1_000_000));
+        let claude_ctx_cleared = updated_native("claude", "general", &claude_ctx_saved, &json!({"contextWindow": null})).unwrap();
+        assert!(native_document("claude", &claude_ctx_cleared).unwrap()["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"].is_null());
+
+        let claude_ttl_saved = updated_native("claude", "general", before_claude, &json!({"promptCacheTtl": "1h"})).unwrap();
+        let claude_ttl_doc = native_document("claude", &claude_ttl_saved).unwrap();
+        assert_eq!(claude_ttl_doc["env"]["CLAUDE_CODE_PROMPT_CACHE_TTL"], "1h");
+        assert!(claude_ttl_doc["promptCacheTtl"].is_null(), "写入 env 时须清理顶层旧 promptCacheTtl");
+        let (ttl_v, ttl_row) = claude_prompt_cache_ttl_row(&claude_ttl_doc);
+        assert_eq!(ttl_v, "1h");
+        assert_eq!(ttl_row["readOnly"], false);
+        let claude_ttl_cleared = updated_native("claude", "general", &claude_ttl_saved, &json!({"promptCacheTtl": null})).unwrap();
+        let claude_ttl_cleared_doc = native_document("claude", &claude_ttl_cleared).unwrap();
+        assert!(claude_ttl_cleared_doc["env"]["CLAUDE_CODE_PROMPT_CACHE_TTL"].is_null());
+        assert!(claude_ttl_cleared_doc["promptCacheTtl"].is_null());
+        assert!(updated_native("claude", "general", before_claude, &json!({"promptCacheTtl": "2h"})).is_err());
+        let (bad_ttl_v, bad_ttl_row) = claude_prompt_cache_ttl_row(&json!({"env":{"CLAUDE_CODE_PROMPT_CACHE_TTL":"2h"}}));
+        assert!(bad_ttl_v.is_null());
+        assert_eq!(bad_ttl_row["readOnly"], true);
+        assert_eq!(bad_ttl_row["valueInvalid"], true);
+
+        // 3. Antigravity 上下文大小与缓存时间均展示只读「不支持」。
+        let agy_ctx = unsupported_context_window_row("建议调小下方“自动压缩阈值”。");
+        assert_eq!(agy_ctx["id"], "contextWindow");
+        assert_eq!(agy_ctx["readOnly"], true);
+        assert_eq!(agy_ctx["cliPreview"], "不支持");
+        assert_eq!(agy_ctx["readOnlyReason"], "建议调小下方“自动压缩阈值”。");
+        let agy_ttl = unsupported_prompt_cache_ttl_row("");
+        assert_eq!(agy_ttl["id"], "promptCacheTtl");
+        assert_eq!(agy_ttl["readOnly"], true);
+        assert_eq!(agy_ttl["cliPreview"], "不支持");
+        assert_eq!(agy_ttl["readOnlyReason"], "");
     }
 }

@@ -348,22 +348,64 @@ async function instanceOptionUiFixture(settings, extraSettings, backend = "codex
   const start = module.indexOf("  function renderExtraSettings()");
   const end = module.indexOf("  function render()", start);
   assert.ok(start >= 0 && end > start);
-  const element = (tag, className = "", text = "") => ({
-    tag, className, textContent: String(text), children: [], attributes: {}, isConnected: true,
-    append(...children) { this.children.push(...children); },
-    setAttribute(key, value) { this.attributes[key] = String(value); },
-    removeAttribute(key) { delete this.attributes[key]; },
-    blur() { this.blurred = true; },
-  });
-  const selections = [], saved = [];
+  const element = (tag, className = "", text = "") => {
+    const classes = new Set(String(className || "").split(/\s+/).filter(Boolean));
+    const node = {
+      tag, className, textContent: String(text), children: [], attributes: {}, isConnected: true,
+      classList: {
+        add(...items) {
+          for (const item of items) classes.add(item);
+          node.className = [...classes].join(" ");
+        },
+        contains: item => classes.has(item),
+      },
+      append(...children) { this.children.push(...children); },
+      replaceChildren(...children) { this.children = [...children]; },
+      setAttribute(key, value) { this.attributes[key] = String(value); },
+      getAttribute(key) { return Object.prototype.hasOwnProperty.call(this.attributes, key) ? this.attributes[key] : null; },
+      removeAttribute(key) { delete this.attributes[key]; },
+      blur() { this.blurred = true; },
+    };
+    return node;
+  };
+  const button = (label, className = "", onClick = null) => {
+    const node = element("button", className, label);
+    node.type = "button";
+    node.onclick = onClick;
+    return node;
+  };
+  const icon = name => element("svg", `icon-${name}`);
+  const selections = [], saved = [], openedPopups = [];
   const context = {
     record: { backend, settings, extraSettings, capabilityError }, name: "general", selected: "codex:local",
-    element, content: element("div"), controls: new Set(), message: "",
+    element, button, icon, content: element("div"), controls: new Set(), message: "",
     inherit: { value: "", label: "使用原生默认" },
     booleanOptions: [{ value: "", label: "使用原生默认" }, { value: "true", label: "开启" }, { value: "false", label: "关闭" }],
     boolValue: value => value == null ? "" : String(value),
     effortLabels: { xhigh: "极高" }, fieldCopy: (label, description) => ({ label, description }),
+    writable: () => true,
+    openPopup: (trigger, opts) => openedPopups.push({ trigger, opts }),
     section(parent, label) { const card = element("section"); card.label = label; parent.append(card); return card; },
+    settingSelect(key, label, options, value, transform = v => v, unsupported = false) {
+      const control = element("select", "select-trigger");
+      control.id = `settings-general-${key}`;
+      control.options = options;
+      control.value = value;
+      control.settingsUnsupported = unsupported;
+      control.onchange = () => {
+        saved.push(JSON.parse(JSON.stringify({ [key]: transform(control.value) })));
+      };
+      context.controls.add(control);
+      return control;
+    },
+    switchControl(label, value) {
+      const control = element("input", "appearance-notification-switch");
+      control.type = "checkbox";
+      control.setAttribute("role", value == null ? "checkbox" : "switch");
+      control.setAttribute("aria-label", label);
+      control.checked = value === true;
+      return control;
+    },
     addSelect(card, key, label, description, options, value, transform) {
       selections.push({ card, key, label, description, options, value, transform });
     },
@@ -378,7 +420,7 @@ async function instanceOptionUiFixture(settings, extraSettings, backend = "codex
 test("Codex 实例页单独显示持久侧边开关，旧服务缺字段时禁用", async () => {
   const module = await readFile(new URL("../assets/harness/features/settings/instance-settings.js", import.meta.url), "utf8");
   const start = module.indexOf("  function renderGeneral()");
-  const end = module.indexOf("  function renderModels()", start);
+  const end = module.indexOf("  function renderCodexReasoning()", start);
   for (const value of [undefined, false, true]) {
     const switches = [], cards = [];
     const context = {
@@ -395,10 +437,24 @@ test("Codex 实例页单独显示持久侧边开关，旧服务缺字段时禁�
     assert.equal(side.card.label, "侧边会话");
     assert.equal(side.checked, value === true);
     assert.equal(side.unsupported, value === undefined);
-    assert.match(side.description, /默认关闭/);
-    assert.match(side.description, /已有侧边不转换/);
+    assert.match(side.description, /仅影响新建侧边/);
+    assert.match(side.description, /保留历史/);
     assert.equal(switches.filter(control => control.card.label === "Codex 常规设置").length, 4);
   }
+  // Antigravity 不再渲染只读常规说明卡片（执行协议/默认权限/全局自定义指令），仅保留目录异常与底部提示。
+  const agyCards = [], agyAppended = [];
+  const agyContext = {
+    record: { backend: "antigravity", settings: {}, capabilityError: "cli offline" },
+    content: { append(...nodes) { agyAppended.push(...nodes); } },
+    element: (tag, cls, text) => ({ tag, cls, text }),
+    section(_content, label) { agyCards.push(label); return { label }; },
+    addSwitch() {},
+  };
+  rawVm.createContext(agyContext); rawVm.runInContext(module.slice(start, end), agyContext);
+  agyContext.renderGeneral();
+  assert.deepEqual(agyCards, []);
+  assert.equal(agyAppended.length, 2);
+  assert.match(agyAppended[0].text, /cli offline/);
 });
 
 test("实例额外设置使用原生默认选项，只读诊断不创建可写控件", async () => {
@@ -464,18 +520,220 @@ test("实例额外设置拒绝无法确认的返回类型，并兼容未提供�
   rawVm.runInContext(fixture.module.slice(start, end), context);
   const result = {
     ok: true, instanceId: "claude-fixture", backend: "claude", revision: "r", preferenceRevision: "p",
-    readOnly: false, settings: { awaySummaryEnabled: null, promptSuggestionEnabled: null, autoCompactWindow: null,
-      syncClaudeAiSkills: true },
+    readOnly: false, settings: { awaySummaryEnabled: null, promptSuggestionEnabled: null,
+      autoCompactPercent: 85, syncClaudeAiSkills: true },
   };
   assert.equal(context.checkedResult(result, "claude-fixture"), result);
-  result.extraSettings = [{ id: "syncClaudeAiSkills", kind: "boolean", label: "同步 Skills",
-    description: "测试", group: "同步", readOnly: false, options: [] }];
+  result.extraSettings = [
+    { id: "autoCompactPercent", kind: "integer", label: "自动压缩阈值", description: "测试",
+      group: "缓存与压缩", readOnly: false, min: 50, max: 98, unit: "%",
+      cliPreview: "85%", defaultLabel: "95%", options: [] },
+    { id: "syncClaudeAiSkills", kind: "boolean", label: "同步 Skills",
+      description: "测试", group: "同步", readOnly: false, options: [] },
+  ];
   assert.equal(context.checkedResult(result, "claude-fixture"), result);
   result.settings.syncClaudeAiSkills = "true";
   assert.throws(() => context.checkedResult(result, "claude-fixture"), /额外设置字段无法确认/);
   result.settings.syncClaudeAiSkills = true;
-  result.extraSettings[0].readOnly = true;
+  result.extraSettings[1].readOnly = true;
   assert.throws(() => context.checkedResult(result, "claude-fixture"), /额外设置字段无法确认/);
+});
+
+test("自动压缩阈值三端统一按百分比输入（50～98%），右侧展示对应 CLI 数值并支持清空恢复默认", async () => {
+  const fixture = await instanceOptionUiFixture({ autoCompactPercent: 85 }, [
+    {
+      id: "autoCompactPercent", kind: "integer", group: "缓存与压缩", label: "自动压缩阈值",
+      description: "50～98%", readOnly: false, min: 50, max: 98,
+      unit: "%", cliPreview: "510,000", defaultLabel: "90%", options: [],
+    },
+  ]);
+  const row = fixture.context.content.children[0].children[0];
+  assert.equal(row.className, "appearance-field instance-setting-number-row");
+  const controlBox = row.children[1];
+  assert.equal(controlBox.className, "appearance-number instance-setting-number-control");
+  assert.equal(controlBox.children[0].className, "instance-setting-cli-value");
+  assert.equal(controlBox.children[0].textContent, "510,000");
+  const unitWrap = controlBox.children[1];
+  assert.equal(unitWrap.className, "instance-setting-unit-input");
+  assert.equal(unitWrap.children[1].textContent, "%");
+  const input = [...fixture.context.controls][0];
+  assert.equal(input.value, "85");
+  assert.equal(input.placeholder, "90%");
+  for (const invalid of ["49", "99", "85.5"]) {
+    input.value = invalid; input.onchange();
+    assert.equal(input.value, "85");
+    assert.equal(fixture.saved.length, 0);
+  }
+  input.value = "50"; input.onchange();
+  assert.deepEqual(fixture.saved[0], { autoCompactPercent: 50 });
+  input.value = "98"; input.onchange();
+  assert.deepEqual(fixture.saved[1], { autoCompactPercent: 98 });
+  input.value = ""; input.onchange();
+  assert.deepEqual(fixture.saved[2], { autoCompactPercent: null });
+
+  const readonlyFixture = await instanceOptionUiFixture({
+    autoCompactPercent: null, compactionModel: "session", compactionPrompt: null,
+  }, [
+    {
+      id: "autoCompactPercent", kind: "integer", group: "缓存与压缩", label: "自动压缩阈值",
+      description: "测试", readOnly: true, readOnlyReason: "需要 agy 1.5.15 及以上",
+      cliPreview: "原生默认（随模型）", options: [],
+    },
+    {
+      id: "compactionModel", kind: "enum", group: "缓存与压缩", label: "压缩模型",
+      description: "", readOnly: true, readOnlyReason: "暂跟随会话模型",
+      options: [{ value: "session", label: "跟随会话模型" }],
+    },
+    {
+      id: "compactionPrompt", kind: "text", group: "缓存与压缩", label: "压缩提示词",
+      description: "", readOnly: true, readOnlyReason: "",
+      cliPreview: "不支持", options: [],
+    },
+  ], "antigravity");
+  const roRows = readonlyFixture.context.content.children[0].children;
+  assert.equal(roRows[0].children[1].textContent, "原生默认（随模型）");
+  assert.equal(roRows[1].children[1].textContent, "跟随会话模型");
+  assert.equal(roRows[2].children[1].textContent, "不支持");
+  assert.equal(roRows[2].children[0].description, "");
+  assert.equal(readonlyFixture.context.controls.size, 0);
+
+  // 手动压缩模型：默认关闭开关并禁用右侧 [模型 Select] [策略菜单按钮]；开启后可编辑，未设置时默认跟随会话模型 + 默认使用。
+  const disabledModelFixture = await instanceOptionUiFixture({
+    compactionModelEnabled: false,
+    compactionModel: "session",
+    compactionModelMode: "always",
+  }, [
+    {
+      id: "compactionModel", kind: "enum", group: "缓存与压缩", label: "手动压缩模型",
+      description: "仅用于手动压缩，完成后自动切回原模型。",
+      readOnly: false,
+      enabledKey: "compactionModelEnabled",
+      enabledValue: false,
+      modeKey: "compactionModelMode",
+      modeValue: "always",
+      modeOptions: [
+        { value: "always", label: "默认使用", description: "手动压缩时始终切换" },
+        { value: "cache_expired", label: "缓存失效使用", description: "无有效缓存时切换" },
+      ],
+      options: [
+        { value: "session", label: "跟随会话模型" },
+        { value: "gemini-3.8-flash", label: "Gemini 3.8 Flash" },
+      ],
+    },
+  ], "antigravity");
+  const offRow = disabledModelFixture.context.content.children[0].children[0];
+  assert.equal(offRow.className, "appearance-field instance-setting-compaction-model-row");
+  assert.equal(offRow.children[1].children[0].settingsUnsupported, true);
+  assert.equal(offRow.children[1].children[1].settingsUnsupported, true);
+  const offSwitch = offRow.children[2];
+  assert.equal(offSwitch.checked, false);
+  assert.notEqual(offSwitch.settingsUnsupported, true);
+  offSwitch.checked = true;
+  offSwitch.onchange();
+  assert.deepEqual(disabledModelFixture.saved[0], { compactionModelEnabled: true });
+
+  const modelFixture = await instanceOptionUiFixture({
+    compactionModelEnabled: true,
+    compactionModel: "session",
+    compactionModelMode: "always",
+  }, [
+    {
+      id: "compactionModel", kind: "enum", group: "缓存与压缩", label: "手动压缩模型",
+      description: "仅用于手动压缩，完成后自动切回原模型。",
+      readOnly: false,
+      enabledKey: "compactionModelEnabled",
+      enabledValue: true,
+      modeKey: "compactionModelMode",
+      modeValue: "always",
+      modeOptions: [
+        { value: "always", label: "默认使用", description: "手动压缩时始终切换" },
+        { value: "cache_expired", label: "缓存失效使用", description: "无有效缓存时切换" },
+      ],
+      options: [
+        { value: "session", label: "跟随会话模型" },
+        { value: "gemini-3.8-flash", label: "Gemini 3.8 Flash" },
+      ],
+    },
+  ], "antigravity");
+  const modelRow = modelFixture.context.content.children[0].children[0];
+  assert.equal(modelRow.className, "appearance-field instance-setting-compaction-model-row");
+  const pairBox = modelRow.children[1];
+  assert.equal(pairBox.className, "instance-setting-compaction-model-control");
+  const modelSelect = pairBox.children[0];
+  const modeBtn = pairBox.children[1];
+  const modelSwitch = modelRow.children[2];
+  assert.equal(modelSwitch.checked, true);
+  assert.equal(modelSelect.tag, "select");
+  assert.equal(modelSelect.settingsUnsupported, false);
+  assert.equal(modeBtn.settingsUnsupported, false);
+  assert.equal(modeBtn.getAttribute("aria-haspopup"), "menu");
+  assert.equal(modeBtn.children[0].textContent, "默认使用");
+  assert.equal(modeBtn.menuOptions.length, 2);
+  assert.equal(modeBtn.menuOptions[0].selected, true);
+  assert.equal(modeBtn.menuOptions[1].selected, false);
+  modeBtn.menuOptions[1].action();
+  assert.deepEqual(modelFixture.saved[0], { compactionModelMode: "cache_expired" });
+  modelSelect.value = "gemini-3.8-flash";
+  modelSelect.onchange();
+  assert.deepEqual(modelFixture.saved[1], { compactionModel: "gemini-3.8-flash" });
+  modelSelect.value = "session";
+  modelSelect.onchange();
+  assert.deepEqual(modelFixture.saved[2], { compactionModel: "session" });
+
+  // 上下文大小与缓存时间：支持端提供输入/选择，不支持端展示只读「不支持」。
+  const ctxAndTtlFixture = await instanceOptionUiFixture({
+    contextWindow: 600000,
+    promptCacheTtl: "1h",
+  }, [
+    {
+      id: "contextWindow", kind: "integer", group: "缓存与压缩", label: "上下文大小",
+      description: "最低 100,000。", readOnly: false, min: 100000, max: 10000000, unit: "TK",
+      cliPreview: "600,000", defaultLabel: "原生默认", options: [],
+    },
+    {
+      id: "promptCacheTtl", kind: "enum", group: "缓存与压缩", label: "缓存时间",
+      description: "", readOnly: false,
+      options: [{ value: "5m", label: "5 分钟" }, { value: "1h", label: "1 小时" }],
+    },
+  ], "claude");
+  const ctxRow = ctxAndTtlFixture.context.content.children[0].children[0];
+  assert.equal(ctxRow.children[1].children[1].className, "instance-setting-unit-input is-wide");
+  assert.equal(ctxRow.children[1].children[1].children[1].textContent, "TK");
+  const ctxInput = [...ctxAndTtlFixture.context.controls][0];
+  assert.equal(ctxInput.value, "600000");
+  ctxInput.value = "99999"; ctxInput.onchange();
+  assert.equal(ctxAndTtlFixture.saved.length, 0);
+  ctxInput.value = "500000"; ctxInput.onchange();
+  assert.deepEqual(ctxAndTtlFixture.saved[0], { contextWindow: 500000 });
+  ctxInput.value = ""; ctxInput.onchange();
+  assert.deepEqual(ctxAndTtlFixture.saved[1], { contextWindow: null });
+  assert.equal(ctxAndTtlFixture.selections[0].key, "promptCacheTtl");
+  assert.equal(ctxAndTtlFixture.selections[0].value, "1h");
+  assert.equal(ctxAndTtlFixture.selections[0].options[0].label, "使用原生默认");
+  assert.equal(ctxAndTtlFixture.selections[0].transform(""), null);
+  assert.equal(ctxAndTtlFixture.selections[0].transform("5m"), "5m");
+
+  const agyUnsupportedFixture = await instanceOptionUiFixture({
+    contextWindow: null,
+    promptCacheTtl: null,
+  }, [
+    {
+      id: "contextWindow", kind: "integer", group: "缓存与压缩", label: "上下文大小",
+      description: "", readOnly: true, readOnlyReason: "建议调小下方“自动压缩阈值”。",
+      cliPreview: "不支持", options: [],
+    },
+    {
+      id: "promptCacheTtl", kind: "enum", group: "缓存与压缩", label: "缓存时间",
+      description: "", readOnly: true, readOnlyReason: "",
+      cliPreview: "不支持", options: [],
+    },
+  ], "antigravity");
+  const agyRoRows = agyUnsupportedFixture.context.content.children[0].children;
+  assert.equal(agyRoRows[0].children[1].textContent, "不支持");
+  assert.equal(agyRoRows[0].children[0].description, "建议调小下方“自动压缩阈值”。");
+  assert.equal(agyRoRows[1].children[1].textContent, "不支持");
+  assert.equal(agyRoRows[1].children[0].description, "");
+  assert.equal(agyUnsupportedFixture.context.controls.size, 0);
 });
 
 function storage() {
@@ -19610,8 +19868,12 @@ test("真实实例设置页、缓存与公共菜单联动：首次保存不禁�
     updated,
     capabilities: {},
     capabilityError: "",
-    extraSettings: [],
-    effectiveModel: "m1",
+    extraSettings: [
+      { id: "compactionModel", kind: "enum", label: "压缩模型", group: "缓存与压缩", description: "",
+        readOnly: true, readOnlyReason: "暂跟随会话模型", options: [{ value: "session", label: "跟随会话模型" }] },
+      { id: "reasoningSummary", kind: "enum", label: "思考摘要", group: "模型与思考", description: "测试",
+        readOnly: false, options: [{ value: "detailed", label: "详细" }] },
+    ],
     models: [
       { model: "m1", displayName: "Model One", supportedReasoningEfforts: [{ reasoningEffort: "high" }], hiddenByInstance: serverHidden.includes("m1") },
       { model: "m2", displayName: "Model Two", supportedReasoningEfforts: [{ reasoningEffort: "high" }], hiddenByInstance: serverHidden.includes("m2") },
@@ -19619,7 +19881,7 @@ test("真实实例设置页、缓存与公共菜单联动：首次保存不禁�
     ],
     settings: {
       todo: true, memories: false, multiAgent: true, goals: false,
-      persistentSideThreads: false, model: null, reasoningEffort: null,
+      persistentSideThreads: false, compactionModel: "session", reasoningSummary: null,
       ultraReasoningEnabled: false, hiddenModelIds: [...serverHidden],
     },
   });
@@ -19691,8 +19953,27 @@ test("真实实例设置页、缓存与公共菜单联动：首次保存不禁�
     return null;
   };
   const trigger = findById("settings-general-hiddenModelIds");
-  const defaultModelSelect = findById("settings-general-model");
-  assert.ok(trigger && defaultModelSelect);
+  const todoSwitch = findById("settings-general-todo");
+  assert.ok(trigger && todoSwitch);
+  const visibilityRows = page.querySelectorAll(".instance-model-visibility-row");
+  assert.equal(visibilityRows.length, 1, "显示模型行应带专用类名以便手机端纵向排列");
+  assert.ok(visibilityRows[0].children.includes(trigger), "显示模型多选触发器应位于该行内");
+  const cssText = await readFile(new URL("../assets/harness/style.css", import.meta.url), "utf8");
+  const baseVisibilityIdx = cssText.indexOf(".appearance-screen .select-trigger.instance-model-visibility-trigger{");
+  const mobileVisibilityIdx = cssText.indexOf(".appearance-screen .instance-settings-content .select-trigger.instance-model-visibility-trigger{");
+  assert.ok(baseVisibilityIdx > 0 && mobileVisibilityIdx > baseVisibilityIdx,
+    "手机端显示模型 100% 宽度规则必须位于基础 240px 规则之后，防止窄屏将左侧文案挤成单字竖排");
+  assert.ok(cssText.indexOf(".appearance-screen .instance-settings-content .appearance-card .instance-model-visibility-row{") > baseVisibilityIdx,
+    "手机端显示模型纵向排列规则必须位于后置媒体查询内");
+  assert.equal(findById("settings-general-model"), null, "实例默认值（默认模型）已移除");
+  assert.equal(findById("settings-general-reasoningEffort"), null, "实例默认值（默认思考深度）已移除");
+  const sectionHeadings = page.querySelectorAll(".instance-settings-section-heading")
+    .map(node => node.children.map(child => child.textContent || "").join(""));
+  assert.deepEqual(
+    sectionHeadings,
+    ["显示模型", "缓存与压缩", "思考深度", "codexCodex 常规设置", "侧边会话", "模型与思考"],
+    "缓存与压缩应紧随显示模型下方，其余分组保持在其后",
+  );
   assert.equal(trigger.disabled, false);
   assert.equal(trigger.children[0].textContent, "已显示 2/3 个模型");
 
@@ -19711,7 +19992,7 @@ test("真实实例设置页、缓存与公共菜单联动：首次保存不禁�
   assert.equal(pendingSaves[0].payload.expectedPreferenceRevision, "pref-1");
   assert.equal(context.cachedInstanceSettings("codex:local", "general")?.blocked, true,
     "save() 会先使实例缓存失效（blocked=true）");
-  assert.equal(defaultModelSelect.disabled, true, "保存期间其他控件仍应保持禁用");
+  assert.equal(todoSwitch.disabled, true, "保存期间其他控件仍应保持禁用");
   assert.equal(trigger.disabled, false, "本次显示模型保存期间多选触发器不能因自身缓存失效被禁用");
   assert.equal(getActivePopup()?.trigger, trigger, "首次保存期间多选菜单应保持打开");
 
@@ -19742,7 +20023,7 @@ test("真实实例设置页、缓存与公共菜单联动：首次保存不禁�
   assert.equal(trigger.disabled, false, "第二次保存飞行期间触发器仍保持可连续勾选");
   assert.equal(getActivePopup()?.trigger, trigger);
 
-  // 4) 放行第二次保存回执，全部完成且弹层持续保持打开，默认模型列表同步过滤
+  // 4) 放行第二次保存回执，全部完成且弹层持续保持打开，其他控件恢复可用
   serverHidden = ["m2", "m1", "m3"];
   serverPrefRev = 3;
   serverInstRev = 3;
@@ -19753,12 +20034,7 @@ test("真实实例设置页、缓存与公共菜单联动：首次保存不禁�
   assert.equal(getActivePopup()?.trigger, trigger, "全部保存完成后多选菜单仍保持打开");
   assert.equal(trigger.disabled, false);
   assert.equal(trigger.children[0].textContent, "已全部隐藏（0/3）");
-  assert.equal(findById("settings-general-model").disabled, false);
-  assert.deepEqual(
-    Array.from(findById("settings-general-model").selectOptions, o => o.value),
-    [""],
-    "默认模型选项应同步过滤已隐藏模型",
-  );
+  assert.equal(findById("settings-general-todo").disabled, false);
 
   // 5) 权限变只读时，即使处于保存飞行中也立即禁用触发器并关闭菜单
   clickOption("m1"); // 恢复显示 m1

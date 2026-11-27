@@ -21,6 +21,8 @@ pub(crate) struct AntigravityQueue {
 pub(crate) struct QueuedMessage {
     pub id: String,
     pub payload: Value,
+    #[serde(default)]
+    pub compact: bool,
     pub created_at: u64,
     #[serde(default)]
     pub state: String,
@@ -52,8 +54,8 @@ impl QueuedMessage {
         json!({
             "id": self.id,
             "clientUserMessageId": self.payload["clientUserMessageId"],
-            "action": "send",
-            "text": self.payload["prompt"],
+            "action": if self.compact { "compact" } else { "send" },
+            "text": if self.compact { json!("压缩上下文") } else { self.payload["prompt"].clone() },
             "createdAt": self.created_at,
             "remoteQueueSource": "remote",
             "canSendNow": matches!(self.state.as_str(), "queued" | "paused" | ""),
@@ -121,6 +123,21 @@ impl AntigravityQueue {
         let msg = QueuedMessage {
             id,
             payload,
+            compact: false,
+            created_at: now_ms,
+            state: "queued".into(),
+            reason: String::new(),
+        };
+        self.messages.push(msg.clone());
+        self.revision += 1;
+        msg
+    }
+
+    pub(crate) fn enqueue_compact(&mut self, payload: Value, now_ms: u64) -> QueuedMessage {
+        let msg = QueuedMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            payload,
+            compact: true,
             created_at: now_ms,
             state: "queued".into(),
             reason: String::new(),
@@ -235,6 +252,10 @@ impl AntigravityQueue {
                 "state": existing.state,
                 "message": existing.original.view(self.paused),
             }));
+        }
+        let ready = self.ready_by_id(message_id)?;
+        if ready.compact {
+            return Err(ApiError::new(400, "压缩操作不支持编辑"));
         }
         let msg = self.take_by_id(message_id)?;
         let view = msg.view(self.paused);

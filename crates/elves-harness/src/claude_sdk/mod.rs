@@ -72,8 +72,6 @@ pub(super) struct WslBackend {
     pub config: WslConfig,
     pub linux_cwd: String,
     pub scripts: Scripts,
-    /// 仅对尚未创建的新会话生效的自动压缩窗口（按实例设置）。
-    pub auto_compact: Option<String>,
 }
 
 impl WslBackend {
@@ -105,12 +103,6 @@ impl WslBackend {
         ]
         .map(str::to_owned)
         .to_vec();
-        if !spec.resumed
-            && let Some(window) = &self.auto_compact
-        {
-            // 用户要求自动压缩窗口按实例设置；只给后续新建会话传原生 CLI 参数。
-            argv.extend(["--autocompact".to_owned(), window.clone()]);
-        }
         if spec.resumed {
             argv.extend(["--resume".to_owned(), spec.native_id.clone()]);
         } else {

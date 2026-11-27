@@ -42,7 +42,7 @@ export function currentEffort() {
     if (modelIdentityMatches(model, remembered.model) && (catalog?.supportedReasoningEfforts || [])
         .some(effort => effort.reasoningEffort === remembered.reasoningEffort)) return remembered.reasoningEffort;
     if (isClaude() || isAntigravity()) {
-      // 用户要求 Claude / Antigravity 的实例默认深度用于后续新会话；已记住的有效选择优先，默认值也必须受所选模型支持。
+      // 未记住有效选择时回退到引擎原生目录报告的默认思考深度（须受当前模型支持）。
       if (modelDefaults.reasoningEffort && (catalog?.supportedReasoningEfforts || [])
           .some(effort => effort.reasoningEffort === modelDefaults.reasoningEffort))
         return modelDefaults.reasoningEffort;

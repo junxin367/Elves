@@ -546,6 +546,8 @@ impl CodexHarness {
         input: Vec<Value>,
         authorization: &HarnessAuthorization,
     ) -> anyhow::Result<Value> {
+        self.restore_compaction_model_if_needed(id, Some(authorization))
+            .await?;
         self.ensure_loaded(id, authorization).await?;
         self.store.lock().await.commit(|data| {
             data.thread_devices
@@ -690,6 +692,9 @@ impl CodexHarness {
             params["config"]["model_reasoning_effort"] = json!(effort);
         }
         super::super::instance_settings::apply_codex_compaction_default(&config, &mut params);
+        let start_model = params["model"].as_str().map(str::to_owned);
+        self.apply_auto_compact(&config, start_model.as_deref(), &mut params)
+            .await;
         let response = self
             .runtime
             .request("thread/start", params, Some(authorization))

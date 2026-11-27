@@ -50,6 +50,16 @@ struct SavedStore {
     conversations: BTreeMap<String, Conversation>,
 }
 
+/// 手动压缩临时切换压缩模型时的恢复记录；压缩结束、失败、中断或重连后必须切回原会话模型。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompactionModelRestore {
+    original_model: String,
+    #[serde(default)]
+    original_effort: String,
+    compaction_model: String,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Conversation {
@@ -94,6 +104,10 @@ struct Conversation {
     #[serde(default)]
     active_turn_id: Option<String>,
     #[serde(default)]
+    compaction: Value,
+    #[serde(default)]
+    compaction_model_restore: Option<CompactionModelRestore>,
+    #[serde(default)]
     turns: Vec<Value>,
 }
 
@@ -108,6 +122,13 @@ impl Conversation {
                 .turns
                 .last()
                 .is_some_and(|t| t["status"] == "inProgress")
+    }
+
+    fn compacting(&self) -> bool {
+        matches!(
+            self.compaction["state"].as_str(),
+            Some("pending" | "running" | "unknown")
+        )
     }
 
     fn stop_requested(&self) -> bool {
@@ -208,7 +229,7 @@ impl Conversation {
             "queueEditRecovery": true,
             "queuedImageEditing": true,
             "queuedImageRemoval": true,
-            "compact": false,
+            "compact": true,
             "sessionPermissions": true,
             "forkThread": false,
         });
@@ -245,9 +266,14 @@ impl Conversation {
             "status": status,
             "editableMessage": null,
             "editHistoryHead": self.edit_history_head,
-            "messageEditReady": !self.active() && !has_waiting_request
+            "messageEditReady": !self.active() && !self.compacting() && !has_waiting_request
                 && self.remote_queue.messages.is_empty()
                 && self.remote_queue.edits.values().all(|edit| edit.state != "editing"),
+            "compaction": if self.compaction.is_object() {
+                self.compaction.clone()
+            } else {
+                json!({ "state": "idle" })
+            },
             "goal": self.goal,
             "tokenUsage": self.token_usage,
             "capabilities": capabilities,
@@ -344,6 +370,7 @@ impl Antigravity {
             }
             conversation.remote_queue.recover();
             conversation.active_turn_id = None;
+            conversation.compaction = json!({ "state": "idle" });
             if let Some(last) = conversation.turns.last_mut()
                 && last["status"] == "inProgress"
             {
@@ -620,7 +647,8 @@ impl Antigravity {
         } else {
             String::new()
         };
-        let (client, _channels) = AcpClient::spawn(config, &home_cwd, "~", None, false).await?;
+        let (client, _channels) =
+            AcpClient::spawn(config, &home_cwd, "~", None, false, None).await?;
         let res = async {
             let _init = client.initialize().await?;
             // 先直接调用只读 session/list；未登录时会立即返回 -32000，避免触发 authenticate 阻塞等待浏览器 OAuth。
@@ -712,6 +740,8 @@ impl Antigravity {
                     goal: Value::Null,
                     remote_queue: AntigravityQueue::default(),
                     active_turn_id: None,
+                    compaction: json!({ "state": "idle" }),
+                    compaction_model_restore: None,
                     turns: Vec::new(),
                 },
             );
@@ -817,7 +847,8 @@ impl Antigravity {
             linux_cwd.clone()
         };
 
-        let (client, mut channels) = AcpClient::spawn(config, &probe_cwd, &linux_cwd, None, false).await?;
+        let (client, mut channels) =
+            AcpClient::spawn(config, &probe_cwd, &linux_cwd, None, false, None).await?;
         let mut temp_session_id: Option<String> = None;
         let outcome = async {
             let init = client.initialize().await?;
@@ -964,7 +995,7 @@ impl Antigravity {
             "cwd": cwd,
             "globalPaths": [],
             "data": merged,
-            "nativeCapabilities": { "goal": true, "compact": false },
+            "nativeCapabilities": { "goal": true, "compact": true },
         }))
     }
 
@@ -1438,7 +1469,7 @@ impl Antigravity {
         let effective_cwd = c.effective_cwd().to_owned();
         let app_data_dir = self.resolve_session_app_data_dir(&c).await;
         let (client, mut channels) =
-            AcpClient::spawn(&c.config, &c.cwd, &c.linux_cwd, app_data_dir, false).await?;
+            AcpClient::spawn(&c.config, &c.cwd, &c.linux_cwd, app_data_dir, false, None).await?;
         let mut updates = Vec::new();
         let outcome = async {
             let _init = client.initialize().await?;
@@ -1625,12 +1656,17 @@ impl Antigravity {
             self.resolve_session_app_data_dir(c).await
         };
         let dangerously_skip_permissions = c.permission_mode.as_deref() == Some("bypassPermissions");
+        let auto_compact_override = super::instance_settings::antigravity_auto_compact_override(
+            &self.directory,
+            &c.config.instance_id(),
+        )?;
         let (client, mut channels) = AcpClient::spawn(
             &c.config,
             &c.cwd,
             &c.linux_cwd,
             app_data_dir,
             dangerously_skip_permissions,
+            auto_compact_override.as_deref(),
         )
         .await?;
         let setup_res = async {
@@ -1800,7 +1836,16 @@ impl Antigravity {
                 commands_to_cache = Some((c.config.instance_id(), cmds));
             }
             if let Some(usage) = effect.token_usage {
-                let merged = projection::merge_token_usage(&c.token_usage, &usage, &c.model);
+                let mut merged = projection::merge_token_usage(&c.token_usage, &usage, &c.model);
+                // 临时切换到独立压缩模型执行 /compact 期间，保留原会话模型的上下文窗口容量，避免容量环跳变。
+                if c.compacting()
+                    && c.compaction_model_restore.is_some()
+                    && !c.token_usage["modelContextWindow"].is_null()
+                {
+                    merged["modelContextWindow"] = c.token_usage["modelContextWindow"].clone();
+                    merged["modelContextWindowSource"] =
+                        c.token_usage["modelContextWindowSource"].clone();
+                }
                 c.token_usage = merged.clone();
                 // 仅当通知携带真实输入/输出 Token 明细时更新 `_acpUsage`；纯上下文窗口通知（`{used, size}`）不得将轮次 Token 置零。
                 if let Some(used) = update["used"].as_u64() {
@@ -1973,6 +2018,15 @@ impl Antigravity {
         c: &mut Conversation,
         payload: &Value,
     ) -> anyhow::Result<()> {
+        if let Some(restore) = c.compaction_model_restore.take() {
+            // 若上次手动压缩切模型后尚未切回（例如服务重启或连接中断），下次发送前先按原模型恢复。
+            if c.model.is_empty() && !restore.original_model.is_empty() {
+                c.model = restore.original_model;
+            }
+            if c.effort.is_empty() && !restore.original_effort.is_empty() {
+                c.effort = restore.original_effort;
+            }
+        }
         let saved_effort = c.effort.clone();
         let mut restore_effort = true;
         if let Some(model) = payload["model"]
@@ -2049,7 +2103,352 @@ impl Antigravity {
         current.effort = c.effort.clone();
         current.permission_mode = c.permission_mode.clone();
         current.permission_revision = c.permission_revision;
+        current.compaction_model_restore = c.compaction_model_restore.clone();
         self.persist_locked(&saved, None).await
+    }
+
+    /// 经官方 ACP `/compact` 执行 Antigravity 手动上下文压缩：
+    /// 仅在空闲时按实例「压缩模型」策略临时切换模型，压缩完成后无论成功、取消或失败均自动切回原模型。
+    async fn start_compaction(
+        self: &Arc<Self>,
+        thread_id: &str,
+        payload: &Value,
+    ) -> anyhow::Result<Value> {
+        let mut c = self.conversation(thread_id).await?;
+        if c.compacting() {
+            return Err(error(409, "已有压缩正在执行，请等待完成后重试"));
+        }
+        if c.active() {
+            return Err(error(409, "Antigravity 当前轮次仍在执行，请等待结束"));
+        }
+        let (runtime, _) = self.ensure_runtime(&c, false, None).await?;
+        // 确保原会话模型与残留的恢复状态先就位。
+        Self::apply_acp_options(&runtime, &mut c, payload).await?;
+        self.save_options(&c).await?;
+
+        let original_model = c.model.clone();
+        let original_effort = c.effort.clone();
+        let mut actual_model = original_model.clone();
+        let mut switched_restore: Option<CompactionModelRestore> = None;
+
+        // 用户要求仅在手动压缩时按策略临时切换压缩模型；执行中由原生自动压缩处理，不走此逻辑。
+        if let Ok(pref) = super::instance_settings::compaction_model_preference(
+            &self.directory,
+            &c.config.instance_id(),
+        ) && pref.model.is_some()
+        {
+            let metrics = self
+                .session_metrics(thread_id)
+                .await
+                .unwrap_or(Value::Null);
+            let cache_valid =
+                super::session_metrics::cache_is_valid(&metrics, &original_model, now_ms());
+            if let Some(target_model) = super::instance_settings::resolve_manual_compaction_model(
+                &pref,
+                &original_model,
+                cache_valid,
+            ) {
+                let restore = CompactionModelRestore {
+                    original_model: original_model.clone(),
+                    original_effort: original_effort.clone(),
+                    compaction_model: target_model.clone(),
+                };
+                {
+                    let mut saved = self.saved.lock().await;
+                    if let Some(conv) = saved.conversations.get_mut(thread_id) {
+                        conv.compaction_model_restore = Some(restore.clone());
+                        self.persist_locked(&saved, None).await?;
+                    }
+                }
+                if let Err(failure) = runtime
+                    .client
+                    .session_set_config_option(&runtime.native_session_id, "model", &target_model)
+                    .await
+                {
+                    let mut saved = self.saved.lock().await;
+                    if let Some(conv) = saved.conversations.get_mut(thread_id) {
+                        conv.compaction_model_restore = None;
+                        let _ = self.persist_locked(&saved, None).await;
+                    }
+                    // 压缩准备被原生拒绝时同样返回实例原文，不在错误前后追加说明。
+                    return Err(failure);
+                }
+                actual_model = target_model;
+                switched_restore = Some(restore);
+            }
+        }
+
+        let now = now_ms();
+        let turn_id = format!("agy-compact-turn-{}", uuid::Uuid::new_v4());
+        let item_id = format!("agy-compact-{}", uuid::Uuid::new_v4());
+        let pre_tokens = c.token_usage["last"]["totalTokens"].as_u64();
+        let mut item = json!({
+            "id": item_id,
+            "type": "contextCompaction",
+            "backend": "antigravity",
+            "status": "inProgress",
+            "completed": false,
+            "source": "manual",
+            "startedAtMs": now,
+            "remoteInlineEvent": true,
+            "remoteCompactionLifecycle": true,
+        });
+        if !actual_model.is_empty() {
+            item["compactionModel"] = json!(actual_model);
+        }
+        if let Some(pre) = pre_tokens {
+            item["preTokens"] = json!(pre);
+        }
+        let turn = json!({
+            "id": turn_id,
+            "status": "inProgress",
+            "turnStartedAtMs": now,
+            "startedAt": now,
+            "items": [item.clone()],
+        });
+        let compaction_state = json!({
+            "state": "running",
+            "turnId": turn_id,
+            "itemId": item_id,
+        });
+        {
+            let mut saved = self.saved.lock().await;
+            let conv = saved
+                .conversations
+                .get_mut(thread_id)
+                .ok_or_else(|| error(404, "Antigravity 会话不存在"))?;
+            conv.turns.push(turn.clone());
+            conv.active_turn_id = Some(turn_id.clone());
+            conv.compaction = compaction_state.clone();
+            conv.updated_at = now;
+            conv.edit_history_head = format!("agy-head-{}", conv.turns.len());
+            self.persist_locked(&saved, Some(thread_id)).await?;
+        }
+        self.publish(json!({
+            "method": "turn/started",
+            "params": {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "turn": turn,
+                "startedAtMs": now,
+            }
+        }));
+        self.publish(json!({
+            "method": "item/started",
+            "params": {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "item": item,
+            }
+        }));
+
+        let service = self.clone();
+        let tid = thread_id.to_owned();
+        let active_turn_id = turn_id.clone();
+        let active_item_id = item_id.clone();
+        let rt = runtime.clone();
+        tokio::spawn(async move {
+            let prompt_res = rt
+                .client
+                .session_prompt(
+                    &rt.native_session_id,
+                    vec![json!({ "type": "text", "text": "/compact" })],
+                )
+                .await;
+            service
+                .finish_compaction(
+                    &tid,
+                    &active_turn_id,
+                    &active_item_id,
+                    &rt,
+                    switched_restore,
+                    pre_tokens,
+                    now,
+                    prompt_res,
+                )
+                .await;
+        });
+
+        Ok(json!({
+            "ok": true,
+            "threadId": thread_id,
+            "backend": "antigravity",
+            "compaction": compaction_state,
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_compaction(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        item_id: &str,
+        runtime: &Arc<ActiveRuntime>,
+        restore: Option<CompactionModelRestore>,
+        pre_tokens: Option<u64>,
+        started_at_ms: u64,
+        result: anyhow::Result<Value>,
+    ) {
+        let mut restored_cleanly = restore.is_none();
+        if let Some(restore) = &restore {
+            if !restore.original_model.is_empty() && runtime.client.is_live() {
+                match runtime
+                    .client
+                    .session_set_config_option(
+                        &runtime.native_session_id,
+                        "model",
+                        &restore.original_model,
+                    )
+                    .await
+                {
+                    Ok(updated) => {
+                        let supports_thought = updated["configOptions"]
+                            .as_array()
+                            .is_some_and(|opts| {
+                                opts.iter().any(|o| {
+                                    o["id"] == "thought_level" || o["category"] == "thought_level"
+                                })
+                            });
+                        if supports_thought && !restore.original_effort.is_empty() {
+                            let _ = runtime
+                                .client
+                                .session_set_config_option(
+                                    &runtime.native_session_id,
+                                    "thought_level",
+                                    &restore.original_effort,
+                                )
+                                .await;
+                        }
+                        restored_cleanly = true;
+                    }
+                    Err(failure) => {
+                        let _ = crate::diagnostic_log::append_diagnostic_log(
+                            "remote_access.antigravity_compaction_model_restore_failed",
+                            json!({"threadId": thread_id, "model": restore.original_model, "error": format!("{failure:#}")}),
+                        );
+                    }
+                }
+            }
+        }
+
+        let now = now_ms();
+        let duration_ms = now.saturating_sub(started_at_ms);
+        let (status, error_obj, failed, interrupted, prompt_usage) = match result {
+            Ok(value) => {
+                let stop = value["stopReason"].as_str().unwrap_or("end_turn");
+                let usage = value.get("usage").filter(|u| u.is_object()).cloned();
+                if matches!(stop, "cancelled" | "canceled") {
+                    ("interrupted", Value::Null, false, true, usage)
+                } else {
+                    ("completed", Value::Null, false, false, usage)
+                }
+            }
+            Err(err) => (
+                "failed",
+                // 压缩与普通发送共用原生错误投影，保留原文及扩展详情，不退回统一限额模板。
+                acp::turn_error(&err),
+                true,
+                false,
+                None,
+            ),
+        };
+
+        let (final_item, final_turn, token_usage_event) = {
+            let mut saved = self.saved.lock().await;
+            let Some(c) = saved.conversations.get_mut(thread_id).filter(|c| !c.deleted) else {
+                return;
+            };
+            if restored_cleanly {
+                c.compaction_model_restore = None;
+            }
+            if c.active_turn_id.as_deref() == Some(turn_id) {
+                c.active_turn_id = None;
+            }
+            c.compaction = json!({ "state": "idle" });
+            let post_tokens = prompt_usage
+                .as_ref()
+                .and_then(|u| u["outputTokens"].as_u64().filter(|n| *n > 0))
+                .or_else(|| c.token_usage["last"]["totalTokens"].as_u64());
+            let mut usage_ev = None;
+            if let Some(ref u) = prompt_usage
+                && let Some(normalized) = projection::normalize_usage_update(u)
+            {
+                let mut merged = projection::merge_token_usage(&c.token_usage, &normalized, &c.model);
+                if restore.is_some() && !c.token_usage["modelContextWindow"].is_null() {
+                    merged["modelContextWindow"] = c.token_usage["modelContextWindow"].clone();
+                    merged["modelContextWindowSource"] =
+                        c.token_usage["modelContextWindowSource"].clone();
+                }
+                c.token_usage = merged.clone();
+                usage_ev = Some(merged);
+            }
+            let mut item_snapshot = Value::Null;
+            let mut turn_snapshot = Value::Null;
+            if let Some(turn) = c.turns.iter_mut().find(|t| t["id"] == turn_id) {
+                turn["status"] = json!(status);
+                turn["turnCompletedAtMs"] = json!(now);
+                turn["completedAt"] = json!(now);
+                if !error_obj.is_null() {
+                    turn["error"] = error_obj;
+                }
+                if let Some(items) = turn["items"].as_array_mut()
+                    && let Some(item) = items.iter_mut().find(|it| it["id"] == item_id)
+                {
+                    item["status"] = json!(status);
+                    item["completed"] = json!(true);
+                    item["completedAtMs"] = json!(now);
+                    item["durationMs"] = json!(duration_ms);
+                    if let Some(pre) = pre_tokens {
+                        item["preTokens"] = json!(pre);
+                    }
+                    if let Some(post) = post_tokens {
+                        item["postTokens"] = json!(post);
+                    }
+                    item_snapshot = item.clone();
+                }
+                turn_snapshot = turn.clone();
+            }
+            c.updated_at = now;
+            if failed || interrupted {
+                c.remote_queue.pause("压缩未确认完成，后续操作已暂停；请核对后手动重试");
+            }
+            let displayed = if turn_snapshot.is_object() {
+                c.displayed_turn(&turn_snapshot)
+            } else {
+                Value::Null
+            };
+            let _ = self.persist_locked(&saved, Some(thread_id)).await;
+            (item_snapshot, displayed, usage_ev)
+        };
+
+        if let Some(usage) = token_usage_event {
+            self.publish(json!({
+                "method": "thread/tokenUsage/updated",
+                "params": { "threadId": thread_id, "tokenUsage": usage }
+            }));
+        }
+        if final_item.is_object() {
+            self.publish(json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "item": final_item,
+                }
+            }));
+        }
+        if final_turn.is_object() {
+            self.publish(json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "turn": final_turn,
+                    "completedAtMs": now,
+                }
+            }));
+        }
+        self.queue_changed(thread_id).await;
     }
 
     /// 创建新 Antigravity 会话并发送首条消息（或首条目标）。
@@ -2100,24 +2499,6 @@ impl Antigravity {
         {
             effective_payload["permissionMode"] = json!(default_mode);
         }
-        if let Ok((pref_model, pref_effort)) =
-            super::instance_settings::antigravity_default_model_and_effort(&self.directory, &inst_id)
-        {
-            if effective_payload["model"]
-                .as_str()
-                .is_none_or(|s| s.trim().is_empty())
-                && let Some(model) = pref_model
-            {
-                effective_payload["model"] = json!(model);
-            }
-            if effective_payload["reasoningEffort"]
-                .as_str()
-                .is_none_or(|s| s.trim().is_empty())
-                && let Some(effort) = pref_effort
-            {
-                effective_payload["reasoningEffort"] = json!(effort);
-            }
-        }
         let temp_conv = Conversation {
             backend: antigravity_backend(),
             id: format!("antigravity-pending-{}", uuid::Uuid::new_v4()),
@@ -2155,6 +2536,8 @@ impl Antigravity {
             goal: Value::Null,
             remote_queue: AntigravityQueue::default(),
             active_turn_id: None,
+            compaction: json!({ "state": "idle" }),
+            compaction_model_restore: None,
             turns: Vec::new(),
         };
 
@@ -2553,6 +2936,33 @@ impl Antigravity {
             let lifecycle = self.lifecycle_gate.read().await;
             anyhow::ensure!(self.is_accepting(), "远程服务正在关闭，Antigravity 操作尚未派发");
             let mut c = self.conversation(id).await?;
+            if msg.compact {
+                if c.active() || c.compacting() {
+                    return Err(error(409, "手动压缩需等待当前任务结束，不能引导执行"));
+                }
+                {
+                    let mut saved = self.saved.lock().await;
+                    let conv = saved
+                        .conversations
+                        .get_mut(id)
+                        .ok_or_else(|| error(404, "Antigravity 会话不存在"))?;
+                    conv.remote_queue.mark_sending(&msg.id)?;
+                    self.persist_locked(&saved, None).await?;
+                }
+                self.queue_changed(id).await;
+                let mut response = self.start_compaction(id, &msg.payload).await?;
+                {
+                    let mut saved = self.saved.lock().await;
+                    if let Some(conv) = saved.conversations.get_mut(id) {
+                        conv.remote_queue.confirm_sent(&msg.id);
+                        self.persist_locked(&saved, None).await?;
+                    }
+                }
+                response["messageId"] = json!(msg.id);
+                response["confirmed"] = json!(true);
+                response["deliveryState"] = json!("accepted");
+                return Ok(response);
+            }
             if !c.active() && let Some(mode) = msg.payload["permissionMode"].as_str() {
                 c.permission_mode = Some(mode.to_owned());
             }
@@ -2658,6 +3068,7 @@ impl Antigravity {
                 .filter(|c| {
                     !c.deleted
                         && !c.active()
+                        && !c.compacting()
                         && ((!c.remote_queue.paused && !c.remote_queue.messages.is_empty())
                             || c.goal["status"] == "active")
                 })
@@ -2717,7 +3128,7 @@ impl Antigravity {
                 let Some(c) = saved
                     .conversations
                     .get_mut(&id)
-                    .filter(|c| !c.deleted && !c.active())
+                    .filter(|c| !c.deleted && !c.active() && !c.compacting())
                 else {
                     continue;
                 };
@@ -2804,6 +3215,7 @@ impl Antigravity {
             action,
             "send"
                 | "steerQueued"
+                | "compact"
                 | "setGoal"
                 | "updateGoal"
                 | "editMessage"
@@ -3321,10 +3733,32 @@ impl Antigravity {
                 self.change_metadata("deleteThread", id, payload).await
             }
             "warmSession" => Ok(json!({ "ok": true, "threadId": id, "warm": false })),
-            "compact" => Err(error(
-                501,
-                "当前 Antigravity ACP 协议未提供手动上下文压缩接口",
-            )),
+            "compact" => {
+                if c.compacting() {
+                    return Err(error(409, "已有压缩正在执行，请等待完成后重试"));
+                }
+                if c.active() {
+                    // 用户要求执行中不打断原任务；手动压缩与普通消息共用同一队列，等本轮结束后再执行。
+                    let msg = {
+                        let mut saved = self.saved.lock().await;
+                        let conv = saved
+                            .conversations
+                            .get_mut(id)
+                            .ok_or_else(|| error(404, "Antigravity 会话不存在"))?;
+                        conv.remote_queue.paused = false;
+                        let msg = conv.remote_queue.enqueue_compact(payload.clone(), now_ms());
+                        self.persist_locked(&saved, None).await?;
+                        msg
+                    };
+                    self.queue_changed(id).await;
+                    let mut snap = self.queue(id).await?;
+                    snap["messageId"] = json!(msg.id);
+                    snap["confirmed"] = json!(true);
+                    snap["deliveryState"] = json!("queued");
+                    return Ok(snap);
+                }
+                self.start_compaction(id, payload).await
+            }
             _ => Err(error(409, "此操作暂不支持 Antigravity 会话")),
         }
     }
@@ -3859,6 +4293,44 @@ mod tests {
         assert_eq!(c.turns[0]["id"], "agy-local-turn-0", "尚未接续执行的外部历史仍正常导入");
         c.sync_local_turns(vec![json!({"id":"agy-local-turn-1","items":[]})]);
         assert_eq!(c.turns[0]["id"], "agy-local-turn-1");
+    }
+
+    #[tokio::test]
+    async fn agy_compaction_failure_preserves_native_error_and_history() {
+        let raw = " \tQuota exhausted\r\n原生错误  ";
+        let detail = "  Resets 2:40pm (America/Los_Angeles)\r\n";
+        let response_error = json!({"code":-32603,"message":raw,"data":{"message":detail}});
+        let script = format!(
+            "if(q.method==='session/prompt')console.log(JSON.stringify({{id:q.id,error:{response_error}}}));"
+        );
+        let (dir, ag, _auth, rt) = audit_fixture(&script, false, true).await;
+        {
+            let mut saved = ag.saved.lock().await;
+            let c = saved.conversations.get_mut("antigravity-audit").unwrap();
+            c.active_turn_id = Some("agy-compact-audit".into());
+            c.compaction = json!({"state":"running"});
+            c.turns.push(json!({"id":"agy-compact-audit","status":"inProgress","items":[
+                {"id":"compact-item","type":"contextCompaction","status":"inProgress","completed":false}
+            ]}));
+            c.remote_queue.enqueue(json!({"clientUserMessageId":"later","prompt":"queued"}), 1);
+        }
+        let result = rt.client.session_prompt("audit", vec![json!({"type":"text","text":"/compact"})]).await;
+        assert!(result.is_err());
+        ag.finish_compaction(
+            "antigravity-audit", "agy-compact-audit", "compact-item", &rt, None, None, 1, result,
+        ).await;
+        rt.client.close().await;
+        let c = ag.conversation("antigravity-audit").await.unwrap();
+        assert!(!c.active());
+        assert!(c.remote_queue.paused);
+        assert_eq!(c.turns[0]["status"], "failed");
+        assert_eq!(c.turns[0]["items"][0]["status"], "failed");
+        assert_eq!(c.turns[0]["error"]["source"], "antigravity");
+        assert_eq!(c.turns[0]["error"]["nativeMessage"], raw);
+        assert_eq!(c.turns[0]["error"]["nativeDetails"], json!([detail]));
+        let reopened = Antigravity::new(dir.path()).unwrap();
+        let history = reopened.history_authorized(&json!({"threadId":"antigravity-audit"}), None).await.unwrap();
+        assert_eq!(history["data"][0]["error"], c.turns[0]["error"]);
     }
 
     #[tokio::test]
@@ -4535,6 +5007,15 @@ mod tests {
         q.confirm_sent(&next.id);
         q.pause("stopped");
         assert!(q.next_ready().is_none());
+
+        let mut cq = AntigravityQueue::default();
+        let compact_item = cq.enqueue_compact(json!({ "command": "compact" }), 30);
+        assert!(compact_item.compact);
+        let view = compact_item.view(false);
+        assert_eq!(view["action"], "compact");
+        assert_eq!(view["text"], "压缩上下文");
+        let err = cq.begin_edit(&compact_item.id, "edit-compact").unwrap_err();
+        assert_eq!(err.code, 400);
     }
 
     #[test]
@@ -4743,12 +5224,15 @@ mod tests {
                     goal: Value::Null,
                     remote_queue: AntigravityQueue::default(),
                     active_turn_id: None,
+                    compaction: json!({ "state": "idle" }),
+                    compaction_model_restore: None,
                     turns: Vec::new(),
                 },
             );
         }
         let detail = ag.detail_authorized(id, None).await.unwrap();
         assert_eq!(detail["thread"]["instanceId"], "antigravity:local");
+        assert_eq!(detail["thread"]["capabilities"]["compact"], true);
         assert_eq!(detail["thread"]["permissionMode"], "default");
         assert_eq!(
             detail["thread"]["permissionModes"],
@@ -4850,6 +5334,8 @@ mod tests {
                     goal: Value::Null,
                     remote_queue: AntigravityQueue::default(),
                     active_turn_id: None,
+                    compaction: json!({ "state": "idle" }),
+                    compaction_model_restore: None,
                     turns: vec![json!({
                         "id": "t1",
                         "status": "completed",
@@ -4936,6 +5422,8 @@ mod tests {
                     goal: Value::Null,
                     remote_queue: AntigravityQueue::default(),
                     active_turn_id: Some("agy-turn-1".into()),
+                    compaction: json!({ "state": "idle" }),
+                    compaction_model_restore: None,
                     turns: vec![json!({
                         "id": "agy-turn-1",
                         "status": "inProgress",

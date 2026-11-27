@@ -129,6 +129,18 @@ impl WslConfig {
     }
 }
 
+/// 手动压缩临时切换压缩模型时的恢复记录；压缩结束、失败、中断或服务重启后必须切回原会话模型。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompactionModelRestore {
+    original_model: String,
+    #[serde(default)]
+    original_effort: String,
+    compaction_model: String,
+    #[serde(default)]
+    command_id: String,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Conversation {
@@ -191,6 +203,8 @@ struct Conversation {
     native_history_head: String,
     #[serde(default)]
     spent_requests: BTreeMap<String, Value>,
+    #[serde(default)]
+    compaction_model_restore: Option<CompactionModelRestore>,
 }
 
 #[derive(Clone)]
@@ -297,11 +311,14 @@ impl Conversation {
         }
         self.native_control["settings"] = settings.clone();
         // 用户要求区分命令受理与实际生效；只用原生确认后的值更新会话模型，待确认选择单独展示。
-        if let Some(model) = settings["model"].as_str() {
-            self.model = model.into();
-        }
-        if let Some(effort) = settings["effort"].as_str() {
-            self.effort = effort.into();
+        // 手动压缩临时切往独立压缩模型期间保留界面显示的原会话模型，压缩结束后自动切回。
+        if self.compaction_model_restore.is_none() {
+            if let Some(model) = settings["model"].as_str() {
+                self.model = model.into();
+            }
+            if let Some(effort) = settings["effort"].as_str() {
+                self.effort = effort.into();
+            }
         }
     }
 
@@ -1299,6 +1316,7 @@ impl Claude {
             native_title: String::new(),
             native_history_head: String::new(),
             spent_requests: BTreeMap::new(),
+            compaction_model_restore: None,
         };
         let process = self.launch(&probe, command, Some(json!({}))).await?;
         state.process = Some(process.clone());
@@ -1519,6 +1537,7 @@ impl Claude {
                 native_title: title.into(),
                 native_history_head: String::new(),
                 spent_requests: BTreeMap::new(),
+            compaction_model_restore: None,
             };
             saved.conversations.insert(c.id.clone(), c);
             changed = true;
@@ -1949,14 +1968,6 @@ impl Claude {
             "--permission-prompt-tool",
             "stdio",
         ]);
-        if !c.resumed
-            && let Some(window) = super::instance_settings::claude_auto_compact(
-                &self.directory,
-                &c.config.instance_id(),
-            )?
-        {
-            command.args(["--autocompact", &window]);
-        }
         if c.resumed {
             command.args(["--resume", &c.native_id]);
         } else {
@@ -1990,17 +2001,10 @@ impl Claude {
         // 用户要求别的应用持有会话时不能在这里继续：两个 CLI 写同一份记录会损坏历史。
         // 接回自己宿主里仍在执行的 CLI 不受影响（它们按脚本路径识别为本程序所有）。
         self.ensure_not_held_elsewhere(c).await?;
-        // 用户要求自动压缩窗口按实例设置，只给尚未创建的新会话传原生 CLI 参数。
-        let auto_compact = if c.resumed {
-            None
-        } else {
-            super::instance_settings::claude_auto_compact(&self.directory, &c.config.instance_id())?
-        };
         let backend = Arc::new(sdk::WslBackend {
             config: c.config.clone(),
             linux_cwd: c.linux_cwd.clone(),
             scripts,
-            auto_compact,
         });
         let (writer, reader) = sdk::connect(backend, &c.native_id, c.resumed);
         // 重启前仍在执行（或有后台任务）的会话：接回 WSL 内继续运行的宿主；空闲会话不启动 CLI。
@@ -2441,6 +2445,7 @@ impl Claude {
             native_title: String::new(),
             native_history_head: String::new(),
             spent_requests: BTreeMap::new(),
+            compaction_model_restore: None,
         };
         // 模型与 Skill 目录共用原生初始化方式；探测不恢复已有会话，不发送模型消息。
         self.spawn_stdio(&c).await
@@ -2705,6 +2710,7 @@ impl Claude {
             native_title: String::new(),
             native_history_head: String::new(),
             spent_requests: BTreeMap::new(),
+            compaction_model_restore: None,
         };
         let process = self.spawn(&c).await?;
         // 用户要求实例默认思考深度用于后续新会话；仅首条消息补齐缺省值，显式等级和显式恢复默认保持优先。
@@ -3677,6 +3683,13 @@ impl Claude {
                 }
                 c.remote_queue.observe_turns(&c.turns, &c.native_status);
                 c.remote_queue.observe_compaction(&c.native_control);
+                let needs_compaction_restore = c.compaction_model_restore.is_some()
+                    && !c.active()
+                    && !matches!(
+                        c.native_control["compaction"]["state"].as_str(),
+                        Some("pending" | "running")
+                    )
+                    && !c.remote_queue.is_awaiting_compaction();
                 let mut view = c.view();
                 let changed = history_changed
                     || previous_view != view
@@ -3713,10 +3726,19 @@ impl Claude {
                     reverted,
                     naming_activity,
                     ledger_changed,
+                    needs_compaction_restore,
                 ))
             })
             .await?;
-        let (update, completed, usage_changed, reverted, naming_activity, ledger_changed) = update;
+        let (
+            update,
+            completed,
+            usage_changed,
+            reverted,
+            naming_activity,
+            ledger_changed,
+            needs_compaction_restore,
+        ) = update;
         if reverted || ledger_changed {
             self.flush_or_retry_later().await;
         }
@@ -3753,6 +3775,12 @@ impl Claude {
         }
         if usage_changed {
             self.publish(json!({"method":"thread/tokenUsage/updated","params":{"threadId":id,"tokenUsage":usage}}));
+        }
+        if needs_compaction_restore && let Some(service) = self.weak.upgrade() {
+            let thread_id = id.to_owned();
+            tokio::spawn(async move {
+                service.restore_compaction_model_background(&thread_id).await;
+            });
         }
         Ok(())
     }
@@ -5651,6 +5679,7 @@ mod tests {
             native_title: String::new(),
             native_history_head: String::new(),
             spent_requests: BTreeMap::new(),
+            compaction_model_restore: None,
             turns: vec![
                 json!({"id":"turn-1","_process":"new-process","status":"inProgress","items":[]}),
             ]

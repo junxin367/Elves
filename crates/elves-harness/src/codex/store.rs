@@ -132,6 +132,18 @@ pub(super) struct OpenCommand {
     pub inherited: bool,
 }
 
+/// 手动压缩临时切换压缩模型时的恢复记录；压缩完成、失败、中断或服务重启后必须切回原会话模型。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct CompactionModelRestore {
+    pub original_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_service_tier: Option<String>,
+    pub compaction_model: String,
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub(super) struct Data {
@@ -157,6 +169,8 @@ pub(super) struct Data {
     pub deletions: BTreeMap<String, Deletion>,
     /// 交接给下一个 Harness 的后台终端，键为 `会话ID:条目ID`；见 OpenCommand。
     pub background_commands: BTreeMap<String, OpenCommand>,
+    /// 手动压缩临时切往独立压缩模型后待恢复的原会话模型，按会话持久化防止重启遗留。
+    pub compaction_model_restores: BTreeMap<String, CompactionModelRestore>,
 }
 
 pub(super) struct Store {

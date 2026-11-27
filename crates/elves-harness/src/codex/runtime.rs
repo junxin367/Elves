@@ -96,7 +96,7 @@ pub(super) struct Connection {
     pub generation: String,
     pub generation_index: u64,
     pub user_agent: OnceLock<String>,
-    codex_home: Option<PathBuf>,
+    pub(super) codex_home: Option<PathBuf>,
     transport: ServiceTransport,
     /// 私有服务身份；断线后仍保留，关停判定据此区分“私有服务状态未知”与“stdio 子进程断开”。
     server: Option<crate::codex_server::PrivateServer>,

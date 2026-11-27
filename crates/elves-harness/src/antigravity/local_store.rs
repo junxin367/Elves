@@ -346,7 +346,9 @@ pub(crate) fn parse_transcript_jsonl(text: &str) -> LocalTranscript {
             "USER_INPUT" => {
                 let raw_content = entry["content"].as_str().unwrap_or("");
                 let user_text = extract_user_request_text(raw_content);
-                if user_text.is_empty() {
+                // 原生 /compact 会记录一条仅含 `/compact` 的 USER_INPUT 与紧随的 CHECKPOINT；
+                // 重读本地轨迹时不将控制命令伪装成普通用户消息泡。
+                if user_text.is_empty() || user_text.trim() == "/compact" {
                     continue;
                 }
                 turns.push(json!({
@@ -362,6 +364,45 @@ pub(crate) fn parse_transcript_jsonl(text: &str) -> LocalTranscript {
                         "id": format!("agy-local-user-{step_index}"),
                         "content": [{ "type": "text", "text": user_text }],
                     }],
+                }));
+            }
+            "CHECKPOINT" => {
+                let uncached_input = entry["input_tokens"].as_u64().unwrap_or(0);
+                let cache_read = entry["cache_read_tokens"].as_u64().unwrap_or(0);
+                let output_tokens = entry["output_tokens"].as_u64().unwrap_or(0);
+                let pre_tokens = uncached_input.saturating_add(cache_read);
+                let post_tokens = (output_tokens > 0).then_some(output_tokens);
+                let item_id = format!("agy-local-compact-{step_index}");
+                let mut item = json!({
+                    "id": item_id,
+                    "type": "contextCompaction",
+                    "backend": "antigravity",
+                    "status": "completed",
+                    "completed": true,
+                    "source": "manual",
+                    "startedAtMs": (ts_ms > 0).then_some(ts_ms),
+                    "completedAtMs": (ts_ms > 0).then_some(ts_ms),
+                    "remoteInlineEvent": true,
+                    "remoteCompactionLifecycle": true,
+                });
+                if pre_tokens > 0 {
+                    item["preTokens"] = json!(pre_tokens);
+                }
+                if let Some(post) = post_tokens {
+                    item["postTokens"] = json!(post);
+                }
+                if let Some(model_raw) = entry["model"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    item["compactionModel"] = json!(split_model_effort(model_raw).0);
+                }
+                turns.push(json!({
+                    "id": format!("agy-local-compact-turn-{step_index}"),
+                    "status": "completed",
+                    "createdAt": ts_ms,
+                    "completedAt": ts_ms,
+                    "turnStartedAtMs": ts_ms,
+                    "turnCompletedAtMs": ts_ms,
+                    "_nativeRequestTimestamps": true,
+                    "items": [item],
                 }));
             }
             "PLANNER_RESPONSE" => {
@@ -1288,6 +1329,25 @@ mod tests {
         );
         assert_eq!(parsed.turns[1]["items"][0]["content"][0]["text"], "第二个问题");
         assert_eq!(parsed.turns[1]["items"][1]["text"], "第二个回答");
+    }
+
+    #[test]
+    fn parses_checkpoint_and_skips_bare_compact_command() {
+        let sample = concat!(
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-27T02:00:00Z","content":"<USER_REQUEST>\nhello\n</USER_REQUEST>"}"#, "\n",
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-27T02:00:02Z","model":"claude-sonnet-5-5","input_tokens":1000,"cache_read_tokens":2000,"output_tokens":100,"content":"world"}"#, "\n",
+            r#"{"step_index":2,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-27T02:01:00Z","content":"<USER_REQUEST>\n/compact\n</USER_REQUEST>"}"#, "\n",
+            r#"{"step_index":3,"source":"MODEL","type":"CHECKPOINT","status":"DONE","created_at":"2026-11-27T02:01:03Z","model":"gemini-3.8-flash-high","input_tokens":19000,"cache_read_tokens":0,"output_tokens":450}"#, "\n"
+        );
+        let parsed = parse_transcript_jsonl(sample);
+        assert_eq!(parsed.turns.len(), 2);
+        assert_eq!(parsed.turns[0]["items"][0]["content"][0]["text"], "hello");
+        assert_eq!(parsed.turns[1]["items"][0]["type"], "contextCompaction");
+        assert_eq!(parsed.turns[1]["items"][0]["status"], "completed");
+        assert_eq!(parsed.turns[1]["items"][0]["preTokens"], 19000);
+        assert_eq!(parsed.turns[1]["items"][0]["postTokens"], 450);
+        assert_eq!(parsed.turns[1]["items"][0]["compactionModel"], "gemini-3.8-flash");
+        assert_eq!(parsed.model, "claude-sonnet-5-5");
     }
 
     #[test]

@@ -1013,6 +1013,7 @@ impl CodexHarness {
         if let Some(model) = model {
             params["model"] = json!(model);
         }
+        self.apply_auto_compact(&config, model, &mut params).await;
         let effort = payload.get("reasoningEffort").or_else(|| {
             saved
                 .get("reasoningEffort")

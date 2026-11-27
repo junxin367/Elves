@@ -305,8 +305,44 @@ impl CodexHarness {
                             }
                         };
                         let affected = frame["params"]["threadId"].as_str().map(str::to_owned);
+                        let is_compaction_end = frame["method"] == "turn/completed"
+                            || (frame["method"] == "item/completed"
+                                && frame["params"]["item"]["type"] == "contextCompaction");
                         service.catalog.observe(&frame).await;
                         service.projection.lock().await.ingest(frame);
+                        if is_compaction_end
+                            && let Some(id) = affected.clone()
+                        {
+                            // 手动压缩切换过独立压缩模型后，在压缩终态立即切回原会话模型。
+                            let needs_restore = !service.projection.lock().await.compactions.contains_key(&id)
+                                && service
+                                    .store
+                                    .lock()
+                                    .await
+                                    .data
+                                    .compaction_model_restores
+                                    .contains_key(&id);
+                            if needs_restore {
+                                let restore_service = service.clone();
+                                execution::spawn_service(
+                                    service.audit.clone(),
+                                    "compaction-model-restore",
+                                    async move {
+                                        let lock = restore_service.thread_lock(&id).await;
+                                        let _serial = lock.lock().await;
+                                        if let Err(failure) = restore_service
+                                            .restore_compaction_model_if_needed(&id, None)
+                                            .await
+                                        {
+                                            let _ = crate::diagnostic_log::append_diagnostic_log(
+                                                "remote_access.codex_compaction_model_restore_failed",
+                                                json!({"threadId": id, "error": format!("{failure:#}")}),
+                                            );
+                                        }
+                                    },
+                                );
+                            }
+                        }
                         if paused && let Some(id) = affected {
                             service.queue_changed(&id).await;
                         }
@@ -842,6 +878,37 @@ impl CodexHarness {
             .clone()
     }
 
+    pub(super) async fn apply_auto_compact(
+        &self,
+        config: &Value,
+        model: Option<&str>,
+        params: &mut Value,
+    ) {
+        let Some(controller) = self.controller.get().and_then(Weak::upgrade) else {
+            return;
+        };
+        let codex_home = self
+            .runtime
+            .connection()
+            .await
+            .ok()
+            .and_then(|connection| connection.codex_home.clone())
+            .unwrap_or_else(|| {
+                let settings = crate::settings::SettingsStore::default()
+                    .load()
+                    .unwrap_or_default();
+                crate::codex_home::codex_home_dir_for_settings(&settings)
+            });
+        super::instance_settings::apply_codex_auto_compact(
+            &controller.state_dir,
+            "codex:local",
+            &codex_home,
+            config,
+            model,
+            params,
+        );
+    }
+
     async fn ensure_loaded(
         &self,
         id: &str,
@@ -871,6 +938,33 @@ impl CodexHarness {
                 }
             }
         }
+        let pending_restore = if self.projection.lock().await.compactions.contains_key(id) {
+            None
+        } else {
+            self.store
+                .lock()
+                .await
+                .data
+                .compaction_model_restores
+                .get(id)
+                .cloned()
+        };
+        if let Some(restore) = &pending_restore {
+            // 若上次手动压缩切模型后尚未切回（例如连接断开或服务重启），重连加载时直接以原会话模型恢复。
+            params["model"] = json!(restore.original_model);
+            if let Some(effort) = &restore.original_effort {
+                params["config"]["model_reasoning_effort"] = json!(effort);
+            }
+            if let Some(tier) = &restore.original_service_tier {
+                params["serviceTier"] = json!(tier);
+            }
+        }
+        let resume_model = params["model"]
+            .as_str()
+            .or_else(|| identity["thread"]["model"].as_str())
+            .map(str::to_owned);
+        self.apply_auto_compact(&config, resume_model.as_deref(), &mut params)
+            .await;
         let response = self
             .runtime
             .request(
@@ -879,6 +973,17 @@ impl CodexHarness {
                 Some(guard),
             )
             .await?;
+        if pending_restore.is_some() {
+            self.store.lock().await.commit(|data| {
+                data.compaction_model_restores.remove(id);
+                Ok(())
+            })?;
+            self.projection
+                .lock()
+                .await
+                .pending_compaction_models
+                .remove(id);
+        }
         let mut thread = crate::codex_service::normalize_session_response(&response)?;
         self.decorate_persistent_side(&response["thread"], &mut thread).await;
         for key in ["model", "reasoningEffort", "serviceTier"] {

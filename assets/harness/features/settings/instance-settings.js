@@ -48,7 +48,7 @@ export const settingsNavigation = [
   ] }
 ];
 export const instanceSettingPages = [
-  { id: "types", label: "会话实例", section: "general", description: "按实例管理默认模型、思考、缓存压缩和原生能力。" },
+  { id: "types", label: "会话实例", section: "general", description: "按实例管理显示模型、思考、缓存压缩和原生能力。" },
   { id: "skills", label: "Skills", section: "skills", description: "查看和管理所选实例的 Skills。" },
   { id: "mcp", label: "MCP", section: "mcp", description: "查看和管理所选实例的 MCP 服务。" },
   { id: "hooks", label: "钩子", section: "hooks", description: "查看和管理所选实例的原生钩子。" }
@@ -89,9 +89,6 @@ function section(parent, label, backend = null) {
 // 用户要求默认状态统一口径；实例原生配置的空值称“使用原生默认”，模型能力的默认值单独注明来源。
 const inherit = { value: "", label: "使用原生默认" };
 const booleanOptions = [inherit, { value: "true", label: "开启" }, { value: "false", label: "关闭" }];
-const compactOptions = [inherit, { value: "auto", label: "自动" },
-  ...[100000, 200000, 400000, 600000, 800000, 1000000].map(value =>
-    ({ value: String(value), label: `${value / 1000}k Token` }))];
 const boolValue = value => value == null ? "" : String(value);
 const apiValue = value => value === "" ? null : value === "true" ? true : value === "false" ? false : value;
 
@@ -129,7 +126,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
   const display = switchControl("显示此实例", false);
   if (name === "general") {
     const row = element("label", "appearance-field");
-    row.append(fieldCopy("显示此实例", "所有客户端共用此开关，不会停止正在执行的任务。"), display);
+    row.append(fieldCopy("显示此实例", "所有客户端共用，不影响运行中的任务。"), display);
     head.append(row);
   }
   const content = element("div", "instance-settings-content");
@@ -179,7 +176,8 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
       control.disabled = (control === visibilityTrigger ? !canWriteVisibility : !canWrite)
         || control.settingsUnsupported === true;
     }
-    if (activePopup?.trigger === visibilityTrigger && (!visibilityTrigger.isConnected || visibilityTrigger.disabled))
+    if (activePopup?.trigger && (!activePopup.trigger.isConnected || activePopup.trigger.disabled)
+        && (activePopup.trigger === visibilityTrigger || controls.has(activePopup.trigger)))
       closePopup();
     const canReadPrompt = promptReadable() && !detecting && !saving;
     for (const control of promptControls) control.disabled = !canReadPrompt;
@@ -189,8 +187,9 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     const row = element("label", "appearance-field");
     const control = switchControl(label, value);
     control.id = `settings-${name}-${key}`; control.settingsUnsupported = unsupported;
-    const suffix = value == null ? " 当前使用原生默认设置。" : "";
-    row.append(fieldCopy(label, `${description || ""}${suffix}`), control);
+    const inherited = value == null ? "当前使用原生默认设置。" : "";
+    const copyText = [description, inherited].filter(Boolean).join(" ");
+    row.append(fieldCopy(label, copyText), control);
     const owner = record, ownerId = selected;
     control.onchange = () => {
       if (record === owner && selected === ownerId && control.isConnected)
@@ -202,21 +201,11 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     if (!options.some(option => option.value === value))
       options = [...options, { value, label: `${value}（当前配置）`, disabled: true }];
     const control = selectControl(`settings-${name}-${key}`, label, options, value);
-    // 设置模型与命名模型共用自动搜索门槛，保留搜索 Select 的宽菜单，不因少量选项隐藏输入而跳宽。
-    if (key === "model") {
-      control.searchMode = "auto";
-      control.selectSearchPlaceholder = "搜索模型";
-    }
     control.settingsUnsupported = unsupported;
     const owner = record, ownerId = selected;
     control.onchange = () => {
       if (record !== owner || selected !== ownerId || !control.isConnected) return;
-      const settings = { [key]: transform(control.value) };
-      if (key === "model" && ["codex", "antigravity"].includes(record.backend)) {
-        // 切换 Codex 或 Antigravity 实例默认模型时恢复模型默认思考深度，避免把旧模型的专属等级带给新模型。
-        settings.reasoningEffort = null;
-      }
-      void save(settings);
+      void save({ [key]: transform(control.value) });
     };
     controls.add(control);
     return control;
@@ -228,54 +217,41 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
   }
   function renderGeneral() {
     const backend = record.backend, values = record.settings;
-    const label = backend === "claude" ? "Claude" : backend === "antigravity" ? "Antigravity" : "Codex";
+    if (backend === "antigravity") {
+      // 用户要求移除 Antigravity 实例页的只读常规说明卡片（执行协议/默认权限/全局自定义指令），保留目录异常与底部提示。
+      if (record.capabilityError)
+        content.append(element("p", "appearance-hint error-text", `无法读取当前 Antigravity 实例模型目录：${record.capabilityError}`));
+      content.append(element("p", "appearance-hint", "项目设置、启动参数和组织策略仍按原生优先级生效。"));
+      return;
+    }
+    const label = backend === "claude" ? "Claude" : "Codex";
     const card = section(content, `${label} 常规设置`, backend);
     if (backend === "codex") {
+      // 用户要求精简设置项描述：标题与控件已自解释的开关不再重复介绍，仅保留影响范围、依赖或副作用说明。
       for (const [key, label, description] of [
-        ["todo", "任务清单（Todo）", "允许 Codex 创建任务清单并更新任务进度。"],
-        ["memories", "记忆", "在后续会话中使用实例已有的记忆。"],
-        ["multiAgent", "子智能体", "允许 Codex 调用子智能体处理任务。"],
-        ["goals", "目标模式", "为持续任务设置目标并跟踪进度。"]
+        ["todo", "任务清单（Todo）", ""],
+        ["memories", "记忆", ""],
+        ["multiAgent", "子智能体", ""],
+        ["goals", "目标模式", ""]
       ]) addSwitch(card, key, label, description, values[key]);
       content.append(element("p", "appearance-hint",
         "仅修改所选实例的原生配置，新会话或重新加载后生效。"));
       // 用户要求按 Codex 实例提供默认关闭的持久侧边开关；旧服务缺字段时禁用，不能假装已支持。
       const sides = section(content, "侧边会话");
       addSwitch(sides, "persistentSideThreads", "持久侧边会话",
-        "默认关闭。开启后新建的侧边会保留历史，可在关闭标签或服务重启后重新打开；已有侧边不转换。",
+        "仅影响新建侧边，关闭标签或重启后保留历史。",
         values.persistentSideThreads === true, typeof values.persistentSideThreads !== "boolean");
-    } else if (backend === "antigravity") {
-      // 用户要求参考 Codex / Claude 补齐 Antigravity 设置，同时明确区分 ACP 运行时边界与本地配置文件能力。
-      for (const [title, description, value] of [
-        ["执行协议", "会话执行、模型能力发现、审批与权限切换均经官方 agy acp 协议处理。", "ACP"],
-        ["默认权限", "可在「设置 → 权限」按实例配置新会话默认权限模式。", "权限页配置"],
-        ["全局自定义指令", "直接读写所选实例的 ~/.gemini/GEMINI.md。", "自定义指令页"]
-      ]) {
-        const row = element("div", "appearance-field");
-        row.append(fieldCopy(title, description), element("span", "muted", value));
-        card.append(row);
-      }
-      content.append(element("p", "appearance-hint",
-        "默认模型、默认思考深度与显示模型按所选 Antigravity 实例保存在 Elves 偏好中，新会话创建时经 ACP 自动应用。"));
-      if (record.capabilityError)
-        content.append(element("p", "appearance-hint error-text", `无法读取当前 Antigravity 实例模型目录：${record.capabilityError}`));
     } else {
       addSwitch(card, "awaySummaryEnabled", "离开期间回顾",
-        "离开后返回时自动回顾会话进展；关闭后保留已有回顾。", values.awaySummaryEnabled);
-      addSelect(card, "promptSuggestionEnabled", "输入建议", "根据会话进展提供后续输入建议。",
+        "关闭后保留已有回顾。", values.awaySummaryEnabled);
+      addSelect(card, "promptSuggestionEnabled", "输入建议", "",
         booleanOptions, boolValue(values.promptSuggestionEnabled), apiValue,
         record.capabilities?.promptSuggestions !== true);
-      addSelect(card, "autoCompactWindow", "自动压缩窗口", "达到窗口阈值时自动压缩上下文。",
-        compactOptions, values.autoCompactWindow == null ? "" : String(values.autoCompactWindow),
-        value => value === "" ? null : value === "auto" ? "auto" : Number(value),
-        record.capabilities?.autoCompactWindow !== true);
       content.append(element("p", "appearance-hint",
-        "回顾和输入建议保存在所选实例的原生配置；自动压缩窗口用于此实例后续新建的远程会话。"));
-      if (record.capabilities?.promptSuggestions !== true || record.capabilities?.autoCompactWindow !== true) {
-        const unsupported = [record.capabilities?.promptSuggestions !== true && "输入建议",
-          record.capabilities?.autoCompactWindow !== true && "自动压缩窗口"].filter(Boolean).join("、");
+        "回顾和输入建议保存在所选实例的原生配置，新会话生效。"));
+      if (record.capabilities?.promptSuggestions !== true) {
         content.append(element("p", "appearance-hint",
-          `该实例的 Claude CLI 尚未确认支持${unsupported}，对应控件暂不可用。`));
+          "该实例的 Claude CLI 尚未确认支持输入建议，对应控件暂不可用。"));
       }
       // 兼容没有额外设置返回值的旧服务；新服务在下方统一展示实际失败原因，避免漏报 doctor 校验失败。
       if (record.capabilityError && !record.extraSettings?.length)
@@ -283,49 +259,12 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     }
     content.append(element("p", "appearance-hint", "项目设置、启动参数和组织策略仍按原生优先级生效。"));
   }
-  function renderModels() {
-    const values = record.settings;
-    const card = section(content, "实例默认值");
-    const models = record.models || [];
-    const hidden = Array.isArray(values.hiddenModelIds) ? values.hiddenModelIds : [];
-    const modelControl = settingSelect("model", "默认模型",
-      [inherit,
-        ...models.filter(model => !hidden.includes(model.model))
-          .map(model => ({ value: model.model, label: model.displayName || model.model }))],
-      values.model || "", value => value === "" ? null : value);
-    const modelId = values.model || record.effectiveModel;
-    // 已配置的模型退出目录时不能借用另一个模型的能力；仍允许用户重选模型或移除失效覆盖。
-    const model = modelId ? models.find(model => model.model === modelId) : models.find(model => model.isDefault);
-    const efforts = (model?.supportedReasoningEfforts || [])
-      .filter(effort => effort.reasoningEffort !== "ultra" || values.ultraReasoningEnabled === true);
-    // 用户要求 Claude 也在会话实例设置默认思考深度；按原生模型能力列出等级，保存为同一实例的 Harness 默认值。
-    const claudeEffortUnsupported = record.backend === "claude" && record.capabilities?.defaultReasoningEffort !== true;
-    const effortControl = settingSelect("reasoningEffort", "默认思考深度",
-        [{ value: "", label: "使用模型默认" }, ...efforts.map(effort =>
-          ({ value: effort.reasoningEffort, label: effortLabels[effort.reasoningEffort] || effort.reasoningEffort }))],
-        values.reasoningEffort || "", apiValue, !model || claudeEffortUnsupported);
-    effortControl.classList.add("instance-model-default-effort");
-    // 用户要求 Codex、Claude、Antigravity 的默认模型与思考深度合为一行：模型在前、深度在后，保留各自的能力校验及保存行为。
-    const row = element("div", "appearance-field instance-model-defaults-row");
-    const selectors = element("div", "instance-model-defaults-selectors");
-    selectors.append(modelControl, effortControl);
-    row.append(fieldCopy("默认模型与思考深度", ["codex", "antigravity"].includes(record.backend)
-      ? "切换默认模型后，思考深度恢复为“使用模型默认”；可选深度由模型能力决定。"
-      : "用于此实例后续新会话；输入区已记住的有效选择优先，已有会话保持原深度。"), selectors);
-    card.append(row);
-    if (claudeEffortUnsupported) content.append(element("p", "appearance-hint",
-      "所选实例的 Claude CLI 尚未确认提供 --effort，默认思考深度暂不可修改。"));
-    if (!model) content.append(element("p", "appearance-hint",
-      "当前模型未出现在实例目录中，请选择可用模型或选择“使用原生默认”。"));
-    // 实例默认值与输入区记住的选择是不同来源；明确既有优先级，不能把此处描述为覆盖全部新会话选择。
-    content.append(element("p", "appearance-hint",
-      "新会话优先使用输入区已记住且仍可用的模型与思考深度，没有可用选择时使用实例默认值。已有会话保留各自设置。"));
-  }
+  // 用户要求移除设置页「实例默认值」：新会话模型与思考深度由新建页输入区按实例自动记住并跨端共享，未记忆时沿用引擎原生默认。
   function renderCodexReasoning() {
     if (record.backend !== "codex") return;
     const reasoning = section(content, "思考深度");
     addSwitch(reasoning, "ultraReasoningEnabled", "开放 Ultra 思考深度",
-      "默认关闭；开启后，仅在支持的 Codex 模型中显示 Ultra。", record.settings.ultraReasoningEnabled);
+      "仅支持的模型可见。", record.settings.ultraReasoningEnabled);
   }
   function currentHiddenModelIds() {
     return pendingHidden ?? (Array.isArray(record?.settings?.hiddenModelIds) ? record.settings.hiddenModelIds : []);
@@ -406,14 +345,14 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     ];
   }
   function renderModelVisibility() {
-    // 用户要求所有会话实例统一提供「显示模型」且使用多选菜单；与实例默认值保持同一排布，避免长列表占满页面。
+    // 用户要求所有会话实例统一提供「显示模型」且使用多选菜单，避免长列表占满页面；
+    // 手机端（<=760px）与数值/手动压缩模型行一致改为纵向排列，防止 240px 触发器将左侧文案挤成单字竖排。
     if (!Array.isArray(record.settings.hiddenModelIds)) return;
     const models = record.models || [];
     const card = section(content, "显示模型");
     syncModelVisibilityTrigger();
-    const row = element("div", "appearance-field");
-    row.append(fieldCopy("可选模型",
-      "默认显示全部；取消勾选后，仅从此实例的模型选择列表隐藏。新增模型自动显示，已有会话保留当前模型。"), visibilityTrigger);
+    const row = element("div", "appearance-field instance-model-visibility-row");
+    row.append(fieldCopy("可选模型", "仅隐藏选择列表，已有会话保留当前模型。"), visibilityTrigger);
     controls.add(visibilityTrigger);
     card.append(row);
     if (!models.length) content.append(element("p", "appearance-hint",
@@ -539,11 +478,16 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     promptControls.add(control); card.append(row);
   }
   function renderExtraSettings() {
-    const rows = record.extraSettings || [];
+    const options = arguments[0] || {};
+    const allRows = record.extraSettings || [];
+    if (!allRows.length) return;
+    const rows = allRows.filter(option =>
+      (options.onlyGroup ? option.group === options.onlyGroup : true)
+      && (options.excludeGroup ? option.group !== options.excludeGroup : true));
+    if (options.showCapabilityError !== false && record.capabilityError)
+      content.append(element("p", "appearance-hint", `部分原生设置能力核对失败：${record.capabilityError}`));
     if (!rows.length) return;
     const groups = new Map();
-    if (record.capabilityError)
-      content.append(element("p", "appearance-hint", `部分原生设置能力核对失败：${record.capabilityError}`));
     for (const option of rows) {
       if (!groups.has(option.group)) groups.set(option.group, section(content, option.group));
       const card = groups.get(option.group), value = record.settings[option.id];
@@ -553,7 +497,11 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
         const label = option.options?.find(choice => choice.value === value)?.label;
         const configured = label || (option.id.startsWith("nativeModelEffort:") ? effortLabels[value] : "") || String(value);
         // 诊断项只说明文件中的值；不能把已移除或未确认的原生能力显示成“已开启”。
-        const text = option.id === "compactionModel" ? configured
+        // 用户要求所有实例均展示压缩提示词，不支持时右侧改为纯文字“不支持”，不渲染设置按钮。
+        const text = option.id === "compactionModel"
+          ? (option.enabledKey && record.settings[option.enabledKey] === false ? "已关闭" : configured)
+          : option.cliPreview ? option.cliPreview
+          : option.id === "compactionPrompt" ? "不支持"
           : option.valueInvalid ? "配置值无效" : value == null ? "使用原生默认" : `配置值：${configured}`;
         row.append(fieldCopy(option.label, option.readOnlyReason || option.description),
           element("span", "muted", text));
@@ -561,18 +509,90 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
       }
       if (option.kind === "boolean") {
         addSelect(card, option.id, option.label, option.description, booleanOptions, boolValue(value));
+      } else if (option.kind === "enum" && option.modeKey && Array.isArray(option.modeOptions)) {
+        // 用户要求「手动压缩模型」增加独立开关（默认关闭，避免默认就生效）：
+        // 关闭时禁用模型与策略选择并保留已选配置；开启后右侧按 [模型 Select] [策略菜单按钮] [开关] 排列（手机端开关置于首行右侧）。
+        const row = element("div", "appearance-field instance-setting-compaction-model-row");
+        const enabledKey = option.enabledKey || "";
+        const enabled = enabledKey ? record.settings[enabledKey] === true : true;
+        const modeKey = option.modeKey;
+        const modeValue = record.settings[modeKey] ?? option.modeValue ?? option.modeOptions[0]?.value ?? "";
+        const currentMode = option.modeOptions.find(choice => choice.value === modeValue) || option.modeOptions[0];
+        const owner = record, ownerId = selected;
+        let toggle = null;
+        if (enabledKey) {
+          toggle = switchControl(`启用${option.label}`, enabled);
+          toggle.id = `settings-${name}-${enabledKey}`;
+          toggle.classList.add("instance-setting-compaction-model-switch");
+          toggle.onchange = () => {
+            if (record === owner && selected === ownerId && toggle.isConnected)
+              void save({ [enabledKey]: toggle.checked });
+          };
+          controls.add(toggle);
+        }
+        const modeTrigger = button("", `${option.label}使用策略`, () => togglePopup(modeTrigger),
+          "select-trigger instance-setting-mode-trigger");
+        modeTrigger.id = `settings-${name}-${modeKey}`;
+        modeTrigger.settingsUnsupported = !enabled;
+        modeTrigger.setAttribute("aria-haspopup", "menu");
+        modeTrigger.setAttribute("aria-expanded", "false");
+        modeTrigger.setAttribute("aria-description", `当前策略：${currentMode?.label || ""}`);
+        modeTrigger.title = `${option.label}策略：${currentMode?.label || ""}${currentMode?.description ? ` · ${currentMode.description}` : ""}`;
+        modeTrigger.replaceChildren(element("span", "select-label", currentMode?.label || "选择策略"), icon("chevron"));
+        modeTrigger.menuOptions = option.modeOptions.map(choice => ({
+          value: choice.value,
+          label: choice.label,
+          description: choice.description || "",
+          checkable: true,
+          selected: choice.value === modeValue,
+          action: () => {
+            if (record !== owner || selected !== ownerId || !modeTrigger.isConnected) return;
+            if (choice.value !== modeValue) void save({ [modeKey]: choice.value });
+          }
+        }));
+        modeTrigger.onkeydown = event => {
+          if (modeTrigger.disabled || event.isComposing) return;
+          if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+            event.preventDefault();
+            openPopup(modeTrigger, { edge: event.key === "Home" ? "first" : event.key === "End" ? "last" : null, focusSearch: false });
+          }
+        };
+        const modelOptions = option.options.length ? option.options : [{ value: "session", label: "跟随会话模型" }];
+        const modelValue = value || "session";
+        // 选择「跟随会话模型」提交 "session"，与服务端返回的 settings.compactionModel 一致（服务端落盘时仍移除偏好键，不改动策略）。
+        const modelSelect = settingSelect(
+          option.id,
+          option.label,
+          modelOptions,
+          modelValue,
+          next => next,
+          !enabled
+        );
+        modelSelect.classList.add("instance-setting-compaction-model-select");
+        modelSelect.searchMode = "auto";
+        modelSelect.selectSearchLabel = "搜索手动压缩模型";
+        modelSelect.selectSearchPlaceholder = "搜索手动压缩模型";
+        controls.add(modeTrigger);
+        const box = element("span", "instance-setting-compaction-model-control");
+        box.append(modelSelect, modeTrigger);
+        if (toggle) row.append(fieldCopy(option.label, option.description), box, toggle);
+        else row.append(fieldCopy(option.label, option.description), box);
+        card.append(row);
       } else if (option.kind === "enum") {
         addSelect(card, option.id, option.label, option.description,
           [inherit, ...option.options], value || "", value => value || null);
       } else if (option.kind === "text") {
         addPromptSetting(card, option, value);
       } else if (option.kind === "integer") {
-        const row = element("label", "appearance-field");
+        // 用户要求自动压缩阈值三端统一用百分比输入（50～98%），右侧紧邻输入框展示对应数值与未设置默认值。
+        const unit = option.unit || "";
+        const hasMeta = Boolean(option.cliPreview || unit);
+        const row = element("label", hasMeta ? "appearance-field instance-setting-number-row" : "appearance-field");
         const input = element("input");
         input.type = "number"; input.step = "1";
         input.id = `settings-${name}-${option.id}`; input.setAttribute("aria-label", option.label);
         input.min = String(option.min); input.max = String(option.max);
-        input.placeholder = "使用原生默认"; input.value = value == null ? "" : String(value);
+        input.placeholder = option.defaultLabel || "使用原生默认"; input.value = value == null ? "" : String(value);
         const owner = record, ownerId = selected;
         input.onchange = () => {
           // 数字控件失焦可能晚于切换实例或重新读取；旧控件不能借用新目标及新版本保存。
@@ -581,15 +601,33 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
           if (input.validity?.badInput || raw !== "" && (!Number.isSafeInteger(next) || next < option.min || next > option.max)) {
             input.value = value == null ? "" : String(value);
             input.setAttribute("aria-invalid", "true");
-            message = `${option.label}需要填写 ${option.min}～${option.max} 的整数，或留空使用原生默认。`;
+            const unitSuffix = unit ? (unit === "%" ? unit : ` ${unit}`) : "";
+            message = `${option.label}需要填写 ${option.min}～${option.max}${unitSuffix} 的整数，或留空使用原生默认。`;
             sync(); return;
           }
           if (next !== value) void save({ [option.id]: next });
         };
         input.oninput = () => input.removeAttribute("aria-invalid");
         input.onkeydown = event => { if (event.key === "Enter") { event.preventDefault(); input.blur(); } };
-        // 与现有数字设置共用容器：PC 输入宽 100px、手机 82px，保持同一行且说明按剩余宽度换行。
-        const box = element("span", "appearance-number"); box.append(input);
+        // 与现有数字设置共用容器；带对应 CLI 数值预览或单位时在右侧并排展示，窄屏自动折行避免挤占说明列。
+        const box = element("span", option.cliPreview || unit
+          ? "appearance-number instance-setting-number-control"
+          : "appearance-number");
+        if (option.cliPreview) {
+          const preview = element("span", "instance-setting-cli-value", option.cliPreview);
+          preview.title = option.cliPreview;
+          box.append(preview);
+        }
+        if (unit) {
+          // 大整数单位（如 TK）保持 100px/82px 宽度，百分比沿用 76px/68px 紧凑宽度。
+          const wrap = element("span", option.max > 999
+            ? "instance-setting-unit-input is-wide"
+            : "instance-setting-unit-input");
+          wrap.append(input, element("span", "instance-setting-unit", unit));
+          box.append(wrap);
+        } else {
+          box.append(input);
+        }
         row.append(fieldCopy(option.label, option.description), box);
         controls.add(input); card.append(row);
       }
@@ -600,19 +638,18 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     if (record) {
       if (name === "general") {
         // 合并页面只读取当前实例的一份设置；旧服务未返回模型目录时仍可显示已有常规配置。
-        // 所有实例统一按「实例默认值 → 显示模型」排列，保持切换实例时的布局一致。
-        if (Array.isArray(record.models)) renderModels();
+        // 用户要求按「显示模型 → 缓存与压缩」排列，其余扩展分组继续留在常规设置下方。
         renderModelVisibility();
+        renderExtraSettings({ onlyGroup: "缓存与压缩", showCapabilityError: false });
         if (Array.isArray(record.models)) renderCodexReasoning();
         renderGeneral();
       }
       else if (name === "models") {
-        renderModels();
         renderModelVisibility();
         renderCodexReasoning();
       }
       else renderInventory();
-      renderExtraSettings();
+      renderExtraSettings(name === "general" ? { excludeGroup: "缓存与压缩" } : {});
       if (record.readOnly || session?.readOnly) message ||= record.readOnlyReason || "当前为只读访问";
     }
     sync();
@@ -640,6 +677,16 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
           || typeof option.group !== "string" || typeof option.description !== "string"
           || typeof option.readOnly !== "boolean" || !Object.hasOwn(values, option.id)
           || option.valueInvalid != null && typeof option.valueInvalid !== "boolean"
+          || option.unit != null && typeof option.unit !== "string"
+          || option.cliPreview != null && typeof option.cliPreview !== "string"
+          || option.defaultLabel != null && typeof option.defaultLabel !== "string"
+          || option.enabledKey != null && (typeof option.enabledKey !== "string" || !option.enabledKey
+            || !Object.hasOwn(values, option.enabledKey) || typeof values[option.enabledKey] !== "boolean")
+          || option.modeKey != null && (typeof option.modeKey !== "string" || !option.modeKey
+            || !Object.hasOwn(values, option.modeKey)
+            || !Array.isArray(option.modeOptions) || !option.modeOptions.length
+            || option.modeOptions.some(choice => !choice || typeof choice.value !== "string" || typeof choice.label !== "string")
+            || !option.modeOptions.some(choice => choice.value === values[option.modeKey]))
           || !["boolean", "integer", "integerString", "enum", "text"].includes(option.kind)
           || !Array.isArray(option.options) || option.options.some(choice =>
             !choice || typeof choice.value !== "string" || typeof choice.label !== "string")
@@ -667,11 +714,6 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
       if (result.backend === "codex" && Object.hasOwn(values, "persistentSideThreads")
           && typeof values.persistentSideThreads !== "boolean")
         throw new Error("持久侧边开关字段无效，请重新读取。");
-      if (result.backend === "claude" && (!Object.hasOwn(values, "autoCompactWindow")
-          || values.autoCompactWindow !== null && values.autoCompactWindow !== "auto"
-            && !(Number.isInteger(values.autoCompactWindow) && values.autoCompactWindow >= 100000
-              && values.autoCompactWindow <= 1000000)))
-        throw new Error("实例常规设置字段不完整，请重新读取。");
     }
     if (name === "models" || name === "general" && result.models != null) {
       if (!Array.isArray(result.models) || result.models.some(model => !model || typeof model.model !== "string"
@@ -679,9 +721,6 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
             || model.displayName != null && typeof model.displayName !== "string"
             || model.supportedReasoningEfforts != null && (!Array.isArray(model.supportedReasoningEfforts)
               || model.supportedReasoningEfforts.some(effort => !effort || typeof effort.reasoningEffort !== "string")))
-          || ["model", "reasoningEffort"].some(key => !Object.hasOwn(values, key)
-            || values[key] !== null && typeof values[key] !== "string")
-          || result.effectiveModel != null && typeof result.effectiveModel !== "string"
           || result.backend === "codex" && typeof values.ultraReasoningEnabled !== "boolean")
         throw new Error("实例模型设置字段不完整，请重新读取。");
     } else if (name !== "general" && (!result.inventory || !Array.isArray(result.inventory.data)
@@ -774,7 +813,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
       for (const [key, value] of Object.entries(settings)) {
         const actual = key === "enabled" ? record.inventory?.enabled
           : ["skill", "server", "hook"].includes(key) ? record.inventory?.data?.find(row => row.id === value.id)?.enabled
-            : record.settings[key === "effortLevel" ? "reasoningEffort" : key];
+            : record.settings[key];
         if (key === "hiddenModelIds" ? JSON.stringify(actual) !== JSON.stringify(value)
           : actual !== (["skill", "server", "hook"].includes(key) ? value.enabled : value))
           throw new Error("保存结果与所选设置不一致，请重新读取核对。");
@@ -784,7 +823,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
         needsRead = true; externalRefresh = true;
       }
       if (name === "models" || name === "general"
-          && ["model", "reasoningEffort", "ultraReasoningEnabled", "defaultServiceTier", "hiddenModelIds"]
+          && ["ultraReasoningEnabled", "defaultServiceTier", "hiddenModelIds"]
             .some(key => Object.hasOwn(settings, key))) {
         // 已确认的配置变更即使设置窗口已关闭也须失效缓存；其他实例的旧磁盘目录同样不能在下次启动恢复。
         const removed = readCache.remove(scope, "models", id === "codex:local" ? "global" : id).catch(() => {});
@@ -815,7 +854,11 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
       }
       if (alive()) message = Object.hasOwn(settings, "hiddenModelIds")
         ? "模型显示设置已保存，已有会话继续使用当前模型。"
-        : "已保存，新会话或重新加载后生效。";
+        : Object.hasOwn(settings, "compactionModelEnabled")
+            || Object.hasOwn(settings, "compactionModel")
+            || Object.hasOwn(settings, "compactionModelMode")
+          ? "已保存，下次手动压缩时生效。"
+          : "已保存，新会话或重新加载后生效。";
       return "";
     } catch (error) {
       queuedHidden = null;
@@ -837,7 +880,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
   }
   async function show(force = false) {
     if (!alive() || saving) return;
-    if (activePopup?.trigger === visibilityTrigger) closePopup();
+    if (activePopup?.trigger && (activePopup.trigger === visibilityTrigger || controls.has(activePopup.trigger))) closePopup();
     pendingHidden = null; queuedHidden = null;
     // 重新检测开始即撤销旧读取和写入口；迟到的旧回包不能盖掉“实例不可用”，也不能恢复旧控件。
     const version = retireRead();
@@ -880,7 +923,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
   }
   instances.onchange = () => {
     if (!alive() || saving || detecting) { sync(); return; }
-    if (activePopup?.trigger === visibilityTrigger) closePopup();
+    if (activePopup?.trigger && (activePopup.trigger === visibilityTrigger || controls.has(activePopup.trigger))) closePopup();
     pendingHidden = null; queuedHidden = null;
     selected = instances.value; setSelectedInstance(selected); void read();
   };
@@ -904,7 +947,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     dispose() {
       disposed = true;
       pendingHidden = null; queuedHidden = null;
-      if (activePopup?.trigger === visibilityTrigger) closePopup();
+      if (activePopup?.trigger && (activePopup.trigger === visibilityTrigger || controls.has(activePopup.trigger))) closePopup();
       promptEditor?.close(); retireRead(); unsubscribe();
     }
   };

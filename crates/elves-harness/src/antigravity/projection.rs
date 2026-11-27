@@ -211,7 +211,7 @@ pub(crate) fn normalize_models_from_setup(setup: &Value) -> Value {
         "permissionModes": permission_modes,
         "nativeCapabilities": {
             "goal": true,
-            "compact": false
+            "compact": true
         }
     })
 }

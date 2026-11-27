@@ -38,6 +38,8 @@ pub(super) struct Projection {
     pub active: HashMap<String, String>,
     pub queue_turn_outcomes: HashMap<String, Value>,
     pub compactions: HashMap<String, Value>,
+    /// 手动压缩临时切换到独立压缩模型时，记录本次压缩使用的显式模型名供事件卡片展示。
+    pub pending_compaction_models: HashMap<String, String>,
     // 每个主会话仅保留当前轮次的首个原生模型输出时间；服务重启或旧历史缺失时不估算。
     first_token_observations: HashMap<String, (String, Option<u64>)>,
     compaction_records: VecDeque<CompactionRecord>,
@@ -70,6 +72,7 @@ impl Default for Projection {
             active: HashMap::new(),
             queue_turn_outcomes: HashMap::new(),
             compactions: HashMap::new(),
+            pending_compaction_models: HashMap::new(),
             first_token_observations: HashMap::new(),
             compaction_records: VecDeque::new(),
             plans: HashMap::new(),
@@ -412,6 +415,15 @@ impl Projection {
             }
         }
         item["completed"] = json!(completed || item["completed"] == true);
+        if item["compactionModel"].is_null()
+            && item["model"].is_null()
+            && let Some(model) = self.pending_compaction_models.get(id)
+        {
+            item["compactionModel"] = json!(model);
+        }
+        if item["completed"] == true {
+            self.pending_compaction_models.remove(id);
+        }
         // 缺少原生开始时间时只用收帧时间给正文定位，不能把定位回退传成 Token hover 的实测起点。
         let position_at_ms = item["startedAtMs"]
             .as_u64()

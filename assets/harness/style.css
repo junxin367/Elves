@@ -2045,6 +2045,21 @@ body{font-weight:var(--ui-font-weight,400)}
 .appearance-number{display:inline-flex;align-items:center;gap:6px;flex-shrink:0}
 .appearance-number>input{width:100px;padding:7px 9px}
 .appearance-number>input[aria-invalid=true]{border-color:var(--danger)}
+/* 用户要求缓存与压缩数值项（上下文大小、自动压缩阈值）右侧并排展示“对应 CLI 实际数值 + 输入框”；PC 单行靠右对齐，手机折行避免挤压说明。 */
+.instance-setting-number-control{gap:10px;max-width:65%;min-width:0;justify-content:flex-end}
+.instance-setting-number-control>input{text-align:right;font-variant-numeric:tabular-nums}
+.instance-setting-cli-value{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:.85714rem;font-variant-numeric:tabular-nums}
+.instance-setting-unit-input{display:inline-flex;align-items:center;gap:5px;flex-shrink:0}
+.instance-setting-unit-input>input{width:76px;padding:7px 9px;text-align:right;font-variant-numeric:tabular-nums}
+.instance-setting-unit-input.is-wide>input{width:100px}
+.instance-setting-unit-input>input[aria-invalid=true]{border-color:var(--danger)}
+.instance-setting-unit{color:var(--muted);font-size:.92857rem;flex-shrink:0}
+/* 用户要求「手动压缩模型」增加独立开关（默认关闭）并与 [模型 Select] [策略菜单按钮] 同行排列；PC 靠右齐排，手机首行标题+开关、次行占满。 */
+.instance-setting-compaction-model-row>.appearance-field-copy{flex:1 1 auto;min-width:0}
+.instance-setting-compaction-model-control{display:inline-flex;align-items:center;justify-content:flex-end;gap:8px;max-width:65%;min-width:0;flex-shrink:0}
+.instance-setting-compaction-model-switch{flex-shrink:0}
+.appearance-screen .select-trigger.instance-setting-mode-trigger{width:auto;min-width:max-content;max-width:none;flex-shrink:0}
+.appearance-screen .select-trigger.instance-setting-compaction-model-select{width:var(--settings-model-width);min-width:120px;max-width:100%;flex:0 1 var(--settings-model-width)}
 .appearance-theme-button{display:inline-flex;align-items:center;justify-content:center;width:auto;gap:5px;padding:0 6px;font-size:.85714rem}
 .appearance-font-family{width:max-content;min-width:min(140px,100%);max-width:100%;padding:5px 10px;border-radius:999px}
 .appearance-section-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:24px}
@@ -2214,12 +2229,6 @@ body{font-weight:var(--ui-font-weight,400)}
 .instance-settings-inventory-empty{margin:0;padding:16px;border-top:1px solid var(--line);text-align:center}
 .instance-settings-status:empty{display:none}
 .instance-settings-actions{justify-content:flex-end;margin-top:12px}
-/* 用户要求 Codex、Claude 默认模型在前、思考深度在后并保持两个 Select 同排。
- * 模型 Select 固定 240px，思考深度按内容保留空间；组合沿用 480px / 65% 上限并靠卡片右侧对齐，760px 及以下说明上移。 */
-.instance-model-defaults-selectors{display:flex;align-items:center;justify-content:flex-end;flex-wrap:nowrap;gap:8px;flex:0 1 480px;min-width:0;max-width:65%}
-.instance-settings-content .instance-model-defaults-selectors>.select-trigger:not(.instance-model-default-effort){flex:0 1 var(--settings-model-width);max-width:100%;min-width:0}
-.instance-settings-content .instance-model-defaults-selectors>.instance-model-default-effort{flex:0 1 auto;width:max-content;max-width:50%}
-.instance-model-defaults-selectors .select-label{flex:1;text-align:left}
 /* 用户要求命名实例与模型保持同排，左侧实例、右侧关联模型；长名称省略，不把模型挤到下一行。
  * PC 的组合宽度最多占当前卡片 65% 并靠右对齐；760px 及以下说明移至上方，两个选择器共同使用整行宽度。 */
 .conversation-naming-target-selectors{display:flex;align-items:center;justify-content:flex-end;flex-wrap:nowrap;gap:8px;flex:0 1 480px;min-width:0;max-width:65%}
@@ -2232,12 +2241,13 @@ body{font-weight:var(--ui-font-weight,400)}
  .instance-settings-target .select-trigger,.instance-settings-content .select-trigger{max-width:58%;flex-shrink:0}
  .instance-settings-target .appearance-field>.appearance-field-copy,.instance-settings-content .appearance-field>.appearance-field-copy{flex:1 1 0;overflow-wrap:anywhere}
  .instance-settings-target .appearance-notification-switch,.instance-settings-content .appearance-notification-switch{flex-shrink:0}
- .instance-settings-content .appearance-card .instance-model-defaults-row{flex-direction:column;align-items:stretch;gap:10px}
- .instance-settings-content .instance-model-defaults-row>.appearance-field-copy{flex:none}
- .instance-settings-content .appearance-card .instance-model-defaults-row>.instance-model-defaults-selectors{flex:none;width:100%;max-width:100%}
  .instance-settings-content .appearance-card .conversation-naming-target-row{flex-direction:column;align-items:stretch;gap:10px}
  .instance-settings-content .conversation-naming-target-row>.appearance-field-copy{flex:none}
  .instance-settings-content .appearance-card .conversation-naming-target-row>.conversation-naming-target-selectors{flex:none;width:100%;max-width:100%}
+ .instance-settings-content .appearance-card .instance-setting-number-row{flex-direction:column;align-items:stretch;gap:8px}
+ .instance-settings-content .instance-setting-number-row>.appearance-field-copy{flex:none}
+ .instance-settings-content .instance-setting-number-row>.instance-setting-number-control{flex:none;max-width:100%;justify-content:space-between;flex-wrap:wrap;gap:6px 10px}
+ .instance-setting-cli-value{white-space:normal;overflow-wrap:anywhere}
  .shortcut-setting-row{align-items:flex-start}
  .shortcut-setting-row>kbd{max-width:60%}
 }
@@ -2294,6 +2304,8 @@ body{font-weight:var(--ui-font-weight,400)}
   width:var(--settings-input-width,100px)
 }
 .appearance-screen input[type=number][placeholder]{--settings-input-width:160px}
+.appearance-screen .instance-setting-number-control .instance-setting-unit-input>input{width:76px}
+.appearance-screen .instance-setting-number-control .instance-setting-unit-input.is-wide>input{width:100px}
 .appearance-screen .select-trigger{
   display:inline-flex;justify-content:space-between;gap:var(--settings-select-gap);
   width:var(--settings-select-width,120px);flex-shrink:1
@@ -2307,8 +2319,7 @@ body{font-weight:var(--ui-font-weight,400)}
 .appearance-screen .appearance-font-family{width:120px}
 .appearance-screen .select-trigger:where(#appearance-preset){width:140px}
 .appearance-screen .select-trigger:where(#conversation-naming-model),
-.appearance-screen .select-trigger.instance-model-visibility-trigger,
-.appearance-screen .instance-model-defaults-selectors>.select-trigger:not(.instance-model-default-effort){
+.appearance-screen .select-trigger.instance-model-visibility-trigger{
   width:var(--settings-model-width)
 }
 /* 用户要求「显示模型」改用多选菜单，触发器复用模型宽度（240px）与左对齐摘要，避免长开关列表占用页面。 */
@@ -2319,7 +2330,6 @@ body{font-weight:var(--ui-font-weight,400)}
 .appearance-screen .conversation-naming-target-selectors>#conversation-naming-model{
   flex:0 1 var(--settings-model-width);width:var(--settings-model-width)
 }
-.appearance-screen .instance-model-default-effort{width:var(--settings-effort-width)}
 .appearance-screen .instance-settings-target .select-trigger,
 .appearance-screen .select-trigger:where(#permission-instance,#instruction-instance,#conversation-naming-instance,#claude-recap-instance){
   width:var(--settings-instance-width)
@@ -2361,6 +2371,36 @@ body{font-weight:var(--ui-font-weight,400)}
   }
   .appearance-screen input[type=number]:not([placeholder]){--settings-input-width:80px}
   .appearance-screen input[type=number][placeholder]{--settings-input-width:120px}
+  /* 手机端（<=760px）须置于设置页通用 240px/200px/160px 控件宽度规则之后，避免被后置通用规则覆盖：
+   * 「显示模型」改为说明在上、多选触发器占满整行宽度；行内普通 Select 维持 58% 上限；带单位数字输入框保持 68px/82px。 */
+  .appearance-screen .instance-settings-content .appearance-card .instance-model-visibility-row{
+    flex-direction:column;align-items:stretch;gap:8px
+  }
+  .appearance-screen .instance-settings-content .instance-model-visibility-row>.appearance-field-copy{flex:none}
+  .appearance-screen .instance-settings-content .select-trigger.instance-model-visibility-trigger{
+    width:100%;max-width:100%
+  }
+  .appearance-screen .instance-settings-content .appearance-card .instance-setting-compaction-model-row{
+    display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:8px 12px
+  }
+  .appearance-screen .instance-settings-content .instance-setting-compaction-model-row>.appearance-field-copy{
+    grid-column:1;grid-row:1;flex:none
+  }
+  .appearance-screen .instance-settings-content .instance-setting-compaction-model-row>.instance-setting-compaction-model-switch{
+    grid-column:2;grid-row:1;justify-self:end
+  }
+  .appearance-screen .instance-settings-content .instance-setting-compaction-model-row>.instance-setting-compaction-model-control{
+    grid-column:1 / -1;grid-row:2;width:100%;max-width:100%;justify-content:flex-start
+  }
+  .appearance-screen .instance-settings-content .instance-setting-compaction-model-control>.instance-setting-compaction-model-select{
+    flex:1 1 0;width:auto;max-width:none;min-width:0
+  }
+  .appearance-screen .instance-settings-target .appearance-field>.select-trigger,
+  .appearance-screen .instance-settings-content .appearance-field:not(.instance-model-visibility-row)>.select-trigger{
+    max-width:58%;flex-shrink:1
+  }
+  .appearance-screen .instance-setting-number-control .instance-setting-unit-input>input{width:68px}
+  .appearance-screen .instance-setting-number-control .instance-setting-unit-input.is-wide>input{width:82px}
 }
 .appearance-screen{--settings-control-active:color-mix(in srgb,var(--composer-hover),var(--text) 6%)}
 

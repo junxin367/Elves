@@ -53,7 +53,7 @@ import { activeInstanceId } from "../session/instances.js";
 import { cacheDisplayData, currentThreadDisplay, optionalCachedRead, readScope } from "../session/thread-cache.js";
 
 export function compactCommandAvailable() {
-  if (isAntigravity()) return false;
+  if (isAntigravity() && thread?.capabilities?.compact === false) return false;
   if (isClaude() && !claudeCommandSupported("compact")) return false;
   return !!session && !creating && !!selectedId && thread?.id === selectedId && !threadReadOnly() && connected
     && !busy && !stopping && !pending && !editingMessage && !editingQueuedMessage && !compactionLocked(selectedId);
@@ -72,7 +72,9 @@ export function slashMenuEntries(query = slashQuery()) {
   if (!isClaude() && !isAntigravity() || nativeSkillPosition) entries.push(...skillChoices.filter(skill => !selectedSkills.some(item => skillIdentity(item) === skillIdentity(skill))
     && [skill.name, skill.displayName, skill.description].some(value => String(value).toLowerCase().includes(query.query)))
     .map(skill => ({ type: "skill", enabled: true, skill })));
-  if (compactCommandMatches(query.query) && !isAntigravity() && (!isClaude() || claudeCommandSupported("compact")))
+  if (compactCommandMatches(query.query)
+      && (!isAntigravity() || thread?.capabilities?.compact !== false)
+      && (!isClaude() || claudeCommandSupported("compact")))
     entries.push({ type: "compact", enabled: compactCommandAvailable() });
   // 用户要求分支紧接“压缩”并与回复菜单同名；保留旧搜索词，不支持的会话不显示禁用占位。
   if (threadForkAllowed() && ["fork", "分支到新聊天", "在新聊天中分支"].some(value => value.includes(query.query)))

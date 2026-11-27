@@ -104,13 +104,15 @@ pub(crate) struct AcpChannels {
 
 impl AcpClient {
     /// 启动指定本机或 WSL 环境中的 `agy acp` 进程；恢复桌面 App/IDE 历史会话时可传官方 `--app-data-dir` 参数，
-    /// 选择“无限制模式”时传递官方 `--dangerously-skip-permissions` 参数。
+    /// 选择“无限制模式”时传递官方 `--dangerously-skip-permissions` 参数，
+    /// 配置自动压缩阈值百分比时通过官方 `AGY_CLI_AUTO_COMPACT_OVERRIDE` 环境变量传入（需 agy >= 1.5.15）。
     pub(crate) async fn spawn(
         config: &EnvConfig,
         cwd: &str,
         linux_cwd: &str,
         app_data_dir: Option<&str>,
         dangerously_skip_permissions: bool,
+        auto_compact_override: Option<&str>,
     ) -> anyhow::Result<(Arc<Self>, AcpChannels)> {
         config.validate()?;
         let verified_data_dir = app_data_dir.filter(|dir| super::local_store::valid_app_data_dir(dir));
@@ -122,6 +124,9 @@ impl AcpClient {
             }
             if let Some(dir) = verified_data_dir {
                 cmd.args(["--app-data-dir", dir]);
+            }
+            if let Some(value) = auto_compact_override {
+                cmd.env("AGY_CLI_AUTO_COMPACT_OVERRIDE", value);
             }
             if !cwd.is_empty() && Path::new(cwd).is_dir() {
                 cmd.current_dir(cwd);
@@ -141,6 +146,9 @@ impl AcpClient {
             }
             // 用户与系统时区及 PATH 须来自目标 WSL 登录环境，避免绕过 /etc/profile。
             cmd.args(["--exec", "/bin/bash", "-lc", "exec \"$@\"", "--"]);
+            if let Some(value) = auto_compact_override {
+                cmd.args(["env", &format!("AGY_CLI_AUTO_COMPACT_OVERRIDE={value}")]);
+            }
             cmd.arg(&config.executable);
             cmd.arg("acp");
             if dangerously_skip_permissions {

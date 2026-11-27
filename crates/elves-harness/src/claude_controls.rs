@@ -207,6 +207,108 @@ impl Claude {
             .await
     }
 
+    /// 压缩终态或下次操作前，将临时切往独立压缩模型的会话自动切回原模型及思考深度。
+    pub(super) async fn restore_compaction_model_if_needed(
+        &self,
+        c: &mut Conversation,
+        process: &Process,
+        authorization: Option<&HarnessAuthorization>,
+    ) -> anyhow::Result<()> {
+        let Some(restore) = c.compaction_model_restore.clone() else {
+            return Ok(());
+        };
+        if c.active()
+            || matches!(
+                c.native_control["compaction"]["state"].as_str(),
+                Some("pending" | "running")
+            )
+            || c.remote_queue.is_awaiting_compaction()
+        {
+            return Ok(());
+        }
+        if !restore.original_model.is_empty() {
+            let before = setting_change_id(&c.native_control["settings"]["changes"]["model"]);
+            let applied = process
+                .control(
+                    json!({"subtype":"set_model","model":restore.original_model}),
+                    authorization,
+                )
+                .await?;
+            if process.shared && applied["nativeSettings"].is_object() {
+                c.native_control["settings"] = applied["nativeSettings"].clone();
+            }
+            let _ = self.wait_for_setting_switch(&c.id, "model", &before).await;
+        }
+        let effort_value = if restore.original_effort.is_empty() {
+            Value::Null
+        } else {
+            json!(restore.original_effort)
+        };
+        let _ = process
+            .control(
+                json!({"subtype":"apply_flag_settings","settings":{"effortLevel": effort_value}}),
+                authorization,
+            )
+            .await;
+        c.compaction_model_restore = None;
+        if !restore.original_model.is_empty() {
+            c.model = restore.original_model.clone();
+        }
+        c.effort = restore.original_effort.clone();
+        let id = c.id.clone();
+        let restored_model = c.model.clone();
+        let restored_effort = c.effort.clone();
+        self.change(|saved| {
+            if let Some(current) = saved.conversations.get_mut(&id) {
+                current.compaction_model_restore = None;
+                current.model = restored_model;
+                current.effort = restored_effort;
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(())
+    }
+
+    pub(super) async fn restore_compaction_model_background(self: &Arc<Self>, id: &str) {
+        if !self.accepting() {
+            return;
+        }
+        let _lifecycle = self.lifecycle_gate.read().await;
+        if !self.accepting() {
+            return;
+        }
+        let lock = self.lock(id).await;
+        let Ok(_guard) = lock.try_lock() else {
+            return;
+        };
+        let Ok(mut c) = self.conversation(id).await else {
+            return;
+        };
+        if c.compaction_model_restore.is_none() {
+            return;
+        }
+        let Some(process) = self
+            .processes
+            .lock()
+            .await
+            .get(id)
+            .filter(|p| p.channel.live.load(Ordering::Acquire))
+            .cloned()
+        else {
+            return;
+        };
+        if let Err(failure) = self
+            .restore_compaction_model_if_needed(&mut c, &process, None)
+            .await
+        {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "remote_access.claude_compaction_model_restore_failed",
+                json!({"threadId": id, "error": format!("{failure:#}")}),
+            );
+        }
+    }
+
     pub(super) async fn execute_native_command(
         &self,
         c: &mut Conversation,
@@ -220,17 +322,9 @@ impl Claude {
         if let Some(mode) = payload["permissionMode"].as_str() {
             c.permission_mode = Some(mode.to_owned());
         }
-        // 用户要求压缩提示词按实例发起；只传给同一 WSL 原生 /compact，不改代理或正常会话系统提示词。
-        let compaction_prompt = if action == "compact" {
-            crate::instance_settings::claude_compaction_prompt(
-                &self.directory,
-                &c.config.instance_id(),
-            )?
-        } else {
-            String::new()
-        };
         let (name, argument) = match action {
-            "compact" => ("compact", compaction_prompt.as_str()),
+            // 用户要求 Claude 压缩提示词改为不支持，原生 /compact 不附加自定义提示词。
+            "compact" => ("compact", ""),
             "setGoal" => ("goal", goal_argument(payload)?),
             "updateGoal" => {
                 let goal = &c.native_control["goal"];
@@ -281,6 +375,9 @@ impl Claude {
                     Ok(json!({"deferred":true}))
                 };
             }
+            // 先清理上次手动压缩遗留的模型恢复状态，确保 original_model 为真实会话模型。
+            self.restore_compaction_model_if_needed(c, process, Some(authorization))
+                .await?;
         }
         // 用户要求压缩与发送消息、/goal 一样触发所选模型切换：网页菜单里的模型只是本地选择，
         // 不在此先应用，/compact 会沿用 CLI 当前模型而界面仍显示新选择。
@@ -335,17 +432,120 @@ impl Claude {
                 };
             }
         }
+        let effective_command_id = if action == "compact" {
+            Some(
+                command_id
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            )
+        } else {
+            command_id.map(str::to_owned)
+        };
+        let mut switched_restore: Option<CompactionModelRestore> = None;
+        if action == "compact" {
+            // 用户要求仅在手动压缩时按策略临时切换压缩模型，压缩完成后自动切回原模型；执行中自动压缩不干预。
+            if let Ok(pref) = crate::instance_settings::compaction_model_preference(
+                &self.directory,
+                &c.config.instance_id(),
+            ) && pref.model.is_some()
+            {
+                let original_model = c.model.clone();
+                let original_effort = c.effort.clone();
+                let metrics = c.metrics();
+                let cache_valid = crate::session_metrics::cache_is_valid(
+                    &metrics,
+                    &original_model,
+                    now_ms(),
+                );
+                if let Some(target_model) =
+                    crate::instance_settings::resolve_manual_compaction_model(
+                        &pref,
+                        &original_model,
+                        cache_valid,
+                    )
+                {
+                    let catalog = normalize_models(&process.initialization);
+                    let supported = catalog["data"]
+                        .as_array()
+                        .is_some_and(|rows| rows.iter().any(|row| row["model"] == target_model));
+                    if !supported {
+                        return Err(error(
+                            400,
+                            format!(
+                                "实例配置的手动压缩模型 {target_model} 不在当前 Claude CLI 可用目录中，压缩尚未发出"
+                            ),
+                        ));
+                    }
+                    let restore = CompactionModelRestore {
+                        original_model: original_model.clone(),
+                        original_effort: original_effort.clone(),
+                        compaction_model: target_model.clone(),
+                        command_id: effective_command_id.clone().unwrap_or_default(),
+                    };
+                    let id = c.id.clone();
+                    c.compaction_model_restore = Some(restore.clone());
+                    self.change(|saved| {
+                        if let Some(current) = saved.conversations.get_mut(&id) {
+                            current.compaction_model_restore = Some(restore.clone());
+                        }
+                        Ok(())
+                    })
+                    .await?;
+                    let before =
+                        setting_change_id(&c.native_control["settings"]["changes"]["model"]);
+                    let switch_res = async {
+                        process
+                            .control(
+                                json!({"subtype":"set_model","model":target_model}),
+                                Some(authorization),
+                            )
+                            .await?;
+                        self.wait_for_setting_switch(&c.id, "model", &before).await
+                    }
+                    .await;
+                    if let Err(failure) = switch_res {
+                        c.compaction_model_restore = None;
+                        let _ = self
+                            .change(|saved| {
+                                if let Some(current) = saved.conversations.get_mut(&id) {
+                                    current.compaction_model_restore = None;
+                                }
+                                Ok(())
+                            })
+                            .await;
+                        if !original_model.is_empty() {
+                            let _ = process
+                                .control(
+                                    json!({"subtype":"set_model","model":original_model}),
+                                    Some(authorization),
+                                )
+                                .await;
+                        }
+                        return Err(failure);
+                    }
+                    switched_restore = Some(restore);
+                }
+            }
+        }
         let expected_goal = (action == "updateGoal").then_some(&c.native_control["goal"]);
-        self.dispatch_native_command(
-            c,
-            process,
-            name,
-            argument,
-            expected_goal,
-            authorization,
-            command_id,
-        )
-        .await
+        let dispatched = self
+            .dispatch_native_command(
+                c,
+                process,
+                name,
+                argument,
+                expected_goal,
+                authorization,
+                effective_command_id.as_deref(),
+            )
+            .await;
+        if dispatched.is_err() && switched_restore.is_some() {
+            // /compact 未发出时立刻切回原模型，不能停留在压缩模型。
+            let _ = self
+                .restore_compaction_model_if_needed(c, process, Some(authorization))
+                .await;
+        }
+        dispatched
     }
 }
 

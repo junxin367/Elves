@@ -136,6 +136,10 @@ impl Message {
 }
 
 impl RemoteQueue {
+    pub(super) fn is_awaiting_compaction(&self) -> bool {
+        self.awaiting_compaction.is_some()
+    }
+
     pub(super) fn observe_compaction(&mut self, control: &Value) {
         let confirmed: Vec<_> = self
             .messages
@@ -872,6 +876,9 @@ impl Claude {
                     )
                     .await;
             }
+            // 普通消息或历史编辑派发前，必须先确认上次手动压缩切过的模型已恢复原模型。
+            self.restore_compaction_model_if_needed(&mut c, process, Some(authorization))
+                .await?;
             // 用户要求权限不能阻断消息：普通投递交由连接端确认或登记待生效，原生审批和草稿继续保留；
             // 显式 next 引导仍不改写当前轮次权限。
             if !steer {
@@ -1063,6 +1070,27 @@ impl Claude {
         let _lifecycle = self.lifecycle_gate.read().await;
         if !self.accepting() {
             return;
+        }
+        let restore_candidates: Vec<_> = self
+            .saved
+            .lock()
+            .await
+            .conversations
+            .values()
+            .filter(|c| {
+                !c.deleted
+                    && !c.active()
+                    && c.compaction_model_restore.is_some()
+                    && !matches!(
+                        c.native_control["compaction"]["state"].as_str(),
+                        Some("pending" | "running")
+                    )
+                    && c.remote_queue.awaiting_compaction.is_none()
+            })
+            .map(|c| c.id.clone())
+            .collect();
+        for id in restore_candidates {
+            self.restore_compaction_model_background(&id).await;
         }
         let candidates: Vec<_> = self
             .saved

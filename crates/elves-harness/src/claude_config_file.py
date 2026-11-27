@@ -54,6 +54,21 @@ def update(path, changes, expected):
     elif set(changes) == {"permissionMode"}:
         if not isinstance(changes["permissionMode"], str) or changes["permissionMode"] not in MODES:
             raise ConfigError(400, "Claude 权限模式无效")
+    elif set(changes) == {"autoCompactPercent"}:
+        # 用户要求三端统一用百分比设置自动压缩阈值（50～98%），Claude 直接写入原生 env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE。
+        value = changes["autoCompactPercent"]
+        if value is not None and (type(value) is not int or not 50 <= value <= 98):
+            raise ConfigError(400, "Claude 自动压缩阈值必须为 50～98 的整数，或留空使用原生默认")
+    elif set(changes) == {"contextWindow"}:
+        # 用户确认 Claude 上下文大小写入原生 env.CLAUDE_CODE_AUTO_COMPACT_WINDOW（≥ 100,000 Token，留空恢复原生默认）。
+        value = changes["contextWindow"]
+        if value is not None and (type(value) is not int or not 100_000 <= value <= 10_000_000):
+            raise ConfigError(400, "Claude 上下文大小必须为 100000～10000000 的整数，或留空使用原生默认")
+    elif set(changes) == {"promptCacheTtl"}:
+        # 用户要求在缓存与压缩中开放 Claude 缓存时间，读写 env.CLAUDE_CODE_PROMPT_CACHE_TTL（5m / 1h / 留空恢复默认）。
+        value = changes["promptCacheTtl"]
+        if value is not None and value not in {"5m", "1h"}:
+            raise ConfigError(400, "Claude 缓存时间仅支持 5m、1h 或留空使用原生默认")
     elif set(changes) <= {"awaySummaryEnabled", "promptSuggestionEnabled", "disableAllHooks", "model"} | EXTRA_BOOLEAN_SETTINGS:
         # 用户要求常规设置按所属实例保存；原生配置仅开放已核对的键，不能接收任意 JSON 配置写入。
         for key, value in changes.items():
@@ -91,6 +106,53 @@ def update(path, changes, expected):
             permissions["defaultMode"] = changes["permissionMode"]
         else:
             permissions.pop("defaultMode", None)
+    elif "autoCompactPercent" in changes:
+        value = changes["autoCompactPercent"]
+        if value is None:
+            if "env" in document:
+                env = document["env"]
+                if not isinstance(env, dict):
+                    raise ConfigError(422, "Claude env 配置格式无效，未覆盖原文件")
+                env.pop("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", None)
+                if not env:
+                    document.pop("env", None)
+        else:
+            env = document.setdefault("env", {})
+            if not isinstance(env, dict):
+                raise ConfigError(422, "Claude env 配置格式无效，未覆盖原文件")
+            env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = str(value)
+    elif "contextWindow" in changes:
+        value = changes["contextWindow"]
+        if value is None:
+            if "env" in document:
+                env = document["env"]
+                if not isinstance(env, dict):
+                    raise ConfigError(422, "Claude env 配置格式无效，未覆盖原文件")
+                env.pop("CLAUDE_CODE_AUTO_COMPACT_WINDOW", None)
+                if not env:
+                    document.pop("env", None)
+        else:
+            env = document.setdefault("env", {})
+            if not isinstance(env, dict):
+                raise ConfigError(422, "Claude env 配置格式无效，未覆盖原文件")
+            env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(value)
+    elif "promptCacheTtl" in changes:
+        value = changes["promptCacheTtl"]
+        # 清理顶层同名 promptCacheTtl，防止清空 env 后旧顶层键继续生效。
+        document.pop("promptCacheTtl", None)
+        if value is None:
+            if "env" in document:
+                env = document["env"]
+                if not isinstance(env, dict):
+                    raise ConfigError(422, "Claude env 配置格式无效，未覆盖原文件")
+                env.pop("CLAUDE_CODE_PROMPT_CACHE_TTL", None)
+                if not env:
+                    document.pop("env", None)
+        else:
+            env = document.setdefault("env", {})
+            if not isinstance(env, dict):
+                raise ConfigError(422, "Claude env 配置格式无效，未覆盖原文件")
+            env["CLAUDE_CODE_PROMPT_CACHE_TTL"] = value
     else:
         for key, value in changes.items():
             if value is None:

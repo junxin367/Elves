@@ -128,6 +128,7 @@ pub(super) struct ConfigFile {
     pub display: String,
     pub backend: String,
     pub claude_config: Option<super::claude::WslConfig>,
+    pub antigravity_config: Option<super::antigravity::acp::EnvConfig>,
     pub antigravity_root: Option<PathBuf>,
     pub antigravity_home_root: Option<PathBuf>,
     pub home: String,
@@ -183,6 +184,17 @@ pub(super) fn config_target(
         home: environment.home.clone(),
         antigravity_root: (instance.backend == "antigravity").then_some(root),
         antigravity_home_root,
+        antigravity_config: (instance.backend == "antigravity").then(|| {
+            super::antigravity::acp::EnvConfig {
+                distribution: environment.distribution.clone(),
+                user: environment.user.clone(),
+                executable: environment
+                    .executables
+                    .get("antigravity")
+                    .cloned()
+                    .unwrap_or_default(),
+            }
+        }),
         claude_config: (instance.backend == "claude").then(|| super::claude::WslConfig {
             distribution: environment.distribution.clone(),
             user: environment.user.clone(),

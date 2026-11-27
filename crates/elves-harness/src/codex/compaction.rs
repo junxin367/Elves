@@ -1,9 +1,13 @@
+use std::path::PathBuf;
+use std::sync::Weak;
+
 use serde_json::{Value, json};
 
-use super::store::Queued;
+use super::store::{CompactionModelRestore, Queued};
 use super::{CodexHarness, error};
 use crate::HarnessAuthorization;
 use crate::codex_service::normalize_session_response;
+use crate::codex_service::ServiceDispatchGuard;
 
 impl CodexHarness {
     pub(super) async fn compact(
@@ -123,16 +127,276 @@ impl CodexHarness {
         Ok(response)
     }
 
+    async fn codex_home_dir(&self) -> PathBuf {
+        self.runtime
+            .connection()
+            .await
+            .ok()
+            .and_then(|connection| connection.codex_home.clone())
+            .unwrap_or_else(|| {
+                let settings = crate::settings::SettingsStore::default()
+                    .load()
+                    .unwrap_or_default();
+                crate::codex_home::codex_home_dir_for_settings(&settings)
+            })
+    }
+
+    async fn manual_compaction_cache_valid(&self, id: &str, current_model: &str) -> bool {
+        let first_token = self.session_first_token(id).await;
+        let attached = self.any_side(id).await;
+        let home = self.codex_home_dir().await;
+        let thread_id = id.to_owned();
+        let metrics = tokio::task::spawn_blocking(move || {
+            if attached {
+                crate::session_metrics::codex_thread(&home, &thread_id, first_token, true)
+            } else {
+                crate::session_metrics::codex(&home, &thread_id, first_token)
+            }
+        })
+        .await
+        .unwrap_or(Value::Null);
+        let metrics = crate::session_metrics::with_cache_expiry(metrics, id);
+        crate::session_metrics::cache_is_valid(&metrics, current_model, crate::now_ms())
+    }
+
+    async fn reload_thread_with_model(
+        &self,
+        id: &str,
+        model: &str,
+        effort: Option<&str>,
+        service_tier: Option<&str>,
+        guard: Option<&dyn ServiceDispatchGuard>,
+        remember_view: bool,
+    ) -> anyhow::Result<()> {
+        let connection = self.runtime.connection().await?;
+        // Codex 0.171 在线程已加载且有订阅者时会忽略 thread/resume 的 model 覆盖，必须先卸载再按目标模型重连。
+        let _ = self
+            .runtime
+            .request("thread/unsubscribe", json!({"threadId": id}), guard)
+            .await;
+        self.loaded.lock().await.remove(id);
+        let identity = self
+            .runtime
+            .read("thread/read", json!({"threadId": id, "includeTurns": false}))
+            .await?;
+        let config = self
+            .runtime
+            .request(
+                "config/read",
+                json!({"cwd": identity["thread"]["cwd"], "includeLayers": true}),
+                None,
+            )
+            .await?;
+        let mut params = json!({"threadId": id, "excludeTurns": true, "model": model});
+        super::super::instance_settings::apply_codex_compaction_default(&config, &mut params);
+        if let Some(effort) = effort.filter(|value| !value.is_empty()) {
+            params["config"]["model_reasoning_effort"] = json!(effort);
+        }
+        if let Some(tier) = service_tier.filter(|value| !value.is_empty()) {
+            params["serviceTier"] = json!(tier);
+        }
+        if crate::codex_service::attached_parent_id(&identity["thread"]).is_some() {
+            let side = self.persistent_snapshot(&identity["thread"]).await?;
+            super::sides::apply_side_fork_permissions(&mut params, &side.permissions)?;
+        }
+        self.apply_auto_compact(&config, Some(model), &mut params)
+            .await;
+        let response = self
+            .runtime
+            .request("thread/resume", params, guard)
+            .await?;
+        let mut thread = normalize_session_response(&response)?;
+        self.decorate_persistent_side(&response["thread"], &mut thread)
+            .await;
+        let persistent_side = thread["serviceSide"] == true;
+        if remember_view {
+            for key in ["model", "reasoningEffort", "serviceTier"] {
+                if let Some(value) = response.get(key) {
+                    thread[key] = value.clone();
+                }
+            }
+            self.remember_settings(id, &response).await?;
+            let mut loaded = self.loaded.lock().await;
+            self.projection
+                .lock()
+                .await
+                .threads
+                .insert(id.to_owned(), thread);
+            loaded.insert(id.to_owned(), connection.generation.clone());
+        } else {
+            // 临时切到压缩模型时不改写界面展示的会话模型与持久设置，压缩完后恢复原模型。
+            self.loaded
+                .lock()
+                .await
+                .insert(id.to_owned(), connection.generation.clone());
+        }
+        if persistent_side {
+            self.side_idle
+                .lock()
+                .await
+                .loaded(id, &connection.generation, false);
+        }
+        Ok(())
+    }
+
+    pub(super) async fn restore_compaction_model_if_needed(
+        &self,
+        id: &str,
+        guard: Option<&dyn ServiceDispatchGuard>,
+    ) -> anyhow::Result<()> {
+        let pending = self
+            .store
+            .lock()
+            .await
+            .data
+            .compaction_model_restores
+            .get(id)
+            .cloned();
+        let Some(restore) = pending else {
+            return Ok(());
+        };
+        if self.projection.lock().await.compactions.contains_key(id) {
+            return Ok(());
+        }
+        self.reload_thread_with_model(
+            id,
+            &restore.original_model,
+            restore.original_effort.as_deref(),
+            restore.original_service_tier.as_deref(),
+            guard,
+            true,
+        )
+        .await?;
+        self.store.lock().await.commit(|data| {
+            data.compaction_model_restores.remove(id);
+            Ok(())
+        })?;
+        self.projection
+            .lock()
+            .await
+            .pending_compaction_models
+            .remove(id);
+        Ok(())
+    }
+
     pub(super) async fn start_compaction(
         &self,
         id: &str,
         authorization: &HarnessAuthorization,
     ) -> anyhow::Result<Value> {
-        if !self.known_side(id).await {
+        let is_side = self.known_side(id).await;
+        let mut switched_restore: Option<CompactionModelRestore> = None;
+        if !is_side {
+            self.restore_compaction_model_if_needed(id, Some(authorization))
+                .await?;
             self.ensure_loaded(id, authorization).await?;
+            // 用户要求仅在手动压缩时按策略临时切换压缩模型，执行中自动压缩不干预；
+            // 临时侧边会话为 ephemeral 不可卸载重载，不执行切换。
+            if let Some(controller) = self.controller.get().and_then(Weak::upgrade)
+                && let Ok(pref) = crate::instance_settings::compaction_model_preference(
+                    &controller.state_dir,
+                    "codex:local",
+                )
+                && pref.model.is_some()
+            {
+                let (saved_model, saved_effort, saved_tier) = {
+                    let store = self.store.lock().await;
+                    let saved = store.data.settings.get(id);
+                    (
+                        saved
+                            .and_then(|value| value["model"].as_str())
+                            .map(str::to_owned),
+                        saved
+                            .and_then(|value| value["reasoningEffort"].as_str())
+                            .map(str::to_owned),
+                        saved
+                            .and_then(|value| value["serviceTier"].as_str())
+                            .map(str::to_owned),
+                    )
+                };
+                let proj_model = self
+                    .projection
+                    .lock()
+                    .await
+                    .threads
+                    .get(id)
+                    .and_then(|thread| thread["model"].as_str())
+                    .map(str::to_owned);
+                let original_model = saved_model.or(proj_model).unwrap_or_default();
+                let original_model = if original_model.is_empty() {
+                    self.runtime
+                        .read("thread/read", json!({"threadId": id, "includeTurns": false}))
+                        .await
+                        .ok()
+                        .and_then(|read| read["thread"]["model"].as_str().map(str::to_owned))
+                        .unwrap_or_default()
+                } else {
+                    original_model
+                };
+                if !original_model.is_empty() {
+                    let cache_valid = self
+                        .manual_compaction_cache_valid(id, &original_model)
+                        .await;
+                    if let Some(target_model) =
+                        crate::instance_settings::resolve_manual_compaction_model(
+                            &pref,
+                            &original_model,
+                            cache_valid,
+                        )
+                    {
+                        let restore = CompactionModelRestore {
+                            original_model: original_model.clone(),
+                            original_effort: saved_effort,
+                            original_service_tier: saved_tier,
+                            compaction_model: target_model.clone(),
+                        };
+                        self.store.lock().await.commit(|data| {
+                            data.compaction_model_restores
+                                .insert(id.to_owned(), restore.clone());
+                            Ok(())
+                        })?;
+                        if let Err(failure) = self
+                            .reload_thread_with_model(
+                                id,
+                                &target_model,
+                                None,
+                                None,
+                                Some(authorization),
+                                false,
+                            )
+                            .await
+                        {
+                            let _ = self.store.lock().await.commit(|data| {
+                                data.compaction_model_restores.remove(id);
+                                Ok(())
+                            });
+                            let _ = self
+                                .reload_thread_with_model(
+                                    id,
+                                    &restore.original_model,
+                                    restore.original_effort.as_deref(),
+                                    restore.original_service_tier.as_deref(),
+                                    Some(authorization),
+                                    true,
+                                )
+                                .await;
+                            return Err(error(
+                                503,
+                                &format!("切换压缩模型 {target_model} 失败，压缩未发出：{failure}"),
+                            ));
+                        }
+                        self.projection
+                            .lock()
+                            .await
+                            .pending_compaction_models
+                            .insert(id.to_owned(), target_model);
+                        switched_restore = Some(restore);
+                    }
+                }
+            }
         }
         let revision = self.projection.lock().await.compaction_revision(id);
-        let result = if self.known_side(id).await {
+        let result = if is_side {
             let generation = self.side_generation(id).await?;
             self.runtime
                 .request_in_generation(
@@ -151,7 +415,33 @@ impl CodexHarness {
                 )
                 .await
         };
-        result?;
+        if let Err(failure) = result {
+            if let Some(restore) = switched_restore {
+                self.projection
+                    .lock()
+                    .await
+                    .pending_compaction_models
+                    .remove(id);
+                if self
+                    .reload_thread_with_model(
+                        id,
+                        &restore.original_model,
+                        restore.original_effort.as_deref(),
+                        restore.original_service_tier.as_deref(),
+                        Some(authorization),
+                        true,
+                    )
+                    .await
+                    .is_ok()
+                {
+                    let _ = self.store.lock().await.commit(|data| {
+                        data.compaction_model_restores.remove(id);
+                        Ok(())
+                    });
+                }
+            }
+            return Err(failure);
+        }
         let mut projection = self.projection.lock().await;
         // 开始/完成事件可能早于 RPC 回执，不能将已完成压缩覆盖成 pending。
         if projection.compaction_revision(id) == revision {

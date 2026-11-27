@@ -83,6 +83,40 @@ fn add_cache_expiry(metrics: &mut Value, expiry: Option<CacheExpiry>) {
     object.insert("cacheExpirySource".to_owned(), json!(expiry.source));
 }
 
+fn cache_model_matches(observed: &str, current: &str) -> bool {
+    let observed = observed.trim();
+    let current = current.trim();
+    if observed.is_empty() || current.is_empty() {
+        return true;
+    }
+    if observed.eq_ignore_ascii_case(current) {
+        return true;
+    }
+    // Antigravity 转录模型常带思考深度后缀（如 gemini-4-neon-high），匹配其基础模型名。
+    let obs_lower = observed.to_ascii_lowercase();
+    let cur_lower = current.to_ascii_lowercase();
+    obs_lower
+        .strip_prefix(&cur_lower)
+        .is_some_and(|rest| rest.starts_with('-'))
+}
+
+/// 依据已有模型缓存倒计时判断当前会话模型是否处于有效缓存期内。
+/// 仅当存在明确未过期的缓存记录且归属当前模型时返回 `true`；过期、换模型或缺少缓存记录均视为缓存失效。
+pub(super) fn cache_is_valid(metrics: &Value, current_model: &str, now_ms: u64) -> bool {
+    if !metrics.is_object() {
+        return false;
+    }
+    if let Some(observed) = metrics["cacheModel"].as_str()
+        && !cache_model_matches(observed, current_model)
+    {
+        return false;
+    }
+    if let Some(expires_at) = count(&metrics["cacheExpiresAtMs"]) {
+        return expires_at > now_ms;
+    }
+    count(&metrics["cacheRemainingMs"]).is_some_and(|remaining| remaining > 0)
+}
+
 fn count(value: &Value) -> Option<u64> {
     value.as_u64().filter(|value| *value <= SAFE_INTEGER)
 }
@@ -1193,5 +1227,40 @@ mod tests {
         let rewritten = read_codex(&path).unwrap();
         assert_eq!(rewritten["totalTokens"], 900);
         assert_eq!(rewritten["steps"], 1);
+    }
+
+    #[test]
+    fn session_metrics_cache_is_valid_checks_expiry_and_model_matching() {
+        assert!(!cache_is_valid(&Value::Null, "gpt-6.1-sol", 5_000));
+        assert!(!cache_is_valid(
+            &json!({"cacheModel": "gpt-6.1-sol"}),
+            "gpt-6.1-sol",
+            5_000
+        ));
+        assert!(cache_is_valid(
+            &json!({"cacheModel": "gpt-6.1-sol", "cacheExpiresAtMs": 10_000}),
+            "gpt-6.1-sol",
+            5_000
+        ));
+        assert!(!cache_is_valid(
+            &json!({"cacheModel": "gpt-6.1-sol", "cacheExpiresAtMs": 5_000}),
+            "gpt-6.1-sol",
+            5_000
+        ));
+        assert!(!cache_is_valid(
+            &json!({"cacheModel": "claude-opus-5-5", "cacheExpiresAtMs": 10_000}),
+            "claude-sonnet-5-5",
+            5_000
+        ));
+        assert!(cache_is_valid(
+            &json!({"cacheModel": "gemini-4-neon-high", "cacheExpiresAtMs": 10_000}),
+            "gemini-4-neon",
+            5_000
+        ));
+        assert!(cache_is_valid(
+            &json!({"cacheModel": "gemini-4-neon", "cacheRemainingMs": 1_500}),
+            "gemini-4-neon",
+            5_000
+        ));
     }
 }
