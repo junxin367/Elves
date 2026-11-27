@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
+import { desktopImagePattern } from "../assets/harness/local-inputs.js";
 
 const source = await readFile(new URL("../assets/harness/session-tools.js", import.meta.url), "utf8");
 const wrapper = source.slice(source.indexOf("export function mountSessionTools("),
@@ -555,6 +556,96 @@ test("侧边资源交给主页面预览，拒绝其他来源及隐藏标签，�
   assert.equal(opened.length, 4);
   assert.equal(h.messageListeners.size, 0);
   h.api.dispose();
+});
+
+async function imagePreviewHarness({ sidePanel = false, visible = true, onPost } = {}) {
+  const [attachments, media] = await Promise.all([
+    readFile(new URL("../assets/harness/attachments.js", import.meta.url), "utf8"),
+    readFile(new URL("../assets/harness/features/messages/media-state.js", import.meta.url), "utf8"),
+  ]);
+  const slice = (source, begin, end) => {
+    const start = source.indexOf(begin), finish = source.indexOf(end, start + begin.length);
+    assert.ok(start >= 0 && finish > start);
+    return source.slice(start, finish).replace(/^export /gm, "");
+  };
+  const sent = [], classes = { add() {}, remove() {}, toggle() {} };
+  const node = tag => ({ tag, children: [], complete: false, style: {}, classList: classes,
+    append(...items) { this.children.push(...items); }, prepend(...items) { this.children.unshift(...items); },
+    setAttribute() {}, removeAttribute() {}, addEventListener() {}, remove() {}, focus() {},
+    showModal() { this.open = true; }, close() { this.open = false; } });
+  const body = node("body"), window = {};
+  window.parent = sidePanel ? { postMessage(data, origin) { sent.push({ data, origin }); onPost?.(data, origin); } } : window;
+  const context = vm.createContext({
+    window, location: { origin: "http://127.0.0.1:45222" },
+    document: { body, activeElement: null, documentElement: {
+      dataset: { workspaceSidePanel: String(sidePanel), workspaceSidePanelVisible: String(visible) }
+    } },
+    desktopImagePattern, atob, TextDecoder,
+    $: () => null, element: node, button: () => node("button"), icon: () => node("icon"),
+    rememberTransientHistory() {}, remoteMediaUrl: value => value,
+    fitMediaPreview: () => ({ resize() {}, dispose() {} }),
+    bindImageContextMenu() {}, bindMediaPreviewDismiss: () => () => {},
+    setTimeout: () => 0, clearTimeout() {},
+  });
+  vm.runInContext([
+    slice(attachments, "export function requestWorkspaceMediaPreview(", "function loadVideoPoster("),
+    slice(attachments, "function detectImageMime(", "function dataUrl("),
+    slice(media, "export function openImagePreview(", "export function messageImageOwner("),
+  ].join("\n"), context);
+  return { body, sent, show: context.openImagePreview,
+    open: source => context.openImagePreview({ getAttribute: () => null, isConnected: true, focus() {} },
+      { originalImageSource: source, alt: "图片.png" }) };
+}
+
+const stagedPreviewImage = "/api/desktop/input-files/00000000-0000-4000-8000-000000000001/0/image";
+const previewImageSources = ["/api/images/abcdefghijklmnopqrst", stagedPreviewImage,
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42kAAAAASUVORK5CYII="];
+
+test("侧边本机原图、普通图片和内联图片均转交主页面，原地址与关闭归属保持", async () => {
+  for (const source of previewImageSources) {
+    const main = await imagePreviewHarness();
+    const h = harness({ openImagePreview: main.show });
+    h.api.openSideThread({ id: "side-a" });
+    const frame = h.views.children[0].children[0]; frame.contentWindow = { postMessage() {} };
+    const child = await imagePreviewHarness({ sidePanel: true,
+      onPost: (data, origin) => h.message({ source: frame.contentWindow, origin, data }) });
+    child.open(source);
+    assert.equal(child.body.children.length, 0, "侧边不得创建只能覆盖 iframe 的预览");
+    assert.equal(child.sent.length, 1, "每次点击仅转交一次");
+    assert.equal(child.sent[0].data.source, source, "本机地址不能被错误替换成空内联地址");
+    assert.equal(child.sent[0].origin, "http://127.0.0.1:45222");
+    assert.equal(main.body.children.length, 1, "使用主页面已有预览器覆盖 Elves 可视区域");
+    const dialog = main.body.children[0];
+    assert.equal(dialog.open, true);
+    assert.equal(dialog.children[0].children[1].children[0].src, source, "加载原图地址，避免转成缩略图");
+    h.api.close();
+    assert.equal(dialog.open, false, "收起来源侧边时关闭其主页面预览");
+    h.api.dispose();
+  }
+});
+
+test("主会话与手机整页的图片仍在本页预览，隐藏侧边不转交也不创建本地预览", async () => {
+  for (const source of previewImageSources) {
+    const page = await imagePreviewHarness();
+    page.open(source);
+    assert.equal(page.sent.length, 0);
+    assert.equal(page.body.children.length, 1);
+    const hidden = await imagePreviewHarness({ sidePanel: true, visible: false });
+    hidden.open(source);
+    assert.equal(hidden.sent.length, 0);
+    assert.equal(hidden.body.children.length, 0);
+  }
+});
+
+test("侧边图片转交保留地址校验，外部地址、越界暂存地址与主动 SVG 均不接受", async () => {
+  const child = await imagePreviewHarness({ sidePanel: true });
+  for (const source of ["https://other.example/image.png", stagedPreviewImage.replace("/0/", "/16/"),
+    "/api/desktop/input-files/../../private/image", `${stagedPreviewImage}?path=other`,
+    `data:image/svg+xml;base64,${Buffer.from('<svg><script>alert(1)</script></svg>').toString("base64")}`]) {
+    child.open(source);
+  }
+  assert.equal(child.sent.length, 0);
+  assert.equal(child.body.children.length, 0);
 });
 
 test("侧边标签只接受自身原生执行状态，隐藏后仍同步旋转图标并在结束时恢复", () => {

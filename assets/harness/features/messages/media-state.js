@@ -120,7 +120,9 @@ export function openImagePreview(link, image) {
   const desktopSource = source.startsWith("/api/desktop/input-files/") && desktopImagePattern.test(source);
   const inlineSource = safeInlineImageSource(source, { allowSvg: true });
   if (!remoteSource && !desktopSource && !inlineSource) return;
-  if (!desktopSource && requestWorkspaceMediaPreview({ kind: "image", source: remoteSource ? source : inlineSource, name: image.alt || "图片" })) return;
+  // 用户要求 PC 侧边图片与主会话一样覆盖 Elves 可视区域，本机暂存原图也必须转交主页面。
+  // 只传已校验的原图地址；主页面继续核对来源 iframe，图片读取保留本机设备授权校验。
+  if (requestWorkspaceMediaPreview({ kind: "image", source: remoteSource || desktopSource ? source : inlineSource, name: image.alt || "图片" })) return;
   $("#image-preview-dialog")?.close();
   rememberTransientHistory();
   const trigger = link;
