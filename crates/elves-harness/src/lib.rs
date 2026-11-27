@@ -1714,6 +1714,11 @@ impl HarnessController {
                 &mut value,
                 instance_settings::ultra_enabled(&self.state_dir, &creation_instance)?,
             );
+            value = instance_settings::decorate_codex_model_visibility(
+                &self.state_dir,
+                &creation_instance,
+                value,
+            )?;
         }
         if let Some(mode) = creation_mode
             .or_else(|| codex_creation.then(|| value["permissionMode"].clone()))

@@ -19220,12 +19220,466 @@ test("Antigravity 历史会话在详情尚未加载时也能识别已启用实�
   // 即使 sidebar 尚未命中、仅有会话 ID，也应回退到已启用的 Antigravity 实例而非返回空字符串
   assert.equal(context.convId({ id: "antigravity-other-2" }), "antigravity:local");
 
-  // 验证权限与实例设置前端已放开 Antigravity
+  // 验证权限与实例设置前端已放开所有实例统一模型显示设置及 Antigravity 钩子
   const permissionsSource = await readFile(new URL("../assets/harness/permissions.js", import.meta.url), "utf8");
   const instanceSettingsSource = await readFile(new URL("../assets/harness/features/settings/instance-settings.js", import.meta.url), "utf8");
   assert.match(permissionsSource, /permissionOptions\(record\.backend, record\.supportedModes\)/);
-  assert.match(instanceSettingsSource, /\["claude", "antigravity"\]\.includes\(record\.backend\)/);
+  assert.doesNotMatch(instanceSettingsSource, /\["claude", "antigravity"\]\.includes\(record\.backend\)/);
+  assert.match(instanceSettingsSource, /instance-model-visibility-trigger/);
   assert.match(instanceSettingsSource, /name === "hooks" \? "hook" : "server"/);
+});
+
+test("所有会话实例统一使用多选菜单管理显示模型并支持连续勾选串行保存", async () => {
+  const module = await readFile(new URL("../assets/harness/features/settings/instance-settings.js", import.meta.url), "utf8");
+  const popupSource = await readFile(new URL("../assets/harness/ui/popup.js", import.meta.url), "utf8");
+  assert.match(popupSource, /trigger\.popupEmptyText \|\| \(hasFooter \? "本机暂无可用项目" : "暂无可用选项"\)/);
+
+  const start = module.indexOf("  function currentHiddenModelIds()");
+  const end = module.indexOf("  function renderInventory()", start);
+  assert.ok(start >= 0 && end > start);
+
+  const element = (tag, className = "", text = "") => {
+    const node = {
+      tag, className, textContent: String(text), children: [], attributes: {}, isConnected: true,
+      disabled: false, settingsUnsupported: false,
+      append(...children) { this.children.push(...children); },
+      replaceChildren(...children) { this.children = [...children]; },
+      setAttribute(key, value) { this.attributes[key] = String(value); },
+      getAttribute(key) { return this.attributes[key] ?? null; },
+    };
+    return node;
+  };
+
+  for (const backend of ["codex", "claude", "antigravity"]) {
+    const saved = [];
+    let popupRenders = 0;
+    const visibilityTrigger = element("button", "select-trigger instance-model-visibility-trigger");
+    const context = {
+      record: {
+        backend,
+        settings: { hiddenModelIds: ["m2"] },
+        models: [
+          { model: "m1", displayName: "Model One" },
+          { model: "m2", displayName: "Model Two" },
+          { model: "m3", displayName: "m3" },
+        ],
+        capabilityError: "",
+      },
+      selected: `${backend}:local`,
+      recordIdentity: `id:${backend}`,
+      savingHidden: false,
+      pendingHidden: null,
+      queuedHidden: null,
+      visibilityTrigger,
+      content: element("div"),
+      controls: new Set(),
+      activePopup: { trigger: visibilityTrigger },
+      element,
+      icon: name => element("span", `icon-${name}`),
+      fieldCopy: (label, description) => ({ label, description }),
+      section(parent, label) { const card = element("section"); card.label = label; parent.append(card); return card; },
+      identityWritable: () => true,
+      writable: () => true,
+      sync: () => {},
+      renderPopup: () => { popupRenders++; },
+      save: payload => { saved.push(JSON.parse(JSON.stringify(payload))); },
+    };
+    rawVm.createContext(context);
+    rawVm.runInContext(module.slice(start, end), context);
+
+    context.renderModelVisibility();
+    assert.equal(context.content.children.length, 1, `${backend} 应渲染单张显示模型卡片`);
+    assert.equal(context.content.children[0].label, "显示模型");
+    assert.equal(visibilityTrigger.children[0].textContent, "已显示 2/3 个模型");
+    assert.equal(visibilityTrigger.settingsUnsupported, false);
+    assert.equal(visibilityTrigger.menuOptions.length, 4, "3 个模型 + 底部全部显示");
+    assert.deepEqual(
+      Array.from(visibilityTrigger.menuOptions.slice(0, 3), o => [o.value, o.checkable, o.selected, o.keepOpen, o.description]),
+      [
+        ["m1", true, true, true, "m1"],
+        ["m2", true, false, true, "m2"],
+        ["m3", true, true, true, ""],
+      ],
+    );
+    const showAll = visibilityTrigger.menuOptions[3];
+    assert.equal(showAll.footer, true);
+    assert.equal(showAll.separatorBefore, true);
+    assert.equal(showAll.keepOpen, true);
+    assert.equal(showAll.disabled, false);
+
+    // 连续勾选两次：第一次立即发起保存，第二次在 savingHidden=true 期间入队合并并立即刷新多选菜单
+    visibilityTrigger.menuOptions[0].action();
+    assert.equal(context.savingHidden, true);
+    assert.deepEqual(saved, [{ hiddenModelIds: ["m2", "m1"] }]);
+    assert.equal(visibilityTrigger.children[0].textContent, "已显示 1/3 个模型");
+    assert.equal(popupRenders, 1);
+
+    visibilityTrigger.menuOptions[2].action();
+    assert.deepEqual(saved, [{ hiddenModelIds: ["m2", "m1"] }], "保存飞行中不并发重复请求");
+    assert.deepEqual(Array.from(context.queuedHidden), ["m2", "m1", "m3"]);
+    assert.equal(visibilityTrigger.children[0].textContent, "已全部隐藏（0/3）");
+    assert.equal(popupRenders, 2);
+
+    // 点击底部“全部显示”清空隐藏名单
+    visibilityTrigger.menuOptions[3].action();
+    assert.deepEqual(Array.from(context.queuedHidden), []);
+    assert.equal(visibilityTrigger.children[0].textContent, "全部显示（3）");
+    assert.equal(visibilityTrigger.menuOptions[3].disabled, true);
+  }
+
+  // 空目录但有历史隐藏项时允许打开菜单恢复全部显示；无目录且无隐藏项时禁用
+  const emptyTrigger = element("button", "select-trigger instance-model-visibility-trigger");
+  const emptyCtx = {
+    record: { backend: "codex", settings: { hiddenModelIds: [] }, models: [], capabilityError: "CLI 未响应" },
+    selected: "codex:local", recordIdentity: "id:codex",
+    savingHidden: false, pendingHidden: null, queuedHidden: null,
+    visibilityTrigger: emptyTrigger, content: element("div"), controls: new Set(),
+    activePopup: null, element, icon: name => element("span", `icon-${name}`),
+    fieldCopy: (label, description) => ({ label, description }),
+    section(parent, label) { const card = element("section"); card.label = label; parent.append(card); return card; },
+    writable: () => true, renderPopup() {}, save() {},
+  };
+  rawVm.createContext(emptyCtx);
+  rawVm.runInContext(module.slice(start, end), emptyCtx);
+  emptyCtx.renderModelVisibility();
+  assert.equal(emptyTrigger.settingsUnsupported, true);
+  assert.equal(emptyTrigger.children[0].textContent, "暂无可选模型");
+  assert.match(emptyTrigger.popupEmptyText, /CLI 未响应/);
+  assert.ok(emptyCtx.content.children.some(node => node.textContent.includes("CLI 未响应")));
+
+  emptyCtx.record.settings.hiddenModelIds = ["old-model"];
+  emptyCtx.content.children = [];
+  emptyCtx.renderModelVisibility();
+  assert.equal(emptyTrigger.settingsUnsupported, false, "存在历史隐藏项时须允许打开恢复全部显示");
+  assert.equal(emptyTrigger.children[0].textContent, "已隐藏 1 个模型");
+  assert.equal(emptyTrigger.menuOptions.at(-1).disabled, false);
+});
+
+test("真实实例设置页、缓存与公共菜单联动：首次保存不禁用多选触发器，支持连续勾选串行合并保存并保留只读与跨端冲突拦截", async () => {
+  const stripModule = code => code
+    .replace(/^\s*import\s[\s\S]*?from\s+["'][^"']+["'];?\s*$/gm, "")
+    .replace(/\bexport\s+(?=(?:async\s+)?function\b|const\b|let\b|class\b)/g, "");
+  const [menuPartsCode, positionCode, popupCode, selectCode, cacheCode, pageCode] = await Promise.all([
+    readFile(new URL("../assets/harness/ui/menu-parts.js", import.meta.url), "utf8"),
+    readFile(new URL("../assets/harness/ui/position.js", import.meta.url), "utf8"),
+    readFile(new URL("../assets/harness/ui/popup.js", import.meta.url), "utf8"),
+    readFile(new URL("../assets/harness/ui/select.js", import.meta.url), "utf8"),
+    readFile(new URL("../assets/harness/features/settings/instance-settings-cache.js", import.meta.url), "utf8"),
+    readFile(new URL("../assets/harness/features/settings/instance-settings.js", import.meta.url), "utf8"),
+  ]);
+
+  let document;
+  class FakeNode {
+    constructor(tag, className = "", text = "") {
+      this.tag = tag; this.className = className; this.textContent = String(text);
+      this.children = []; this.attributes = new Map(); this.dataset = {};
+      this.style = { setProperty() {} }; this.parentElement = null;
+      this.isConnected = tag === "body"; this.disabled = false; this.hidden = false;
+      this.value = ""; this.checked = false; this.indeterminate = false; this.scrollTop = 0;
+      this.classList = {
+        add: (...names) => {
+          const set = new Set(this.className.split(" ").filter(Boolean));
+          for (const n of names) set.add(n);
+          this.className = [...set].join(" ");
+        },
+        toggle: (n, force) => {
+          const set = new Set(this.className.split(" ").filter(Boolean));
+          if (force ?? !set.has(n)) set.add(n); else set.delete(n);
+          this.className = [...set].join(" ");
+        },
+      };
+    }
+    setConnected(state) {
+      this.isConnected = state;
+      for (const child of this.children) child.setConnected?.(state);
+    }
+    append(...children) {
+      for (const child of children) {
+        if (!child) continue;
+        if (child.parentElement) {
+          child.parentElement.children = child.parentElement.children.filter(c => c !== child);
+        }
+        child.parentElement = this;
+        this.children.push(child);
+        child.setConnected?.(this.isConnected);
+      }
+    }
+    insertBefore(child, before) {
+      const index = this.children.indexOf(before);
+      assert.ok(index >= 0);
+      if (child.parentElement) {
+        child.parentElement.children = child.parentElement.children.filter(c => c !== child);
+      }
+      child.parentElement = this;
+      this.children.splice(index, 0, child);
+      child.setConnected?.(this.isConnected);
+    }
+    replaceChildren(...children) {
+      for (const child of this.children) { child.parentElement = null; child.setConnected?.(false); }
+      this.children = [];
+      this.append(...children);
+    }
+    contains(node) { return this === node || this.children.some(child => child.contains?.(node)); }
+    setAttribute(k, v) { this.attributes.set(k, String(v)); }
+    getAttribute(k) { return this.attributes.get(k) ?? null; }
+    removeAttribute(k) { this.attributes.delete(k); }
+    hasAttribute(k) { return this.attributes.has(k); }
+    closest() { return null; }
+    focus() { document.activeElement = this; this.onfocus?.(); }
+    click() { if (!this.disabled) this.onclick?.(); }
+    scrollIntoView() {}
+    getBoundingClientRect() { return { left: 200, top: 120, right: 440, bottom: 156, width: 240, height: 36 }; }
+    remove() {
+      if (this.parentElement) {
+        this.parentElement.children = this.parentElement.children.filter(child => child !== this);
+      }
+      this.parentElement = null;
+      this.setConnected(false);
+    }
+    querySelectorAll(selector) {
+      const descendants = [];
+      const visit = node => {
+        for (const child of node.children || []) { descendants.push(child); visit(child); }
+      };
+      visit(this);
+      return descendants.filter(node => selector.split(",").some(part => {
+        if (part.startsWith(".") && !(node.className || "").split(" ").includes(part.slice(1))) return false;
+        if (part.startsWith("button") && node.tag !== "button") return false;
+        if (part.includes(":not(:disabled)") && node.disabled) return false;
+        const checked = part.match(/\[(aria-selected|aria-checked)="true"\]/);
+        return !checked || node.getAttribute(checked[1]) === "true";
+      }));
+    }
+    querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+    dispatchEvent(event) { if (event.type === "change") this.onchange?.(event); }
+  }
+  const element = (tag, className = "", text = "") => new FakeNode(tag, className, text);
+  const button = (text, label, action, className = "") => {
+    const node = element("button", className, text);
+    node.setAttribute("aria-label", label);
+    node.title = label;
+    node.onclick = action;
+    return node;
+  };
+  document = {
+    activeElement: null,
+    body: element("body"),
+    createTextNode: text => ({ textContent: String(text), setConnected() {}, contains: () => false }),
+  };
+
+  const instances = [{
+    id: "codex:local", backend: "codex", label: "Codex", ready: true,
+    environmentId: "local", distribution: "", user: "", home: "/home/codex", executable: "codex.exe",
+  }];
+  const sharedListeners = new Set();
+  const sharedSettingsState = { epoch: "ep-1", instanceRevision: 1 };
+  const pendingSaves = [];
+  const apiCalls = [];
+  let serverHidden = ["m2"];
+  let serverPrefRev = 1;
+  let serverInstRev = 1;
+  const makeSnapshot = (updated = false) => ({
+    ok: true,
+    instanceId: "codex:local",
+    backend: "codex",
+    settingsEpoch: sharedSettingsState.epoch,
+    instanceRevision: serverInstRev,
+    path: "/home/codex/config.toml",
+    revision: "rev-1",
+    preferenceRevision: `pref-${serverPrefRev}`,
+    readOnly: false,
+    readOnlyReason: "",
+    updated,
+    capabilities: {},
+    capabilityError: "",
+    extraSettings: [],
+    effectiveModel: "m1",
+    models: [
+      { model: "m1", displayName: "Model One", supportedReasoningEfforts: [{ reasoningEffort: "high" }], hiddenByInstance: serverHidden.includes("m1") },
+      { model: "m2", displayName: "Model Two", supportedReasoningEfforts: [{ reasoningEffort: "high" }], hiddenByInstance: serverHidden.includes("m2") },
+      { model: "m3", displayName: "Model Three", supportedReasoningEfforts: [{ reasoningEffort: "high" }], hiddenByInstance: serverHidden.includes("m3") },
+    ],
+    settings: {
+      todo: true, memories: false, multiAgent: true, goals: false,
+      persistentSideThreads: false, model: null, reasoningEffort: null,
+      ultraReasoningEnabled: false, hiddenModelIds: [...serverHidden],
+    },
+  });
+
+  const context = rawVm.createContext({
+    AbortController, DOMException, Event, Set, Map, JSON, Date, Object, Array, Number, String, Boolean, Math, Error, Promise,
+    setTimeout, clearTimeout,
+    window: { innerWidth: 1200, innerHeight: 800, visualViewport: null },
+    navigator: { platform: "Win32", userAgent: "" },
+    document,
+    element,
+    button,
+    icon: name => element("span", "ui-icon", name),
+    openSettingsPrompt: () => null,
+    connected: true,
+    nativeConnectionVersion: 1,
+    session: { scope: "local", readOnly: false },
+    readCache: { remove: async () => {} },
+    loadModels: async () => [],
+    refreshSkillCatalog: async () => {},
+    updateComposer: () => {},
+    privateInputScope: s => s?.scope || "",
+    activeInstanceId: () => "codex:local",
+    availableSessionInstances: () => instances,
+    sessionInstances: instances,
+    sessionInstanceEnabled: () => true,
+    loadSessionInstances: async () => instances,
+    setInstanceDisplay: async () => {},
+    invalidateModelSettings: () => {},
+    selectedEffort: "",
+    setSelectedEffort: () => {},
+    effortLabels: { low: "低", medium: "中", high: "高", xhigh: "极高", ultra: "Ultra" },
+    sharedSettingsWritable: s => !!s && !s.readOnly,
+    sharedSettingsState,
+    subscribeSharedSettings: fn => { sharedListeners.add(fn); return () => sharedListeners.delete(fn); },
+    notice: () => {},
+    api: (path, payload) => {
+      apiCalls.push({ path, payload: JSON.parse(JSON.stringify(payload)) });
+      if (path === "/api/settings/instance" && payload.operation !== "save") {
+        return Promise.resolve(makeSnapshot(false));
+      }
+      if (path === "/api/settings/instance" && payload.operation === "save") {
+        return new Promise((resolve, reject) => {
+          pendingSaves.push({ payload: JSON.parse(JSON.stringify(payload)), resolve, reject });
+        });
+      }
+      return Promise.reject(new Error(`unexpected api ${path}`));
+    },
+  });
+
+  rawVm.runInContext(
+    [menuPartsCode, positionCode, popupCode, selectCode, cacheCode, pageCode].map(stripModule).join("\n"),
+    context,
+  );
+  const getActivePopup = () => rawVm.runInContext("activePopup", context);
+
+  const page = element("div", "appearance-settings-page");
+  document.body.append(page);
+  const mounted = context.mountInstanceSettingsPage({ page, section: "general" });
+  await mounted.show();
+
+  const findById = id => {
+    const stack = [page];
+    while (stack.length) {
+      const node = stack.pop();
+      if (node.id === id) return node;
+      for (const c of node.children || []) stack.push(c);
+    }
+    return null;
+  };
+  const trigger = findById("settings-general-hiddenModelIds");
+  const defaultModelSelect = findById("settings-general-model");
+  assert.ok(trigger && defaultModelSelect);
+  assert.equal(trigger.disabled, false);
+  assert.equal(trigger.children[0].textContent, "已显示 2/3 个模型");
+
+  // 1) 打开公共多选弹层并点击第一个模型，触发真实 save()
+  trigger.click();
+  assert.equal(getActivePopup()?.trigger, trigger, "多选菜单应打开");
+  const clickOption = value => {
+    const option = getActivePopup()?.list.querySelectorAll("button").find(n => n.dataset.value === value);
+    assert.ok(option, `弹层中应存在选项 ${value}`);
+    option.click();
+  };
+
+  clickOption("m1");
+  assert.equal(pendingSaves.length, 1, "首次勾选应立即发出保存请求");
+  assert.deepEqual(pendingSaves[0].payload.settings, { hiddenModelIds: ["m2", "m1"] });
+  assert.equal(pendingSaves[0].payload.expectedPreferenceRevision, "pref-1");
+  assert.equal(context.cachedInstanceSettings("codex:local", "general")?.blocked, true,
+    "save() 会先使实例缓存失效（blocked=true）");
+  assert.equal(defaultModelSelect.disabled, true, "保存期间其他控件仍应保持禁用");
+  assert.equal(trigger.disabled, false, "本次显示模型保存期间多选触发器不能因自身缓存失效被禁用");
+  assert.equal(getActivePopup()?.trigger, trigger, "首次保存期间多选菜单应保持打开");
+
+  // 触发 fitPopup() 不能关闭正在连续勾选的多选菜单
+  context.fitPopup();
+  assert.equal(getActivePopup()?.trigger, trigger, "fitPopup() 不得关闭未禁用的多选菜单");
+
+  // 2) 首次保存尚未完成时，通过真实 popup.js 按钮点击勾选第二个模型
+  clickOption("m3");
+  assert.equal(pendingSaves.length, 1, "保存飞行中第二次勾选不能并发重复请求");
+  assert.equal(trigger.children[0].textContent, "已全部隐藏（0/3）");
+  assert.deepEqual(
+    getActivePopup().list.querySelectorAll('button[aria-checked="true"]').map(n => n.dataset.value),
+    [],
+    "弹层勾选状态应立即反映连续勾选结果",
+  );
+
+  // 3) 放行第一次保存回执（带新 preferenceRevision=pref-2），应自动串行发出第二次合并保存
+  serverHidden = ["m2", "m1"];
+  serverPrefRev = 2;
+  serverInstRev = 2;
+  pendingSaves.shift().resolve(makeSnapshot(true));
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(pendingSaves.length, 1, "第一次保存完成后应自动用新版本发出排队中的第二次保存");
+  assert.deepEqual(pendingSaves[0].payload.settings, { hiddenModelIds: ["m2", "m1", "m3"] });
+  assert.equal(pendingSaves[0].payload.expectedPreferenceRevision, "pref-2");
+  assert.equal(trigger.disabled, false, "第二次保存飞行期间触发器仍保持可连续勾选");
+  assert.equal(getActivePopup()?.trigger, trigger);
+
+  // 4) 放行第二次保存回执，全部完成且弹层持续保持打开，默认模型列表同步过滤
+  serverHidden = ["m2", "m1", "m3"];
+  serverPrefRev = 3;
+  serverInstRev = 3;
+  pendingSaves.shift().resolve(makeSnapshot(true));
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(pendingSaves.length, 0);
+  assert.equal(getActivePopup()?.trigger, trigger, "全部保存完成后多选菜单仍保持打开");
+  assert.equal(trigger.disabled, false);
+  assert.equal(trigger.children[0].textContent, "已全部隐藏（0/3）");
+  assert.equal(findById("settings-general-model").disabled, false);
+  assert.deepEqual(
+    Array.from(findById("settings-general-model").selectOptions, o => o.value),
+    [""],
+    "默认模型选项应同步过滤已隐藏模型",
+  );
+
+  // 5) 权限变只读时，即使处于保存飞行中也立即禁用触发器并关闭菜单
+  clickOption("m1"); // 恢复显示 m1
+  assert.equal(pendingSaves.length, 1);
+  assert.equal(trigger.disabled, false);
+  context.session.readOnly = true;
+  for (const fn of sharedListeners) fn({ instance: false });
+  assert.equal(trigger.disabled, true, "只读切换后必须立即禁用多选触发器");
+  assert.equal(getActivePopup(), null, "只读禁用后必须关闭多选菜单");
+  serverHidden = ["m2", "m3"];
+  serverPrefRev = 4;
+  serverInstRev = 4;
+  pendingSaves.shift().resolve(makeSnapshot(true));
+  await new Promise(resolve => setImmediate(resolve));
+
+  // 6) 第 5 步权限变更导致保存被拒绝后处于待重新读取状态；恢复可写并重新核对后，再测他端更晚变更拦截
+  assert.equal(trigger.disabled, true, "只读打断保存后须保持禁用直至重新读取核对");
+  context.session.readOnly = false;
+  await mounted.show();
+  assert.equal(trigger.disabled, false);
+  trigger.click();
+  assert.equal(getActivePopup()?.trigger, trigger, "重新核对后应可再次打开多选菜单");
+  clickOption("m2"); // 发出第 1 次保存：恢复 m2 -> ["m3"]
+  assert.equal(pendingSaves.length, 1);
+  clickOption("m3"); // 排队第 2 次保存：恢复 m3 -> []
+  assert.equal(pendingSaves.length, 1);
+  // 模拟他端发布了更晚版本 instanceRevision=10
+  for (const fn of sharedListeners) {
+    fn({ instance: true, instanceId: "codex:local", epoch: sharedSettingsState.epoch, instanceRevision: 10 });
+  }
+  serverHidden = ["m3"];
+  serverPrefRev = 5;
+  serverInstRev = 5; // 落后于 10
+  pendingSaves.shift().resolve(makeSnapshot(true));
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(pendingSaves.length, 0, "发现他端更晚变更时不能继续发出旧的排队保存覆盖他端配置");
+  mounted.dispose();
 });
 
 test("Token 明细使用文字行，不显示表格、表头、单价或介绍", () => {

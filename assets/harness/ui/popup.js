@@ -186,7 +186,7 @@ export function renderPopup() {
   if (hasFooter) list.append(options);
   if (!choices.some(option => !option.footer)) options.append(createMenuEmpty(
     query ? trigger.selectSearchLabel ? "没有匹配的选项，请修改搜索条件" : "没有匹配的项目，请修改搜索条件"
-      : hasFooter ? "本机暂无可用项目" : "暂无可用选项", "popover-empty"));
+      : trigger.popupEmptyText || (hasFooter ? "本机暂无可用项目" : "暂无可用选项"), "popover-empty"));
   choices.forEach(option => {
     if (option.separatorBefore) {
       (option.footer ? list : options).append(createMenuSeparator("popup-separator"));

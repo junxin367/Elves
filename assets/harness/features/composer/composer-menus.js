@@ -71,7 +71,7 @@ export function renderModelMenu() {
   // 用户要求共用菜单项，但模型与思考深度的选择、独立滚动和焦点恢复仍归本模块管理。
   const group = createMenuGroup("模型", "model-options");
   const modelId = currentModelId(), matchedModel = currentModel(), selectedReasoning = currentEffort();
-  // 用户要求 Claude 可按实例隐藏模型；完整目录保留用于当前模型和能力判断，仅过滤可重新选择的条目。
+  // 用户要求所有会话实例统一支持按实例隐藏模型；完整目录保留用于当前模型和能力判断，仅过滤可重新选择的条目。
   const visibleModels = availableModels.filter(model =>
     `${model.displayName || ""} ${model.model}`.toLowerCase().includes(modelQuery.trim().toLowerCase()));
   for (const model of visibleModels) group.append(choice(model.displayName || model.model, matchedModel === model, () => {

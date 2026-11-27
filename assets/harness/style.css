@@ -879,10 +879,11 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .new-chat-backend>.backend-icon-codex,.backend-picker-popup .popup-option[data-value=codex]>.ui-icon,.thread-link>.codex-session-icon,.thread-label-line>.codex-session-icon,.thread-backend-icon[data-backend=codex]{color:var(--text);color:light-dark(var(--text),#fff)}
 /* 会话类型和项目选择器共用通用 Select 的勾选、鼠标悬停与键盘轮廓，不再单独定义选中填色。 */
 /* 项目与实例列表接入公共菜单；保留项目搜索、固定底部入口和各自宽度，不再使用专用行高与圆角。 */
+.ui-popup .popup-list.has-footer{display:flex;flex-direction:column;overflow:hidden}
+.ui-popup .popup-options{overflow:auto;min-height:0;scrollbar-width:thin;overscroll-behavior:contain}
+.ui-popup .popup-option-footer{flex-shrink:0}
 .project-picker-popup .popup-list{scrollbar-width:thin}
-.project-picker-popup .popup-list.has-footer{display:flex;flex-direction:column;overflow:hidden}
-.project-picker-popup .popup-options{overflow:auto;min-height:0;scrollbar-width:thin;overscroll-behavior:contain}
-.project-picker-popup .popup-option-footer{flex-shrink:0;margin-top:4px;border-top:1px solid var(--line)}
+.project-picker-popup .popup-option-footer{margin-top:4px;border-top:1px solid var(--line)}
 .project-picker-popup .popup-option>.ui-icon{color:var(--muted)}
 .appearance-heading{flex-shrink:0}
 .appearance-body{overflow:auto;min-height:0;padding:0 2px;scrollbar-width:thin}
@@ -2304,9 +2305,12 @@ body{font-weight:var(--ui-font-weight,400)}
 .appearance-screen .appearance-font-family{width:120px}
 .appearance-screen .select-trigger:where(#appearance-preset){width:140px}
 .appearance-screen .select-trigger:where(#conversation-naming-model),
+.appearance-screen .select-trigger.instance-model-visibility-trigger,
 .appearance-screen .instance-model-defaults-selectors>.select-trigger:not(.instance-model-default-effort){
   width:var(--settings-model-width)
 }
+/* 用户要求「显示模型」改用多选菜单，触发器复用模型宽度（240px）与左对齐摘要，避免长开关列表占用页面。 */
+.appearance-screen .select-trigger.instance-model-visibility-trigger>.select-label{text-align:left}
 .appearance-screen .conversation-naming-target-selectors>#conversation-naming-instance{
   flex:0 1 var(--settings-instance-width);width:var(--settings-instance-width)
 }

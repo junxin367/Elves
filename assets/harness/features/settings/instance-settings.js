@@ -3,6 +3,7 @@ import { button, element } from "../../ui/dom.js";
 import { openSettingsPrompt } from "../../ui/dialog.js";
 import { icon } from "../../ui/icons.js";
 import { selectControl, setSelectOptions } from "../../ui/select.js";
+import { activePopup, closePopup, openPopup, renderPopup, togglePopup } from "../../ui/popup.js";
 import { connected, session } from "../../core/state.js";
 import { readCache } from "../../core/stores.js";
 import { loadModels, refreshSkillCatalog, updateComposer } from "../../core/actions.js";
@@ -98,15 +99,19 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
   setSelectedInstance = () => {} }) {
   const scope = privateInputScope(session);
   let disposed = false, selected = "", record = null, detecting = false, loading = false, saving = false, needsRead = false;
-  let pendingModelFocus = null, recordIdentity = "", promptEditor = null;
+  let savingHidden = false, pendingHidden = null, queuedHidden = null, recordIdentity = "", promptEditor = null;
   let generation = 0, message = "", externalRefresh = false, inventoryQuery = "";
   const inventoryControls = new Set();
   const alive = () => !disposed && page.isConnected && scope === privateInputScope(session);
   // 过期缓存后台核对时可继续编辑；已知跨端变化或服务、CLI 身份变化后，旧记录只供查看。
-  const writable = () => alive() && connected && session && !session.readOnly && !record?.readOnly
-    && !detecting && !saving && !needsRead && !!record
-    && recordIdentity === instanceSettingsIdentity(selected, name) && !cachedInstanceSettings(selected, name)?.blocked
+  // 拆分身份权限校验与缓存阻断校验：显示模型连续勾选保存期间，本次 save() 自身会先将缓存标为 blocked，
+  // 仅放行本次保存导致的缓存失效，身份、权限、只读与外部刷新阻断仍严格生效。
+  const identityWritable = () => alive() && connected && session && !session.readOnly && !record?.readOnly
+    && !detecting && !needsRead && !!record
+    && recordIdentity === instanceSettingsIdentity(selected, name)
     && !!currentInstance() && !currentInstance().error && record.backend === currentInstance().backend;
+  const baseWritable = () => identityWritable() && !cachedInstanceSettings(selected, name)?.blocked;
+  const writable = () => baseWritable() && !saving;
   const currentInstance = () => availableSessionInstances().find(instance => instance.id === selected);
   const promptReadable = () => alive() && connected && !!record
     && recordIdentity === instanceSettingsIdentity(selected, name);
@@ -135,6 +140,25 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
   actions.append(reload);
   // 用户要求设置页移除“重新检测实例”按钮；实例目录仍由进入设置及服务状态变化自动检测，当前配置保留“重新读取”。
   page.append(head, content, status, actions);
+  // 用户要求所有会话实例统一提供「显示模型」且改用多选菜单，避免长开关列表占用页面；
+  // 持久复用同一触发器并在连续勾选保存期间保持弹层不关闭，保留搜索词、焦点与滚动位置。
+  const visibilityTrigger = button("", "显示模型", () => togglePopup(visibilityTrigger),
+    "select-trigger instance-model-visibility-trigger");
+  visibilityTrigger.id = `settings-${name}-hiddenModelIds`;
+  visibilityTrigger.setAttribute("aria-haspopup", "menu");
+  visibilityTrigger.setAttribute("aria-expanded", "false");
+  visibilityTrigger.searchMode = "auto";
+  visibilityTrigger.selectSearchLabel = "搜索模型";
+  visibilityTrigger.selectSearchPlaceholder = "搜索模型";
+  visibilityTrigger.popupEmptyText = "尚未取得当前实例的完整模型目录";
+  visibilityTrigger.menuOptions = [];
+  visibilityTrigger.onkeydown = event => {
+    if (visibilityTrigger.disabled || event.isComposing) return;
+    if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+      event.preventDefault();
+      openPopup(visibilityTrigger, { edge: event.key === "Home" ? "first" : event.key === "End" ? "last" : null, focusSearch: false });
+    }
+  };
   const controls = new Set(), promptControls = new Set();
   function sync() {
     instances.disabled = !alive() || detecting || saving || !availableSessionInstances().length;
@@ -148,7 +172,15 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     // 用户要求已有配置在后台核对时继续显示，不再反复进入整页读取状态；首次无缓存时才显示读取提示。
     status.textContent = detecting ? "正在检测会话实例…" : loading && !record ? "正在读取实例设置…" : saving ? "正在保存…" : message;
     const canWrite = writable();
-    for (const control of controls) control.disabled = !canWrite || control.settingsUnsupported === true;
+    // 仅本次显示模型保存（savingHidden）飞行中忽略自身 invalidateInstanceSettings() 导致的 blocked，
+    // 保留全部身份、授权、只读与错误状态校验；非本保存期或保存其他设置时仍与 canWrite 一致。
+    const canWriteVisibility = savingHidden ? identityWritable() : canWrite;
+    for (const control of controls) {
+      control.disabled = (control === visibilityTrigger ? !canWriteVisibility : !canWrite)
+        || control.settingsUnsupported === true;
+    }
+    if (activePopup?.trigger === visibilityTrigger && (!visibilityTrigger.isConnected || visibilityTrigger.disabled))
+      closePopup();
     const canReadPrompt = promptReadable() && !detecting && !saving;
     for (const control of promptControls) control.disabled = !canReadPrompt;
     if (promptEditor) alive() ? promptEditor.sync() : promptEditor.close();
@@ -255,7 +287,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     const values = record.settings;
     const card = section(content, "实例默认值");
     const models = record.models || [];
-    const hidden = ["claude", "antigravity"].includes(record.backend) ? values.hiddenModelIds || [] : [];
+    const hidden = Array.isArray(values.hiddenModelIds) ? values.hiddenModelIds : [];
     const modelControl = settingSelect("model", "默认模型",
       [inherit,
         ...models.filter(model => !hidden.includes(model.model))
@@ -288,45 +320,106 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     // 实例默认值与输入区记住的选择是不同来源；明确既有优先级，不能把此处描述为覆盖全部新会话选择。
     content.append(element("p", "appearance-hint",
       "新会话优先使用输入区已记住且仍可用的模型与思考深度，没有可用选择时使用实例默认值。已有会话保留各自设置。"));
-    if (record.backend === "codex") {
-      const reasoning = section(content, "思考深度");
-      addSwitch(reasoning, "ultraReasoningEnabled", "开放 Ultra 思考深度",
-        "默认关闭；开启后，仅在支持的 Codex 模型中显示 Ultra。", values.ultraReasoningEnabled);
+  }
+  function renderCodexReasoning() {
+    if (record.backend !== "codex") return;
+    const reasoning = section(content, "思考深度");
+    addSwitch(reasoning, "ultraReasoningEnabled", "开放 Ultra 思考深度",
+      "默认关闭；开启后，仅在支持的 Codex 模型中显示 Ultra。", record.settings.ultraReasoningEnabled);
+  }
+  function currentHiddenModelIds() {
+    return pendingHidden ?? (Array.isArray(record?.settings?.hiddenModelIds) ? record.settings.hiddenModelIds : []);
+  }
+  function syncModelVisibilityTrigger() {
+    const owner = record, ownerId = selected, ownerIdentity = recordIdentity;
+    if (!owner || !Array.isArray(owner.settings?.hiddenModelIds)) {
+      visibilityTrigger.menuOptions = [];
+      return;
     }
+    const hidden = currentHiddenModelIds(), hiddenSet = new Set(hidden), models = owner.models || [];
+    const hiddenInCatalog = models.filter(model => hiddenSet.has(model.model)).length;
+    const visibleCount = models.length - hiddenInCatalog;
+    const summary = !models.length
+      ? (hidden.length ? `已隐藏 ${hidden.length} 个模型` : "暂无可选模型")
+      : !hiddenInCatalog
+        ? `全部显示（${models.length}）`
+        : visibleCount === 0
+          ? `已全部隐藏（0/${models.length}）`
+          : `已显示 ${visibleCount}/${models.length} 个模型`;
+    visibilityTrigger.setAttribute("aria-description", `当前状态：${summary}`);
+    visibilityTrigger.title = `显示模型：${summary}`;
+    visibilityTrigger.replaceChildren(element("span", "select-label", summary), icon("chevron"));
+    visibilityTrigger.popupEmptyText = owner.capabilityError
+      ? `未能返回模型列表（${owner.capabilityError}）`
+      : "尚未取得当前实例的完整模型目录";
+    // 无目录且无已隐藏项时禁用触发器并在下方说明原因；存在历史隐藏项时仍允许打开菜单执行“全部显示”。
+    visibilityTrigger.settingsUnsupported = !models.length && !hidden.length;
+    const applyHidden = next => {
+      if (selected !== ownerId || recordIdentity !== ownerIdentity || !visibilityTrigger.isConnected) return;
+      if (savingHidden) {
+        if (!identityWritable()) { sync(); return; }
+        pendingHidden = next;
+        queuedHidden = next;
+        syncModelVisibilityTrigger();
+        if (activePopup?.trigger === visibilityTrigger) renderPopup();
+        return;
+      }
+      if (!writable()) return;
+      pendingHidden = next;
+      queuedHidden = null;
+      savingHidden = true;
+      syncModelVisibilityTrigger();
+      if (activePopup?.trigger === visibilityTrigger) renderPopup();
+      void save({ hiddenModelIds: next });
+    };
+    // 完整原生目录仍保留在多选菜单中，隐藏名单只按当前实例保存，不能变成全局模型白名单或修改原生配置文件。
+    visibilityTrigger.menuOptions = [
+      ...models.map(model => {
+        const label = model.displayName || model.model;
+        return {
+          value: model.model,
+          label,
+          description: label === model.model ? "" : model.model,
+          searchText: model.model,
+          checkable: true,
+          selected: !hiddenSet.has(model.model),
+          keepOpen: true,
+          action: () => {
+            const next = new Set(currentHiddenModelIds());
+            if (next.has(model.model)) next.delete(model.model);
+            else next.add(model.model);
+            applyHidden([...next]);
+          }
+        };
+      }),
+      {
+        value: "__show_all__",
+        label: "全部显示",
+        footer: true,
+        separatorBefore: true,
+        keepOpen: true,
+        disabled: !hidden.length,
+        action: () => {
+          if (currentHiddenModelIds().length) applyHidden([]);
+        }
+      }
+    ];
   }
   function renderModelVisibility() {
-    if (!["claude", "antigravity"].includes(record.backend) || !Array.isArray(record.settings.hiddenModelIds)) return;
-    const owner = record, ownerId = selected, hidden = record.settings.hiddenModelIds, models = record.models || [];
-    const card = section(content, "显示模型", record.backend);
-    const reset = button("全部显示", "显示当前实例的全部模型", () => {
-      if (record === owner && selected === ownerId && reset.isConnected && hidden.length)
-        void save({ hiddenModelIds: [] });
-    }, "text-button");
-    reset.settingsUnsupported = !hidden.length; controls.add(reset);
-    const summary = element("div", "appearance-field");
-    summary.append(fieldCopy("模型列表",
-      "默认显示全部；关闭某项后，仅从此实例的模型选择列表隐藏。新增模型自动显示，已有会话保留当前模型。"), reset);
-    card.append(summary);
-    if (!models.length) card.append(element("p", "appearance-hint",
+    // 用户要求所有会话实例统一提供「显示模型」且使用多选菜单；与实例默认值保持同一排布，避免长列表占满页面。
+    if (!Array.isArray(record.settings.hiddenModelIds)) return;
+    const models = record.models || [];
+    const card = section(content, "显示模型");
+    syncModelVisibilityTrigger();
+    const row = element("div", "appearance-field");
+    row.append(fieldCopy("可选模型",
+      "默认显示全部；取消勾选后，仅从此实例的模型选择列表隐藏。新增模型自动显示，已有会话保留当前模型。"), visibilityTrigger);
+    controls.add(visibilityTrigger);
+    card.append(row);
+    if (!models.length) content.append(element("p", "appearance-hint",
       record.capabilityError
         ? `当前实例未能返回模型列表（${record.capabilityError}），请确认登录状态后点击重新读取。`
-        : "尚未取得当前实例的完整模型目录；可以先恢复全部显示，再重新读取。"));
-    // 完整原生目录仍保留在设置页，隐藏名单只按当前实例保存，不能变成全局模型白名单或修改 Claude 配置。
-    for (const model of models) {
-      const label = model.displayName || model.model;
-      const row = element("label", "appearance-field");
-      const control = switchControl(`显示模型 ${label}`, !hidden.includes(model.model));
-      control.dataset.modelVisibilityId = model.model;
-      control.onchange = () => {
-        if (record !== owner || selected !== ownerId || !control.isConnected) return;
-        const next = new Set(hidden);
-        control.checked ? next.delete(model.model) : next.add(model.model);
-        pendingModelFocus = { instanceId: ownerId, model: model.model };
-        void save({ hiddenModelIds: [...next] });
-      };
-      row.append(fieldCopy(label, label === model.model ? "" : model.model), control);
-      controls.add(control); card.append(row);
-    }
+        : "尚未取得当前实例的完整模型目录；可以先在菜单中恢复全部显示，再重新读取。"));
   }
   function renderInventory() {
     const inventory = record.inventory || {};
@@ -507,20 +600,25 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     if (record) {
       if (name === "general") {
         // 合并页面只读取当前实例的一份设置；旧服务未返回模型目录时仍可显示已有常规配置。
+        // 所有实例统一按「实例默认值 → 显示模型」排列，保持切换实例时的布局一致。
         if (Array.isArray(record.models)) renderModels();
         renderModelVisibility();
+        if (Array.isArray(record.models)) renderCodexReasoning();
         renderGeneral();
       }
-      else if (name === "models") renderModels();
+      else if (name === "models") {
+        renderModels();
+        renderModelVisibility();
+        renderCodexReasoning();
+      }
       else renderInventory();
       renderExtraSettings();
       if (record.readOnly || session?.readOnly) message ||= record.readOnlyReason || "当前为只读访问";
     }
     sync();
-    if (pendingModelFocus && !saving && !loading && selected === pendingModelFocus.instanceId) {
-      const control = [...controls].find(control => control.dataset?.modelVisibilityId === pendingModelFocus.model);
-      if (control && !control.disabled) control.focus({ preventScroll: true });
-      pendingModelFocus = null;
+    if (activePopup?.trigger === visibilityTrigger) {
+      if (visibilityTrigger.isConnected && !visibilityTrigger.disabled) renderPopup();
+      else closePopup();
     }
   }
   function checkedResult(result, id) {
@@ -530,7 +628,7 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
         || !result.settings || Array.isArray(result.settings) || typeof result.settings !== "object")
       throw new Error("实例设置返回结果无法确认，请重新读取。");
     const values = result.settings;
-    if (["claude", "antigravity"].includes(result.backend) && values.hiddenModelIds != null
+    if (values.hiddenModelIds != null
         && (!Array.isArray(values.hiddenModelIds) || values.hiddenModelIds.length > 512
           || new Set(values.hiddenModelIds).size !== values.hiddenModelIds.length
           || values.hiddenModelIds.some(id => typeof id !== "string" || !id.length || id.length > 200
@@ -648,11 +746,23 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     }
   }
   async function save(settings, expected = record) {
-    if (!writable()) { render(); return "当前无法保存，请重新读取核对。"; }
+    const isHiddenOnly = Object.keys(settings).length === 1 && Object.hasOwn(settings, "hiddenModelIds");
+    if (!writable()) {
+      if (isHiddenOnly) { savingHidden = false; pendingHidden = null; queuedHidden = null; }
+      render();
+      return "当前无法保存，请重新读取核对。";
+    }
     const id = selected, before = record, identity = instanceSettingsIdentity(selected, name);
     // 保存先撤销同一实例旧读取；旧快照不能在成功回执之后回填，也不能带着旧版本继续写入其他分类。
     retireRead(); invalidateInstanceSettings(id);
-    saving = true; message = ""; render();
+    saving = true; message = "";
+    if (isHiddenOnly) {
+      savingHidden = true;
+      sync();
+    } else {
+      render();
+    }
+    let keepHiddenSaving = false;
     try {
       const result = await api("/api/settings/instance", { instanceId: id, section: name,
         operation: "save", settings, expectedRevision: expected.revision,
@@ -692,11 +802,23 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
         // 用户修改原生 Skill 后及时撤销旧补全缓存；只为当前实例主动重读，不借用其他会话的环境探测。
         void refreshSkillCatalog({ reload: id === activeInstanceId() }).catch(() => {});
       }
+      if (isHiddenOnly && queuedHidden !== null && alive() && selected === id && !needsRead
+          && identity === instanceSettingsIdentity(id, name)) {
+        const followUp = queuedHidden;
+        queuedHidden = null;
+        if (JSON.stringify(followUp) !== JSON.stringify(record.settings.hiddenModelIds)) {
+          keepHiddenSaving = true;
+          saving = false;
+          syncModelVisibilityTrigger();
+          return await save({ hiddenModelIds: followUp }, record);
+        }
+      }
       if (alive()) message = Object.hasOwn(settings, "hiddenModelIds")
         ? "模型显示设置已保存，已有会话继续使用当前模型。"
         : "已保存，新会话或重新加载后生效。";
       return "";
     } catch (error) {
+      queuedHidden = null;
       const failure = `${error.message} 未自动重复保存，请重新读取核对。`;
       if (alive() && selected === id) {
         record = before; needsRead = true;
@@ -704,14 +826,19 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
       }
       return failure;
     } finally {
-      if (alive() && selected === id) {
-        saving = false; render();
-        if (externalRefresh) { externalRefresh = false; void read(); }
+      if (!keepHiddenSaving) {
+        if (isHiddenOnly) { savingHidden = false; pendingHidden = null; queuedHidden = null; }
+        if (alive() && selected === id) {
+          saving = false; render();
+          if (externalRefresh) { externalRefresh = false; void read(); }
+        }
       }
     }
   }
   async function show(force = false) {
     if (!alive() || saving) return;
+    if (activePopup?.trigger === visibilityTrigger) closePopup();
+    pendingHidden = null; queuedHidden = null;
     // 重新检测开始即撤销旧读取和写入口；迟到的旧回包不能盖掉“实例不可用”，也不能恢复旧控件。
     const version = retireRead();
     // 已检测的目录可直接准备目标；重新检测才等待环境扫描，避免每次切回设置都重复启动检测。
@@ -753,6 +880,8 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
   }
   instances.onchange = () => {
     if (!alive() || saving || detecting) { sync(); return; }
+    if (activePopup?.trigger === visibilityTrigger) closePopup();
+    pendingHidden = null; queuedHidden = null;
     selected = instances.value; setSelectedInstance(selected); void read();
   };
   display.onchange = () => {
@@ -770,7 +899,15 @@ export function mountInstanceSettingsPage({ page, section: name, getSelectedInst
     }
   });
   render();
-  return { show, dispose() { disposed = true; promptEditor?.close(); retireRead(); unsubscribe(); } };
+  return {
+    show,
+    dispose() {
+      disposed = true;
+      pendingHidden = null; queuedHidden = null;
+      if (activePopup?.trigger === visibilityTrigger) closePopup();
+      promptEditor?.close(); retireRead(); unsubscribe();
+    }
+  };
 }
 
 export function mountShortcuts(page) {

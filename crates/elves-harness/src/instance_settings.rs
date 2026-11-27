@@ -72,6 +72,29 @@ fn claude_default_effort(value: &Value) -> Result<Option<&str>, ApiError> {
         .map(Some).ok_or_else(|| ApiError::new(400, "Claude 默认思考深度必须是当前模型支持的原生等级，或使用模型默认"))
 }
 
+fn apply_hidden_model_visibility(catalog: &mut Value, hidden: &[String]) {
+    // 用户要求所有会话实例（Codex、Claude、Antigravity）统一默认显示全部模型并允许按实例隐藏；
+    // 仅在返回视图上叠加 hiddenByInstance，保留原生完整目录及能力，隐藏不能改变已有会话的执行模型。
+    if let Some(rows) = catalog["data"].as_array_mut() {
+        for row in rows {
+            row["hiddenByInstance"] = json!(row["model"]
+                .as_str()
+                .is_some_and(|id| hidden.iter().any(|hidden| hidden == id)));
+        }
+    }
+}
+
+pub(super) fn decorate_codex_model_visibility(
+    directory: &Path,
+    instance: &str,
+    mut catalog: Value,
+) -> Result<Value, ApiError> {
+    let (preference, _) = preferences(directory)?;
+    let hidden = hidden_model_ids(&preference["instances"][instance]["hiddenModelIds"])?;
+    apply_hidden_model_visibility(&mut catalog, &hidden);
+    Ok(catalog)
+}
+
 pub(super) fn decorate_claude_model_visibility(
     directory: &Path,
     instance: &str,
@@ -79,13 +102,7 @@ pub(super) fn decorate_claude_model_visibility(
 ) -> Result<Value, ApiError> {
     let (preference, _) = preferences(directory)?;
     let hidden = hidden_model_ids(&preference["instances"][instance]["hiddenModelIds"])?;
-    // 用户要求 Claude 默认显示全部模型、允许按实例隐藏；保留原生完整目录及能力，隐藏不能改变已有会话的执行模型。
-    if let Some(rows) = catalog["data"].as_array_mut() {
-        for row in rows {
-            row["hiddenByInstance"] = json!(row["model"].as_str()
-                .is_some_and(|id| hidden.iter().any(|hidden| hidden == id)));
-        }
-    }
+    apply_hidden_model_visibility(&mut catalog, &hidden);
     // 用户要求在会话实例设置 Claude 默认深度；只叠加完整目录的默认值，历史会话快照仍保留自身等级。
     if catalog["catalogComplete"] != false {
         let effort = claude_default_effort(&preference["instances"][instance]["defaultReasoningEffort"])?;
@@ -203,13 +220,7 @@ pub(super) fn decorate_antigravity_model_visibility(
         antigravity_default_model(&preference["instances"][instance]["defaultModel"])?;
     let configured_effort =
         antigravity_default_effort(&preference["instances"][instance]["defaultReasoningEffort"])?;
-    if let Some(rows) = catalog["data"].as_array_mut() {
-        for row in rows {
-            row["hiddenByInstance"] = json!(row["model"]
-                .as_str()
-                .is_some_and(|id| hidden.iter().any(|hidden| hidden == id)));
-        }
-    }
+    apply_hidden_model_visibility(&mut catalog, &hidden);
     if let Some(model) = configured_model
         && catalog["data"]
             .as_array()
@@ -1561,10 +1572,11 @@ pub(super) async fn settings(
             },
         )?;
         if changes.contains_key("hiddenModelIds") {
-            if target.backend != "claude" || !matches!(section, "general" | "models") || changes.len() != 1
+            // 用户要求所有会话实例统一支持显示模型；写入只保存在 Elves 实例偏好，不修改 Codex/Claude 原生配置文件。
+            if !matches!(section, "general" | "models") || changes.len() != 1
                 || !changes["hiddenModelIds"].is_array()
             {
-                return Err(ApiError::new(400, "模型显示设置仅支持单独修改当前 Claude 实例的隐藏名单"));
+                return Err(ApiError::new(400, "模型显示设置仅支持单独修改当前实例的隐藏名单"));
             }
             let ids = hidden_model_ids(&changes["hiddenModelIds"])?;
             let (preference, _) = preferences(directory)?;
@@ -1771,9 +1783,11 @@ pub(super) async fn settings(
         validate_compact(window)?;
         values["autoCompactWindow"] = window.clone();
     }
-    if target.backend == "claude" && matches!(section, "general" | "models") {
+    if model_settings {
         values["hiddenModelIds"] = json!(hidden_model_ids(
             &preference["instances"][instance]["hiddenModelIds"])?);
+    }
+    if target.backend == "claude" && matches!(section, "general" | "models") {
         values["reasoningEffort"] = json!(claude_default_effort(
             &preference["instances"][instance]["defaultReasoningEffort"])?);
     }
@@ -1830,6 +1844,8 @@ pub(super) async fn settings(
         if target.backend == "claude" {
             // 隐藏名单可能在本次保存中改变；返回前按已确认的新偏好标记，完整模型与能力不变。
             catalog = decorate_claude_model_visibility(directory, instance, catalog)?;
+        } else if target.backend == "codex" {
+            catalog = decorate_codex_model_visibility(directory, instance, catalog)?;
         }
         response["models"] = catalog["data"].clone();
         response["effectiveModel"] = catalog["defaultModel"].clone();
@@ -1910,6 +1926,33 @@ mod tests {
     }
 
     #[test]
+    fn codex_model_visibility_defaults_to_all_and_preserves_native_catalog() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = json!({"data":[
+            {"model":"gpt-5.4","supportedReasoningEfforts":[{"reasoningEffort":"high"}]},
+            {"model":"gpt-5.4-mini","supportedReasoningEfforts":[{"reasoningEffort":"medium"}]}],
+            "defaultModel":"gpt-5.4","defaultReasoningEffort":"high"});
+        let shown = decorate_codex_model_visibility(directory.path(), "codex:local", catalog.clone()).unwrap();
+        assert_eq!(shown["data"].as_array().unwrap().len(), 2);
+        assert_eq!(shown["data"][0]["hiddenByInstance"], false);
+        assert_eq!(shown["data"][1]["hiddenByInstance"], false);
+        std::fs::write(directory.path().join(PREFERENCES_FILE),
+            serde_json::to_string(&json!({"instances":{
+                "codex:local":{"hiddenModelIds":["gpt-5.4-mini"]},
+                "codex:wsl:ubuntu":{"hiddenModelIds":["gpt-5.4"]}
+            }})).unwrap()).unwrap();
+        let local = decorate_codex_model_visibility(directory.path(), "codex:local", catalog.clone()).unwrap();
+        let wsl = decorate_codex_model_visibility(directory.path(), "codex:wsl:ubuntu", catalog.clone()).unwrap();
+        assert_eq!(local["data"][0]["hiddenByInstance"], false);
+        assert_eq!(local["data"][1]["hiddenByInstance"], true);
+        assert_eq!(wsl["data"][0]["hiddenByInstance"], true);
+        assert_eq!(wsl["data"][1]["hiddenByInstance"], false);
+        assert_eq!(local["defaultModel"], "gpt-5.4");
+        assert_eq!(local["data"][1]["supportedReasoningEfforts"], catalog["data"][1]["supportedReasoningEfforts"]);
+        assert!(catalog["data"][1]["hiddenByInstance"].is_null(), "原始 Codex 目录缓存不能被展示偏好污染");
+    }
+
+    #[test]
     fn claude_model_visibility_defaults_to_all_and_preserves_native_catalog() {
         let directory = tempfile::tempdir().unwrap();
         let catalog = json!({"data":[
@@ -1965,6 +2008,7 @@ mod tests {
         assert!(validate_hidden_model_selection(&["retired".into()], &["retired".into()], None).is_ok());
         assert!(validate_hidden_model_selection(&[], &["retired".into()], None).is_ok());
         assert!(updated_native("claude", "general", "{}", &json!({"hiddenModelIds":["present"]})).is_err());
+        assert!(updated_native("codex", "general", "", &json!({"hiddenModelIds":["present"]})).is_err());
     }
 
     #[test]
