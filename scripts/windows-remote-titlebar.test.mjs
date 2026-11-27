@@ -43,8 +43,9 @@ test("独立窗口的原生标题跟随页面标题，主窗口保持程序标�
 
 test("会话窗口页面标题同步顶部会话标题，重命名、切换和重建界面后继续有效", async () => {
   const pageSource = await readFile(new URL("../assets/harness/features/session/side-panel.js", import.meta.url), "utf8");
-  const start = pageSource.indexOf("export function installSessionWindowTitleSync()");
-  const body = pageSource.slice(start, pageSource.indexOf("let workspaceSidePanelStateSignature", start)).replace(/^export /, "");
+  // 标题同步的安装状态属于模块；截取真实声明，避免只运行函数时遗漏依赖。
+  const start = pageSource.indexOf("let sessionWindowTitleSyncInstalled = false;");
+  const body = pageSource.slice(start, pageSource.indexOf("let workspaceSidePanelStateSignature", start)).replace(/^export /m, "");
   assert.ok(start > 0 && body.includes("function installSessionWindowTitleSync"));
   const run = ({ sessionWindow, heading }) => {
     const observers = [];
