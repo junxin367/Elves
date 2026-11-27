@@ -555,25 +555,29 @@ html[data-workspace-side-panel=true] .composer-anchor>.composer-metrics,
 .composer-tooltip{position:fixed;inset:auto;margin:0;max-width:min(320px,calc(100vw - 16px));max-height:calc(100dvh - 16px);padding:6px 10px;border:1px solid color-mix(in srgb,var(--tooltip-text) 18%,var(--tooltip-bg));border-radius:12px;background:var(--tooltip-bg);color:var(--tooltip-text);box-shadow:0 4px 16px #0002;font-size:calc(var(--font-size)*.85);line-height:1.5;white-space:normal;overflow-wrap:anywhere;overflow:hidden;pointer-events:none;user-select:none;z-index:calc(var(--layer-menu,200) + 1)}
 /* Token 统计的纯文字回退保持视口内换行；详情卡片按下方 composer-metrics-detail 的尺寸展示。 */
 .composer-tooltip.composer-metrics-tooltip{width:max-content;max-width:calc(100vw - 16px);font-variant-numeric:tabular-nums}
-/* 用户确认 Token 详情只保留模型、Token、费用和关键耗时，不显示单价、公式或口径说明。
- * 350px 对齐确认稿；窄屏保留左右各 8px，与 ui/tooltip.js 的可视视口定位同步。 */
-.composer-tooltip.composer-metrics-detail{width:350px;max-width:calc(100vw - 16px);padding:0;border:1px solid var(--line);border-radius:10px;background:var(--control-bg,var(--side));color:var(--text);font-size:calc(var(--font-size)*.75);line-height:1.6;white-space:normal;overflow:auto;overscroll-behavior:contain;pointer-events:auto;user-select:text;scrollbar-width:thin}
-.composer-metrics-detail-header{position:sticky;top:0;z-index:1;min-height:43px;padding:5px 14px;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--line);background:var(--control-bg,var(--side))}
+/* 用户确认 Token 详情改为无表格文字行；308px、左右 16px 内边距沿用确认稿。
+ * 用户要求各处文字统一参考菜单说明字号：复用 appearance/apply.js 按界面字号 × 78.57% 四舍五入的公共变量，
+ * 标题、数量、费用与耗时均继承同一结果，不能再按父字号叠加缩放；
+ * 窄屏保留左右各 8px，与 ui/tooltip.js 的可视视口定位同步。 */
+.composer-tooltip.composer-metrics-detail{width:308px;max-width:calc(100vw - 16px);padding:0;border:1px solid var(--line);border-radius:12px;background:var(--control-bg,var(--side));color:var(--text);font-size:var(--menu-description-font-size);line-height:1.65;white-space:normal;overflow:auto;overscroll-behavior:contain;pointer-events:auto;user-select:text;scrollbar-width:thin}
+.composer-metrics-detail-header{position:sticky;top:0;z-index:1;padding:12px 16px 9px;display:flex;align-items:center;gap:8px;background:var(--control-bg,var(--side))}
 .composer-metrics-detail-header strong{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:inherit;font-weight:600}
-.composer-metrics-detail-close{display:grid;place-items:center;flex:0 0 28px;width:28px;height:28px;padding:0;border:0;border-radius:6px;background:transparent;color:var(--muted);font-size:20px;line-height:1;cursor:pointer}
+.composer-metrics-detail-close{display:grid;place-items:center;flex:0 0 28px;width:28px;height:28px;margin:-4px -4px -4px 0;padding:0;border:0;border-radius:6px;background:transparent;color:var(--muted);font-size:20px;line-height:1;cursor:pointer}
 .composer-metrics-detail-close:hover{background:var(--hover);color:var(--text)}
 .composer-metrics-detail-close:focus-visible{outline:1px solid var(--focus-ring);outline-offset:-1px}
-.composer-metrics-detail-body{padding:5px 14px 12px}
-.composer-metrics-detail table{width:100%;border-collapse:collapse;table-layout:fixed;font-size:inherit}
-.composer-metrics-detail th{padding:6px 0;border-bottom:1px solid var(--line);color:var(--muted);font-size:.85em;font-weight:400;text-align:left;white-space:nowrap}
-.composer-metrics-detail th:nth-child(1){width:36%}.composer-metrics-detail th:nth-child(2){width:34%}.composer-metrics-detail th:nth-child(3){width:30%}
-.composer-metrics-detail td{padding:6px 0;border:0;vertical-align:middle;overflow-wrap:anywhere}
-.composer-metrics-detail :is(td,th):last-child{text-align:right}
-.composer-metrics-detail tfoot td{padding:8px 0;border-top:1px solid var(--line);font-weight:600}
-.composer-metrics-detail-timings{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:7px 24px;padding-top:11px;border-top:1px solid var(--line);font-size:.92em}
-.composer-metrics-detail-timings>div{display:flex;justify-content:space-between;gap:8px;min-width:0}
-.composer-metrics-detail-timings span{color:var(--muted)}.composer-metrics-detail-timings b{font-weight:400;white-space:nowrap}
-@media(max-width:380px){.composer-metrics-detail-body{padding-inline:12px}.composer-metrics-detail-header{padding-inline:12px}.composer-metrics-detail-timings{column-gap:16px}}
+.composer-metrics-detail-body{padding:0 16px 14px}
+.composer-metrics-detail-usage>p{margin:0 0 5px}
+.composer-metrics-detail-label{color:var(--muted)}
+.composer-metrics-detail-usage .composer-metrics-detail-label{margin-right:8px}
+.composer-metrics-detail-count,.composer-metrics-detail-fee{display:inline-block;max-width:100%;overflow-wrap:anywhere;vertical-align:baseline}
+.composer-metrics-detail-fee{margin-left:7px;color:var(--muted);font-size:inherit}
+.composer-metrics-detail-total{padding-top:3px;font-weight:600}
+.composer-metrics-detail-total :is(.composer-metrics-detail-label,.composer-metrics-detail-fee){color:inherit}
+.composer-metrics-detail-total .composer-metrics-detail-fee{font-weight:500}
+.composer-metrics-detail-timings{margin-top:11px;padding-top:10px;border-top:1px solid var(--line);font-size:inherit;line-height:1.8}
+.composer-metrics-detail-timing-line{display:flex;flex-wrap:wrap;gap:0 18px}
+.composer-metrics-detail-timing-item{display:inline-flex;gap:5px;min-width:0;max-width:100%}
+.composer-metrics-detail-timing-item b{font-weight:400;overflow-wrap:anywhere}
 /* 用户要求压缩 hover 分行展示模型与实测统计；宽度最多 420px，继续使用通用提示层的 8px 视口边距。 */
 .composer-tooltip.compaction-tooltip{max-width:min(420px,calc(100vw - 16px));padding:10px 12px;white-space:pre-line;font-variant-numeric:tabular-nums;line-height:1.65}
 /* 用户要求上下文用量文字使用主题正文色；兼容旧标签页仍保有 muted 类时加载到这份样式。 */

@@ -17035,6 +17035,7 @@ function composerMetricsHarness({ animate = false, reducedMotion = false } = {})
         this.parentNode = null;
       },
       setAttribute(key, value) { this.attributes[key] = value; },
+      addEventListener(type, handler) { this[`on${type}`] = handler; },
       classList: { add: value => classes.add(value), remove: value => classes.delete(value), contains: value => classes.has(value) }
     };
     if (animate) item.animate = (frames, options) => {
@@ -19056,7 +19057,7 @@ test("Antigravity 历史会话在详情尚未加载时也能识别已启用实�
   assert.match(instanceSettingsSource, /name === "hooks" \? "hook" : "server"/);
 });
 
-test("Token 明细只显示 Token 和费用，不显示单价、公式或介绍", () => {
+test("Token 明细使用文字行，不显示表格、表头、单价或介绍", () => {
   const h = composerMetricsHarness(), c = h.context;
   const billing = { models: ["model-a"], rows: [
     { kind: "input", tokens: 18400, costUsd: .0368 },
@@ -19064,13 +19065,29 @@ test("Token 明细只显示 Token 和费用，不显示单价、公式或介绍"
     { kind: "cacheRead", tokens: 63200, costUsd: .01264 },
   ], totalTokens: 86400, totalCostUsd: .09744 };
   const value = c.normalizeComposerMetrics(h.value({ billing }));
-  const content = c.composerMetricsDetail(value, [["工具耗时", "31.2s"]]);
+  const content = c.composerMetricsDetail(value, [
+    ["首 Token", "0.42s"], ["本轮耗时", "32s"], ["缓存命中", "77.5%"],
+    ["输出速度", "150tk/s"], ["工具耗时", "31.2s"],
+  ]);
   const root = c.element("div", "");
   content.render(root, false, () => {});
-  assert.match(root.textContent, /model-a类型Token费用 \$/);
-  assert.match(root.textContent, /输入18,4000\.0368输出4,8000\.0480缓存读取63,2000\.0126/);
-  assert.match(root.textContent, /合计86,4000\.0974/);
-  assert.doesNotMatch(root.textContent, /单价|公式|口径|未缓存|其中|每百万|会话累计/);
+  assert.match(root.textContent, /model-a输入18,400· \$0\.0368输出4,800· \$0\.0480缓存读取63,200· \$0\.0126/);
+  assert.match(root.textContent, /合计86,400· \$0\.0974/);
+  assert.doesNotMatch(root.textContent, /类型|费用 \$|单价|公式|口径|未缓存|其中|每百万|会话累计/);
+  const flatten = node => [node, ...node.children.flatMap(flatten)];
+  const nodes = flatten(root);
+  assert.ok(nodes.every(node => !["table", "thead", "tbody", "tfoot", "tr", "td", "th"].includes(node.tag)));
+  assert.equal(nodes.filter(node => node.attributes.role === "listitem").length, 4);
+  assert.deepEqual(nodes.filter(node => node.className === "composer-metrics-detail-timing-line")
+    .map(node => node.children.length), [2, 2, 1], "每行最多两项指标，不使用固定表格列");
+  assert.equal(nodes.filter(node => node.tag === "button").length, 0, "悬停不显示关闭按钮");
+  let closed = 0;
+  const pinned = c.element("div", "");
+  content.render(pinned, true, () => closed++);
+  const dismiss = flatten(pinned).find(node => node.attributes["aria-label"] === "关闭 Token 统计");
+  assert.ok(dismiss, "点击固定后保留关闭按钮");
+  dismiss.onclick();
+  assert.equal(closed, 1);
 });
 
 test("Token 明细保留未知费用，极小非零费用不显示免费，非法快照不能补齐合计", () => {
@@ -19084,9 +19101,9 @@ test("Token 明细保留未知费用，极小非零费用不显示免费，非�
   assert.equal(value.billing.totalCostUsd, null);
   const root = c.element("div", "");
   c.composerMetricsDetail(value, []).render(root, false, () => {});
-  assert.match(root.textContent, /<0\.0001/);
-  assert.match(root.textContent, /输出5—/);
-  assert.match(root.textContent, /合计35—/);
+  assert.match(root.textContent, /<\$0\.0001/);
+  assert.match(root.textContent, /输出5· —/);
+  assert.match(root.textContent, /合计35· —/);
   const invalid = structuredClone(billing);
   invalid.rows.push(invalid.rows[0]);
   assert.equal(c.normalizeComposerMetrics(h.value({ billing: invalid })).billing, null);
@@ -19097,6 +19114,18 @@ test("Token 明细保留未知费用，极小非零费用不显示免费，非�
   const legacyRoot = c.element("div", "");
   c.composerMetricsDetail(oldClaude, []).render(legacyRoot, false, () => {});
   assert.doesNotMatch(legacyRoot.textContent, /输入/, "没有缓存写入明细时不能把含写入的 Token 当成普通输入");
+  const cacheWrites = c.normalizeComposerMetrics(h.value({ billing: {
+    models: [], rows: [
+      { kind: "cacheWrite5m", tokens: 0, costUsd: 0 },
+      { kind: "cacheWrite1h", tokens: 2, costUsd: .00001 },
+      { kind: "cacheWrite", tokens: 3, costUsd: null },
+    ], totalTokens: 5, totalCostUsd: null,
+  } }));
+  const cacheRoot = c.element("div", "");
+  c.composerMetricsDetail(cacheWrites, []).render(cacheRoot, false, () => {});
+  assert.match(cacheRoot.textContent, /缓存写入 5m0· \$0\.0000/);
+  assert.match(cacheRoot.textContent, /缓存写入 1h2· <\$0\.0001/);
+  assert.match(cacheRoot.textContent, /缓存写入3· —/);
 });
 
 test("Token 明细按当前轮次更新，切换会话和等待新轮统计时清理旧浮层", async () => {

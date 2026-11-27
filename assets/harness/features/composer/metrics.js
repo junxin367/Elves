@@ -299,12 +299,16 @@ function composerMetricsDetail(metrics, timings) {
     cacheWrite5m: "缓存写入 5m", cacheWrite1h: "缓存写入 1h", cacheWrite: "缓存写入" };
   const tokens = value => Number.isSafeInteger(value) && value >= 0 ? value.toLocaleString("en-US") : "—";
   const cost = value => !composerMetricsNumber(value) ? "—" : value > 0 && value < .0001 ? "<0.0001" : value.toFixed(4);
+  const currency = value => {
+    const amount = cost(value);
+    return amount === "—" ? amount : amount.startsWith("<") ? `<$${amount.slice(1)}` : `$${amount}`;
+  };
   const model = billing.models.join(" · ") || "Token 统计";
   return {
     key: JSON.stringify([metrics.turnId, billing, timings]),
     label: [model, ...billing.rows.map(row => `${titles[row.kind]} ${tokens(row.tokens)} Token，费用 ${cost(row.costUsd)} 美元`)].join("。"),
     render(node, pinned, close) {
-      // 用户确认简洁效果：只展示模型、Token、费用与关键耗时；不显示单价、公式、图表或口径介绍。
+      // 用户确认无表格效果：名称、Token 和费用在同一文字行自然排列，不加表头、单价或介绍。
       const header = element("div", "composer-metrics-detail-header");
       const title = element("strong", "", model);
       title.title = model;
@@ -317,36 +321,36 @@ function composerMetricsDetail(metrics, timings) {
       node.append(header);
       const body = element("div", "composer-metrics-detail-body");
       if (billing.rows.length) {
-        const table = element("table", "");
-        table.setAttribute("aria-label", "本轮 Token 和估算费用");
-        const head = element("thead", ""), columns = element("tr", "");
-        for (const label of ["类型", "Token", "费用 $"]) {
-          const cell = element("th", "", label); cell.setAttribute("scope", "col"); columns.append(cell);
-        }
-        head.append(columns); table.append(head);
-        const rows = element("tbody", "");
-        for (const row of billing.rows) {
-          const tr = element("tr", "");
-          tr.append(element("td", "", titles[row.kind]), element("td", "", tokens(row.tokens)),
-            element("td", "", cost(row.costUsd)));
-          rows.append(tr);
-        }
-        table.append(rows);
-        if (Number.isSafeInteger(billing.totalTokens)) {
-          const foot = element("tfoot", ""), total = element("tr", "");
-          total.append(element("td", "", "合计"), element("td", "", tokens(billing.totalTokens)),
-            element("td", "", cost(billing.totalCostUsd)));
-          foot.append(total); table.append(foot);
-        }
-        body.append(table);
+        const usage = element("div", "composer-metrics-detail-usage");
+        usage.setAttribute("role", "list");
+        usage.setAttribute("aria-label", "本轮 Token 和估算费用");
+        const appendRow = (label, count, fee, total = false) => {
+          const row = element("p", total ? "composer-metrics-detail-total" : "");
+          row.setAttribute("role", "listitem");
+          row.setAttribute("aria-label", `${label} ${tokens(count)} Token，费用 ${cost(fee)} 美元`);
+          row.append(element("span", "composer-metrics-detail-label", label),
+            element("span", "composer-metrics-detail-count", tokens(count)),
+            element("span", "composer-metrics-detail-fee", `· ${currency(fee)}`));
+          usage.append(row);
+        };
+        for (const row of billing.rows) appendRow(titles[row.kind], row.tokens, row.costUsd);
+        if (Number.isSafeInteger(billing.totalTokens))
+          appendRow("合计", billing.totalTokens, billing.totalCostUsd, true);
+        body.append(usage);
       }
       if (timings.length) {
-        const grid = element("div", "composer-metrics-detail-timings");
-        for (const [label, value] of timings) {
-          const row = element("div", "");
-          row.append(element("span", "", label), element("b", "", value)); grid.append(row);
+        const details = element("div", "composer-metrics-detail-timings");
+        // 确认稿每行两项，沿文字宽度自然排列；字号增大或窄屏时允许换行，不固定成表格列。
+        for (let index = 0; index < timings.length; index += 2) {
+          const line = element("div", "composer-metrics-detail-timing-line");
+          for (const [label, value] of timings.slice(index, index + 2)) {
+            const item = element("span", "composer-metrics-detail-timing-item");
+            item.append(element("span", "composer-metrics-detail-label", label), element("b", "", value));
+            line.append(item);
+          }
+          details.append(line);
         }
-        body.append(grid);
+        body.append(details);
       }
       node.append(body);
     }
