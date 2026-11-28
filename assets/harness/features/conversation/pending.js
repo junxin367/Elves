@@ -1,21 +1,22 @@
 // 写操作与回执：发送/创建/编辑等写入的幂等提交与待确认回执的核对；待发送状态在 pending-state.js，本地保存与恢复在 pending-store.js。
 
 import { recoveryStorageMessage } from "../../recovery-store.js";
-import { notice } from "../../ui/notice.js";
 import {
   applyQueuedSendResult, reloadThread, renderMessages, selectThread, updateComposer
 } from "../../core/actions.js";
 import { creating, selectedId, selectionToken, selectionVersion, session, thread } from "../../core/state.js";
 import { recoveryStore } from "../../core/stores.js";
 import { randomId } from "../../core/util.js";
-import { api } from "../api.js";
+import { api, operationErrorState, receiptResultState } from "../api.js";
 import { openForkResult, validForkResult } from "./fork.js";
 import { clearSubmittedDraft, recoverFailedInput, restorePrivateInputs } from "../composer/draft-restore.js";
 import {
   recoveryGeneration, setRecoveryScope, smallInputStorageRecord, snapshotDraft, submittedDrafts
 } from "../composer/drafts.js";
 import { selectCreatedThread } from "../composer/new-chat-settings.js";
-import { confirmPendingSend, pending, pendingTimer, sendNotDelivered, setPendingTimer } from "./pending-state.js";
+import { confirmPendingSend, pending, sendNotDelivered } from "./pending-state.js";
+import { receiptById, reserveReceipt, retryReceipt } from "./receipt-registry.js";
+import { receiptNotice, receiptSurface } from "./receipt-context.js";
 import { savePending } from "./pending-store.js";
 import { applyGoalComposerReceipt, updateGoalComposerPending } from "../goal/composer-submission.js";
 import { goalComposerAction, goalReceiptOutcome, goalSubmissionState, goalVersion } from "../goal/state.js";
@@ -34,20 +35,21 @@ export async function mutate(action, payload, { reliable = false, receiptId = nu
   if (payload?.threadId && threadActionReadOnly(action, payload.threadId))
     throw Object.assign(new Error("此会话仅供查看，不能提交操作。"), { code: 403, notSubmitted: true });
   const queueAction = ["steerQueued", "removeQueued"].includes(action);
-  if (queueAction && pending)
-    throw Object.assign(new Error("队列操作仍待确认，请先查询原回执，不要重复引导或删除。"), { notSubmitted: true });
   const trackedOperation = queueAction || ["deleteThread", "createSideThread", "closeSideThread", "forkThread"].includes(action);
   const version = selectionVersion;
   const deviceId = session?.device.id, generation = recoveryGeneration;
   const operationScope = privateInputScope(session);
   const currentAuthorization = () => generation === recoveryGeneration && deviceId === session?.device.id
     && operationScope === privateInputScope(session);
-  const id = receiptId || (reliable && pending ? pending.id : randomId());
+  const id = receiptId || randomId();
   const goalAction = goalComposerAction(action, payload);
-  if (reliable && !pending) {
+  if (reliable) {
+    const release = reserveReceipt(payload);
+    if (!release) throw Object.assign(new Error(queueAction ? "队列操作仍待确认，请先查询原回执，不要重复引导或删除。"
+      : "此会话还有待确认的操作，请勿重复提交。"), { notSubmitted: true });
     try {
       const record = {
-        id, action, payload, deviceId: session.device.id, selectionToken, operationScope, time: Date.now(),
+        id, action, payload, deviceId: session.device.id, selectionToken, operationScope, receiptSurface, time: Date.now(),
         // AGY 普通消息受理期间只复用发送按钮，不把“等待开始/响应”做成回执提示；传输或送达未知另行处理。
         ...(!goalAction && (["send", "editMessage"].includes(action) && antigravityThreadId(payload.threadId)
           || action === "create" && payload.backend === "antigravity") ? { agySending: true } : {}),
@@ -75,7 +77,7 @@ export async function mutate(action, payload, { reliable = false, receiptId = nu
           record.recoveryScope = currentScope;
           if (!smallInputStorageRecord(record)) throw error;
           // 大小受控的记录仍可使用会话存储回执；大图片必须先可靠存入 IndexedDB。
-          notice("浏览器本地草稿存储不可用；本次回执将保存在会话存储，未发送草稿仅保留在本页。", true);
+          receiptNotice(record, "浏览器本地草稿存储不可用；本次回执将保存在会话存储，未发送草稿仅保留在本页。", true);
         }
         if (generation !== recoveryGeneration || deviceId !== session?.device.id)
           throw new Error("设备授权已更换，操作未提交。");
@@ -88,59 +90,70 @@ export async function mutate(action, payload, { reliable = false, receiptId = nu
         state: "failed", result: { ok: false, message: error.message, code: "receipt-storage-unavailable" }
       } });
       throw error;
-    }
+    } finally { release(); }
   }
-  const ownsPending = () => reliable && pending?.id === id;
+  const own = () => reliable && currentAuthorization() ? receiptById(id) : null;
+  const ownsPending = () => !!own();
   let result;
+  const posting = own();
+  if (posting) postingReceipts.add(posting);
   try { result = await api(`/api/action/${action}`, payload, id); }
   catch (error) {
     if (!currentAuthorization()) throw error;
-    if (error.notSubmitted) {
+    const failureState = operationErrorState(error);
+    if (error.notSubmitted && failureState === "failed") {
       if (goalAction) Object.assign(error, { receiptId: id, goalReceipt: {
         state: "failed", result: { ok: false, notSent: true, message: error.message }
       } });
       if (ownsPending()) {
-        const unsent = pending;
-        try { await recoverFailedInput(unsent); }
-        catch {
-          error.message += " 本地恢复记录更新失败，请保留当前输入。";
-        } finally {
-          if (pending === unsent) savePending(null);
+        const unsent = own();
+        markReceiptFeedback(unsent, "failed", { ok: false, notSent: true, message: error.message, code: error.code });
+        try {
+          await recoverFailedInput(unsent);
+          if (own() === unsent) savePending(null, unsent);
+        } catch (restoreError) {
+          receiptNotice(unsent, restoreError.message, true);
+          retryReceipt(unsent, 5000, resolvePending);
         }
       }
       throw error;
     }
     if (goalAction && ownsPending()) {
-      const rejected = error.outcomeUnknown !== true && Number.isInteger(error.code)
-        && error.code >= 400 && error.code < 500 && error.code !== 408;
-      const receipt = { state: rejected ? "failed" : "unknown",
-        result: { ok: false, message: error.message, code: error.code, outcomeUnknown: !rejected } };
-      Object.assign(error, { goalReceipt: receipt, receiptId: id, result: receipt.result, outcomeUnknown: !rejected });
-      updateGoalComposerPending({ ...pending, result: receipt.result, receiptState: receipt.state });
+      const receipt = { state: failureState,
+        result: { ok: false, message: error.message, code: error.code, outcomeUnknown: failureState === "unknown" } };
+      Object.assign(error, { goalReceipt: receipt, receiptId: id, result: receipt.result, outcomeUnknown: failureState === "unknown" });
+      updateGoalComposerPending({ ...own(), result: receipt.result, receiptState: receipt.state });
       throw error;
     }
     if (trackedOperation) {
-      const rejected = error.outcomeUnknown !== true && Number.isInteger(error.code)
-        && error.code >= 400 && error.code < 500 && error.code !== 408;
-      Object.assign(error, { receiptId: id, operationState: rejected ? "failed" : "unknown", outcomeUnknown: !rejected });
+      Object.assign(error, { receiptId: id, operationState: failureState, outcomeUnknown: failureState === "unknown" });
     }
     if (reliable) {
-      // A network failure does not prove the native client rejected the message.
-      const rejected = error.outcomeUnknown !== true && Number.isInteger(error.code) && error.code >= 400 && error.code < 500
-        && ![408, 409].includes(error.code);
-      if (rejected && ownsPending()) {
-        await recoverFailedInput(pending);
-        if (ownsPending()) savePending(null);
+      if (failureState === "failed" && ownsPending()) {
+        const rejected = own();
+        markReceiptFeedback(rejected, "failed", { ok: false, message: error.message, code: error.code });
+        try {
+          await recoverFailedInput(rejected);
+          if (own() === rejected) savePending(null, rejected);
+        } catch (restoreError) {
+          receiptNotice(rejected, restoreError.message, true);
+          retryReceipt(rejected, 5000, resolvePending);
+        }
       } else {
-        if (ownsPending() && pending.agySending) pending.agySending = false;
-        if (ownsPending() && error.operationState !== "failed")
+        if (own()?.agySending) own().agySending = false;
+        if (ownsPending() && error.operationState !== "failed") {
+          // 先核对原结果；能够立即查明的断线不短暂显示人工核对横幅。
+          markReceiptFeedback(own(), "checking");
           error.pendingFeedback = true;
-        if (ownsPending()) void resolvePending();
-        if (action === "send") error.deliveryPending = true;
+        }
+        if (ownsPending()) void resolvePending(own());
+        if (action === "send" && failureState !== "failed") error.deliveryPending = true;
       }
     }
     throw error;
-  }
+  } finally { if (posting) postingReceipts.delete(posting); }
+  if (!currentAuthorization()) throw Object.assign(new Error("设备授权已更换，已忽略旧回执。"), { staleAuthorization: true });
+  result = { ...result, state: receiptResultState(result) };
   // 删除回执必须匹配原请求且具有明确状态；缺字段或串回执不能被当成成功并清理会话。
   if (action === "deleteThread" && (result?.requestId !== id
       || !["pending", "unknown", "failed", "completed"].includes(result?.state))) {
@@ -150,7 +163,7 @@ export async function mutate(action, payload, { reliable = false, receiptId = nu
   if (goalAction) {
     const data = result.result || {};
     const goalSubmission = goalSubmissionState(data.goalSubmission, action);
-    if (ownsPending()) updateGoalComposerPending({ ...pending, result: data, receiptState: result.state,
+    if (ownsPending()) updateGoalComposerPending({ ...own(), result: data, receiptState: goalReceiptOutcome(result, action) === "unknown" ? "unknown" : result.state,
       ...(goalSubmission ? { goalSubmission } : {}) });
     if (goalReceiptOutcome(result, action) === "succeeded") return data;
     throw Object.assign(new Error(data.message || (result.state === "pending"
@@ -160,11 +173,12 @@ export async function mutate(action, payload, { reliable = false, receiptId = nu
     });
   }
   if (result.state === "pending") {
+    markReceiptFeedback(own(), "pending");
     const confirmed = (action === "send" || action === "editMessage") && ownsPending()
-      ? await confirmPendingSend(pending, result.result).catch(() => null) : null;
+      ? await confirmPendingSend(own(), result.result).catch(() => null) : null;
     if (confirmed && ownsPending()) result = { state: confirmed.ok === false ? "failed" : "completed", result: confirmed };
     else {
-      if (ownsPending()) void resolvePending();
+      if (ownsPending()) void resolvePending(own());
       throw Object.assign(new Error("操作仍在处理，请稍后查看会话或回执"), { deliveryPending: action === "send",
         pendingFeedback: ownsPending(),
         ...(trackedOperation ? { receiptId: id, operationState: "pending", outcomeUnknown: true } : {}),
@@ -172,14 +186,13 @@ export async function mutate(action, payload, { reliable = false, receiptId = nu
     }
   }
   if (result.state === "unknown") {
-    if (ownsPending() && pending.agySending) pending.agySending = false;
+    if (own()?.agySending) own().agySending = false;
     const confirmed = (action === "send" || action === "editMessage") && ownsPending()
-      ? await confirmPendingSend(pending, result.result).catch(() => null) : null;
+      ? await confirmPendingSend(own(), result.result).catch(() => null) : null;
     if (confirmed && ownsPending()) result = { state: confirmed.ok === false ? "failed" : "completed", result: confirmed };
     else {
-      if (ownsPending() && (queueAction || action === "send" || action === "editMessage"
-          || queuedEditActions.has(action) && session.capabilities?.queueEditRecovery === true))
-        void resolvePending();
+      markReceiptFeedback(own(), "checking");
+      if (ownsPending()) void resolvePending(own());
       throw Object.assign(new Error(result.result?.message || "送达状态未知，请在会话中确认，勿重复发送"), {
         pendingFeedback: ownsPending(),
         ...(trackedOperation ? { receiptId: id, operationState: "unknown", outcomeUnknown: true } : {}),
@@ -190,59 +203,88 @@ export async function mutate(action, payload, { reliable = false, receiptId = nu
     }
   }
   if (action === "forkThread" && result.state === "completed" && !validForkResult(result.result, payload.threadId)) {
-    if (ownsPending()) void resolvePending();
+    markReceiptFeedback(own(), "unknown");
+    if (ownsPending()) void resolvePending(own());
     throw Object.assign(new Error("分支回执不完整或身份不匹配，请核对原请求，不要重复创建"),
       { receiptId: id, outcomeUnknown: true });
   }
-  if (ownsPending() && result.state === "failed") await recoverFailedInput(pending);
-  if (ownsPending()) savePending(null);
+  let recovered = true;
+  if (ownsPending() && result.state === "failed") {
+    const rejected = own();
+    markReceiptFeedback(rejected, "failed", result.result);
+    try { await recoverFailedInput(rejected); }
+    catch (restoreError) {
+      recovered = false;
+      receiptNotice(rejected, restoreError.message, true);
+      retryReceipt(rejected, 5000, resolvePending);
+    }
+  }
+  if (ownsPending() && recovered) savePending(null, own());
   if (result.state === "failed") {
     if (action === "create" && result.result?.threadId && creating && selectionVersion === version) {
       await selectCreatedThread(result.result.threadId);
     }
     throw Object.assign(new Error(result.result?.message || "原生操作未完成"), {
       result: result.result, goalSubmission: result.result?.goalSubmission, code: result.result?.code,
-      ...(trackedOperation ? { receiptId: id, operationState: "failed", outcomeUnknown: result.result?.outcomeUnknown === true }
-        : ["approve", "answer"].includes(action) ? { approvalState: "failed" } : {})
+      receiptId: id, operationState: "failed",
+      ...(result.result?.notSent === true ? { notSent: true } : {}),
+      ...(["approve", "answer"].includes(action) ? { approvalState: "failed" } : {})
     });
   }
   return result.result;
 }
-export async function resolvePending() {
-  if (!pending || !session) return;
-  if (pending.recoveryUnavailable) {
+const postingReceipts = new WeakSet();
+function markReceiptFeedback(record, state, result) {
+  if (!record || receiptById(record.id) !== record || record.receiptState === state && !record.receiptMissing) return;
+  if (record.receiptState === "failed" && state !== "failed") return;
+  // 只记同一请求的实际查询/派发结果。保持对象身份，以免打断正在按此记录只读核对的任务。
+  record.receiptState = state;
+  if (state === "failed") record.result = result;
+  delete record.receiptMissing;
+  try { savePending(record); }
+  catch { receiptNotice(record, "未能更新本地回执状态，原请求仍保留，请保持页面打开。", true); }
+}
+export async function resolvePending(current = pending, nativeEvidence = false) {
+  if (!current || !session) return;
+  if (!nativeEvidence && checkingReceipts.has(current)) return checkingReceipts.get(current);
+  const check = checkOriginalReceipt(current);
+  checkingReceipts.set(current, check);
+  try { await check; } finally { if (checkingReceipts.get(current) === check) checkingReceipts.delete(current); }
+}
+const checkingReceipts = new WeakMap();
+async function checkOriginalReceipt(current) {
+  const notice = (message, error = false) => receiptNotice(current, message, error);
+  if ((current.operationScope || current.recoveryScope) && (current.operationScope || current.recoveryScope) !== privateInputScope(session)) return;
+  if (current.recoveryUnavailable) {
     try { await restorePrivateInputs(session); }
     catch (error) { notice(recoveryStorageMessage(error), true); return; }
-    if (pending?.recoveryUnavailable) { notice("本地恢复记录仍不可读取，原请求标识已保留，请先核对本机会话。", true); return; }
-    return resolvePending();
+    const restored = receiptById(current.id);
+    if (!restored || restored === current || restored.recoveryUnavailable) { notice("本地恢复记录仍不可读取，原请求标识已保留，请先核对本机会话。", true); return; }
+    return resolvePending(restored);
   }
-  const current = pending;
   const deviceId = session.device.id;
   const queueAction = ["steerQueued", "removeQueued"].includes(current.action);
-  const scopedOperation = queueAction || current.action === "forkThread";
-  const operationScope = scopedOperation ? privateInputScope(session) : null, generation = recoveryGeneration;
+  const operationScope = privateInputScope(session), generation = recoveryGeneration;
   const version = selectionVersion;
   const queueReadVersion = queueVersion;
   if (current.invalid || (current.deviceId && current.deviceId !== deviceId)) {
     notice("回执记录损坏或属于旧设备授权。请先检查原生会话，再人工解除锁定；不会自动重发。", true);
     updateComposer(); return;
   }
-  const stillCurrent = () => pending === current && session?.device.id === deviceId
-    && (!scopedOperation || generation === recoveryGeneration && operationScope === privateInputScope(session));
-  const retry = delay => {
-    clearTimeout(pendingTimer);
-    setPendingTimer(setTimeout(() => { if (stillCurrent()) void resolvePending(); }, delay));
-  };
+  const stillCurrent = () => receiptById(current.id) === current && session?.device.id === deviceId
+    && generation === recoveryGeneration && operationScope === privateInputScope(session);
+  if (!stillCurrent()) return;
+  const retry = delay => retryReceipt(current, delay, resolvePending);
   try {
-    let receipt = await api(`/api/receipts/${current.id}`);
+    // 已有明确失败结果时，只重试本地输入恢复。存储/读取失败不能把失败重新解释为“送达未知”。
+    let receipt = current.receiptState === "failed" ? { state: "failed", result: current.result }
+      : await api(`/api/receipts/${current.id}`);
     if (!stillCurrent()) return;
+    receipt = { ...receipt, state: receiptResultState(receipt) };
     if (typeof current.agySending === "boolean") current.agySending = receipt.state === "pending";
     if (goalComposerAction(current.action, current.payload)) {
       const outcome = await applyGoalComposerReceipt(current, receipt, { allowSelection: true });
-      if (outcome === "pending" && pending?.id === current.id) {
-        clearTimeout(pendingTimer);
-        setPendingTimer(setTimeout(() => { if (pending?.id === current.id) void resolvePending(); }, 2000));
-      }
+      if (outcome === "pending" && receiptById(current.id)) retry(2000);
       return;
     }
     if ((current.action === "send" || current.action === "editMessage")
@@ -257,14 +299,19 @@ export async function resolvePending() {
         if (abandoned) receipt = { state: "failed", result: { ok: false, notSent: true, code: "not-delivered",
           message: "消息没有送达，内容已保留，可以恢复后重新发送。" } };
         else {
+          markReceiptFeedback(current, "unknown");
           if (typeof (receipt.result?.clientUserMessageId ?? current.payload?.clientUserMessageId) === "string") retry(5000);
           else notice("回执缺少客户端消息标识，无法自动核对。请在会话中确认后再解除锁定。", true);
           updateComposer(); return;
         }
       }
     }
-    if (receipt.state === "pending") { retry(2000); if (current.agySending) updateComposer(); return; }
+    if (receipt.state === "pending") {
+      markReceiptFeedback(current, "pending");
+      retry(2000); if (pending === current) updateComposer(); return;
+    }
     if (receipt.state === "unknown") {
+      markReceiptFeedback(current, "unknown");
       if (queuedEditActions.has(current.action)) {
         if (session.capabilities?.queueEditRecovery === true) {
           const state = await checkQueuedMessageEdit(current.payload.threadId, current.payload.editId);
@@ -274,6 +321,7 @@ export async function resolvePending() {
       updateComposer(); return;
     }
     if (receipt.state === "failed") {
+      markReceiptFeedback(current, "failed", receipt.result);
       try { await recoverFailedInput(current); }
       catch (error) {
         notice(error.message || "输入恢复失败，原请求回执已保留，请勿重新发送。", true);
@@ -284,20 +332,22 @@ export async function resolvePending() {
     if (queueAction && receipt.state === "completed"
         && (receipt.result?.threadId !== current.payload.threadId
           || receipt.result?.messageId !== current.payload.messageId)) {
+      markReceiptFeedback(current, "unknown");
       notice("队列操作回执的会话或消息不匹配，原请求标识已保留，请继续核对原回执。", true);
       updateComposer(); return;
     }
     if (current.action === "forkThread") {
       if (receipt.state === "completed" && !validForkResult(receipt.result, current.payload.threadId)) {
+        markReceiptFeedback(current, "unknown");
         notice("分支回执身份不匹配，原请求已保留，不会重复创建", true);
         updateComposer(); return;
       }
-      savePending(null);
+      savePending(null, current);
       if (receipt.state === "completed") await openForkResult(current, receipt.result);
       else notice(receipt.result?.message || "分支未创建", true);
       updateComposer(); return;
     }
-    savePending(null);
+    savePending(null, current);
     if (queueAction) {
       const id = current.payload.threadId;
       if (receipt.state === "completed") {
@@ -318,7 +368,6 @@ export async function resolvePending() {
                 && operationScope === privateInputScope(session)) notice(error.message, true);
           });
         }
-        notice(current.action === "steerQueued" ? "队列引导结果已确认" : "队列删除结果已确认");
       } else notice(receipt.result?.message || "队列操作未完成，请核对原消息", true);
       updateComposer(); return;
     }
@@ -326,7 +375,6 @@ export async function resolvePending() {
       if (receipt.state === "completed") {
         applyQueueReorderResult(current.payload.threadId, receipt.result,
           current.selectionToken === selectionToken ? queueReadVersion : -1);
-        notice("队列顺序已更新");
       } else {
         if (selectedId === current.payload.threadId) void reloadQueue().catch(error => notice(error.message, true));
         notice(receipt.result?.message || "队列排序未完成，请重新核对顺序", true);
@@ -338,9 +386,7 @@ export async function resolvePending() {
       if (receipt.state === "completed") {
         completeQueuedEditAction(current.action, current.payload, receipt.result,
           current.selectionToken === selectionToken ? queueReadVersion : -1);
-        notice(current.action === "beginQueuedEdit" ? "排队消息已取回输入框"
-          : current.action === "cancelQueuedEdit" ? "已取消编辑并恢复队列消息"
-          : current.action === "dismissQueuedEdit" ? "已结束待确认编辑，未保存、删除或重发消息" : "队列消息修改已确认保存");
+        // 结果已反映在队列或编辑器里，自动恢复不额外发“回执已确认”通知。
       } else {
         if (current.action === "beginQueuedEdit")
           finishQueuedMessageEdit(queuedEdits.get(current.payload.threadId));
@@ -369,6 +415,9 @@ export async function resolvePending() {
     updateComposer();
   } catch (error) {
     if (!stillCurrent()) return;
+    // 建立写请求和只读恢复可能并行。POST 尚未返回时，读不到回执不能凭空制造“送达未知”。
+    if (postingReceipts.has(current)) { retry(2000); return; }
+    if (!current.receiptMissing) markReceiptFeedback(current, "unknown");
     if (current.agySending) { current.agySending = false; updateComposer(); }
     if (error.code === 404) {
       if (goalComposerAction(current.action, current.payload)) {
@@ -390,7 +439,7 @@ export async function resolvePending() {
               && history.data.some(turn => turn.items?.some(item => item.type === "userMessage"
                 && item.clientId === current.payload.messageId && !item.remotePendingInput));
             if (received) {
-              savePending(null);
+              savePending(null, current);
               confirmQueuedSteerDisplay(current.payload.threadId, current.payload.messageId,
                 { ok: true, threadId: current.payload.threadId, messageId: current.payload.messageId });
               if (pendingSteer?.threadId === current.payload.threadId
@@ -419,10 +468,10 @@ export async function resolvePending() {
           try { await recoverFailedInput(current); }
           catch (failure) { notice(failure.message, true); retry(5000); return; }
           if (!stillCurrent()) return;
-          savePending(null);
+          savePending(null, current);
           notice(confirmed.message, true);
         } else if (confirmed && stillCurrent()) {
-          savePending(null);
+          savePending(null, current);
           applyQueuedSendResult(current.payload.threadId, confirmed,
             current.selectionToken === selectionToken ? queueReadVersion : -1, current.payload);
           clearSubmittedDraft(current.payload,
@@ -438,13 +487,13 @@ export async function resolvePending() {
               retry(5000); updateComposer(); return;
             }
             if (!stillCurrent()) return;
-            savePending(null);
+            savePending(null, current);
             notice("消息没有送达，内容已保留，可以恢复后重新发送。", true);
           } else retry(5000);
         }
       }
       else notice("未找到上一条消息的回执。不会自动重发；请先检查会话。", true);
       updateComposer();
-    } else retry(5000);
+    } else { if (pending === current) updateComposer(); retry(5000); }
   }
 }

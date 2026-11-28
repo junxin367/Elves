@@ -7,8 +7,7 @@ import { notice } from "../../ui/notice.js";
 import { reloadThread } from "../../core/actions.js";
 import { connected, selectedId, session, thread } from "../../core/state.js";
 import { randomId } from "../../core/util.js";
-import { api } from "../api.js";
-import { syncPendingFeedbackTimer } from "../composer/composer.js";
+import { api, operationErrorState, receiptResultState } from "../api.js";
 import { pendingFeedbackReady } from "../composer/send-state.js";
 import {
   editableGoalStatuses, fitGoalEditor, goalEditBaseline, goalEditDraft, goalEditPending,
@@ -18,22 +17,28 @@ import {
 } from "./state.js";
 import { isAntigravity, isClaude, threadReadOnly } from "../session/capabilities.js";
 import { currentThreadDisplay } from "../session/thread-cache.js";
+import { receiptNotice } from "../conversation/receipt-context.js";
 
 function scheduleGoalEditReceipt() {
   clearTimeout(goalEditPollTimer);
-  if (goalEditPending?.state !== "pending") return;
+  const record = goalEditPending;
+  if (record?.state !== "pending") return;
   setGoalEditPollTimer(setTimeout(() => {
+    if (goalEditPending?.id !== record.id) return;
     void resolveGoalEditReceipt().catch(error => {
-      const current = goalEditPending;
-      if (current?.state !== "pending") return;
-      setGoalEditPending({ ...current, state: "unknown" });
+      if (error.operationState === "failed") {
+        receiptNotice(record, error.message, true);
+        return;
+      }
+      if (goalEditPending?.id !== record.id) return;
+      setGoalEditPending({ ...goalEditPending, state: "unknown" });
       renderGoalStatus();
-      notice(`查询目标操作回执失败：${error.message}。不会重复提交，请稍后手动查回执。`, true);
     });
   }, 2000));
 }
 async function applyGoalEditReceipt(record, receipt) {
-  if (goalEditPending?.id !== record.id) return receipt?.state || "stale";
+  if (goalEditPending?.id !== record.id || record.deviceId !== session?.device.id) return "stale";
+  receipt = { ...receipt, state: receiptResultState(receipt) };
   if (receipt.state === "pending") {
     setGoalEditPending({ ...record, state: "pending" });
     scheduleGoalEditReceipt();
@@ -48,7 +53,7 @@ async function applyGoalEditReceipt(record, receipt) {
   setGoalEditPending(null);
   if (receipt.state === "failed") {
     const error = Object.assign(new Error(receipt.result?.message || "原生目标更新未完成"),
-      { code: receipt.result?.code || 503 });
+      { code: receipt.result?.code || 503, operationState: "failed" });
     if (error.code === 409 && selectedId === record.payload.threadId) {
       await reloadThread().catch(() => {});
     }
@@ -63,7 +68,6 @@ async function applyGoalEditReceipt(record, receipt) {
       && receipt.result?.nativeCommand?.name === "goal"
       && receipt.result.threadId === record.payload.threadId) {
     setGoalEditDraft(null);
-    notice("目标命令已交给 Claude，状态将随原生执行更新");
     renderGoalStatus();
     if (selectedId === record.payload.threadId) await reloadThread();
     return "completed";
@@ -112,7 +116,6 @@ async function resolveGoalEditReceipt() {
       if (error.code === 404) {
         setGoalEditPending({ ...record, state: "unknown" });
         renderGoalStatus();
-        notice("未找到目标操作回执。不会自动重试，请在桌面核对后解除锁定。", true);
       } else if (record.state === "pending") scheduleGoalEditReceipt();
       throw error;
     } finally { setGoalEditReceiptRequest(null); }
@@ -196,10 +199,10 @@ async function submitGoalUpdate(payload) {
     const receipt = await api("/api/action/updateGoal", payload, record.id);
     await applyGoalEditReceipt(record, receipt);
   } catch (error) {
-    if (goalEditPending?.id === record.id && error.code && error.code !== 503) setGoalEditPending(null);
-    else if (goalEditPending?.id === record.id) setGoalEditPending({ ...record, state: "unknown" });
+    if (goalEditPending?.id === record.id)
+      setGoalEditPending(operationErrorState(error) === "failed" ? null : { ...record, state: "unknown" });
     renderGoalStatus();
-    notice(error.message, true);
+    if (operationErrorState(error) === "failed") receiptNotice(record, error.message, true);
   }
 }
 function renderGoalEditor(goal, pendingRecord) {
@@ -340,7 +343,6 @@ function renderGoalEditor(goal, pendingRecord) {
   if (!input.disabled) input.focus();
 }
 export function renderGoalStatus() {
-  syncPendingFeedbackTimer();
   const root = $("#goal-area");
   if (!root) { stopGoalLiveTimer(); return null; }
   const display = currentThreadDisplay(), goal = display?.goal;
@@ -363,10 +365,12 @@ export function renderGoalStatus() {
   root.dataset.goalSignature = signature;
   root.dataset.goalThread = display?.id || "";
   root.replaceChildren();
-  root.hidden = !hasCurrentGoal && (!pendingRecord || !pendingFeedbackReady(pendingRecord));
+  root.hidden = !hasCurrentGoal && (!pendingRecord || pendingRecord.deviceId === session?.device.id && !pendingFeedbackReady(pendingRecord));
   if (root.hidden) {
     stopGoalLiveTimer();
     renderGoalEditor(goal, pendingRecord);
+    // 恢复时可能还没有目标卡，待处理回执仍走同一次只读查询，不依赖卡片可见。
+    if (pendingRecord?.state === "pending") queueMicrotask(() => void resolveGoalEditReceipt().catch(() => {}));
     return null;
   }
   if (!hasCurrentGoal && pendingRecord) {

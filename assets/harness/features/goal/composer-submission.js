@@ -15,7 +15,9 @@ import {
 } from "../composer/drafts.js";
 import { selectCreatedThread } from "../composer/new-chat-settings.js";
 import { pendingFeedbackReady } from "../composer/send-state.js";
-import { pending, pendingTimer, setPending } from "../conversation/pending-state.js";
+import { pending } from "../conversation/pending-state.js";
+import { installReceipt, receiptById } from "../conversation/receipt-registry.js";
+import { receiptNotice } from "../conversation/receipt-context.js";
 import { savePending } from "../conversation/pending-store.js";
 import { dismissGoalComposerRecovery, goalPayloadForThread, persistGoalComposerRecoveries } from "./composer.js";
 import {
@@ -24,19 +26,20 @@ import {
 } from "./state.js";
 import { editingMessage } from "../messages/message-edit.js";
 import { editingQueuedMessage } from "../queue/state.js";
-import { threadReadOnly, validRelatedThreadId } from "../session/capabilities.js";
+import { privateInputScope, threadReadOnly, validRelatedThreadId } from "../session/capabilities.js";
 import { threadDeleted, threadDeletionLocked } from "../sidebar/deletion-state.js";
 
 export function updateGoalComposerPending(record) {
   try { savePending(record); }
   catch {
-    clearTimeout(pendingTimer);
-    setPending(record);
-    notice("目标回执已保留在当前页面，但浏览器无法更新会话存储；请保持页面打开并核对。", true);
+    installReceipt(record);
+    receiptNotice(record, "目标回执已保留在当前页面，但浏览器无法更新会话存储；请保持页面打开并核对。", true);
   }
 }
 export async function applyGoalComposerReceipt(record, receipt, { allowSelection = false, manuallyVerified = false } = {}) {
-  if (!record || record.deviceId !== session?.device.id || !goalComposerAction(record.action, record.payload)) return;
+  if (!record || record.deviceId !== session?.device.id || !goalComposerAction(record.action, record.payload)
+      || (record.operationScope || record.recoveryScope) && (record.operationScope || record.recoveryScope) !== privateInputScope(session)) return;
+  const notice = (message, error = false) => receiptNotice(record, message, error);
   const result = receipt?.result || {};
   if (receipt?.state === "completed" && result.ok === true && result.backend === "claude"
       && result.nativeCommand?.name === "goal" && typeof result.nativeCommand.id === "string"
@@ -45,14 +48,13 @@ export async function applyGoalComposerReceipt(record, receipt, { allowSelection
     const owns = record.selectionToken === selectionToken && draftKey() === (record.payload.threadId
       || newDraftKey(record.payload.projectId, record.payload.backend, record.payload.instanceId));
     clearSubmittedDraft(record.payload, owns);
-    if (pending?.id === record.id) savePending(null);
+    if (receiptById(record.id)) savePending(null, record);
     goalComposerRecoveries.delete(result.threadId); persistGoalComposerRecoveries();
     if (record.action === "create" && allowSelection && owns && creating)
       await selectCreatedThread(result.threadId).catch(error => notice(`命令已受理，会话读取失败：${error.message}`, true));
     else if (selectedId === result.threadId)
       await reloadThread().catch(error => notice(`命令已受理，状态读取失败：${error.message}`, true));
     void loadSidebar(null, { fresh: true }).catch(() => {});
-    notice(result.nativeCommand.state === "completed" ? "目标命令已执行" : "目标命令已交给 Claude，等待原生执行");
     updateComposer();
     return "succeeded";
   }
@@ -61,13 +63,13 @@ export async function applyGoalComposerReceipt(record, receipt, { allowSelection
   const deletedThreadId = state?.threadId || record.payload.threadId;
   if (deletedThreadId && threadDeleted(deletedThreadId, record.deviceId)) {
     goalComposerRecoveries.delete(deletedThreadId); persistGoalComposerRecoveries();
-    if (pending?.id === record.id) savePending(null);
+    if (receiptById(record.id)) savePending(null, record);
     return "failed";
   }
   const outcome = manuallyVerified ? "failed" : goalReceiptOutcome(receipt, record.action);
   const confirmedCreated = record.action === "create" && (record.confirmedCreated || result.status === "created"
     || state?.firstTurnAccepted || manuallyVerified);
-  const updated = { ...record, result, receiptState: receipt?.state || "unknown",
+  const updated = { ...record, result, receiptState: outcome === "unknown" ? "unknown" : receipt?.state || "unknown",
     ...(confirmedCreated ? { confirmedCreated: true } : {}),
     ...(state ? { goalSubmission: state } : {}), ...(manuallyVerified ? { manuallyVerified: true } : {}) };
   if (record.recoveryRef && recoveryScope) {
@@ -95,11 +97,11 @@ export async function applyGoalComposerReceipt(record, receipt, { allowSelection
       if (!previous && !drafts.has(threadId) && !goalDrafts.has(threadId)) storeDraft(threadId, record.draft);
       try {
         // 明确失败时把同一记录移到恢复存储，避免临时存两份图片占满配额。
-        if (outcome === "failed" && pending?.id === record.id) sessionStorage.removeItem("codex-elves-pending");
+        if (outcome === "failed" && receiptById(record.id)) savePending(null, record);
         persistGoalComposerRecoveries(true);
       }
       catch (error) {
-        if (pending?.id === record.id) updateGoalComposerPending(updated);
+        updateGoalComposerPending(updated);
         notice(error.message, true);
         return;
       }
@@ -114,8 +116,8 @@ export async function applyGoalComposerReceipt(record, receipt, { allowSelection
   if (outcome === "succeeded" && thread?.id === threadId && record.goalReadVersion === goalVersion && result.goal) {
     setGoalVersion(goalVersion + 1); thread.goal = result.goal;
   }
-  if (pending?.id === record.id) {
-    if (["succeeded", "failed"].includes(outcome)) savePending(null);
+  if (receiptById(record.id)) {
+    if (["succeeded", "failed"].includes(outcome)) savePending(null, record);
     else updateGoalComposerPending(updated);
   }
   if (consumedCreation && allowSelection && ownsSelection && creating) {
@@ -126,7 +128,8 @@ export async function applyGoalComposerReceipt(record, receipt, { allowSelection
     void loadSidebar(null, { fresh: true }).catch(error => notice(`目标提交已处理，但会话列表更新失败：${error.message}`, true));
   if (outcome === "succeeded" && selectedId === threadId)
     void reloadThread().catch(error => notice(`目标已创建，但会话同步失败：${error.message}`, true));
-  notice(goalComposerReceiptMessage(updated, outcome), outcome !== "succeeded");
+  // 尚在处理时只读核对，不让每次轮询都弹出“请查回执”。
+  if (outcome === "failed") notice(goalComposerReceiptMessage(updated, outcome), true);
   updateComposer();
   return outcome;
 }

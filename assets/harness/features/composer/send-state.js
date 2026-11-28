@@ -1,4 +1,4 @@
-// 发送状态：发送中标记与诊断状态、待确认反馈的延迟与计时器、排队编辑是否带原图片的判断，以及 Claude 新建会话前的项目目录信任确认；输入区、审批、目标与队列共用。
+// 发送状态：发送按钮、异常反馈条件、未知请求的退出等待计时，以及队列图片和 Claude 项目信任确认。
 
 import { confirmAction } from "../../ui/dialog.js";
 import { api } from "../api.js";
@@ -9,21 +9,15 @@ export let sending = null;
 export function setSending(value) { return sending = value; }
 export let composerDiagnosticState = "";
 export function setComposerDiagnosticState(value) { return composerDiagnosticState = value; }
-const pendingFeedbackDelayMs = 5000;
-// 用户要求 Claude 消息的送达结果由 Harness 自己判定（服务端 UNKNOWN_ABANDON_MS 45 秒 / SENDING_ABANDON_MS 120 秒结案）；
-// 超过此时间仍无结论才给出“放弃等待”。必须大于服务端最长结案时限，否则会抢在自动结案之前打扰用户。
+// 仅在 Claude / AGY 已明确送达不明时，沿用 3 分钟后的“放弃等待”；正常在途多久都不弹回执。
 export const claudeGiveUpDelayMs = 180000;
 let pendingFeedbackTimer = null;
 export function setPendingFeedbackTimer(value) { return pendingFeedbackTimer = value; }
-export function pendingFeedbackDelay(record) {
-  // Claude 压缩命令受理后迟迟不开始才提示，时长与 compaction.js 的 nativeCompactionStartGraceMs 保持一致。
-  if (record?.action === "nativeCompactionStart") return 20000;
-  // 用户要求：队列操作未确认满 8 秒才补充等待提醒；其他操作仍为 5 秒，不改变真实失败提示或回执轮询。
-  return ["steerQueued", "removeQueued", "reorderQueued", "beginQueuedEdit", "editQueued", "cancelQueuedEdit", "dismissQueuedEdit"]
-    .includes(record?.action) ? 8000 : pendingFeedbackDelayMs;
-}
 export function pendingFeedbackReady(record) {
-  return !Number.isFinite(record?.time) || Date.now() - record.time >= pendingFeedbackDelay(record);
+  // 用户要求：计时不作为送达证据。普通在途、服务仍在处理或恢复时缺少时间都不显示核对入口。
+  if (["failed", "completed"].includes(record?.receiptState ?? record?.state)) return false;
+  return !!record && (record.invalid === true || record.recoveryUnavailable === true || record.receiptMissing === true
+    || (record.receiptState ?? record.state ?? record.recoveryState) === "unknown");
 }
 export function clearPendingFeedbackTimer() {
   clearTimeout(pendingFeedbackTimer);

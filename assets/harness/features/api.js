@@ -9,13 +9,25 @@ import { threadActionReadOnly } from "./session/capabilities.js";
 import { currentChannelMeasurements, markMessageChannelUnavailable } from "./session/connection-state.js";
 import { threadDeleted, threadDeletionLocked } from "./sidebar/deletion-state.js";
 
+export function operationErrorState(error) {
+  // 用户要求明确失败不再出现回执确认。原生明确未知优先，HTTP 状态码不能覆盖已派发的证据。
+  const state = error?.operationState || error?.approvalState;
+  if (error?.outcomeUnknown === true) return state === "pending" ? "pending" : "unknown";
+  if (error?.notSubmitted === true || error?.notSent === true || state === "failed") return "failed";
+  if (state === "pending" || state === "unknown") return state;
+  return Number.isInteger(error?.code) && error.code >= 400 && error.code < 500 && error.code !== 408 ? "failed" : "unknown";
+}
+export function receiptResultState(receipt) {
+  if (receipt?.result?.outcomeUnknown === true || receipt?.state === "failed" && receipt.result?.ok === true) return "unknown";
+  return ["pending", "unknown", "failed", "completed"].includes(receipt?.state) ? receipt.state : "unknown";
+}
 export async function api(path, body, id, signal, { resourcePriority = "foreground", onChannelLatency = null, recoveryProbe = false } = {}) {
   if (path.startsWith("/api/action/") && body?.threadId
       && threadActionReadOnly(path.slice("/api/action/".length), body.threadId))
     throw Object.assign(new Error("此会话仅供查看，不能提交操作。"), { code: 403, notSubmitted: true });
   if (path.startsWith("/api/action/") && path !== "/api/action/deleteThread" && body?.threadId
       && (threadDeletionLocked(body.threadId) || threadDeleted(body.threadId)))
-    throw Object.assign(new Error("此会话正在删除或已删除，请先核对删除结果。"), { code: 409 });
+    throw Object.assign(new Error("此会话正在删除或已删除，请先核对删除结果。"), { code: 409, notSubmitted: true });
   const deviceId = session?.device.id, deviceCreatedAtMs = session?.device.createdAtMs ?? null;
   const encodedBody = body === undefined ? undefined : JSON.stringify(body);
   // 16 KiB/s 包含 base64 上传；12 MiB 图片可等待约 18 分钟，仍有有限上限。

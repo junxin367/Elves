@@ -26,7 +26,7 @@ export function disposeMainNavigation() {
   chooseNavigation = null;
 }
 
-export function mountMainNavigation({ workspace, openSettings, openScheduledTasks, openRemoteAccess, logout }) {
+export function mountMainNavigation({ workspace, openSettings, openScheduledTasks, openRemoteAccess, logout, onConversationVisibility }) {
   disposeMainNavigation();
   const shell = element("div", "remote-shell");
   const navigation = element("nav", "main-navigation");
@@ -88,6 +88,7 @@ export function mountMainNavigation({ workspace, openSettings, openScheduledTask
     // 隐藏而不销毁会话 DOM，实时消息和会话操作继续使用原来的实例与授权。
     workspace.hidden = current !== "conversation";
     workspace.inert = workspace.hidden;
+    onConversationVisibility?.();
     // 设置、定时任务与远程会话占同一内容列并共享选中状态；只隐藏页面，不用弹窗锁住主导航。
     settingsPage.hidden = current !== "settings";
     scheduledPage.hidden = current !== "scheduled";

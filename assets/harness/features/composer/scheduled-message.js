@@ -8,7 +8,7 @@ import { notice } from "../../ui/notice.js";
 import { closeComposerMenus, updateComposer } from "../../core/actions.js";
 import { connected, nativeConnectionVersion, selectedId, selectionVersion, session, thread } from "../../core/state.js";
 import { randomId } from "../../core/util.js";
-import { api } from "../api.js";
+import { api, operationErrorState, receiptResultState } from "../api.js";
 import { rememberDraft } from "./drafts.js";
 import { promptSelection, setPromptSelection } from "./prompt-editor.js";
 import { renderSelectedSkills } from "./selected-skills.js";
@@ -241,7 +241,7 @@ async function saveScheduledEdit() {
     }, randomId());
     if (scheduledEditor !== editor || editor.scope !== scheduledScope()) return;
     if (receipt?.state !== "completed" || receipt.result?.ok !== true) {
-      editor.uncertain = receipt?.state !== "failed";
+      editor.uncertain = receiptResultState(receipt) !== "failed";
       editor.error = receipt?.result?.message || (editor.uncertain
         ? "保存结果待确认，请关闭后重新打开核对" : "定时消息保存失败");
       return;
@@ -251,7 +251,7 @@ async function saveScheduledEdit() {
     await reloadScheduledMessages(editor.message.threadId);
   } catch (error) {
     if (scheduledEditor !== editor || editor.scope !== scheduledScope()) return;
-    editor.uncertain = error.outcomeUnknown === true || !error.notSubmitted && !error.code;
+    editor.uncertain = operationErrorState(error) !== "failed";
     editor.error = editor.uncertain ? "保存结果待确认，请关闭后重新打开核对" : error.message;
   } finally {
     editor.saving = false;
@@ -262,9 +262,10 @@ async function saveScheduledEdit() {
 export async function submitScheduledMessage(payload) {
   const receipt = await api("/api/action/createScheduledMessage", payload, randomId());
   if (receipt?.state !== "completed") {
-    throw Object.assign(new Error(receipt?.result?.message || "定时消息设置结果待确认"), {
-      outcomeUnknown: receipt?.state === "unknown",
-      pendingFeedback: receipt?.state === "pending"
+    const state = receiptResultState(receipt);
+    throw Object.assign(new Error(receipt?.result?.message || (state === "failed" ? "定时消息设置失败" : "定时消息设置结果待确认")), {
+      operationState: state, outcomeUnknown: state === "unknown",
+      pendingFeedback: state === "pending"
     });
   }
   if (receipt.result?.ok !== true) throw new Error(receipt.result?.message || "定时消息设置失败");

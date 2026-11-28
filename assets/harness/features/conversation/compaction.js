@@ -6,7 +6,7 @@ import { notice } from "../../ui/notice.js";
 import { applyQueuedSendResult, reloadThread, updateComposer } from "../../core/actions.js";
 import { busy, connected, selectedId, selectionVersion, session, stopping, thread } from "../../core/state.js";
 import { randomId } from "../../core/util.js";
-import { api } from "../api.js";
+import { api, operationErrorState, receiptResultState } from "../api.js";
 import { modelIdentityMatches } from "../composer/model-identity.js";
 import {
   modelChoiceVersion, selectedEffort, selectedModel, setSelectedEffort, setSelectedModel
@@ -30,7 +30,7 @@ export function restoreCompactions() {
       compactions.set(value.threadId, {
         state: value.state, threadId: value.threadId, receiptId,
         deviceId: typeof value.deviceId === "string" ? value.deviceId : null,
-        acknowledged: value.acknowledged === true,
+        acknowledged: value.acknowledged === true, checkPendingReceipt: value.state === "pending" && !!receiptId,
         turnId: typeof value.turnId === "string" ? value.turnId : null,
         itemId: typeof value.itemId === "string" ? value.itemId : null,
         baselineTurnId: typeof value.baselineTurnId === "string" ? value.baselineTurnId : null,
@@ -71,7 +71,7 @@ export function compactionQueueSendReason(id = selectedId) {
   if (current.state === "unknown")
     return "压缩结果仍待确认，可继续编辑草稿；不会自动重发压缩请求，请查回执、重新读取或在本机核对后再发送。";
   if (current.state === "pending" && !current.acknowledged && !current.nativeConfirmed)
-    return "压缩请求尚未确认，可继续编辑草稿；不会自动重发压缩请求，请查回执或重新读取后再发送。";
+    return "正在提交压缩请求，可继续编辑草稿。";
   if (session?.capabilities?.compactionQueueSend !== true)
     return "当前服务尚不支持压缩期间发送排队消息，可继续编辑草稿；请更新远程服务或等待压缩完成。";
   return "";
@@ -143,41 +143,12 @@ export function reconcileCompaction(id, value) {
   if (thread?.id === id) thread.compaction = normalizeCompaction(current);
   return current;
 }
-// 用户要求 Claude 压缩没有异常时不显示提示、出现异常时再提示。命令已受理、等待原生开始属于正常过渡：
-// 会话正在执行本轮时由原生排队，空闲时通常数秒内（含恢复后台会话约 4 秒）进入压缩画面，这两种情况都保持静默。
-// 只有会话已空闲、且受理后超过宽限仍未开始压缩才提示；会话执行中不计时，转为空闲后重新计时，
-// 避免长时间执行结束的瞬间误报。宽限与 composer.js 的延时刷新共用，需同步核对。
-export const nativeCompactionStartGraceMs = 20000;
-let nativeCompactionIdleSince = { id: "", at: 0 };
-export function nativeCompactionStartPending(compaction = currentCompaction()) {
-  return isClaude() && compaction.state === "pending"
-    && !!thread?.nativeCommands?.some(command => command.name === "compact" && command.state === "pending");
-}
-// 返回开始计算“迟迟不开始”的时间点；原生仍在排队或执行本轮时返回 null，不计时。
-export function nativeCompactionStartBaseline(id, compaction = currentCompaction(id)) {
-  if (!id || !nativeCompactionStartPending(compaction) || isActiveThread()) {
-    nativeCompactionIdleSince = { id: "", at: 0 };
-    return null;
-  }
-  if (nativeCompactionIdleSince.id !== id) nativeCompactionIdleSince = { id, at: Date.now() };
-  return Math.max(nativeCompactionIdleSince.at, Number.isFinite(compaction.time) ? compaction.time : 0);
-}
 export function renderCompactionBanner(root, id, compaction) {
   if (!id || !compactionLocked(id)) return;
   const unavailable = compaction.deviceId && session?.device.id && compaction.deviceId !== session.device.id;
-  if (!unavailable && nativeCompactionStartPending(compaction)) {
-    const since = nativeCompactionStartBaseline(id, compaction);
-    // 原生已有待处理弹窗时由对应卡片说明原因，这里不再重复提示。
-    if (since !== null && Date.now() - since >= nativeCompactionStartGraceMs && !thread?.requests?.length) {
-      const box = element("div", "pending-banner",
-        "压缩命令已受理，但原生一直没有开始压缩。请在该会话的原版 Claude CLI 中核对，或重新读取状态。");
-      const reload = button("重新读取", "从原生会话重新读取压缩状态", () => void recoverCompaction(id), "text-button");
-      reload.disabled = !connected || selectedId !== id;
-      box.append(reload);
-      root.append(box);
-    }
-    return;
-  }
+  // 用户要求：Claude 已受理、尚未开始不是异常，空闲多久都不提示；真实结果未知或授权异常仍保留恢复入口。
+  if (!unavailable && isClaude() && compaction.state === "pending"
+      && thread?.nativeCommands?.some(command => command.name === "compact" && command.state === "pending")) return;
   const sendReason = compactionQueueSendReason(id);
   if (compaction.state === "running" && !unavailable && !sendReason) return;
   const awaitingReceipt = compaction.state === "unknown"
@@ -216,6 +187,7 @@ async function applyCompactionReceipt(id, receiptId, receipt) {
   const current = compactions.get(id);
   if (!current || current.receiptId !== receiptId || current.state === "idle"
       || current.deviceId && current.deviceId !== session?.device.id) return;
+  receipt = { ...receipt, state: receiptResultState(receipt) };
   const scope = privateInputScope(session);
   const refresh = async () => {
     if (selectedId !== id || privateInputScope(session) !== scope) return;
@@ -227,6 +199,7 @@ async function applyCompactionReceipt(id, receiptId, receipt) {
     }
   };
   if (receipt.state === "pending") {
+    current.checkPendingReceipt = true;
     updateComposer();
     return;
   }
@@ -289,24 +262,38 @@ async function applyCompactionReceipt(id, receiptId, receipt) {
   }
   await refresh();
 }
-async function resolveCompactionReceipt(id) {
+const compactionReceiptChecks = new Set();
+export function checkPendingCompactionReceipt(id) {
+  const current = compactions.get(id);
+  // 只在服务已答 pending 或重新打开后借既有连接探测读取原回执；正常的压缩 POST 还在途时不发额外查询。
+  if (current?.checkPendingReceipt && current.state === "pending" && !current.nativeConfirmed && !current.acknowledged
+      && current.deviceId === session?.device?.id) return resolveCompactionReceipt(id, { background: true });
+}
+async function resolveCompactionReceipt(id, { background = false } = {}) {
   const current = compactions.get(id);
   if (!current?.receiptId || !session || !connected) return;
   if (current.deviceId && current.deviceId !== session.device.id) {
     notice("压缩回执属于旧设备授权。请在本机核对后人工解除锁定。", true);
     return;
   }
+  if (compactionReceiptChecks.has(current.receiptId)) return;
+  compactionReceiptChecks.add(current.receiptId);
   const scope = privateInputScope(session);
   try {
-    const receipt = await api(`/api/receipts/${current.receiptId}`);
-    if (privateInputScope(session) !== scope) return;
+    const receipt = await api(`/api/receipts/${current.receiptId}`, undefined, undefined, undefined,
+      background ? { resourcePriority: "background" } : undefined);
+    if (privateInputScope(session) !== scope || background && selectedId !== id) return;
     await applyCompactionReceipt(id, current.receiptId, receipt);
   } catch (error) {
-    if (compactions.get(id)?.receiptId !== current.receiptId) return;
-    notice(error.code === 404
-      ? "未找到压缩回执。不会自动重发；请重新读取会话或在本机核对。"
-      : `查询压缩回执失败：${error.message}`, true);
-  }
+    const latest = compactions.get(id);
+    if (privateInputScope(session) !== scope || latest?.receiptId !== current.receiptId
+        || background && (selectedId !== id || latest.state !== "pending" || latest.acknowledged || latest.nativeConfirmed)) return;
+    if (latest.state === "pending" && !latest.acknowledged && !latest.nativeConfirmed)
+      setCompactionState(id, { ...latest, state: "unknown" });
+    if (selectedId !== id) return;
+    updateComposer();
+    // 真正未知由原压缩区域提示一次，读取失败不再叠加一条“请查回执”通知。
+  } finally { compactionReceiptChecks.delete(current.receiptId); }
 }
 async function recoverCompaction(id) {
   if (!connected || selectedId !== id) return;
@@ -371,13 +358,12 @@ export async function compactContext() {
     const current = compactions.get(id);
     if (current?.receiptId !== receiptId) return;
     // 502/504 等代理错误不能证明请求未到达；明确未知优先保留回执，只有明确未提交或普通 4xx 才解除锁定。
-    if (!error.outcomeUnknown && (error.notSubmitted || error.code && error.code < 500)) {
+    if (operationErrorState(error) === "failed") {
       setCompactionState(id, { state: "idle", turnId: current.turnId, itemId: current.itemId });
       notice(error.message, true);
     } else {
       if (current.state === "running" && current.liveItemId && current.liveItemId === current.itemId) return;
       setCompactionState(id, { ...current, state: "unknown" });
-      notice("未收到压缩回执。不会自动重发；请查回执、重新读取，或在本机核对后解除锁定。", true);
     }
   } finally { updateComposer(); }
 }

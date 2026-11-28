@@ -7,7 +7,7 @@ import {
   updateComposer
 } from "../../core/actions.js";
 import {
-  busy, connected, selectedId, selectionVersion, session, setBusy, stopping, thread, turns
+  busy, connected, selectedId, selectionVersion, session, stopping, thread, turns
 } from "../../core/state.js";
 import { randomId } from "../../core/util.js";
 import { rememberDraft } from "../composer/drafts.js";
@@ -16,6 +16,7 @@ import { selectedEffort, selectedModel } from "../composer/options-state.js";
 import { resizeEditorInput } from "../composer/prompt-editor.js";
 import { compactionLocked } from "../conversation/compaction.js";
 import { pending, reportMutationError } from "../conversation/pending-state.js";
+import { beginReceiptActivity, captureReceiptOwner } from "../conversation/receipt-context.js";
 import { messageCopyText } from "./user-content.js";
 import { clearSentMessageDisplays } from "../queue/sent-display.js";
 import { editingQueuedMessage, queuedActionBusy } from "../queue/state.js";
@@ -137,7 +138,7 @@ async function submitMessageEdit() {
   }
   edit.error = "";
   closeComposerMenus();
-  setBusy(true); updateComposer();
+  const owner = captureReceiptOwner({ threadId: edit.threadId }), finishActivity = beginReceiptActivity(owner.payload); updateComposer();
   try {
     if (editingMessage !== edit || selectedId !== edit.threadId || version !== selectionVersion
         || threadReadOnly(edit.threadId) || !threadSentMessageEditAllowed(edit.threadId)
@@ -156,7 +157,7 @@ async function submitMessageEdit() {
     await loadSidebar(null, { fresh: true });
   } catch (error) {
     if (editingMessage === edit && !error.pendingFeedback) edit.error = error.message;
-    reportMutationError(error);
+    else reportMutationError(error, owner);
   }
-  finally { setBusy(false); updateComposer(); }
+  finally { finishActivity(); updateComposer(); }
 }

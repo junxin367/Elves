@@ -15,7 +15,7 @@ import {
 } from "../../core/state.js";
 import { readCache, transcriptCache } from "../../core/stores.js";
 import { randomId } from "../../core/util.js";
-import { api } from "../api.js";
+import { api, operationErrorState, receiptResultState } from "../api.js";
 import { currentEffort, currentModelId } from "../composer/model-choice.js";
 import { permissionWrites } from "../composer/options-state.js";
 import { pendingFeedbackReady } from "../composer/send-state.js";
@@ -530,7 +530,7 @@ export function showSideCreation(record, { recordHistory = true } = {}) {
 }
 export function updateSideCreationStatus(record) {
   if (sideCreationView?.record !== record) return;
-  const unknown = record.state === "unknown" && pendingFeedbackReady(record);
+  const unknown = record.state === "unknown";
   if (sideCreationView.dock) { sideCreationView.dock.update(unknown); return; }
   sideCreationView.status.querySelector("p").textContent = unknown
     ? "正在确认创建结果，可返回主会话查看。" : "正在创建侧边会话…";
@@ -644,7 +644,8 @@ async function resolveRelatedOperation(record, { allowSelection = false } = {}) 
   if (record.request) return record.request;
   record.request = (async () => {
     try {
-      const receipt = await api(`/api/receipts/${record.id}`);
+      const received = await api(`/api/receipts/${record.id}`);
+      const receipt = { ...received, state: receiptResultState(received) };
       if (!ownsRelatedOperation(record)) return;
       if (receipt.state === "completed") await finishRelatedOperation(record, receipt.result, { allowSelection });
       else if (receipt.state === "failed" && receipt.result?.outcomeUnknown !== true) {
@@ -659,7 +660,7 @@ async function resolveRelatedOperation(record, { allowSelection = false } = {}) 
       if (!ownsRelatedOperation(record)) return;
       record.state = "unknown"; persistRelatedOperations();
       updateSideCreationStatus(record);
-      notice(`侧边会话操作待核对：${error.message}。原请求标识已保留，不会重复执行`, true);
+      // 创建标签或原会话已经显示恢复状态，不把同一未知结果再弹一次通知。
     } finally {
       record.request = null;
       if (record.scope === privateInputScope(session)) { scheduleRelatedOperationCheck(); updateComposer(); }
@@ -718,13 +719,14 @@ export async function runRelatedOperation(action, item = null) {
     await finishRelatedOperation(record, result, { allowSelection: true });
   } catch (error) {
     if (!ownsRelatedOperation(record)) return;
-    if (error.notSubmitted || error.operationState === "failed" && !error.outcomeUnknown) {
+    const state = operationErrorState(error);
+    if (state === "failed") {
       relatedThreadOperations.delete(key);
       if (sideCreationView?.record === record) requestSideCreationBack();
-    } else record.state = error.operationState === "pending" ? "pending" : "unknown";
+    } else record.state = state;
     updateSideCreationStatus(record);
     persistRelatedOperations(); scheduleRelatedOperationCheck();
-    throw error;
+    if (state === "failed") throw error;
   } finally { if (scope === privateInputScope(session)) updateComposer(); }
 }
 export function renderRelatedOperationStatus(root) {

@@ -26,6 +26,9 @@ import {
 } from "./connection-state.js";
 import { stopRelatedSessionTimers } from "./related-state.js";
 import { scheduleRelatedOperationCheck } from "./related.js";
+import { checkPendingCompactionReceipt } from "../conversation/compaction.js";
+import { threadDeletionKey, threadDeletions } from "../sidebar/deletion-state.js";
+import { checkThreadDeletion } from "../sidebar/thread-deletion.js";
 
 export function readConnectionSession(signal, recoveryObservation = undefined, { resourcePriority = "foreground", recoveryProbe = false } = {}) {
   const deviceId = session?.device.id;
@@ -131,6 +134,12 @@ export function setConnection(value) {
   const restored = !connected && value;
   if (connected && !value) setConnectionCycleVersion(connectionCycleVersion + 1);
   setConnected(value);
+  if (value && selectedId && !document.hidden) {
+    // 用户要求普通等待不弹回执：服务已返回“处理中”的删除和压缩由现有探测核对，不依赖用户点击横幅。
+    checkPendingCompactionReceipt(selectedId);
+    const deleting = threadDeletions.get(threadDeletionKey(selectedId));
+    if (deleting?.state === "pending") void checkThreadDeletion(deleting, { background: true });
+  }
   if (changed) recordRuntimeDiagnostic("connection.state");
   if (!value) stopRelatedSessionTimers();
   else scheduleRelatedOperationCheck();

@@ -4,10 +4,7 @@ import { clearComposerAttachments, composerAttachmentsLoading, setComposerAttach
 import { permissionModeKnown } from "../../permissions.js";
 import { recoveryStorageMessage } from "../../recovery-store.js";
 import { $ } from "../../ui/dom.js";
-// 历史编辑失败的提示走 notice：漏掉这个导入时，页面里 id="notice" 的元素会变成同名全局变量，
-// 调用只会报“notice is not a function”，并让失败回执卡在“正在确认送达”。
-import { notice } from "../../ui/notice.js";
-import { selectedId, session, setBusy } from "../../core/state.js";
+import { selectedId, session } from "../../core/state.js";
 import { recoveryStore, transcriptCache } from "../../core/stores.js";
 import {
   approvalDrafts, approvalReplies, blockingRequestStates, questionDrafts, questionReceiptChecks,
@@ -30,12 +27,14 @@ import {
 import { resizeComposerInput } from "./prompt-editor.js";
 import { promptOptimizationSettingsDialog } from "./prompt-optimization.js";
 import { renderSelectedSkills } from "./selected-skills.js";
-import { clearPendingFeedbackTimer, sending, setSending } from "./send-state.js";
+import { clearPendingFeedbackTimer } from "./send-state.js";
 import { setSelectedSkills } from "./skill-catalog.js";
 import { compactions } from "../conversation/compaction.js";
 import {
-  pending, pendingTimer, setPending, setPendingSendRequest, validSkillSelection
+  pending, setPendingSendRequest, validSkillSelection
 } from "../conversation/pending-state.js";
+import { allReceipts, clearReceiptRegistry, installReceipt, receiptById } from "../conversation/receipt-registry.js";
+import { clearReceiptActivity, clearStoredReceipts, receiptBelongsHere, receiptNotice } from "../conversation/receipt-context.js";
 import { assignGoalEditPending, goalComposerRecoveries, setSelectedGoal } from "../goal/state.js";
 import { setSelectedScheduledAt } from "./scheduled-state.js";
 import { editingMessage, setEditingMessage } from "../messages/message-edit.js";
@@ -66,13 +65,12 @@ export function clearPrivateInputs({ persisted = true } = {}) {
   queuedEdits.clear(); questionDrafts.clear(); questionReplyReceipts.clear(); questionReceiptChecks.clear(); compactions.clear();
   sentMessageDisplays.clear();
   blockingRequestStates.clear(); approvalReplies.clear(); approvalDrafts.clear(); threadDeletions.clear();
-  setPending(null); setPendingSendRequest(null); setEditingQueuedMessage(null); setEditingMessage(null);
-  if (sending) { setSending(null); setBusy(false); }
+  clearReceiptRegistry(); clearReceiptActivity(); setPendingSendRequest(null); setEditingQueuedMessage(null); setEditingMessage(null);
   assignGoalEditPending(null);
   setSelectedSkills([]); setSelectedGoal(null); setSelectedScheduledAt(null); transcriptCache.clear();
   void clearReadViews();
-  clearTimeout(pendingTimer);
-  for (const key of ["codex-elves-pending", "codex-elves-input-owner", "codex-elves-goal-composer-recoveries",
+  clearStoredReceipts(previousScope);
+  for (const key of ["codex-elves-input-owner",
     "codex-elves-queue-edits", "codex-elves-question-receipts", "codex-elves-compact-pending",
     "codex-elves-goal-edit-pending", "codex-elves-failed-inputs", threadDeletionStorageKey]) {
     try { sessionStorage.removeItem(key); } catch {}
@@ -95,6 +93,7 @@ export async function restorePrivateInputs(value, { expected = null, requestGene
   const currentGeneration = recoveryGeneration;
   setRecoveryScope(scope);
   try { sessionStorage.setItem("codex-elves-input-owner", scope); } catch {}
+  const knownBeforeRead = new Set(allReceipts().map(record => record.id));
   const [savedDrafts, savedPending, savedFailures, activeReceipts, savedQueueEdits] = await Promise.all([
     recoveryStore.list(scope, "draft"), recoveryStore.list(scope, "pending"), recoveryStore.list(scope, "failed"),
     recoveryStore.list(scope, "active"), recoveryStore.list(scope, "queue-edit")
@@ -108,18 +107,20 @@ export async function restorePrivateInputs(value, { expected = null, requestGene
         ...(record.recoveryUnavailable ? { invalid: false, recoveryUnavailable: false } : {}) }
       : { ...record, invalid: true };
   };
-  setPending(hydrate(pending));
+  for (const record of allReceipts()) {
+    // 正在本页写入的对象须保留身份，不能被重新连接前读到的磁盘快照替换。
+    if (record.recoveryRef && (!record.draft || record.recoveryUnavailable)) installReceipt(hydrate(record));
+  }
   for (const [id, record] of goalComposerRecoveries) goalComposerRecoveries.set(id, hydrate(record));
   // IndexedDB 本身保存完整回执，sessionStorage 被限制时仍可找回原请求标识。
-  if (!pending) {
-    const candidates = savedPending.map(entry => entry.value)
-      .filter(record => record.deviceId === value.device.id && record.recoveryScope === scope
+  for (const { value: record } of savedPending) {
+    if (receiptBelongsHere(record) && !knownBeforeRead.has(record.id) && !receiptById(record.id)
+        && record.deviceId === value.device.id && record.recoveryScope === scope
         && activeReceipts.some(active => active.id === record.id)
-        && ![...goalComposerRecoveries.values()].some(recovery => recovery.id === record.id));
-    const latest = candidates.sort((left, right) => right.time - left.time)[0];
-    if (latest) setPending({ ...latest, recoveryRef: latest.id });
+        && ![...goalComposerRecoveries.values()].some(recovery => recovery.id === record.id))
+      installReceipt({ ...record, recoveryRef: record.id });
   }
-  if (pending?.draft) submittedDrafts.set(pending.payload, pending.draft);
+  for (const record of allReceipts()) if (record.draft) submittedDrafts.set(record.payload, record.draft);
   // 用户要求客户端重开后直接恢复最后的编辑正文和附件；恢复记录与普通草稿分开，不能跨授权借用。
   for (const { id, value: edit } of savedQueueEdits)
     if (validQueuedMessageEdit(edit) && edit.editId === id && edit.deviceId === value.device.id
@@ -170,9 +171,7 @@ export async function recoverFailedInput(record) {
   }
   if (generation !== recoveryGeneration || record.deviceId !== session?.device.id) return;
   failedInputRecoveries.set(record.id, recovery);
-  // 历史编辑失败只恢复修改文字；原生附件由成功重发保留，不能把文字恢复误报为附件也已恢复。
-  if (record.action === "editMessage")
-    notice("历史编辑未完成，修改文字已保留；请核对当前会话历史和原附件后再发送。", true);
+  // 历史编辑失败保留修改文字，恢复入口说明附件边界；实际错误由编辑器显示，不再追加一条“请核对”通知。
   const isCurrent = draftKey() === key && !editingQueuedMessage && !editingMessage;
   if (isCurrent && composerAttachmentsLoading()) return;
   const existing = isCurrent ? snapshotDraft() : storedDraft(key);

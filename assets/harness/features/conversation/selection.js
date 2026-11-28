@@ -4,6 +4,7 @@ import { clearComposerAttachments } from "../../attachments.js";
 import { preserveBackgroundTaskSnapshot } from "../../background-tasks.js";
 import { $ } from "../../ui/dom.js";
 import { notice } from "../../ui/notice.js";
+import { syncReceiptSelection } from "./receipt-registry.js";
 import { closePopup } from "../../ui/popup.js";
 import { setSelectValue } from "../../ui/select.js";
 import {
@@ -107,12 +108,13 @@ export async function startNewChat(projectId, { focus = true, closeSidebar = tru
   resetMessages();
   setEditingQueuedMessage(null);
   setSelectValue($("#project-select"), project);
-  setSelectionVersion(selectionVersion + 1); setCreating(true); setSelectedId(null); setThread(null); setHistoryCursor(null); setHistoryInitialized(false); turns.clear(); transcriptEvents.clear(); renderMessages();
+  setSelectionVersion(selectionVersion + 1); setCreating(true); setSelectedId(null); setThread(null); setHistoryCursor(null); setHistoryInitialized(false); turns.clear(); transcriptEvents.clear();
   setRelatedSessionView(null); setRelatedReturnTranscript(null); sessionMenu?.close(); syncRelatedSessionLayout();
   setSelectionToken(randomId());
   setCreationProject($("#project-select").value); setNotifiedTokenUsage(null); setThreadReadVersion(threadReadVersion + 1);
   const instance = newChatBackendOptions().find(value => value.value === creationInstanceId) || newChatBackendOptions()[0];
   setCreationInstanceId(instance?.value || "codex:local"); assignCreationBackend(instance?.backend || "codex");
+  syncReceiptSelection(); renderMessages();
   if ($("#new-chat-backend")) setSelectValue($("#new-chat-backend"), creationInstanceId);
   setConnection(backendAvailable() && stream?.readyState === EventSource.OPEN);
   syncNewChatHash();
@@ -197,6 +199,7 @@ export async function selectThread(id, { closeSidebar = true, force = false, rel
   const version = setSelectionVersion(selectionVersion + 1);
   setSelectionToken(randomId());
   setSelectedId(id); setCreating(false); setThread(initialSide); turns.clear(); transcriptEvents.clear(); setHistoryCursor(null); setHistoryInitialized(false);
+  syncReceiptSelection();
   if (focusRelatedInput) requestSideComposerFocus(id);
   // 用户反馈切换会话后旧消息被补插、时序错乱：清空旧轮次后，之前已被原生接替的成功记录以本次读取的历史为准。
   settleSentMessageDisplays(id);
@@ -350,6 +353,7 @@ export function showWelcome({ startNew = true, clearHash = false } = {}) {
   setEditingQueuedMessage(null);
   setSelectionVersion(selectionVersion + 1); setThreadReadVersion(threadReadVersion + 1); setSelectionToken(randomId());
   setSelectedId(null); setThread(null); setCreating(false); setHistoryCursor(null); setHistoryInitialized(false); turns.clear(); transcriptEvents.clear(); setNotifiedTokenUsage(null);
+  syncReceiptSelection();
   if (clearHash) {
     const hash = new URLSearchParams(location.hash.slice(1));
     if (hash.has("thread")) {

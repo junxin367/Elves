@@ -34,7 +34,8 @@ import {
   followMessages, setMessageVersion, setSessionPlan, turnFieldVersions, turnVersions
 } from "./history-state.js";
 import { retireNativeHistoryTurns } from "./history.js";
-import { acceptedSendItem, pending } from "./pending-state.js";
+import { acceptedSendItem } from "./pending-state.js";
+import { receiptForPayload } from "./receipt-registry.js";
 import {
   enrichTurnTranscriptEvents, mergeItemProjection, mergeTranscriptEvents, transcriptEventTypes
 } from "./transcript-events.js";
@@ -407,10 +408,12 @@ export function receive(event) {
     scheduleSidebarRefresh();
     return;
   }
+  // 实时接受证据跟随事件的线程，不借用当前输入框；同请求的慢核对不能挡住已经到达的原生消息。
+  const pending = params.threadId ? receiptForPayload({ threadId: params.threadId }) : null;
   const pendingClientId = pending?.payload?.clientUserMessageId ?? pending?.confirmationClientUserMessageId;
-  if (!sending && pending?.action === "send" && params.threadId === pending.payload?.threadId
+  if ((!sending || sending.payload !== pending?.payload) && pending?.action === "send" && params.threadId === pending.payload?.threadId
       && typeof pendingClientId === "string" && params.item && acceptedSendItem([params.item], pendingClientId))
-    void resolvePending();
+    void resolvePending(pending, true);
   if (event.method === "remote/asyncQuestionsChanged") {
     scheduleSidebarRefresh();
     if (params.threadId === selectedId) {
@@ -430,11 +433,11 @@ export function receive(event) {
   if (event.method === "thread/queue/changed") {
     if (params.threadId === selectedId && !applyQueueSnapshot(params.threadId, params.queuedMessages, params.queuedEdits, params))
       void reloadQueue().catch(error => notice(error.message, true));
-    if (!sending && pending?.action === "send" && params.threadId === pending.payload?.threadId
+    if ((!sending || sending.payload !== pending?.payload) && pending?.action === "send" && params.threadId === pending.payload?.threadId
         && typeof pendingClientId === "string" && (params.queuedMessages || []).some(message =>
           (message.clientUserMessageId ?? message.submissionOptions?.clientUserMessageId
             ?? (!message.serverQueuedMessageId ? message.id : null)) === pendingClientId))
-      void resolvePending();
+      void resolvePending(pending, true);
     return;
   }
   if (event.method === "remote/threadReverted" && typeof eventThreadId === "string") {

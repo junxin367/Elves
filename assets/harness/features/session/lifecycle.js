@@ -30,7 +30,7 @@ import {
   setHistoryLoadingOlder, setHistoryLoadingTurnId, setHistoryRequest, setThreadRequest,
   syncHistoryButtons, threadRequest
 } from "../conversation/history-state.js";
-import { pending, pendingTimer } from "../conversation/pending-state.js";
+import { allReceipts, stopReceiptChecks } from "../conversation/receipt-registry.js";
 import {
   selectionController, setSelectionController, setThreadReadVersion, suppressAutomaticNewChat,
   threadReadVersion
@@ -84,7 +84,7 @@ export function disconnect() {
   approvalResizeObserver?.disconnect(); setApprovalResizeObserver(null);
   stream?.close(); setStream(null); stopConnectionPoll();
   cancelConnectionProbe();
-  clearTimeout(refreshTimer); clearTimeout(sidebarTimer); clearTimeout(pendingTimer);
+  clearTimeout(refreshTimer); clearTimeout(sidebarTimer); stopReceiptChecks();
   setRefreshTimer(null);
   clearTimeout(streamRetry); setStreamRetry(null);
   setSelectionVersion(selectionVersion + 1); setSidebarVersion(sidebarVersion + 1); setConnected(false);
@@ -120,7 +120,7 @@ function openStream({ suppressErrors = false } = {}) {
     try {
       const refresh = async () => {
         if (!await syncConnectionState(current)) return;
-        void resolvePending();
+        for (const record of allReceipts()) void resolvePending(record);
         await refreshAll({ fresh: true });
       };
       await (suppressErrors ? withRecoveryErrorSilence(refresh) : refresh());
@@ -270,7 +270,8 @@ async function connectPage(signal) {
         throw new Error("设备授权仍在其他页面变更，请稍后重新连接；已保存的新授权草稿未被清理。");
       }
       storageError = error;
-      if (pending?.recoveryRef && !pending.draft) Object.assign(pending, { invalid: true, recoveryUnavailable: true });
+      for (const record of allReceipts()) if (record.recoveryRef && !record.draft)
+        Object.assign(record, { invalid: true, recoveryUnavailable: true });
       break;
     }
   }
@@ -304,7 +305,9 @@ async function connectPage(signal) {
   }
   try { await refreshAll(); }
   catch (error) { if (session?.device.id === deviceId) notice(error.message, true); }
-  updateComposer(); void resolvePending(); drainPendingNotificationOpen();
+  updateComposer();
+  for (const record of allReceipts()) void resolvePending(record);
+  drainPendingNotificationOpen();
 }
 export function probeConnectionRecovery() {
   if (!session || pageLeaving || document.hidden || initialAuthenticationRequired)

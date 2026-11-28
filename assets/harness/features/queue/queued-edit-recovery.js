@@ -5,10 +5,12 @@ import { confirmAction } from "../../ui/dialog.js";
 import { $, button, element } from "../../ui/dom.js";
 import { notice } from "../../ui/notice.js";
 import { mutate, updateComposer } from "../../core/actions.js";
-import { busy, connected, selectedId, session, setBusy, thread } from "../../core/state.js";
+import { busy, connected, selectedId, session, thread } from "../../core/state.js";
 import { api } from "../api.js";
 import { pending } from "../conversation/pending-state.js";
 import { savePending } from "../conversation/pending-store.js";
+import { receiptForPayload, receiptById } from "../conversation/receipt-registry.js";
+import { beginReceiptActivity, captureReceiptOwner, receiptNotice } from "../conversation/receipt-context.js";
 import { applyQueueRead, reloadQueue } from "./queue.js";
 import { completeQueuedEditAction } from "./queued-edit.js";
 import {
@@ -30,7 +32,7 @@ export async function checkQueuedMessageEdit(threadId, editId) {
       if (result.threadId !== threadId || result.editId !== editId) throw new Error("队列编辑状态归属不一致，请重新读取");
       request.result = result;
       if (selectedId === threadId) applyQueueRead(threadId, result, request.queueReadVersion);
-      const current = pending;
+      const current = receiptForPayload({ threadId });
       if (queuedEditActions.has(current?.action) && current.deviceId === deviceId
           && current.payload.threadId === threadId && current.payload.editId === editId && !result.operationPending) {
         const beginning = current.action === "beginQueuedEdit"
@@ -39,11 +41,11 @@ export async function checkQueuedMessageEdit(threadId, editId) {
         const terminal = ["committed", "canceled"].includes(result.editState)
           && result.result?.ok === true
           && result.operationFingerprint === await queuedEditFingerprint(current.action, current.payload);
-        if (pending === current && (beginning || dismissed || terminal)) {
-          savePending(null);
+        if (receiptById(current.id) === current && (beginning || dismissed || terminal)) {
+          savePending(null, current);
           completeQueuedEditAction(current.action, current.payload,
             { ...result.result, ...result, editState: dismissed ? "dismissed" : result.editState }, queueVersion);
-          notice(beginning && result.editState === "editing" ? "排队消息已取回输入框"
+          receiptNotice(current, beginning && result.editState === "editing" ? "排队消息已取回输入框"
             : dismissed ? "已结束待确认编辑，未保存、删除或重发消息" : "队列编辑完成状态已核对");
         }
       }
@@ -126,7 +128,8 @@ async function dismissQueuedMessageEdit(threadId, editId) {
   const readVersion = queueVersion;
   const previousPending = pending;
   if (pending) savePending(null);
-  setBusy(true); updateComposer();
+  const owner = captureReceiptOwner({ threadId }), finishActivity = beginReceiptActivity(owner.payload);
+  updateComposer();
   let dismissed = false;
   try {
     const payload = { threadId, editId, confirmed: true };
@@ -134,10 +137,10 @@ async function dismissQueuedMessageEdit(threadId, editId) {
     dismissed = true;
     completeQueuedEditAction("dismissQueuedEdit", payload, result, readVersion);
     if (selectedId === threadId) await reloadQueue();
-    notice("已结束待确认编辑，未保存、删除或重发消息");
+    receiptNotice(owner, "已结束待确认编辑，未保存、删除或重发消息");
   } catch (error) {
-    if (!dismissed && !pending && previousPending && session?.device.id === deviceId) savePending(previousPending);
-    notice(error.message, true);
+    if (!dismissed && !receiptForPayload({ threadId }) && previousPending && session?.device.id === deviceId) savePending(previousPending);
+    receiptNotice(owner, error.message, true);
   }
-  finally { setBusy(false); updateComposer(); }
+  finally { finishActivity(); updateComposer(); }
 }

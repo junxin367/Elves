@@ -386,15 +386,6 @@ impl Conversation {
             .is_some_and(|turn| turn["status"] == "inProgress")
     }
 
-    /// 共享会话此刻没有任何执行，也没有等待用户的请求：此后不会再出现新的原生接收记录。
-    /// 与编辑历史的准入判断一致（见 enqueue_shared_input）。
-    fn natively_idle(&self) -> bool {
-        self.shared
-            && !self.active()
-            && self.native_status["tempo"] == "idle"
-            && self.native_status["needs"].is_null()
-    }
-
     fn active(&self) -> bool {
         // 原版已回复的澄清也可能标为 blocked；只按生成活动或未完成轮次显示执行中，保留真正的工具等待。
         if self.shared {

@@ -9,7 +9,9 @@ import { $ } from "../../ui/dom.js";
 import { notice } from "../../ui/notice.js";
 import { closePopup } from "../../ui/popup.js";
 import { applyQueuedSendResult, closeComposerMenus, mutate, updateComposer } from "../../core/actions.js";
-import { busy, connected, selectedId, selectionVersion, session, setBusy, stopping, thread } from "../../core/state.js";
+import { busy, connected, selectedId, selectionVersion, session, stopping, thread } from "../../core/state.js";
+import { beginReceiptActivity, captureReceiptOwner, receiptNotice } from "../conversation/receipt-context.js";
+import { receiptForPayload } from "../conversation/receipt-registry.js";
 import { randomId } from "../../core/util.js";
 import { restoreDraft, restoreQueuedMessageEdit } from "../composer/draft-restore.js";
 import {
@@ -78,10 +80,10 @@ export async function beginQueuedMessageEdit(threadId, message) {
   if (editingMessage || editingQueuedMessage) { $("#prompt").focus(); return; }
   const version = selectionVersion;
   let attachments;
-  setBusy(true); updateComposer();
+  const owner = captureReceiptOwner({ threadId }), finishActivity = beginReceiptActivity(owner.payload); updateComposer();
   try { attachments = await attachmentsFromQueuedMessage(message); }
-  catch (error) { notice(error.message || "无法读取排队消息的图片，请刷新后重试", true); return; }
-  finally { setBusy(false); updateComposer(); }
+  catch (error) { receiptNotice(owner, error.message || "无法读取排队消息的图片，请刷新后重试", true); return; }
+  finally { finishActivity(); updateComposer(); }
   if (selectionVersion !== version || selectedId !== threadId || thread?.id !== threadId
       || editingMessage || editingQueuedMessage || pending || !connected || threadReadOnly(threadId)) return;
   rememberDraft();
@@ -115,14 +117,14 @@ async function requestQueuedMessageEdit(edit) {
     ...(edit.imageRemoval ? { expectedImageSources: edit.originalImageSources } : {})
   };
   const readVersion = queueVersion;
-  setBusy(true); updateComposer();
+  const owner = captureReceiptOwner(payload), finishActivity = beginReceiptActivity(payload); updateComposer();
   try {
     const result = await mutate("beginQueuedEdit", payload, { reliable: true });
     completeQueuedEditAction("beginQueuedEdit", payload, result, readVersion);
   } catch (error) {
-    if (!pending) finishQueuedMessageEdit(edit);
-    reportMutationError(error);
-  } finally { setBusy(false); updateComposer(); }
+    if (!receiptForPayload(payload)) finishQueuedMessageEdit(edit);
+    reportMutationError(error, owner);
+  } finally { finishActivity(); updateComposer(); }
   if (editingQueuedMessage === edit && edit.state === "editing") {
     $("#prompt").focus({ preventScroll: true });
     setPromptSelection($("#prompt"), $("#prompt").value.length);
@@ -195,7 +197,7 @@ export async function submitQueuedMessageEdit() {
   const key = `${threadId}:${messageId}`, readVersion = queueVersion;
   if (queuedActionBusy.has(key)) return;
   queuedActionBusy.add(key);
-  setBusy(true);
+  const owner = captureReceiptOwner({ threadId }), finishActivity = beginReceiptActivity(owner.payload);
   const payload = {
     threadId,
     editId: edit.editId,
@@ -212,9 +214,9 @@ export async function submitQueuedMessageEdit() {
     completeQueuedEditAction("editQueued", payload, result, readVersion);
     if (selectedId === threadId) $("#prompt").focus({ preventScroll: true });
   } catch (error) {
-    reportMutationError(error);
+    reportMutationError(error, owner);
   } finally {
     queuedActionBusy.delete(key);
-    setBusy(false); updateComposer();
+    finishActivity(); updateComposer();
   }
 }

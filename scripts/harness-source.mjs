@@ -94,6 +94,26 @@ export async function loadHarnessAppSource(root = defaultRoot) {
       reloadScheduledMessages: async () => {},
     })) if (!Object.hasOwn(context, name)) context[name] = value;
     const missing = name => !Object.hasOwn(context, name) && new RegExp(`\\b${name}\\(`).test(code);
+    // 回执测试使用真实的按请求登记、输入锁和页面归属；同一 VM 只装配一次，两个 iframe 分属两个 VM。
+    const scopeNames = ["receiptSurfaceForLocation", "receiptSurface", "receiptStorageKey", "goalReceiptStorageKey", "receiptBelongsHere", "receiptOwnerKey",
+      "receiptInView", "captureReceiptOwner", "receiptNotice", "syncReceiptActivity", "syncReceiptNotices",
+      "beginReceiptActivity", "clearReceiptActivity", "clearStoredReceipts"];
+    const recordNames = ["allReceipts", "receiptById", "receiptForPayload", "reserveReceipt", "syncReceiptView", "syncReceiptSelection",
+      "installReceipt", "removeReceipt", "retryReceipt", "stopReceiptChecks", "clearReceiptRegistry"];
+    if ([...scopeNames, ...recordNames].some(n => new RegExp(`\\b${n}\\b`).test(code))) {
+      for (const [k, v] of Object.entries({ pending: null, selectedId: null, session: null, creating: false,
+        creationProject: "", creationInstanceId: "codex:local", creationBackend: "codex",
+        syncNoticeOwner() {}, privateInputScope: v => v?.device?.id ? JSON.stringify([v.device.id, v.device.createdAtMs ?? null]) : null
+      })) if (!Object.hasOwn(context, k)) context[k] = v;
+      for (const [name, field] of [["setPending","pending"],["setBusy","busy"],["setSending","sending"],["setStopping","stopping"]]) {
+        if (!Object.hasOwn(context, name)) runInContext(`function ${name}(value) { return ${field} = value; }`, context);
+      }
+      for (const [path, names] of [["receipt-context", scopeNames], ["receipt-registry", recordNames]]) {
+        if (names.every(k => Object.hasOwn(context, k))) continue;
+        const real = runInContext(`(() => {${moduleText(`features/conversation/${path}.js`)}\nreturn {${names.join(",")}};})()`, context);
+        for (const k of names) if (!Object.hasOwn(context, k)) context[k] = real[k];
+      }
+    }
     // 菜单渲染片段复用真实公共内容组件；显式注入的用例桩优先，DOM/图标依赖沿用当前 VM 的提供者。
     const menuParts = ["createMenuSurface", "createMenuDescription", "createMenuTitle", "createMenuEmpty",
       "createMenuGroup", "createMenuSeparator", "createMenuItem", "createMenuSearch", "createMenuButton", "createMenuHelp",
@@ -109,6 +129,8 @@ export async function loadHarnessAppSource(root = defaultRoot) {
     const define = (name, start, end) => {
       if (!Object.hasOwn(context, name)) definitions.push(section(start, end));
     };
+    if (missing("operationErrorState")) define("operationErrorState", "function operationErrorState(", "function receiptResultState(");
+    if (missing("receiptResultState")) define("receiptResultState", "function receiptResultState(", "async function api(");
     if (missing("conversationBackend") || missing("antigravityThreadId")) {
       define("claudeThreadId", "function claudeThreadId(", "function antigravityThreadId(");
       define("antigravityThreadId", "function antigravityThreadId(", "function activeBackend(");

@@ -16,18 +16,17 @@ import { activePopup, fitPopup, renderPopup } from "../../ui/popup.js";
 import { setSelectOptions } from "../../ui/select.js";
 import {
   applyQueuedSendResult, closeComposerMenus, loadModels, loadSidebar, mutate, reloadThread,
-  renderApprovals, renderGoalStatus, renderQueueArea, renderQueuedEditRecoveryControls,
+  renderGoalStatus, renderQueueArea, renderQueuedEditRecoveryControls,
   resolvePending, scheduleMessages, selectThread
 } from "../../core/actions.js";
 import {
   busy, connected, creating, nativeConnectionVersion, pageLeaving, selectedId, selectionToken,
-  selectionVersion, session, setBusy, setStopping, sidebar, stopping, thread
+  selectionVersion, session, sidebar, stopping, thread
 } from "../../core/state.js";
 import { recoveryStore } from "../../core/stores.js";
 import { randomId } from "../../core/util.js";
 import { api } from "../api.js";
 import { appearance } from "../appearance/theme.js";
-import { approvalReplies, questionReplyReceipts, setApprovalSignature } from "../approval-state.js";
 import { renderClaudeControlNotices } from "../claude-notices.js";
 import { syncClaudeUsage } from "./claude-usage.js";
 import { refitComposerMenus } from "./composer-menus.js";
@@ -59,9 +58,9 @@ import { loadInstancePermissionCatalog, updateComposerPermissions } from "./perm
 import { composerPrompt, effortLabels, resizeComposerInput } from "./prompt-editor.js";
 import { updatePromptOptimization } from "./prompt-optimization.js";
 import {
-  claudeGiveUpDelayMs, clearPendingFeedbackTimer, composerDiagnosticState, pendingFeedbackDelay, pendingFeedbackReady,
+  claudeGiveUpDelayMs, clearPendingFeedbackTimer, composerDiagnosticState, pendingFeedbackReady,
   prepareClaudeProjectCreation, queuedEditHasOriginalImages, sending, setComposerDiagnosticState,
-  setPendingFeedbackTimer, setSending, setThreadOwnershipRetry, threadOwnershipRetry
+  setPendingFeedbackTimer, setThreadOwnershipRetry, threadOwnershipRetry
 } from "./send-state.js";
 import { selectedSkills } from "./skill-catalog.js";
 import { scheduledTimeLabel, selectedScheduledAt } from "./scheduled-state.js";
@@ -72,17 +71,19 @@ import {
 import { compactCommandAvailable, renderSkillMenu } from "./skills.js";
 import {
   compactContext, compactionInProgress, compactionLocked, compactionQueueSendReason,
-  currentCompaction, nativeCompactionStartBaseline, renderCompactionBanner
+  currentCompaction, renderCompactionBanner
 } from "../conversation/compaction.js";
 import { historyInitialized, setFollowMessages, updateScrollControl } from "../conversation/history-state.js";
-import { pending, pendingTimer, setPendingTimer } from "../conversation/pending-state.js";
+import { pending } from "../conversation/pending-state.js";
+import { receiptById, receiptForPayload, retryReceipt, syncReceiptSelection } from "../conversation/receipt-registry.js";
+import { beginReceiptActivity, captureReceiptOwner, receiptInView, receiptNotice } from "../conversation/receipt-context.js";
 import { savePending } from "../conversation/pending-store.js";
 import {
   applyGoalComposerReceipt, manuallyResolveGoalComposer, renderGoalComposerRecovery
 } from "../goal/composer-submission.js";
 import { goalComposerReason, goalPrefix, selectGoalCommand } from "../goal/composer.js";
 import {
-  goalComposerAction, goalComposerPlaceholder, goalComposerRecoveries, goalEditPending,
+  goalComposerAction, goalComposerPlaceholder,
   goalRecordThreadId, goalVersion, selectedGoal
 } from "../goal/state.js";
 import { editingMessage, queuedEditSubmittingAction, updateMessageEditor } from "../messages/message-edit.js";
@@ -99,11 +100,7 @@ import { recordRuntimeDiagnostic, stream } from "../session/connection-state.js"
 import {
   activeInstanceId, availableSessionInstances, newChatBackendOptions, sessionInstanceEnabled
 } from "../session/instances.js";
-import { relatedThreadOperations, sideCreationView } from "../session/related-state.js";
-import {
-  ownsRelatedOperation, renderRelatedOperationStatus, syncRelatedSessionLayout,
-  updateSideCreationStatus
-} from "../session/related.js";
+import { renderRelatedOperationStatus, syncRelatedSessionLayout } from "../session/related.js";
 import { syncRequestedSideInput, syncWorkspaceSidePanelState } from "../session/side-panel.js";
 import { currentThreadDisplay } from "../session/thread-cache.js";
 import { rememberThreadDisplay, syncRelatedModelDisplay } from "../session/thread-display.js";
@@ -219,41 +216,23 @@ export async function releaseThreadHolders() {
 
 export function syncPendingFeedbackTimer() {
   clearPendingFeedbackTimer();
-  if (!session || pageLeaving || document.hidden) return;
-  const compaction = currentCompaction();
-  const awaitingCompaction = compaction.state === "unknown"
-    || compaction.state === "pending" && !compaction.acknowledged && !compaction.nativeConfirmed;
-  // Claude 压缩受理后迟迟不开始才提示：会话执行中的排队不计时，空闲后到点再刷新输入区提示。
-  const nativeStartSince = nativeCompactionStartBaseline(selectedId, compaction);
-  const records = [
-    pending?.agySending ? null : pending, threadDeletions.get(threadDeletionKey(selectedId)),
-    goalEditPending?.payload.threadId === selectedId ? goalEditPending : null,
-    awaitingCompaction ? compaction : null,
-    nativeStartSince === null ? null : { action: "nativeCompactionStart", time: nativeStartSince },
-    ...[...relatedThreadOperations.values()].filter(record =>
-      ownsRelatedOperation(record) && record.parentThreadId === selectedId),
-    ...[...goalComposerRecoveries.values()].filter(record =>
-      record.recoveryState === "unknown" && (goalRecordThreadId(record) === selectedId
-        || creating && newDraftKey(record.payload.projectId, record.payload.backend, record.payload.instanceId) === draftKey())),
-    ...[...approvalReplies.values(), ...questionReplyReceipts.values()].filter(record =>
-      record.deviceId === session.device.id && record.threadId === selectedId)
-  ];
-  const remaining = records.filter(record => record && Number.isFinite(record.time)
-      && (!record.deviceId || record.deviceId === session.device.id)
-      && !["confirming", "deleted"].includes(record.state))
-    .map(record => record.time + pendingFeedbackDelay(record) - Date.now()).filter(delay => delay > 0);
-  if (!remaining.length) return;
+  const record = pending;
+  if (!session || pageLeaving || document.hidden || !record || !receiptInView(record)
+      || record.deviceId !== session.device.id || record.invalid || record.recoveryUnavailable
+      || !pendingFeedbackReady(record) || !["send", "editMessage"].includes(record.action)
+      || !(claudeThreadId(record.payload?.threadId) || antigravityThreadId(record.payload?.threadId))) return;
+  // 只更新已经出现的异常提示上的“放弃等待”按钮，不为正常在途的请求设置界面计时器。
+  const remaining = record.time + claudeGiveUpDelayMs - Date.now();
+  if (!Number.isFinite(remaining) || remaining <= 0) return;
   const version = selectionVersion, scope = privateInputScope(session);
   setPendingFeedbackTimer(setTimeout(() => {
     setPendingFeedbackTimer(null);
-    if (pageLeaving || document.hidden || version !== selectionVersion || scope !== privateInputScope(session)) return;
-    if (sideCreationView) updateSideCreationStatus(sideCreationView.record);
-    setApprovalSignature(null);
-    renderApprovals();
+    if (pageLeaving || document.hidden || pending !== record || version !== selectionVersion || scope !== privateInputScope(session)) return;
     updateComposer();
-  }, Math.min(...remaining)));
+  }, remaining));
 }
 export function updateComposer({ followEnd = false } = {}) {
+  syncReceiptSelection();
   workspaceOpenIn?.updateContext();
   sessionTools?.updateContext();
   syncRelatedSessionLayout();
@@ -370,18 +349,19 @@ export function updateComposer({ followEnd = false } = {}) {
   add.disabled = add.menuOptions.every(option => option.disabled);
   if (activePopup?.trigger === add) renderPopup();
   const queuedEditAction = queuedEditSubmittingAction();
-  // AGY 的原请求还在正常处理时只使用现有按钮；切换会话不能把上个会话标成发送中。
-  const agySending = pending?.agySending === true && !active && !pending.invalid && !pending.recoveryUnavailable
+  // 各实例的正常发送只显示原按钮忙态。后台明确返回 pending 时按钮继续等待，不盖住已执行轮次的停止入口。
+  const receiptSending = (pending?.agySending === true || pending?.receiptState === "pending"
+    && ["send", "create", "editMessage", "setGoal"].includes(pending.action)) && !active && !pending.invalid && !pending.recoveryUnavailable
     && pending.deviceId === session?.device?.id && (!pending.operationScope || pending.operationScope === privateInputScope(session))
     && (pending.payload?.threadId ? pending.payload.threadId === selectedId
       : creating && pending.selectionToken === selectionToken);
   const sendingLabel = sending ? sending.phase === "syncing" ? "同步中…" : "发送中…"
-    : agySending ? "发送中…" : queuedEditAction === "cancelQueuedEdit" ? "处理中…" : queuedEditAction === "editQueued" ? "发送中…" : "";
+    : receiptSending ? "发送中…" : queuedEditAction === "cancelQueuedEdit" ? "处理中…" : queuedEditAction === "editQueued" ? "发送中…" : "";
   if ($("#send-status").textContent !== sendingLabel) $("#send-status").textContent = sendingLabel;
   // 用户要求压缩执行中空输入显示停止；有正文或附件时仍可加入原生队列，旧 print 会话保留原停止行为。
   // 用户要求排队取回后沿用普通发送图标和文案；空草稿不能误显示停止当前任务。
   // 只有定时标记、还没有正文时仍按空输入处理，执行中保留停止按钮。
-  const action = sending || agySending ? "sending" : editingQueuedMessage || scheduling && (prompt || hasAttachments) ? "send"
+  const action = sending || receiptSending ? "sending" : editingQueuedMessage || scheduling && (prompt || hasAttachments) ? "send"
     : isClaude() && !claudeNativeQueue() && active && selectedId ? "stop"
     : !goalMode && !editing && (active || compactionInProgress(compaction))
       && ((!prompt && !hasAttachments) || pending) && selectedId ? "stop" : "send";
@@ -405,7 +385,7 @@ export function updateComposer({ followEnd = false } = {}) {
   else if (unsupportedImages) send.title = "当前服务版本尚不支持图片发送，请先更新程序";
   if (unsupportedFiles) send.title = "请更新远程服务后发送文件和文件夹";
   if (unsupportedProjectless) send.title = "当前服务版本尚不支持无项目会话，请先更新程序或选择已有项目";
-  send.setAttribute("aria-busy", String(busy || stopping || agySending));
+  send.setAttribute("aria-busy", String(busy || stopping || receiptSending));
   const blockedBy = !sessionTypeEnabled && action !== "stop" ? "backend-disabled"
     : editingMessage ? "message-edit" : editingQueuedMessage?.state === "starting" ? "queue-edit-loading"
     : deleting ? "delete" : busy ? "busy" : stopping ? "stopping"
@@ -493,7 +473,7 @@ export function updateComposer({ followEnd = false } = {}) {
   if (goalMode && goalReason && !busy && !pending && !threadReadOnly())
     $("#pending-area").append(element("div", "pending-banner goal-composer-note", goalReason));
   renderClaudeControlNotices($("#pending-area"));
-  if (pending && (!sending || pending.payload !== sending.payload)
+  if (pending && (!sending || pending.payload !== sending.payload) && receiptInView(pending)
       && (pending.invalid || pending.deviceId && pending.deviceId !== session.device.id
         || !pending.agySending && pendingFeedbackReady(pending))) {
     const unavailable = pending.invalid || (pending.deviceId && pending.deviceId !== session.device.id);
@@ -717,12 +697,13 @@ export async function sendMessage() {
   const action = wasCreating ? "create" : goalMode ? "setGoal" : scheduledAt ? "createScheduledMessage" : "send";
   const goalRecord = goalMode ? {
     id: randomId(), action, payload, draft, goalReadVersion: goalVersion,
-    deviceId: session.device.id, selectionToken, time: Date.now()
+    ...captureReceiptOwner(payload), selectionToken, time: Date.now()
   } : null;
   const submission = { payload, phase: "sending" };
   const sendDisplay = action === "send" ? rememberSendDisplay(payload) : null;
-  setSending(submission);
-  setBusy(true); updateComposer();
+  const owner = captureReceiptOwner(payload);
+  const finishActivity = beginReceiptActivity(payload, "send", submission);
+  updateComposer();
   let requestStarted = false;
   try {
     if (wasCreating && payload.backend === "claude" && session.capabilities?.claudeProjectTrust === true) {
@@ -738,16 +719,16 @@ export async function sendMessage() {
       ? await submitScheduledMessage(payload)
       : await mutate(action, payload, { reliable: true, receiptId: goalRecord?.id });
     if (!currentAuthorization()) return;
-    if (result.permissionWarning) notice(result.permissionWarning, true);
+    if (result.permissionWarning) receiptNotice(owner, result.permissionWarning, true);
     if (goalMode) {
-      await applyGoalComposerReceipt(pending?.id === goalRecord.id ? pending : goalRecord,
+      await applyGoalComposerReceipt(receiptById(goalRecord.id) || goalRecord,
         { state: "completed", result }, { allowSelection: true });
       return;
     }
     if (action === "createScheduledMessage") {
       clearSubmittedDraft(payload, selectionVersion === version);
       await reloadScheduledMessages(id);
-      notice(`已设置定时发送：${scheduledTimeLabel(scheduledAt)}`);
+      receiptNotice(owner, `已设置定时发送：${scheduledTimeLabel(scheduledAt)}`);
       return;
     }
     const queued = !wasCreating && applyQueuedSendResult(id, result, queueReadVersion, payload);
@@ -771,31 +752,24 @@ export async function sendMessage() {
   } catch (error) {
     if (!currentAuthorization()) return;
     if (!requestStarted) submittedDrafts.delete(payload);
-    finishSendDisplay(sendDisplay, !pending);
+    finishSendDisplay(sendDisplay, !receiptForPayload(payload));
     if (goalMode) {
-      const record = pending?.id === goalRecord.id ? pending : goalRecord;
+      const record = receiptById(goalRecord.id) || goalRecord;
       const outcome = await applyGoalComposerReceipt(record, error.goalReceipt || {
         state: "unknown", result: error.result || { ok: false, outcomeUnknown: true, message: error.message }
       }, { allowSelection: true });
-      if (outcome === "pending" && pending?.id === goalRecord.id) {
-        clearTimeout(pendingTimer);
-        setPendingTimer(setTimeout(() => { if (pending?.id === goalRecord.id) void resolvePending(); }, 2000));
-      }
+      if (outcome === "pending" && receiptById(goalRecord.id)) retryReceipt(record, 2000, resolvePending);
       return;
     }
     if (error.pendingFeedback) updateComposer();
-    else if (error.deliveryPending) {
-      // 原生消息可能已被并发回执确认；AGY 的未知结果只走同一条内联恢复提示，不再叠加通知。
-      if (!antigravityThreadId(payload.threadId) && payload.backend !== "antigravity")
-        notice("正在自动核对原生接收状态，不会重发消息。");
-    }
     else if (submission.phase === "syncing") recordDiagnostic("remote.send.reload", {
       phase: "failure", errorType: error?.name || "Error"
     });
-    else notice(error.message, true);
+    // 同一请求可能已被原生事件确认；送达核对由原会话状态承载，不追加等待通知。
+    else if (!error.deliveryPending) receiptNotice(owner, error.message, true);
   } finally {
     finishSendDisplay(sendDisplay);
-    if (sending === submission) { setSending(null); setBusy(false); updateComposer(); }
+    finishActivity(); updateComposer();
   }
 }
 export async function stopGeneration() {
@@ -803,18 +777,19 @@ export async function stopGeneration() {
   if (stopping || busy || threadReadOnly() || !connected || !selectedId
       || !isActiveThread() && !compactionInProgress()) return;
   const id = selectedId, version = selectionVersion, claude = isClaude(), antigravity = isAntigravity();
-  setStopping(true); updateComposer();
+  const owner = captureReceiptOwner({ threadId: id });
+  const finishActivity = beginReceiptActivity(owner.payload, "stop"); updateComposer();
   try {
     const result = await mutate("stop", { threadId: id });
     // 用户要求 AGY 停止只按真实回执提示：取消通知写入仅表示已请求，不能提前显示“已停止”。
     // Claude 沿用既有强制结束及清理回执，AGY 的轮次结束等待原生事件。
-    notice(result?.cleanupPending ? result.message || "会话已停止，后台终端清理尚未确认"
+    receiptNotice(owner, result?.cleanupPending ? result.message || "会话已停止，后台终端清理尚未确认"
       : result?.forced ? `${antigravity ? "Antigravity" : "Claude"} 没有响应停止请求，已强制结束它的进程；会话已保留，可以继续发送。`
       : antigravity ? result?.stopped ? "本轮已结束" : "已请求停止"
         : claude ? "已停止" : "已请求停止并清理此会话的后台终端");
     if (version === selectionVersion && selectedId === id) await reloadThread();
-  } catch (error) { notice(error.message, true); }
-  finally { setStopping(false); updateComposer(); }
+  } catch (error) { receiptNotice(owner, error.message, true); }
+  finally { finishActivity(); updateComposer(); }
 }
 
 export function mountComposerScroll() {

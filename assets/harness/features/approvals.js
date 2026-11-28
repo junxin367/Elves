@@ -15,7 +15,6 @@ import {
 } from "./approval-state.js";
 import { claudePlanOptionLabel, claudeRewindDialogText } from "./claude-notices.js";
 import { fitApprovalArea } from "./composer/composer-menus.js";
-import { syncPendingFeedbackTimer } from "./composer/composer.js";
 import { pendingFeedbackReady } from "./composer/send-state.js";
 import { reconcileChildren } from "./messages/item-presentation.js";
 import { setMarkdown } from "./messages/media.js";
@@ -78,7 +77,7 @@ function renderAsyncQuestion(card, request, requestThreadId) {
       || fields.some(question => !draft.get(question.id)?.trim());
   };
   if (submissionState) {
-    if (pendingFeedbackReady(receipt))
+    if (submissionState === "unknown")
       status.textContent = receipt?.skip ? "正在确认问题跳过结果。" : "正在确认回答结果。";
     if (receipt?.skip) skip.textContent = "跳过中…";
     else submit.textContent = "提交中…";
@@ -96,7 +95,6 @@ function renderAsyncQuestion(card, request, requestThreadId) {
   update(); footer.append(status, actions); form.append(footer); card.append(form);
 }
 export function renderApprovals() {
-  syncPendingFeedbackTimer();
   // 用户要求请求出现和处理完成时同步主侧栏与侧边标签，不能仅刷新审批卡片或等待执行状态变化。
   syncWorkspaceSidePanelState();
   const root = $("#approval-area"); if (!root) return;

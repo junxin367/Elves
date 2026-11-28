@@ -14,6 +14,7 @@ import { renderSelectedSkills } from "../composer/selected-skills.js";
 import { selectedSkills, slashQuery } from "../composer/skill-catalog.js";
 import { compactionLocked } from "../conversation/compaction.js";
 import { pending, validSkillSelection } from "../conversation/pending-state.js";
+import { goalReceiptStorageKey } from "../conversation/receipt-context.js";
 import {
   goalComposerAction, goalComposerRecoveries, goalRecordThreadId, goalSubmissionState,
   hydrateGoalComposerRecord, selectedGoal, setSelectedGoal, unfinishedGoal
@@ -50,7 +51,7 @@ export function goalComposerStorageRecord(record) {
 // 从会话存储恢复目标创建的失败/未知回执，供目标输入恢复提示使用。
 export function restoreGoalComposerRecoveries() {
   try {
-    const stored = JSON.parse(sessionStorage.getItem("codex-elves-goal-composer-recoveries") || "[]");
+    const stored = JSON.parse(sessionStorage.getItem(goalReceiptStorageKey) || "[]");
     if (Array.isArray(stored)) for (const saved of stored) {
       const record = hydrateGoalComposerRecord(saved);
       const state = goalSubmissionState(record?.goalSubmission, record?.action);
@@ -113,10 +114,10 @@ function clearGoalComposerMode() {
 export function persistGoalComposerRecoveries(required = false) {
   try {
     if (goalComposerRecoveries.size)
-      sessionStorage.setItem("codex-elves-goal-composer-recoveries", JSON.stringify([...goalComposerRecoveries.values()]
+      sessionStorage.setItem(goalReceiptStorageKey, JSON.stringify([...goalComposerRecoveries.values()]
         .filter(record => record.recoveryState !== "unknown" || pending?.id !== record.id)
         .map(goalComposerStorageRecord)));
-    else sessionStorage.removeItem("codex-elves-goal-composer-recoveries");
+    else sessionStorage.removeItem(goalReceiptStorageKey);
     return true;
   } catch {
     if (required) throw new Error("无法保存已创建会话的目标草稿，请保留页面并核对回执。");

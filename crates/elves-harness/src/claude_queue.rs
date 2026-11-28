@@ -2,15 +2,6 @@
 use super::*;
 use std::collections::HashSet;
 
-/// 消息进入 sending（实际派发开始）后超过这个时间，仍没有任何原生接收记录、会话也已空闲，就认定投递已经失败。
-/// 必须大于一次投递内部的全部等待（初始化 60 秒 + 接收回执 10 秒 + 余量），否则会把仍在派发的消息误判为失败。
-const SENDING_ABANDON_MS: u64 = 120_000;
-/// 派发结果已被判为“未知”的消息：会话空闲且没有原生接收记录满这个时间就结案。
-/// 此时承载这次写入的 CLI 已经回应过或退出，迟到的接收记录会在数秒内出现，45 秒足够排除。
-const UNKNOWN_ABANDON_MS: u64 = 45_000;
-/// 记住最近结案的消息数量；超出后丢弃最早的。
-const ABANDONED_LIMIT: usize = 256;
-
 /// 只在一次主会话历史投影内使用。工具收到原生结果才算返回，任务转入后台不必等后台任务退出。
 #[derive(Default)]
 pub(super) struct ReplyEvidence<'a> {
@@ -94,8 +85,7 @@ pub(super) struct RemoteQueue {
     messages: Vec<Message>,
     edits: BTreeMap<String, Edit>,
     accepted: BTreeMap<String, String>,
-    // 已按原生证据结案为“没有送达”的消息（客户端消息标识 → 结案时刻）。网页据此恢复输入，
-    // 不再让用户去原生客户端核对；这类消息之后若又出现原生接收记录，仍以接收记录为准（见 queue_send_state）。
+    // 旧版按等待时长结束的记录不具有“未送达”证据，保留落盘字段但不再用于失败判定或自动重发。
     abandoned: BTreeMap<String, u64>,
     revision: u64,
     paused: bool,
@@ -379,57 +369,6 @@ impl RemoteQueue {
         }
     }
 
-    /// 已经不会再送达的消息：状态为 sending/unknown、停留超过各自时限，且会话此刻空闲（没有执行、没有等待用户）。
-    /// 压缩命令有自己的原生终态判定，不在此列。
-    fn stale_ids(&self, now: u64, idle: bool) -> Vec<String> {
-        if !idle {
-            return Vec::new();
-        }
-        self.messages
-            .iter()
-            .filter(|m| !m.compact)
-            .filter(|m| {
-                let age = now.saturating_sub(m.since.max(m.created_at));
-                match m.state.as_str() {
-                    "sending" => age >= SENDING_ABANDON_MS,
-                    "unknown" => age >= UNKNOWN_ABANDON_MS,
-                    _ => false,
-                }
-            })
-            .map(|m| m.id.clone())
-            .collect()
-    }
-
-    /// 结案：把确定不会再送达的消息移出队列并记为“没有送达”，不再挡住后续发送；返回结案条数。
-    /// 用户要求 Harness 自己判定送达结果，不能让用户去原生客户端核对（2026-11-25）；这里只依据原生记录与会话空闲，
-    /// 不重发、不改写历史。
-    pub(super) fn abandon_stale(&mut self, now: u64, idle: bool) -> usize {
-        let stale = self.stale_ids(now, idle);
-        for id in &stale {
-            self.messages.retain(|m| &m.id != id);
-            self.abandoned.insert(id.clone(), now);
-            if self.awaiting_turn.as_deref() == Some(id.as_str()) {
-                self.awaiting_turn = None;
-                self.awaiting_started = false;
-            }
-        }
-        while self.abandoned.len() > ABANDONED_LIMIT {
-            let Some(oldest) = self
-                .abandoned
-                .iter()
-                .min_by_key(|(_, at)| **at)
-                .map(|(id, _)| id.clone())
-            else {
-                break;
-            };
-            self.abandoned.remove(&oldest);
-        }
-        if !stale.is_empty() {
-            self.revision += 1;
-        }
-        stale.len()
-    }
-
     pub(super) fn pause_for_version_recovery(&mut self, reason: &str) {
         let Some(reason) = (match reason {
             "native_draft" => Some("Claude 终端有未发送草稿，请先处理后重试"),
@@ -644,24 +583,9 @@ impl Claude {
     pub(crate) async fn queue_send_state(&self, payload: &Value) -> anyhow::Result<Value> {
         let id = required(payload, "threadId")?;
         let client = required(payload, "clientUserMessageId")?;
-        let mut c = self.conversation(id).await?;
-        // 迟迟没有原生接收记录、会话也已空闲的消息不会再送达：按原生证据结案，网页据此恢复输入，不让用户去核对。
-        if !c
-            .remote_queue
-            .stale_ids(now_ms(), c.natively_idle())
-            .is_empty()
-        {
-            self.change(|saved| {
-                if let Some(c) = saved.conversations.get_mut(id) {
-                    let idle = c.natively_idle();
-                    c.remote_queue.abandon_stale(now_ms(), idle);
-                }
-                Ok(())
-            })
-            .await?;
-            self.remote_queue_changed(id).await;
-            c = self.conversation(id).await?;
-        }
+        let c = self.conversation(id).await?;
+        // 用户要求只在确实未知时保留核对。空闲与等待时长不能证明未送达；
+        // 已接收由原生身份确认，明确拒绝由失败回执结案，读取本身不解除未知消息保护。
         let message = c.remote_queue.messages.iter().find(|m| m.id == client);
         let accepted = c.remote_queue.accepted.contains_key(client)
             || c.native_clients.values().any(|id| id == client)
@@ -678,9 +602,6 @@ impl Claude {
             "accepted"
         } else if queued {
             "queued"
-        } else if c.remote_queue.abandoned.contains_key(client) {
-            // 已按原生证据结案：会话空闲且始终没有这条消息的接收记录。
-            "notDelivered"
         } else {
             "unknown"
         });
@@ -813,9 +734,6 @@ impl Claude {
                 {
                     return Err(error(409, "请等待 Claude 结束当前执行后再编辑历史消息"));
                 }
-                // 迟迟没有原生接收记录的旧消息已经不会再送达：先结案，不能让它一直挡住新的发送。
-                let idle = c.natively_idle();
-                c.remote_queue.abandon_stale(now_ms(), idle);
                 let direct = native_edit.is_some() || !c.running_for_send();
                 if direct
                     && c.remote_queue
@@ -885,9 +803,6 @@ impl Claude {
                     .conversations
                     .get_mut(id)
                     .context("Claude 会话不存在")?;
-                // 迟迟没有原生接收记录的旧消息已经不会再送达：先结案，不能让它一直挡住这次发送。
-                let idle = c.natively_idle();
-                c.remote_queue.abandon_stale(now_ms(), idle);
                 anyhow::ensure!(
                     !c.remote_queue
                         .messages
@@ -3505,80 +3420,50 @@ mod tests {
         }
     }
 
-    /// 用户要求 Harness 自己判定送达结果，不让用户去原生客户端核对：
-    /// 只有“会话空闲 + 停留超时 + 无原生接收记录”的 sending/unknown 消息才结案，其余一律不动。
     #[test]
-    fn only_stale_sending_or_unknown_messages_are_closed_and_only_when_the_session_is_idle() {
-        let now = 10_000_000;
+    fn receipt_recovery_preserves_unknown_messages_regardless_of_age() {
         let mut queue = RemoteQueue {
             messages: vec![
-                tracked("fresh-unknown", "unknown", now - 1_000, false),
-                tracked("stale-unknown", "unknown", now - UNKNOWN_ABANDON_MS, false),
-                // sending 的时限更长：一次派发内部的等待可达 70 秒，不能把仍在派发的消息当成失败。
-                tracked(
-                    "fresh-sending",
-                    "sending",
-                    now - UNKNOWN_ABANDON_MS - 1,
-                    false,
-                ),
-                tracked("stale-sending", "sending", now - SENDING_ABANDON_MS, false),
+                tracked("old-unknown", "unknown", 1, false),
+                tracked("old-sending", "sending", 1, false),
                 tracked("old-queued", "queued", 1, false),
                 tracked("old-compact", "unknown", 1, true),
             ],
-            awaiting_turn: Some("stale-sending".into()),
+            awaiting_turn: Some("old-sending".into()),
             awaiting_started: true,
             ..Default::default()
         };
-        assert_eq!(queue.abandon_stale(now, false), 0, "会话仍在执行时不能结案");
-        assert_eq!(queue.messages.len(), 6);
-
-        assert_eq!(queue.abandon_stale(now, true), 2);
-        let left: Vec<_> = queue.messages.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(
-            left,
-            [
-                "fresh-unknown",
-                "fresh-sending",
-                "old-queued",
-                "old-compact"
-            ]
-        );
-        assert!(queue.abandoned.contains_key("stale-unknown"));
-        assert!(queue.abandoned.contains_key("stale-sending"));
-        assert!(
-            queue.awaiting_turn.is_none(),
-            "结案的消息不能继续占着等待位"
-        );
-        assert!(!queue.awaiting_started);
-        assert_eq!(queue.abandon_stale(now, true), 0, "结案是幂等的");
-    }
-
-    #[test]
-    fn closed_message_records_are_bounded() {
-        let mut queue = RemoteQueue::default();
-        for index in 0..(ABANDONED_LIMIT as u64 + 40) {
-            queue
-                .messages
-                .push(tracked(&format!("m-{index}"), "unknown", 1, false));
-            assert_eq!(queue.abandon_stale(1_000_000 + index, true), 1);
-        }
-        assert_eq!(queue.abandoned.len(), ABANDONED_LIMIT);
-        assert!(!queue.abandoned.contains_key("m-0"), "最早的记录先被丢弃");
-        assert!(
-            queue
-                .abandoned
-                .contains_key(&format!("m-{}", ABANDONED_LIMIT + 39))
-        );
+        queue.recover();
+        let restored: RemoteQueue = serde_json::from_value(serde_json::to_value(&queue).unwrap()).unwrap();
+        assert_eq!(restored.messages.len(), 4);
+        assert_eq!(restored.messages[0].state, "unknown");
+        assert_eq!(restored.messages[1].state, "unknown");
+        assert_eq!(restored.messages[2].state, "queued");
+        assert_eq!(restored.messages[3].state, "unknown");
+        assert!(restored.abandoned.is_empty());
+        assert_eq!(restored.awaiting_turn.as_deref(), Some("old-sending"));
     }
 
     #[tokio::test]
-    async fn an_idle_unknown_message_is_closed_as_not_delivered_and_stops_blocking_sends() {
+    async fn receipt_from_legacy_timeout_is_not_proof_of_non_delivery() {
+        let (_directory, _auth_directory, service, c, _auth, _calls, _replies) = fixture().await;
+        service.change(|saved| {
+            saved.conversations.get_mut(&c.id).unwrap().remote_queue.abandoned.insert("old".into(), 1);
+            Ok(())
+        }).await.unwrap();
+        let state = service.queue_send_state(&json!({"threadId":c.id,"clientUserMessageId":"old"})).await.unwrap();
+        assert_eq!(state["deliveryState"], "unknown");
+        assert_eq!(state["confirmed"], false);
+    }
+
+    #[tokio::test]
+    async fn an_idle_unknown_message_keeps_its_receipt_and_does_not_allow_resend() {
         let (_directory, _auth_directory, service, c, auth, calls, _replies) = fixture().await;
         service
             .command("send", &payload(&c, "old"), &auth)
             .await
             .unwrap();
-        // 派发结果未知，之后会话回到空闲，且时间已超过结案时限。
+        // 原生已经空闲且长期没有接收记录，仍不足以证明此消息未送达。
         service
             .change(|saved| {
                 let current = saved.conversations.get_mut(&c.id).unwrap();
@@ -3595,13 +3480,13 @@ mod tests {
             .queue_send_state(&json!({"threadId":c.id,"clientUserMessageId":"old"}))
             .await
             .unwrap();
-        assert_eq!(state["deliveryState"], "unknown", "未满时限不能提前结案");
+        assert_eq!(state["deliveryState"], "unknown");
         assert!(
             service
                 .command("send", &payload(&c, "blocked"), &auth)
                 .await
                 .is_err(),
-            "时限内仍须等待，不能越过未知消息"
+            "不能越过未知消息"
         );
 
         service
@@ -3609,7 +3494,7 @@ mod tests {
                 let current = saved.conversations.get_mut(&c.id).unwrap();
                 // 年龄取 since 与创建时间中较晚者，两者都要调早。
                 let message = &mut current.remote_queue.messages[0];
-                message.since = now_ms() - UNKNOWN_ABANDON_MS - 1_000;
+                message.since = now_ms() - 600_000;
                 message.created_at = message.since;
                 Ok(())
             })
@@ -3619,27 +3504,26 @@ mod tests {
             .queue_send_state(&json!({"threadId":c.id,"clientUserMessageId":"old"}))
             .await
             .unwrap();
-        assert_eq!(state["deliveryState"], "notDelivered");
+        assert_eq!(state["deliveryState"], "unknown");
         assert_eq!(state["confirmed"], false);
         let current = service.conversation(&c.id).await.unwrap();
-        assert!(current.remote_queue.messages.is_empty());
-        assert!(current.remote_queue.abandoned.contains_key("old"));
+        assert_eq!(current.remote_queue.messages.len(), 1);
+        assert!(current.remote_queue.abandoned.is_empty());
         assert!(
             calls.lock().await.is_empty(),
-            "结案只清理记录，不能重发旧消息"
+            "读取不能重发旧消息"
         );
 
-        // 不再挡住新的发送；旧消息也不会被重发。
-        service
+        assert!(service
             .command("send", &payload(&c, "new"), &auth)
             .await
-            .unwrap();
-        assert_eq!(calls.lock().await.len(), 1);
+            .is_err());
+        assert!(calls.lock().await.is_empty());
     }
 
-    /// 结案后原生记录才姗姗来迟：以接收记录为准，不能继续报“没有送达”。
+    /// 迟到的原生记录只确认原消息；等待期间不曾把消息宣告为失败。
     #[tokio::test]
-    async fn a_late_native_receipt_still_wins_over_a_closed_message() {
+    async fn a_late_native_receipt_resolves_the_original_unknown_message() {
         let (_directory, _auth_directory, service, c, auth, _calls, _replies) = fixture().await;
         service
             .command("send", &payload(&c, "late"), &auth)
@@ -3652,7 +3536,7 @@ mod tests {
                 current.turns[0]["status"] = json!("completed");
                 let message = &mut current.remote_queue.messages[0];
                 message.state = "unknown".into();
-                message.since = now_ms() - UNKNOWN_ABANDON_MS - 1_000;
+                message.since = now_ms() - 600_000;
                 message.created_at = message.since;
                 Ok(())
             })
@@ -3662,7 +3546,7 @@ mod tests {
             .queue_send_state(&json!({"threadId":c.id,"clientUserMessageId":"late"}))
             .await
             .unwrap();
-        assert_eq!(closed["deliveryState"], "notDelivered");
+        assert_eq!(closed["deliveryState"], "unknown");
         service
             .change(|saved| {
                 let current = saved.conversations.get_mut(&c.id).unwrap();

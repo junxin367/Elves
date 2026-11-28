@@ -7729,7 +7729,7 @@ test("Claude 目标回执只确认原生命令受理，不提前改写目标或�
   assert.equal(JSON.stringify(h.context.thread), before, "受理不能冒充已经清除原生目标");
   assert.equal(h.pending(), null);
   assert.equal(h.calls.length, 1);
-  assert.match(h.notices.at(-1), /状态将随原生执行更新/);
+  assert.deepEqual(h.notices, [], "已受理不另发回执通知");
 });
 
 test("Claude 新目标已受理后读取失败不恢复发送锁，也不提前展示目标正文", async () => {
@@ -7753,7 +7753,8 @@ test("Claude 新目标已受理后读取失败不恢复发送锁，也不提前�
   assert.equal(context.pending, null);
   assert.equal(context.thread.goal, null);
   assert.equal(cleared.length, 1);
-  assert.match(notices.at(-1), /等待原生执行/);
+  assert.equal(notices.length, 1);
+  assert.match(notices[0], /状态读取失败：暂时离线/);
 });
 
 test("Claude 原生命令能力按实例目录读取，压缩回执未知也不强制排队普通消息", () => {
@@ -7826,6 +7827,61 @@ test("目标操作结果未知时只查原回执，不重复暂停或删除，�
   assert.equal(calls[1].path, `/api/receipts/${receiptId}`);
   assert.equal(pending(), null);
   assert.equal(context.thread.goal.objective, "后来创建的目标");
+});
+
+test("目标明确未提交的503解除回执锁，网关失败或显式未知仍保留原请求", async () => {
+  for (const [failure, locked] of [
+    [{ code: 503, notSubmitted: true }, false],
+    [{ code: 409 }, false],
+    [{ code: 502 }, true],
+    [{ code: 409, outcomeUnknown: true }, true],
+  ]) {
+    const h = goalControlHarness();
+    h.context.respond = () => { throw Object.assign(new Error("原始失败原因"), failure); };
+    await h.context.changeGoalState("pause", h.context.thread.goal);
+    assert.equal(!!h.pending(), locked, JSON.stringify(failure));
+    assert.deepEqual(h.notices, locked ? [] : ["原始失败原因"], "未知保留原恢复区，明确失败只通知原文");
+    assert.equal(h.calls.length, 1);
+  }
+});
+
+test("审批收到明确失败回执后不要求核对，503拒绝与409冲突保留原错误", async () => {
+  for (const code of [409, 503]) {
+    const request = { id: "approval", method: "item/commandExecution/requestApproval" }, notices = [];
+    const state = { sourceVersion: 1, generation: 1 };
+    const context = nodeVm.createContext({
+      connected: true, selectedId: "main", session: { device: { id: "device" } },
+      thread: { id: "main", requests: [request] }, approvalReplies: new Map(),
+      threadReadOnly: () => false, approvalsAllowed: () => true,
+      blockingApprovalIdentity: () => "same", approvalReplyKey: () => "key", blockingRequestState: () => state,
+      setApprovalSignature() {}, renderApprovals() {}, reloadThread: async () => {},
+      notice: message => notices.push(message),
+      mutate: async () => { throw Object.assign(new Error("原生拒绝原文"), { approvalState: "failed", code }); },
+    });
+    vm.runInContext(sourceSection("async function submitBlockingRequest(", "async function applyQuestionReceipt("), context);
+    await context.submitBlockingRequest("main", request, "approve", { decision: "accept" });
+    assert.equal(context.approvalReplies.size, 0);
+    assert.deepEqual(notices, ["原生拒绝原文"]);
+  }
+});
+
+test("审批已接受后状态刷新失败，不得重新显示回执确认或清除之后的审批", async () => {
+  const request = { id: "approval", method: "item/commandExecution/requestApproval" }, notices = [];
+  const state = { sourceVersion: 1, generation: 1 };
+  const context = nodeVm.createContext({
+    connected: true, selectedId: "main", session: { device: { id: "device" } },
+    thread: { id: "main", requests: [request] }, approvalReplies: new Map(),
+    threadReadOnly: () => false, approvalsAllowed: () => true,
+    blockingApprovalIdentity: () => "same", approvalReplyKey: () => "key", blockingRequestState: () => state,
+    applyBlockingRequestsSnapshot: () => false, requestsSnapshotIsVersioned: () => false,
+    setApprovalSignature() {}, renderApprovals() {},
+    reloadThread: async () => { throw new Error("只读刷新失败"); },
+    notice: message => notices.push(message), mutate: async () => ({ ok: true }),
+  });
+  vm.runInContext(sourceSection("async function submitBlockingRequest(", "async function applyQuestionReceipt("), context);
+  await context.submitBlockingRequest("main", request, "approve", { decision: "accept" });
+  assert.equal(context.approvalReplies.get("key").state, "pending", "等原生快照同步，不变成送达未知");
+  assert.deepEqual(notices, []);
 });
 
 test("原有目标正文编辑仍兼容没有operation的请求，不改变目标暂停状态", async () => {
@@ -8612,7 +8668,10 @@ function queuedEditFeedbackHarness() {
       context.pending = { id: "edit-receipt", action, payload, deviceId: "device-a", time: Date.now() };
       try {
         const result = await response.promise;
-        if (result.outcomeUnknown) throw Object.assign(new Error("操作结果未确认"), { pendingFeedback: true });
+        if (result.outcomeUnknown) {
+          context.pending.receiptState = "unknown";
+          throw Object.assign(new Error("操作结果未确认"), { pendingFeedback: true });
+        }
         context.pending = null;
         return result;
       } catch (error) {
@@ -8625,7 +8684,7 @@ function queuedEditFeedbackHarness() {
   vm.runInContext([
     sourceSection("function queuedEditSubmittingAction(", "async function submitMessageEdit("),
     sourceSection("function reportMutationError(", "function acceptedSendItem("),
-    (sourceSection("const pendingFee", "function set") + "\n" + sourceSection("function pen", "function cle")),
+    sourceSection("function pendingFeedbackReady(", "function clearPendingFeedbackTimer("),
     `function renderSendFeedback(){${sourceSection("  const queuedEditAction = queuedEditSubmittingAction();",
       '  $("#prompt").disabled =')}}`,
     `function renderComposerPlaceholder(){${sourceSection('  $("#prompt").placeholder =',
@@ -8849,10 +8908,6 @@ test("排队输入发送结果未知时保留原回执和草稿，停止spinner�
   assert.equal(h.context.busy, false);
   assert.equal(h.send.disabled, true);
   assert.equal(h.send.querySelector(".spinner"), null);
-  assert.equal(h.context.pendingFeedbackReady(record), false);
-  record.time -= 5000;
-  assert.equal(h.context.pendingFeedbackReady(record), false);
-  record.time -= 3000;
   assert.equal(h.context.pendingFeedbackReady(record), true);
   assert.equal(h.context.pending, record);
   assert.equal(h.context.editingQueuedMessage, h.edit);
@@ -9151,7 +9206,7 @@ test("Claude 压缩输入区只保留一处待确认，目标原文折叠展示�
       nativeCommands: [{ name: "compact", state: "unknown" }] },
     compactionLocked: () => true, compactionQueueSendReason: () => "", pendingFeedbackReady: () => true,
     privateInputScope: () => "auth", expandedClaudeGoalNotice: "", connected: true });
-  vm.runInContext((sourceSection("function renderClaudeControlNotices(") + sourceSection("const nativeCompactionStartGraceMs", "function renderCompactionBanner(") + sourceSection("function renderCompactionBanner(", "async function applyCompactionReceipt(")), context);
+  vm.runInContext(sourceSection("function renderClaudeControlNotices(") + sourceSection("function renderCompactionBanner(", "async function applyCompactionReceipt("), context);
   const root = element("div");
   context.renderClaudeControlNotices(root);
   context.renderCompactionBanner(root, "claude-fixture", { state: "unknown", receiptId: "receipt" });
@@ -9549,6 +9604,19 @@ test("未知写回执仍保持未知并且只派发一次，不因业务错误�
   await assert.rejects(context.api("/api/action/send", { threadId: "owned", prompt: "测试" }, "only-once"),
     error => error.code === 503 && error.outcomeUnknown === true);
   assert.equal(calls.length, 1);
+});
+
+test("动作HTTP错误保留明确未提交证据和原文，网关错误不能被当作明确拒绝", async () => {
+  for (const result of [
+    { ok: false, message: "  额度限制原文\n时间和换行保留  ", notSent: true },
+    { ok: false, message: "  额度限制原文\n时间和换行保留  ", notSent: true, outcomeUnknown: true },
+    { ok: false, message: "  额度限制原文\n时间和换行保留  " },
+  ]) {
+    const h = transportClient(() => jsonResponse(result, 503));
+    await assert.rejects(h.context.api("/api/action/send", { threadId: "owned", prompt: "测试" }, "once"),
+      error => error.message === result.message && (error.notSubmitted === true) === (result.notSent === true && result.outcomeUnknown !== true));
+    assert.equal(h.calls.length, 1);
+  }
 });
 
 const sidebarPreferenceSource = sourceSection("function restoreSidebarPreferences()", "async function changeSidebar(payload)");
@@ -10694,7 +10762,7 @@ test("详情错误已进入展示队列后再删除会话，也不能覆盖成�
   }
 });
 
-function queuedReceiptHarness({ disk = storage(), refresh = async () => {} } = {}) {
+function queuedReceiptHarness({ disk = storage(), refresh = async () => {}, side = null } = {}) {
   disk.removeItem = key => disk.records.delete(key);
   const requests = [], notices = [], refreshes = [], timers = new Map(), clearedDrafts = [];
   const draft = { text: "操作期间保留的普通草稿", skills: [{ name: "skill-a", path: "/skill-a" }],
@@ -10703,7 +10771,8 @@ function queuedReceiptHarness({ disk = storage(), refresh = async () => {} } = {
   let sequence = 0;
   const context = {
     performance, sessionStorage: disk, session: { device: { id: "device-a", createdAtMs: 1 }, capabilities: {} },
-    selectedId: "main", thread: { id: "main", queuedMessages: [{ id: "queued-a", text: "原队列正文" }] },
+    selectedId: side || "main", thread: { id: side || "main", queuedMessages: [{ id: "queued-a", text: "原队列正文" }] },
+    location: { pathname: side ? "/side-thread" : "/", hash: side ? `#thread=${side}` : "" }, URLSearchParams,
     selectionVersion: 1, selectionToken: "selected-a", recoveryGeneration: 0, recoveryScope: null,
     connected: true, busy: false, stopping: false, pending: null, pendingTimer: null, sending: null,
     claudeThreadId: id => typeof id === "string" && id.startsWith("claude-"),
@@ -10742,19 +10811,18 @@ function queuedReceiptHarness({ disk = storage(), refresh = async () => {} } = {
   installSentMessageDisplayHarness(context);
   vm.runInContext([
     sourceSection("function threadActionReadOnly(", "function threadReadOnlyMessage("),
-    (sourceSection("const pendingFee", "function set") + "\n" + sourceSection("function pen", "function cle")),
+    sourceSection("function pendingFeedbackReady(", "function clearPendingFeedbackTimer("),
     sourceSection("function savePen"),
     (sourceSection("function ordinar", "function rem") + "\n" + sourceSection("async function recoverFa", "function res")),
     (sourceSection("async function mutat", "async functi") + "\n" + sourceSection("function reportM", "function acc")),
-    sourceSection("async function resolvePending()"),
+    sourceSection("async function resolvePending("),
     sourceSection("function confirmQueuedSteerDisplay(", "function renderQueuedMessages("),
     sourceSection("async function removeQueuedMessage("),
     sourceSection("async function stopG", "function mou"),
     `function renderPending(){${sourceSection("  if (pending && (!sending || pending.payload !== sending.payload)",
       "  renderFailedInputRecovery(")}}`,
   ].join("\n"), context);
-  context.pending = vm.runInContext(`(()=>{${(sourceSection("let pending = null;", "function rep") + "\n" + sourceSection("function restoreStor", "function sav"))}
-    restoreStoredPending(); return pending;})()`, context);
+  vm.runInContext(`${sourceSection("function restoreStor", "function sav")}\nrestoreStoredPending();`, context);
   const receipt = (index, state, result = {}) => requests[index].resolve({
     requestId: requests[index].requestId || context.pending?.id, state, result,
   });
@@ -10947,12 +11015,7 @@ test("队列引导和删除unknown保留原回执，刷新只读恢复且不清�
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(first.context.pending.id, id);
     first.context.renderPending();
-    assert.equal(first.area.children.length, 0, "正常等待的前八秒不额外显示回执横幅");
-    first.context.pending.time -= 5000;
-    first.context.renderPending();
-    assert.equal(first.area.children.length, 0, "队列操作等待五秒时仍不显示回执横幅");
-    first.context.pending.time -= 3000;
-    first.context.renderPending();
+    assert.equal(first.area.children.length, 1, "真实 unknown 可以立即核对，不按等待时长推断异常");
     const banner = first.area.children[0];
     assert.match(banner.text, /正在确认队列.*结果/);
     assert.deepEqual(banner.children.map(node => node.label), ["查回执"]);
@@ -10998,6 +11061,45 @@ test("队列写回包中断仍只查同一原回执，明确失败解锁且保�
     assert.equal(fixture.requests.filter(request => request.path.startsWith("/api/action/")).length, 1);
     assert.deepEqual(fixture.refreshes, []);
   }
+});
+
+test("队列写请求仍在途时并发读取的404不显示未确认，不重复提交", async () => {
+  const h = queuedReceiptHarness(), operation = h.invoke("steerQueued");
+  const current = h.context.pending, read = h.context.resolvePending(current);
+  assert.equal(h.requests[1].path, `/api/receipts/${current.id}`);
+  h.requests[1].reject(Object.assign(new Error("未找到"), { code: 404 }));
+  await read;
+  current.time -= 300000;
+  h.context.renderPending();
+  assert.equal(h.area.children.length, 0);
+  assert.equal(h.context.pending, current);
+  assert.deepEqual(h.notices, []);
+  h.completed(0);
+  await operation;
+  assert.equal(h.context.pending, null);
+  assert.equal(h.requests.filter(r => r.path.startsWith("/api/action/")).length, 1);
+});
+
+test("可靠权限提交明确409失败直接释放原回执，不留查回执横幅", async () => {
+  const h = queuedReceiptHarness();
+  const action = h.context.mutate("setPermissions", { threadId: "main", permissionMode: "default" }, { reliable: true });
+  h.requests[0].reject(Object.assign(new Error("权限配置已变化"), { code: 409 }));
+  await assert.rejects(action, /权限配置已变化/);
+  assert.equal(h.context.pending, null);
+  assert.equal(h.requests.length, 1, "明确失败不需要查询原回执");
+});
+
+test("发送已明确失败时恢复草稿出错，不得再次改成送达未知", async () => {
+  const h = queuedReceiptHarness();
+  h.context.pending = { id: "original", action: "send", deviceId: "device-a", receiptState: "unknown",
+    payload: { threadId: "main", clientUserMessageId: "message", prompt: "保留原输入" } };
+  h.context.recoverFailedInput = async () => { throw new Error("存储暂时不可用"); };
+  const check = h.context.resolvePending();
+  h.receipt(0, "failed", { ok: false, notSent: true, message: "原生明确拒绝" });
+  await check;
+  assert.equal(h.context.pending.receiptState, "failed");
+  h.context.renderPending();
+  assert.equal(h.area.children.length, 0, "失败后只保留草稿恢复错误，不再要求核对送达");
 });
 
 test("队列原回执404或结果身份不符继续保锁，不重复写入", async () => {
@@ -12174,7 +12276,7 @@ test("删除挂起期间同设备同会话的原生删除事实先生效，迟�
   h.assertControlRetained();
 });
 
-test("删除尚无原生确认时迟到HTTP失败仍保留准确原回执unknown和原错误提示", async () => {
+test("删除尚无原生确认时迟到HTTP失败保留原回执unknown，不叠加错误通知", async () => {
   const h = sidebarDeletionHarness();
   const deletion = h.context.deleteSidebarThread(h.target);
   await new Promise(resolve => setImmediate(resolve));
@@ -12186,7 +12288,7 @@ test("删除尚无原生确认时迟到HTTP失败仍保留准确原回执unknown
   assert.equal(h.persisted().find(item => item.threadId === h.target.id).state, "unknown");
   assert.equal(h.context.drafts.get(h.target.id), "删除目标草稿");
   assert.equal(h.context.sidebar.recent.some(item => item.id === h.target.id), true);
-  assert.deepEqual(h.notices, [{ message: "Failed to fetch", error: true }]);
+  assert.deepEqual(h.notices, []);
   assert.equal(h.calls.length, 1);
   h.assertControlRetained();
 });
@@ -12217,7 +12319,7 @@ test("旧版删除unknown回执使用删除提示且核对时绝不重发", asyn
   const key = h.context.threadDeletionKey(h.target.id);
   const record = h.context.threadDeletions.get(key);
   assert.equal(record.state, "unknown");
-  assert.deepEqual(h.notices, [{ message: expected, error: true }]);
+  assert.deepEqual(h.notices, [], "未知结果用原会话提示，不另弹通知");
   const reads = [];
   h.context.threadDeletionChecks = new Set();
   h.context.api = async path => {
@@ -12229,7 +12331,7 @@ test("旧版删除unknown回执使用删除提示且核对时绝不重发", asyn
   assert.deepEqual(reads, ["/api/receipts/original-delete-receipt"]);
   assert.equal(h.context.threadDeletions.get(key).state, "unknown");
   assert.equal(h.context.drafts.get(h.target.id), "删除目标草稿");
-  assert.deepEqual(h.notices.at(-1), { message: expected, error: true });
+  assert.deepEqual(h.notices, [], "再次读取仍未知时保留原恢复提示，不叠加 Toast");
   assert.equal(h.calls.length, 1);
   h.assertControlRetained();
 });
@@ -12269,6 +12371,30 @@ test("旧服务删除回执恢复后只核对原回执，不再次派发删除",
   assert.equal(h.context.threadDeleted(h.target.id), true);
   assert.deepEqual(h.notices, [{ message: "已确认会话永久删除", error: false }]);
   h.assertControlRetained();
+});
+
+test("删除在后台读取原回执，pending 不提醒，切换会话后迟到结果不显示", async () => {
+  const h = sidebarDeletionHarness(), c = h.context, key = c.threadDeletionKey(h.target.id);
+  c.threadDeletionChecks = new Set();
+  c.selectedId = h.target.id;
+  c.threadDeletions.set(key, { id: "original", threadId: h.target.id, deviceId: "device-a", state: "pending" });
+  vm.runInContext(sourceSection("async function checkThreadDeletion("), c);
+  let response;
+  c.api = (path, _body, _id, _signal, options) => {
+    assert.equal(path, "/api/receipts/original");
+    assert.equal(options.resourcePriority, "background");
+    response = deferred(); return response.promise;
+  };
+  for (const changeThread of [false, true, false]) {
+    const check = c.checkThreadDeletion(c.threadDeletions.get(key), { background: true });
+    if (changeThread) { c.selectedId = "other"; response.reject(new Error("旧页读取失败")); }
+    else response.resolve({ requestId: "original", state: "pending", result: {} });
+    await check;
+    assert.equal(c.threadDeletions.get(key).state, "pending");
+    assert.deepEqual(h.notices, []);
+    c.selectedId = h.target.id;
+  }
+  assert.equal(h.calls.length, 0);
 });
 
 test("删除核对拒绝串回执和矛盾成功，始终保留原会话、草稿和请求标识", async () => {
@@ -12320,7 +12446,7 @@ for (const [label, deletedId, deviceId] of [
   ["其他设备的同ID", "delete-target", "device-b"],
   ["同设备的其他会话", "another-deleted-thread", "device-a"],
 ])
-  test(`${label}已删除不得压制当前未确认删除的HTTP错误或改写其原回执`, async () => {
+  test(`${label}已删除不得清除当前删除的未知结果或改写其原回执`, async () => {
     const h = sidebarDeletionHarness();
     const deletion = h.context.deleteSidebarThread(h.target);
     await new Promise(resolve => setImmediate(resolve));
@@ -12335,7 +12461,7 @@ for (const [label, deletedId, deviceId] of [
     assert.equal(h.context.threadDeletions.get(otherKey), confirmedOther);
     assert.equal(confirmedOther.state, "deleted");
     assert.equal(h.context.drafts.get(h.target.id), "删除目标草稿");
-    assert.deepEqual(h.notices, [{ message: "Failed to fetch", error: true }]);
+    assert.deepEqual(h.notices, []);
     assert.equal(h.calls.length, 1);
     h.assertControlRetained();
   });
@@ -15197,7 +15323,7 @@ test("后台迟到的旧队列事件不能覆盖已清空的较新展示快照",
   assert.equal(context.currentThreadDisplay().queuedMessages.length, 0);
 });
 
-// 操作反馈延迟：只验证 UI 提示时机，不调用真实会话或新增查询轮询。
+// 操作反馈由结果驱动；假时钟验证长时间在途不会被误报为未知。
 function delayFeedbackHarness() {
   let now = 100000, nextTimer = 0;
   const timers = new Map(), notices = [], disk = storage(), area = {
@@ -15240,7 +15366,7 @@ function delayFeedbackHarness() {
     goalComposerStorageRecord: record => record,
     renderQueuedEditRecoveryControls: node => node.append({ label: "查回执" }),
     compactionQueueSendReason: () => "", threadReadOnly: () => false,
-    // 这些用例针对 Codex 会话；Claude 压缩“迟迟不开始”提示另有专项用例。
+    // 这些用例针对 Codex 会话；Claude 压缩等待另有专项用例。
     isClaude: () => false, isActiveThread: () => false, thread: null,
     element, button: (label, aria, action) => Object.assign(element("button", "", label), { label, aria, action }), $: () => area,
     notice: (message, error = false) => notices.push({ message, error }),
@@ -15253,12 +15379,12 @@ function delayFeedbackHarness() {
   vm.createContext(context);
   context.nativeConnectionVersion ??= 1;
   vm.runInContext([
-    (sourceSection("const pendingFee", "function set") + "\n" + sourceSection("function pen", "async functi") + "\n" + sourceSection("function syncPen", "function upd")),
+    sourceSection("const claudeGiveUpDelayMs =", "function queuedEditHasOriginalImages("),
+    sourceSection("function syncPendingFeedbackTimer(", "function updateComposer("),
     sourceSection("function savePen"),
     sourceSection("function renderRelatedOperationStatus("),
     sourceSection("function renderAsync", "function ren"),
     sourceSection("function updateB"),
-    sourceSection("const nativeCompactionStartGraceMs", "function renderCompactionBanner("),
     sourceSection("function renderCompactionBanner(", "async function applyCompactionReceipt("),
     sourceSection("async function applyCompactionReceipt(", "async function resolveCompactionReceipt("),
     `function renderFeedback(){${sourceSection("  const deletion = threadDeletions.get(threadDeletionKey(selectedId));",
@@ -15296,7 +15422,7 @@ test("快速操作完成不出现额外回执提示，也不留下延时刷新",
   const h = delayFeedbackHarness();
   const record = h.pending("steerQueued");
   assert.equal(h.area.children.length, 0);
-  assert.equal(h.timers.size, 1);
+  assert.equal(h.timers.size, 0);
   await h.advance(100);
   h.context.savePending(null);
   h.context.updateComposer();
@@ -15307,45 +15433,46 @@ test("快速操作完成不出现额外回执提示，也不留下延时刷新",
   assert.deepEqual(h.notices, []);
 });
 
-test("队列未确认操作到八秒才提示，普通发送和目标仍为五秒，原草稿与回执锁保持", async () => {
-  for (const [action, delayMs] of [
-    ["send", 5000], ["setGoal", 5000],
-    ["steerQueued", 8000], ["removeQueued", 8000], ["reorderQueued", 8000],
-    ["beginQueuedEdit", 8000], ["editQueued", 8000], ["cancelQueuedEdit", 8000], ["dismissQueuedEdit", 8000],
-  ]) {
+test("各操作正常在途不按时长提醒，只有结果未知才显示，原草稿与回执锁保持", async () => {
+  for (const action of ["send", "create", "editMessage", "setPermissions", "forkThread", "setGoal",
+    "steerQueued", "removeQueued", "reorderQueued", "beginQueuedEdit", "editQueued", "cancelQueuedEdit", "dismissQueuedEdit"]) {
     const h = delayFeedbackHarness(), record = h.pending(action);
-    await h.advance(4999);
-    assert.equal(h.area.children.length, 0, action);
-    await h.advance(1);
-    if (delayMs === 8000) {
-      assert.equal(h.area.children.length, 0, `${action} 五秒时不显示提示`);
-      await h.advance(2999);
-      assert.equal(h.area.children.length, 0, `${action} 八秒前不显示提示`);
-      await h.advance(1);
+    for (const state of [undefined, "pending"]) {
+      record.receiptState = state;
+      await h.advance(300000);
+      h.context.updateComposer();
+      assert.equal(h.area.children.length, 0, action);
+      assert.equal(h.timers.size, 0);
     }
+    record.receiptState = "unknown";
+    h.context.updateComposer();
     assert.equal(h.area.children.length, 1, action);
-    assert.match(h.area.children[0].text, /^正在确认.+结果。$/);
-    assert.equal(h.context.pending, record, "延时反馈不能解除未知回执锁");
+    assert.match(h.area.children[0].text, /^正在确认/);
+    assert.equal(h.context.pending, record, "展示不能解除未知回执锁");
     assert.equal(record.draft.text, "保留草稿");
     assert.equal(h.timers.size, 0, "只重绘一次，没有新增轮询");
     assert.deepEqual(h.notices, []);
   }
 });
 
-test("侧边操作、删除和压缩复用同一个五秒 UI 提示定时器", async () => {
+test("侧边操作、删除和压缩在途保持静默，真实未知才在原会话显示", async () => {
   for (const kind of ["side-create", "side-close", "delete", "compact"]) {
     const h = delayFeedbackHarness(), record = { id: kind, time: h.now(), state: "pending",
       deviceId: "device-a", threadId: "main" };
-    if (kind.startsWith("side")) h.context.relatedThreadOperations.set(kind, {
-      ...record, parentThreadId: "main", scope: h.context.privateInputScope(h.context.session),
+    if (kind.startsWith("side")) h.context.relatedThreadOperations.set(kind, Object.assign(record, {
+      parentThreadId: "main", scope: h.context.privateInputScope(h.context.session),
       action: kind === "side-create" ? "createSideThread" : "closeSideThread",
-    });
+    }));
     else if (kind === "delete") h.context.threadDeletions.set(h.context.threadDeletionKey("main"), record);
-    else h.context.compactions.set("main", { ...record, receiptId: "compact-receipt" });
+    else h.context.compactions.set("main", Object.assign(record, { receiptId: "compact-receipt" }));
     h.context.updateComposer();
     assert.equal(h.area.children.length, 0, kind);
-    assert.equal(h.timers.size, 1, kind);
-    await h.advance(5000);
+    assert.equal(h.timers.size, 0, kind);
+    await h.advance(300000);
+    h.context.updateComposer();
+    assert.equal(h.area.children.length, 0, kind);
+    record.state = "unknown";
+    h.context.updateComposer();
     assert.equal(h.area.children.length, 1, kind);
     assert.match(h.area.children[0].text, /^正在确认.+结果。$/);
     assert.equal(h.timers.size, 0, kind);
@@ -15431,12 +15558,12 @@ test("手动压缩入队回执解除请求占位，迟到回执不覆盖已确�
   }
 });
 
-test("问答先显示提交按钮状态，五秒后才增加中性说明且保留原回答回执", async () => {
+test("问答只在结果未知时增加说明，正常等待保留提交按钮状态及原回答回执", async () => {
   for (const skip of [false, true]) {
     const h = delayFeedbackHarness(), key = JSON.stringify(["device-a", "main", "question"]);
     const request = { id: "question", params: { questions: [{ id: "field", question: "问题" }] } };
     const record = { id: "answer-receipt", deviceId: "device-a", threadId: "main",
-      requestId: "question", state: "unknown", time: h.now(), skip };
+      requestId: "question", state: "pending", time: h.now(), skip };
     h.context.questionReplyReceipts.set(key, record);
     let card;
     h.context.renderApprovals = () => {
@@ -15447,22 +15574,30 @@ test("问答先显示提交按钮状态，五秒后才增加中性说明且保�
     assert.equal(card.querySelector(".async-question-status").textContent, "");
     assert.match(card.querySelectorAll("button").find(node => /中…$/.test(node.textContent)).textContent,
       skip ? /^跳过中/ : /^提交中/);
-    await h.advance(5000);
+    await h.advance(300000);
+    h.context.renderApprovals();
+    assert.equal(card.querySelector(".async-question-status").textContent, "");
+    record.state = "unknown";
+    h.context.renderApprovals();
     assert.match(card.querySelector(".async-question-status").textContent, /^正在确认.+结果。$/);
     assert.equal(h.context.questionReplyReceipts.get(key), record);
   }
 });
 
-test("审批等待期间保留控件锁，五秒后增加核对入口，不解除原授权状态", async () => {
+test("审批等待期间保留控件锁，确实未知才增加核对入口，不解除原授权状态", async () => {
   const h = delayFeedbackHarness(), key = "approval", card = h.context.element("section");
   card.append(h.context.button("允许一次", "允许一次", () => assert.fail("不能重新提交")));
-  const record = { deviceId: "device-a", threadId: "main", state: "unknown", time: h.now() };
+  const record = { deviceId: "device-a", threadId: "main", state: "pending", time: h.now() };
   h.context.approvalReplies.set(key, record);
   h.context.renderApprovals = () => h.context.updateBlockingApprovalControls(card, key);
   h.context.renderApprovals(); h.context.updateComposer();
   assert.equal(card.querySelector("button").disabled, true);
   assert.equal(card.querySelector(".remote-approval-reply-status"), null);
-  await h.advance(5000);
+  await h.advance(300000);
+  h.context.renderApprovals();
+  assert.equal(card.querySelector(".remote-approval-reply-status"), null);
+  record.state = "unknown";
+  h.context.renderApprovals();
   assert.match(card.querySelector(".remote-approval-reply-status").children[0].textContent, /^正在确认操作结果。$/);
   assert.equal(card.querySelector("button").disabled, true);
   assert.equal(h.context.approvalReplies.get(key), record);
@@ -18823,8 +18958,7 @@ test("Skill 目录读取连续失败时按次数退避重试，成功后归零�
   assert.equal(await failRead(), 15, "成功后重新从第一档开始");
 });
 
-test("Claude 压缩命令受理后的正常等待保持静默，空闲超过宽限才提示，执行中排队与原生弹窗不提示", () => {
-  // 用户要求压缩没有异常时不显示提示：已受理等待原生开始是正常过渡，只有会话空闲且迟迟不开始才提示。
+test("Claude 压缩已受理后不按等待时长提示，真实未知仍可重新读取", () => {
   const element = (tag, className = "", text = "") => ({ tag, className, text, children: [],
     append(...children) { this.children.push(...children); } });
   let now = 1_000_000, reloads = 0;
@@ -18838,51 +18972,55 @@ test("Claude 压缩命令受理后的正常等待保持静默，空闲超过宽�
     thread: { id: "claude-fixture", backend: "claude", status: { type: "idle" }, requests: [],
       nativeCommands: [{ name: "compact", state: "pending" }] },
   });
-  vm.runInContext(sourceSection("const nativeCompactionStartGraceMs", "function renderCompactionBanner(")
-    + sourceSection("function renderCompactionBanner(", "async function applyCompactionReceipt("), context);
+  vm.runInContext(sourceSection("function renderCompactionBanner(", "async function applyCompactionReceipt("), context);
   const render = () => {
     const root = element("div");
     context.renderCompactionBanner(root, "claude-fixture", compaction);
     return root.children;
   };
-  const grace = vm.runInContext("nativeCompactionStartGraceMs", context);
-  assert.equal(grace, 20000);
-  assert.equal(vm.runInContext(sourceSection("function pendingFeedbackDelay(", "function pendingFeedbackReady(")
-    + '; pendingFeedbackDelay({ action: "nativeCompactionStart" })', context), grace, "延时刷新与提示宽限一致");
   assert.equal(render().length, 0, "刚受理时静默");
-  now += grace - 1;
-  assert.equal(render().length, 0, "宽限内静默");
-  now += 1;
-  const overdue = render();
-  assert.equal(overdue.length, 1, "空闲且超过宽限仍未开始才提示");
-  assert.match(overdue[0].text, /原生一直没有开始压缩/);
-  overdue[0].children.find(child => child.text === "重新读取").click();
-  assert.equal(reloads, 1);
-
-  // 会话仍在执行本轮时压缩由原生排队，属于正常等待：不计时、不提示；执行结束后重新计时。
+  now += 300000;
+  assert.equal(render().length, 0, "空闲五分钟仍未开始也不表示结果未知");
   context.thread.status = { type: "active" };
-  now += 10 * grace;
   assert.equal(render().length, 0, "执行中排队不提示");
   context.thread.status = { type: "idle" };
-  assert.equal(render().length, 0, "执行刚结束重新计时");
-  now += grace - 1;
-  assert.equal(render().length, 0);
-  now += 1;
-  assert.equal(render().length, 1);
-
-  // 原生已有待处理弹窗时由弹窗卡片说明，不再叠加压缩提示。
   context.thread.requests = [{ method: "remote/nativeDialog" }];
   assert.equal(render().length, 0);
-  context.thread.requests = [];
+  compaction.state = "unknown";
+  const [banner] = render();
+  banner.children.find(child => child.text === "重新读取").click();
+  assert.equal(reloads, 1);
+});
 
-  // 原生已开始压缩（running）或命令已结束后，不再属于“等待开始”。
-  context.thread.nativeCommands = [{ name: "compact", state: "running" }];
-  assert.equal(context.nativeCompactionStartBaseline("claude-fixture", compaction), null);
-  assert.equal(render().length, 0);
-
-  const composer = sourceSection("function syncPendingFeedbackTimer()", "function updateComposer(");
-  assert.match(composer, /nativeCompactionStartBaseline\(selectedId, compaction\)/);
-  assert.match(composer, /action: "nativeCompactionStart"/);
+test("压缩只在服务答复 pending 后补读，合并重复读取，旧页结果不触发提示", async () => {
+  const h = compactionBoundaryHarness(), c = h.context, id = c.selectedId;
+  const record = { state: "pending", deviceId: c.session.device.id, receiptId: "original" };
+  c.compactions.set(id, record);
+  vm.runInContext(sourceSection("async function resolveCompactionReceipt(", "async function recoverCompaction("), c);
+  let count = 0, read;
+  c.api = (path, _body, _id, _signal, options) => {
+    assert.equal(path, "/api/receipts/original");
+    assert.equal(options.resourcePriority, "background");
+    count++; read = deferred(); return read.promise;
+  };
+  await c.checkPendingCompactionReceipt(id);
+  assert.equal(count, 0);
+  await c.applyCompactionReceipt(id, "original", { state: "pending" });
+  const check = c.checkPendingCompactionReceipt(id);
+  await c.checkPendingCompactionReceipt(id);
+  assert.equal(count, 1);
+  c.selectedId = "other";
+  read.reject(new Error("迟到的旧页读取"));
+  await check;
+  assert.equal(record.state, "pending");
+  assert.deepEqual(h.notices, []);
+  c.selectedId = id;
+  const recheck = c.checkPendingCompactionReceipt(id);
+  read.resolve({ requestId: "original", state: "unknown" });
+  await recheck;
+  assert.equal(c.compactions.get(id).state, "unknown");
+  await c.checkPendingCompactionReceipt(id);
+  assert.equal(count, 2);
 });
 
 function compactionBoundaryHarness({ storageFails = false, reloadFails = false } = {}) {
@@ -18912,7 +19050,7 @@ function compactionBoundaryHarness({ storageFails = false, reloadFails = false }
   });
   nodeVm.runInContext([
     sourceSection("function normalizeCompaction(", "function compactionAdvanced("),
-    sourceSection("function compactionAdvanced(", "// 用户要求 Claude 压缩没有异常时不显示提示"),
+    sourceSection("function compactionAdvanced(", "function renderCompactionBanner("),
     sourceSection("async function applyCompactionReceipt(", "async function resolveCompactionReceipt("),
     sourceSection("function compactionModelChoice(", "function compactionEventMatches("),
     sourceSection("function compactionEventMatches("),
@@ -19367,7 +19505,7 @@ function claudeSendReceiptHarness() {
   return { ...h, threadId, recovered, pendingSend, settle, answer };
 }
 
-test("Claude 回执未知后服务端判定未送达：自动恢复输入并解除锁定，不重发也不要求人工核对", async () => {
+test("Claude 明确未派发证据才恢复输入并解除锁定，不重发也不要求人工核对", async () => {
   for (const action of ["send", "editMessage"]) {
     const h = claudeSendReceiptHarness(), { context } = h;
     context.pending = h.pendingSend(action);
@@ -19379,7 +19517,7 @@ test("Claude 回执未知后服务端判定未送达：自动恢复输入并解�
     h.answer(1, { threadId: h.threadId, clientUserMessageId: "client-1", confirmed: false, deliveryState: "unknown" });
     await h.settle();
     assert.equal(h.requests[2].path, "/api/read/sendState", "确认未命中后再读一次服务端的结案判定");
-    h.answer(2, { threadId: h.threadId, clientUserMessageId: "client-1", confirmed: false, deliveryState: "notDelivered" });
+    h.answer(2, { threadId: h.threadId, clientUserMessageId: "client-1", confirmed: false, deliveryState: "notDelivered", notSent: true });
     await resolving;
     assert.equal(h.recovered.length, 1, `${action}：输入必须恢复`);
     assert.equal(context.pending, null, `${action}：锁定必须解除`);
@@ -19390,25 +19528,30 @@ test("Claude 回执未知后服务端判定未送达：自动恢复输入并解�
   }
 });
 
-test("Claude 回执未知但服务端仍未结案：继续只读核对，输入保持锁定", async () => {
-  const h = claudeSendReceiptHarness(), { context } = h;
-  context.pending = h.pendingSend();
-  const resolving = context.resolvePending();
-  h.answer(0, { requestId: "send-receipt-1", state: "unknown", result: {} });
-  await h.settle();
-  h.answer(1, { threadId: h.threadId, clientUserMessageId: "client-1", confirmed: false, deliveryState: "unknown" });
-  await h.settle();
-  // 服务端答复的线程或消息标识不匹配时，不能当作结案。
-  h.answer(2, { threadId: "claude-other", clientUserMessageId: "client-1", confirmed: false, deliveryState: "notDelivered" });
-  await resolving;
-  assert.equal(h.recovered.length, 0);
-  assert.equal(context.pending.id, "send-receipt-1");
-  assert.deepEqual([...h.timers.values()].map(timer => timer.delay), [5000], "5 秒后继续核对");
+test("Claude 旧超时结案、串会话或明确未知均不能当作未派发：继续只读核对且不重发", async () => {
+  for (const invalid of [{ threadId: "claude-other", notSent: true }, {}, { notSent: true, outcomeUnknown: true }]) {
+    const h = claudeSendReceiptHarness(), { context } = h;
+    context.pending = h.pendingSend();
+    const resolving = context.resolvePending();
+    h.answer(0, { requestId: "send-receipt-1", state: "unknown", result: {} });
+    await h.settle();
+    h.answer(1, { threadId: h.threadId, clientUserMessageId: "client-1", confirmed: false, deliveryState: "unknown" });
+    await h.settle();
+    h.answer(2, { threadId: h.threadId, clientUserMessageId: "client-1", confirmed: false, deliveryState: "notDelivered", ...invalid });
+    await resolving;
+    assert.equal(h.recovered.length, 0);
+    assert.equal(context.pending.id, "send-receipt-1");
+    assert.deepEqual([...h.timers.values()].map(timer => timer.delay), [5000], "5 秒后只读核对");
+    assert.ok(h.requests.every(request => !request.path.startsWith("/api/action/")));
+  }
 });
 
-test("Claude 消息待确认横幅不再提供查回执/已人工确认，3 分钟仍无结论才可放弃等待", () => {
+test("Claude 正常等待数分钟不提示，真正未知才展示恢复入口，不改 Codex 异常核对", () => {
   const h = claudeSendReceiptHarness(), { context } = h;
   context.pending = h.pendingSend("send", h.threadId, 6000);
+  context.renderPending();
+  assert.equal(h.area.children.length, 0);
+  context.pending.receiptState = "unknown";
   context.renderPending();
   assert.match(h.area.children[0].text, /正在确认消息送达，确认后会自动更新/);
   assert.deepEqual(h.area.children[0].children, [], "自动结案期间没有任何需要用户处理的按钮");
@@ -19421,10 +19564,13 @@ test("Claude 消息待确认横幅不再提供查回执/已人工确认，3 分�
   // 历史编辑同样；非 Claude 会话保持原有的人工核对入口。
   h.area.children.length = 0;
   context.pending = h.pendingSend("editMessage", h.threadId, 6000);
+  context.pending.receiptState = "unknown";
   context.renderPending();
   assert.deepEqual(h.area.children[0].children, []);
   h.area.children.length = 0;
   context.pending = h.pendingSend("send", "codex-thread", 6000);
+  context.pending.receiptState = "unknown";
+  context.selectedId = "codex-thread";
   context.renderPending();
   assert.deepEqual(h.area.children[0].children.map(node => node.label), ["查回执", "已人工确认"]);
 });
@@ -19441,8 +19587,7 @@ test("AGY 正常等原生消息时不显示回执横幅；真正送达未知才�
   h.answer(0, { requestId: context.pending.id, state: "unknown", result: {} });
   await h.settle();
   context.renderPending();
-  assert.equal(h.area.children.length, 1);
-  assert.deepEqual(h.area.children[0].children, [], "只保留既有的一条内联提示");
+  assert.equal(h.area.children.length, 0, "先只读核对原生证据，避免临时闪出待确认横幅");
   h.answer(1, { threadId: id, clientUserMessageId: "client-1", confirmed: true,
     deliveryState: "accepted", messageId: "native-message" });
   await resolving;
@@ -19454,6 +19599,7 @@ test("AGY 正常等原生消息时不显示回执横幅；真正送达未知才�
 test("AGY 迟到的原生拒绝只提示原文一次，不重复查询送达或重发", async () => {
   const h = claudeSendReceiptHarness(), { context } = h;
   const id = "antigravity-11111111-1111-4111-8111-111111111111", raw = " Native error\n  detail ";
+  context.selectedId = id;
   context.antigravityThreadId = value => value === id;
   context.pending = { ...h.pendingSend("send", id), agySending: true };
   const resolving = context.resolvePending();
@@ -19467,12 +19613,106 @@ test("AGY 迟到的原生拒绝只提示原文一次，不重复查询送达或�
   assert.deepEqual(h.requests.map(r => r.path), ["/api/receipts/send-receipt-1", "/api/read/sendState"]);
 });
 
-test("AGY 发送按钮的等待只属于原会话、原授权，不覆盖真实执行中的停止入口", () => {
-  const code = `(() => {${sourceSection("  const agySending =", "  const sendingLabel =")} return agySending; })()`;
+test("A 的送达回执不会出现在 B 的输入框", () => {
+  const h = claudeSendReceiptHarness(), { context } = h;
+  context.pending = h.pendingSend("send", h.threadId, 6000);
+  context.selectedId = "other-thread";
+  context.renderPending();
+  assert.equal(h.area.children.length, 0);
+});
+
+test("两条会话可以各自等待回执，重复发送仍被本会话阻止，A 的迟到成功不解除 B", async () => {
+  const h = queuedReceiptHarness(), c = h.context;
+  const payload = id => ({ threadId: id, clientUserMessageId: `${id}-user`, prompt: `${id}-draft` });
+  const a = payload("main"), b = payload("other");
+  const first = c.mutate("send", a, { reliable: true });
+  await new Promise(setImmediate);
+  const idA = c.pending.id;
+  const endA = c.beginReceiptActivity(a, "send", { payload: a });
+  c.selectedId = "other"; c.syncReceiptSelection();
+  assert.equal(c.pending, null); assert.equal(c.busy, false); assert.equal(c.sending, null);
+  const second = c.mutate("send", b, { reliable: true });
+  await new Promise(setImmediate);
+  const idB = c.pending.id;
+  assert.notEqual(idA, idB);
+  assert.equal(JSON.parse(h.disk.getItem("codex-elves-pending")).length, 2);
+  const endB = c.beginReceiptActivity(b, "send", { payload: b });
+  await assert.rejects(c.mutate("send", b, { reliable: true }), /待确认/);
+  assert.equal(h.requests.length, 2);
+  h.receipt(0, "completed", { ok: true, threadId: "main", clientUserMessageId: a.clientUserMessageId });
+  await first; endA();
+  assert.equal(c.pending.id, idB); assert.equal(c.sending.payload, b); assert.equal(c.busy, true);
+  assert.equal(JSON.parse(h.disk.getItem("codex-elves-pending")).id, idB);
+  const reload = queuedReceiptHarness({ disk: h.disk });
+  assert.equal(reload.context.pending, null);
+  reload.context.selectedId = "other"; reload.context.syncReceiptSelection(); assert.equal(reload.context.pending.id, idB);
+  h.receipt(1, "completed", { ok: true, threadId: "other" }); await second; endB();
+  assert.equal(c.pending, null); assert.equal(c.busy, false);
+});
+
+test("主会话和两个侧边 iframe 共用浏览器存储，隐藏、重开、迟到回执均只作用于来源线程", async () => {
+  const disk = storage(), names = ["main", "side-a", "side-b"];
+  const pages = names.map((id, i) => queuedReceiptHarness({ disk, side: i ? id : null }));
+  const writes = pages.map((h, i) => h.context.mutate("removeQueued", { threadId: names[i], messageId: `q-${i}` },
+    { reliable: true, receiptId: `receipt-${i}` }));
+  const keys = names.map((name, i) => `codex-elves-pending${i ? `:side:${name}` : ""}`);
+  for (const [i, h] of pages.entries()) {
+    assert.equal(JSON.parse(disk.getItem(keys[i])).id, `receipt-${i}`);
+    assert.equal(h.context.allReceipts().length, 1);
+    const reopened = queuedReceiptHarness({ disk, side: i ? names[i] : null });
+    assert.equal(reopened.context.pending.id, `receipt-${i}`);
+    assert.ok(names.every((_, j) => i === j || !reopened.context.receiptById(`receipt-${j}`)));
+  }
+  const side = pages[1].context, record = side.pending;
+  side.document = { documentElement: { dataset: { workspaceSidePanelVisible: "false" } } };
+  side.receiptNotice(record, "侧边 A 的错误", true);
+  assert.equal(pages[1].notices.length, 0);
+  side.document.documentElement.dataset.workspaceSidePanelVisible = "true"; side.syncReceiptActivity();
+  assert.deepEqual(pages[1].notices, [{ message: "侧边 A 的错误", error: true }]);
+  pages[1].receipt(0, "completed", { threadId: "side-a", messageId: "q-1" }); await writes[1];
+  assert.equal(disk.getItem(keys[1]), null);
+  assert.ok(disk.getItem(keys[0]) && disk.getItem(keys[2]));
+  assert.equal(pages[0].notices.length + pages[2].notices.length, 0);
+  for (const i of [0, 2]) { pages[i].receipt(0, "completed", { threadId: names[i], messageId: `q-${i}` }); await writes[i]; }
+});
+
+test("新建首条回执按项目和实例隔离，换授权或没有归属的记录不能锁住当前草稿", () => {
+  const h = queuedReceiptHarness(), c = h.context;
+  Object.assign(c, { selectedId: null, creating: true, creationBackend: "claude", creationInstanceId: "wsl:test-a", creationProject: "p" });
+  const payload = { backend: "claude", instanceId: "wsl:test-a", projectId: "p", prompt: "fixture" };
+  const record = { ...c.captureReceiptOwner(payload), action: "create", id: "create-one" };
+  c.savePending(record);
+  assert.equal(c.pending.id, "create-one");
+  c.creationProject = "other"; c.syncReceiptSelection(); assert.equal(c.pending, null);
+  c.creationProject = "p"; c.creationInstanceId = "wsl:test-b"; c.syncReceiptSelection(); assert.equal(c.pending, null);
+  c.creationInstanceId = "wsl:test-a"; c.syncReceiptSelection(); assert.equal(c.pending.id, "create-one");
+  c.session.device.createdAtMs++; c.syncReceiptSelection(); assert.equal(c.pending, null);
+  c.installReceipt({ invalid: true }); assert.equal(c.receiptForPayload(payload), null);
+  c.receiptNotice(record, "旧授权失败", true); assert.deepEqual(h.notices, []);
+});
+
+test("侧边升级只接回旧单键中属于自己的回执，不覆盖主会话或兄弟记录", () => {
+  const disk = storage();
+  const base = { action: "removeQueued", deviceId: "device-a", time: 1 };
+  const entries = ["main", "side-a", "side-b"].map(id => ({ ...base, id: `r-${id}`, payload: { threadId: id, messageId: "q" } }));
+  disk.setItem("codex-elves-pending", JSON.stringify(entries));
+  const a = queuedReceiptHarness({ disk, side: "side-a" });
+  assert.equal(a.context.pending.id, "r-side-a");
+  assert.deepEqual(JSON.parse(disk.getItem("codex-elves-pending")).map(r => r.id), ["r-main", "r-side-b"]);
+  assert.equal(queuedReceiptHarness({ disk, side: "side-b" }).context.pending.id, "r-side-b");
+  assert.equal(queuedReceiptHarness({ disk }).context.pending.id, "r-main");
+});
+
+test("三种实例正常等待只用原会话的发送按钮，不覆盖其他会话和真实执行中的停止入口", () => {
+  const code = `(() => {${sourceSection("  const receiptSending =", "  const sendingLabel =")} return receiptSending; })()`;
   const ctx = { active: false, pending: { agySending: true, deviceId: "device", operationScope: "scope",
     payload: { threadId: "antigravity-a" } }, selectedId: "antigravity-a", session: { device: { id: "device" } },
     privateInputScope: () => "scope", creating: false };
   assert.equal(nodeVm.runInNewContext(code, ctx), true);
+  for (const id of ["codex-a", "claude-a", "antigravity-a"]) for (const state of ["pending", "unknown"]) {
+    assert.equal(nodeVm.runInNewContext(code, { ...ctx, selectedId: id, pending: { ...ctx.pending, agySending: false,
+      action: "send", receiptState: state, payload: { threadId: id } } }), state === "pending");
+  }
   for (const changed of [{ active: true }, { selectedId: "antigravity-b" }, { privateInputScope: () => "other" },
     { session: { device: { id: "new" } } }]) assert.equal(nodeVm.runInNewContext(code, { ...ctx, ...changed }), false);
 });

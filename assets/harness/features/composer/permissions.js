@@ -6,7 +6,7 @@ import { notice } from "../../ui/notice.js";
 import { setSelectOptions } from "../../ui/select.js";
 import { mutate, updateComposer } from "../../core/actions.js";
 import { busy, connected, creating, selectedId, session, stopping } from "../../core/state.js";
-import { api } from "../api.js";
+import { api, operationErrorState } from "../api.js";
 import { draftKey, snapshotDraft, storeDraft } from "./drafts.js";
 import {
   codexCreationDefaults, newAntigravityPermissionMode, newClaudePermissionMode, newCodexPermissionMode,
@@ -17,6 +17,7 @@ import {
   permissionWrites, rememberInstancePermissionCatalog, rememberPermissionSelection
 } from "./options-state.js";
 import { pending } from "../conversation/pending-state.js";
+import { captureReceiptOwner, receiptNotice } from "../conversation/receipt-context.js";
 import { editingMessage } from "../messages/message-edit.js";
 import { editingQueuedMessage } from "../queue/state.js";
 import { activeBackend, isActiveThread, isAntigravity, isClaude, privateInputScope, threadReadOnly } from "../session/capabilities.js";
@@ -178,6 +179,7 @@ export async function changeComposerPermissions() {
     return;
   }
   const id = selectedId, instanceId = activeInstanceId(), scope = privateInputScope(session);
+  const owner = captureReceiptOwner({ threadId: id });
   if (!id || permissionWrites.has(id)) return;
   const writing = { scope, mode };
   let finishPermissionWrite, saved = false;
@@ -192,11 +194,12 @@ export async function changeComposerPermissions() {
       throw new Error("会话权限保存结果尚未确认，请重新读取会话后核对。");
     rememberPermissionSelection(id, mode, result.permissionRevision || 0);
     saved = true;
-    notice(result.appliesTo === "immediate" ? "会话权限已生效。"
+    receiptNotice(owner, result.appliesTo === "immediate" ? "会话权限已生效。"
       : result.permissionPending === true ? "权限选择已保存，等待原生可安全切换时生效；当前会话可继续使用。"
       : "已保存，仅本会话的后续新轮次使用所选权限。");
   } catch (error) {
-    if (scope === privateInputScope(session)) notice(error.message, true);
+    if (scope === privateInputScope(session) && (!error.pendingFeedback || operationErrorState(error) === "failed"))
+      receiptNotice(owner, error.message, true);
   } finally {
     if (permissionWrites.get(id) === writing) permissionWrites.delete(id);
     finishPermissionWrite(saved);

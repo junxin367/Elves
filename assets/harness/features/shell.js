@@ -57,6 +57,7 @@ import {
 } from "./conversation/history-state.js";
 import { scheduleHistoryLoad } from "./conversation/history.js";
 import { savePending } from "./conversation/pending-store.js";
+import { syncReceiptNotices } from "./conversation/receipt-context.js";
 import { welcomeNode } from "./conversation/selection-state.js";
 import { startNewChat } from "./conversation/selection.js";
 import { selectGoalCommand } from "./goal/composer.js";
@@ -430,6 +431,7 @@ export function shell() {
   };
   mountMainNavigation({
     workspace,
+    onConversationVisibility: syncReceiptNotices,
     openSettings: mountSettingsPage,
     openScheduledTasks: mountScheduledTasksPage,
     openRemoteAccess: mountRemoteAccessPage,

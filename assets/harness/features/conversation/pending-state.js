@@ -5,9 +5,8 @@ import { updateComposer } from "../../core/actions.js";
 import { selectedId, session, turns } from "../../core/state.js";
 import { api } from "../api.js";
 import { antigravityThreadId, claudeThreadId } from "../session/capabilities.js";
+import { receiptNotice } from "./receipt-context.js";
 
-export let pendingTimer = null;
-export function setPendingTimer(value) { return pendingTimer = value; }
 export function validSkillSelection(value) {
   return value == null || (Array.isArray(value) && value.length <= 16 && value.every(skill =>
     skill && typeof skill.name === "string" && skill.name.length > 0 && skill.name.length <= 256
@@ -23,8 +22,9 @@ export let pending = null;
 export function setPending(value) { return pending = value; }
 export let pendingSendRequest = null;
 export function setPendingSendRequest(value) { return pendingSendRequest = value; }
-export function reportMutationError(error) {
+export function reportMutationError(error, owner = null) {
   if (error.pendingFeedback) { updateComposer(); return; }
+  if (owner) { receiptNotice(owner, error.message, true); return; }
   notice(error.message, true);
 }
 export function acceptedSendItem(items, clientId) {
@@ -80,9 +80,7 @@ export async function confirmPendingSend(current, result = {}) {
   try { return await promise; }
   finally { if (pendingSendRequest === request) pendingSendRequest = null; }
 }
-// Claude 服务端按原生证据判定这条消息没有送达（会话已空闲，且始终没有接收记录）。
-// 用户要求 Harness 自己判定送达结果，不再让用户去原生客户端核对（2026-11-25）：调用方据此恢复输入并解除锁定，
-// 绝不自动重发。只认服务端对同一线程、同一消息标识的明确答复；原生记录晚到时服务端会改回已接收，见 queue_send_state。
+// 仅接受同一消息明确未派发的证据；旧服务仅按时间返回 notDelivered 时仍保持未知，不据此解锁重发。
 export async function sendNotDelivered(current) {
   const threadId = current.payload?.threadId, clientId = current.payload?.clientUserMessageId;
   if (current.action !== "send" && current.action !== "editMessage" || typeof threadId !== "string"
@@ -91,5 +89,6 @@ export async function sendNotDelivered(current) {
       || current.deviceId && current.deviceId !== session?.device.id) return false;
   const state = await api("/api/read/sendState", { threadId, clientUserMessageId: clientId });
   return state?.threadId === threadId && state.clientUserMessageId === clientId
-    && state.deliveryState === "notDelivered" && state.confirmed !== true;
+    && state.deliveryState === "notDelivered" && state.notSent === true && state.confirmed !== true
+    && state.outcomeUnknown !== true;
 }

@@ -3752,6 +3752,10 @@ impl IntoResponse for ApiError {
         let mut payload = json!({"ok":false,"message":self.message});
         if self.outcome_unknown {
             payload["outcomeUnknown"] = json!(true);
+        } else {
+            // 用户要求明确未执行时不显示回执确认；与 execute 的 ApiError 判定保持一致，
+            // 503 等服务拒绝也携带未派发证据，不能让前端仅凭 HTTP 码误判为结果未知。
+            payload["notSent"] = json!(true);
         }
         let mut response = (
             StatusCode::from_u16(self.code).unwrap_or(StatusCode::BAD_REQUEST),
@@ -6995,6 +6999,23 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn receipt_http_rejection_preserves_not_sent_and_unknown_evidence() {
+        for code in [409, 503, 504] {
+            for unknown in [false, true] {
+                let message = "  原生错误\n保留原文  ";
+                let error = ApiError { code, message: message.into(), outcome_unknown: unknown };
+                let response = error.into_response();
+                assert_eq!(response.status().as_u16(), code);
+                let body = axum::body::to_bytes(response.into_body(), 8192).await.unwrap();
+                let value: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(value["message"], message);
+                assert_eq!(value["notSent"] == true, !unknown);
+                assert_eq!(value["outcomeUnknown"] == true, unknown);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn recent_priority_is_shared_across_authorized_clients_and_preserved_when_read() {

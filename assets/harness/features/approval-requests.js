@@ -4,7 +4,8 @@ import { notice } from "../ui/notice.js";
 import { mutate, reloadThread, renderApprovals, renderSidebar } from "../core/actions.js";
 import { connected, pageLeaving, selectedId, session, sidebar, thread } from "../core/state.js";
 import { randomId } from "../core/util.js";
-import { api } from "./api.js";
+import { api, operationErrorState, receiptResultState } from "./api.js";
+import { receiptNotice } from "./conversation/receipt-context.js";
 import {
   approvalReplies, approvalReplyKey, blockingApprovalIdentity, blockingRequestState,
   notifiedQuestions, questionDrafts, questionReceiptChecks, questionReplyReceipts, questionVersion,
@@ -106,6 +107,7 @@ export async function submitBlockingRequest(requestThreadId, request, action, va
   if (approvalReplies.has(key)) return;
   const record = { deviceId, threadId: requestThreadId, requestId: request.id, method: request.method,
     state: "submitting", time: Date.now() };
+  const notice = (message, error = false) => receiptNotice({ deviceId, payload: { threadId: requestThreadId } }, message, error);
   approvalReplies.set(key, record);
   setApprovalSignature(null); renderApprovals();
   try {
@@ -117,17 +119,18 @@ export async function submitBlockingRequest(requestThreadId, request, action, va
       return;
     }
     if (approvalReplies.get(key) === record) record.state = result?.outcomeUnknown ? "unknown" : "pending";
-    if (!applied && selectedId === requestThreadId) await reloadThread();
+    // 已明确接受的答复不会因为随后的只读刷新失败而退回“结果未知”。
+    if (!applied && selectedId === requestThreadId) await reloadThread().catch(() => {});
   } catch (error) {
     if (session?.device.id !== deviceId || blockingRequestState(requestThreadId).sourceVersion !== sourceVersion) return;
     if (approvalReplies.get(key) === record) {
-      const notSubmitted = error.notSubmitted === true && error.outcomeUnknown !== true;
-      if (notSubmitted || error.outcomeUnknown !== true && (error.approvalState === "failed" && error.code !== 409
-          || error.code && ![409, 503].includes(error.code))) approvalReplies.delete(key);
-      else record.state = error.approvalState === "pending" || error.code === 409 ? "pending" : "unknown";
+      const state = operationErrorState(error);
+      if (state === "failed") approvalReplies.delete(key);
+      else record.state = state;
     }
-    notice(error.message, true);
-    if (selectedId === requestThreadId) void reloadThread().catch(readError => notice(readError.message, true));
+    // 明确拒绝只报原错误；仍在处理或确实未知由原卡片说明，避免再叠加一条回执通知。
+    if (operationErrorState(error) === "failed") notice(error.message, true);
+    if (selectedId === requestThreadId) void reloadThread().catch(() => {});
   } finally {
     if (session?.device.id === deviceId && selectedId === requestThreadId
         && blockingRequestState(requestThreadId).sourceVersion === sourceVersion) {
@@ -140,6 +143,7 @@ async function applyQuestionReceipt(key, receipt) {
   if (!record || record.deviceId !== session?.device.id || receipt?.requestId !== record.id
       || receipt.result?.threadId && receipt.result.threadId !== record.threadId
       || receipt.result?.requestId && receipt.result.requestId !== record.requestId) return;
+  receipt = { ...receipt, state: receiptResultState(receipt) };
   const outcomeUnknown = receipt.result?.outcomeUnknown === true;
   if (receipt.state === "completed" && receipt.result?.ok === true && !outcomeUnknown) {
     setQuestionReceipt(key, null); questionDrafts.delete(key);
@@ -157,7 +161,7 @@ async function applyQuestionReceipt(key, receipt) {
   } else if (receipt.state === "failed" && !outcomeUnknown) {
     setQuestionReceipt(key, null);
     setApprovalSignature(null); renderApprovals(); renderSidebar();
-    throw new Error(receipt.result?.message || "回答未提交，请核对问题后重试");
+    throw Object.assign(new Error(receipt.result?.message || "回答提交失败"), { operationState: "failed" });
   } else {
     setQuestionReceipt(key, { ...record, state: receipt.state === "pending" && !outcomeUnknown ? "pending" : "unknown" });
     setApprovalSignature(null); renderApprovals();
@@ -179,8 +183,10 @@ export async function recoverQuestionReceipts() {
           { resourcePriority: "background" });
         if (scope !== privateInputScope(session) || questionReplyReceipts.get(key)?.id !== record.id) return;
         await applyQuestionReceipt(key, receipt);
-      } catch {
+      } catch (error) {
         // 404、断网或本地存储失败均不能证明原回答未派发，保留原锁待下次核对。
+        if (scope === privateInputScope(session) && error.operationState === "failed")
+          receiptNotice({ deviceId, payload: { threadId: record.threadId } }, error.message, true);
       } finally {
         if (questionReceiptChecks.get(key) === checking) questionReceiptChecks.delete(key);
       }
@@ -195,6 +201,7 @@ export async function submitAsyncQuestion(requestThreadId, request, answers, { s
   if (questionReplyReceipts.has(key) || request.params?.submissionState) return;
   const record = { id: randomId(), deviceId: session.device.id, threadId: requestThreadId,
     requestId: request.id, state: "pending", ...(skip ? { skip: true } : {}) };
+  const notice = (message, error = false) => receiptNotice({ deviceId: record.deviceId, payload: { threadId: requestThreadId } }, message, error);
   try { setQuestionReceipt(key, record); }
   catch (error) { notice(error.message, true); return; }
   setApprovalSignature(null); renderApprovals();
@@ -206,11 +213,11 @@ export async function submitAsyncQuestion(requestThreadId, request, answers, { s
     await applyQuestionReceipt(key, receipt);
   } catch (error) {
     if (questionReplyReceipts.get(key)?.id === record.id) {
-      const notSubmitted = error.notSubmitted === true && error.outcomeUnknown !== true;
-      if (notSubmitted || error.outcomeUnknown !== true && error.code && error.code !== 503) setQuestionReceipt(key, null);
-      else setQuestionReceipt(key, { ...record, state: "unknown" });
+      const state = operationErrorState(error);
+      if (state === "failed") setQuestionReceipt(key, null);
+      else setQuestionReceipt(key, { ...record, state });
     }
-    notice(error.message, true);
+    if (operationErrorState(error) === "failed") notice(error.message, true);
     if (error.code === 409 && selectedId === requestThreadId)
       void reloadThread().catch(() => {});
   } finally {

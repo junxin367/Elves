@@ -11,7 +11,9 @@ import {
   closeComposerMenus, mutate, reloadThread, renderMessages, renderQueuedEditRecoveryControls,
   updateComposer
 } from "../../core/actions.js";
-import { busy, connected, selectedId, selectionVersion, session, setBusy, stopping, thread } from "../../core/state.js";
+import { busy, connected, selectedId, selectionVersion, session, stopping, thread } from "../../core/state.js";
+import { beginReceiptActivity, captureReceiptOwner, receiptNotice } from "../conversation/receipt-context.js";
+import { receiptForPayload } from "../conversation/receipt-registry.js";
 import { api } from "../api.js";
 import { persistQueuedEditDraft, persistQueuedEdits, recoveryGeneration } from "../composer/drafts.js";
 import { compactionLocked } from "../conversation/compaction.js";
@@ -73,16 +75,16 @@ async function reorderQueuedMessages(threadId, expectedMessageIds, messageIds, f
   const payload = { threadId, messageIds, expectedMessageIds }, readVersion = queueVersion;
   const preview = { ...payload, deviceId: session.device.id };
   setQueueReorder(preview);
-  setBusy(true); updateComposer();
+  const owner = captureReceiptOwner(payload), finishActivity = beginReceiptActivity(payload); updateComposer();
   try {
     const result = await mutate("reorderQueued", payload, { reliable: true });
     if (session?.device.id === preview.deviceId) applyQueueReorderResult(threadId, result, readVersion);
   } catch (error) {
-    reportMutationError(error);
-    if (!pending && selectedId === threadId) void reloadQueue().catch(error => notice(error.message, true));
+    reportMutationError(error, owner);
+    if (!receiptForPayload(payload) && selectedId === threadId) void reloadQueue().catch(error => receiptNotice(owner, error.message, true));
   } finally {
     if (queueReorder === preview) setQueueReorder(null);
-    setBusy(false); updateComposer();
+    finishActivity(); updateComposer();
     if (focusId && selectedId === threadId) {
       const row = [...document.querySelectorAll(".queued-message[data-message-id]")].find(row => row.dataset.messageId === focusId);
       if (row) {
@@ -453,6 +455,7 @@ export function renderQueueArea() {
 async function removeQueuedMessage(threadId, messageId) {
   if (!threadId || !messageId || threadReadOnly(threadId) || !connected || busy || stopping || pending) return;
   const operationScope = privateInputScope(session), generation = recoveryGeneration;
+  const owner = captureReceiptOwner({ threadId });
   const currentAuthorization = () => operationScope === privateInputScope(session) && generation === recoveryGeneration;
   const key = `${threadId}:${messageId}`;
   if (queuedActionBusy.has(key)) return;
@@ -469,9 +472,9 @@ async function removeQueuedMessage(threadId, messageId) {
           ? result.queuedMessages
           : (thread.queuedMessages || []).filter(message => message?.id !== messageId), result?.queuedEdits, result);
     if (!applied || result?.queueSyncPending)
-      void reloadQueue().catch(error => { if (currentAuthorization()) notice(error.message, true); });
+      void reloadQueue().catch(error => { if (currentAuthorization()) receiptNotice(owner, error.message, true); });
   } catch (error) {
-    if (currentAuthorization()) reportMutationError(error);
+    if (currentAuthorization()) reportMutationError(error, owner);
   } finally {
     queuedActionBusy.delete(key);
     if (currentAuthorization() && selectedId === threadId) updateComposer();
@@ -481,6 +484,7 @@ async function steerQueuedMessage(threadId, messageId) {
   if (!threadId || !messageId || threadReadOnly(threadId) || !connected || busy || stopping || pending
       || compactionLocked(threadId)) return;
   const operationScope = privateInputScope(session), generation = recoveryGeneration;
+  const owner = captureReceiptOwner({ threadId });
   const currentAuthorization = () => operationScope === privateInputScope(session) && generation === recoveryGeneration;
   const key = `${threadId}:${messageId}`;
   if (queuedActionBusy.has(key)) return;
@@ -536,7 +540,7 @@ async function steerQueuedMessage(threadId, messageId) {
           phase: "failure", durationMs: performance.now() - reloadStartedAt,
           errorType: error?.name || "Error", reason: "network-error"
         });
-        notice(error.message, true);
+        receiptNotice(owner, error.message, true);
       });
     }
     recordDiagnostic("remote.steer", {
@@ -544,7 +548,7 @@ async function steerQueuedMessage(threadId, messageId) {
     });
   } catch (error) {
     if (!currentAuthorization()) return;
-    finishSendDisplay(sendDisplay, !pending);
+    finishSendDisplay(sendDisplay, !receiptForPayload(owner.payload));
     if (pendingSteer === preview) {
       setPendingSteer(null);
       renderMessages();
@@ -553,7 +557,7 @@ async function steerQueuedMessage(threadId, messageId) {
       phase: "failure", durationMs: performance.now() - startedAt,
       errorType: error?.name || "Error", reason: "network-error"
     });
-    reportMutationError(error);
+    reportMutationError(error, owner);
   } finally {
     if (pendingSteer === preview && (!currentAuthorization() || selectedId !== threadId)) setPendingSteer(null);
     queuedActionBusy.delete(key);
