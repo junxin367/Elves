@@ -437,6 +437,30 @@ class SharedQueueHistoryTests(unittest.TestCase):
         ], pending_text="无关")
         self.assertEqual([row["uuid"] for row in native.messages], ["u0", "a1", "a2", "r1", "r2", "a3", "u1"])
 
+    def test_main_reply_end_preserves_its_real_input_through_filtered_rows_and_replay(self):
+        def final(uuid, parent, reason="end_turn"):
+            return {"type": "assistant", "uuid": uuid, "parentUuid": parent,
+                    "message": {"id": uuid, "model": "real", "stop_reason": reason,
+                                "content": [{"type": "text", "text": "完成"}]}}
+
+        user = {"type": "user", "uuid": "u", "message": {"content": "问题"}}
+        rows = [user, {"type": "attachment", "uuid": "hidden", "parentUuid": "u",
+                       "attachment": {"type": "deferred_tools_delta"}}, final("a", "hidden"),
+                {**user, "uuid": "other", "parentUuid": "a"}, final("b", "other", "stop_sequence"),
+                final("unlinked", "missing"), {**final("side", "u"), "isSidechain": True}]
+        reader = self.read(rows)
+        for native in (reader, self.read(rows)):
+            projected = {row["uuid"]: row for row in native.messages}
+            self.assertEqual(projected["a"]["nativeReplyTo"], "u")
+            self.assertEqual(projected["b"]["nativeReplyTo"], "other")
+            self.assertEqual(projected["b"]["message"]["stop_reason"], "stop_sequence")
+            self.assertNotIn("nativeReplyTo", projected["unlinked"])
+            self.assertNotIn("side", projected)
+        # 文件被替换后不能沿用旧分支的归属；相同 UUID 的父节点在新文件中缺失。
+        reader.log_path.write_text(json.dumps(final("a", "hidden")) + "\n", encoding="utf-8")
+        reader.read_messages()
+        self.assertNotIn("nativeReplyTo", reader.messages[0])
+
     def test_tool_results_forward_only_render_metadata_for_their_single_call(self):
         patch_rows = [{"oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1, "lines": ["-旧", "+新"]}]
         native = self.read([

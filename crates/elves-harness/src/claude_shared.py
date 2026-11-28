@@ -1329,6 +1329,7 @@ class NativeSession:
         self.all_messages = []
         # 不进入历史的记录（附件等）的 uuid → parentUuid，给中断标记穿过它们找父节点用；上限见 ROW_LINK_LIMIT。
         self.row_links = {}
+        self.reply_owners = {}
         self.history = NativeHistory()
         self.retired_usage = []
         self.image_inputs = {}
@@ -1985,6 +1986,7 @@ class NativeSession:
                 and stat.st_mtime_ns != self.log_mtime):
             self.messages, self.all_messages, self.log_offset, self.seen = [], [], 0, set()
             self.row_links = {}
+            self.reply_owners.clear()
             self._compact_history_model = None
             self.history = NativeHistory()
             self.scheduled_fires = {}
@@ -2032,8 +2034,17 @@ class NativeSession:
                 if row["uuid"] in self.seen:
                     continue
                 self.row_links[row["uuid"]] = row.get("parentUuid")
+                # 队列只认同一条输入的最终回复。沿真实父链传递归属（含不展示的附件），缺父节点不按行序猜。
+                parent = row.get("parentUuid")
+                owner = self.reply_owners.get(parent) if isinstance(parent, str) else None
+                if row.get("subtype") == "compact_boundary" or row.get("isCompactSummary") is True:
+                    owner = None  # 内部摘要不是原输入的最终回复。
+                if owner:
+                    self.reply_owners[row["uuid"]] = owner
                 if len(self.row_links) > ROW_LINK_LIMIT:
-                    self.row_links.pop(next(iter(self.row_links)))
+                    oldest = next(iter(self.row_links))
+                    self.row_links.pop(oldest)
+                    self.reply_owners.pop(oldest, None)
                 self.observe_control_record(row)
                 if row.get("type") == "user" and row.get("permissionMode") in (
                         "default", "manual", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"):
@@ -2132,6 +2143,8 @@ class NativeSession:
                 skill = native_skill_command(row)
                 if skill:
                     row["nativeSkillCommand"] = skill
+                if row["type"] == "user" and (native_turn_start(row) or notification):
+                    self.reply_owners[row["uuid"]] = row["uuid"]
                 self.seen.add(row["uuid"])
                 # 原生回退菜单定位真实 user 节点；吸收在工具轮次中的 queued_command 仍保留正文，不伪造独立回退点。
                 row["nativeEditable"] = native_editable and not row.get("nativeControlCommand")
@@ -2167,7 +2180,9 @@ class NativeSession:
                 if isinstance(row.get("message"), dict):
                     message = {key: row["message"][key] for key in
                                # 用户要求显示最后实际请求用量；保留原生 usage（含缓存和 iterations），不读取 job 累计 tokens。
-                               ("role", "id", "model", "content", "usage") if key in row["message"]}
+                               ("role", "id", "model", "content", "usage", "stop_reason") if key in row["message"]}
+                    if row["type"] == "assistant" and owner and message.get("stop_reason") in ("end_turn", "stop_sequence"):
+                        self.messages[-1]["nativeReplyTo"] = owner
                     if isinstance(message.get("content"), list):
                         # 展示不需要加密签名和请求诊断；原生文件保留原文，避免把不可见数据反复传到网页。
                         message["content"] = [{key: value for key, value in part.items()

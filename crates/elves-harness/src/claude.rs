@@ -3577,7 +3577,7 @@ impl Claude {
         // 持锁期间只做与当前会话状态相关的合并，其他请求不再排在整段投影之后。
         let native_clients: BTreeMap<String, String> =
             serde_json::from_value(frame["clients"].clone())?;
-        let (mut projected, anchor) = project_anchored_history(frame, generation);
+        let (mut projected, anchor, completed_replies) = project_anchored_history(frame, generation);
         subagents::decorate_turns(id, &mut projected);
         let update = self
             .change_lazy(|saved| {
@@ -3755,6 +3755,7 @@ impl Claude {
                     c.live_preview = None;
                 }
                 c.remote_queue.observe_turns(&c.turns, &c.native_status);
+                c.remote_queue.observe_final_reply(&completed_replies);
                 c.remote_queue.observe_compaction(&c.native_control);
                 let needs_compaction_restore = c.compaction_model_restore.is_some()
                     && !c.active()
@@ -4770,9 +4771,13 @@ fn project_shared_history(frame: &Value, generation: &str) -> Vec<Value> {
     project_anchored_history(frame, generation).0
 }
 
-fn project_anchored_history(frame: &Value, generation: &str) -> (Vec<Value>, Option<native_controls::CompactionAnchor>) {
+fn project_anchored_history<'a>(frame: &'a Value, generation: &str) -> (
+    Vec<Value>, Option<native_controls::CompactionAnchor>, std::collections::HashSet<&'a str>,
+) {
     let mut turns: Vec<Value> = vec![];
     let mut native_owners: HashMap<&str, usize> = HashMap::new();
+    let verify_replies = remote_queue::ReplyEvidence::can_confirm(frame, generation);
+    let mut reply_evidence = remote_queue::ReplyEvidence::default();
     let mut native_positions = HashMap::new();
     let compactions = frame["native_control"]["compactionEvents"]
         .as_array()
@@ -5011,6 +5016,12 @@ fn project_anchored_history(frame: &Value, generation: &str) -> (Vec<Value>, Opt
                     turn["durationMs"] = row["durationMs"].clone();
                 }
             } else if matches!(row["type"].as_str(), Some("assistant" | "user")) {
+                if verify_replies
+                    && let Some(native_user) = turn["_nativeUserId"].as_str()
+                    && let Some(client) = frame["clients"][native_user].as_str()
+                {
+                    reply_evidence.observe(client, native_user, row);
+                }
                 tools::confirm_task_continuation(turn, row);
                 let mut native_frame = row.clone();
                 native_frame["message"]["content"] = content;
@@ -5141,7 +5152,7 @@ fn project_anchored_history(frame: &Value, generation: &str) -> (Vec<Value>, Opt
         })
     });
     native_controls::project_compactions(compactions, &mut turns, &native_positions);
-    (turns, anchor)
+    (turns, anchor, reply_evidence.completed)
 }
 
 fn new_session_model_defaults(payload: &Value, catalog: &Value) -> Value {

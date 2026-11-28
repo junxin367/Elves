@@ -11,6 +11,83 @@ const UNKNOWN_ABANDON_MS: u64 = 45_000;
 /// 记住最近结案的消息数量；超出后丢弃最早的。
 const ABANDONED_LIMIT: usize = 256;
 
+/// 只在一次主会话历史投影内使用。工具收到原生结果才算返回，任务转入后台不必等后台任务退出。
+#[derive(Default)]
+pub(super) struct ReplyEvidence<'a> {
+    current_client: Option<&'a str>,
+    open_tools: HashSet<&'a str>,
+    pub(super) completed: HashSet<&'a str>,
+}
+
+impl<'a> ReplyEvidence<'a> {
+    pub(super) fn can_confirm(frame: &Value, generation: &str) -> bool {
+        // 只读历史不代表原生连接已空闲；执行、审批、缺少实时状态时也不为队列扫描工具或回复。
+        let status = &frame["native_status"];
+        !generation.starts_with("native-history-")
+            && frame["subagentReadOnly"] != true
+            && status["tempo"] == "idle"
+            && matches!(status["state"].as_str(), Some("idle" | "done" | "ended"))
+            && status["needs"].is_null()
+            && (status["outcome"].is_null()
+                || status["outcome"] == "completed"
+                || status["outcome"] == "success")
+            && frame["requests"]
+                .as_object()
+                .is_some_and(|requests| requests.is_empty())
+    }
+
+    pub(super) fn observe(&mut self, client: &'a str, native_user: &str, row: &'a Value) {
+        if self.current_client != Some(client) {
+            self.open_tools.clear();
+            self.current_client = Some(client);
+        }
+        let message = &row["message"];
+        let assistant = row["type"] == "assistant";
+        let mut has_text = false;
+        let mut tool_result = false;
+        for part in message["content"].as_array().into_iter().flatten() {
+            match part["type"].as_str() {
+                Some("tool_use") if assistant => {
+                    self.open_tools.insert(part["id"].as_str().unwrap_or(""));
+                }
+                Some("tool_result") if !assistant => {
+                    tool_result = true;
+                    if let Some(id) = part["tool_use_id"].as_str().filter(|id| !id.is_empty()) {
+                        self.open_tools.remove(id);
+                    }
+                }
+                Some("text") if assistant => {
+                    has_text |= part["text"].as_str().is_some_and(|s| !s.trim().is_empty());
+                }
+                _ => {}
+            }
+        }
+        if !assistant && !tool_result {
+            return;
+        }
+        // end_turn 也会出现在单独的思考块上。只认可沿真实父链归属本轮的最终正文；
+        // 同轮后续模型输出或工具活动会取代这份证据，不把它当作通用的 _nativeDone。
+        if assistant
+            && has_text
+            && self.open_tools.is_empty()
+            && message["model"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty() && s != "<synthetic>")
+            && row["isApiErrorMessage"] != true
+            && matches!(
+                message["stop_reason"].as_str(),
+                Some("end_turn" | "stop_sequence")
+            )
+            && !native_user.is_empty()
+            && row["nativeReplyTo"] == native_user
+        {
+            self.completed.insert(client);
+        } else {
+            self.completed.remove(client);
+        }
+    }
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub(super) struct RemoteQueue {
@@ -246,6 +323,19 @@ impl RemoteQueue {
             self.awaiting_turn = None;
             self.paused = true;
             self.revision += 1;
+        }
+    }
+
+    pub(super) fn observe_final_reply(&mut self, completed: &HashSet<&str>) {
+        // 主会话可能不写 turn_duration。只核对所等输入自身的最终正文和同一快照的空闲状态；
+        // 不借用后续轮次的 end_turn，不解除暂停，也不重置正在核对的派发。
+        if self
+            .awaiting_turn
+            .as_deref()
+            .is_some_and(|id| completed.contains(id))
+        {
+            self.awaiting_turn = None;
+            self.awaiting_started = false;
         }
     }
 
@@ -2363,6 +2453,129 @@ mod tests {
             .cloned()
             .collect();
         assert_eq!(sent.last().unwrap()["steer"], true);
+    }
+
+    #[tokio::test]
+    async fn main_reply_end_without_duration_drains_only_once_after_idle() {
+        let (_directory, _auth_directory, service, c, auth, calls, replies) = fixture().await;
+        replies.lock().await.push_back(Reply::SyncIdle);
+        for (id, expected) in [("A", "accepted"), ("B", "queued"), ("C", "queued")] {
+            let result = service
+                .command("send", &payload(&c, id), &auth)
+                .await
+                .unwrap();
+            assert_eq!(result["deliveryState"], expected);
+        }
+        let mut frame = json!({"native_id":c.native_id,"clients":{"u":"A"},"pending":[],"requests":{},
+            "messages":[{"type":"user","uuid":"u","message":{"content":"问题"}},
+                {"type":"assistant","uuid":"a","nativeReplyTo":"u","message":{"id":"response",
+                    "model":"real","stop_reason":"end_turn","content":[{"type":"text","text":"完成"}]}}]});
+        frame["native_status"] = json!({"tempo":"idle","state":"idle"});
+        service
+            .apply_shared_snapshot(&c.id, "native-history-test", &frame, json!({}), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .conversation(&c.id)
+                .await
+                .unwrap()
+                .remote_queue
+                .awaiting_turn
+                .as_deref(),
+            Some("A")
+        );
+        for (status, expected) in [
+            (json!({"tempo":"active","state":"working"}), vec!["A"]),
+            (
+                json!({"tempo":"blocked","state":"blocked","needs":"permission prompt"}),
+                vec!["A"],
+            ),
+            (
+                json!({"tempo":"idle","state":"idle","needs":"input needed"}),
+                vec!["A"],
+            ),
+            (json!({"tempo":"idle","state":"idle"}), vec!["A", "B"]),
+            (json!({"tempo":"idle","state":"idle"}), vec!["A", "B"]),
+        ] {
+            frame["native_status"] = status;
+            service
+                .ingest_shared(&c.id, "queue-fixture", &frame)
+                .await
+                .unwrap();
+            service.drain_remote_queues().await;
+            let calls = calls.lock().await;
+            let sent: Vec<_> = calls
+                .iter()
+                .filter(|r| r["subtype"] == "shared_send")
+                .map(|r| r["client_id"].as_str().unwrap())
+                .collect();
+            assert_eq!(sent, expected);
+        }
+        assert_eq!(
+            service
+                .conversation(&c.id)
+                .await
+                .unwrap()
+                .remote_queue
+                .awaiting_turn
+                .as_deref(),
+            Some("B")
+        );
+    }
+
+    #[test]
+    fn main_reply_end_requires_final_text_matching_the_input_and_all_tool_results() {
+        let user = json!({"type":"user","uuid":"u","message":{"content":"问题"}});
+        let mut reply = json!({"type":"assistant","nativeReplyTo":"u","message":{"id":"r","model":"real",
+            "stop_reason":"end_turn","content":[{"type":"text","text":"完成"}]}});
+        let released = |rows: Vec<Value>| {
+            let frame = json!({"clients":{"u":"A","u2":"B"},"messages":rows,"requests":{},
+                "native_status":{"tempo":"idle","state":"idle"}});
+            let (turns, _, completed) = super::super::project_anchored_history(&frame, "test");
+            let mut queue = RemoteQueue {
+                awaiting_turn: Some("A".into()),
+                ..Default::default()
+            };
+            queue.observe_turns(&turns, &frame["native_status"]);
+            queue.observe_final_reply(&completed);
+            queue.awaiting_turn.is_none() && !queue.paused
+        };
+        for (key, value) in [
+            ("stop_reason", json!("max_tokens")),
+            ("model", json!("<synthetic>")),
+            (
+                "content",
+                json!([{"type":"thinking","thinking":"结束前的思考"}]),
+            ),
+        ] {
+            let mut invalid = reply.clone();
+            invalid["message"][key] = value;
+            assert!(!released(vec![user.clone(), invalid]));
+        }
+        let mut other = reply.clone();
+        other["nativeReplyTo"] = json!("u2");
+        assert!(!released(vec![user.clone(), other.clone()]));
+        assert!(!released(vec![
+            user.clone(),
+            json!({"type":"user","uuid":"u2","message":{"content":"另一条"}}),
+            other
+        ]));
+        let mut failure = reply.clone();
+        failure["isApiErrorMessage"] = json!(true);
+        assert!(!released(vec![user.clone(), failure]));
+        let calls = json!({"type":"assistant","message":{"id":"tools","stop_reason":"tool_use",
+            "content":[{"type":"tool_use","id":"t1","name":"Bash"},{"type":"tool_use","id":"t2","name":"Bash"}]}});
+        let result = |id: &str| json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":id}]}});
+        let mut rows = vec![user.clone(), calls.clone(), result("t1"), reply.clone()];
+        assert!(!released(rows.clone()));
+        rows.push(result("t2"));
+        assert!(!released(rows.clone()), "仅补齐工具结果不能代替最终回复");
+        reply["message"]["stop_reason"] = json!("stop_sequence");
+        rows.push(reply.clone());
+        assert!(released(rows.clone()));
+        rows.push(calls);
+        assert!(!released(rows), "后续工具不能沿用之前的完成证据");
     }
 
     #[test]
