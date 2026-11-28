@@ -48,6 +48,10 @@ function harness({ desktop = true, android = false, sidePanel = false, parentWin
         child.parent = this; this.children.push(child);
       }
     }
+    insertBefore(child, anchor) {
+      if(child.parent)child.parent.children=child.parent.children.filter(x=>x!==child);
+      child.parent=this;this.children.splice(this.children.indexOf(anchor),0,child);
+    }
     after(child) {
       if (child.parent) child.parent.children = child.parent.children.filter(value => value !== child);
       child.parent = this.parent;
@@ -103,7 +107,7 @@ function harness({ desktop = true, android = false, sidePanel = false, parentWin
     disconnect() { this.disconnected = true; }
   }
   const context = vm.createContext({
-    node, control, document, URL, URLSearchParams,
+    node, control, document, URL, URLSearchParams, icon: () => node("span","ui-icon"),
     window: { matchMedia: () => media, location: { href: "http://127.0.0.1:45222/" },
       addEventListener: (name, callback) => { if (name === "message") messageListeners.add(callback); },
       removeEventListener: (name, callback) => { if (name === "message") messageListeners.delete(callback); } },
@@ -116,6 +120,8 @@ function harness({ desktop = true, android = false, sidePanel = false, parentWin
     sections: [["staged", "已暂存"], ["unstaged", "未暂存"], ["untracked", "未跟踪"]],
     mountSessionToolPages: options => renderer(options, "changes"),
     mountSessionFiles: options => renderer(options, "files"),
+    mountTaskLauncher: (host, getContext, choose) => Object.assign(renderer({workspace:host,getContext}, "launcher"),{choose}),
+    mountTaskView: (host, options) => renderer({...options,workspace:host}, options.item.kind),
   });
   context.window.parent = parentWindow || context.window;
   vm.runInContext(wrapper, context);
@@ -922,6 +928,7 @@ test("PC 标签开关位于会话菜单右侧，展开移到右侧栏同一窗�
   assert.equal(h.toggle.getAttribute("aria-label"), "隐藏标签页");
   assert.equal(h.empty.hidden, false);
   assert.equal(h.renderers.length, 0);
+  assert.equal(h.toolbar.children.filter(child=>child.getAttribute("aria-label")==="新建标签页").length,1);
   assert.equal(h.toolbar.children.some(child =>
     child.classList.contains("workspace-reader-add") || child.classList.contains("workspace-reader-close")), false);
   h.toggle.emit("click");
@@ -929,6 +936,25 @@ test("PC 标签开关位于会话菜单右侧，展开移到右侧栏同一窗�
   assert.equal(h.toggle.getAttribute("aria-label"), "打开标签页");
   h.api.dispose();
   assert.equal(h.toggle.isConnected, false);
+});
+
+test("新标签入口原位替换、记录按会话复用，失效标签不能借用当前身份",()=>{
+  const h=harness();
+  h.api.openFile("README.md");const file=h.visibleTabs()[0],view=h.visibleViews()[0];view.readingPosition=47;
+  const plus=h.toolbar.children.find(n=>n.getAttribute("aria-label")==="新建标签页");
+  plus.emit("click"); const first=h.renderers.at(-1);
+  plus.emit("click"); const next=h.renderers.at(-1);
+  h.visibleTabs()[1].children[0].emit("click");
+  first.choose("records");
+  assert.equal(h.visibleTabs()[0],file);assert.equal(h.visibleTabs()[1],h.selected());assert.equal(first.disposed,true);
+  const record=h.selected(),records=h.renderers.at(-1);
+  h.visibleTabs()[2].children[0].emit("click");next.choose("records");
+  assert.equal(h.selected(),record);assert.equal(h.visibleTabs().length,2);assert.equal(view.readingPosition,47);
+  records.options.openTask({id:"A",name:"原生命令"});
+  assert.equal(h.renderers.at(-1).kind,"task");
+  h.state.threadId="thread-b";h.api.updateContext();records.options.openTask({id:"A",name:"旧会话"});
+  assert.equal(h.visibleTabs().length,0);h.state.threadId="thread-a";h.api.updateContext();
+  assert.equal(h.visibleTabs().length,3);h.api.dispose();
 });
 
 test("隐藏创建等待面板保留原操作，迟到会话标签可在隐藏状态接替", () => {

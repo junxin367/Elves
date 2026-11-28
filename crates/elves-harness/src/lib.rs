@@ -60,6 +60,7 @@ use crate::codex_service::{ServiceDispatchGuard, ServiceDispatchPermit};
 use crate::settings::{RemoteAccessSettings, SettingsStore};
 
 mod antigravity;
+mod background_tasks;
 mod browser;
 mod channels;
 mod claude;
@@ -2237,6 +2238,10 @@ impl HarnessController {
                     "queueEdit" => self.antigravity.queue_edit_state(&payload).await,
                     "sendState" => self.antigravity.queue_send_state(&payload).await,
                     "relatedThreads" => self.antigravity.related_threads(id).await,
+                    "backgroundTaskRecords" | "backgroundTaskDetail" =>
+                        self.antigravity.task_records(id, payload["taskId"].as_str()).await,
+                    "backgroundTasks" | "stopBackgroundTask" => Err(ApiError::new(409,
+                        "AGY 尚无已验证的实时后台任务列表和单任务停止接口").into()),
                     _ => {
                         self.antigravity
                             .command(action, &payload, authorization)
@@ -2357,6 +2362,8 @@ impl HarnessController {
                     "queueEdit" => self.claude.queue_edit_state(&payload).await,
                     "sendState" => self.claude.queue_send_state(&payload).await,
                     "relatedThreads" => self.claude.related_threads(id).await,
+                    "backgroundTaskRecords" | "backgroundTaskDetail" | "backgroundTasks" =>
+                        self.claude.background_tasks(action, &payload, authorization).await,
                     _ => self.claude.command(action, &payload, authorization).await,
                 }
             })
@@ -4760,6 +4767,7 @@ async fn read(
             | "notifications"
             | "relatedThreads"
             | "sidePresence"
+            | "backgroundTasks" | "backgroundTaskRecords" | "backgroundTaskDetail"
             | "harnessDiagnostics"
             | "scheduledTasks"
             | "scheduledMessages"
@@ -4792,6 +4800,9 @@ async fn read(
     }
     if action == "relatedThreads" {
         validate_related_threads_payload(&action, &payload)?;
+    }
+    if matches!(action.as_str(), "backgroundTasks" | "backgroundTaskRecords" | "backgroundTaskDetail") {
+        validate_background_task(&action,&payload)?;
     }
     if action == "fast" {
         validate_fast_payload(&action, &payload)?;
@@ -4914,6 +4925,18 @@ fn notification_thread_id(value: &Value) -> Option<&str> {
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
     })
+}
+
+fn validate_background_task(action: &str, payload: &Value) -> Result<(), ApiError> {
+    let detail = matches!(action,"backgroundTaskDetail"|"stopBackgroundTask");
+    let stop = action=="stopBackgroundTask";
+    let valid = |v:&Value| v.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 512 && !s.chars().any(char::is_control));
+    if notification_thread_id(&payload["threadId"]).is_none() || detail && !valid(&payload["taskId"])
+        || stop && !valid(&payload["token"])
+        || payload.as_object().is_none_or(|m| m.keys().any(|k| !(k=="threadId" || detail && k=="taskId" || stop && k=="token"))) {
+        return Err(ApiError::new(400,"后台任务身份参数无效"));
+    }
+    Ok(())
 }
 
 fn validate_related_threads_payload(action: &str, payload: &Value) -> Result<(), ApiError> {
@@ -5745,6 +5768,7 @@ async fn action(
             | "setFast"
             | "setPermissions"
             | "stop"
+            | "stopBackgroundTask"
             | "compact"
             | "optimizePrompt"
             | "cancelPromptOptimize"
@@ -5787,6 +5811,7 @@ async fn action(
     if action.ends_with("ScheduledTask") && !state.desktop {
         return Err(ApiError::new(403, "定时任务仅可在 Elves 本机工作区使用"));
     }
+    if action == "stopBackgroundTask" { validate_background_task(&action,&payload)?; }
     if action == "releaseExternalHolders" {
         // 用户要求“关闭其他占用”在 Elves 本机客户端、网页、PWA、手机和 Android 上一样可用，不做设备特殊处理；
         // 只读访问已在上方统一拒绝。只接受会话标识；要结束哪些进程由服务端重新核对，页面不能指定。
@@ -8205,6 +8230,21 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
    if(sidePolicy.boundaryError){output({id:q.id,error:{code:sidePolicy.boundaryError,message:'side boundary fixture failure'}});return;}
    break;
  }
+ case 'thread/backgroundTerminals/list':{
+   const pth=__dirname+'/fixture-terminals.json';
+   const tasks=fs.existsSync(pth)?JSON.parse(fs.readFileSync(pth,'utf8')):{};
+   result={data:tasks[p.threadId]||[],nextCursor:null};break;
+ }
+ case 'thread/backgroundTerminals/terminate':{
+   const pth=__dirname+'/fixture-terminals.json',tasks=JSON.parse(fs.readFileSync(pth,'utf8'));
+   const found=tasks[p.threadId]?.find(x=>x.processId===p.processId);
+   if(!found){result={terminated:false};break;}
+   tasks[p.threadId]=tasks[p.threadId].filter(x=>x!==found);fs.writeFileSync(pth,JSON.stringify(tasks));
+   event('item/completed',{threadId:p.threadId,turnId:'bg-turn',item:{type:'commandExecution',source:'unifiedExecStartup',
+     id:found.itemId,processId:found.processId,command:found.command,status:'failed',exitCode:-1,
+     aggregatedOutput:'A\r\n',durationMs:100,completedAtMs:1000}});
+   result={terminated:true};break;
+ }
  case 'thread/unsubscribe':
    if(sidePolicy.idleEventBurst)for(let index=0;index<1024;index++)event('thread/status/changed',{threadId:'idle-background',status:{type:'idle'}});
    if(sidePolicy.idleUnsubscribeError){output({id:q.id,error:{code:-32000,message:'idle unsubscribe outcome unknown'}});return;}
@@ -8532,6 +8572,48 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn background_task_api_is_scoped_and_terminates_only_one_confirmed_process() {
+        let (directory,auth)=harness_fixture().await;
+        let ctrl=&auth.controller;
+        let created=ctrl.call_authorized("create",json!({"projectId":"project-a","prompt":"ready"}),&auth).await.unwrap();
+        let t=created["threadId"].as_str().unwrap();
+        let other=ctrl.call_authorized("create",json!({"projectId":"project-a","prompt":"other"}),&auth).await.unwrap();
+        let other=other["threadId"].as_str().unwrap();
+        std::fs::write(directory.path().join("fixture-terminals.json"),serde_json::to_vec(&json!({
+            (t):[{"itemId":"A","processId":"111","command":"first"},{"itemId":"B","processId":"222","command":"second"}],
+            (other):[{"itemId":"A","processId":"333","command":"separate"}]})).unwrap()).unwrap();
+        let base=json!({"threadId":t});
+        let rd=ctrl.call_authorized("backgroundTaskDetail",json!({"threadId":t,"taskId":"A"}),&auth).await.unwrap();
+        assert_eq!(rd["task"]["status"],"running");
+        let payload=json!({"threadId":t,"taskId":"A","token":rd["task"]["token"]});
+        let mut stale=payload.clone();stale["threadId"]=json!(other);
+        assert!(ctrl.call_authorized("stopBackgroundTask",stale,&auth).await.is_err());
+        assert!(validate_background_task("stopBackgroundTask",&json!({"threadId":t,"taskId":"A","token":"a","processId":"333"})).is_err());
+        ctrl.access_policy.write().unwrap().read_only=true;
+        assert!(ctrl.call_authorized("stopBackgroundTask",payload.clone(),&auth).await.is_err());
+        ctrl.access_policy.write().unwrap().read_only=false;
+        let r=ctrl.call_authorized("stopBackgroundTask",payload.clone(),&auth).await.unwrap();
+        assert_eq!(r["status"],"requested");
+        assert!(ctrl.call_authorized("stopBackgroundTask",payload,&auth).await.is_err());
+        let active=ctrl.call_authorized("backgroundTasks",base.clone(),&auth).await.unwrap();
+        assert_eq!(active["items"].as_array().unwrap().len(),1);assert_eq!(active["items"][0]["id"],"B");
+        let final_row=tokio::time::timeout(Duration::from_secs(5),async{
+            loop{
+                let r=ctrl.call_authorized("backgroundTaskDetail",json!({"threadId":t,"taskId":"A"}),&auth).await.unwrap();
+                if r["task"]["status"]=="stopped"{break r["task"].clone();}
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        }).await.unwrap();
+        assert_eq!(final_row["nativeStatus"],"failed");assert_eq!(final_row["exitCode"],-1);assert_eq!(final_row["output"],"A\r\n");
+        let records=ctrl.call_authorized("backgroundTaskRecords",base,&auth).await.unwrap();
+        assert_eq!(records["records"][0]["id"],"A");assert!(records["records"][0].get("output").is_none());
+        let requests=harness_engine_requests(directory.path());
+        assert_eq!(requests.iter().filter(|q|q["method"]=="thread/backgroundTerminals/terminate").count(),1);
+        assert!(!requests.iter().any(|q|q["method"]=="thread/backgroundTerminals/clean"||q["method"]=="turn/interrupt"));
+        ctrl.harness.enabled.store(false, Ordering::Release);ctrl.harness.release().await;
     }
 
     #[tokio::test]

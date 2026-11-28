@@ -9,6 +9,7 @@ import { permissionOptions } from "../permissions.js";
 import { isAndroidContainer, openAndroidBrowser, postPlatformMessage } from "../platform.js";
 import { createWorkspaceBranch } from "../session-files.js";
 import { mountSessionMenu } from "../session-menu.js";
+import { watchTaskList } from "../background-tasks.js";
 import { mountSessionTools } from "../session-tools.js";
 import { copyText } from "../ui/clipboard.js";
 import { confirmAction } from "../ui/dialog.js";
@@ -19,7 +20,7 @@ import { activePopup, closePopup, openPopup, togglePopup } from "../ui/popup.js"
 import { selectControl, setSelectValue } from "../ui/select.js";
 import { composerTooltips, installComposerTooltips, setComposerTooltips } from "../ui/tooltip.js";
 import {
-  closeComposerMenus, loadModels, renderSidebar, requireAuthentication, updateComposer
+  closeComposerMenus, loadModels, renderSidebar, requireAuthentication, updateComposer, mutate
 } from "../core/actions.js";
 import { app, connected, creating, nativeConnectionVersion, selectedId, session, sidebar, thread } from "../core/state.js";
 import { api } from "./api.js";
@@ -440,20 +441,29 @@ export function shell() {
   $("#connection-state").onclick = refreshConnectionFromIndicator;
   const toolsTrigger = $("#open-session-tools");
   toolsTrigger.append(icon("tools"));
+  const taskContext=()=>({id:selectedId,connected,poll:!creating && thread?.id===selectedId && !!selectedId && activeBackend()==="codex"
+    && !thread?.ephemeral && thread?.viewKind!=="subagent",
+    scope:JSON.stringify([privateInputScope(session),selectedId,nativeConnectionVersion])});
+  const taskList=watchTaskList(taskContext,(id,signal)=>api("/api/read/backgroundTasks",{threadId:id},null,signal,
+    {resourcePriority:"background"}),()=>sessionMenu?.updateContext());
   setSessionTools(mountSessionTools({
     workspace: $(".workspace"), trigger: $("#open-session-tools"),
     sidePanel: workspaceSidePanel,
     onFileContextMenu: openWorkspaceFileContextMenu,
     createSideThread: createDesktopSideThread,
+    readTasks:(action,payload,signal)=>api(`/api/read/${action}`,payload,null,signal),
+    stopTask:payload=>mutate("stopBackgroundTask",payload),
     getContext: () => ({ deviceId: session?.device.id, threadId: selectedId, creating,
       workspaceFilePreview: session?.capabilities?.workspaceFilePreview === true,
+      connected,connectionVersion:nativeConnectionVersion,taskScopeSupported:thread?.viewKind!=="subagent" && thread?.ephemeral!==true,
+      canCreateSide:!creating && thread?.id===selectedId && !relatedSessionView && connected && sideThreadsEnabled() && !threadReadOnly(),
       projectId: creationProject, readOnly: threadReadOnly(), cacheScope: privateInputScope(session) }),
     cache: workspaceViewCache,
     request: (path, options, consume) => {
       const measurements = currentChannelMeasurements();
       return requestRemote(path, options, consume, measurements, origin => markMessageChannelUnavailable(origin, measurements));
     },
-    beforeOpen: () => { sessionMenu?.close(); closePopup(); closeComposerMenus(); closeMobileSidebar({ focus: false }); },
+    beforeOpen: ({keepMenu=false}={}) => { if(!keepMenu)sessionMenu?.close(); closePopup(); closeComposerMenus(); closeMobileSidebar({ focus: false }); },
     onUnauthorized: requireAuthentication,
     onSideThreadRead: threadId => {
       // 外层标签收到侧边正文的成功已读回执后，立即同步父会话菜单和侧栏投影。
@@ -468,17 +478,22 @@ export function shell() {
   setSessionMenu(mountSessionMenu({
     trigger: toolsTrigger,
     // 用户要求只展示所属会话的实时后台任务；侧边菜单虽可读取父关联列表，也不能借用父会话任务。
-    getBackgroundTasks: () => ({
+    getBackgroundTasks: () => {
+      const probed=taskList.value();
+      return ({
       scope: !creating && thread?.id === selectedId
         ? JSON.stringify([privateInputScope(session), selectedId, nativeConnectionVersion]) : "",
       connected, snapshot: thread?.id === selectedId ? thread : null,
-      items: thread?.id === selectedId ? thread.backgroundTaskItems : null,
+      reason: taskContext().poll ? probed.reason : "",
+      items: taskContext().poll ? probed.items : thread?.id === selectedId ? thread.backgroundTaskItems : null,
       summary: thread?.id === selectedId ? thread.backgroundTasks : ""
-    }),
+    });},
+    openTask:task=>sessionTools?.openTask(task),openTaskRecords:()=>sessionTools?.openTaskRecords(),disposeTasks:()=>taskList.dispose(),
     getContext: () => {
       const parentThreadId = relatedSessionView?.kind === "side"
         ? relatedSessionView.openedFromThreadId || relatedSessionView.parentThreadId : null;
       return { deviceId: session?.device.id, cacheScope: privateInputScope(session),
+        taskRecordsAvailable:thread?.viewKind!=="subagent" && thread?.ephemeral!==true,
         threadId: !creating ? parentThreadId || selectedId : null, readOnly: threadReadOnly(), connected,
         subagentsEnabled: subagentsEnabled(),
         sideThreadsEnabled: sideThreadsEnabled(),

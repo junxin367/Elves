@@ -341,6 +341,8 @@ def native_task_notification(row):
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", identity):
         return None
     value = {"taskId": identity, "summary": field("summary", None)}
+    if row.get("ambient") is True:
+        value["ambient"] = True
     if row.get("shouldQuery") is False or row.get("skip_transcript") is True or row.get("ambient") is True:
         value["statusOnly"] = True
     status, tool, event = field("status"), field("tool-use-id"), field("event", 2000)

@@ -220,11 +220,18 @@ export function mergeItemProjection(previous, item) {
   // ACP 的“工具已返回”可能晚于后台终态到达。仅同一命令保留已核对的终态，不覆盖新错误或不同任务。
   if (previous?.type === "commandExecution" && item.type === previous.type && previous.id === item.id
       && previous.backgroundTaskId && (!item.backgroundTaskId || item.backgroundTaskId === previous.backgroundTaskId)
-      && ["completed", "failed", "stopped"].includes(previous.backgroundStatus)
+      && ["completed", "failed", "stopped", "killed", "canceled", "cancelled"].includes(previous.backgroundStatus)
       && [undefined, null, "running", "unknown"].includes(item.backgroundStatus)
       && (!["failed", "interrupted"].includes(item.status) || item.status === previous.status)) {
     item = { ...item, backgroundTaskId: previous.backgroundTaskId, backgroundStatus: previous.backgroundStatus,
       backgroundSummary: previous.backgroundSummary, exitCode: previous.exitCode ?? item.exitCode, status: previous.status };
+  }
+  if (previous?.type === "commandExecution" && item.type === previous.type && previous.id === item.id
+      && previous.backgroundTaskId && previous.backgroundTaskId === item.backgroundTaskId
+      && previous.backgroundStatus === item.backgroundStatus && item.backgroundOutput == null
+      && typeof previous.backgroundOutput === "string") {
+    projection.backgroundOutput = previous.backgroundOutput;
+    projection.backgroundOutputTruncated = previous.backgroundOutputTruncated;
   }
   for (const field of ["messageMetadata", "sentAtMs", "startedAtMs", "completedAtMs", "completed",
     "remoteImages", "remoteVideos", "fileAttachments", "clientId", "remoteCompactionInput",

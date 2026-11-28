@@ -23,6 +23,10 @@ impl CodexHarness {
                 self.check_side_idle_barrier(id).await?;
             }
         }
+        if action=="stopBackgroundTask" {
+            let id=required(&payload,"threadId")?;
+            return self.stop_background_task(id,&payload,authorization).await;
+        }
         if action == "setFast" {
             return self.set_fast(&payload, authorization).await;
         }

@@ -1669,6 +1669,15 @@ impl Antigravity {
         }))
     }
 
+    pub(crate) async fn task_records(&self, id: &str, detail: Option<&str>) -> anyhow::Result<Value> {
+        // AGY 只读取所属会话现有转录；打开记录不拉起 ACP，也不把 session/cancel 当作单任务停止。
+        self.sync_local_transcript_if_available(id).await;
+        let c = self.conversation(id).await?;
+        let records = super::background_tasks::historical(&c.turns, detail);
+        Ok(super::background_tasks::result(id, records.into_values().collect(), detail,
+            (!c.history_loaded).then_some("此会话尚无可读取的原生转录")))
+    }
+
     pub(crate) async fn history_authorized(
         self: &Arc<Self>,
         payload: &Value,

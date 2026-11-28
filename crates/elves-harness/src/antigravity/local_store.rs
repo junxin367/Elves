@@ -1295,6 +1295,12 @@ mod tests {
             let result = parse(&sample);
             assert_eq!(count(&result), 0);
             assert_eq!(result[0]["items"][1]["backgroundStatus"], expected);
+            let records=crate::background_tasks::historical(&result, Some("local/task-2"));
+            let row=records.get("local/task-2").expect("已核实的所属命令");
+            assert_eq!(row["status"], if expected=="stopped" {"cancelled"} else {expected});
+            assert_eq!(row["canStop"],false);
+            let view=crate::background_tasks::result("local",records.into_values().collect(),None,None);
+            assert_eq!(view["records"].as_array().unwrap().len(),usize::from(expected!="unknown"));
             assert_eq!(result[0]["items"].as_array().unwrap().last().unwrap()["text"], "原生回复");
         }
         for (row, key, value) in [(4,"source",json!("USER")),(5,"step_index",json!(7)),

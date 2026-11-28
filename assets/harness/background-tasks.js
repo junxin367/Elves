@@ -89,7 +89,34 @@ export function updateSessionMenuAria(trigger) {
   const label = "会话菜单"
     + (tasks ? Number.isSafeInteger(count) && count > 0
       ? `，${count} 个后台任务正在执行` : "，有后台任务正在执行" : "")
+    + (!tasks && trigger.getAttribute("data-background-list-error") ? "，后台任务列表暂不可获取" : "")
     + (unread ? "，有未读的侧边会话" : "");
   trigger.setAttribute("aria-label", label);
-  trigger.title = label;
+  trigger.title = trigger.getAttribute("data-background-list-error") ? `${label}\n${trigger.getAttribute("data-background-list-error")}` : label;
+}
+
+// Codex 只查前台当前会话。切换、断线、隐藏页面或更换授权后，旧查询不得点亮新会话。
+export function watchTaskList(context, read, changed) {
+  let owner="",items=null,reason="",timer=null,abort=null,closed=false;
+  function update(){
+    const c=context(),next=!document.hidden&&c.connected&&c.poll?c.scope:"";
+    if(next===owner||closed)return;
+    clearTimeout(timer);abort?.abort();abort=null;items=null;reason="";owner=next;
+    if(owner)void load(c,owner);
+  }
+  async function load(c,key){
+    const ctrl=abort=new AbortController();
+    try{
+      const r=await read(c.id,ctrl.signal);
+      if(closed||ctrl.signal.aborted||context().scope!==key||owner!==key)return;
+      if(r?.threadId!==c.id||r.ok!==true)throw Error("后台任务列表身份无效");
+      items=Array.isArray(r.items)?r.items:null;reason=r.reason||"";
+      changed();
+    }catch(e){if(!closed&&!ctrl.signal.aborted&&owner===key){items=null;reason=e.message;changed();}}
+    finally{if(!closed&&!ctrl.signal.aborted&&owner===key){abort=null;
+      timer=setTimeout(()=>{update();if(owner===key)void load(context(),key);},items?.length?2500:items===null?15000:7000);}}
+  }
+  function visibility(){update();changed();}
+  document.addEventListener("visibilitychange",visibility);
+  return {value(){update();return {items,reason};},dispose(){closed=true;clearTimeout(timer);abort?.abort();document.removeEventListener("visibilitychange",visibility);}};
 }

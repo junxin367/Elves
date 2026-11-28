@@ -155,6 +155,9 @@ impl TaskNotices {
                 .find(|(_, item)| item["type"] == "commandExecution" && item["id"] == call_id)
             {
                 command["backgroundTaskId"] = json!(id);
+                if let Some(time)=row["created_at"].as_str().and_then(|s|chrono::DateTime::parse_from_rfc3339(s).ok()) {
+                    command["backgroundStartedAtMs"]=json!(time.timestamp_millis());
+                }
                 // 历史只证明曾转入后台；未收到终态时不把旧记录作为实时运行列表。
                 command["backgroundStatus"] = json!("unknown");
                 self.open.insert(step, (index, i));
@@ -171,6 +174,11 @@ impl TaskNotices {
             };
             let command = &mut turns[t]["items"][i];
             command["backgroundStatus"] = json!(status);
+            if let Some(time) = content.lines().find_map(|line| line.strip_prefix("[Message] timestamp="))
+                .and_then(|s| s.split_once(" sender=")).and_then(|(s,_)| chrono::DateTime::parse_from_rfc3339(s).ok()) {
+                command["backgroundEndedAtMs"] = json!(time.timestamp_millis());
+            }
+            if status == "stopped" { command["backgroundDisposition"] = json!("cancelled"); }
             command["backgroundSummary"] = json!(summary);
             // 原生输出留在原工具，并保留内部空白与换行。只去掉信封的最后一个换行，不展开截断日志的路径。
             if let Some(body) = content.strip_suffix("</SYSTEM_MESSAGE>").or_else(|| content.strip_suffix("</SYSTEM_MESSAGE>\n"))
@@ -259,6 +267,9 @@ pub(super) fn merge_managed(saved: &mut [Value], parsed: &[Value]) {
             "backgroundTaskId",
             "backgroundStatus",
             "backgroundSummary",
+            "backgroundEndedAtMs",
+            "backgroundStartedAtMs",
+            "backgroundDisposition",
             "status",
             "exitCode",
         ] {

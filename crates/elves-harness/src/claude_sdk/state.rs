@@ -141,6 +141,21 @@ impl PeerState {
     pub(super) fn alive(&self) -> bool {
         self.alive
     }
+    pub(super) fn owns_shell_task(&self, id: &str, run: &str) -> bool {
+        self.alive && self.tasks.can_control(id,run)
+    }
+    pub(super) fn recognizes_finished_shell(&self,id:&str,run:&str)->bool{
+        self.alive && self.tasks.finished_shell(id,run)
+    }
+    pub(super) fn save_shell_output(&mut self,id:&str,run:&str,reply:&Value)->bool{
+        self.tasks.save_output(id,run,reply)
+    }
+    pub(super) fn mark_task_stop(&mut self,id:&str,run:&str,value:bool)->bool {
+        self.alive && self.task_stop_supported() && self.tasks.stop_marker(id,run,value)
+    }
+    pub(super) fn task_stop_supported(&self)->bool{
+        crate::background_tasks::supported_since(&self.version,"2.1.330")
+    }
 
     #[cfg(test)]
     pub(super) fn has_requests(&self) -> bool {
@@ -166,6 +181,7 @@ impl PeerState {
         }
         self.alive = alive;
         if !alive {
+            self.version.clear();
             // 进程已退出：它持有的审批、后台任务和正在执行的轮次都随之结束。
             self.tempo = Tempo::Idle;
             self.compacting = false;
@@ -611,6 +627,7 @@ impl PeerState {
         }
         // 用户要求后台任务进入会话菜单；明细只来自当前在线 CLI，不缓存成历史运行状态。
         status["backgroundTaskItems"] = if self.alive { self.tasks.items() } else { json!([]) };
+        status["taskStopSupported"] = json!(self.alive && self.task_stop_supported());
         if self.alive && self.tasks.has_tasks() {
             status["background"] = json!(self.tasks.summary());
         }

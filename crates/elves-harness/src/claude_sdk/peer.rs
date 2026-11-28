@@ -393,6 +393,7 @@ impl Inner {
         match request["subtype"].as_str().unwrap_or("") {
             "initialize" => self.initialize(request).await,
             "shared_sync" => self.sync().await,
+            "get_task_output" | "stop_task" => self.shell_task_control(request).await,
             "shared_warm" => self.warm().await,
             "shared_send" => self.send(request).await,
             "shared_native_command" => self.native_command(request).await,
@@ -405,6 +406,47 @@ impl Inner {
             "shared_edit_message" => self.edit_message(request).await,
             _ => Err(PeerError::plain("此原生 Claude 控制操作尚未适配", true)),
         }
+    }
+
+    async fn shell_task_control(&self, request: &Value) -> Reply {
+        let id=request["task_id"].as_str().unwrap_or_default();
+        let run=request["run_id"].as_str().unwrap_or_default();
+        let subtype=request["subtype"].as_str().unwrap_or_default();
+        let key=uuid::Uuid::new_v4().to_string();
+        let (tx,rx)=oneshot::channel();
+        // 与 CLI 替换互斥：仅向持有该原生 run_id 的现有 CLI 写单任务控制，不启动或中断会话。
+        let sent={
+            let cli=self.cli.lock().await;
+            let Some(cli)=cli.as_ref().filter(|_|self.state(|s|s.owns_shell_task(id,run)
+                || subtype=="get_task_output" && s.recognizes_finished_shell(id,run))) else {
+                return Err(PeerError::new("ESTALE","任务已结束或运行身份已变化",true));
+            };
+            if subtype=="stop_task" && !self.state(|s|s.task_stop_supported()) {
+                return Err(PeerError::new("EINVAL","此 Claude CLI 尚未验证单任务停止",true));
+            }
+            if subtype=="stop_task" && !self.state(|s|s.mark_task_stop(id,run,true)) {
+                return Ok(json!({"alreadyRequested":true}));
+            }
+            lock(&self.cli_pending).insert(key.clone(),tx);
+            Self::write_cli(cli,&json!({"type":"control_request","request_id":key,
+                "request":{"subtype":subtype,"task_id":id}}))
+        };
+        let result=async {
+            let write=sent?;
+            tokio::time::timeout(CLI_CONTROL_TIMEOUT,async {
+                write.await.map_err(|_|PeerError::plain("任务控制写入回执未知",false))?
+                    .map_err(|e|PeerError::plain(e,false))?;
+                rx.await.map_err(|_|PeerError::plain("任务控制回执未知",false))?
+                    .map_err(|e|PeerError::plain(e,false))
+            }).await.map_err(|_|PeerError::plain("等待任务控制回执超时",false))?
+        }.await;
+        if subtype=="stop_task"{
+            // 不同设备请求也不重发；只有能确认没有写入才撤销标记。标记本身不是结束回执。
+            if result.as_ref().is_err_and(|e|e.not_sent){self.state(|s|s.mark_task_stop(id,run,false));}
+            self.bump();
+        }
+        lock(&self.cli_pending).remove(&key);
+        result
     }
 
     fn settings_projection(&self) -> Value {
@@ -810,6 +852,17 @@ impl Inner {
         }
         let now = now_ms();
         let seen = self.state(|state| state.observe_cli(&frame, now));
+        if seen.dirty && frame["subtype"]=="task_notification"
+            && let (Some(id),Some(run))=(frame["task_id"].as_str(),frame["run_id"].as_str())
+            && self.state(|s|s.recognizes_finished_shell(id,run)) {
+            // 读取任务不可阻塞 CLI 读循环（响应走同一管道）。不启动新 CLI，不读取通知中的文件路径。
+            let (inner,id,run)=(self.clone(),id.to_owned(),run.to_owned());
+            tokio::spawn(async move{
+                let reply=inner.shell_task_control(&json!({"subtype":"get_task_output","task_id":id,"run_id":run})).await
+                    .unwrap_or_else(|failure|json!({"error":failure.message}));
+                if inner.state(|s|s.save_shell_output(&id,&run,&reply)){inner.bump();}
+            });
+        }
         self.apply(seen).await;
     }
 
@@ -2181,6 +2234,41 @@ mod tests {
         assert_eq!(upper.reader_log()[0]["subtype"], "initialize");
         assert!(upper.cli_log().is_empty(), "只读历史不启动 CLI");
         assert!(lock(&upper.log.specs).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn background_task_control_checks_run_before_writing_and_keeps_other_task_alive() {
+        let mut upper=Upper::start(Arc::new(|frame|{
+            if frame["type"]=="user"{
+                let mut out=standard_cli(frame);
+                out.push(json!({"type":"system","subtype":"init","claude_code_version":"2.1.330"}));
+                for task in ["A","B"]{out.push(json!({"type":"system","subtype":"task_started","task_id":task,
+                    "run_id":format!("run-{task}"),"is_backgrounded":true,"task_type":"local_bash"}));}
+                return out;
+            }
+            let req=&frame["request"];
+            match req["subtype"].as_str() {
+                Some("get_task_output")=>vec![success(&frame["request_id"],json!({"output":
+                    if req["task_id"]=="A" {" \r\nA [killed]\n"} else {" \r\nB\n"},"truncated":false}))],
+                Some("stop_task")=>vec![success(&frame["request_id"],json!({})),json!({"type":"system",
+                    "subtype":"task_notification","task_id":req["task_id"],"run_id":"run-A","status":"stopped"})],
+                _=>standard_cli(frame)
+            }
+        }),false,Duration::from_secs(600));
+        upper.initialize(json!({})).await;
+        let call=|sub:&str,id:&str,run:&str|json!({"subtype":sub,"task_id":id,"run_id":run});
+        assert_eq!(upper.call(call("stop_task","A","run-A")).await["subtype"],"error");
+        upper.call(send_request("client-1","fixture")).await;
+        upper.wait_for(|f|f["native_status"]["backgroundTaskItems"].as_array().is_some_and(|rs|rs.len()==2)).await;
+        assert_eq!(upper.call(call("stop_task","B","run-A")).await["subtype"],"error");
+        assert_eq!(upper.call(call("stop_task","A","run-A")).await["subtype"],"success");
+        let output=upper.call(call("get_task_output","B","run-B")).await;
+        assert_eq!(output["response"]["output"]," \r\nB\n");
+        upper.wait_for(|f|f["background_task_results"].as_array().is_some_and(|rs|rs.iter().any(|r|
+            r["taskId"]=="A" && r["output"]==" \r\nA [killed]\n"))).await;
+        let sent=upper.cli_log();
+        assert_eq!(sent.iter().filter(|f|f["request"]["subtype"]=="stop_task").count(),1);
+        assert!(!sent.iter().any(|f|f["request"]["subtype"]=="interrupt"));
     }
 
     #[tokio::test(start_paused = true)]

@@ -6,6 +6,9 @@ use serde_json::{Value, json};
 
 #[derive(Clone, Default, PartialEq)]
 struct Task {
+    run: String,
+    tool: String,
+    stop_requested: bool,
     kind: String,
     name: String,
     started_at_ms: Option<u64>,
@@ -16,6 +19,11 @@ struct Task {
 
 impl Task {
     fn describe(&mut self, value: &Value) {
+        if !self.run.is_empty() && value["run_id"].as_str().is_some_and(|run|run!=self.run) {
+            *self=Task{order:self.order,..Task::default()};
+        }
+        if let Some(run) = value["run_id"].as_str() { self.run = run.into(); }
+        if let Some(tool) = value["tool_use_id"].as_str() { self.tool = tool.into(); }
         if let Some(kind) = value["task_type"].as_str().filter(|s| !s.is_empty()) {
             self.kind = kind.to_owned();
         }
@@ -35,13 +43,42 @@ pub(super) struct BackgroundTasks {
     starts: BTreeMap<String, Task>,
     // 只暂存最近终态，以便任务通知先于 JSONL 的原工具记录到达；不参与菜单计数或进程保活。
     finished: VecDeque<Value>,
+    // 原生列表移除可能早于结束通知。仅保留身份用于核对后来的回执，不算活动任务。
+    retired: VecDeque<(String,Task)>,
     sequence: u64,
 }
 
 impl BackgroundTasks {
+    pub(super) fn can_control(&self, id: &str, run: &str) -> bool {
+        self.active.get(id).is_some_and(|task| !run.is_empty() && task.run == run && task.kind == "local_bash")
+    }
+    pub(super) fn finished_shell(&self,id:&str,run:&str)->bool {
+        !run.is_empty() && self.finished.iter().any(|r|r["taskId"]==id && r["runId"]==run && r["kind"]=="local_bash")
+    }
+    pub(super) fn save_output(&mut self,id:&str,run:&str,response:&Value)->bool {
+        let Some(r)=self.finished.iter_mut().find(|r|r["taskId"]==id && r["runId"]==run && r["kind"]=="local_bash") else{return false;};
+        r["outputPending"] = json!(false);
+        let Some(s)=response["output"].as_str() else{
+            r["outputError"]=response["error"].clone();
+            return true;
+        };
+        // 64 个回执只存每项最后 16 KiB 原文，截取从字符边界开始，界面明确标注。
+        let (s,cut)=crate::background_tasks::bounded_tail(s,16*1024);
+        r["output"]=json!(s);r["outputTruncated"]=json!(cut||response["truncated"]==true);
+        true
+    }
+    pub(super) fn stop_marker(&mut self,id:&str,run:&str,value:bool)->bool {
+        if !self.can_control(id,run){return false;}
+        let task=self.active.get_mut(id).unwrap();
+        if task.stop_requested==value{return false;}
+        task.stop_requested=value;
+        if let Some(start)=self.starts.get_mut(id).filter(|s|s.run==run){start.stop_requested=value;}
+        true
+    }
     pub(super) fn clear(&mut self) {
         self.active.clear();
         self.starts.clear();
+        self.retired.clear();
         // CLI 退出会使运行列表失效，但不会撤销已收到的终态；最后两帧可能合并进同一快照。
         self.sequence = 0;
     }
@@ -76,6 +113,8 @@ impl BackgroundTasks {
                     if value["ambient"] == true {
                         continue;
                     }
+                    if let Some(run)=value["run_id"].as_str()
+                        && self.finished.iter().any(|r|r["taskId"]==id && r["runId"]==run) {continue;}
                     let mut task = self.task(id);
                     task.describe(value);
                     task.started_at_ms = task.started_at_ms.or_else(|| {
@@ -85,7 +124,9 @@ impl BackgroundTasks {
                     });
                     next.insert(id.to_owned(), task);
                 }
-                for id in self.active.keys().filter(|id| !next.contains_key(*id)) {
+                for (id,old) in self.active.iter().filter(|(id,_)| !next.contains_key(*id)) {
+                    if self.retired.len()==64 {self.retired.pop_front();}
+                    self.retired.push_back((id.clone(),old.clone()));
                     self.starts.remove(id);
                 }
                 let changed = self.active != next;
@@ -96,6 +137,8 @@ impl BackgroundTasks {
                 let Some(id) = task_id(frame) else {
                     return false;
                 };
+                if let Some(run)=frame["run_id"].as_str()
+                    && self.finished.iter().any(|r|r["taskId"]==id && r["runId"]==run) {return false;}
                 self.finished.retain(|receipt| receipt["taskId"] != id);
                 if frame["ambient"] == true {
                     self.starts.remove(id);
@@ -157,12 +200,30 @@ impl BackgroundTasks {
                 let Some(id) = task_id(frame) else {
                     return false;
                 };
+                if self.active.get(id).is_some_and(|t| !t.run.is_empty() && frame["run_id"].as_str().is_some_and(|run|run!=t.run)) {
+                    return false;
+                }
                 self.starts.remove(id);
-                let removed = self.active.remove(id).is_some();
+                let old = self.active.remove(id);
+                let removed = old.is_some();
+                let old=old.or_else(||{
+                    let run=frame["run_id"].as_str().filter(|s|!s.is_empty())?;
+                    let pos=self.retired.iter().position(|(known,t)|known==id && t.run==run)?;
+                    self.retired.remove(pos).map(|(_,t)|t)
+                });
                 if frame["ambient"] == true { return removed; }
-                let receipt = json!({"taskId":id,"toolUseId":frame["tool_use_id"],
+                let mut receipt = json!({"taskId":id,"runId":frame["run_id"],"toolUseId":frame["tool_use_id"],
                     "status":frame["status"],"summary":frame["summary"]});
-                if self.finished.iter().any(|known| known == &receipt) { return removed; }
+                if self.finished.iter().any(|known| known["taskId"] == id && known["status"] == receipt["status"]
+                    && known["summary"] == receipt["summary"] && known["toolUseId"] == receipt["toolUseId"]) { return removed; }
+                receipt["completedAtMs"] = json!(now);
+                if let Some(task) = old {
+                    receipt["confirmedBackground"] = json!(true);
+                    receipt["outputPending"]=json!(task.kind=="local_bash" && !task.run.is_empty());
+                    receipt["runId"]=json!(task.run);
+                    receipt["name"] = json!(task.name); receipt["kind"] = json!(task.kind);
+                    receipt["startedAtMs"] = json!(task.started_at_ms);
+                }
                 self.finished.retain(|known| known["taskId"] != id);
                 if self.finished.len() == 64 { self.finished.pop_front(); }
                 self.finished.push_back(receipt);
@@ -181,7 +242,7 @@ impl BackgroundTasks {
             tasks
                 .into_iter()
                 .map(|(id, task)| json!({
-                    "id":id,"name":task.name,"kind":task.kind,"status":"running",
+                    "id":id,"name":task.name,"kind":task.kind,"status":"running","runId":task.run,"toolUseId":task.tool,"stopRequested":task.stop_requested,
                     "startedAtMs":task.started_at_ms,"elapsedMs":task.elapsed_ms,
                     "sampledAtMs":task.sampled_at_ms
                 }))
@@ -242,6 +303,19 @@ fn task_id(value: &Value) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_task_retired_before_notice_cannot_reappear_or_stop_a_new_run() {
+        let mut tasks=BackgroundTasks::default();
+        let started=json!({"subtype":"task_started","task_type":"local_bash","task_id":"A","run_id":"run1","is_backgrounded":true});
+        tasks.observe(&started,1);assert!(tasks.stop_marker("A","run1",true));assert!(!tasks.stop_marker("A","run1",true));
+        tasks.observe(&json!({"subtype":"background_tasks_changed","tasks":[]}),2);
+        let ended=json!({"subtype":"task_notification","task_id":"A","run_id":"run1","status":"stopped","summary":"原文"});
+        tasks.observe(&ended,3);assert!(tasks.finished_shell("A","run1"));
+        tasks.observe(&started,4);assert!(!tasks.has_tasks());
+        let mut next=started.clone();next["run_id"]=json!("run2");tasks.observe(&next,5);
+        tasks.observe(&ended,6);assert!(tasks.can_control("A","run2"));assert!(!tasks.can_control("A","run1"));
+    }
 
     #[test]
     fn foreground_work_enters_the_list_only_after_background_confirmation() {

@@ -2,6 +2,8 @@ import { requestRemote } from "./channels.js";
 import { createWorkspaceBranch, createWorkspaceLocation, displayWorkspaceName, displayWorkspacePath, mountPreviewControlsScroll, mountSessionFiles, setWorkspaceBranch } from "./session-files.js";
 import { safeInlineImageSource } from "./attachments.js";
 import { isAndroidContainer } from "./platform.js";
+import { icon } from "./ui/icons.js";
+import { mountMobileTaskView, mountTaskLauncher, mountTaskView } from "./task-views.js";
 
 const sections = [
   ["staged", "已暂存"], ["unstaged", "未暂存"], ["untracked", "未跟踪"]
@@ -124,7 +126,8 @@ export function mountSessionTools(options) {
   const owner = `workspace-reader-${Math.random().toString(36).slice(2)}`;
   const widthKey = "codexElvesWorkspacePanelWidth";
   let disposed = false, mobile = null, sequence = 0, contextKey = "", authorizationKey = "", drag = null;
-  let currentContext = null, displayedContext = null;
+  let currentContext = null, displayedContext = null, mobileTasks = null;
+  const stopRequests = new Map();
   // 默认 480px 便于并排阅读；仅用户拖动或键盘调整才保存，窗口临时变窄不能覆盖偏好。
   let preferredWidth = 480;
   try {
@@ -134,7 +137,7 @@ export function mountSessionTools(options) {
   const dock = node("aside", "workspace-reader");
   dock.id = `${owner}-panel`;
   dock.hidden = true; dock.inert = true;
-  dock.setAttribute("aria-label", "文件、变更、子智能体与侧边会话");
+  dock.setAttribute("aria-label", "工作区标签面板");
   const separator = node("div", "workspace-reader-resize");
   separator.tabIndex = 0;
   separator.setAttribute("role", "separator");
@@ -143,7 +146,10 @@ export function mountSessionTools(options) {
   const toolbar = node("header", "workspace-reader-toolbar");
   const tablist = node("div", "workspace-reader-tabs");
   tablist.setAttribute("role", "tablist");
-  tablist.setAttribute("aria-label", "文件、变更、子智能体与侧边会话标签页");
+  tablist.setAttribute("aria-label", "工作区标签页");
+  // 用户要求加号只新开工具选择页；与最右侧的显隐开关分开，不直接创建会话或终端。
+  const add = control("", "新建标签页", () => { if (desktop() && !disposed) openTab({kind:"launcher", nonce:++sequence}); }, "icon-button workspace-reader-new");
+  add.append(icon("plus"));
   const toggle = control("", "打开标签页", () => {
     if (disposed || !desktop()) return;
     updateContext(); beforeOpen?.();
@@ -155,8 +161,8 @@ export function mountSessionTools(options) {
   toggle.setAttribute("aria-controls", dock.id);
   toggle.innerHTML = '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3"/><path class="workspace-reader-toggle-pane" d="M14 4h3a3 3 0 0 1 3 3v10a3 3 0 0 1-3 3h-3z"/><path d="M14 4v16"/></svg>';
   const views = node("div", "workspace-reader-views");
-  const empty = node("div", "workspace-reader-empty", "从会话菜单打开文件、变更、子智能体或侧边会话");
-  toolbar.append(tablist); dock.append(separator, toolbar, views, empty); workspace.append(dock);
+  const empty = node("div", "workspace-reader-empty", "暂无打开的标签页");
+  toolbar.append(tablist,add); dock.append(separator, toolbar, views, empty); workspace.append(dock);
   trigger.after(toggle);
 
   function identity(context = getContext() || {}) {
@@ -227,6 +233,8 @@ export function mountSessionTools(options) {
     toggle.focus({ preventScroll: true });
   }
   function tabKey(item) {
+    if (item.kind === "launcher") return JSON.stringify(["launcher",item.nonce]);
+    if (item.kind === "task") return JSON.stringify(["task",item.taskId]);
     if (item.kind === "side" || item.kind === "subagent") return JSON.stringify([item.kind, item.threadId]);
     if (item.kind === "side-creation") return JSON.stringify(["side-creation", item.requestId]);
     if (item.kind === "file") return JSON.stringify(["file", item.sourceThreadId || "", item.path.replaceAll("\\", "/")]);
@@ -274,10 +282,12 @@ export function mountSessionTools(options) {
     const value = { ...(getContext() || {}) }, nextAuthorization = authorizationIdentity(value);
     // 会话/新建项目分别保留标签、内容、选中项、显隐、宽度及标签滚动；注销或更换授权才释放全部页面与请求。
     if (nextAuthorization !== authorizationKey) {
+      mobileTasks?.dispose();mobileTasks=null;stopRequests.clear();
       clearContexts(); authorizationKey = nextAuthorization;
     }
     const next = identity(value);
     if (next !== contextKey || !currentContext) {
+      mobileTasks?.dispose();mobileTasks=null;
       finishDrag(false);
       contextKey = next;
       if (!contexts.has(next)) contexts.set(next, {
@@ -287,14 +297,18 @@ export function mountSessionTools(options) {
       currentContext.value = value;
       syncLayout();
     } else currentContext.value = value;
+    const active=currentContext.tabs.get(currentContext.active);
+    if(active && ["launcher","records","task"].includes(active.item.kind)) active.renderer.updateContext?.();
+    mobileTasks?.updateContext();
     mobile?.updateContext();
   }
-  function openTab(item, { reveal = true } = {}) {
+  function openTab(item, { reveal = true, replace = null } = {}) {
     if (disposed) return;
-    updateContext(); beforeOpen?.();
+    updateContext(); beforeOpen?.({keepMenu:item.kind==="task"});
     const context = currentContext, tabs = context.tabs;
     if (reveal) context.expanded = true;
     const key = tabKey(item), existing = tabs.get(key);
+    const replaced = replace?.item.kind === "launcher" && tabs.get(replace.key) === replace ? replace : null;
     if (existing) {
       selectTab(existing);
       if (item.kind === "file") void existing.renderer.openFile(item.path, item.line);
@@ -302,12 +316,15 @@ export function mountSessionTools(options) {
       else if (item.kind === "changes") existing.renderer.open("changes");
       else void existing.renderer.open();
       if (reveal) existing.renderer.focusComposer?.();
+      if (replaced && replaced!==existing) closeTab(replaced.key,false,context);
       return existing;
     }
     const id = `${owner}-${++sequence}`;
     const threadTab = item.kind === "side" || item.kind === "subagent";
     const side = threadTab || item.kind === "side-creation";
-    const label = side ? item.title : item.kind === "changes" ? "变更" : item.kind === "files" ? "打开文件"
+    const taskPage = ["records","task","launcher"].includes(item.kind);
+    const label = taskPage ? ({records:"任务记录",task:item.title || "后台任务",launcher:"新标签页"})[item.kind]
+      : side ? item.title : item.kind === "changes" ? "变更" : item.kind === "files" ? "打开文件"
       : `${displayWorkspaceName((item.path || item.file.path).split(/[\\/]/).at(-1))}${item.kind === "change" ? " · 变更" : ""}`;
     let title = item.kind === "change" ? `${sections.find(([name]) => name === item.file.section)?.[1] || "变更"}：${displayedPath(item.file)}`
       : item.path ? displayWorkspacePath(item.path) : label;
@@ -322,7 +339,10 @@ export function mountSessionTools(options) {
     button.setAttribute("aria-controls", id);
     const symbol = node("span", "workspace-reader-tab-icon");
     symbol.innerHTML = `<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">${
-      side
+      item.kind === "records" ? '<circle cx="10" cy="10" r="7"/><path d="M10 5v5l3 2"/>'
+        : item.kind === "task" ? '<rect x="2" y="3" width="16" height="14" rx="2"/><path d="m5 7 3 3-3 3m6 0h3"/>'
+        : item.kind === "launcher" ? '<path d="M5 10h10M10 5v10"/>'
+        : side
         ? '<path d="M3 3.5h14v10H8l-4 3v-3H3z"/><path d="M6 7h8M6 10h5"/>'
         : item.kind === "changes" || item.kind === "change"
         ? '<rect x="4" y="2.5" width="12" height="15" rx="2"/><path d="M7 7h6M10 4v6M7 13h6"/>'
@@ -347,7 +367,8 @@ export function mountSessionTools(options) {
     tab.append(button, remove);
     const view = node("section", "workspace-reader-view");
     view.id = id; view.setAttribute("role", "tabpanel"); view.setAttribute("aria-labelledby", button.id);
-    tablist.append(tab); views.append(view);
+    if (replaced) tablist.insertBefore(tab,replaced.tab); else tablist.append(tab);
+    views.append(view);
     const retainsTab = () => !disposed && tabs.get(key) === record && contexts.get(context.key) === context
       && authorizationKey === authorizationIdentity();
     const ownsTab = () => retainsTab() && currentContext === context && context.key === identity();
@@ -393,6 +414,13 @@ export function mountSessionTools(options) {
       if (retainsTab()) options.onSideThreadRead?.(threadId);
     })
       : item.kind === "side-creation" ? mountWorkspaceSideCreation(view)
+      : item.kind === "launcher" ? mountTaskLauncher(view,rendererOptions.getContext,kind=>{
+        if (!ownsTab() || context.active!==key) return;
+        if (kind==="side") { if (options.createSideThread?.()) closeTab(key,false,context); }
+        else if (["records","files","changes"].includes(kind)) openTab({kind},{replace:record});
+      })
+      : taskPage ? mountTaskView(view,{item,getContext:rendererOptions.getContext,read:options.readTasks,
+        stop:options.stopTask,pending:stopRequests,openTask:task=>{if(ownsTab())openTask(task);}})
       : item.kind === "changes" || item.kind === "change"
       ? mountSessionToolPages({ ...rendererOptions, cache: item.kind === "changes" ? options.cache : null })
       : mountSessionFiles(rendererOptions);
@@ -414,14 +442,20 @@ export function mountSessionTools(options) {
         updateThreadState({});
         return true;
       } };
-    tabs.set(key, record); selectTab(record);
+    if (replaced) {
+      // 选择入口后在原位置替换新标签；其余标签的 DOM、顺序、滚动和草稿都不能重建。
+      const ordered=[...tabs];tabs.clear();
+      for(const [k,v] of ordered){if(k===replaced.key)tabs.set(key,record);tabs.set(k,v);}
+    } else tabs.set(key, record);
+    selectTab(record);
+    if(replaced)closeTab(replaced.key,false,context);
     if (side) {
       renderer.open();
       if (reveal) renderer.focusComposer?.();
     }
     else if (item.kind === "changes") renderer.open("changes");
     else if (item.kind === "change") void renderer.openChange(item.file, item.list);
-    else if (item.kind === "files") void renderer.open();
+    else if (item.kind === "files" || taskPage) void renderer.open();
     else void renderer.openFile(item.path, item.line);
     return record;
   }
@@ -430,6 +464,19 @@ export function mountSessionTools(options) {
     updateContext();
     if (desktop()) openTab({ kind: name });
     else mobilePages().open(name);
+  }
+  function taskPageFor(item){
+    if(disposed)return;
+    updateContext();
+    if(!currentContext?.value.threadId || currentContext.value.creating)return;
+    if(desktop())return openTab(item);
+    mobileTasks ||= mountMobileTaskView(workspace,{getContext:() => getContext() || {},read:options.readTasks,
+      stop:options.stopTask,pending:stopRequests,onClose:()=>{mobileTasks=null;trigger.focus?.();}});
+    beforeOpen?.();
+    mobileTasks.open(item);
+  }
+  function openTask(task){
+    if(typeof task?.id==="string" && task.id) return taskPageFor({kind:"task",taskId:task.id,title:task.name || "后台任务"});
   }
   function openFile(path, line) {
     if (disposed || typeof path !== "string" || !path) return;
@@ -545,6 +592,7 @@ export function mountSessionTools(options) {
   updateContext();
   return {
     open, openFile, openSideThread, openSubagent, openSideCreation, updateContext,
+    openTask,openTaskRecords:()=>taskPageFor({kind:"records"}),
     updateThreadTitle(threadId, title, source) {
       if (disposed || authorizationKey !== authorizationIdentity()) return false;
       let changed = false;
@@ -563,10 +611,10 @@ export function mountSessionTools(options) {
             && authorizationIdentity(context.value) === authorizationKey)
           closeTab(tabKey({ kind, threadId }), parentThreadId !== null && context === currentContext, context);
     },
-    close: () => desktop() ? hidePanel() : mobile?.close(),
+    close: () => desktop() ? hidePanel() : mobileTasks ? mobileTasks.back() : mobile?.close(),
     dispose() {
       if (disposed) return;
-      clearContexts(); mobile?.dispose(); disposed = true;
+      mobileTasks?.dispose();mobileTasks=null;stopRequests.clear();clearContexts(); mobile?.dispose(); disposed = true;
       observer?.disconnect(); desktopMedia.removeEventListener("change", syncLayout);
       toggle.remove(); dock.remove(); workspace.classList.remove("workspace-reader-open", "workspace-reader-resizing");
       workspace.style.removeProperty("--workspace-reader-width");

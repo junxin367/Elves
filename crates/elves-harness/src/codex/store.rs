@@ -114,7 +114,7 @@ pub(super) struct Deletion {
 }
 
 /// 用户要求（2026-11-21）：Codex 的后台终端（exec_command 让出后仍在运行的命令）也算执行中，退出或升级时
-/// 不能被静默结束。协议没有列出后台终端的接口，thread/read 在命令结束前也看不到它，只能按 item/started 与
+/// 不能被静默结束。兼容不支持实验性后台列表的引擎，退出保护仍按 item/started 与
 /// item/completed 跟踪；Harness 交接时随私有服务代次保存在这里，新 Harness 只在接上同一代次服务时沿用。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -169,6 +169,8 @@ pub(super) struct Data {
     pub deletions: BTreeMap<String, Deletion>,
     /// 交接给下一个 Harness 的后台终端，键为 `会话ID:条目ID`；见 OpenCommand。
     pub background_commands: BTreeMap<String, OpenCommand>,
+    /// 只存经原生后台列表证实的身份和终态，永不用于推断当前仍在运行。
+    pub task_records: BTreeMap<String, Vec<Value>>,
     /// 手动压缩临时切往独立压缩模型后待恢复的原会话模型，按会话持久化防止重启遗留。
     pub compaction_model_restores: BTreeMap<String, CompactionModelRestore>,
     /// 按原生会话、轮次、条目保存压缩证据；历史有对应条目才附加，不据此复活轮次。

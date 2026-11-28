@@ -181,11 +181,20 @@ pub(super) fn apply_command_receipts(turns: &mut [Value], receipts: &Value) {
     let Some(receipts) = receipts.as_array().filter(|list| !list.is_empty()) else { return };
     let by_task: HashMap<_, _> = receipts.iter().filter_map(|r| Some((r["taskId"].as_str()?, r))).collect();
     for item in turns.iter_mut().flat_map(|t| t["items"].as_array_mut().into_iter().flatten()) {
-        if item["type"] != "commandExecution" || !matches!(item["backgroundStatus"].as_str(), Some("unknown" | "running")) { continue; }
+        if item["type"] != "commandExecution" { continue; }
         let Some(receipt) = item["backgroundTaskId"].as_str().and_then(|id| by_task.get(id)) else { continue };
         if receipt["toolUseId"].as_str().is_some_and(|id| item["id"] != id) { continue; }
-        if let Some(status @ ("completed" | "failed" | "killed" | "stopped" | "canceled" | "cancelled")) = receipt["status"].as_str() {
+        if let Some(output)=receipt["output"].as_str(){
+            item["backgroundOutput"]=json!(output);
+            item["backgroundOutputTruncated"]=receipt["outputTruncated"].clone();
+            item["_sdkTaskResult"]=json!(true);
+        }
+        if matches!(item["backgroundStatus"].as_str(),Some("unknown"|"running"))
+            && let Some(status @ ("completed" | "failed" | "killed" | "stopped" | "canceled" | "cancelled")) = receipt["status"].as_str() {
             write_command_result(item, status, receipt["summary"].as_str().unwrap_or(""));
+            for (field,key) in [("startedAtMs","startedAtMs"),("completedAtMs","backgroundEndedAtMs")] {
+                if receipt[field].is_u64() {item[key]=receipt[field].clone();}
+            }
             item["_sdkTaskResult"] = json!(true);
         }
     }
@@ -198,10 +207,16 @@ pub(super) fn retain_command_receipts(previous: &[Value], turns: &mut [Value]) {
         .filter_map(|item| Some((item["id"].as_str()?, item))).collect();
     if receipts.is_empty() { return; }
     for item in turns.iter_mut().flat_map(|t| t["items"].as_array_mut().into_iter().flatten()) {
-        if item["type"] != "commandExecution" || !matches!(item["backgroundStatus"].as_str(), Some("running" | "unknown")) { continue; }
+        if item["type"] != "commandExecution" { continue; }
         let Some(old) = item["id"].as_str().and_then(|id| receipts.get(id)).copied() else { continue };
         if old["backgroundTaskId"] != item["backgroundTaskId"] { continue; }
-        for field in ["backgroundStatus", "backgroundSummary", "status", "exitCode", "_sdkTaskResult"] {
+        if item["backgroundOutput"].is_null() && old["backgroundOutput"].is_string(){
+            item["backgroundOutput"]=old["backgroundOutput"].clone();
+            item["backgroundOutputTruncated"]=old["backgroundOutputTruncated"].clone();
+            item["_sdkTaskResult"]=json!(true);
+        }
+        if !matches!(item["backgroundStatus"].as_str(), Some("running" | "unknown")) {continue;}
+        for field in ["backgroundStatus", "backgroundSummary", "status", "exitCode", "startedAtMs", "backgroundEndedAtMs", "_sdkTaskResult"] {
             if let Some(value) = old.get(field) { item[field] = value.clone(); }
         }
     }
@@ -252,7 +267,7 @@ pub(super) fn notification_turn(
         "turnStartedAtMs":row["timestampMs"],
         "items":[{"id":format!("{uuid}-notification"),"type":"claudeTaskNotification","source":"claude",
             "kind":kind,"taskId":task,"status":status,"summary":summary,
-            "event":notification["event"],"statusOnly":notification["statusOnly"] == true,
+            "event":notification["event"],"statusOnly":notification["statusOnly"] == true,"ambient":notification["ambient"]==true,
             "completedAtMs":row["timestampMs"]}]}),
     )
 }

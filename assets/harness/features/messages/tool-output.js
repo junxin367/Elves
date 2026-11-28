@@ -54,7 +54,9 @@ export function renderToolOutput(details, item) {
   if (["mcpToolCall", "dynamicToolCall"].includes(item.type) || item.type === "webSearch" && item.source === "claude") {
     renderGenericToolOutput(body, item); details.append(body); return;
   }
-  const content = item.type === "commandExecution" ? item.aggregatedOutput || item.output || ""
+  // 原命令卡与任务详情共用已确认的最终输出；初次转后台的启动回执不冒充最终 stdout。
+  const finalBackground = item.type === "commandExecution" && typeof item.backgroundOutput === "string";
+  const content = item.type === "commandExecution" ? (finalBackground ? item.backgroundOutput : item.aggregatedOutput || item.output || "")
     : item.type === "reasoning" ? [item.summary, item.content].flatMap(value => Array.isArray(value) ? value.map(entry => entry.text || entry) : [value || ""]).join("\n\n")
     : item.type === "fileChange" ? (item.changes || []).map(change => `${change.path || ""}\n${change.diff || ""}`).join("\n\n")
     : item.type === "error" ? item.message : JSON.stringify(item, null, 2);
@@ -65,9 +67,10 @@ export function renderToolOutput(details, item) {
   if (item.type === "commandExecution") {
     body.classList.add("command-shell");
     const title = element("div", "command-shell-title");
-    const copy = button("", "复制完整命令输出", () => void copyText(`$ ${commandText(item)}\n${text}`), "command-shell-copy");
+    const cut = finalBackground && item.backgroundOutputTruncated === true;
+    const copy = button("", cut ? "复制已显示的命令输出" : "复制完整命令输出", () => void copyText(`$ ${commandText(item)}\n${text}`), "command-shell-copy");
     copy.append(icon("copy"));
-    title.append(element("span", "", "Shell"), copy); body.append(title);
+    title.append(element("span", "", cut ? "Shell · 输出已截取" : "Shell"), copy); body.append(title);
     output.classList.add("command-output");
     result = element("span", "command-result");
     output.append(element("span", "command-prompt", `$ ${commandText(item)}\n`), result);

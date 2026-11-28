@@ -1695,11 +1695,31 @@ input:focus,textarea:focus,.prompt-editor:focus,button:focus-visible{outline:1px
 .workspace-reader-tab-select:focus-visible,.workspace-reader-tab-close:focus-visible,.workspace-reader-toggle:focus-visible{outline:2px solid var(--skill);outline-offset:-2px}
 .workspace-reader-views{position:relative;flex:1;min-width:0;min-height:0;overflow:hidden}
 .workspace-reader-empty{display:grid;place-content:center;flex:1;min-width:0;padding:24px;color:var(--muted);font-size:.85714rem;text-align:center;line-height:1.6}
+.workspace-reader-toolbar .workspace-reader-tabs{flex:0 1 auto}
+.workspace-reader-toolbar .workspace-reader-toggle{margin-inline-start:auto}
+.workspace-reader-new{flex:none;width:32px;height:32px;padding:0;color:var(--text-secondary);font-size:1.3rem}
+/* 新标签入口随面板宽度分栏；终端待接入，不能将打开标签或查看输出当作创建终端。 */
 .task-launcher,.task-view{container-type:inline-size;min-width:0;max-height:100%;overflow:auto;padding:18px 20px}
+.task-launcher h2,.task-field h3{font-size:var(--menu-font-size);color:var(--text-secondary);font-weight:500;margin:0 0 8px}
 /* 按新标签页内容区而非窗口宽度分栏：3 个 110px 入口加 2 个 8px 间距共 346px，
    容器查询已扣除左右内边距。更宽仍为三列，拖至面板下限时保持两列。 */
 .task-launcher-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
 @container (min-width:346px){.task-launcher-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
+.task-launcher-action{min-width:0;display:flex;flex-direction:column;align-items:flex-start;justify-content:space-between;gap:9px;min-height:62px;padding:9px 11px;border:1px solid var(--line);border-radius:8px;background:var(--code);text-align:start;font-size:var(--menu-font-size);overflow-wrap:anywhere}
+.task-launcher-action-head{display:flex;align-items:center;justify-content:space-between;width:100%;color:var(--text-secondary)}
+.task-launcher-action-head .ui-icon{width:16px;height:16px}.task-launcher-action-head small{font-size:var(--menu-description-font-size)}
+.task-launcher-action:disabled{background:transparent;color:var(--text-secondary);opacity:.75}
+.task-view-heading,.task-record-title,.task-facts,.task-stop{display:flex;align-items:center;gap:8px}
+.task-view-heading{justify-content:space-between}.task-view-heading h2{font-size:1.1rem;margin:0;overflow-wrap:anywhere;min-width:0}
+.task-stop{white-space:nowrap;padding:4px 8px;border:1px solid var(--line);border-radius:6px;color:var(--danger);font-size:var(--menu-font-size)}
+.task-stop .ui-icon,.task-record-title .ui-icon{width:14px;height:14px}
+.task-facts{flex-wrap:wrap;gap:4px 10px;font-size:var(--menu-description-font-size);color:var(--text-secondary);margin:5px 0;font-variant-numeric:tabular-nums}
+.task-running,.task-completed{color:var(--green)}.task-failed{color:var(--danger)}
+.task-view-body{margin-top:12px}.task-field{margin:16px 0}.task-field pre{padding:10px 12px;background:var(--code);border-radius:6px;white-space:pre-wrap;overflow-wrap:anywhere;max-height:none}
+.task-record{display:block;width:100%;padding:9px 4px;text-align:start;border:0;border-bottom:1px solid var(--line);border-radius:0;font-size:var(--menu-font-size)}
+.task-record-title{overflow-wrap:anywhere}.task-record .task-facts{margin-inline-start:22px}
+.task-view-note{white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text-secondary);font-size:var(--menu-font-size)}
+.task-mobile-body{min-height:0;flex:1;overflow:auto}.task-mobile .task-view{max-height:none}
 .workspace-reader-view{position:absolute;inset:0;min-width:0;min-height:0;overflow:hidden}
 .workspace-side-thread{display:block;width:100%;height:100%;border:0;background:transparent;color-scheme:inherit}
 /* 用户要求 PC 侧边会话不显示重复顶部信息：外层标签提供会话名，内页整段标题/路径/按钮均隐藏。
@@ -1868,6 +1888,8 @@ html[data-session-window=true] .workspace>.sidebar,html[data-session-window=true
 .session-related-menu-background-count{flex-shrink:0;color:var(--muted);font-size:var(--menu-description-font-size);font-variant-numeric:tabular-nums}
 .session-related-menu-item.session-related-menu-background-task{min-height:32px;padding:4px 9px;gap:8px;cursor:default;user-select:text}
 .session-related-menu-item.session-related-menu-background-task:hover{background:transparent}
+.session-related-menu-item.session-related-menu-background-task:is(button){cursor:pointer;user-select:none}
+.session-related-menu-item.session-related-menu-background-task:is(button):is(:hover,:focus-visible){background:var(--hover)}
 .session-related-menu-background-task>.ui-icon{flex:0 0 1em;width:1em;height:1em;color:var(--muted)}
 .session-related-menu-unread{flex:0 0 auto;width:.45em;height:.45em;border-radius:50%;background:var(--accent-indicator)}
 .session-related-menu-running{width:.85em;height:.85em}

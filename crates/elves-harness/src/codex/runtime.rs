@@ -499,6 +499,10 @@ impl Runtime {
         }
     }
 
+    pub(super) async fn existing_task_connection(&self) -> Option<Arc<Connection>> {
+        self.connection.lock().await.clone().filter(|c| c.alive.load(Ordering::Acquire))
+    }
+
     /// 当前连接上仍在等待引擎响应的请求方法（去重、排序）；没有存活连接时为空。
     pub async fn pending_methods(&self) -> Vec<String> {
         let connection = self.connection.lock().await.clone();
@@ -632,7 +636,7 @@ impl Connection {
         guarded_write(&self.stdin, bytes, guard, TIMEOUT).await
     }
 
-    async fn request(
+    pub(super) async fn request(
         &self,
         method: &str,
         params: Value,

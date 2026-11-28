@@ -35,7 +35,7 @@ export async function mutate(action, payload, { reliable = false, receiptId = nu
   if (payload?.threadId && threadActionReadOnly(action, payload.threadId))
     throw Object.assign(new Error("此会话仅供查看，不能提交操作。"), { code: 403, notSubmitted: true });
   const queueAction = ["steerQueued", "removeQueued"].includes(action);
-  const trackedOperation = queueAction || ["deleteThread", "createSideThread", "closeSideThread", "forkThread"].includes(action);
+  const trackedOperation = queueAction || ["deleteThread", "createSideThread", "closeSideThread", "forkThread","stopBackgroundTask"].includes(action);
   const version = selectionVersion;
   const deviceId = session?.device.id, generation = recoveryGeneration;
   const operationScope = privateInputScope(session);

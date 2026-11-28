@@ -1,6 +1,7 @@
 //! Harness 的 Codex 原生执行适配器：维护会话归属、队列、编辑事务、审批和事件。
 //! 用户要求 Codex 仅保留服务模式；不连接 Codex App，也不包含桌面 IPC、页面脚本或注入回退。
 mod catalog;
+mod background;
 mod commands;
 mod compaction;
 mod compaction_details;
@@ -96,6 +97,7 @@ pub(super) struct CodexHarness {
     loaded: Mutex<HashMap<String, String>>,
     /// 正在运行的命令（含后台终端），键为 `会话ID:条目ID`；见 store::OpenCommand。
     open_commands: Mutex<std::collections::BTreeMap<String, store::OpenCommand>>,
+    task_registry: Mutex<background::Registry>,
     /// 当前连接代次与对应的私有服务代次；只跟踪当前连接上的命令事件。
     connection_identity: Mutex<(String, Option<String>)>,
     pin_capability: Mutex<Option<(String, bool)>>,
@@ -208,6 +210,7 @@ impl CodexHarness {
             queue_recovery_after: Mutex::new(HashMap::new()),
             loaded: Mutex::new(HashMap::new()),
             open_commands: Mutex::new(inherited_commands),
+            task_registry: Mutex::new(background::Registry::default()),
             connection_identity: Mutex::new((String::new(), None)),
             pin_capability: Mutex::new(None),
             project_preferences: Mutex::new(None),
@@ -676,7 +679,7 @@ impl CodexHarness {
     }
 
     /// 跟踪命令执行条目：item/started 记录、item/completed 移除。exec_command 让出后命令仍在运行时，
-    /// 这里是唯一能看到后台终端的地方。只接受当前连接的事件；重连到新服务或 stdio 时清空旧记录。
+    /// 保活覆盖所有未结束命令；菜单另以原生后台列表确认。只接受当前连接的事件。
     async fn observe_open_commands(self: &Arc<Self>, frame: &Value) {
         let method = frame["method"].as_str().unwrap_or("");
         let generation = frame["_generation"].as_str().unwrap_or("");
@@ -705,6 +708,7 @@ impl CodexHarness {
             return;
         };
         let item = &params["item"];
+        self.observe_task_event(generation, thread_id, method, params).await;
         match method {
             "item/started" | "item/completed" if item["type"] == "commandExecution" => {
                 let Some(item_id) = item["id"].as_str() else {
@@ -1108,7 +1112,8 @@ impl CodexHarness {
             } else {
                 false
             };
-        if !retained_side && !retained_deletion && !local_project && action != "sidePresence" {
+        if !retained_side && !retained_deletion && !local_project && !matches!(action,
+            "sidePresence" | "backgroundTasks" | "backgroundTaskDetail" | "backgroundTaskRecords" | "stopBackgroundTask") {
             self.start().await.map_err(|failure| {
                 if action == "deleteThread" {
                     deletion::delete_preflight_failure(failure)
@@ -1143,6 +1148,8 @@ impl CodexHarness {
             "queueEdit" => self.queue_edit(&payload).await,
             "sendState" => self.send_state(&payload).await,
             "relatedThreads" => self.related_sides(&payload).await,
+            "backgroundTasks" | "backgroundTaskRecords" | "backgroundTaskDetail" =>
+                self.read_background_tasks(action, &payload).await,
             _ => {
                 let authorization = authorization.context("会话写操作缺少设备授权")?;
                 // 祖先删除会同时锁住全部后代；先串行化删除再取会话锁，避免两个删除各持一端互相等待。

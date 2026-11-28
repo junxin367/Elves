@@ -45,7 +45,7 @@ function menuSignature(data) {
 
 export function mountSessionMenu({
   trigger, getContext, getBackgroundTasks, load, openChanges, openBrowser, openFiles, openSubagent, createSideThread, openSideThread,
-  closeSideThread, beforeOpen, onError, onData, cache, renderSubagentIcon
+  closeSideThread, beforeOpen, onError, onData, cache, renderSubagentIcon, openTask, openTaskRecords, disposeTasks
 }) {
   let disposed = false, opened = false, owner = "", authorization = "", context = null, cached = null;
   let suspended = false;
@@ -99,6 +99,7 @@ export function mountSessionMenu({
       subagentsEnabled: value.subagentsEnabled ?? value.relatedEnabled !== false,
       sideThreadsEnabled: value.sideThreadsEnabled ?? value.relatedEnabled !== false,
       sideThreadView: value.sideThreadView === true,
+      taskRecordsAvailable: value.taskRecordsAvailable !== false,
       createPending: value.createPending === true,
       authorization: JSON.stringify([deviceId, cacheScope]),
       connected: value.connected === true, owner: JSON.stringify([deviceId, cacheScope, threadId,
@@ -304,6 +305,11 @@ export function mountSessionMenu({
     const live = !!scope && value?.connected === true;
     const source = live ? Array.isArray(value.items) ? value.items : value.snapshot || null : null;
     const summary = live ? value.summary : "";
+    const reason=live && typeof value.reason==="string"?value.reason:"";
+    if((trigger.getAttribute("data-background-list-error")||"")!==reason){
+      if(reason) trigger.setAttribute("data-background-list-error",reason);else trigger.removeAttribute("data-background-list-error");
+      updateSessionMenuAria(trigger);
+    }
     if ((!live || backgroundScope !== scope) && backgroundSource && typeof backgroundSource === "object")
       retiredBackgroundSources.add(backgroundSource);
     if (backgroundSource === source && backgroundScope === scope
@@ -327,7 +333,7 @@ export function mountSessionMenu({
   }
   function renderBackgroundTasks() {
     backgroundGroup?.remove(); backgroundGroup = null; backgroundTimes.length = 0;
-    // 用户确认：无后台任务时整个分组不出现；只读列表固定在子智能体之前，不提供停止或详情入口。
+    // 没有运行任务时隐藏整个分组。点真实任务直接看详情；旧数量摘要没有任务身份，不作为按钮。
     if (!backgroundItems.length) { if (opened) fit(); return; }
     const group = section("后台任务");
     backgroundGroup = group;
@@ -338,8 +344,17 @@ export function mountSessionMenu({
     const list = element("div", "session-related-menu-background-list");
     list.setAttribute("role", "list"); list.setAttribute("aria-label", "后台任务");
     for (const item of backgroundItems) {
-      const row = element("div", "session-related-menu-item session-related-menu-background-task");
-      row.setAttribute("role", "listitem");
+      const interactive=typeof openTask==="function" && Array.isArray(backgroundSource);
+      const row = element(interactive?"button":"div", "session-related-menu-item session-related-menu-background-task");
+      if(interactive){
+        const expected=backgroundScope;row.type="button";row.tabIndex=-1;row.setAttribute("role","menuitem");
+        row.dataset.menuKey=`task:${item.id}`;
+        row.addEventListener("click",event=>{
+          event.preventDefault();event.stopPropagation();syncBackgroundTasks();
+          if(!row.isConnected||expected!==backgroundScope||!backgroundItems.some(r=>r.id===item.id))return;
+          openTask({id:item.id,name:item.name});
+        });
+      }else row.setAttribute("role", "listitem");
       row.append(icon(item.icon));
       const name = element("span", "session-related-menu-name", item.name);
       name.title = item.name;
@@ -406,6 +421,9 @@ export function mountSessionMenu({
     changes.dataset.menuKey = "changes"; tools.append(changes);
     const files = itemButton("文件", openFiles, []);
     files.dataset.menuKey = "files"; tools.append(files);
+    if(!desktop() && typeof openTaskRecords==="function" && context?.threadId && context.taskRecordsAvailable!==false){
+      const records=itemButton("任务记录",openTaskRecords,[]);records.dataset.menuKey="task-records";tools.append(records);
+    }
     // 用户要求 PC 布局（宽于 760px）不显示浏览器；手机保留，跨断点缩放时由现有 resize 重渲染同步。
     if (!desktop()) {
       const browser = itemButton("浏览器", openBrowser, []);
@@ -919,6 +937,7 @@ export function mountSessionMenu({
     },
     dispose() {
       if (disposed) return;
+      disposeTasks?.();
       close(false, true); disposed = true; entries.clear(); cached = null; suppressedClick = null; blockedContext = null;
       for (const remove of listeners) remove();
       for (const [name, value] of originalAria) {
@@ -926,6 +945,7 @@ export function mountSessionMenu({
       }
       times.length = 0; backgroundTimes.length = 0; mutationButtons.clear(); layer.remove();
       trigger.classList.remove("has-background-tasks");
+      trigger.removeAttribute("data-background-list-error");
       trigger.removeAttribute("data-background-task-count");
       updateSessionMenuAria(trigger);
     }

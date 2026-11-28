@@ -1977,6 +1977,64 @@ impl Claude {
             "transcriptEvents":[],"backend":"claude","sessionPlan":tools::session_plan(&c.turns)}))
     }
 
+    pub async fn background_tasks(self:&Arc<Self>, action:&str, payload:&Value, auth:&HarnessAuthorization) -> anyhow::Result<Value> {
+        let id=payload["threadId"].as_str().context("缺少会话标识")?;
+        let detail=payload["taskId"].as_str();
+        if action=="backgroundTaskRecords" { self.sync_discovered(id,Some(auth)).await?; }
+        let c=self.conversation(id).await?;
+        let process=self.processes.lock().await.get(id)
+            .filter(|p|p.shared && p.channel.live.load(Ordering::Acquire)).cloned();
+        let items=background_task_items(&c.native_status,now_ms());
+        if action=="backgroundTasks" {
+            return Ok(json!({"ok":true,"threadId":id,"items":if process.is_some(){items}else{Value::Null}}));
+        }
+        let mut rows=super::background_tasks::historical(&c.turns,detail);
+        for receipt in c.native_status["taskReceipts"].as_array().into_iter().flatten() {
+            let Some(task)=receipt["taskId"].as_str().filter(|t|detail.is_none_or(|d|d==*t)) else {continue};
+            if receipt["confirmedBackground"]!=true && !rows.contains_key(task) {continue;}
+            let Some(status)=super::background_tasks::terminal(&receipt["status"]) else {continue};
+            let row=rows.entry(task.into()).or_insert_with(||super::background_tasks::describe(task,
+                receipt["kind"].as_str().unwrap_or("task"),&receipt["name"]));
+            if row["status"]!="failed" || status!="completed" {row["status"]=json!(status);}
+            for field in ["name","startedAtMs","completedAtMs"] {
+                if row[field].is_null() && !receipt[field].is_null() {row[field]=receipt[field].clone();}
+            }
+            if detail.is_some() && row["summary"].is_null() {row["summary"]=receipt["summary"].clone();}
+            if detail.is_some() && receipt["output"].is_string() {
+                row["output"]=receipt["output"].clone();row["outputKind"]=json!("final");
+                row["outputTruncated"]=receipt["outputTruncated"].clone();
+            }
+            if detail.is_some() {
+                row["outputPending"]=json!(receipt["outputPending"]==true && process.is_some());
+                if receipt["outputError"].is_string(){row["outputError"]=receipt["outputError"].clone();}
+            }
+        }
+        if let (Some(task),Some(proc),Some(active))=(detail,process.as_ref(),
+            items.as_array().and_then(|items|items.iter().find(|row|row["id"]==payload["taskId"]))) {
+            let row=rows.entry(task.into()).or_insert_with(||json!({}));
+            for field in ["id","name","kind","status","startedAtMs","elapsedMs"] {
+                row[field]=active[field].clone();
+            }
+            let run=active["runId"].as_str().unwrap_or_default();
+            let token=format!("{}:{run}",proc.channel.generation);
+            let allowed=!run.is_empty() && active["kind"]=="local_bash";
+            row["stopRequested"]=json!(active["stopRequested"]==true);
+            row["canStop"]=json!(allowed && active["stopRequested"]!=true && c.native_status["taskStopSupported"]==true);
+            row["token"]=json!(token);
+            if allowed {
+                match proc.control(json!({"subtype":"get_task_output","task_id":task,"run_id":run}),None).await {
+                    Ok(reply) if reply["output"].is_string() => {
+                        row["output"]=reply["output"].clone(); row["outputKind"]=json!("live");
+                        row["outputTruncated"]=reply["truncated"].clone();
+                    }
+                    Ok(_) => { row["canStop"]=json!(false); row["outputError"]=json!("原生 CLI 未返回任务输出"); }
+                    Err(e) => { row["canStop"]=json!(false); row["outputError"]=json!(e.to_string()); }
+                }
+            }
+        }
+        Ok(super::background_tasks::result(id,rows.into_values().collect(),detail,None))
+    }
+
     pub async fn queue(&self, id: &str) -> anyhow::Result<Value> {
         if let Some((parent, _)) = subagents::parse_id(id) {
             self.conversation(&parent).await?;
@@ -2827,11 +2885,25 @@ impl Claude {
         // 用户要求别的应用持有会话时不能继续写入；这些动作都会向同一份原生记录追加内容。
         if matches!(
             action,
-            "send" | "editMessage" | "compact" | "setGoal" | "updateGoal"
+            "send" | "editMessage" | "compact" | "setGoal" | "updateGoal" | "stopBackgroundTask"
         ) {
             self.ensure_not_held_elsewhere(&c).await?;
         }
         match action {
+            "stopBackgroundTask" => {
+                if c.native_status["taskStopSupported"]!=true{return Err(error(409,"此 Claude CLI 尚未验证单任务停止"));}
+                let proc=self.processes.lock().await.get(id)
+                    .filter(|p|p.shared && p.channel.live.load(Ordering::Acquire)).cloned()
+                    .ok_or_else(||error(409,"此会话没有已连接的 Claude 后台任务"))?;
+                let active=c.native_status["backgroundTaskItems"].as_array().and_then(|rows|rows.iter()
+                    .find(|row|row["id"]==payload["taskId"] && row["kind"]=="local_bash"))
+                    .ok_or_else(||error(409,"此任务已结束或不能单独停止"))?;
+                let run=active["runId"].as_str().filter(|s|!s.is_empty()).ok_or_else(||error(409,"缺少原生任务运行身份"))?;
+                if payload["token"]!=format!("{}:{run}",proc.channel.generation) {return Err(error(409,"任务身份已变化，请重新查看"));}
+                proc.control(json!({"subtype":"stop_task","task_id":payload["taskId"],"run_id":run}),Some(authorization)).await?;
+                // CLI 对不存在的任务也可能返回 {}；不能以控制回执替代任务的原生结束通知。
+                Ok(json!({"ok":true,"threadId":id,"taskId":payload["taskId"],"status":"requested"}))
+            }
             "editMessage" => {
                 // 执行中禁止编辑，提交与普通发送共用已有会话锁；不停止任务、不把编辑重发放入队列。
                 if !c.shared || c.active() {
@@ -3600,6 +3672,10 @@ impl Claude {
                 let previous_queue = c.queue_snapshot(&self.epoch);
                 c.native_id = native_id.into();
                 c.native_status = frame["native_status"].clone();
+                if let Some(receipts)=frame["background_task_results"].as_array()
+                    && let Some(map)=c.native_status.as_object_mut() {
+                    map.insert("taskReceipts".into(),json!(receipts));
+                }
                 let usage_changed = c.token_usage != usage;
                 c.token_usage = usage.clone();
                 c.native_clients = native_clients;
