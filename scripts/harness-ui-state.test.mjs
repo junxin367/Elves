@@ -19429,6 +19429,54 @@ test("Claude 消息待确认横幅不再提供查回执/已人工确认，3 分�
   assert.deepEqual(h.area.children[0].children.map(node => node.label), ["查回执", "已人工确认"]);
 });
 
+test("AGY 正常等原生消息时不显示回执横幅；真正送达未知才自动核对，同条接受后静默结束", async () => {
+  const h = claudeSendReceiptHarness(), { context } = h;
+  const id = "antigravity-11111111-1111-4111-8111-111111111111";
+  context.selectedId = id;
+  context.antigravityThreadId = value => value === id;
+  context.pending = { ...h.pendingSend("send", id, 60000), agySending: true };
+  context.renderPending();
+  assert.equal(h.area.children.length, 0, "正常等待即使满一分钟也不是异常或人工回执");
+  const resolving = context.resolvePending();
+  h.answer(0, { requestId: context.pending.id, state: "unknown", result: {} });
+  await h.settle();
+  context.renderPending();
+  assert.equal(h.area.children.length, 1);
+  assert.deepEqual(h.area.children[0].children, [], "只保留既有的一条内联提示");
+  h.answer(1, { threadId: id, clientUserMessageId: "client-1", confirmed: true,
+    deliveryState: "accepted", messageId: "native-message" });
+  await resolving;
+  assert.equal(context.pending, null);
+  assert.deepEqual(h.notices, []);
+  assert.ok(h.requests.every(request => !request.path.startsWith("/api/action/")));
+});
+
+test("AGY 迟到的原生拒绝只提示原文一次，不重复查询送达或重发", async () => {
+  const h = claudeSendReceiptHarness(), { context } = h;
+  const id = "antigravity-11111111-1111-4111-8111-111111111111", raw = " Native error\n  detail ";
+  context.antigravityThreadId = value => value === id;
+  context.pending = { ...h.pendingSend("send", id), agySending: true };
+  const resolving = context.resolvePending();
+  h.answer(0, { requestId: context.pending.id, state: "unknown", result: {} });
+  await h.settle();
+  h.answer(1, { threadId: id, clientUserMessageId: "client-1", confirmed: false, deliveryState: "failed", message: raw });
+  await resolving;
+  assert.equal(context.pending, null);
+  assert.equal(h.recovered.length, 1);
+  assert.deepEqual(h.notices, [{ message: raw, error: true }]);
+  assert.deepEqual(h.requests.map(r => r.path), ["/api/receipts/send-receipt-1", "/api/read/sendState"]);
+});
+
+test("AGY 发送按钮的等待只属于原会话、原授权，不覆盖真实执行中的停止入口", () => {
+  const code = `(() => {${sourceSection("  const agySending =", "  const sendingLabel =")} return agySending; })()`;
+  const ctx = { active: false, pending: { agySending: true, deviceId: "device", operationScope: "scope",
+    payload: { threadId: "antigravity-a" } }, selectedId: "antigravity-a", session: { device: { id: "device" } },
+    privateInputScope: () => "scope", creating: false };
+  assert.equal(nodeVm.runInNewContext(code, ctx), true);
+  for (const changed of [{ active: true }, { selectedId: "antigravity-b" }, { privateInputScope: () => "other" },
+    { session: { device: { id: "new" } } }]) assert.equal(nodeVm.runInNewContext(code, { ...ctx, ...changed }), false);
+});
+
 function warmHarness(overrides = {}) {
   const calls = [];
   const context = nodeVm.createContext({

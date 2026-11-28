@@ -342,6 +342,12 @@ impl AcpClient {
         params: Value,
         timeout: Option<Duration>,
     ) -> anyhow::Result<Value> {
+        self.request_observing_write(method, params, timeout, None).await
+    }
+
+    async fn request_observing_write(
+        &self, method: &str, params: Value, timeout: Option<Duration>, written: Option<oneshot::Sender<()>>,
+    ) -> anyhow::Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
@@ -355,6 +361,8 @@ impl AcpClient {
             self.pending.lock().await.remove(&id);
             return Err(error);
         }
+        // 仅允许开始核对本次写入后的转录；写入本身不是接收回执。
+        if let Some(written) = written { let _ = written.send(()); }
         let reply = match timeout {
             Some(duration) => match tokio::time::timeout(duration, rx).await {
                 Ok(received) => received,
@@ -559,13 +567,19 @@ impl AcpClient {
         session_id: &str,
         prompt: Vec<Value>,
     ) -> anyhow::Result<Value> {
-        let result = self.request_with_timeout(
+        self.session_prompt_observing_write(session_id, prompt, None).await
+    }
+
+    pub(super) async fn session_prompt_observing_write(
+        &self, session_id: &str, prompt: Vec<Value>, written: Option<oneshot::Sender<()>>,
+    ) -> anyhow::Result<Value> {
+        let result = self.request_observing_write(
             "session/prompt",
             json!({
                 "sessionId": session_id,
                 "prompt": prompt,
             }),
-            None,
+            None, written,
         )
         .await;
         // 写入后连接中断不能等同于未发送。保留未知回执，阻止队列自动重发同一消息。

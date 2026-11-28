@@ -56,8 +56,11 @@ export async function confirmPendingSend(current, result = {}) {
   const promise = (async () => {
     if (session.capabilities?.queueSendRecovery === true) {
       const state = await api("/api/read/sendState", { threadId, clientUserMessageId: clientId });
-      return state.confirmed === true && state.threadId === threadId
-        && state.clientUserMessageId === clientId
+      if (state?.threadId !== threadId || state.clientUserMessageId !== clientId) return null;
+      // AGY 首次观察超时后原生仍可能明确拒绝；这是失败终态而非已送达，错误必须保留原文。
+      if (state.deliveryState === "failed" && state.confirmed === false && antigravityThreadId(threadId)
+          && typeof state.message === "string") return { ...state, ok: false };
+      return state.confirmed === true
         && (historicalEdit ? state.deliveryState === "accepted" : ["queued", "accepted"].includes(state.deliveryState))
         ? state : null;
     }
@@ -83,7 +86,7 @@ export async function confirmPendingSend(current, result = {}) {
 export async function sendNotDelivered(current) {
   const threadId = current.payload?.threadId, clientId = current.payload?.clientUserMessageId;
   if (current.action !== "send" && current.action !== "editMessage" || typeof threadId !== "string"
-      || typeof clientId !== "string" || !(claudeThreadId(threadId) || antigravityThreadId(threadId))
+      || typeof clientId !== "string" || !claudeThreadId(threadId)
       || session?.capabilities?.queueSendRecovery !== true
       || current.deviceId && current.deviceId !== session?.device.id) return false;
   const state = await api("/api/read/sendState", { threadId, clientUserMessageId: clientId });

@@ -48,6 +48,9 @@ export async function mutate(action, payload, { reliable = false, receiptId = nu
     try {
       const record = {
         id, action, payload, deviceId: session.device.id, selectionToken, operationScope, time: Date.now(),
+        // AGY 普通消息受理期间只复用发送按钮，不把“等待开始/响应”做成回执提示；传输或送达未知另行处理。
+        ...(!goalAction && (["send", "editMessage"].includes(action) && antigravityThreadId(payload.threadId)
+          || action === "create" && payload.backend === "antigravity") ? { agySending: true } : {}),
         ...(["send", "create", "setGoal", "editMessage"].includes(action) ? {
           // 历史回退事件会重新加载正文；先保存编辑文字，失败或刷新后不能随旧消息节点一起丢失。
           draft: action === "editMessage"
@@ -129,6 +132,7 @@ export async function mutate(action, payload, { reliable = false, receiptId = nu
         await recoverFailedInput(pending);
         if (ownsPending()) savePending(null);
       } else {
+        if (ownsPending() && pending.agySending) pending.agySending = false;
         if (ownsPending() && error.operationState !== "failed")
           error.pendingFeedback = true;
         if (ownsPending()) void resolvePending();
@@ -158,7 +162,7 @@ export async function mutate(action, payload, { reliable = false, receiptId = nu
   if (result.state === "pending") {
     const confirmed = (action === "send" || action === "editMessage") && ownsPending()
       ? await confirmPendingSend(pending, result.result).catch(() => null) : null;
-    if (confirmed && ownsPending()) result = { state: "completed", result: confirmed };
+    if (confirmed && ownsPending()) result = { state: confirmed.ok === false ? "failed" : "completed", result: confirmed };
     else {
       if (ownsPending()) void resolvePending();
       throw Object.assign(new Error("操作仍在处理，请稍后查看会话或回执"), { deliveryPending: action === "send",
@@ -168,9 +172,10 @@ export async function mutate(action, payload, { reliable = false, receiptId = nu
     }
   }
   if (result.state === "unknown") {
+    if (ownsPending() && pending.agySending) pending.agySending = false;
     const confirmed = (action === "send" || action === "editMessage") && ownsPending()
       ? await confirmPendingSend(pending, result.result).catch(() => null) : null;
-    if (confirmed && ownsPending()) result = { state: "completed", result: confirmed };
+    if (confirmed && ownsPending()) result = { state: confirmed.ok === false ? "failed" : "completed", result: confirmed };
     else {
       if (ownsPending() && (queueAction || action === "send" || action === "editMessage"
           || queuedEditActions.has(action) && session.capabilities?.queueEditRecovery === true))
@@ -231,6 +236,7 @@ export async function resolvePending() {
   try {
     let receipt = await api(`/api/receipts/${current.id}`);
     if (!stillCurrent()) return;
+    if (typeof current.agySending === "boolean") current.agySending = receipt.state === "pending";
     if (goalComposerAction(current.action, current.payload)) {
       const outcome = await applyGoalComposerReceipt(current, receipt, { allowSelection: true });
       if (outcome === "pending" && pending?.id === current.id) {
@@ -243,7 +249,7 @@ export async function resolvePending() {
         && ["pending", "unknown"].includes(receipt.state)) {
       const confirmed = await confirmPendingSend(current, receipt.result);
       if (!stillCurrent()) return;
-      if (confirmed) receipt = { state: "completed", result: confirmed };
+      if (confirmed) receipt = { state: confirmed.ok === false ? "failed" : "completed", result: confirmed };
       else if (receipt.state === "unknown") {
         // 服务端已按原生证据结案为“没有送达”：与明确失败同样处理，恢复输入并解除锁定，不重发。
         const abandoned = await sendNotDelivered(current).catch(() => false);
@@ -257,14 +263,14 @@ export async function resolvePending() {
         }
       }
     }
-    if (receipt.state === "pending") { retry(2000); return; }
+    if (receipt.state === "pending") { retry(2000); if (current.agySending) updateComposer(); return; }
     if (receipt.state === "unknown") {
       if (queuedEditActions.has(current.action)) {
         if (session.capabilities?.queueEditRecovery === true) {
           const state = await checkQueuedMessageEdit(current.payload.threadId, current.payload.editId);
           if (stillCurrent() && state?.operationPending) retry(2000);
         } else notice("队列编辑结果尚未确认，请更新远程服务后核对；不会重复保存或恢复消息。", true);
-      } else if (queueAction) retry(5000);
+      } else if (queueAction || current.action === "create" && typeof current.agySending === "boolean") retry(5000);
       updateComposer(); return;
     }
     if (receipt.state === "failed") {
@@ -363,6 +369,7 @@ export async function resolvePending() {
     updateComposer();
   } catch (error) {
     if (!stillCurrent()) return;
+    if (current.agySending) { current.agySending = false; updateComposer(); }
     if (error.code === 404) {
       if (goalComposerAction(current.action, current.payload)) {
         updateGoalComposerPending({ ...current, receiptState: "unknown" });
@@ -405,9 +412,16 @@ export async function resolvePending() {
       }
       if (queuedEditActions.has(current.action) && session.capabilities?.queueEditRecovery === true)
         await checkQueuedMessageEdit(current.payload.threadId, current.payload.editId);
-      else if (current.action === "send" && current.payload?.clientUserMessageId) {
+      else if ((current.action === "send" || current.action === "editMessage" && antigravityThreadId(current.payload?.threadId))
+          && current.payload?.clientUserMessageId) {
         const confirmed = await confirmPendingSend(current).catch(() => null);
-        if (confirmed && stillCurrent()) {
+        if (confirmed?.ok === false && stillCurrent()) {
+          try { await recoverFailedInput(current); }
+          catch (failure) { notice(failure.message, true); retry(5000); return; }
+          if (!stillCurrent()) return;
+          savePending(null);
+          notice(confirmed.message, true);
+        } else if (confirmed && stillCurrent()) {
           savePending(null);
           applyQueuedSendResult(current.payload.threadId, confirmed,
             current.selectionToken === selectionToken ? queueReadVersion : -1, current.payload);

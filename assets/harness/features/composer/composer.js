@@ -226,7 +226,7 @@ export function syncPendingFeedbackTimer() {
   // Claude 压缩受理后迟迟不开始才提示：会话执行中的排队不计时，空闲后到点再刷新输入区提示。
   const nativeStartSince = nativeCompactionStartBaseline(selectedId, compaction);
   const records = [
-    pending, threadDeletions.get(threadDeletionKey(selectedId)),
+    pending?.agySending ? null : pending, threadDeletions.get(threadDeletionKey(selectedId)),
     goalEditPending?.payload.threadId === selectedId ? goalEditPending : null,
     awaitingCompaction ? compaction : null,
     nativeStartSince === null ? null : { action: "nativeCompactionStart", time: nativeStartSince },
@@ -370,13 +370,18 @@ export function updateComposer({ followEnd = false } = {}) {
   add.disabled = add.menuOptions.every(option => option.disabled);
   if (activePopup?.trigger === add) renderPopup();
   const queuedEditAction = queuedEditSubmittingAction();
+  // AGY 的原请求还在正常处理时只使用现有按钮；切换会话不能把上个会话标成发送中。
+  const agySending = pending?.agySending === true && !active && !pending.invalid && !pending.recoveryUnavailable
+    && pending.deviceId === session?.device?.id && (!pending.operationScope || pending.operationScope === privateInputScope(session))
+    && (pending.payload?.threadId ? pending.payload.threadId === selectedId
+      : creating && pending.selectionToken === selectionToken);
   const sendingLabel = sending ? sending.phase === "syncing" ? "同步中…" : "发送中…"
-    : queuedEditAction === "cancelQueuedEdit" ? "处理中…" : queuedEditAction === "editQueued" ? "发送中…" : "";
+    : agySending ? "发送中…" : queuedEditAction === "cancelQueuedEdit" ? "处理中…" : queuedEditAction === "editQueued" ? "发送中…" : "";
   if ($("#send-status").textContent !== sendingLabel) $("#send-status").textContent = sendingLabel;
   // 用户要求压缩执行中空输入显示停止；有正文或附件时仍可加入原生队列，旧 print 会话保留原停止行为。
   // 用户要求排队取回后沿用普通发送图标和文案；空草稿不能误显示停止当前任务。
   // 只有定时标记、还没有正文时仍按空输入处理，执行中保留停止按钮。
-  const action = sending ? "sending" : editingQueuedMessage || scheduling && (prompt || hasAttachments) ? "send"
+  const action = sending || agySending ? "sending" : editingQueuedMessage || scheduling && (prompt || hasAttachments) ? "send"
     : isClaude() && !claudeNativeQueue() && active && selectedId ? "stop"
     : !goalMode && !editing && (active || compactionInProgress(compaction))
       && ((!prompt && !hasAttachments) || pending) && selectedId ? "stop" : "send";
@@ -400,7 +405,7 @@ export function updateComposer({ followEnd = false } = {}) {
   else if (unsupportedImages) send.title = "当前服务版本尚不支持图片发送，请先更新程序";
   if (unsupportedFiles) send.title = "请更新远程服务后发送文件和文件夹";
   if (unsupportedProjectless) send.title = "当前服务版本尚不支持无项目会话，请先更新程序或选择已有项目";
-  send.setAttribute("aria-busy", String(busy || stopping));
+  send.setAttribute("aria-busy", String(busy || stopping || agySending));
   const blockedBy = !sessionTypeEnabled && action !== "stop" ? "backend-disabled"
     : editingMessage ? "message-edit" : editingQueuedMessage?.state === "starting" ? "queue-edit-loading"
     : deleting ? "delete" : busy ? "busy" : stopping ? "stopping"
@@ -489,7 +494,8 @@ export function updateComposer({ followEnd = false } = {}) {
     $("#pending-area").append(element("div", "pending-banner goal-composer-note", goalReason));
   renderClaudeControlNotices($("#pending-area"));
   if (pending && (!sending || pending.payload !== sending.payload)
-      && (pending.invalid || pending.deviceId && pending.deviceId !== session.device.id || pendingFeedbackReady(pending))) {
+      && (pending.invalid || pending.deviceId && pending.deviceId !== session.device.id
+        || !pending.agySending && pendingFeedbackReady(pending))) {
     const unavailable = pending.invalid || (pending.deviceId && pending.deviceId !== session.device.id);
     const pendingGoal = goalComposerAction(pending.action, pending.payload);
     const pendingQueueItem = ["steerQueued", "removeQueued"].includes(pending.action);
@@ -778,7 +784,11 @@ export async function sendMessage() {
       return;
     }
     if (error.pendingFeedback) updateComposer();
-    else if (error.deliveryPending) notice("正在自动核对原生接收状态，不会重发消息。");
+    else if (error.deliveryPending) {
+      // 原生消息可能已被并发回执确认；AGY 的未知结果只走同一条内联恢复提示，不再叠加通知。
+      if (!antigravityThreadId(payload.threadId) && payload.backend !== "antigravity")
+        notice("正在自动核对原生接收状态，不会重发消息。");
+    }
     else if (submission.phase === "syncing") recordDiagnostic("remote.send.reload", {
       phase: "failure", errorType: error?.name || "Error"
     });

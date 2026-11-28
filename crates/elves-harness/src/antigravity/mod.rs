@@ -3,6 +3,7 @@
 
 pub(crate) mod acp;
 mod checkpoints;
+mod input_receipt;
 pub(crate) mod local_store;
 pub(crate) mod projection;
 pub(crate) mod queue;
@@ -178,6 +179,7 @@ impl Conversation {
         if let Some(obj) = value.as_object_mut() {
             obj.remove("_acpUsage");
             obj.remove("_pendingUserItem");
+            obj.remove("_rejectedInputId");
             obj.remove("_pendingPrompts");
             obj.remove("_promptError");
             obj.remove("_promptUsage");
@@ -329,6 +331,7 @@ impl Conversation {
 struct ActiveRuntime {
     client: Arc<AcpClient>,
     native_session_id: String,
+    receipt_source: Option<input_receipt::Source>,
     #[allow(dead_code)]
     initialize_result: Value,
     supports_image: bool,
@@ -1325,21 +1328,37 @@ impl Antigravity {
 
     pub(crate) async fn queue_send_state(&self, payload: &Value) -> anyhow::Result<Value> {
         let id = payload["threadId"].as_str().context("缺少 Antigravity 会话 ID")?;
-        let client_id = payload["clientUserMessageId"].as_str().unwrap_or("");
-        let c = self.conversation(id).await?;
-        let found = c.turns.iter().any(|turn| {
-            turn["id"] == client_id
-                || turn["items"]
-                    .as_array()
-                    .is_some_and(|items| items.iter().any(|i| i["clientId"] == client_id))
-        });
-        let queued = c.remote_queue.messages.iter().any(|m| m.id == client_id);
-        Ok(json!({
-            "ok": true,
-            "threadId": id,
-            "clientUserMessageId": client_id,
-            "state": if found { "delivered" } else if queued { "queued" } else { "unknown" },
-        }))
+        let client_id = payload["clientUserMessageId"].as_str().filter(|s| !s.is_empty())
+            .ok_or_else(|| error(400, "缺少客户端消息标识"))?;
+        let saved = self.saved.lock().await;
+        let c = saved.conversations.get(id).filter(|c| !c.deleted)
+            .ok_or_else(|| error(404, "Antigravity 会话不存在"))?;
+        // 原生用户项才表示送达；本地轮次、投递中的队列和未知结果都不能解除回执锁。
+        let mut rejection = None;
+        for turn in c.turns.iter().rev() {
+            if let Some(item) = turn["items"].as_array().and_then(|items| items.iter().find(|i|
+                i["type"] == "userMessage" && i["clientId"] == client_id && i["remotePendingInput"] != true))
+            {
+                return Ok(json!({"ok":true,"threadId":id,"clientUserMessageId":client_id,
+                    "state":"delivered","confirmed":true,"deliveryState":"accepted","turnId":turn["id"],"messageId":item["id"]}));
+            }
+            if turn["_rejectedInputId"] == client_id && turn["error"]["source"] == "antigravity" {
+                rejection.get_or_insert(&turn["error"]);
+            }
+        }
+        if let Some(native) = rejection {
+            return Ok(json!({"ok":true,"threadId":id,"clientUserMessageId":client_id,"confirmed":false,
+                "state":"failed","deliveryState":"failed","code":native["statusCode"],"message":native["nativeMessage"]}));
+        }
+        let queued = c.remote_queue.messages.iter().any(|m| !m.compact && m.id == client_id
+            && matches!(m.state.as_str(), "" | "queued" | "paused"));
+        let mut state = if queued { c.remote_queue.snapshot(id, &self.epoch) } else { json!({"ok":true,"threadId":id}) };
+        state["clientUserMessageId"] = json!(client_id);
+        state["confirmed"] = json!(queued);
+        state["deliveryState"] = json!(if queued { "queued" } else { "unknown" });
+        state["state"] = state["deliveryState"].clone();
+        if queued { state["messageId"] = json!(client_id); }
+        Ok(state)
     }
 
     /// 定位目标 Antigravity 实例的 `~/.gemini` 本地配置与转录根目录（本机或 WSL UNC）。
@@ -1519,12 +1538,12 @@ impl Antigravity {
 
     /// 检测已有原生会话实际归属的 Antigravity 数据目录（`antigravity` / `antigravity-cli` / `antigravity-ide`），
     /// 供 `agy acp --app-data-dir` 定位轨迹库，避免桌面 App 会话续聊时触发 `trajectory not found`。
-    async fn resolve_session_app_data_dir(&self, c: &Conversation) -> Option<&'static str> {
-        if !local_store::valid_native_id(&c.native_id) {
+    async fn resolve_session_app_data_dir(root: Option<PathBuf>, native_id: &str) -> Option<&'static str> {
+        if !local_store::valid_native_id(native_id) {
             return None;
         }
-        let gemini_root = self.resolve_gemini_root(&c.config).await?;
-        let native_id = c.native_id.clone();
+        let gemini_root = root?;
+        let native_id = native_id.to_owned();
         tokio::task::spawn_blocking(move || {
             local_store::detect_session_app_data_dir(&gemini_root, &native_id)
         })
@@ -1546,7 +1565,7 @@ impl Antigravity {
             return Ok(false);
         }
         let effective_cwd = c.effective_cwd().to_owned();
-        let app_data_dir = self.resolve_session_app_data_dir(&c).await;
+        let app_data_dir = Self::resolve_session_app_data_dir(self.resolve_gemini_root(&c.config).await, &c.native_id).await;
         let (client, mut channels) =
             AcpClient::spawn(&c.config, &c.cwd, &c.linux_cwd, app_data_dir, false, None).await?;
         let mut updates = Vec::new();
@@ -1730,10 +1749,11 @@ impl Antigravity {
         system_prompt_append: Option<&str>,
     ) -> anyhow::Result<(Arc<ActiveRuntime>, Value, AcpChannels)> {
         let effective_cwd = c.effective_cwd().to_owned();
+        let gemini_root = self.resolve_gemini_root(&c.config).await;
         let app_data_dir = if create_new || c.native_id.is_empty() {
             None
         } else {
-            self.resolve_session_app_data_dir(c).await
+            Self::resolve_session_app_data_dir(gemini_root.clone(), &c.native_id).await
         };
         // /usage 使用默认 CLI 数据目录；桌面或 IDE 专用目录的登录结果不能给 CLI 额度标注账号或等级。
         let account = if matches!(app_data_dir, None | Some("antigravity-cli")) {
@@ -1795,9 +1815,13 @@ impl Antigravity {
             .unwrap_or_else(|| c.native_id.clone());
         let supports_image = init["agentCapabilities"]["promptCapabilities"]["image"] == true;
         let supports_steering = projection::supports_prompt_steering(&init);
+        let receipt_source = gemini_root.and_then(|root|
+            input_receipt::Source::new(root, app_data_dir.unwrap_or("antigravity-cli"),
+                &native_session_id, create_new || c.native_id.is_empty()));
         let runtime = Arc::new(ActiveRuntime {
             client: client.clone(),
             native_session_id,
+            receipt_source,
             initialize_result: init,
             supports_image,
             supports_steering,
@@ -2773,23 +2797,40 @@ impl Antigravity {
             "_pendingPrompts": 1,
         });
 
-        {
-            let mut saved = self.saved.lock().await;
-            let c = saved
-                .conversations
-                .get_mut(thread_id)
+        let (first, unique_text, native_at_start) = {
+            let saved = self.saved.lock().await;
+            let c = saved.conversations.get(thread_id)
                 .ok_or_else(|| error(404, "Antigravity 会话不存在"))?;
             if c.active() {
                 return Err(error(409, "Antigravity 当前轮次仍在执行，请等待结束或使用队列引导"));
+            }
+            let first = c.turns.is_empty();
+            let text = runtime.receipt_source.as_ref().filter(|_| c.native_id == runtime.native_session_id)
+                .and_then(|_| input_receipt::unique_text(&blocks, &c.turns))
+                // 另一条在途或结果未知的队列消息也可能迟到落盘；同文时仍由原 ACP 请求确认。
+                .filter(|text| !c.remote_queue.messages.iter().any(|m| m.id != client_msg_id
+                    && matches!(m.state.as_str(), "unknown" | "sending") && m.payload["prompt"].as_str() == Some(text)));
+            (first, text, c.native_id.clone())
+        };
+        let proof = match (runtime.receipt_source.clone(), unique_text) {
+            (Some(source), Some(text)) => source.baseline(first).await.map(|cursor| (cursor, text)),
+            _ => None,
+        };
+        let (confirmation, received) = oneshot::channel();
+        {
+            let mut saved = self.saved.lock().await;
+            let c = saved.conversations.get_mut(thread_id).filter(|c| !c.deleted)
+                .ok_or_else(|| error(404, "Antigravity 会话不存在"))?;
+            if c.active() || c.native_id != native_at_start {
+                return Err(error(409, "Antigravity 会话状态已改变，本条消息未派发"));
             }
             c.turns.push(turn.clone());
             c.active_turn_id = Some(turn_id.clone());
             c.updated_at = now;
             c.edit_history_head = format!("agy-head-{}", c.turns.len());
             self.persist_locked(&saved, Some(thread_id)).await?;
+            self.prompt_confirmations.lock().await.insert(turn_id.clone(), confirmation);
         }
-        let (confirmation, received) = oneshot::channel();
-        self.prompt_confirmations.lock().await.insert(turn_id.clone(), confirmation);
         turn.as_object_mut().unwrap().remove("_pendingUserItem");
         turn.as_object_mut().unwrap().remove("_pendingPrompts");
 
@@ -2808,8 +2849,10 @@ impl Antigravity {
         let tid = thread_id.to_owned();
         let active_turn_id = turn_id.clone();
         let rt = runtime.clone();
+        let (written, write_observed) = oneshot::channel();
+        let dispatched_at = now_ms();
         tokio::spawn(async move {
-            let prompt_res = rt.client.session_prompt(&rt.native_session_id, blocks).await;
+            let prompt_res = rt.client.session_prompt_observing_write(&rt.native_session_id, blocks, Some(written)).await;
             if prompt_res.is_ok() {
                 service.confirm_turn_message(&tid, &active_turn_id).await;
             } else if let Some(sender) = service.prompt_confirmations.lock().await.remove(&active_turn_id) {
@@ -2824,7 +2867,26 @@ impl Antigravity {
         });
 
         // 接收观察窗口与 ACP 写入预算同为 15 秒；超时只返回待核对，后台原请求继续等待，不能重发。
-        match tokio::time::timeout(Duration::from_secs(15), received).await {
+        let mut received = received;
+        let verify = async {
+            let Some((cursor, text)) = proof else { return false };
+            write_observed.await.is_ok() && cursor.observe(text, dispatched_at).await
+                && runtime.client.is_live() && self.runtimes.lock().await.get(thread_id)
+                    .is_some_and(|rt| Arc::ptr_eq(rt, runtime))
+        };
+        let wait = async {
+            tokio::select! {
+                biased;
+                result = &mut received => result,
+                matched = verify => {
+                    if matched {
+                        self.confirm_matching_turn_message(thread_id, &turn_id, Some(&runtime.native_session_id)).await;
+                    }
+                    received.await
+                },
+            }
+        };
+        match tokio::time::timeout(Duration::from_secs(15), wait).await {
             Ok(Ok(Ok(()))) => {}
             Ok(Ok(Err(err))) => return Err(err.into()),
             _ => {
@@ -2838,6 +2900,8 @@ impl Antigravity {
             "threadId": thread_id,
             "turnId": turn_id,
             "clientUserMessageId": client_msg_id,
+            "confirmed": true,
+            "deliveryState": "accepted",
             "item": user_item,
             "backend": "antigravity",
         }))
@@ -2853,10 +2917,16 @@ impl Antigravity {
     }
 
     async fn confirm_turn_message(&self, thread_id: &str, turn_id: &str) {
+        self.confirm_matching_turn_message(thread_id, turn_id, None).await;
+    }
+
+    async fn confirm_matching_turn_message(&self, thread_id: &str, turn_id: &str, native: Option<&str>) {
         let item = {
             let mut saved = self.saved.lock().await;
             let Some(c) = saved.conversations.get_mut(thread_id).filter(|c| !c.deleted) else { return };
+            if native.is_some_and(|id| c.native_id != id || c.active_turn_id.as_deref() != Some(turn_id)) { return; }
             let Some(turn) = c.turns.iter_mut().find(|t| t["id"] == turn_id) else { return };
+            if native.is_some() && (turn["_pendingPrompts"] != 1 || turn["_promptError"].is_object()) { return; }
             let Some(item) = turn.as_object_mut().and_then(|t| t.remove("_pendingUserItem")) else { return };
             turn["items"].as_array_mut().unwrap().insert(0, item.clone());
             if let Some(client_id) = item["clientId"].as_str() {
@@ -2895,7 +2965,11 @@ impl Antigravity {
                 let _ = self.persist_locked(&saved, Some(thread_id)).await;
                 return;
             }
-            turn.as_object_mut().unwrap().remove("_pendingUserItem");
+            // 回执观察期结束后才返回原生拒绝，也要让同一条消息的只读查询结案。已经有接受证据或仅断线均不能据此判拒绝。
+            if let Some(pending) = turn.as_object_mut().unwrap().remove("_pendingUserItem")
+                && turn["_promptError"]["source"] == "antigravity" && pending["clientId"].is_string() {
+                turn["_rejectedInputId"] = pending["clientId"].clone();
+            }
             if turn["_promptError"].is_object() {
                 Err(turn["_promptError"].clone())
             } else {
@@ -4327,6 +4401,7 @@ mod tests {
         let rt = Arc::new(ActiveRuntime {
             client,
             native_session_id: "audit".into(),
+            receipt_source: input_receipt::Source::new(dir.path().to_owned(), "antigravity-cli", "audit", true),
             initialize_result: Value::Null,
             supports_image: false,
             supports_steering: steering,
@@ -4680,11 +4755,20 @@ mod tests {
         let result = ag.dispatch_turn("antigravity-audit", &rt, &json!({
             "prompt":"direct","clientUserMessageId":"direct-1"
         })).await;
+        tokio::time::timeout(AUDIT_ACTION_TIMEOUT, async {
+            while ag.conversation("antigravity-audit").await.unwrap().active() { tokio::task::yield_now().await; }
+        }).await.unwrap();
         let c = ag.conversation("antigravity-audit").await.unwrap();
         rt.client.close().await;
         assert!(result.is_err());
         assert!(c.turns.iter().all(|t| t["items"].as_array().unwrap().is_empty()));
         assert!(c.turns.iter().all(|t| c.displayed_turn(t).get("_pendingUserItem").is_none()));
+        let restored = Antigravity::new(_dir.path()).unwrap();
+        let state = restored.queue_send_state(&json!({"threadId":"antigravity-audit",
+            "clientUserMessageId":"direct-1"})).await.unwrap();
+        assert_eq!(state["deliveryState"], "failed", "迟到或重连后的明确拒绝也要结束核对");
+        assert_eq!(state["confirmed"], false);
+        assert_eq!(state["message"], "rejected for regression");
     }
 
     #[tokio::test]
@@ -4701,6 +4785,69 @@ mod tests {
         assert!(result.unwrap().is_ok());
         assert!(c.active());
         assert_eq!(c.turns[0]["items"][0]["clientId"], "direct-1");
+    }
+
+    #[tokio::test]
+    async fn audit_send_confirms_new_native_input_without_waiting_for_output() {
+        // 隔离 CLI 只向本次临时转录追加用户输入，不发任何思考、工具或 prompt 成功回包。
+        let script = r#"if(q.method==='fixture/path'){globalThis.path=q.params.path;console.log(JSON.stringify({id:q.id,result:{}}))}
+            if(q.method==='session/prompt'){globalThis.promptId=q.id;
+                require('fs').appendFileSync(globalThis.path,JSON.stringify({type:'USER_INPUT',source:'USER_EXPLICIT',status:'DONE',
+                    created_at:new Date().toISOString(),step_index:6,content:'<USER_REQUEST>\n'+q.params.prompt[0].text+'\n</USER_REQUEST>\n<ADDITIONAL_METADATA></ADDITIONAL_METADATA>'})+'\n');}
+            if(q.method==='fixture/reject'){console.log(JSON.stringify({id:globalThis.promptId,error:{code:-32603,message:'fixture native failure'}}));
+                console.log(JSON.stringify({id:q.id,result:{}}));}"#;
+        let (dir, ag, _auth, rt) = audit_fixture(script, false, false).await;
+        let path = dir.path().join("antigravity-cli/brain/audit/.system_generated/logs/transcript_full.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{\"step_index\":5,\"type\":\"PLANNER_RESPONSE\"}\n").unwrap();
+        rt.client.request_with_timeout("fixture/path", json!({"path":path}), Some(AUDIT_ACTION_TIMEOUT)).await.unwrap();
+        let payload = json!({"threadId":"antigravity-audit","clientUserMessageId":"client-native","prompt":"精确核对\n第二行"});
+        let result = tokio::time::timeout(AUDIT_ACTION_TIMEOUT, ag.dispatch_turn("antigravity-audit", &rt, &payload))
+            .await.expect("原生输入已落盘，无需等首条输出").unwrap();
+        let state = ag.queue_send_state(&payload).await.unwrap();
+        assert_eq!(state["deliveryState"], "accepted");
+        assert_eq!(state["confirmed"], true);
+        assert_eq!(state["turnId"], result["turnId"]);
+        assert_eq!(state["messageId"], result["item"]["id"]);
+        let c = ag.conversation("antigravity-audit").await.unwrap();
+        assert!(c.active());
+        assert_eq!(c.turns[0]["items"].as_array().unwrap().len(), 1);
+        assert!(c.turns[0]["firstTokenAtMs"].is_null(), "原生输入不能算作首 Token");
+        rt.client.request_with_timeout("fixture/reject", json!({}), Some(AUDIT_ACTION_TIMEOUT)).await.unwrap();
+        tokio::time::timeout(AUDIT_ACTION_TIMEOUT, async {
+            while ag.conversation("antigravity-audit").await.unwrap().active() { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        let c = ag.conversation("antigravity-audit").await.unwrap();
+        assert_eq!(c.turns[0]["error"]["nativeMessage"], "fixture native failure");
+        assert_eq!(c.turns[0]["items"].as_array().unwrap().len(), 1);
+        rt.client.close().await;
+    }
+
+    #[tokio::test]
+    async fn audit_send_state_does_not_confirm_placeholders_or_uncertain_queue() {
+        let (_dir, ag, _auth, rt) = audit_fixture(AUDIT_ACCEPT, true, false).await;
+        let id = "antigravity-audit";
+        let query = |client| json!({"threadId":id,"clientUserMessageId":client});
+        {
+            let mut saved = ag.saved.lock().await;
+            let c = saved.conversations.get_mut(id).unwrap();
+            c.turns[0]["_pendingUserItem"] = json!({"type":"userMessage","clientId":"unwritten"});
+            c.turns[0]["items"] = json!([{"type":"reasoning","clientId":"tool"},
+                {"type":"userMessage","clientId":"placeholder","remotePendingInput":true}]);
+            for key in ["waiting", "inflight", "uncertain"] { c.remote_queue.enqueue(query(key), now_ms()); }
+            c.remote_queue.mark_sending("inflight").unwrap();
+            c.remote_queue.delivery_failed("uncertain", true, "unknown");
+        }
+        for key in ["turn-1","unwritten","tool","placeholder","inflight","uncertain"] {
+            let r = ag.queue_send_state(&query(key)).await.unwrap();
+            assert_eq!(r["deliveryState"], "unknown", "{key}");
+            assert_eq!(r["confirmed"], false, "{key}");
+        }
+        let queued = ag.queue_send_state(&query("waiting")).await.unwrap();
+        assert_eq!(queued["deliveryState"], "queued");
+        assert_eq!(queued["confirmed"], true);
+        assert!(queued["queuedMessages"].is_array());
+        rt.client.close().await;
     }
 
     #[tokio::test]
@@ -4782,6 +4929,7 @@ mod tests {
         let unavailable = Arc::new(ActiveRuntime {
             client: AcpClient::test_closed_writer(),
             native_session_id: rt.native_session_id.clone(),
+            receipt_source: None,
             initialize_result: Value::Null,
             supports_image: false,
             supports_steering: true,
@@ -4867,6 +5015,7 @@ mod tests {
         let unavailable = ActiveRuntime {
             client: AcpClient::test_closed_writer(),
             native_session_id: "audit".into(),
+            receipt_source: None,
             initialize_result: Value::Null,
             supports_image: false,
             supports_steering: true,
