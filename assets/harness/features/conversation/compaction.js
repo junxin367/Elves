@@ -3,8 +3,8 @@
 import { confirmAction } from "../../ui/dialog.js";
 import { button, element } from "../../ui/dom.js";
 import { notice } from "../../ui/notice.js";
-import { reloadThread, updateComposer } from "../../core/actions.js";
-import { busy, connected, selectedId, session, stopping, thread } from "../../core/state.js";
+import { applyQueuedSendResult, reloadThread, updateComposer } from "../../core/actions.js";
+import { busy, connected, selectedId, selectionVersion, session, stopping, thread } from "../../core/state.js";
 import { randomId } from "../../core/util.js";
 import { api } from "../api.js";
 import { modelIdentityMatches } from "../composer/model-identity.js";
@@ -130,6 +130,7 @@ export function reconcileCompaction(id, value) {
     }
     return setCompactionState(id, {
       ...current, ...projection,
+      turnId: projection.turnId || (projection.itemId && projection.itemId === current?.itemId ? current.turnId : null),
       // 原生读取确认的 pending 与本页尚未送达的请求分开，不能改写回执确认状态。
       nativeConfirmed: current?.nativeConfirmed === true
         || !current?.receiptId || compactionAdvanced(current, projection)
@@ -230,6 +231,8 @@ async function applyCompactionReceipt(id, receiptId, receipt) {
     return;
   }
   if (receipt.state === "unknown") {
+    // 已看见同次原生开始时，未知的只是送达回执；保留回执身份，不撤销正在执行的事实。
+    if (current.state === "running" && current.liveItemId && current.liveItemId === current.itemId) return;
     setCompactionState(id, { ...current, state: "unknown" });
     updateComposer();
     return;
@@ -252,14 +255,39 @@ async function applyCompactionReceipt(id, receiptId, receipt) {
     if (current.state !== "running" && !current.nativeConfirmed)
       setCompactionState(id, { state: "idle", turnId: current.baselineTurnId, itemId: current.baselineItemId });
     updateComposer();
+    if (session?.capabilities?.compactionItemEvents && connected && selectedId === id) {
+      // 入队只同步队列，不为一个队列标记重新下载历史；旧服务仍按原方式核对。
+      applyQueuedSendResult(id, { ...receipt.result, queueSyncPending: true }, null);
+      return;
+    }
     await refresh();
     return;
   }
   const acknowledged = setCompactionState(id, { ...current, acknowledged: true });
   if (receipt.result?.compaction) reconcileCompaction(id, receipt.result.compaction);
-  // 用户要求远程压缩完成时不再弹出提示；仍核对回执、解除压缩状态并刷新会话。
   updateComposer();
-  if (compactions.get(id)?.receiptId === acknowledged.receiptId) await refresh();
+  const latest = compactions.get(id);
+  if (latest?.receiptId !== acknowledged.receiptId) return;
+  const expected = receipt.result?.nativeCommand?.id || receipt.result?.compaction?.itemId;
+  // 只有同次在线条目才证明客户端已看到开始；pending、入队或 running 回执本身都不是正文证据。
+  const seen = value => value?.state === "running" && value.liveItemId && value.liveItemId === value.itemId
+    && (!expected || expected === "pending-manual-context-compaction" || expected === value.liveItemId);
+  if (seen(latest)) return;
+  if (session?.capabilities?.compactionItemEvents && connected && selectedId === id
+      && ["pending", "running"].includes(latest.state)) {
+    if (latest.startReadScheduled) return;
+    latest.startReadScheduled = true;
+    const selection = selectionVersion;
+    // 原生开始事件可能晚于受理。给小事件 3 秒先到，漏事件才补一次只读历史；不延迟渲染、不重发压缩。
+    setTimeout(() => {
+      const value = compactions.get(id);
+      if (value?.receiptId !== receiptId) return;
+      delete value.startReadScheduled;
+      if (connected && selection === selectionVersion && !seen(value)) void refresh();
+    }, 3000);
+    return;
+  }
+  await refresh();
 }
 async function resolveCompactionReceipt(id) {
   const current = compactions.get(id);
@@ -347,6 +375,7 @@ export async function compactContext() {
       setCompactionState(id, { state: "idle", turnId: current.turnId, itemId: current.itemId });
       notice(error.message, true);
     } else {
+      if (current.state === "running" && current.liveItemId && current.liveItemId === current.itemId) return;
       setCompactionState(id, { ...current, state: "unknown" });
       notice("未收到压缩回执。不会自动重发；请查回执、重新读取，或在本机核对后解除锁定。", true);
     }
@@ -363,7 +392,8 @@ function compactionEventMatches(current, item, turnId, completed = false) {
   if (current.itemId && current.itemId !== "pending-manual-context-compaction"
       && item?.id && current.itemId !== item.id) return false;
   if (current.turnId && turnId && current.turnId !== turnId) return false;
-  return !(current.receiptId && !current.itemId && !current.turnId && item?.source === "automatic");
+  return !(current.receiptId && !current.turnId && (!current.itemId || current.itemId === "pending-manual-context-compaction")
+    && item?.source === "automatic");
 }
 export function receiveCompactionLifecycle(event, params) {
   const id = params.threadId;
@@ -375,16 +405,20 @@ export function receiveCompactionLifecycle(event, params) {
   for (const item of items) {
     const itemCompleted = event.method === "item/completed" || item.completed === true
       || ["completed", "failed", "interrupted", "cancelled", "canceled"].includes(item.status);
+    if (!itemCompleted && current?.state === "idle" && current.itemId === item.id
+        && (!current.turnId || current.turnId === turnId)) continue;
     if (!compactionEventMatches(current, item, turnId, itemCompleted)) continue;
     if (itemCompleted) {
       setCompactionState(id, { state: "idle", turnId, itemId: item.id });
       current = compactions.get(id); changed = true; completed = true;
     } else if (event.method === "item/started" || item.completed === false) {
-      current = setCompactionState(id, { ...current, state: "running", nativeConfirmed: true, turnId, itemId: item.id });
+      current = setCompactionState(id, { ...current, state: "running", nativeConfirmed: true,
+        turnId, itemId: item.id, liveItemId: item.id, independentLifecycle: item.remoteCompactionLifecycle === true });
       changed = true;
     }
   }
-  if (!completed && event.method === "turn/completed" && current?.state === "running"
+  // Claude 手动压缩可挂在已经回复完的轮次后；结束正文轮次本身不是独立压缩操作的终态。
+  if (!completed && event.method === "turn/completed" && current?.state === "running" && !current.independentLifecycle
       && current.turnId && current.turnId === turnId) {
     setCompactionState(id, { state: "idle", turnId, itemId: current.itemId });
     changed = true; completed = true;

@@ -245,16 +245,16 @@ impl Checkpoint {
 
 /// 只合并已核实的检查点。托管轮把标记单独保存，不能打断 ACP 正在拼接的最后一段思考或回复。
 pub(super) fn merge(turns: &mut [Value], checkpoints: &[Checkpoint]) -> bool {
-    merge_evidence(turns, checkpoints)
+    merge_evidence(turns, checkpoints, |_, _| {})
 }
 
-pub(super) fn merge_recent(turns: &mut [Value], checkpoints: &[Checkpoint]) -> bool {
+pub(super) fn recent_updates(turns: &mut [Value], checkpoints: &[Checkpoint]) -> Vec<Value> {
     let Some(last) = turns.last().filter(|t| {
         t["id"]
             .as_str()
             .is_some_and(|id| id.starts_with("agy-turn-"))
     }) else {
-        return false;
+        return vec![];
     };
     // 前台只检查末轮新增的边界；同秒重复输入仍需经过全部可能轮次的唯一归属验证。
     let fresh: Vec<_> = checkpoints
@@ -266,27 +266,39 @@ pub(super) fn merge_recent(turns: &mut [Value], checkpoints: &[Checkpoint]) -> b
                 && cp.owns(last)
         })
         .collect();
-    merge_evidence(turns, fresh)
+    let mut changed = Vec::new();
+    merge_evidence(turns, fresh, |index, item| changed.push((index, item.clone())));
+    changed.into_iter().map(|(index, mut item)| {
+        let turn = &turns[index];
+        if let Some(items) = turn["items"].as_array() {
+            // 与历史投影共用同一个插入位置，只随事件发下一个正文 ID，不复制整轮回复。
+            let at = insertion_index(items, &item);
+            item["beforeItemId"] = items[at..].iter().find(|i| !i["nativeCheckpointStep"].is_u64())
+                .map_or(Value::Null, |i| i["id"].clone());
+        }
+        json!({"turnId":turn["id"],"item":item})
+    }).collect()
 }
 
 fn merge_evidence<'a>(
     turns: &mut [Value],
     checkpoints: impl IntoIterator<Item = &'a Checkpoint>,
+    mut on_change: impl FnMut(usize, &Value),
 ) -> bool {
     let mut changed = false;
     for cp in checkpoints {
         // 已从转录导入的条目按原生步骤和时间对齐，不重复生成，也不移动任何已有消息。
-        if let Some(item) = turns
-            .iter_mut()
-            .filter(|t| {
+        if let Some((index,item)) = turns
+            .iter_mut().enumerate()
+            .filter(|(_,t)| {
                 t["_agyInheritedHistory"] != true
                     && t["id"]
                         .as_str()
                         .is_some_and(|id| id.starts_with("agy-local-"))
             })
-            .filter_map(|t| t.get_mut("items")?.as_array_mut())
-            .flatten()
-            .find(|i| {
+            .filter_map(|(index,t)| Some((index,t.get_mut("items")?.as_array_mut()?)))
+            .flat_map(|(index,items)| items.iter_mut().map(move |i| (index,i)))
+            .find(|(_,i)| {
                 i["id"] == cp.item["id"]
                     && i["type"] == "contextCompaction"
                     && i["recordedAtMs"]
@@ -295,7 +307,7 @@ fn merge_evidence<'a>(
                         == Some(cp.at)
             })
         {
-            changed |= replace_checkpoint(item, cp);
+            if replace_checkpoint(item, cp) { changed = true; on_change(index, item); }
             continue;
         }
         let mut matches = turns
@@ -314,9 +326,10 @@ fn merge_evidence<'a>(
         }
         let events = turn["_agyCheckpoints"].as_array_mut().unwrap();
         if let Some(old) = events.iter_mut().find(|i| i["id"] == cp.item["id"]) {
-            changed |= replace_checkpoint(old, cp);
+            if replace_checkpoint(old, cp) { changed = true; on_change(index, old); }
         } else {
             events.push(cp.item());
+            on_change(index, events.last().unwrap());
             changed = true;
         }
     }
@@ -345,6 +358,15 @@ fn local_step(id: &str) -> Option<u64> {
     suffix.split('-').next()?.parse().ok()
 }
 
+fn insertion_index(items: &[Value], event: &Value) -> usize {
+    let step = event["nativeCheckpointStep"].as_u64().unwrap_or(0);
+    let at = event["recordedAtMs"].as_u64().unwrap_or(0);
+    items.iter().position(|i| {
+        if let Some(native) = i["id"].as_str().and_then(local_step) { return native > step; }
+        i["startedAtMs"].as_u64().or_else(|| i["sentAtMs"].as_u64()).is_some_and(|ms| ms / 1000 > at / 1000)
+    }).unwrap_or(items.len())
+}
+
 pub(super) fn display(turn: &mut Value) {
     let Some(mut events) = turn
         .as_object_mut()
@@ -357,28 +379,12 @@ pub(super) fn display(turn: &mut Value) {
     };
     events.sort_by_key(|e| e["nativeCheckpointStep"].as_u64());
     for event in events.iter() {
-        let (Some(step), Some(at)) = (
-            event["nativeCheckpointStep"].as_u64(),
-            event["recordedAtMs"].as_u64(),
-        ) else {
-            continue;
-        };
-        if items.iter().any(|i| i["id"] == event["id"]) {
+        if !event["nativeCheckpointStep"].is_u64() || !event["recordedAtMs"].is_u64()
+            || items.iter().any(|i| i["id"] == event["id"]) {
             continue;
         }
         // 原生导入项有步骤号，托管 ACP 项有接收时间；同秒不倒置已显示的项。没有后项时就停在当前位置。
-        let index = items
-            .iter()
-            .position(|i| {
-                if let Some(native) = i["id"].as_str().and_then(local_step) {
-                    return native > step;
-                }
-                i["startedAtMs"]
-                    .as_u64()
-                    .or_else(|| i["sentAtMs"].as_u64())
-                    .is_some_and(|ms| ms / 1000 > at / 1000)
-            })
-            .unwrap_or(items.len());
+        let index = insertion_index(items, event);
         items.insert(index, event.clone());
     }
 }

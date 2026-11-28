@@ -959,6 +959,14 @@ pub(crate) struct CompactionModelPreference {
     pub mode: CompactionModelMode,
 }
 
+impl CompactionModelPreference {
+    /// 用户要求尽快显示压缩开始；仅当缓存结果确实可能改变本次型号时才扫描会话统计。
+    pub(crate) fn needs_cache_check(&self, current: &str) -> bool {
+        self.mode == CompactionModelMode::CacheExpired
+            && resolve_manual_compaction_model(self, current, false).is_some()
+    }
+}
+
 fn parse_compaction_model_enabled(value: &Value) -> Result<bool, ApiError> {
     if value.is_null() {
         return Ok(false);
@@ -3571,6 +3579,10 @@ mod tests {
             model: Some("gpt-6.1-sol".into()),
             mode: CompactionModelMode::Always,
         };
+        assert!(!pref_disabled.needs_cache_check("gpt-6.1-terra"));
+        assert!(!pref_always.needs_cache_check("gpt-6.1-terra"));
+        assert!(!pref_expired.needs_cache_check("GPT-6.1-sol"));
+        assert!(pref_expired.needs_cache_check("gpt-6.1-terra"));
         assert_eq!(
             resolve_manual_compaction_model(&pref_always, "gpt-6.1-terra", true).as_deref(),
             Some("gpt-6.1-sol")

@@ -313,6 +313,18 @@ function mergeHistoryTurn(snapshot, readVersion, { older = false, beforeId = nul
     const isPreview = item => item._nativePreview === true
       || typeof item.id === "string" && item.id.startsWith("native-live-");
     const items = (authoritative.items || []).filter(item => !isPreview(item));
+    if (authoritative === snapshot && current) {
+      // 读取旧完整轮次期间刚收到的压缩小事件只保护该条目，不用旧轮正文覆盖此次读到的新消息。
+      for (const [i, live] of (current.items || []).entries()) {
+        if (live.type !== "contextCompaction") continue;
+        const at = items.findIndex(item => item.id === live.id);
+        if (at >= 0) items[at] = mergeItemProjection(live, items[at]);
+        else if ((itemVersions.get(`${snapshot.id}:${live.id}`) || 0) > readVersion && i > 0) {
+          const after = items.findIndex(item => item.id === current.items[i - 1].id);
+          if (after >= 0) items.splice(after + 1, 0, live);
+        }
+      }
+    }
     const basis = authoritative._nativePreviewBasis;
     let preview = null;
     if (["inProgress", "pending", "unknown"].includes(authoritative.status) && !authoritative._nativeDone

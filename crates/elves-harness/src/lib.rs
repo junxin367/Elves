@@ -4551,6 +4551,8 @@ async fn session(
     // 用户要求各端都提供“关闭其他占用”，不再区分设备；仍声明为能力，是为了让内置旧网页包（如 Android 先于服务端升级）
     // 连到不认识该动作的旧后台时不显示按钮。单独赋值：上面的 json! 已接近宏递归上限，再加一项无法编译。
     response["capabilities"]["releaseExternalHolders"] = json!(true);
+    // 新网页只对支持独立压缩条目事件的服务短暂等待；连接旧服务仍立即读取权威历史。
+    response["capabilities"]["compactionItemEvents"] = json!(true);
     // 用户要求缩短首条消息的等待：输入框开始输入时提前启动 Claude CLI。声明为能力，是为了让内置旧网页包
     // 连到不认识该动作的旧后台时不发起请求；同样单独赋值，避开上面 json! 的宏递归上限。
     response["capabilities"]["warmSession"] = json!(true);

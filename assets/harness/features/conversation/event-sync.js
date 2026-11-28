@@ -2,7 +2,7 @@
 
 import { notice } from "../../ui/notice.js";
 import { loadSidebar, reloadThread } from "../../core/actions.js";
-import { pageLeaving, selectedId, selectionVersion, session } from "../../core/state.js";
+import { pageLeaving, selectedId, selectionVersion, session, turns } from "../../core/state.js";
 import { privateInputScope } from "../session/capabilities.js";
 import { foregroundReadGeneration, refreshTimer, setRefreshTimer, setSidebarTimer, sidebarTimer } from "../session/connection-state.js";
 import { threadDeleted } from "../sidebar/deletion-state.js";
@@ -13,10 +13,24 @@ export function setNotifiedTokenUsage(value) { return notifiedTokenUsage = value
 export let statusVersion = 0, notifiedStatus = null;
 export function setStatusVersion(value) { return statusVersion = value; }
 export function setNotifiedStatus(value) { return notifiedStatus = value; }
-export function scheduleReload() {
-  if (refreshTimer) return;
+let emptyTurnReload = null;
+export function scheduleReload(emptyTurn = null) {
+  if (refreshTimer) {
+    // 停止、补缺、重连等其他理由也要求重读时，不能被压缩小事件取消。
+    if (!emptyTurn || emptyTurn.threadId !== emptyTurnReload?.threadId
+        || emptyTurn.turnId !== emptyTurnReload?.turnId) emptyTurnReload = null;
+    return;
+  }
+  emptyTurnReload = emptyTurn;
   setRefreshTimer(setTimeout(() => {
     setRefreshTimer(null);
+    const check = emptyTurnReload;
+    emptyTurnReload = null;
+    // Codex 可能先发空 turn/started，再发原生压缩 item；在原有刷新时间点检查，不为完整的压缩行重读历史。
+    if (check && check.threadId === selectedId) {
+      const items = turns.get(check.turnId)?.items;
+      if (items?.length === 1 && items[0].type === "contextCompaction") return;
+    }
     const id = selectedId, version = selectionVersion, scope = privateInputScope(session),
       generation = foregroundReadGeneration;
     void reloadThread().catch(error => {

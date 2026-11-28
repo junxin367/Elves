@@ -193,6 +193,8 @@ struct Conversation {
     // 终端预览只属于当前连接的内存视图；其他设置落盘也不能把它保存成原生正式历史。
     #[serde(skip)]
     live_preview: Option<SharedPreview>,
+    #[serde(skip)]
+    compaction_anchor: Option<native_controls::CompactionAnchor>,
     // 用户要求原生发现与网页创建区分：发现项重启/读历史只读，首次用户发送才接入原任务；本地标题修改不能被扫描覆盖。
     #[serde(default)]
     discovered: bool,
@@ -1352,6 +1354,7 @@ impl Claude {
             queued_messages: vec![],
             remote_queue: RemoteQueue::default(),
             live_preview: None,
+            compaction_anchor: None,
             discovered: true,
             native_title: String::new(),
             native_history_head: String::new(),
@@ -1573,6 +1576,7 @@ impl Claude {
                 queued_messages: vec![],
                 remote_queue: RemoteQueue::default(),
                 live_preview: None,
+                compaction_anchor: None,
                 discovered: true,
                 native_title: title.into(),
                 native_history_head: String::new(),
@@ -2481,6 +2485,7 @@ impl Claude {
             queued_messages: vec![],
             remote_queue: RemoteQueue::default(),
             live_preview: None,
+            compaction_anchor: None,
             discovered: false,
             native_title: String::new(),
             native_history_head: String::new(),
@@ -2746,6 +2751,7 @@ impl Claude {
             queued_messages: vec![],
             remote_queue: RemoteQueue::default(),
             live_preview: None,
+            compaction_anchor: None,
             discovered: false,
             native_title: String::new(),
             native_history_head: String::new(),
@@ -3356,6 +3362,10 @@ impl Claude {
         if frame["type"] == "shared_preview" {
             return self.ingest_shared_preview(id, generation, &frame).await;
         }
+        if frame["type"] == "shared_compaction_started" {
+            self.ingest_compaction_start(id, generation, &frame).await;
+            return Ok(());
+        }
         if frame["type"] == "shared_native_command_intent" {
             if self
                 .processes
@@ -3567,7 +3577,7 @@ impl Claude {
         // 持锁期间只做与当前会话状态相关的合并，其他请求不再排在整段投影之后。
         let native_clients: BTreeMap<String, String> =
             serde_json::from_value(frame["clients"].clone())?;
-        let mut projected = project_shared_history(frame, generation);
+        let (mut projected, anchor) = project_anchored_history(frame, generation);
         subagents::decorate_turns(id, &mut projected);
         let update = self
             .change_lazy(|saved| {
@@ -3583,6 +3593,7 @@ impl Claude {
                     "原生会话 UUID 不匹配，未替换原历史"
                 );
                 let initial_import = c.discovered && c.turns.is_empty();
+                c.compaction_anchor = anchor;
                 // 同一次快照前后使用同一计时基准，不能仅因后台任务多运行了几毫秒就重发整段历史。
                 let view_time = now_ms();
                 let previous_view = c.view_at(view_time);
@@ -3724,6 +3735,16 @@ impl Claude {
                 } else {
                     Vec::new()
                 };
+                // 冷启动时所有轮次的内部进程代次都会改变。已结束正文完全相同时，不为它重传旧消息。
+                let changed_turns: Vec<_> = if history_changed {
+                    projected.iter().rev().take(20).filter(|t| {
+                        let Some(old) = c.turns.iter().rev().take(20).find(|old| old["id"] == t["id"]) else { return true };
+                        if old == *t { return false; }
+                        !(matches!(t["status"].as_str(), Some("completed" | "interrupted" | "failed"))
+                            && old.as_object().zip(t.as_object()).is_some_and(|(a,b)| a.len() == b.len()
+                                && b.iter().all(|(k,v)| k == "_process" || a.get(k) == Some(v))))
+                    }).map(|t| t["id"].clone()).collect()
+                } else { vec![] };
                 if history_changed {
                     c.turns.set(projected);
                 }
@@ -3753,27 +3774,22 @@ impl Claude {
                             view[key] = value.clone();
                         }
                     }
-                    (
-                        view,
-                        c.turns
-                            .iter()
-                            .rev()
-                            .take(20)
-                            .map(|turn| c.displayed_turn(turn))
-                            .collect::<Vec<_>>(),
-                        c.turns
-                            .iter()
-                            .map(|turn| turn["id"].clone())
-                            .collect::<Vec<_>>(),
-                        tools::session_plan(&c.turns),
-                    )
+                    // 状态或队列变化只带会话元数据；不让它们排在真正的压缩开始事件前占用手机带宽。
+                    let mut params = json!({"threadId":id,"thread":view,"turns":[],"metadataOnly":!history_changed});
+                    if history_changed {
+                        params["turns"] = json!(c.turns.iter().rev().take(20)
+                            .filter(|t| changed_turns.contains(&t["id"])).map(|t| c.displayed_turn(t)).collect::<Vec<_>>());
+                        params["turnIds"] = json!(c.turns.iter().map(|t| &t["id"]).collect::<Vec<_>>());
+                        params["sessionPlan"] = tools::session_plan(&c.turns);
+                        params["completed"] = json!(completed);
+                    }
+                    params
                 });
                 // 回退分支已消耗的用量只能在回退发生时由旧正文算出；写盘前崩溃可能让旧正文先于账本被替换，
                 // 所以账本变化时不等合并落盘（用户要求回退不能被当成消费撤销）。
                 let ledger_changed = c.spent_requests != spent_before;
                 Ok((
                     update,
-                    completed,
                     usage_changed,
                     reverted,
                     naming_activity,
@@ -3784,7 +3800,6 @@ impl Claude {
             .await?;
         let (
             update,
-            completed,
             usage_changed,
             reverted,
             naming_activity,
@@ -3819,10 +3834,8 @@ impl Claude {
             // 显式原生回退沿用已有缓存失效事件；已确认消息的防丢逻辑不能把被回退的旧分支补回来。
             self.publish(json!({"method":"remote/threadReverted","params":{"threadId":id}}));
         }
-        if let Some((thread, turns, turn_ids, session_plan)) = update {
-            self.publish(json!({"method":"claude/history/updated","params":{
-                "threadId":id,"thread":thread,"turns":turns,"turnIds":turn_ids,
-                "sessionPlan":session_plan,"completed":completed}}));
+        if let Some(params) = update {
+            self.publish(json!({"method":"claude/history/updated","params":params}));
             self.publish(json!({"method":"remote/sidebarChanged","params":{"threadId":id}}));
         }
         if usage_changed {
@@ -4754,6 +4767,10 @@ fn project_shared_setting_changes(
 }
 
 fn project_shared_history(frame: &Value, generation: &str) -> Vec<Value> {
+    project_anchored_history(frame, generation).0
+}
+
+fn project_anchored_history(frame: &Value, generation: &str) -> (Vec<Value>, Option<native_controls::CompactionAnchor>) {
     let mut turns: Vec<Value> = vec![];
     let mut native_owners: HashMap<&str, usize> = HashMap::new();
     let mut native_positions = HashMap::new();
@@ -5116,8 +5133,15 @@ fn project_shared_history(frame: &Value, generation: &str) -> Vec<Value> {
     if let (Some(turn), Some(basis)) = (turns.last_mut(), shared_preview_basis(frame)) {
         turn["_nativePreviewBasis"] = json!(basis);
     }
+    // 保留最近可定位的原生 UUID 即可；无需为手机的单条开始通知常驻整份消息索引。
+    let anchor = frame["compaction_anchor"].as_str().and_then(|uuid| {
+        let (i, item) = native_positions.get(uuid)?;
+        Some(native_controls::CompactionAnchor {
+            uuid: uuid.to_owned(), turn: turns[*i]["id"].as_str()?.to_owned(), item: item.clone(),
+        })
+    });
     native_controls::project_compactions(compactions, &mut turns, &native_positions);
-    turns
+    (turns, anchor)
 }
 
 fn new_session_model_defaults(payload: &Value, catalog: &Value) -> Value {
@@ -5750,6 +5774,7 @@ mod tests {
             queued_messages: vec![],
             remote_queue: RemoteQueue::default(),
             live_preview: None,
+            compaction_anchor: None,
             discovered: false,
             native_title: String::new(),
             native_history_head: String::new(),
@@ -7652,6 +7677,74 @@ mod tests {
             2,
             "已结束轮次只保留正式正文，不恢复残留或迟到预览"
         );
+    }
+
+    #[tokio::test]
+    async fn compaction_start_reaches_the_client_without_the_large_history_or_a_pending_replay() {
+        let (_dir, service, mut c) = fixture();
+        let (_auth_dir, auth) = crate::tests::service_dispatch_fixture().await;
+        let _ = service.controller.set(Arc::downgrade(&auth.controller));
+        let mut rx = auth.controller.events.subscribe();
+        c.shared = true;
+        c.turns.clear();
+        service.saved.lock().await.conversations.insert(c.id.clone(), c.clone());
+        scripted_process(&service, &c.id, json!({})).await;
+        let generation = "scripted-process";
+        let mut rows = vec![];
+        for i in 0..20 {
+            rows.push(json!({"type":"user","uuid":format!("u{i}"),"message":{"content":"问"}}));
+            rows.push(json!({"type":"assistant","uuid":format!("a{i}"),"message":{"id":format!("m{i}"),
+                "content":[{"type":"text","text":"x".repeat(84_000)}]}}));
+            rows.push(json!({"type":"system","subtype":"turn_duration","uuid":format!("done{i}")}));
+        }
+        let mut frame = json!({"type":"shared_snapshot","native_id":c.native_id,"native_status":{"tempo":"idle"},
+            "messages":rows,"compaction_anchor":"done19","clients":{},"pending":[],"requests":{},
+            "native_control":{"compaction":{"state":"idle"},"commands":[],"compactionEvents":[]}});
+        let drain = |receiver: &mut tokio::sync::broadcast::Receiver<Value>|
+            std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
+        service.ingest_shared(&c.id, generation, &frame).await.unwrap();
+        let initial = drain(&mut rx).into_iter().find(|f| f["method"] == "claude/history/updated").unwrap();
+        let history_bytes = serde_json::to_vec(&initial).unwrap().len();
+        assert!(history_bytes > 1_600_000);
+        frame["native_control"] = json!({"compaction":{"state":"pending","itemId":"cmd"},"commands":[
+            {"id":"cmd","name":"compact","state":"pending"}],"compactionEvents":[]});
+        service.ingest_shared(&c.id, generation, &frame).await.unwrap();
+        let pending = drain(&mut rx).into_iter().find(|f| f["method"] == "claude/history/updated").unwrap();
+        assert_eq!(pending["params"]["metadataOnly"], true);
+        assert_eq!(pending["params"]["turns"], json!([]));
+        assert!(pending["params"]["turnIds"].is_null());
+        let start = json!({"type":"shared_compaction_started","native_id":c.native_id,"event":{
+            "id":"cmd","source":"manual","afterUuid":"done19","status":"inProgress","startedAtMs":123456}});
+        service.ingest(&c.id, "obsolete", start.clone()).await.unwrap();
+        let mut other = start.clone();
+        other["event"]["id"] = json!("other-command");
+        service.ingest(&c.id, generation, other).await.unwrap();
+        let mut missing = start.clone();
+        missing["event"]["afterUuid"] = json!("not-in-projection");
+        service.ingest(&c.id, generation, missing).await.unwrap();
+        assert!(drain(&mut rx).is_empty());
+        service.ingest(&c.id, generation, start.clone()).await.unwrap();
+        service.ingest(&c.id, generation, start.clone()).await.unwrap();
+        let frames = drain(&mut rx);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["method"], "item/started");
+        assert_eq!(frames[0]["params"]["turnId"], "u19");
+        let start_bytes = serde_json::to_vec(&frames[0]).unwrap().len();
+        assert!(start_bytes < 1024);
+        eprintln!("compaction frame bytes: history={history_bytes}, start={start_bytes}");
+        assert!(native_controls::accept_live_start(&mut frame["native_control"], &start["event"]));
+        service.ingest_shared(&c.id, generation, &frame).await.unwrap();
+        assert!(drain(&mut rx).iter().all(|f| f["params"]["turns"].as_array().is_none_or(Vec::is_empty)));
+        let history = service.history(&json!({"threadId":c.id})).await.unwrap();
+        assert_eq!(history["data"][0]["items"].as_array().unwrap().last().unwrap()["id"],"cmd");
+        frame["native_control"]["commands"][0]["state"] = json!("completed");
+        frame["native_control"]["compactionEvents"][0]["status"] = json!("completed");
+        frame["native_control"]["compaction"]["state"] = json!("idle");
+        service.ingest_shared(&c.id, generation, &frame).await.unwrap();
+        let end = drain(&mut rx).into_iter().find(|f| f["method"] == "claude/history/updated").unwrap();
+        assert_eq!(end["params"]["turns"].as_array().unwrap().len(),1);
+        service.ingest(&c.id, generation, start).await.unwrap();
+        assert!(drain(&mut rx).is_empty());
     }
 
     #[tokio::test]

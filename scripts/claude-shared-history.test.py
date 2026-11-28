@@ -159,6 +159,23 @@ class SharedQueueHistoryTests(unittest.TestCase):
         self.assertEqual(native.goal["nativeId"], "start")
         self.assertTrue(native.native_capabilities["goal"])
 
+    def test_compaction_start_is_a_small_frame_before_polling_or_serializing_history(self):
+        reader = SdkReader("unused", "test-session")
+        reader.messages = [{"type":"assistant","uuid":"last","message":{"content":"x"*1_700_000}}]
+        reader.native_commands = [{"name":"compact","state":"pending","id":"request"}]
+        frames = []
+        with patch.dict(namespace, {"emit": lambda frame: frames.append(json.dumps(frame))}), \
+                patch.object(reader, "poll", side_effect=lambda **_: frames.append("poll")):
+            reader.sdk_signal({"compacting": True})
+            reader.sdk_signal({"compacting": True})
+            reader.sdk_signal({"compacting": False})
+        self.assertLess(len(frames[0]), 1024)
+        self.assertEqual(frames[1:], ["poll"] * 3)
+        start = json.loads(frames[0])
+        self.assertEqual((start["type"], start["native_id"], start["event"]["afterUuid"], start["event"]["id"]),
+                         ("shared_compaction_started", "test-session", "last", "request"))
+        self.assertEqual(reader.compaction_events["request"]["status"], "inProgress", "退出运行不是成功完成")
+
     def test_native_control_records_preserve_real_quotes_and_clean_command_output(self):
         command = {"type": "user", "uuid": "command", "entrypoint": "cli",
                    "message": {"content": "<command-name>/goal</command-name><command-message>goal</command-message><command-args>完成验收</command-args>"}}

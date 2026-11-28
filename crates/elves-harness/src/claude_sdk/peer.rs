@@ -427,17 +427,22 @@ impl Inner {
 
     /// 立即把合并后的快照交给上层：`shared_sync`、`shared_send` 等回执之前上层必须已经看到最新状态。
     fn emit_now(&self) {
+        self.emit_snapshot(true);
+    }
+
+    fn emit_snapshot(&self, force: bool) -> bool {
+        // 与读取器的小事件共用此锁直到入队；正在合成的旧状态不能在“开始”之后倒发。
+        let reader = lock(&self.reader_frame);
+        let Some(reader) = reader.as_ref() else { return false };
         let signature = (
             self.reader_rev.load(Ordering::Acquire),
             self.state_rev.load(Ordering::Acquire),
         );
-        let Some(reader) = lock(&self.reader_frame).clone() else {
-            return;
-        };
+        if !force && *lock(&self.emitted) == signature { return false; }
         let changes = lock(&self.changes).clone();
-        let frame = self.state(|state| state.compose(&reader, &changes));
+        let frame = self.state(|state| state.compose(reader, &changes));
         *lock(&self.emitted) = signature;
-        let _ = self.out.send(frame);
+        self.out.send(frame).is_ok()
     }
 
     /// 读取器和实时状态都没有变化时，上层手里的就是最新状态，不再复制并重发整份历史。
@@ -445,14 +450,7 @@ impl Inner {
     /// 大会话每多发一份快照都要重新序列化、传输和解析全部历史（实测 8290 条消息、21.6 MiB 的会话
     /// 仅读取器侧就要 0.17–0.18 秒）。有变化时照常立即发出。
     fn emit_if_changed(&self) {
-        let signature = (
-            self.reader_rev.load(Ordering::Acquire),
-            self.state_rev.load(Ordering::Acquire),
-        );
-        if *lock(&self.emitted) == signature {
-            return;
-        }
-        self.emit_now();
+        self.emit_snapshot(false);
     }
 
     /// 提前启动 CLI。只有 CLI 原本没有运行时才算预热；已经在运行的 CLI 保持原来的空闲回收时间。
@@ -1042,9 +1040,20 @@ impl Inner {
             }
             Some("shared_snapshot") => {
                 self.remember_reader_state(&frame);
-                *lock(&self.reader_frame) = Some(frame);
+                let mut reader = lock(&self.reader_frame);
+                *reader = Some(frame);
                 self.reader_rev.fetch_add(1, Ordering::AcqRel);
                 self.dirty.notify_one();
+            }
+            Some("shared_compaction_started") if frame["native_id"] == self.spec.native_id => {
+                let mut reader = lock(&self.reader_frame);
+                if let Some(cached) = reader.as_mut()
+                    && super::super::native_controls::accept_live_start(&mut cached["native_control"], &frame["event"]) {
+                    lock(&self.initialize_request)["native_control"] = cached["native_control"].clone();
+                    self.reader_rev.fetch_add(1, Ordering::AcqRel);
+                    // 在读取器发送全历史前，先透传已定位的原生开始；不在这里触发历史合成。
+                    let _ = self.out.send(frame);
+                }
             }
             // 派发意图与命令意图必须在对应写入之前到达上层，用于重启后核对而不是盲目重发。
             Some("shared_delivery_intent") => {
@@ -1058,6 +1067,11 @@ impl Inner {
             }
             Some("shared_native_command_intent") => {
                 self.remember_reader_state(&frame);
+                let mut reader = lock(&self.reader_frame);
+                if let Some(cached) = reader.as_mut() {
+                    cached["native_control"] = frame["native_control"].clone();
+                    self.reader_rev.fetch_add(1, Ordering::AcqRel);
+                }
                 let _ = self.out.send(frame);
             }
             _ => {}
@@ -1216,7 +1230,8 @@ impl Inner {
             return Err(failure);
         }
         lock(&self.launch).resumed = true;
-        self.emit_now();
+        // 压缩意图已先交给上层，不用为“已受理”再排入一份旧历史；开始、终态由读取器照常通知。
+        if name != "compact" { self.emit_now(); }
         registered["accepted"] = json!(true);
         registered["nativeId"] = json!(self.spec.native_id);
         registered["jobId"] = json!("");
@@ -1619,6 +1634,7 @@ async fn read_reader(
     let mut line = Vec::new();
     while let Some(parsed) = read_json_line(&mut reader, &mut line).await {
         if let Some(frame) = parsed {
+            if inner.reader_generation.load(Ordering::Acquire) != generation { continue; }
             if frame["type"] == "shared_snapshot" {
                 inner.reader_bytes.store(line.len(), Ordering::Release);
             }
@@ -1636,22 +1652,7 @@ async fn emit_loop(inner: Arc<Inner>) {
             return;
         }
         tokio::time::sleep(SNAPSHOT_COALESCE).await;
-        let signature = (
-            inner.reader_rev.load(Ordering::Acquire),
-            inner.state_rev.load(Ordering::Acquire),
-        );
-        if *lock(&inner.emitted) == signature {
-            continue;
-        }
-        let Some(reader) = lock(&inner.reader_frame).clone() else {
-            continue;
-        };
-        let changes = lock(&inner.changes).clone();
-        let frame = inner.state(|state| state.compose(&reader, &changes));
-        *lock(&inner.emitted) = signature;
-        if inner.out.send(frame).is_err() {
-            return;
-        }
+        if !inner.emit_snapshot(false) { continue; }
         // 放宽下一份的最短间隔；其间的变化已经通过 dirty 通知记下，间隔结束后合并发出最新状态。
         tokio::time::sleep(snapshot_spacing(inner.reader_bytes.load(Ordering::Acquire))).await;
     }
@@ -1921,6 +1922,7 @@ mod tests {
             *lock(&log.reader_stop) = Some(stop);
             tokio::spawn(async move {
                 let mut lines = BufReader::new(reader_in).lines();
+                let mut command = Value::Null;
                 loop {
                     let next = tokio::select! {
                         next = lines.next_line() => next,
@@ -1955,11 +1957,18 @@ mod tests {
                             out.push(success(id, json!({"text":text})));
                         }
                         "sdk_command" => {
-                            out.push(json!({"type":"shared_native_command_intent","native_control":{"commands":[]}}));
+                            command = json!({"id":request["id"],"name":request["name"],"state":"pending"});
+                            out.push(json!({"type":"shared_native_command_intent","native_control":{"commands":[command]}}));
                             out.push(success(
                                 id,
                                 json!({"nativeCommand":{"id":request["id"],"name":request["name"],"state":"pending"}}),
                             ));
+                        }
+                        "sdk_signal" if request["compacting"] == true && command["name"] == "compact" => {
+                            out.push(json!({"type":"shared_compaction_started","native_id":NATIVE,
+                                "event":{"id":command["id"],"source":"manual","status":"inProgress","afterUuid":"anchor"}}));
+                            // 不提供后续历史快照，验证小帧能独立到达上层。
+                            out.push(success(id,json!({})));
                         }
                         "sdk_configured_mode" => out.push(success(id, json!({"mode":"acceptEdits"}))),
                         "sdk_edit_prepare" => out.push(success(
@@ -2788,7 +2797,13 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn native_commands_are_registered_then_written_as_slash_text() {
-        let mut upper = Upper::standard();
+        let mut upper = Upper::start(Arc::new(|frame| {
+            let mut frames = standard_cli(frame);
+            if frame["type"] == "user" {
+                frames.push(json!({"type":"system","subtype":"status","status":"compacting"}));
+            }
+            frames
+        }), false, Duration::from_secs(60));
         upper.initialize(json!({})).await;
         let response = upper
             .call(json!({"subtype":"shared_native_command","id":"cmd-1","name":"compact","argument":"focus","expectedGoal":null}))
@@ -2809,6 +2824,9 @@ mod tests {
             .position(|f| f["type"] == "control_response" && f["response"]["request_id"] == "req-2")
             .unwrap();
         assert!(registered < receipt);
+        let started = upper.wait_for(|f| f["type"] == "shared_compaction_started").await;
+        assert_eq!(started["event"]["id"],"cmd-1");
+        assert!(started.get("messages").is_none());
     }
 
     /// 假 CLI 立刻跑完这一轮：消息被接收、执行、回到空闲。

@@ -1,6 +1,74 @@
 //! 同一原生 Claude 会话的目标与压缩控制；命令受理与原生完成分开报告。
 use super::*;
 
+// 读取器生成同一身份和锚点，快照和小事件共用；只认当前原生命令或确定的自动开始。
+pub(super) fn accept_live_start(control: &mut Value, event: &Value) -> bool {
+    let Some(id) = event["id"].as_str().filter(|id| !id.is_empty()) else { return false };
+    if !control.is_object() || event["status"] != "inProgress"
+        || control["compactionEvents"].as_array().is_some_and(|events| events.iter().any(|e|
+            e["id"] == id && matches!(e["status"].as_str(), Some("completed" | "interrupted" | "failed")))) {
+        return false;
+    }
+    match event["source"].as_str() {
+        Some("manual") => {
+            let Some(cmd) = control["commands"].as_array_mut().and_then(|commands| commands.iter_mut()
+                .find(|c| c["name"] == "compact" && c["id"] == id
+                    && matches!(c["state"].as_str(), Some("pending" | "running" | "unknown")))) else { return false };
+            cmd["state"] = json!("running");
+        }
+        Some("automatic") => (),
+        _ => return false,
+    }
+    control["compaction"] = json!({"state":"running","itemId":id});
+    if !control["compactionEvents"].is_array() { control["compactionEvents"] = json!([]); }
+    let events = control["compactionEvents"].as_array_mut().unwrap();
+    if let Some(existing) = events.iter_mut().find(|e| e["id"] == id) { *existing = event.clone(); }
+    else { events.push(event.clone()); }
+    true
+}
+
+#[derive(Clone)]
+pub(super) struct CompactionAnchor {
+    pub uuid: String,
+    pub turn: String,
+    pub item: String,
+}
+
+impl Conversation {
+    fn insert_live_compaction(&mut self, frame: &Value) -> Option<Value> {
+        if self.deleted || !self.shared || frame["native_id"] != self.native_id { return None; }
+        let event = &frame["event"];
+        let item = compaction_item(event)?;
+        // 只在权威投影能把 afterUuid 对到同一条可见消息时走快路；空历史、重连中的新锚点由原快照定位。
+        let anchor = self.compaction_anchor.as_ref()?;
+        if event["afterUuid"] != anchor.uuid { return None; }
+        let index = self.turns.iter().rposition(|t| t["id"] == anchor.turn)?;
+        let items = self.turns[index]["items"].as_array()?;
+        let previous = items.iter().position(|i| i["id"] == item["id"]);
+        if previous.is_some_and(|i| items[i]["status"] != "unknown") { return None; }
+        let at = items.iter().position(|i| i["id"] == anchor.item)? + 1;
+        if !accept_live_start(&mut self.native_control, event) { return None; }
+        let params = json!({"threadId":self.id,"turnId":anchor.turn,"afterItemId":anchor.item,"item":item});
+        let items = self.turns[index]["items"].as_array_mut()?;
+        if let Some(i) = previous { items[i] = item; } else { items.insert(at, item); }
+        Some(json!({"method":"item/started","params":params}))
+    }
+}
+
+impl Claude {
+    pub(super) async fn ingest_compaction_start(&self, id: &str, generation: &str, frame: &Value) {
+        let mut saved = self.saved.lock().await;
+        // 进程正切换时交给新代次权威快照，不同时等待两个全局锁。
+        let Ok(processes) = self.processes.try_lock() else { return };
+        if !processes.get(id).is_some_and(|p| p.channel.generation == generation && p.channel.live.load(Ordering::Acquire)) { return; }
+        if let Some(event) = saved.conversations.get_mut(id).and_then(|c| c.insert_live_compaction(frame)) {
+            // 只先发布已确认的条目；后续权威快照及合并落盘仍按原规则执行。
+            self.publish(event);
+            self.schedule_flush();
+        }
+    }
+}
+
 pub(super) fn compaction_item(event: &Value) -> Option<Value> {
     let id = event["id"].as_str().filter(|id| !id.is_empty())?;
     let status = event["status"].as_str()?;
@@ -137,8 +205,10 @@ impl Claude {
             ))
             .into());
         }
-        // 只确认命令已交给原生；网页等 goal_status / compact_boundary 才显示实际结果。
-        let current = self.conversation(&c.id).await?;
+        // 回执只需要控制字段，不复制完整正文；受理不能替代原生开始或结束证据。
+        let saved = self.saved.lock().await;
+        let current = saved.conversations.get(&c.id).filter(|c| !c.deleted)
+            .ok_or_else(|| error(404, "Claude 会话不存在或已删除"))?;
         Ok(
             json!({"ok":true,"backend":"claude","threadId":c.id,"status":"created",
             "nativeCommand":result["nativeCommand"],"goal":current.native_control["goal"],
@@ -452,16 +522,12 @@ impl Claude {
             if let Ok(pref) = crate::instance_settings::compaction_model_preference(
                 &self.directory,
                 &c.config.instance_id(),
-            ) && pref.model.is_some()
+            ) && pref.enabled && pref.model.is_some()
             {
                 let original_model = c.model.clone();
                 let original_effort = c.effort.clone();
-                let metrics = c.metrics();
-                let cache_valid = crate::session_metrics::cache_is_valid(
-                    &metrics,
-                    &original_model,
-                    now_ms(),
-                );
+                let cache_valid = pref.needs_cache_check(&original_model)
+                    && crate::session_metrics::cache_is_valid(&c.metrics(), &original_model, now_ms());
                 if let Some(target_model) =
                     crate::instance_settings::resolve_manual_compaction_model(
                         &pref,

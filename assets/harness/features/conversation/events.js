@@ -88,6 +88,11 @@ function receiveClaudeHistory(params) {
   for (const snapshot of [...params.turns].reverse()) {
     if (!snapshot?.id || !Array.isArray(snapshot.items)) continue;
     let value = { ...snapshot, items: normalizeDisplayedTurnItems(snapshot.items) };
+    if (!params.preview && value.items.some(i => i.type === "contextCompaction")) {
+      const prior = turns.get(value.id)?.items || [];
+      value.items = value.items.map(i => i.type === "contextCompaction"
+        ? mergeItemProjection(prior.find(p => p.id === i.id), i) : i);
+    }
     if (params.preview) {
       // 用户要求 Claude 正文稳定：终端预览只能更新当前临时气泡，不能用其附带的旧快照覆盖正式消息。
       // 原生正文基线变化、连接切换或轮次结束后，迟到预览必须丢弃；旧服务无基线时等待正式历史。
@@ -124,11 +129,41 @@ function receiveClaudeHistory(params) {
   if (params.preview) { if (applied) scheduleMessages(); return; }
   reconcileSentMessageDisplays(id, thread.queuedMessages);
   rememberThreadDisplay(thread);
-  rememberTranscript();
+  // 只有会话状态或队列变化时不重新序列化整份正文缓存。
+  if (!params.metadataOnly) rememberTranscript();
   updateComposer();
   scheduleMessages();
   scheduleSidebarRefresh();
   if (params.completed) void markVisibleThreadRead().catch(() => {});
+}
+
+// Claude 的开始、AGY 的自动完成只携带一个原生条目。位置不存在时整批交给历史核对，不创建空轮次。
+function applyAnchoredCompactions(id, entries) {
+  if (selectedId !== id || thread?.id !== id || !Array.isArray(entries) || !entries.length) return false;
+  for (const entry of entries) {
+    if (!entry || typeof entry.turnId !== "string") return false;
+    const { turnId, item, afterItemId } = entry;
+    const row = turns.get(turnId), anchor = afterItemId || item?.beforeItemId;
+    if (!row || !Array.isArray(row.items) || item?.type !== "contextCompaction" || !item.id
+        || anchor && !row.items.some(i => i.id === anchor)) return false;
+  }
+  const version = setMessageVersion(messageVersion + 1);
+  for (const { turnId, item, afterItemId } of entries) {
+    const turn = turns.get(turnId), items = [...turn.items], i = items.findIndex(v => v.id === item.id);
+    const previous = items[i];
+    if (afterItemId && completedItem(previous)) continue;
+    if (i >= 0) items.splice(i, 1);
+    const at = afterItemId ? items.findIndex(v => v.id === afterItemId) + 1
+      : item.beforeItemId ? items.findIndex(v => v.id === item.beforeItemId) : items.length;
+    items.splice(at, 0, mergeItemProjection(previous, item));
+    turns.set(turnId, enrichTurnTranscriptEvents({ ...turn, items }));
+    itemVersions.set(`${turnId}:${item.id}`, version);
+    // 自动完成检查点只属于正文，不证明另一次手动压缩已结束。
+    if (afterItemId)
+      receiveCompactionLifecycle({ method: "item/started" }, { threadId: id, turnId, item });
+  }
+  scheduleMessages();
+  return true;
 }
 export function receive(event) {
   if (handleRemoteChannelEvent(event)) return;
@@ -180,6 +215,9 @@ export function receive(event) {
   }
   if (event.method === "remote/resync") {
     if (typeof rawParams.threadId === "string") {
+      if (rawParams.reason === "antigravity_checkpoint" && Array.isArray(rawParams.transcriptUpdates)) {
+        if (eventThreadId !== selectedId || applyAnchoredCompactions(eventThreadId, rawParams.transcriptUpdates)) return;
+      }
       // 单会话重同步只补对应正文，避免重复刷新整个页面。
       scheduleSidebarRefresh();
       if (rawParams.threadId === selectedId) scheduleReload();
@@ -274,6 +312,10 @@ export function receive(event) {
     return;
   }
   if (typeof eventThreadId === "string" && threadDeleted(eventThreadId)) return;
+  if (event.method === "item/started" && rawParams.item?.type === "contextCompaction" && rawParams.afterItemId) {
+    if (eventThreadId === selectedId && !applyAnchoredCompactions(eventThreadId, [rawParams])) scheduleReload();
+    return;
+  }
   let sidebarChanged = false;
   if (nativeError?.terminal && typeof eventThreadId === "string") {
     const failedTurn = {
@@ -548,7 +590,13 @@ export function receive(event) {
       scheduleMessages();
       if (event.method === "turn/completed") rememberTranscript();
     }
-    if (["turn/started", "thread/settings/updated"].includes(event.method)) scheduleReload();
+    // AGY 的手动压缩 turn/started 只含真实压缩项；开始所需正文已齐，不为该轮再触发整页下载。
+    if (event.method === "thread/settings/updated") scheduleReload();
+    if (event.method === "turn/started" && !(params.turn?.items?.length === 1
+        && params.turn.items[0]?.type === "contextCompaction")) {
+      scheduleReload(params.turn?.id && !params.turn.items?.length
+        ? { threadId: selectedId, turnId: params.turn.id } : null);
+    }
   }
   if (event.method === "skills/changed") {
     void refreshSkillCatalog().catch(() => {});

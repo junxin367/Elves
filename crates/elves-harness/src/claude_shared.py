@@ -1289,6 +1289,7 @@ class NativeDiscovery:
         # 发现的会话没有 Elves 自己的 CLI，也就没有待回答的审批或问答；执行状态按空闲展示。
         return {"type": "shared_snapshot", "native_id": native, "job_id": "",
                 "native_status": self.status(row["nativeStatus"], reader.messages), "messages": reader.messages,
+                "compaction_anchor": reader.compaction_anchor(),
                 "history_head": reader.history.current_head(),
                 "retired_usage": reader.retired_usage,
                 "clients": reader.clients, "pending": reader.pending,
@@ -2358,6 +2359,7 @@ class SdkReader(NativeSession):
             started = time.monotonic()
             emit({"type": "shared_snapshot", "native_id": self.native_id, "job_id": "",
                   "native_status": status, "messages": self.messages,
+                  "compaction_anchor": self.compaction_anchor(),
                   "history_head": self.history.current_head(),
                   "retired_usage": self.retired_usage,
                   "clients": self.clients, "pending": self.pending, "requests": {},
@@ -2459,13 +2461,16 @@ class SdkReader(NativeSession):
             resumed = identity in self.compaction_events or command is not None and command["state"] in ("unknown", "running")
             if not previous or previous.get("id") != identity:
                 self._compact_clock = None
-            self.record_compaction_event(identity, "inProgress", source="manual" if command else "automatic",
+            event = self.record_compaction_event(identity, "inProgress", source="manual" if command else "automatic",
                                          measure_start=not resumed,
                                          compactionModel=None if resumed else self.actual_settings.get("model") or self.model,
                                          compactionModelSource="inferred")
             for value in self.native_commands:
                 if value["name"] == "compact" and value["state"] in ("pending", "unknown"):
                     value["state"] = "running"
+            # 手机收到原生开始就能显示；只发同次条目，不等 poll 读盘或序列化整份历史。
+            self.compaction["itemId"] = identity
+            emit({"type": "shared_compaction_started", "native_id": self.native_id, "event": event})
         if self.compaction_screen_active and not active:
             event = self.compaction_events.get(self.compaction_event_id)
             ended = time.monotonic()

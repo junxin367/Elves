@@ -114,7 +114,7 @@ struct Conversation {
     compaction: Value,
     #[serde(default)]
     compaction_model_restore: Option<CompactionModelRestore>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     turns: Vec<Value>,
 }
 
@@ -138,18 +138,20 @@ impl Conversation {
         )
     }
 
-    fn observe_checkpoints(&mut self, events: &[checkpoints::Checkpoint]) -> bool {
-        let Some(latest) = events.last() else { return false; };
+    /// None 表示无变化，空列表表示只读外部会话尚无可定位的轮次，必须补读。
+    fn observe_checkpoints(&mut self, events: &[checkpoints::Checkpoint]) -> Option<Vec<Value>> {
+        let latest = events.last()?;
         if self.discovered && !self.turns.iter().any(|t| t["id"].as_str().is_some_and(|id| id.starts_with("agy-turn-"))) {
             // 原版 App 正在写入的只读会话可能刚开始新轮，旧页面还没有锚点；每个新边界只唤起一次所属历史读取。
             let signature = latest.signature();
             if self.observed_checkpoint_step.is_none_or(|previous| previous < signature) {
                 self.observed_checkpoint_step = Some(signature);
-                return true;
+                return Some(vec![]);
             }
-            return false;
+            return None;
         }
-        checkpoints::merge_recent(&mut self.turns, events)
+        let updates = checkpoints::recent_updates(&mut self.turns, events);
+        (!updates.is_empty()).then_some(updates)
     }
 
     fn stop_requested(&self) -> bool {
@@ -514,12 +516,8 @@ impl Antigravity {
             let bytes = serde_json::to_vec(&c.turns)?;
             crate::settings::atomic_write(&turn_path, &bytes)?;
         }
-        // 主存档不内联完整 turns，仅保留元数据、队列、目标和统计，避免大体积写盘阻塞。
-        let mut meta = saved.clone();
-        for conv in meta.conversations.values_mut() {
-            conv.turns.clear();
-        }
-        let bytes = serde_json::to_vec(&meta)?;
+        // 正文仍由上方的原子侧文件保存。保存压缩配置或队列时，不克隆全部会话历史再清空。
+        let bytes = serde_json::to_vec(saved)?;
         crate::settings::atomic_write(&self.directory.join(SESSIONS_FILE), &bytes)?;
         Ok(())
     }
@@ -1240,10 +1238,13 @@ impl Antigravity {
             else { return Ok(Value::Null); };
             // 仅在当前托管轮已经确认所属输入时添加只读展示标记，不碰流式 items、压缩锁或发送队列。
             // 前台正在执行时复用已有增量尾读；最后一次轮询也能补到迟落盘的完成检查点。
-            snapshot.as_ref().is_some_and(|s| current.observe_checkpoints(&s.checkpoints))
+            snapshot.as_ref().and_then(|s| current.observe_checkpoints(&s.checkpoints))
         };
-        if new_checkpoint {
-            self.publish(json!({"method":"remote/resync","params":{"threadId":c.id,"reason":"antigravity_checkpoint"}}));
+        if let Some(updates) = new_checkpoint {
+            // 只发布原生已完成的检查点；不推测开始，不解除其他手动压缩锁。旧网页仍可按 resync 恢复。
+            let mut params = json!({"threadId":c.id,"reason":"antigravity_checkpoint"});
+            if !updates.is_empty() && updates.len() <= 32 { params["transcriptUpdates"] = json!(updates); }
+            self.publish(json!({"method":"remote/resync","params":params}));
         }
         let mut metrics = projection::compute_session_metrics(
             &c.turns,
@@ -2233,14 +2234,11 @@ impl Antigravity {
         if let Ok(pref) = super::instance_settings::compaction_model_preference(
             &self.directory,
             &c.config.instance_id(),
-        ) && pref.model.is_some()
+        ) && pref.enabled && pref.model.is_some()
         {
-            let metrics = self
-                .session_metrics(thread_id)
-                .await
-                .unwrap_or(Value::Null);
-            let cache_valid =
-                super::session_metrics::cache_is_valid(&metrics, &original_model, now_ms());
+            let cache_valid = pref.needs_cache_check(&original_model)
+                && super::session_metrics::cache_is_valid(
+                    &self.session_metrics(thread_id).await.unwrap_or(Value::Null), &original_model, now_ms());
             if let Some(target_model) = super::instance_settings::resolve_manual_compaction_model(
                 &pref,
                 &original_model,
@@ -4084,6 +4082,15 @@ mod tests {
             c.active_turn_id = Some("agy-turn-test".into());
             c.turns[0] = json!({"id":"agy-turn-test","status":"inProgress","turnStartedAtMs":2090,"items":raw});
         }
+        let evidence = transcript_metrics::read(dir.path(),"audit").unwrap().unwrap();
+        let mut sample = ag.conversation(id).await.unwrap();
+        let updates = sample.observe_checkpoints(&evidence.checkpoints).unwrap();
+        assert_eq!(updates.len(),1);
+        assert_eq!(updates[0]["turnId"],"agy-turn-test");
+        assert_eq!(updates[0]["item"]["beforeItemId"],"reply");
+        assert_eq!(updates[0]["item"]["completed"],true);
+        assert!(serde_json::to_vec(&updates).unwrap().len() < 1024);
+        assert!(sample.observe_checkpoints(&evidence.checkpoints).is_none());
         for _ in 0..2 {
             ag.session_metrics_from_root(ag.conversation(id).await.unwrap(),Some(dir.path().to_owned())).await.unwrap();
         }
@@ -4098,13 +4105,13 @@ mod tests {
         let mut external = c.clone();
         external.discovered = true;
         external.turns.clear();
-        assert!(external.observe_checkpoints(&snapshot.checkpoints), "外部只读会话也会刷新新边界");
-        assert!(!external.observe_checkpoints(&snapshot.checkpoints), "同一检查点不重复刷新");
+        assert_eq!(external.observe_checkpoints(&snapshot.checkpoints), Some(vec![]), "无锚点的外部会话仍补读");
+        assert!(external.observe_checkpoints(&snapshot.checkpoints).is_none(), "同一检查点不重复刷新");
         assert!(external.turns.is_empty(), "外部会话等待所属原生历史，不在当前页猜造一轮");
         let mut ambiguous = vec![c.turns[0].clone(),c.turns[0].clone()];
         for t in &mut ambiguous {t.as_object_mut().unwrap().remove("_agyCheckpoints");}
         assert!(!checkpoints::merge(&mut ambiguous,&snapshot.checkpoints));
-        assert!(!checkpoints::merge_recent(&mut ambiguous,&snapshot.checkpoints));
+        assert!(checkpoints::recent_updates(&mut ambiguous,&snapshot.checkpoints).is_empty());
         let mut wrong = ambiguous.remove(0);
         wrong["items"][0]["content"][0]["text"] = json!("别的输入");
         assert!(!checkpoints::merge(std::slice::from_mut(&mut wrong),&snapshot.checkpoints));

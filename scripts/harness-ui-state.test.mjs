@@ -10508,7 +10508,7 @@ function queueReloadHarness() {
     (sourceSection("function queueSn", "function queueMessageTex") + "\n" + sourceSection("function reconcileQu", "async functi")),
     sourceSection("async function steerQueuedMessage("),
     sourceSection("async function reloadThr", "function ret"),
-    sourceSection("function scheduleReload()", "function scheduleSidebarRefresh("),
+    sourceSection("let emptyTurnReload =", "function scheduleSidebarRefresh("),
   ].join("\n"), context);
   const runTimers = () => {
     for (const [id, timer] of [...timers]) {
@@ -12126,7 +12126,7 @@ test("删除成功回执后迟到详情409只保留成功提示，不恢复会�
   });
   installMessageResetHarness(context);
   vm.runInContext(sourceSection("async function reloadThread()", "function retireMissingEphemeralTranscript(")
-    + sourceSection("function scheduleReload()", "function scheduleSidebarRefresh("), context);
+    + sourceSection("let emptyTurnReload =", "function scheduleSidebarRefresh("), context);
   context.scheduleReload(); timers.shift()();
   const oldRequest = context.threadRequest;
   const deletion = context.deleteSidebarThread(h.target);
@@ -16669,6 +16669,16 @@ test("Claude HTTP 完整历史接替预览且迟到读取不能复活旧预览",
   context.turns.set("turn", { ...base, items: [...base.items, preview] });
   context.turnVersions.set("turn", 0);
   assert.equal(context.mergeHistoryTurn({ ...base, status: "completed", _nativeDone: true }, 0).items.length, 1);
+
+  const started = { type: "contextCompaction", id: "compact", status: "inProgress", completed: false,
+    remoteCompactionLifecycle: true };
+  context.turns.set("turn", { ...base, items: [...base.items, started] });
+  context.itemVersions.set("turn:compact", 4);
+  const late = context.mergeHistoryTurn(official, 3);
+  assert.deepEqual(Array.from(late.items, item => item.id), ["user", "compact", "official"],
+    "先发起的 HTTP 读取既不能抹掉新开始，也不能被整轮旧正文挡掉");
+  assert.deepEqual(Array.from(context.mergeHistoryTurn(official, 5).items, item => item.id), ["user", "official"],
+    "不复活已被更新的权威历史移除的条目");
 });
 
 test("Claude 长历史按原生顺序补齐实时快照，零散缓存不能跳过中间分页", () => {
@@ -18928,6 +18938,83 @@ test("压缩边界：已确认请求后的读取失败不能退回送达未知",
   assert.equal(current.state, "pending");
   assert.ok(h.notices.some(notice => /读取|刷新/.test(notice.text)));
   assert.ok(h.notices.every(notice => !/未收到压缩回执/.test(notice.text)));
+});
+
+test("压缩小事件：三端只在未收到同次开始时补读，受理和排队不产生正文", async () => {
+  for (const backend of ["claude", "codex", "antigravity"]) {
+    for (const order of ["event-first", "receipt-first", "lost", "changed-authorization", "queued"]) {
+      const { context: h } = compactionBoundaryHarness();
+      const timers = [];
+      let reads = 0, queueReads = 0;
+      Object.assign(h, { selectionVersion: 1, reloadThread: async () => ++reads,
+        setTimeout: callback => timers.push(callback), applyQueuedSendResult: () => ++queueReads });
+      h.session.capabilities.compactionItemEvents = true;
+      h.thread.backend = backend;
+      const id = h.selectedId;
+      const item = { type: "contextCompaction", id: "operation", source: "manual", completed: false };
+      const emit = () => h.receiveCompactionLifecycle({ method: "item/started" }, { threadId: id, turnId: "turn", item });
+      h.setCompactionState(id, { state: "pending", receiptId: "receipt", deviceId: h.session.device.id });
+      const queued = order === "queued";
+      const result = queued ? { threadId: id, deliveryState: "queued" } : {
+        compaction: backend === "codex" ? { state: "pending", itemId: "pending-manual-context-compaction" }
+          : backend === "antigravity" ? { state: "running", itemId: "operation", turnId: "turn" }
+          : { state: "pending", itemId: "operation" },
+        ...(backend === "claude" ? { nativeCommand: { id: "operation" } } : {}),
+      };
+      if (order === "event-first") emit();
+      await h.applyCompactionReceipt(id, "receipt", { state: "completed", result });
+      assert.equal(reads, 0, `${backend}: ${order}`);
+      if (order === "receipt-first") emit();
+      if (order === "changed-authorization") h.session.device.id = "new-auth";
+      for (const callback of timers) callback();
+      assert.equal(reads, Number(order === "lost"), `${backend}: ${order} fallback`);
+      assert.equal(queueReads, Number(queued));
+      if (["event-first", "receipt-first"].includes(order)) {
+        assert.equal(h.currentCompaction(id).turnId, "turn");
+        h.receiveCompactionLifecycle({ method: "item/completed" }, { threadId: id, turnId: "turn",
+          item: { ...item, completed: true } });
+        emit();
+        assert.equal(h.currentCompaction(id).state, "idle", "迟到开始不能复活已完成的操作");
+      }
+    }
+  }
+});
+
+test("正文压缩小事件：按锚点原位合并，缺轮次或锚点不猜位置，自动完成不影响执行锁", () => {
+  let renders = 0, lifecycle = 0;
+  const ctx = vm.createContext({ selectedId: "thread", thread: { id: "thread" }, turns: new Map([
+    ["turn", { id: "turn", status: "completed", items: [{ id: "answer" }, { id: "next" }] }]]),
+    itemVersions: new Map(), messageVersion: 0, completedItem: i => i?.completed === true,
+    mergeItemProjection: (previous, item) => previous?.completed ? previous : item,
+    enrichTurnTranscriptEvents: t => t, receiveCompactionLifecycle: () => ++lifecycle,
+    scheduleMessages: () => ++renders });
+  vm.runInContext(sourceSection("function applyAnchoredCompactions(", "function receive(event)"), ctx);
+  const start = { turnId: "turn", afterItemId: "answer", item: { type: "contextCompaction", id: "op", completed: false } };
+  const checkpoint = { turnId: "turn", item: { type: "contextCompaction", id: "checkpoint", completed: true, beforeItemId: "next" } };
+  assert.equal(ctx.applyAnchoredCompactions("wrong", [start]), false);
+  assert.equal(ctx.applyAnchoredCompactions("thread", [start, { ...start, afterItemId: "absent" }]), false);
+  assert.equal(ctx.applyAnchoredCompactions("thread", [{ ...start, turnId: "missing" }]), false);
+  assert.equal(renders, 0, "整批定位成功前不改正文");
+  assert.equal(ctx.applyAnchoredCompactions("thread", [start]), true);
+  assert.equal(ctx.applyAnchoredCompactions("thread", [checkpoint, checkpoint]), true);
+  assert.deepEqual(Array.from(ctx.turns.get("turn").items, i => i.id), ["answer", "op", "checkpoint", "next"]);
+  assert.equal(lifecycle, 1);
+});
+
+test("压缩小事件：原生开始后迟到的未知回执、旧轮次结束都不能撤销真实开始", async () => {
+  const { context: h } = compactionBoundaryHarness();
+  const id = h.selectedId;
+  h.setCompactionState(id, { state: "pending", receiptId: "receipt", itemId: "pending-manual-context-compaction" });
+  const item = { type: "contextCompaction", id: "live", remoteCompactionLifecycle: true };
+  const notify = source => h.receiveCompactionLifecycle({ method: "item/started" },
+    { threadId: id, turnId: "turn", item: { ...item, source } });
+  notify("automatic");
+  assert.equal(h.currentCompaction(id).state,"pending");
+  notify("manual");
+  await h.applyCompactionReceipt(id, "receipt", { state: "unknown" });
+  h.receiveCompactionLifecycle({ method: "turn/completed" }, { threadId: id, turn: { id: "turn", items: [] } });
+  assert.equal(h.currentCompaction(id).state, "running");
+  assert.equal(h.currentCompaction(id).receiptId, "receipt");
 });
 
 test("压缩边界：授权变化后的迟到回执不能清除新授权的模型选择", async () => {

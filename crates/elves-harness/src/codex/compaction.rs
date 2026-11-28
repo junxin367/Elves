@@ -297,7 +297,7 @@ impl CodexHarness {
                     &controller.state_dir,
                     "codex:local",
                 )
-                && pref.model.is_some()
+                && pref.enabled && pref.model.is_some()
             {
                 let (saved_model, saved_effort, saved_tier) = {
                     let store = self.store.lock().await;
@@ -334,9 +334,8 @@ impl CodexHarness {
                     original_model
                 };
                 if !original_model.is_empty() {
-                    let cache_valid = self
-                        .manual_compaction_cache_valid(id, &original_model)
-                        .await;
+                    let cache_valid = pref.needs_cache_check(&original_model)
+                        && self.manual_compaction_cache_valid(id, &original_model).await;
                     if let Some(target_model) =
                         crate::instance_settings::resolve_manual_compaction_model(
                             &pref,
