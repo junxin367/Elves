@@ -34,6 +34,7 @@ const HOOK_EVENTS: &[&str] = &[
 #[derive(Debug, Clone)]
 pub(crate) struct LocalTranscript {
     pub turns: Vec<Value>,
+    pub(super) checkpoints: Vec<super::checkpoints::Checkpoint>,
     pub model: String,
     pub effort: String,
     pub token_usage: Value,
@@ -323,6 +324,8 @@ pub(crate) fn parse_transcript_jsonl(text: &str, native_id: &str) -> LocalTransc
     let mut cumulative_output = 0u64;
     let mut cumulative_thought = 0u64;
     let mut notices = super::task_notices::TaskNotices::default();
+    let mut origin = super::checkpoints::Origin::default();
+    let mut checkpoints = Vec::new();
 
     for (line_idx, raw) in text.lines().enumerate() {
         let trimmed = raw.trim();
@@ -331,6 +334,7 @@ pub(crate) fn parse_transcript_jsonl(text: &str, native_id: &str) -> LocalTransc
         }
         let Ok(entry) = serde_json::from_str::<Value>(trimmed) else {
             notices = Default::default();
+            origin.invalidate_input();
             continue;
         };
         let step_index = entry["step_index"]
@@ -343,6 +347,7 @@ pub(crate) fn parse_transcript_jsonl(text: &str, native_id: &str) -> LocalTransc
             .unwrap_or(0);
         let entry_type = entry["type"].as_str().unwrap_or("");
         let source = entry["source"].as_str().unwrap_or("");
+        let boundary = origin.observe(&entry);
 
         notices.observe(native_id, &entry, &mut turns);
         match entry_type {
@@ -370,11 +375,20 @@ pub(crate) fn parse_transcript_jsonl(text: &str, native_id: &str) -> LocalTransc
                 }));
             }
             "CHECKPOINT" => {
-                let uncached_input = entry["input_tokens"].as_u64().unwrap_or(0);
-                let cache_read = entry["cache_read_tokens"].as_u64().unwrap_or(0);
-                let output_tokens = entry["output_tokens"].as_u64().unwrap_or(0);
-                let pre_tokens = uncached_input.saturating_add(cache_read);
-                let post_tokens = (output_tokens > 0).then_some(output_tokens);
+                let Some(boundary) = boundary else { continue; };
+                if let super::checkpoints::Boundary::Automatic(cp) = boundary {
+                    // 用户要求在发生处看见自动压缩：已有轮次时插在前后内容之间，不另起一轮或挪到最终回复后。
+                    if turns.is_empty() {
+                        // 无用户气泡的原生系统会话，首个可见事件也按实际步骤显示。
+                        turns.push(json!({"id":format!("agy-local-turn-{step_index}"),"status":"completed",
+                            "createdAt":ts_ms,"turnStartedAtMs":ts_ms,"_nativeRequestTimestamps":true,"items":[]}));
+                    }
+                    turns.last_mut().unwrap()["items"].as_array_mut().unwrap().push(cp.item());
+                    checkpoints.push(cp);
+                    continue;
+                }
+                let summary_input = entry["input_tokens"].as_u64().zip(entry["cache_read_tokens"].as_u64())
+                    .and_then(|(a,b)| a.checked_add(b));
                 let item_id = format!("agy-local-compact-{step_index}");
                 let mut item = json!({
                     "id": item_id,
@@ -383,19 +397,19 @@ pub(crate) fn parse_transcript_jsonl(text: &str, native_id: &str) -> LocalTransc
                     "status": "completed",
                     "completed": true,
                     "source": "manual",
-                    "startedAtMs": (ts_ms > 0).then_some(ts_ms),
-                    "completedAtMs": (ts_ms > 0).then_some(ts_ms),
+                    "recordedAtMs": (ts_ms > 0).then_some(ts_ms),
                     "remoteInlineEvent": true,
                     "remoteCompactionLifecycle": true,
                 });
-                if pre_tokens > 0 {
-                    item["preTokens"] = json!(pre_tokens);
+                // 手动和自动同一口径：检查点是摘要调用用量，一个落盘时间也不是两个计时端点。
+                if let Some(input) = summary_input { item["summaryInputTokens"] = json!(input); }
+                if let Some(output) = entry["output_tokens"].as_u64() { item["summaryOutputTokens"] = json!(output); }
+                if let Some(model_raw) = entry["model"].as_str().and_then(crate::compaction_facts::model) {
+                    crate::compaction_facts::set_model(&mut item, Some(&split_model_effort(model_raw).0), "native");
                 }
-                if let Some(post) = post_tokens {
-                    item["postTokens"] = json!(post);
-                }
-                if let Some(model_raw) = entry["model"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
-                    item["compactionModel"] = json!(split_model_effort(model_raw).0);
+                if let Some(ms) = entry["duration_ms"].as_u64() {
+                    item["durationMs"] = json!(ms);
+                    item["compactionDurationSource"] = json!("native");
                 }
                 turns.push(json!({
                     "id": format!("agy-local-compact-turn-{step_index}"),
@@ -409,6 +423,13 @@ pub(crate) fn parse_transcript_jsonl(text: &str, native_id: &str) -> LocalTransc
                 }));
             }
             "PLANNER_RESPONSE" => {
+                if let Some(super::checkpoints::Boundary::Model(step, model)) = boundary
+                    && let Some(cp) = checkpoints.last_mut().filter(|cp| cp.step == step)
+                {
+                    cp.infer(&model);
+                    if let Some(i) = turns.last_mut().and_then(|t| t["items"].as_array_mut())
+                        .and_then(|items| items.iter_mut().rev().find(|i| i["nativeCheckpointStep"] == step)) { *i=cp.item(); }
+                }
                 if let Some(model_raw) = entry["model"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
                     let (base, effort) = split_model_effort(model_raw);
                     last_model = base;
@@ -631,6 +652,7 @@ pub(crate) fn parse_transcript_jsonl(text: &str, native_id: &str) -> LocalTransc
 
     LocalTranscript {
         turns,
+        checkpoints,
         model: last_model,
         effort: last_effort,
         token_usage: last_token_usage,
@@ -1405,10 +1427,118 @@ mod tests {
         assert_eq!(parsed.turns[0]["items"][0]["content"][0]["text"], "hello");
         assert_eq!(parsed.turns[1]["items"][0]["type"], "contextCompaction");
         assert_eq!(parsed.turns[1]["items"][0]["status"], "completed");
-        assert_eq!(parsed.turns[1]["items"][0]["preTokens"], 19000);
-        assert_eq!(parsed.turns[1]["items"][0]["postTokens"], 450);
+        assert_eq!(parsed.turns[1]["items"][0]["summaryInputTokens"], 19000);
+        assert_eq!(parsed.turns[1]["items"][0]["summaryOutputTokens"], 450);
+        assert!(parsed.turns[1]["items"][0].get("postTokens").is_none());
         assert_eq!(parsed.turns[1]["items"][0]["compactionModel"], "gemini-3.8-flash");
         assert_eq!(parsed.model, "claude-sonnet-5-5");
+    }
+
+    #[test]
+    fn automatic_checkpoint_stays_at_native_step_without_summary_leak_or_invented_tokens() {
+        let rows = [
+            json!({"type":"USER_INPUT","source":"USER_EXPLICIT","step_index":1,"created_at":"2026-11-26T03:12:00Z","content":"继续"}),
+            json!({"type":"PLANNER_RESPONSE","step_index":2,"content":"压缩前"}),
+            json!({"type":"CHECKPOINT","source":"SYSTEM","status":"RUNNING","step_index":3}),
+            json!({"type":"CHECKPOINT","source":"SYSTEM","status":"DONE","step_index":3,"created_at":"2026-11-26T03:13:00Z",
+                "input_tokens":100,"cache_read_tokens":400,"output_tokens":23,"content":"private summary"}),
+            json!({"type":"CHECKPOINT","source":"SYSTEM","status":"DONE","step_index":3,"created_at":"2026-11-26T03:13:00Z"}),
+            json!({"type":"PLANNER_RESPONSE","step_index":4,"content":"压缩后"}),
+        ];
+        let parsed = parse_transcript_jsonl(&rows.map(|r| r.to_string()).join("\n"), "sample");
+        assert_eq!(parsed.turns.len(), 1);
+        let items = parsed.turns[0]["items"].as_array().unwrap();
+        assert_eq!(items.iter().map(|i| i["type"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["userMessage","agentMessage","contextCompaction","agentMessage"]);
+        assert_eq!(items[2]["source"], "automatic");
+        assert_eq!(items[2]["summaryInputTokens"], 500);
+        assert_eq!(items[2]["summaryOutputTokens"], 23);
+        assert!(items[2].get("postTokens").is_none() && items[2].get("durationMs").is_none());
+        assert!(!items[2].to_string().contains("private summary"));
+    }
+
+    #[test]
+    fn compaction_model_requires_matching_calls_within_the_same_input() {
+        let user=json!({"type":"USER_INPUT","source":"USER_EXPLICIT","step_index":0,"created_at":"2026-11-26T03:12:00Z","content":"test"});
+        let before=json!({"type":"PLANNER_RESPONSE","source":"MODEL","step_index":1,"status":"DONE","model":"model-a","content":"before"});
+        let cp=json!({"type":"CHECKPOINT","source":"SYSTEM","step_index":2,"status":"DONE","created_at":"2026-11-26T03:13:00Z"});
+        let after=json!({"type":"PLANNER_RESPONSE","source":"MODEL","step_index":4,"status":"DONE","model":"model-a","content":"after"});
+        let run=|middle:&[Value],model:&str,checkpoint:Value|{
+            let mut end=after.clone();end["model"]=json!(model);
+            let rows=[user.clone(),before.clone(),checkpoint].into_iter().chain(middle.iter().cloned()).chain([end]);
+            let parsed=parse_transcript_jsonl(&rows.map(|v|v.to_string()).collect::<Vec<_>>().join("\n"),"sandbox");
+            parsed.checkpoints[0].item()
+        };
+        assert_eq!(run(&[],"model-a",cp.clone())["compactionModelSource"],"inferred");
+        assert!(run(&[],"model-b",cp.clone())["compactionModel"].is_null());
+        assert!(run(&[user.clone()],"model-a",cp.clone())["compactionModel"].is_null());
+        assert!(run(&[json!({"type":"ERROR_MESSAGE","step_index":3})],"model-a",cp.clone())["compactionModel"].is_null());
+        let mut explicit=cp;explicit["model"]=json!("explicit");
+        assert_eq!(run(&[],"model-a",explicit)["compactionModel"],"explicit");
+    }
+
+    #[test]
+    fn automatic_checkpoint_in_native_system_session_needs_no_user_bubble() {
+        let root = json!({"type":"SYSTEM_MESSAGE","source":"SYSTEM","status":"DONE","step_index":0,"created_at":"2026-11-26T12:17:02Z"});
+        let cp = json!({"type":"CHECKPOINT","source":"SYSTEM","status":"DONE","step_index":116,"created_at":"2026-11-26T12:24:26Z"});
+        let reply = json!({"type":"PLANNER_RESPONSE","step_index":117,"content":"继续"});
+        let parsed = parse_transcript_jsonl(&format!("{root}\n{cp}\n{reply}\n"), "system-session");
+        assert_eq!(parsed.turns[0]["items"][0]["source"],"automatic");
+        assert_eq!(parsed.turns[0]["items"][1]["type"],"agentMessage");
+        assert_eq!(parsed.turns[0]["items"].as_array().unwrap().len(),2);
+        let tail = parse_transcript_jsonl(&format!("{cp}\n{reply}\n"), "truncated");
+        assert!(tail.checkpoints.is_empty(), "缺少原生起点的尾部不能借用当前打开会话");
+    }
+
+    #[test]
+    #[ignore = "显式指定本机原生转录，仅只读核对位置，不打印正文"]
+    fn replays_native_automatic_checkpoint_positions() {
+        let path = std::env::var_os("ELVES_TEST_AGY_TRANSCRIPT").expect("需要原生转录路径");
+        let input = std::fs::read_to_string(path).unwrap();
+        let rows: Vec<Value> = input.lines().filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap()).collect();
+        let parsed = parse_transcript_jsonl(&input, "offline");
+        let expected: Vec<u64> = rows.iter().filter(|r| r["type"] == "CHECKPOINT" && r["status"] == "DONE"
+            && r["source"] == "SYSTEM").filter_map(|r| r["step_index"].as_u64()).collect();
+        assert!(!expected.is_empty());
+        assert!(!rows.iter().any(|r| r["type"] == "USER_INPUT"
+            && extract_user_request_text(r["content"].as_str().unwrap_or("")) == "/compact"), "本用例针对自动压缩样本");
+        let mut actual = Vec::new();
+        let mut counts = [0;3];
+        for turn in parsed.turns {
+            let items = turn["items"].as_array().unwrap();
+            for (ix, i) in items.iter().enumerate().filter(|(_,i)| i["source"] == "automatic") {
+                let step = i["nativeCheckpointStep"].as_u64().unwrap();
+                  counts[0] += usize::from(i["recordedAtMs"].is_u64());
+                  counts[1] += usize::from(i["compactionModelSource"]=="inferred");
+                  counts[2] += usize::from(i["durationMs"].is_u64());
+                  assert!(i["preTokens"].is_null() && i["postTokens"].is_null());
+                if rows.iter().any(|r| r["type"] == "USER_INPUT" && r["step_index"].as_u64().is_some_and(|s| s < step)) {
+                    assert!(items[..ix].iter().any(|i| i["type"]=="userMessage"));
+                }
+                let steps = |i:&Value| i["id"].as_str()?.strip_prefix("agy-local-")?
+                    .split_once('-')?.1.split('-').next()?.parse::<u64>().ok();
+                assert!(items[..ix].iter().filter_map(steps).all(|s| s < step));
+                assert!(items[ix+1..].iter().filter_map(steps).all(|s| s > step));
+                actual.push(step);
+            }
+        }
+        assert_eq!(actual, expected);
+        if let Some(path) = std::env::var_os("ELVES_TEST_AGY_SAVED_TURNS") {
+            // 读取明确选定的同一原生会话存档，只在内存重放托管合并；验证正文、错误与顺序不因补标记改变。
+            let mut saved: Vec<Value> = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            let non_events = |turns: &[Value]| turns.iter().flat_map(|t| t["items"].as_array().into_iter().flatten())
+                .filter(|i| i["type"] != "contextCompaction").cloned().collect::<Vec<_>>();
+            let prior = non_events(&saved);
+            super::super::checkpoints::merge(&mut saved, &parsed.checkpoints);
+            assert!(!super::super::checkpoints::merge(&mut saved, &parsed.checkpoints));
+            for turn in &mut saved { super::super::checkpoints::display(turn); }
+            assert!(non_events(&saved) == prior, "回看检查点不能改变原有会话内容");
+            let restored: Vec<_> = saved.iter().flat_map(|t| t["items"].as_array().into_iter().flatten())
+                .filter_map(|i| i["nativeCheckpointStep"].as_u64()).collect();
+            assert_eq!(restored,expected);
+        }
+        eprintln!("核对原生压缩位置：{actual:?}，有记录时间/推定型号/耗时：{counts:?}");
     }
 
     #[test]

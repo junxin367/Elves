@@ -1524,19 +1524,48 @@ class NativeSession:
                      and (real_user(row) or row.get("type") == "assistant"
                                             or row.get("subtype") == "turn_duration")), None)
 
-    def record_compaction_event(self, identity, status, at=None, **fields):
+    def record_compaction_event(self, identity, status, at=None, measure_start=True, **fields):
         event = self.compaction_events.setdefault(identity, {
             "id": identity, "afterUuid": self.compaction_anchor(), "source": "manual"})
+        # 模型是这次操作的快照；重读旧记录或修改当前会话设置，都不能降级已确认的型号。
+        command = next((c for c in self.native_commands if c.get("id") == identity and c.get("name") == "compact"), {})
+        rank = {"inferred": 1, "specified": 2, "native": 3}
+        for value, source in ((command.get("compactionModel"), command.get("compactionModelSource")),
+                              (fields.pop("compactionModel", None), fields.pop("compactionModelSource", "native"))):
+            if (isinstance(value, str) and value.strip() and len(value) <= 200 and value.strip() not in ("unknown", "<synthetic>")
+                    and not any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in value)
+                    and rank.get(source, 0) > (rank.get(event.get("compactionModelSource", "native"), 0)
+                                                if event.get("compactionModel") else 0)):
+                event.update(compactionModel=value.strip(), compactionModelSource=source)
         event.update(status=status, **fields)
         observed_at = int(time.time() * 1000) if at is None else at
+        if observed_at > 0:
+            event["recordedAtMs"] = observed_at
         if status == "inProgress":
-            event.setdefault("startedAtMs", observed_at)
+            if measure_start:
+                event.setdefault("startedAtMs", observed_at)
+                if at is None and not getattr(self, "_compact_clock", None):
+                    self._compact_clock = (identity, time.monotonic(), None)
         elif status in ("completed", "failed", "interrupted"):
             event["completedAtMs"] = observed_at
+            clock = getattr(self, "_compact_clock", None)
+            if clock and clock[0] == identity:
+                end = clock[2] if clock[2] is not None else time.monotonic()
+                elapsed = round((end-clock[1])*1000)
+                if elapsed > 0 and "durationMs" not in event and event.get("outcome") != "noop":
+                    event.update(durationMs=elapsed, compactionDurationSource="observed")
+                self._compact_clock = None
             event.pop("phase", None)
         return event
 
     def observe_control_record(self, row):
+        # 顺序扫描同一原生转录时保存当时的调用证据，不拿恢复时的 self.model 给老边界补值。
+        if row.get("type") == "assistant" and not row.get("isSidechain"):
+            msg = row.get("message") or {}
+            model = msg.get("model") if isinstance(msg, dict) and not row.get("isApiErrorMessage") and not row.get("isUnmetered") else None
+            self._compact_history_model = (native_time(row.get("timestamp")), model, row.get("uuid"))
+        elif real_user(row) or row.get("type") == "user" and "<command-name>/model</command-name>" in str((row.get("message") or {}).get("content", ""))[:512]:
+            self._compact_history_model = None
         version = row.get("version", "")
         if not self.native_capabilities and isinstance(version, str) and re.fullmatch(r"\d+\.\d+\.\d+", version):
             # 只读历史不启动 CLI；2.1.322 已实测，执行前仍用 initialize.commands 核对当前实例。
@@ -1588,25 +1617,36 @@ class NativeSession:
                 elif self.goal and text.startswith("Goal still active"):
                     self.goal["status"] = "active"
         elif row.get("type") == "system" and row.get("subtype") == "compact_boundary":
+            metadata = row.get("compactMetadata") or {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            automatic = metadata.get("trigger") in ("auto", "automatic")
             active = next((command for command in self.native_commands
                            if command["name"] == "compact" and command["state"] in ("pending", "running", "stopping", "unknown")), None)
             current = self.compaction_events.get(self.compaction_event_id)
-            stale = active and (at < active["issuedAt"] or row["uuid"] == active.get("baseline"))
+            # 自动边界即使在手动请求等待期间到达，也不是该命令的完成回执。
+            stale = active and (automatic or at < active["issuedAt"] or row["uuid"] == active.get("baseline"))
             if not active and current and current.get("status") in ("inProgress", "unknown"):
                 stale = at < current.get("startedAtMs", 0)
             known = next((event for event in self.compaction_events.values() if event.get("nativeId") == row["uuid"]), None)
             identity = known["id"] if known else active["id"] if active and not stale \
                 else current["id"] if current and not stale and current.get("status") in ("inProgress", "unknown") else row["uuid"]
-            metadata = row.get("compactMetadata") or {}
             fields = {key: metadata[key] for key in ("preTokens", "postTokens", "durationMs")
                       if type(metadata.get(key)) is int and 0 <= metadata[key] <= 9007199254740991}
-            # 用户要求显示实际压缩模型；只接收同次原生压缩元数据，不能用 self.model 或当前设置推断历史压缩型号。
+            # 原生优先。无型号的历史，仅用同一父链已发生的助手请求作推定，不看恢复时的会话模型。
             model = next((metadata[key] for key in ("compactionModel", "model")
                           if isinstance(metadata.get(key), str) and metadata[key].strip()
                           and len(metadata[key]) <= 200
                           and not any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in metadata[key])), None)
             if model is not None:
                 fields["compactionModel"] = model.strip()
+                fields["compactionModelSource"] = "native"
+            elif ((evidence := getattr(self, "_compact_history_model", None)) and 0 < evidence[0] <= at
+                  and evidence[2] and evidence[2] in (row.get("parentUuid"), row.get("logicalParentUuid"))):
+                fields.update(compactionModel=evidence[1], compactionModelSource="inferred")
+            self._compact_history_model = None
+            if "durationMs" in fields:
+                fields["compactionDurationSource"] = "native"
             if "durationMs" in fields and at >= fields["durationMs"]:
                 fields["startedAtMs"] = at - fields["durationMs"]
             self.record_compaction_event(identity, "completed", at, nativeId=row["uuid"],
@@ -1944,6 +1984,7 @@ class NativeSession:
                 and stat.st_mtime_ns != self.log_mtime):
             self.messages, self.all_messages, self.log_offset, self.seen = [], [], 0, set()
             self.row_links = {}
+            self._compact_history_model = None
             self.history = NativeHistory()
             self.scheduled_fires = {}
             self.retired_usage = []
@@ -1971,8 +2012,10 @@ class NativeSession:
                 try:
                     row = json.loads(line)
                 except ValueError:
+                    self._compact_history_model = None
                     continue
                 if not isinstance(row, dict):
+                    self._compact_history_model = None
                     continue
                 self.history.observe(row)
                 if (not self.session_cwd and not row.get("isSidechain") and isinstance(row.get("cwd"), str)
@@ -2380,6 +2423,7 @@ class SdkReader(NativeSession):
         # 只保留每类最近一次操作；已接收操作重连后仅核对，绝不重新发送。
         self.native_commands = [value for value in self.native_commands if value["name"] != name] + [command]
         if name == "compact":
+            command.update(compactionModel=request.get("compactionModel"), compactionModelSource=request.get("compactionModelSource"))
             self.compaction_event_id = ""
             self.compaction = {"state": "pending", "itemId": command["id"]}
         emit({"type": "shared_native_command_intent", "native_control": self.control_projection()})
@@ -2412,12 +2456,23 @@ class SdkReader(NativeSession):
             previous = self.compaction_events.get(self.compaction_event_id)
             identity = command["id"] if command else previous["id"] if previous and previous.get("status") == "unknown" else str(uuid.uuid4())
             self.compaction_event_id = identity
-            self.record_compaction_event(identity, "inProgress")
+            resumed = identity in self.compaction_events or command is not None and command["state"] in ("unknown", "running")
+            if not previous or previous.get("id") != identity:
+                self._compact_clock = None
+            self.record_compaction_event(identity, "inProgress", source="manual" if command else "automatic",
+                                         measure_start=not resumed,
+                                         compactionModel=None if resumed else self.actual_settings.get("model") or self.model,
+                                         compactionModelSource="inferred")
             for value in self.native_commands:
                 if value["name"] == "compact" and value["state"] in ("pending", "unknown"):
                     value["state"] = "running"
         if self.compaction_screen_active and not active:
             event = self.compaction_events.get(self.compaction_event_id)
+            ended = time.monotonic()
+            clock = getattr(self, "_compact_clock", None)
+            if clock and event and clock[0] == event["id"] and clock[2] is None:
+                # 原生 SDK 已停止压缩即停表，稍后转录确认时不把轮询等待记入同次耗时。
+                self._compact_clock = (clock[0], clock[1], ended)
             if event and event.get("phase") == "stopping":
                 self.record_compaction_event(event["id"], "interrupted")
                 self.compaction = {"state": "idle", "itemId": event["id"]}
@@ -2426,7 +2481,7 @@ class SdkReader(NativeSession):
                     value.update(state="completed", message="压缩已停止")
                     self.record_compaction_event(value["id"], "interrupted")
                     self.compaction = {"state": "idle", "itemId": value["id"]}
-            self.compaction_ended_at = time.monotonic()
+            self.compaction_ended_at = ended
         self.compaction_screen_active = active
 
     def sdk_compact_failed(self, message):

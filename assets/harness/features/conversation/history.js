@@ -124,7 +124,13 @@ async function readHistoryPage(older, version, itemsTurnId, generation = foregro
       turnFieldVersions.set("$session:plan", readVersion);
     }
     if (!itemsTurnId && claudeThreadId(id))
-      retireClaudeHistoryTurns(result.turnIds, readVersion, messageVersion + 1);
+      retireNativeHistoryTurns(result.turnIds, readVersion, messageVersion + 1);
+    else if (!itemsTurnId && result.backend === "antigravity" && result.nativeCheckpointTimeline === true) {
+      // 只有旧分段的消息均已随本页返回才退役；翻页前不能丢掉已展示的回复或工具，待发消息和托管轮不动。
+      const restored = new Set(result.data.flatMap(turn => (turn.items || []).map(item => item.id)));
+      retireNativeHistoryTurns(result.turnIds, readVersion, messageVersion + 1,
+        (key, turn) => /^agy-local-compact-turn-\d+$/.test(key) && (turn.items || []).every(item => restored.has(item.id)));
+    }
     // 用户要求旧摘要同步删除后不能被迟到读取复活；仅过滤本次读取开始后已明确删除的 Claude 轮次，不影响分页或 Codex。
     if (!itemsTurnId && claudeThreadId(id))
       result.data = result.data.filter(turn => turns.has(turn.id) || (turnVersions.get(turn.id) || 0) <= readVersion);
@@ -230,13 +236,13 @@ async function readHistoryPage(older, version, itemsTurnId, generation = foregro
     }
   }
 }
-export function retireClaudeHistoryTurns(ids, readVersion, version) {
+export function retireNativeHistoryTurns(ids, readVersion, version, native = (_key, value) => !!value._nativeUserId) {
   if (!Array.isArray(ids)) return false;
   const current = new Set(ids);
   let changed = false;
   for (const [key, value] of turns) {
     // 用户要求旧中断气泡从缓存退役；只处理已确认原生轮次，不能清掉待发送预览或迟于 HTTP 读取的新流消息。
-    if (!value._nativeUserId || current.has(key) || (turnVersions.get(key) || 0) > readVersion) continue;
+    if (!native(key, value) || current.has(key) || (turnVersions.get(key) || 0) > readVersion) continue;
     turns.delete(key); turnVersions.set(key, version); changed = true;
     for (const item of value.items || []) {
       itemVersions.set(`${key}:${item.id}`, version); partialItems.delete(`${key}:${item.id}`);

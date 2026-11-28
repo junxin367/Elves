@@ -1594,7 +1594,7 @@ const vm = {
     const result = nodeVm.createContext(context, options);
     nodeVm.runInContext(backendHelpers, result);
     nodeVm.runInContext(sourceSection("function compactionInProgress(", "function compactionQueueSendReason("), result);
-    nodeVm.runInContext((sourceSection("function retireC", "function pru") + "\n" + sourceSection("function orderCl", "function mer")), result);
+    nodeVm.runInContext((sourceSection("function retireNativeHistoryTurns(", "function pru") + "\n" + sourceSection("function orderCl", "function mer")), result);
     return result;
   },
 };
@@ -6794,7 +6794,7 @@ test("Claude 中断修复退役旧气泡并重算分页，同时保留待发送�
     turnVersions: new Map([["new-live", 20]]), itemVersions: new Map(), partialItems: new Set(["interruption:control-item"]),
     transcriptEvents: new Map([["old-event", { turnId: "interruption" }]]), messageVersion: 20,
   });
-  assert.equal(context.retireClaudeHistoryTurns(["older", "real"], 10, 21), true);
+  assert.equal(context.retireNativeHistoryTurns(["older", "real"], 10, 21), true);
   assert.deepEqual([...context.turns.keys()], ["real", "pending", "new-live"]);
   assert.equal(context.turnVersions.get("interruption"), 21);
   assert.equal(context.itemVersions.get("interruption:control-item"), 21);
@@ -9047,7 +9047,7 @@ test("压缩提示分行保留同次实际模型和统计，缺失字段不借�
   const node = render({ id: "compact", type: "contextCompaction", completed: true,
     compactionModel: "actual-compression-model", preTokens: 283393, postTokens: 9878, durationMs: 198244 });
   assert.match(node.attributes["aria-label"], /\n压缩模型：actual-compression-model\n/);
-  assert.match(node.attributes["aria-label"], /\n压缩前：283,393 Token\n压缩后：9,878 Token\n缩减：96.5%\n用时：3 分 18.244 秒/);
+  assert.match(node.attributes["aria-label"], /\n压缩前：283,393 Token\n压缩后：9,878 Token\n缩减：96.5%\n压缩耗时：3 分 18.244 秒/);
   const info = node.children[2], click = { currentTarget: info, stopPropagation() { this.stopped = true; } };
   assert.equal(info.attributes["aria-expanded"], "false");
   assert.match(info.attributes.title, /\n压缩模型：actual-compression-model\n/);
@@ -9059,13 +9059,39 @@ test("压缩提示分行保留同次实际模型和统计，缺失字段不借�
   assert.equal(modelInfo.attributes["aria-expanded"], undefined);
   assert.deepEqual(opened, [info], "普通模型变更事件不展开压缩详情");
   const missing = render({ id: "missing", type: "contextCompaction", completed: true, postTokens: 0, durationMs: 0 });
-  assert.match(missing.attributes["aria-label"], /压缩模型：原生未提供/);
+  assert.match(missing.attributes["aria-label"], /压缩模型：未记录/);
   assert.match(missing.attributes["aria-label"], /压缩后：0 Token/);
   assert.doesNotMatch(missing.attributes["aria-label"], /压缩前：|缩减：/);
   const invalid = render({ id: "invalid", type: "contextCompaction", completed: true,
     compactionModel: "invalid\nmodel", preTokens: 10, postTokens: 20, durationMs: -1 });
-  assert.match(invalid.attributes["aria-label"], /压缩模型：原生未提供/);
-  assert.doesNotMatch(invalid.attributes["aria-label"], /缩减：|用时：/);
+  assert.match(invalid.attributes["aria-label"], /压缩模型：未记录/);
+  assert.doesNotMatch(invalid.attributes["aria-label"], /缩减：|压缩耗时：/);
+});
+
+test("压缩详情按同次证据升级，AGY 两种来源都展示摘要用量而非压缩比例", () => {
+  const c = vm.createContext({ completedItem: v => v?.completed === true });
+  vm.runInContext(sourceSection("function mergeItemProjection("), c);
+  const render = compactionRenderer();
+  for (const source of ["automatic", "manual"]) {
+    const cp = { id:"cut", type:"contextCompaction", backend:"antigravity", source, completed:true,
+      ...(source === "automatic" ? {nativeCheckpointStep:4} : {}), recordedAtMs:1700000000000,
+      summaryInputTokens:120, summaryOutputTokens:0, preTokens:100, postTokens:1 };
+    const inferred={ ...cp, compactionModel:"a", compactionModelSource:"inferred" };
+    const native={ ...cp, compactionModel:"b", compactionModelSource:"native", durationMs:1234, compactionDurationSource:"observed" };
+    const chosen={ ...cp, compactionModel:"c", compactionModelSource:"specified" };
+    const late=c.mergeItemProjection(c.mergeItemProjection(inferred,native),chosen);
+    assert.deepEqual([late.compactionModel,late.compactionModelSource,late.durationMs],["b","native",1234]);
+    assert.match(render(inferred).attributes["aria-label"], /压缩模型：a（推定）\n记录时间：/);
+    assert.match(render(chosen).attributes["aria-label"], /压缩模型：c（指定）/);
+    const text=render(late).attributes["aria-label"];
+    assert.match(text,/摘要输入：120 Token\n摘要输出：0 Token\n压缩耗时：1.234 秒（实测）/);
+    assert.doesNotMatch(text,/压缩前|压缩后|缩减/);
+    assert.doesNotMatch(render(cp).attributes["aria-label"],/压缩耗时/);
+  }
+  for (const status of ["failed","interrupted","unknown"]) {
+    const label=render({id:"bad",type:"contextCompaction",status,completed:true,preTokens:100,postTokens:1}).attributes["aria-label"];
+    assert.doesNotMatch(label,/压缩后|缩减/);
+  }
 });
 
 test("Claude 目标统计只显示显式返回值，等待期间不自行累计耗时", () => {
@@ -9185,6 +9211,26 @@ test("压缩历史仅有时间字段时，切回会话即可显示进行中或�
   assert.match(render(item).textContent, /正在压缩上下文/);
   assert.match(render({ ...item, completedAtMs: 1794147151527 }).textContent, /上下文已压缩/);
   assert.doesNotMatch(render({ ...item, completedAtMs: 1794147151527 }).textContent, /正在压缩|状态已更新/);
+});
+
+test("AGY 自动压缩按原生锚点渲染一次，摘要输出不能冒充压缩后的上下文", () => {
+  const context = { transcriptEvents: new Map(), itemVersions: new Map(), messageImageMediaReads: new WeakMap() };
+  vm.createContext(context);
+  vm.runInContext([sourceSection("const transcriptEventTyp", "function mergeRe"),
+    sourceSection("function completedIt"), sourceSection("function mergeRe")].join("\n"), context);
+  const input = { id:"input", type:"userMessage" }, reply = { id:"reply", type:"agentMessage" };
+  const event = { type:"contextCompaction", backend:"antigravity", source:"automatic", status:"completed",
+    completed:true, id:"agy-local-compact-7", nativeCheckpointStep:7, beforeItemId:"reply",
+    recordedAtMs:1795662785000, summaryInputTokens:515517, summaryOutputTokens:6665 };
+  const old = { id:event.id, type:"contextCompaction", source:"manual", completed:true, postTokens:6665 };
+  context.mergeTranscriptEvents([{turnId:"t",item:event}, {turnId:"t",item:old}]);
+  let turn = { id:"t", items:[input, reply, old] };
+  for (let i=0; i<2; i++) turn=context.enrichTurnTranscriptEvents(turn);
+  assert.deepEqual(Array.from(turn.items,i=>i.id),["input",event.id,"reply"]);
+  const node = compactionRenderer()(turn.items[1]);
+  assert.equal(node.textContent,"上下文已自动压缩");
+  assert.match(node.attributes["aria-label"], /记录时间：.+\n摘要输入：515,517 Token\n摘要输出：6,665 Token/);
+  assert.doesNotMatch(node.attributes["aria-label"],/压缩后：|缩减：|用时：/);
 });
 
 test("压缩失败、中断和未知历史不能显示为成功完成", () => {
@@ -17962,9 +18008,11 @@ test("Token hover 只展示本轮工具实测区间并集和去重后的上下�
   ctx.turns.get("turn-current").items = [
     tool("native", { toolCallAtMs: 1000, toolResultAtMs: 1250 }),
     tool("other-clock", { toolCallAtMs: 2100, completedAtMs: 5300 }),
+    compact("legacy-mixed-clocks", { backend: "claude", startedAtMs: 2000, completedAtMs: 3100 }),
   ];
   ctx.syncComposerMetrics(); claude.complete(0, { source: "claude-native" }); await claude.flush();
   assert.match(claude.node.title, /工具耗时 250 毫秒（调用至结果）$/u);
+  assert.doesNotMatch(claude.node.title, /上下文压缩耗时/u);
 });
 
 test("缓存倒计时在总 Token 后显示，满一分钟用分钟，到期隐藏", async () => {

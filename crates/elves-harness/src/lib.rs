@@ -64,6 +64,7 @@ mod browser;
 mod channels;
 mod claude;
 mod codex;
+mod compaction_facts;
 mod context_usage;
 mod conversation_naming;
 mod credentials;

@@ -127,7 +127,7 @@ impl CodexHarness {
         Ok(response)
     }
 
-    async fn codex_home_dir(&self) -> PathBuf {
+    pub(super) async fn codex_home_dir(&self) -> PathBuf {
         self.runtime
             .connection()
             .await
@@ -385,17 +385,19 @@ impl CodexHarness {
                                 &format!("切换压缩模型 {target_model} 失败，压缩未发出：{failure}"),
                             ));
                         }
-                        self.projection
-                            .lock()
-                            .await
-                            .pending_compaction_models
-                            .insert(id.to_owned(), target_model);
                         switched_restore = Some(restore);
                     }
                 }
             }
         }
-        let revision = self.projection.lock().await.compaction_revision(id);
+        let revision = {
+            let mut p = self.projection.lock().await;
+            // 切换成功且即将发出本次手动命令才冻结目标；错误回执、恢复或连接代次变化均清除。
+            if let Some(restore) = &switched_restore {
+                p.pending_compaction_models.insert(id.to_owned(), restore.compaction_model.clone());
+            }
+            p.compaction_revision(id)
+        };
         let result = if is_side {
             let generation = self.side_generation(id).await?;
             self.runtime

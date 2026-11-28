@@ -106,6 +106,44 @@ class SharedQueueHistoryTests(unittest.TestCase):
             "compactMetadata": {"trigger": "manual", "compactionModel": "bad\nmodel"}})
         self.assertNotIn("compactionModel", native.compaction_events["invalid-model"])
 
+    def test_compaction_model_uses_bound_command_or_native_parent_and_preserves_measured_time(self):
+        reader = self.native_active()
+        command = {"id":"op", "name":"compact", "state":"pending", "issuedAt":100,
+                   "compactionModel":"chosen", "compactionModelSource":"specified"}
+        reader.native_commands = [command]
+        with patch.object(time, "time", return_value=1), patch.object(time, "monotonic", side_effect=[1.0, 1.125]):
+            reader.sdk_compacting(True)
+            self.assertEqual(reader.compaction_events["op"]["compactionModelSource"], "specified")
+            reader.observe_control_record({"type":"system","uuid":"auto","subtype":"compact_boundary","timestamp":1100,
+                                          "compactMetadata":{"trigger":"automatic"}})
+            self.assertEqual(command["state"], "running")
+            reader.sdk_compacting(False)
+            reader.observe_control_record({"type":"system","uuid":"manual","subtype":"compact_boundary","timestamp":3000,
+                                          "compactMetadata":{"trigger":"manual","model":"actual"}})
+        event = reader.compaction_events["op"]
+        self.assertEqual((event["compactionModel"],event["compactionModelSource"]), ("actual","native"))
+        self.assertEqual((event["durationMs"],event["compactionDurationSource"],event["recordedAtMs"]), (125,"observed",3000))
+        reply = {"type":"assistant","uuid":"parent","timestamp":4000,"message":{"model":"then-model"}}
+        boundary = {"type":"system","uuid":"next","subtype":"compact_boundary","timestamp":5000,
+                    "parentUuid":"parent","compactMetadata":{"trigger":"auto"}}
+        reader.observe_control_record(reply)
+        reader.observe_control_record(boundary)
+        self.assertEqual(reader.compaction_events["next"]["compactionModelSource"], "inferred")
+        self.assertNotIn("durationMs", reader.compaction_events["next"])
+        reader.observe_control_record(reply)
+        reader.observe_control_record({**boundary, "uuid":"fork", "parentUuid":"other"})
+        self.assertNotIn("compactionModel", reader.compaction_events["fork"])
+        reader.observe_control_record(reply)
+        reader.observe_control_record({"type":"user","uuid":"switch","message":{"content":"<command-name>/model</command-name>"}})
+        reader.observe_control_record({**boundary, "uuid":"after-switch"})
+        self.assertNotIn("compactionModel", reader.compaction_events["after-switch"])
+        reader.compaction_events["resumed"]={"id":"resumed","status":"unknown","source":"automatic","startedAtMs":100}
+        reader.compaction_event_id="resumed"
+        reader.sdk_compacting(True)
+        reader.record_compaction_event("resumed","completed",at=5000)
+        self.assertNotIn("durationMs",reader.compaction_events["resumed"])
+        self.assertNotIn("compactionModel",reader.compaction_events["resumed"])
+
 
     def test_native_goal_records_distinguish_clear_from_evaluated_completion(self):
         def goal(identity, at, met=False, sentinel=True):

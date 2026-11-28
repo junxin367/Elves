@@ -1,5 +1,5 @@
 //! AGY 会话统计只读当前原生转录：首次最多尾读 8 MiB，之后只消费完整追加行。
-//! 不启动 CLI、不改写会话正文，按原生 step_index 去重模型调用。
+//! 不启动 CLI、不改写会话正文，按原生 step_index 去重模型调用，并旁路提取同一份追加记录中的压缩检查点。
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -19,6 +19,8 @@ const CACHE_CAPACITY: usize = 64;
 #[derive(Clone, Default)]
 struct Ledger {
     users: BTreeMap<u64, (u64, String)>,
+    checkpoint_origin: super::checkpoints::Origin,
+    checkpoints: BTreeMap<u64, super::checkpoints::Checkpoint>,
     calls: BTreeMap<u64, (Option<u64>, Value)>,
     complete: bool,
     carried: Value,
@@ -29,6 +31,7 @@ struct Ledger {
 #[derive(Clone)]
 pub(crate) struct Snapshot {
     pub turns: Vec<Value>,
+    pub(super) checkpoints: Vec<super::checkpoints::Checkpoint>,
     pub usage: Value,
     pub complete: bool,
 }
@@ -120,9 +123,21 @@ impl Ledger {
         }
         let Ok(entry) = serde_json::from_slice::<Value>(line) else {
             self.complete = false;
+            self.checkpoint_origin.invalidate_input();
             return;
         };
         let kind = entry["type"].as_str().unwrap_or("");
+        match self.checkpoint_origin.observe(&entry) {
+            Some(super::checkpoints::Boundary::Automatic(cp)) => {
+                self.checkpoints.insert(cp.step, cp);
+                // 仅用于前台增量刷新，最近 128 个边界与输入账本同限；完整历史不受此上限影响。
+                if self.checkpoints.len() > 128 { self.checkpoints.pop_first(); }
+            }
+            Some(super::checkpoints::Boundary::Model(step, model)) => {
+                if let Some(cp) = self.checkpoints.get_mut(&step) { cp.infer(&model); }
+            }
+            _ => {}
+        }
         if kind != "USER_INPUT" && entry["source"] != "USER" && kind != "PLANNER_RESPONSE" {
             return;
         }
@@ -224,6 +239,7 @@ impl Ledger {
         let complete = self.complete && (self.calls.is_empty() || total(&usage).is_some());
         Snapshot {
             turns,
+            checkpoints: self.checkpoints.values().cloned().collect(),
             usage,
             complete,
         }

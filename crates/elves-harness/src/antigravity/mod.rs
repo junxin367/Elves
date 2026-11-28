@@ -2,6 +2,7 @@
 //! 本地用户配置文件与本地已落盘对话转录按本机或所属 WSL 实例直接只读/安全写入（见 AGENTS.md）。
 
 pub(crate) mod acp;
+mod checkpoints;
 pub(crate) mod local_store;
 pub(crate) mod projection;
 pub(crate) mod queue;
@@ -95,6 +96,10 @@ struct Conversation {
     #[serde(default)]
     local_transcript_len: u64,
     #[serde(default)]
+    local_projection_version: u8,
+    #[serde(skip)]
+    observed_checkpoint_step: Option<(u64, bool)>,
+    #[serde(default)]
     edit_history_head: String,
     #[serde(default)]
     token_usage: Value,
@@ -132,6 +137,20 @@ impl Conversation {
         )
     }
 
+    fn observe_checkpoints(&mut self, events: &[checkpoints::Checkpoint]) -> bool {
+        let Some(latest) = events.last() else { return false; };
+        if self.discovered && !self.turns.iter().any(|t| t["id"].as_str().is_some_and(|id| id.starts_with("agy-turn-"))) {
+            // 原版 App 正在写入的只读会话可能刚开始新轮，旧页面还没有锚点；每个新边界只唤起一次所属历史读取。
+            let signature = latest.signature();
+            if self.observed_checkpoint_step.is_none_or(|previous| previous < signature) {
+                self.observed_checkpoint_step = Some(signature);
+                return true;
+            }
+            return false;
+        }
+        checkpoints::merge_recent(&mut self.turns, events)
+    }
+
     fn stop_requested(&self) -> bool {
         self.turns.iter().rev().any(|turn| {
             turn["status"] == "inProgress"
@@ -152,6 +171,7 @@ impl Conversation {
 
     fn displayed_turn(&self, turn: &Value) -> Value {
         let mut value = turn.clone();
+        checkpoints::display(&mut value);
         if let Some(obj) = value.as_object_mut() {
             obj.remove("_acpUsage");
             obj.remove("_pendingUserItem");
@@ -161,8 +181,18 @@ impl Conversation {
             obj.remove("_promptStop");
             obj.remove("_acpUsageObservations");
             obj.remove("_nativeRequestTimestamps");
+            obj.remove("_agyInheritedHistory");
         }
         if let Some(items) = value["items"].as_array_mut() {
+            // 明确给前端下一个原生条目的位置；晚到的完成快照也不能把自动压缩推到所有回复之后。
+            let mut next_id = Value::Null;
+            for item in items.iter_mut().rev() {
+                if item["nativeCheckpointStep"].is_u64() {
+                    item["beforeItemId"] = next_id.clone();
+                } else {
+                    next_id = item["id"].clone();
+                }
+            }
             for item in items.iter_mut() {
                 if let Some(obj) = item.as_object_mut() {
                     obj.remove("_acpKind");
@@ -182,7 +212,7 @@ impl Conversation {
         value
     }
 
-    fn sync_local_turns(&mut self, turns: Vec<Value>) {
+    fn sync_local_turns(&mut self, turns: Vec<Value>, checkpoints: &[checkpoints::Checkpoint]) {
         // Elves 已接续执行后，以已保存的真实轮次为准；本地转录可能缺少最终限额错误或只含中间重试，
         // 不能在重进会话时整段替换，导致原生提示和已确认消息消失。统计仍按原有规则同步。
         let has_managed_turn = self.turns.iter().any(|turn| {
@@ -194,6 +224,7 @@ impl Conversation {
         } else {
             sync_turn_usage_from_transcript(&mut self.turns, &turns);
             task_notices::merge_managed(&mut self.turns, &turns);
+            checkpoints::merge(&mut self.turns, checkpoints);
         }
     }
 
@@ -737,6 +768,8 @@ impl Antigravity {
                     history_loaded: false,
                     local_transcript_mtime_ms: 0,
                     local_transcript_len: 0,
+                    local_projection_version: 0,
+                    observed_checkpoint_step: None,
                     edit_history_head: "agy-head-0".into(),
                     token_usage: Value::Null,
                     goal: Value::Null,
@@ -1177,9 +1210,17 @@ impl Antigravity {
             }
         }
         // 历史编辑/新轮次在读取期间改变身份时丢弃旧快照；前端会按当前轮次立即再读。
-        if !self.saved.lock().await.conversations.get(&c.id).is_some_and(|current|
-            !current.deleted && current.native_id == c.native_id && current.edit_history_head == c.edit_history_head) {
-            return Ok(Value::Null);
+        let new_checkpoint = {
+            let mut saved = self.saved.lock().await;
+            let Some(current) = saved.conversations.get_mut(&c.id).filter(|current|
+                !current.deleted && current.native_id == c.native_id && current.edit_history_head == c.edit_history_head)
+            else { return Ok(Value::Null); };
+            // 仅在当前托管轮已经确认所属输入时添加只读展示标记，不碰流式 items、压缩锁或发送队列。
+            // 前台正在执行时复用已有增量尾读；最后一次轮询也能补到迟落盘的完成检查点。
+            snapshot.as_ref().is_some_and(|s| current.observe_checkpoints(&s.checkpoints))
+        };
+        if new_checkpoint {
+            self.publish(json!({"method":"remote/resync","params":{"threadId":c.id,"reason":"antigravity_checkpoint"}}));
         }
         let mut metrics = projection::compute_session_metrics(
             &c.turns,
@@ -1316,6 +1357,10 @@ impl Antigravity {
         let Some(gemini_root) = self.resolve_gemini_root(&c.config).await else {
             return;
         };
+        self.sync_local_transcript_from_root(id, c, gemini_root).await;
+    }
+
+    async fn sync_local_transcript_from_root(&self, id: &str, c: Conversation, gemini_root: PathBuf) {
         let native_id = c.native_id.clone();
         let probe_root = gemini_root.clone();
         let probe_id = native_id.clone();
@@ -1328,7 +1373,9 @@ impl Antigravity {
         let Some((_path, mtime_ms, file_len)) = found else {
             return;
         };
-        let needs_read = !c.history_loaded
+        // 解析规则同样属于缓存键；即使原生文件未变，已打开过的会话也须重新核对检查点。
+        const TRANSCRIPT_PROJECTION_VERSION: u8 = 2;
+        let needs_read = c.local_projection_version != TRANSCRIPT_PROJECTION_VERSION || !c.history_loaded
             || c.turns.is_empty()
             || mtime_ms != c.local_transcript_mtime_ms
             || file_len != c.local_transcript_len;
@@ -1350,8 +1397,14 @@ impl Antigravity {
             && !conv.active()
             && conv.native_id == c.native_id
             && conv.edit_history_head == c.edit_history_head
+            && conv.local_transcript_mtime_ms == c.local_transcript_mtime_ms
+            && conv.local_transcript_len == c.local_transcript_len
         {
-            conv.sync_local_turns(parsed.turns);
+            conv.sync_local_turns(parsed.turns, &parsed.checkpoints);
+            if let Some(last) = parsed.checkpoints.last() {
+                conv.observed_checkpoint_step = Some(conv.observed_checkpoint_step.unwrap_or_default().max(last.signature()));
+            }
+            conv.local_projection_version = TRANSCRIPT_PROJECTION_VERSION;
             conv.history_loaded = true;
             conv.local_transcript_mtime_ms = parsed.mtime_ms;
             conv.local_transcript_len = parsed.file_len;
@@ -1609,6 +1662,7 @@ impl Antigravity {
             "nextCursor": if start == 0 { Value::Null } else { json!(start.to_string()) },
             "transcriptEvents": [],
             "backend": "antigravity",
+            "nativeCheckpointTimeline": c.local_projection_version > 0,
             "sessionPlan": c.session_plan(),
         }))
     }
@@ -2189,7 +2243,6 @@ impl Antigravity {
         let now = now_ms();
         let turn_id = format!("agy-compact-turn-{}", uuid::Uuid::new_v4());
         let item_id = format!("agy-compact-{}", uuid::Uuid::new_v4());
-        let pre_tokens = c.token_usage["last"]["totalTokens"].as_u64();
         let mut item = json!({
             "id": item_id,
             "type": "contextCompaction",
@@ -2198,15 +2251,12 @@ impl Antigravity {
             "completed": false,
             "source": "manual",
             "startedAtMs": now,
+            "recordedAtMs": now,
             "remoteInlineEvent": true,
             "remoteCompactionLifecycle": true,
         });
-        if !actual_model.is_empty() {
-            item["compactionModel"] = json!(actual_model);
-        }
-        if let Some(pre) = pre_tokens {
-            item["preTokens"] = json!(pre);
-        }
+        crate::compaction_facts::set_model(&mut item, Some(&actual_model),
+            if switched_restore.is_some() { "specified" } else { "inferred" });
         let turn = json!({
             "id": turn_id,
             "status": "inProgress",
@@ -2256,6 +2306,7 @@ impl Antigravity {
         let active_item_id = item_id.clone();
         let rt = runtime.clone();
         tokio::spawn(async move {
+            let clock = Instant::now();
             let prompt_res = rt
                 .client
                 .session_prompt(
@@ -2270,8 +2321,8 @@ impl Antigravity {
                     &active_item_id,
                     &rt,
                     switched_restore,
-                    pre_tokens,
-                    now,
+                    now_ms(),
+                    clock.elapsed().as_millis() as u64,
                     prompt_res,
                 )
                 .await;
@@ -2293,10 +2344,14 @@ impl Antigravity {
         item_id: &str,
         runtime: &Arc<ActiveRuntime>,
         restore: Option<CompactionModelRestore>,
-        pre_tokens: Option<u64>,
-        started_at_ms: u64,
+        now: u64,
+        duration_ms: u64,
         result: anyhow::Result<Value>,
     ) {
+        // 时间和型号绑定本次 /compact。ACP 返回即停表，不把恢复会话模型的时间算入压缩。
+        let reported_duration = result.as_ref().ok().and_then(|r| r["durationMs"].as_u64());
+        let reported_model = result.as_ref().ok().and_then(|r| r["compactionModel"].as_str().or_else(|| r["model"].as_str()))
+            .and_then(crate::compaction_facts::model).map(str::to_owned);
         let mut restored_cleanly = restore.is_none();
         if let Some(restore) = &restore {
             if !restore.original_model.is_empty() && runtime.client.is_live() {
@@ -2339,8 +2394,6 @@ impl Antigravity {
             }
         }
 
-        let now = now_ms();
-        let duration_ms = now.saturating_sub(started_at_ms);
         let (status, error_obj, failed, interrupted, prompt_usage) = match result {
             Ok(value) => {
                 let stop = value["stopReason"].as_str().unwrap_or("end_turn");
@@ -2373,10 +2426,6 @@ impl Antigravity {
                 c.active_turn_id = None;
             }
             c.compaction = json!({ "state": "idle" });
-            let post_tokens = prompt_usage
-                .as_ref()
-                .and_then(|u| u["outputTokens"].as_u64().filter(|n| *n > 0))
-                .or_else(|| c.token_usage["last"]["totalTokens"].as_u64());
             let mut usage_ev = None;
             if let Some(ref u) = prompt_usage
                 && let Some(normalized) = projection::normalize_usage_update(u)
@@ -2405,12 +2454,16 @@ impl Antigravity {
                     item["status"] = json!(status);
                     item["completed"] = json!(true);
                     item["completedAtMs"] = json!(now);
-                    item["durationMs"] = json!(duration_ms);
-                    if let Some(pre) = pre_tokens {
-                        item["preTokens"] = json!(pre);
+                    item["recordedAtMs"] = json!(now);
+                    if let Some(ms) = reported_duration.or_else(|| (duration_ms > 0).then_some(duration_ms)) {
+                        item["durationMs"] = json!(ms);
+                        item["compactionDurationSource"] = json!(if reported_duration.is_some() { "native" } else { "observed" });
                     }
-                    if let Some(post) = post_tokens {
-                        item["postTokens"] = json!(post);
+                    crate::compaction_facts::set_model(item, reported_model.as_deref(), "native");
+                    if !failed && !interrupted && let Some(u) = &prompt_usage {
+                        // ACP inputTokens 与缓存读取互斥；缺失不补零，更不能拿本轮或前一轮的用量作前后容量。
+                          if let Some(input) = transcript_metrics::input(u) { item["summaryInputTokens"] = json!(input); }
+                        if let Some(output) = u["outputTokens"].as_u64() { item["summaryOutputTokens"] = json!(output); }
                     }
                     item_snapshot = item.clone();
                 }
@@ -2539,6 +2592,8 @@ impl Antigravity {
             history_loaded: true,
             local_transcript_mtime_ms: 0,
             local_transcript_len: 0,
+            local_projection_version: 0,
+            observed_checkpoint_step: None,
             edit_history_head: "agy-head-0".into(),
             token_usage: Value::Null,
             goal: Value::Null,
@@ -3512,14 +3567,18 @@ impl Antigravity {
                 // `_meta.antigravity.systemPrompt.append` 传入，不触碰内部数据库，也不撤销磁盘文件改动。
                 let mut kept_turns = c.turns[..turn_idx].to_vec();
                 // 引导消息可能处于同一原生轮次；编辑它时仍保留该轮此前已确认的消息与回复。
-                if let Some(items) = c.turns[turn_idx]["items"].as_array()
+                let mut prefix = c.turns[turn_idx].clone();
+                checkpoints::display(&mut prefix);
+                if let Some(items) = prefix["items"].as_array_mut()
                     && let Some(item_idx) = items.iter().position(|item| item["id"] == payload["messageId"])
                     && item_idx > 0 {
-                    let mut prefix = c.turns[turn_idx].clone();
-                    prefix["items"] = json!(&items[..item_idx]);
+                    // 展示标记也按原生位置截断；不能把被编辑消息之后的压缩带入新历史。
+                    items.truncate(item_idx);
                     kept_turns.push(prefix);
                 }
                 let replay_prompt = projection::build_edit_replay_system_prompt(&kept_turns);
+                // 保留旧原生会话已有的标记，但不能把新会话的同号步骤匹配到继承的历史。
+                for turn in &mut kept_turns { turn["_agyInheritedHistory"] = json!(true); }
 
                 if let Some(mode) = payload["permissionMode"].as_str() {
                     c.permission_mode = Some(mode.to_owned());
@@ -3539,6 +3598,10 @@ impl Antigravity {
                         .get_mut(id)
                         .ok_or_else(|| error(404, "Antigravity 会话不存在"))?;
                     conv.native_id = new_runtime.native_session_id.clone();
+                    conv.local_transcript_len = 0;
+                    conv.local_transcript_mtime_ms = 0;
+                    conv.local_projection_version = 0;
+                    conv.observed_checkpoint_step = None;
                     conv.turns = kept_turns;
                     conv.model = c.model.clone();
                     conv.effort = c.effort.clone();
@@ -3961,6 +4024,71 @@ mod tests {
         assert!(saved[1]["_acpUsage"].is_null(), "迟到的上一轮日志不能填进本轮");
     }
 
+    #[tokio::test]
+    async fn automatic_checkpoint_live_projection_is_scoped_idempotent_and_survives_reread() {
+        let (dir, ag, _auth, rt) = audit_fixture(AUDIT_ACCEPT, true, true).await;
+        let id = "antigravity-audit";
+        let logs = dir.path().join("antigravity-cli/brain/audit/.system_generated/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let path = logs.join("transcript_full.jsonl");
+        let rows = [
+            json!({"type":"USER_INPUT","source":"USER_EXPLICIT","step_index":0,"created_at":"1970-01-01T00:00:02Z","content":"检查"}),
+            json!({"type":"PLANNER_RESPONSE","step_index":1,"created_at":"1970-01-01T00:00:03Z","content":"before"}),
+            json!({"type":"CHECKPOINT","source":"SYSTEM","status":"DONE","step_index":2,"created_at":"1970-01-01T00:00:04Z"}),
+            json!({"type":"PLANNER_RESPONSE","step_index":3,"created_at":"1970-01-01T00:00:05Z","content":"after"}),
+        ];
+        std::fs::write(&path, format!("{}\n",rows.map(|r| r.to_string()).join("\n"))).unwrap();
+        let raw = json!([
+            {"type":"userMessage","id":"input","sentAtMs":2090,"content":[{"type":"text","text":"检查"}]},
+            {"type":"commandExecution","id":"tool","startedAtMs":3012},
+            {"type":"agentMessage","id":"reply","startedAtMs":5488,"text":"after","status":"inProgress"}]);
+        {
+            let mut held = ag.saved.lock().await;
+            let c = held.conversations.get_mut(id).unwrap();
+            c.active_turn_id = Some("agy-turn-test".into());
+            c.turns[0] = json!({"id":"agy-turn-test","status":"inProgress","turnStartedAtMs":2090,"items":raw});
+        }
+        for _ in 0..2 {
+            ag.session_metrics_from_root(ag.conversation(id).await.unwrap(),Some(dir.path().to_owned())).await.unwrap();
+        }
+        let c = ag.conversation(id).await.unwrap();
+        assert_eq!(c.turns[0]["items"],raw, "侧带标记不能拆开正在流式更新的回复");
+        let shown = c.displayed_turn(&c.turns[0]);
+        assert!(shown.get("_agyCheckpoints").is_none());
+        assert_eq!(shown["items"].as_array().unwrap().len(),4);
+        assert_eq!(shown["items"][2]["source"],"automatic");
+        assert_eq!(shown["items"][2]["beforeItemId"],"reply");
+        let snapshot = transcript_metrics::read_file(&path).unwrap();
+        let mut external = c.clone();
+        external.discovered = true;
+        external.turns.clear();
+        assert!(external.observe_checkpoints(&snapshot.checkpoints), "外部只读会话也会刷新新边界");
+        assert!(!external.observe_checkpoints(&snapshot.checkpoints), "同一检查点不重复刷新");
+        assert!(external.turns.is_empty(), "外部会话等待所属原生历史，不在当前页猜造一轮");
+        let mut ambiguous = vec![c.turns[0].clone(),c.turns[0].clone()];
+        for t in &mut ambiguous {t.as_object_mut().unwrap().remove("_agyCheckpoints");}
+        assert!(!checkpoints::merge(&mut ambiguous,&snapshot.checkpoints));
+        assert!(!checkpoints::merge_recent(&mut ambiguous,&snapshot.checkpoints));
+        let mut wrong = ambiguous.remove(0);
+        wrong["items"][0]["content"][0]["text"] = json!("别的输入");
+        assert!(!checkpoints::merge(std::slice::from_mut(&mut wrong),&snapshot.checkpoints));
+        // 旧转录缓存长度/时间完全相同但投影版本落后时，重新读取；不需要改动原生文件。
+        let (_,mtime,len) = local_store::find_local_transcript_file(dir.path(),"audit").unwrap();
+        {
+            let mut held = ag.saved.lock().await;
+            let c = held.conversations.get_mut(id).unwrap();
+            c.active_turn_id=None; c.discovered=true;
+            c.turns=vec![json!({"id":"agy-local-turn-0","items":[],"status":"completed"})];
+            c.local_transcript_mtime_ms=mtime; c.local_transcript_len=len;
+        }
+        ag.sync_local_transcript_from_root(id,ag.conversation(id).await.unwrap(),dir.path().to_owned()).await;
+        let c=ag.conversation(id).await.unwrap();
+        assert_eq!(c.turns.len(),1);
+        assert_eq!(c.displayed_turn(&c.turns[0])["items"][2]["source"],"automatic");
+        assert_eq!(Antigravity::new(dir.path()).unwrap().conversation(id).await.unwrap().turns,c.turns);
+        rt.client.close().await;
+    }
+
     #[test]
     fn agy_metrics_same_length_transcript_still_checks_message_identity() {
         let mut saved = vec![json!({"id":"current","turnStartedAtMs":5000,
@@ -4292,14 +4420,14 @@ mod tests {
         rt.client.close().await;
         let mut c = ag.conversation("antigravity-audit").await.unwrap();
         let before = c.turns.clone();
-        c.sync_local_turns(vec![json!({"id":"agy-local-turn-0","status":"completed","items":[]})]);
+        c.sync_local_turns(vec![json!({"id":"agy-local-turn-0","status":"completed","items":[]})], &[]);
         assert_eq!(c.turns, before, "转录刷新不能清除已确认正文与最终原生错误");
         assert_eq!(c.turns[0]["status"], "failed");
         assert_eq!(c.turns[0]["error"]["nativeMessage"], "Quota exceeded");
         c.turns.clear();
-        c.sync_local_turns(vec![json!({"id":"agy-local-turn-0","items":[]})]);
+        c.sync_local_turns(vec![json!({"id":"agy-local-turn-0","items":[]})], &[]);
         assert_eq!(c.turns[0]["id"], "agy-local-turn-0", "尚未接续执行的外部历史仍正常导入");
-        c.sync_local_turns(vec![json!({"id":"agy-local-turn-1","items":[]})]);
+        c.sync_local_turns(vec![json!({"id":"agy-local-turn-1","items":[]})], &[]);
         assert_eq!(c.turns[0]["id"], "agy-local-turn-1");
     }
 
@@ -4325,7 +4453,7 @@ mod tests {
         let result = rt.client.session_prompt("audit", vec![json!({"type":"text","text":"/compact"})]).await;
         assert!(result.is_err());
         ag.finish_compaction(
-            "antigravity-audit", "agy-compact-audit", "compact-item", &rt, None, None, 1, result,
+            "antigravity-audit", "agy-compact-audit", "compact-item", &rt, None, 1200, 200, result,
         ).await;
         rt.client.close().await;
         let c = ag.conversation("antigravity-audit").await.unwrap();
@@ -4333,6 +4461,11 @@ mod tests {
         assert!(c.remote_queue.paused);
         assert_eq!(c.turns[0]["status"], "failed");
         assert_eq!(c.turns[0]["items"][0]["status"], "failed");
+        let event=&c.turns[0]["items"][0];
+        assert_eq!(event["durationMs"],200);
+        assert_eq!(event["recordedAtMs"],1200);
+        assert_eq!(event["compactionDurationSource"],"observed");
+        assert!(event["postTokens"].is_null() && event["summaryOutputTokens"].is_null());
         assert_eq!(c.turns[0]["error"]["source"], "antigravity");
         assert_eq!(c.turns[0]["error"]["nativeMessage"], raw);
         assert_eq!(c.turns[0]["error"]["nativeDetails"], json!([detail]));
@@ -5227,6 +5360,8 @@ mod tests {
                     history_loaded: true,
                     local_transcript_mtime_ms: 0,
                     local_transcript_len: 0,
+                    local_projection_version: 0,
+                    observed_checkpoint_step: None,
                     edit_history_head: "agy-head-0".into(),
                     token_usage: Value::Null,
                     goal: Value::Null,
@@ -5338,6 +5473,8 @@ mod tests {
                     history_loaded: true,
                     local_transcript_mtime_ms: 0,
                     local_transcript_len: 0,
+                    local_projection_version: 0,
+                    observed_checkpoint_step: None,
                     edit_history_head: "agy-head-1".into(),
                     token_usage: Value::Null,
                     goal: Value::Null,
@@ -5426,6 +5563,8 @@ mod tests {
                     history_loaded: true,
                     local_transcript_mtime_ms: 0,
                     local_transcript_len: 0,
+                    local_projection_version: 0,
+                    observed_checkpoint_step: None,
                     edit_history_head: "agy-head-1".into(),
                     token_usage: Value::Null,
                     goal: Value::Null,

@@ -252,7 +252,8 @@ function composerMetricsTurnTimings(turn, source) {
       if (milliseconds(item.startedAtMs) && !inTurn(item.startedAtMs)
           || milliseconds(item.completedAtMs) && !inTurn(item.completedAtMs)) continue;
       const duration = Number.isSafeInteger(item.durationMs) && item.durationMs >= 0 ? item.durationMs : null;
-      const native = pair(item.startedAtMs, item.completedAtMs), interval = native ?? observed;
+      // Claude 历史的两个展示时间可能分别来自 SDK 接收和转录，不是原生时间对；详情气泡与统计沿用同一条显式耗时。
+      const native = claude ? null : pair(item.startedAtMs, item.completedAtMs), interval = native ?? observed;
       const elapsed = duration ?? (interval ? interval[1] - interval[0] : null);
       const key = item.nativeId || item.id, evidence = duration != null ? 2 : native ? 1 : 0;
       if (elapsed != null && (!milliseconds(item.completedAtMs) || lower == null || item.completedAtMs - elapsed >= lower)

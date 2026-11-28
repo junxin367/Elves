@@ -1183,7 +1183,8 @@ impl Inner {
         let mut registered = self
             .reader_control(
                 json!({"subtype":"sdk_command","id":request["id"],"name":name,
-                "argument":argument,"expectedGoal":request["expectedGoal"]}),
+                "argument":argument,"expectedGoal":request["expectedGoal"],
+                "compactionModel":request["compactionModel"],"compactionModelSource":request["compactionModelSource"]}),
             )
             .await
             .map_err(reader_error)?;

@@ -10,18 +10,18 @@ pub(super) fn compaction_item(event: &Value) -> Option<Value> {
     ) {
         return None;
     }
-    Some(
-        json!({"id":id,"type":"contextCompaction","backend":"claude","status":status,
+    let mut item = json!({"id":id,"type":"contextCompaction","backend":"claude","status":status,
         "completed":matches!(status,"completed"|"failed"|"interrupted"),
         "source":if matches!(event["source"].as_str(),Some("auto"|"automatic")) {"automatic"} else {"manual"},
         "nativeId":event["nativeId"],"phase":event["phase"],"outcome":event["outcome"],
         "startedAtMs":event["startedAtMs"],"completedAtMs":event["completedAtMs"],
         "preTokens":event["preTokens"],"postTokens":event["postTokens"],"durationMs":event["durationMs"],
-        // 实际模型只来自当前压缩的原生记录；缺失时保留空值，由界面明确说明原生未提供。
-        "compactionModel":event["compactionModel"].as_str()
-            .filter(|model| !model.trim().is_empty() && model.len() <= 200 && !model.chars().any(char::is_control)),
-        "remoteInlineEvent":true,"remoteCompactionLifecycle":true}),
-    )
+        "recordedAtMs":event["recordedAtMs"],"compactionDurationSource":event["compactionDurationSource"],
+        "remoteInlineEvent":true,"remoteCompactionLifecycle":true});
+    crate::compaction_facts::set_model(&mut item, event["compactionModel"].as_str(),
+        event["compactionModelSource"].as_str().unwrap_or("native"));
+    crate::compaction_facts::timing(&mut item);
+    Some(item)
 }
 
 pub(super) fn project_compactions(
@@ -113,11 +113,16 @@ impl Claude {
         {
             return Err(error(409, "当前 Claude CLI 未提供此原生命令"));
         }
+        // 只把本次已应用的切模绑定给本次命令；未单独指定时保存发出时的会话快照，标为推定。
+        let selected = c.compaction_model_restore.as_ref().filter(|r| Some(r.command_id.as_str()) == command_id);
+        let model = (name == "compact").then(|| selected.map(|r|r.compaction_model.as_str()).unwrap_or(c.model.as_str()))
+            .and_then(crate::compaction_facts::model);
         let result = process
             .control(
                 json!({"subtype":"shared_native_command",
             "id":command_id.map(str::to_owned).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-            "name":name,"argument":argument,"expectedGoal":expected_goal}),
+            "name":name,"argument":argument,"expectedGoal":expected_goal,
+            "compactionModel":model,"compactionModelSource":if selected.is_some() {"specified"} else {"inferred"}}),
                 Some(authorization),
             )
             .await?;
@@ -608,6 +613,27 @@ fn setting_switch_state(before: &str, change: &Value) -> SettingSwitch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "显式提供 Elves 现有索引，仅回放指定测试 WSL 用户的压缩字段"]
+    fn replays_test_wsl_compaction_controls() {
+        let path=std::env::var_os("ELVES_TEST_CLAUDE_CONTROLS").unwrap();
+        let root:Value=serde_json::from_reader(std::fs::File::open(path).unwrap()).unwrap();
+        let rows=&root["conversations"];
+        let mut counts=[0;4];
+        for c in rows.as_object().into_iter().flat_map(|s|s.values()).chain(rows.as_array().into_iter().flatten())
+            .filter(|c|c["config"]["distribution"]=="codex-elves-claude-test" && c["config"]["user"]=="elves-test") {
+            for e in c["nativeControl"]["compactionEvents"].as_array().into_iter().flatten().filter(|e|e["status"]=="completed") {
+                let item=compaction_item(e).unwrap();
+                counts[0]+=1;
+                counts[1]+=usize::from(item["recordedAtMs"].is_u64());
+                counts[2]+=usize::from(item["compactionModel"].is_string());
+                counts[3]+=usize::from(item["durationMs"].is_u64());
+            }
+        }
+        assert!(counts[0]>0 && counts[0]==counts[1]);
+        eprintln!("测试 WSL 历史压缩条数/记录时间/型号/耗时：{counts:?}");
+    }
 
     #[test]
     fn compaction_item_preserves_only_explicit_native_model() {

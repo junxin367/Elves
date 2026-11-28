@@ -12,15 +12,18 @@ export function replaceTranscriptEvents(entries, readVersion = null) {
   // 用户要求切回/刷新不丢压缩记录；读取开始后收到的事件比这次快照新，不能被空列表清掉。
   const live = Number.isFinite(readVersion) ? [...transcriptEvents.entries()]
     .filter(([key]) => (itemVersions.get(key) || 0) > readVersion).map(([, entry]) => entry) : [];
+  const retained = new Map(transcriptEvents);
   transcriptEvents.clear();
   for (const entry of entries || []) {
     const item = entry?.item;
     if (typeof entry?.turnId !== "string" || typeof item?.id !== "string"
         || !transcriptEventTypes.has(item.type) || item.type === "claudeTaskNotification"
         || item.type === "backgroundTaskContinuation") continue;
-    transcriptEvents.set(`${entry.turnId}:${item.id}`, {
+    const key = `${entry.turnId}:${item.id}`;
+    transcriptEvents.set(key, {
       turnId: entry.turnId,
-      item,
+      // 切换会话已清空映射；这里只升级新快照中仍存在的同一条目，不复活已回退的压缩。
+      item: item.type === "contextCompaction" && retained.has(key) ? mergeItemProjection(retained.get(key).item, item) : item,
       beforeItemId: typeof entry.beforeItemId === "string" ? entry.beforeItemId : null
     });
   }
@@ -34,9 +37,7 @@ export function mergeTranscriptEvents(entries) {
         || item.type === "backgroundTaskContinuation") continue;
     const key = `${entry.turnId}:${item.id}`, previous = transcriptEvents.get(key);
     // 已收到的完成证据不能被迟到的进行中历史覆盖；失败和中断状态也随完成记录一起保留。
-    const projected = item.type === "contextCompaction" ? mergeItemProjection(previous?.item, item) : item;
-    const merged = item.type === "contextCompaction" && completedItem(previous?.item) && !completedItem(item)
-      ? mergeItemProjection(projected, previous.item) : projected;
+    const merged = item.type === "contextCompaction" ? mergeItemProjection(previous?.item, item) : item;
     transcriptEvents.set(key, {
       turnId: entry.turnId,
       item: merged,
@@ -76,8 +77,8 @@ export function enrichTurnTranscriptEvents(turn) {
       initialCompaction = entry;
     const existing = items.findIndex(item => item.id === entry.item.id);
     if (existing >= 0) {
-      const item = { ...items[existing], ...entry.item,
-        ...(items[existing].type === "contextCompaction" && items[existing].completed === true ? { completed: true } : {}) };
+      const item = entry.item.type === "contextCompaction"
+        ? mergeItemProjection(items[existing], entry.item) : { ...items[existing], ...entry.item };
       // Claude 同一轮中途换配置时保留原生请求位置，不能把后半轮的变化提前到用户问题之前。
       if (item.type !== "modelChanged" || item.remoteInlineEvent) { items[existing] = item; continue; }
       items.splice(existing, 1);
@@ -109,6 +110,14 @@ export function enrichTurnTranscriptEvents(turn) {
   if (manualCompactions.length) {
     const moving = new Set(manualCompactions);
     items.splice(0, items.length, ...items.filter(item => !moving.has(item)), ...manualCompactions);
+  }
+  // AGY 的完成快照可能晚于后半段流式回复；以所属原生检查点的后项为锚，不能将提示追加到轮末。
+  const anchored = items.filter(item => Number.isSafeInteger(item.nativeCheckpointStep) && item.beforeItemId)
+    .sort((a, b) => a.nativeCheckpointStep - b.nativeCheckpointStep);
+  for (const item of anchored) {
+    if (!items.some(other => other.id === item.beforeItemId)) continue;
+    items.splice(items.indexOf(item), 1);
+    items.splice(items.findIndex(other => other.id === item.beforeItemId), 0, item);
   }
   const projected = items.find(item => item.type === "userMessage" && item.remoteCompactionInput === true);
   if (projected) {
@@ -168,6 +177,43 @@ export function mergeRemoteImageProjection(previous, snapshot, item, mediaReadVe
   return projected;
 }
 export function mergeItemProjection(previous, item) {
+  if (previous?.id === item.id && item.type === "contextCompaction" && previous.type === item.type) {
+    // 原生检查点替换旧的 AGY 手动标签；只有步骤和原生时间都相同才合并迟到的型号。
+    const cp = Number.isSafeInteger(item.nativeCheckpointStep), oldCp = Number.isSafeInteger(previous.nativeCheckpointStep);
+    if (cp !== oldCp || cp && (item.nativeCheckpointStep !== previous.nativeCheckpointStep || item.recordedAtMs !== previous.recordedAtMs))
+      return cp ? { ...item, beforeItemId: item.beforeItemId || previous.beforeItemId } : previous;
+    const merged = { ...previous, ...item };
+    const evidence = v => {
+      const model = [v.compactionModel, v.model].find(s => typeof s === "string" && s.trim() && s.length <= 200
+        && !["<synthetic>", "unknown"].includes(s.trim()) && !/[\u0000-\u001f\u007f-\u009f]/u.test(s));
+      const source = v.compactionModelSource || (v.backend === "antigravity" && v.source === "manual" ? "inferred" : "native");
+      return { model, source, rank: model ? ({ native: 3, specified: 2, inferred: 1 }[source] || 0) : 0 };
+    };
+    // 型号和来源成对比较；旧快照不能把同一条目的原生型号降为推定，也不能给推定型号换上原生标签。
+    const old = evidence(previous), fresh = evidence(item), best = old.rank >= fresh.rank ? old : fresh;
+    if (best.rank) { merged.compactionModel = best.model; merged.compactionModelSource = best.source; }
+    const durationRank = v => !Number.isSafeInteger(v.durationMs) || v.durationMs < 0 ? 0
+      : v.compactionDurationSource === "native" ? 2 : v.compactionDurationSource === "observed" ? Number(v.durationMs > 0)
+      : Number(v.backend !== "antigravity") * 2;
+    const duration = durationRank(previous) >= durationRank(item) ? previous : item;
+    if (durationRank(duration)) {
+      merged.durationMs = duration.durationMs;
+      merged.compactionDurationSource = duration.compactionDurationSource || "native";
+    } else { delete merged.durationMs; delete merged.compactionDurationSource; }
+    for (const k of ["preTokens", "postTokens", "summaryInputTokens", "summaryOutputTokens", "startedAtMs", "completedAtMs",
+      "hoverObservedStartedAtMs", "hoverObservedCompletedAtMs", "recordedAtMs"])
+      if (merged[k] == null && Number.isSafeInteger(previous[k])) merged[k] = previous[k];
+    if (completedItem(previous) && !completedItem(item)) {
+      for (const k of ["completed", "status", "phase", "outcome", "recordedAtMs"])
+        if (previous[k] != null) merged[k] = previous[k];
+    }
+    const timeRanks = {nativeEnd:5,record:4,observedEnd:3,nativeStart:2,observedStart:1};
+    if (Number.isSafeInteger(previous.recordedAtMs) && timeRanks[previous.recordedAtSource] > (timeRanks[item.recordedAtSource] || 0)) {
+      merged.recordedAtMs = previous.recordedAtMs;
+      merged.recordedAtSource = previous.recordedAtSource;
+    }
+    return JSON.stringify(previous) === JSON.stringify(merged) ? previous : merged;
+  }
   // 单条状态事件也可能晚于正文到达，不能用同 ID 的 steered 把已接受的引导内容改回空状态。
   if (previous?.id === item.id && previous.type === "userMessage" && item.type === "steered") return previous;
   const projection = {};
@@ -189,11 +235,6 @@ export function mergeItemProjection(previous, item) {
   if (previous?.id === item.id)
     for (const field of ["hoverObservedStartedAtMs", "hoverObservedCompletedAtMs", "toolCallAtMs", "toolResultAtMs"])
       if (item[field] == null && Number.isSafeInteger(previous?.[field])) hoverTiming[field] = previous[field];
-  // 用户要求压缩模型对应同一条原生记录；较旧历史缺字段时保留已确认型号，不能跨条目或跨会话补模型。
-  const compaction = {};
-  if (previous?.id === item.id && previous.type === "contextCompaction" && item.type === "contextCompaction")
-    for (const field of ["compactionModel", "model"])
-      if (item[field] == null && typeof previous[field] === "string") compaction[field] = previous[field];
-  const merged = mergeRemoteImageProjection(previous, null, { ...projection, ...item, ...hoverTiming, ...compaction });
+  const merged = mergeRemoteImageProjection(previous, null, { ...projection, ...item, ...hoverTiming });
   return previous && JSON.stringify(previous) === JSON.stringify(merged) ? previous : merged;
 }

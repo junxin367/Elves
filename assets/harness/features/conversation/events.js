@@ -33,7 +33,7 @@ import {
   normalizeDisplayedUserMessage, orderClaudeHistoryTurns, partialItems, setHistoryCursor,
   followMessages, setMessageVersion, setSessionPlan, turnFieldVersions, turnVersions
 } from "./history-state.js";
-import { retireClaudeHistoryTurns } from "./history.js";
+import { retireNativeHistoryTurns } from "./history.js";
 import { acceptedSendItem, pending } from "./pending-state.js";
 import {
   enrichTurnTranscriptEvents, mergeItemProjection, mergeTranscriptEvents, transcriptEventTypes
@@ -82,7 +82,7 @@ function receiveClaudeHistory(params) {
     setNotifiedQueue(thread.queuedMessages); setNotifiedQueueEdits(thread.queuedEdits || []); setQueueVersion(queueVersion + 1);
   }
   // 用户要求同步后旧内部摘要气泡消失；完整快照给出全部有效轮次 ID，仅移除已失效的原生轮次，不删除待发送预览。
-  if (!params.preview) retireClaudeHistoryTurns(params.turnIds, version, version);
+  if (!params.preview) retireNativeHistoryTurns(params.turnIds, version, version);
   // 共享会话提供同一原生历史的完整投影；替换对应轮次，CLI 消息不依赖刷新或再次发送。
   let applied = false;
   for (const snapshot of [...params.turns].reverse()) {

@@ -171,6 +171,8 @@ pub(super) struct Data {
     pub background_commands: BTreeMap<String, OpenCommand>,
     /// 手动压缩临时切往独立压缩模型后待恢复的原会话模型，按会话持久化防止重启遗留。
     pub compaction_model_restores: BTreeMap<String, CompactionModelRestore>,
+    /// 按原生会话、轮次、条目保存压缩证据；历史有对应条目才附加，不据此复活轮次。
+    pub compaction_details: BTreeMap<String, Vec<Value>>,
 }
 
 pub(super) struct Store {

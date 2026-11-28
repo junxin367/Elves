@@ -489,6 +489,8 @@ fn receipt_confirms_deletion(receipt: &Receipt, id: &str) -> bool {
 
 impl Data {
     fn forget_deleted_thread(&mut self, id: &str) {
+        self.compaction_details.remove(id);
+        self.compaction_model_restores.remove(id);
         self.queues.remove(id);
         self.edits.retain(|_, edit| edit.thread_id != id);
         self.thread_pins.remove(id);

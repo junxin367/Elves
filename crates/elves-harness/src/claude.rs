@@ -4805,19 +4805,22 @@ fn project_shared_history(frame: &Value, generation: &str) -> Vec<Value> {
                 .unwrap_or_else(|| json!({"id":row["uuid"]}));
             event["status"] = json!("completed");
             event["nativeId"] = row["uuid"].clone();
-            event["completedAtMs"] = row["timestampMs"].clone();
-            event["source"] = row["compactMetadata"]["trigger"].clone();
+            if let Some(at) = row["timestampMs"].as_u64().filter(|n|*n>0) {
+                event["completedAtMs"] = json!(at);
+            }
+            if let Some(trigger) = row["compactMetadata"]["trigger"].as_str() {
+                event["source"] = json!(trigger);
+            }
             for key in ["preTokens", "postTokens", "durationMs"] {
-                event[key] = row["compactMetadata"][key].clone();
+                if let Some(value) = row["compactMetadata"][key].as_u64() {
+                    event[key] = json!(value);
+                    if key == "durationMs" { event["compactionDurationSource"] = json!("native"); }
+                }
             }
             // 刷新历史时同样只读取这条压缩边界的显式型号；不能把后续消息或当前会话模型当作压缩模型。
-            if let Some(model) = ["compactionModel", "model"].iter().find_map(|key| {
-                row["compactMetadata"][*key].as_str()
-                    .filter(|model| !model.trim().is_empty() && model.len() <= 200 && !model.chars().any(char::is_control))
-            })
-            {
-                event["compactionModel"] = json!(model.trim());
-            }
+            let model = ["compactionModel", "model"].iter().find_map(|key|
+                row["compactMetadata"][*key].as_str().and_then(crate::compaction_facts::model));
+            crate::compaction_facts::set_model(&mut event, model, "native");
             let Some(item) = native_controls::compaction_item(&event) else {
                 continue;
             };

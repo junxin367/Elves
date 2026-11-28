@@ -76,6 +76,9 @@ pub struct ProxyRequestAudit {
     pub thread_id: Option<String>,
     #[serde(default)]
     pub turn_id: Option<String>,
+    /// 只记录同一个成功 Responses 终态里同时出现的响应 ID 和型号；不能把失败尝试配给回退后的请求。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_response_model: Option<(String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +104,7 @@ impl ProxyRequestAudit {
         error: Option<String>,
     ) {
         self.upstream_status_code = status_code;
+        self.confirmed_response_model = None;
         self.upstream_attempts.push(ProxyRequestAttempt {
             attempt: self.upstream_attempts.len() as u32 + 1,
             model: model.to_string(),
@@ -118,6 +122,10 @@ impl ProxyRequestAudit {
     }
 
     pub(crate) fn observe_response(&mut self, observer: &UpstreamResponseModelObserver) {
+        if let Some(outcome) = observer.outcome {
+            self.confirmed_response_model = (outcome == ProxyRequestOutcome::Succeeded)
+                .then(|| observer.confirmed_response_model.clone()).flatten();
+        }
         self.outcome = self.outcome.or(observer.outcome);
         self.error_code = self
             .error_code
@@ -535,6 +543,7 @@ fn request_result(record: &ProxyRequestRecord) -> (ProxyRequestAudit, Option<Str
     let mut audit = record.audit.clone();
     if record.state == ProxyRequestState::Pending {
         audit.outcome = None;
+        audit.confirmed_response_model = None;
         audit.error_code = None;
         return (audit, record.error.clone());
     }
@@ -555,6 +564,8 @@ fn request_result(record: &ProxyRequestRecord) -> (ProxyRequestAudit, Option<Str
         }
     }
     audit.observe_response(&observer);
+    // response_body 可能已为客户端改写型号。历史摘要只保留传输层亲自观察到的同帧证据。
+    audit.confirmed_response_model = record.audit.confirmed_response_model.clone();
     audit.outcome = observer.outcome.or(audit.outcome);
     audit.error_code = observer.error_code.clone().or(audit.error_code);
     let error = record.error.clone().or(observer.error).or_else(|| {
@@ -596,6 +607,7 @@ const MAX_SSE_MODEL_LINE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Default)]
 pub(crate) struct UpstreamResponseModelObserver {
+    confirmed_response_model: Option<(String, String)>,
     first: Option<String>,
     terminal: Option<String>,
     pub(crate) outcome: Option<ProxyRequestOutcome>,
@@ -690,6 +702,15 @@ impl UpstreamResponseModelObserver {
                 && value.get("type").and_then(Value::as_str) == Some("message")))
         {
             self.outcome = Some(ProxyRequestOutcome::Succeeded);
+        }
+        if matches!(protocol, UpstreamResponseProtocol::Responses)
+            && self.outcome == Some(ProxyRequestOutcome::Succeeded)
+            && (event_type == "response.completed" || status == Some("completed")
+                || response["object"] == "response.compaction")
+        {
+            let bounded = |key: &str| response[key].as_str().filter(|s| !s.trim().is_empty()
+                && s.len() <= 200 && !s.chars().any(char::is_control)).map(str::to_owned);
+            self.confirmed_response_model = bounded("id").zip(bounded("model"));
         }
         let candidates = match protocol {
             UpstreamResponseProtocol::Responses => {
@@ -1169,6 +1190,38 @@ pub fn read_summaries(limit: usize) -> std::io::Result<Vec<ProxyRequestSummary>>
     flush_pending_records()?;
     let path = default_log_path();
     read_summaries_at_path(&path, limit)
+}
+
+/// Harness 只能用已确认压缩的 (thread, turn, response) 取回实际型号，不开放代理日志或正文。
+pub fn confirmed_response_models(thread: &str) -> BTreeMap<(String, String), Option<String>> {
+    confirmed_response_models_at(&default_log_path(), thread)
+}
+
+fn confirmed_response_models_at(path: &Path, thread: &str) -> BTreeMap<(String, String), Option<String>> {
+    // 只读有界的新版索引，不回填旧日志、不刷写队列；迟到记录可在下次读取时接替推定值。
+    let mut out = BTreeMap::new();
+    if !fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() <= PROXY_INDEX_COMPACT_BYTES * 2) { return out; }
+    let Ok(file) = fs::File::open(path) else { return out };
+    use std::io::{BufRead, BufReader};
+    let mut lines = BufReader::new(file.take(PROXY_INDEX_COMPACT_BYTES * 2)).lines();
+    if !lines.next().is_some_and(|l| l.is_ok_and(|s| s.trim() == PROXY_INDEX_HEADER)) { return out; }
+    let mut rows = Vec::new();
+    for line in lines {
+        // 先以请求 ID 去重，再检查成功；后续没有型号或失败的记录也能否决旧证据。
+        let Ok(line) = line else { return out };
+        let Ok(s) = serde_json::from_str::<ProxyRequestSummary>(&line) else {return out};
+        rows.push(s);
+    }
+    for s in dedupe_summaries(rows) {
+        if s.audit.thread_id.as_deref() != Some(thread) || s.audit.outcome != Some(ProxyRequestOutcome::Succeeded)
+            || s.state != ProxyRequestState::Completed { continue; }
+        if let (Some(turn), Some((id, model))) = (s.audit.turn_id, s.audit.confirmed_response_model) {
+            out.entry((turn,id)).and_modify(|old: &mut Option<String>| {
+                if old.as_ref() != Some(&model) { *old = None; }
+            }).or_insert(Some(model));
+        }
+    }
+    out
 }
 
 pub fn find_record(id: &str) -> std::io::Result<Option<ProxyRequestRecord>> {
@@ -3433,6 +3486,45 @@ data: [DONE]
             super::ProxyRequestSummary::from(&record).audit.outcome,
             Some(super::ProxyRequestOutcome::Incomplete)
         );
+    }
+
+    #[test]
+    fn compaction_receipts_only_accept_an_upstream_terminal_pair_and_latest_request_state() {
+        use serde_json::json;
+        let path=temp_proxy_log_path("compact-receipt");
+        let mut observer=UpstreamResponseModelObserver::default();
+        let protocol=UpstreamResponseProtocol::Responses;
+        observer.observe_value(&json!({"type":"response.created","response":{"id":"resp","model":"early"}}),protocol,None);
+        observer.observe_value(&json!({"type":"response.completed","response":{"id":"resp"}}),protocol,None);
+        assert!(observer.confirmed_response_model.is_none());
+        observer.observe_value(&json!({"type":"response.completed","response":{"id":"resp","model":"actual"}}),protocol,None);
+        let mut record=sample_proxy_record("compact-receipt");
+        record.audit.thread_id=Some("thread".into());
+        record.audit.turn_id=Some("turn".into());
+        record.audit.observe_response(&observer);
+        record.response_body=json!({"status":"completed","id":"resp","model":"client-alias"}).to_string();
+        let summary=super::ProxyRequestSummary::from(&record);
+        let write=|updates: &[&super::ProxyRequestSummary]|{
+            let mut text=format!("{}\n",super::PROXY_INDEX_HEADER);
+            for s in updates{text.push_str(&format!("{}\n",serde_json::to_string(s).unwrap()));}
+            std::fs::write(&path,text).unwrap();
+        };
+        let key=("turn".to_owned(),"resp".to_owned());
+        write(&[&summary]);
+        assert_eq!(super::confirmed_response_models_at(&path,"thread")[&key].as_deref(),Some("actual"));
+        assert!(super::confirmed_response_models_at(&path,"other-thread").is_empty());
+        let mut conflict=summary.clone();conflict.id="conflict".into();
+        conflict.audit.confirmed_response_model=Some(("resp".into(),"different".into()));
+        write(&[&summary,&conflict]);
+        assert!(super::confirmed_response_models_at(&path,"thread")[&key].is_none());
+        let mut later=summary.clone();
+        later.audit.outcome=Some(super::ProxyRequestOutcome::Incomplete);
+        later.audit.confirmed_response_model=None;
+        write(&[&summary,&later]);
+        assert!(super::confirmed_response_models_at(&path,"thread").is_empty());
+        record.audit.record_attempt("retry",None,None);
+        assert!(record.audit.confirmed_response_model.is_none());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

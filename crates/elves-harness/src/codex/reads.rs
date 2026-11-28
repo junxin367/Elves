@@ -500,7 +500,8 @@ impl CodexHarness {
                 "itemOrder":"asc","itemDirection":"older","itemsPageComplete":true,
                 "itemsComplete":page.next_cursor.is_none(),"itemsNextCursor":page.next_cursor,
                 "newestSnapshotItemId":page.newest_snapshot_item_id,"pageLimit":HISTORY_ITEM_PAGE_LIMIT,"transcriptEvents":[]});
-            return Ok(self.projection.lock().await.history(id, history, false));
+            let history=self.projection.lock().await.history(id, history, false);
+            return Ok(self.compaction_history_details(id,history,item_cursor.is_none()).await);
         }
         let page = self
             .runtime
@@ -542,11 +543,8 @@ impl CodexHarness {
             "nextCursor":next_cursor,"backwardsCursor":page["backwardsCursor"],
             "turnOrder":"desc","itemOrder":"asc","turnsPageComplete":true,
             "turnsComplete":next_cursor.is_none(),"itemsPaginationByTurnId":pagination,"transcriptEvents":[]});
-        Ok(self
-            .projection
-            .lock()
-            .await
-            .history(id, history, cursor.is_none()))
+        let history=self.projection.lock().await.history(id,history,cursor.is_none());
+        Ok(self.compaction_history_details(id,history,true).await)
     }
 
     async fn history_items_page(

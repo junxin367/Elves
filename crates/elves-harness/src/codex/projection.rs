@@ -324,6 +324,7 @@ impl Projection {
 
     pub fn forget_compactions(&mut self, id: &str) {
         self.compactions.remove(id);
+        self.pending_compaction_models.remove(id);
         self.compaction_records
             .retain(|record| record.thread_id != id);
     }
@@ -399,31 +400,37 @@ impl Projection {
             return;
         }
         let mut position_at_ms = None;
+        let explicit = item["compactionModel"].as_str().or_else(||item["model"].as_str()).map(str::to_owned);
+        // native item 自己带的型号才是原生证据；派发或首次开始时的型号分别标「指定」「推定」并冻结。
+        if let Some(name) = explicit.as_deref().and_then(crate::compaction_facts::model) {
+            item["compactionModel"] = json!(name);
+            item["compactionModelSource"] = json!("native");
+        }
         if let Some(index) = self.compaction_records.iter().position(|record| {
             record.thread_id == id && record.turn_id == turn_id && record.item["id"] == item["id"]
         }) {
             let previous = self.compaction_records.remove(index).unwrap();
             position_at_ms = Some(previous.position_at_ms);
-            let mut merged = previous.item.clone();
-            for (key, value) in item.as_object().into_iter().flatten() {
-                merged[key] = value.clone();
-            }
             if previous.item["completed"] == true && !completed {
                 item = previous.item;
             } else {
-                item = merged;
+                // 终态/重放可以缺字段。只合并同一条目的证据，空值不能抹掉已确认的型号和计时。
+                for key in ["hoverObservedStartedAtMs","hoverObservedCompletedAtMs","source","status"] {
+                    if item[key].is_null() && !previous.item[key].is_null() { item[key] = previous.item[key].clone(); }
+                }
+                super::compaction_details::merge(&mut item, &previous.item);
             }
         }
         item["completed"] = json!(completed || item["completed"] == true);
-        if item["compactionModel"].is_null()
-            && item["model"].is_null()
-            && let Some(model) = self.pending_compaction_models.get(id)
-        {
-            item["compactionModel"] = json!(model);
+        if position_at_ms.is_none() {
+            if let Some(name) = self.pending_compaction_models.remove(id) {
+                crate::compaction_facts::set_model(&mut item, Some(&name), "specified");
+            } else if !completed {
+                let metadata = self.sides.threads.get(id).map(|s|&s.metadata).or_else(||self.threads.get(id));
+                crate::compaction_facts::set_model(&mut item,metadata.and_then(|t| t["model"].as_str()),"inferred");
+            }
         }
-        if item["completed"] == true {
-            self.pending_compaction_models.remove(id);
-        }
+        crate::compaction_facts::timing(&mut item);
         // 缺少原生开始时间时只用收帧时间给正文定位，不能把定位回退传成 Token hover 的实测起点。
         let position_at_ms = item["startedAtMs"]
             .as_u64()
@@ -448,6 +455,10 @@ impl Projection {
             };
             self.compaction_records.remove(index);
         }
+    }
+
+    pub(super) fn compaction_event(&self, id: &str, turn: &str, item: &str) -> Option<&Value> {
+        self.compaction_records.iter().rev().find(|r|r.thread_id==id && r.turn_id==turn && r.item["id"]==item).map(|r|&r.item)
     }
 
     pub fn history(&self, id: &str, mut history: Value, latest: bool) -> Value {
@@ -559,6 +570,7 @@ impl Projection {
             self.queue_turn_outcomes.clear();
             self.compactions.clear();
             self.compaction_records.clear();
+            self.pending_compaction_models.clear();
             // 新引擎没有旧计划的恢复证据；旧代次缓存不能冒充当前原生状态。
             self.plans.clear();
             self.retired_plan_turns.clear();
@@ -901,6 +913,9 @@ impl Projection {
                     return;
                 }
                 self.remember_compaction(&id, turn_id, frame["params"]["item"].clone(), false);
+                if let Some(enriched) = self.compaction_event(&id, turn_id, frame["params"]["item"]["id"].as_str().unwrap_or("")) {
+                    frame["params"]["item"] = enriched.clone();
+                }
                 self.compactions.insert(
                     id.clone(),
                     json!({"state":"running",
@@ -910,6 +925,9 @@ impl Projection {
             "item/completed" if frame["params"]["item"]["type"] == "contextCompaction" => {
                 let turn_id = frame["params"]["turnId"].as_str().unwrap_or("");
                 self.remember_compaction(&id, turn_id, frame["params"]["item"].clone(), true);
+                if let Some(enriched) = self.compaction_event(&id, turn_id, frame["params"]["item"]["id"].as_str().unwrap_or("")) {
+                    frame["params"]["item"] = enriched.clone();
+                }
                 if self.compactions.get(&id).is_some_and(|state| {
                     state["turnId"].is_null() || state["turnId"] == frame["params"]["turnId"]
                 }) {
@@ -937,6 +955,7 @@ impl Projection {
                 self.resolve(&key);
             }
             "harness/disconnected" => {
+                self.pending_compaction_models.clear();
                 self.priority_runtime_changed();
                 let sides: Vec<_> = self.sides.threads.keys().cloned().collect();
                 for id in sides {
@@ -1314,6 +1333,32 @@ mod tests {
         assert_eq!(projection.sequence, sequence);
         projection.ingest(json!({"method":"thread/status/changed","params":{"threadId":"control","status":{"type":"idle"}}}));
         assert!(projection.threads.contains_key("control"));
+    }
+
+    #[test]
+    fn compaction_times_use_the_item_not_its_turn_or_a_new_clock() {
+        let mut p = Projection::default();
+        p.threads.insert("main".into(),json!({"model":"main-at-start"}));
+        for (phase,t) in [("started",1000),("completed",1008)] {
+            let mut params=json!({"threadId":"main","turnId":"turn","item":{"id":"cut","type":"contextCompaction"}});
+            params[&format!("{phase}AtMs")]=json!(t);
+            p.ingest(json!({"method":format!("item/{phase}"),"params":params}));
+            p.threads.get_mut("main").unwrap()["model"]=json!("changed");
+        }
+        p.ingest(json!({"method":"turn/completed","params":{"threadId":"main","turn":{"id":"turn","status":"completed","durationMs":18}}}));
+        let item = p.compaction_event("main","turn","cut").unwrap();
+        assert_eq!(item["recordedAtMs"],1008);
+        assert_eq!(item["durationMs"],8);
+        assert_eq!(item["compactionModel"],"main-at-start");
+        assert_eq!(item["compactionModelSource"],"inferred");
+        let mut mixed=json!({"startedAtMs":1000,"hoverObservedCompletedAtMs":2000});
+        crate::compaction_facts::timing(&mut mixed);
+        assert!(mixed["durationMs"].is_null());
+        let mut claude=json!({"backend":"claude","startedAtMs":1000,"completedAtMs":2000,
+            "durationMs":12,"compactionDurationSource":"observed"});
+        crate::compaction_facts::timing(&mut claude);
+        assert_eq!(claude["compactionDurationSource"],"observed");
+        assert_eq!(claude["durationMs"],12);
     }
 
     #[test]

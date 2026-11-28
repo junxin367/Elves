@@ -3,6 +3,7 @@
 mod catalog;
 mod commands;
 mod compaction;
+mod compaction_details;
 mod defaults;
 mod deletion;
 mod fast;
@@ -309,7 +310,25 @@ impl CodexHarness {
                             || (frame["method"] == "item/completed"
                                 && frame["params"]["item"]["type"] == "contextCompaction");
                         service.catalog.observe(&frame).await;
-                        service.projection.lock().await.ingest(frame);
+                        let facts = {
+                            let mut projection = service.projection.lock().await;
+                            let p = &frame["params"];
+                            let key = p["turnId"].as_str().zip(p["item"]["id"].as_str()).filter(|_| {
+                                p["item"]["type"] == "contextCompaction" && frame.get("id").is_none()
+                                    && generation == projection.generation && matches!(frame["method"].as_str(), Some("item/started" | "item/completed"))
+                            }).map(|(turn,item)| (turn.to_owned(),item.to_owned()));
+                            projection.ingest(frame);
+                            affected.as_deref().zip(key).and_then(|(id,(turn,item))| {
+                                if projection.sides.threads.contains_key(id) || projection.is_deleted(id) { return None; }
+                                let detail = projection.compaction_event(id,&turn,&item)?;
+                                Some((id.to_owned(), turn, detail.clone()))
+                            })
+                        };
+                        if let Some((id, turn, item)) = facts {
+                            if let Err(err) = service.save_compaction_detail(&id,&turn,&item).await {
+                                let _ = crate::diagnostic_log::append_diagnostic_log("harness.compaction_facts_save_failed",json!({"error":err.to_string()}));
+                            }
+                        }
                         if is_compaction_end
                             && let Some(id) = affected.clone()
                         {
