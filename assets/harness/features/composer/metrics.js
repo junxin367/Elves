@@ -349,7 +349,7 @@ function composerMetricsDetail(metrics, timings) {
         const details = element("div", "composer-metrics-detail-timings");
         const values = new Map(timings);
         // 确认稿的三行位置固定；缺项不把另一项挪到别行，额外的实测压缩耗时仍只在此处显示。
-        for (const pair of [["速度", "首 Token"], ["缓存命中", "本轮耗时"], ["LLM 耗时", "工具耗时"], ["压缩耗时"]]) {
+        for (const pair of [["速度", "首 Token"], ["缓存命中", "本轮耗时"], ["推理", "工具耗时"], ["压缩耗时"]]) {
           if (!pair.some(label => values.has(label))) continue;
           const line = element("div", "composer-metrics-detail-timing-line");
           for (const [index, label] of pair.entries()) {
@@ -432,9 +432,9 @@ export function renderComposerMetrics() {
   if (sameTurn && composerMetricsNumber(metrics?.durationMs)) timingData.push(["本轮耗时", formatDuration(metrics.durationMs / 1000)]);
   if (sameTurn && composerMetricsNumber(metrics?.cacheHitRate)) timingData.push(["缓存命中", `${Number((metrics.cacheHitRate * 100).toFixed(1))}%`]);
   if (sameTurn && composerMetricsNumber(metrics?.tokensPerSecond)) timingData.push(["速度", `${Math.round(metrics.tokensPerSecond)}tk/s`]);
-  // LLM 耗时只接受本轮明确的原生计时，不用本轮耗时减工具、审批或压缩时间反推。
+  // 用户要求 Token 统计弹窗将 LLM 耗时命名为“推理”；仍只接受本轮明确的原生计时，不用其他耗时反推。
   if (sameTurn && value.turnId && composerMetricsNumber(metrics.llmDurationMs))
-    timingData.push(["LLM 耗时", shortDuration(metrics.llmDurationMs)]);
+    timingData.push(["推理", shortDuration(metrics.llmDurationMs)]);
   if (sameTurn && composerMetricsNumber(metrics?.firstTokenMs)) details.push(`首 Token 时间 ${composerMetricsDuration(metrics.firstTokenMs)}`);
   if (sameTurn && composerMetricsNumber(metrics?.durationMs)) details.push(`本轮耗时 ${formatDuration(metrics.durationMs / 1000)}`);
   if (sameTurn && composerMetricsNumber(metrics?.cacheHitRate)) details.push(`缓存命中率 ${Number((metrics.cacheHitRate * 100).toFixed(1))}%`);

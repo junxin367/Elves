@@ -20492,15 +20492,16 @@ test("缓存写入的三种计价档只显示一格，先合计原始费用再�
   assert.equal(c.composerMetricsCompact(999950), "1m");
 });
 
-test("LLM 耗时使用本轮原生字段，缺失或换轮不以墙钟和工具耗时补算", async () => {
+test("推理使用本轮原生字段，缺失或换轮不以墙钟和工具耗时补算", async () => {
   const h = composerMetricsHarness(), c = h.context; let detail;
   c.composerTooltips = {update: (_node,_title,content) => {detail=content}};
   const shown = () => { const root=c.element("div"); detail?.render(root); return root.textContent };
   c.syncComposerMetrics(); h.complete(0,{llmDurationMs:137}); await h.flush();
-  assert.match(shown(), /LLM 耗时137ms/);
-  assert.doesNotMatch(h.text(), /LLM|137/);
-  h.advance(2001); c.syncComposerMetrics(); h.complete(1,{llmDurationMs:-1}); await h.flush();
+  assert.match(shown(), /推理137ms/);
   assert.doesNotMatch(shown(), /LLM 耗时/);
+  assert.doesNotMatch(h.text(), /推理|137/);
+  h.advance(2001); c.syncComposerMetrics(); h.complete(1,{llmDurationMs:-1}); await h.flush();
+  assert.doesNotMatch(shown(), /推理/);
   c.turns.set("next", {id:"next",items:[]}); c.renderComposerMetrics();
   assert.equal(detail,null);
 });
