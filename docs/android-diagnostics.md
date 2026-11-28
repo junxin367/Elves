@@ -44,7 +44,7 @@ Android App 会记录最近的连接、WebSocket、图片及页面故障，便�
 
 | 范围 | 记录内容 |
 | --- | --- |
-| HTTP 请求 | 路径类别、主机、方法、状态码、响应类型、阶段、耗时及安全格式的 `requestId` |
+| HTTP 请求 | 路径类别、主机、方法、状态码、响应类型、阶段、耗时及安全格式的 `requestId`；定时消息列表保留固定路径 `/api/read/scheduledMessages`，不记录查询参数、请求体或消息正文 |
 | WebSocket | `socket.connect/open/ready/closed/timeout/error/retry/resume` 等状态转换，含关闭码 `closeCode`、是否正常关闭 `wasClean`、重试等待 `delayMs` 和本轮连续重试的尝试计数 `attempt` |
 | SharedWorker | `worker.create/open/timeout/error/fallback/resume/close`，用于区分 Worker 启动、事件流超时和回退 |
 | 双线路 | 测速结果、取消与超时区分、网络和响应读取错误 |

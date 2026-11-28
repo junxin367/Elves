@@ -6,7 +6,7 @@ import { confirmAction } from "../../ui/dialog.js";
 import { activePopup, closePopup, openPopup, togglePopup } from "../../ui/popup.js";
 import { notice } from "../../ui/notice.js";
 import { closeComposerMenus, updateComposer } from "../../core/actions.js";
-import { connected, nativeConnectionVersion, selectedId, selectionVersion, session, thread } from "../../core/state.js";
+import { connected, nativeConnectionVersion, pageLeaving, selectedId, selectionVersion, session, thread } from "../../core/state.js";
 import { randomId } from "../../core/util.js";
 import { api, operationErrorState, receiptResultState } from "../api.js";
 import { rememberDraft } from "./drafts.js";
@@ -17,6 +17,7 @@ import { selectedGoal } from "../goal/state.js";
 import { privateInputScope, threadReadOnly } from "../session/capabilities.js";
 
 let scheduledMessages = [], scheduledRequest = null, scheduledLoadedThread = null, scheduledLoadedScope = null;
+let scheduledReadScope = null;
 let scheduledDialog = null, scheduledEditor = null, dialogScope = null, dialogTrigger = null;
 let dialogPromptSelection = null, dialogRestorePrompt = false;
 // 已渲染状态按根元素记录：updateComposer 每次输入都会进入渲染，只比较数组引用和少量状态，
@@ -286,32 +287,50 @@ export async function cancelScheduledMessage(message) {
   }
 }
 
-export async function reloadScheduledMessages(threadId = selectedId) {
+export function retireScheduledMessageRead() {
+  // 退后台或断线只取消列表读取，保留已显示的列表、编辑内容及所有写回执。
+  const previous = scheduledRequest;
+  scheduledRequest = null;
+  scheduledReadScope = null;
+  previous?.controller.abort();
+}
+
+export async function reloadScheduledMessages(threadId = selectedId, { onlyIfNeeded = false } = {}) {
   if (!threadId) {
+    retireScheduledMessageRead();
     scheduledMessages = []; scheduledLoadedThread = null; renderScheduledMessages(); return;
   }
-  if (!scheduledMessagesSupported()) return;
-  const version = selectionVersion, scope = scheduledScope();
-  // 进行中的读取可能早于刚收到的变更事件：记下需要再读一次。切走又切回时旧请求的结果会被丢弃，必须另起一次。
-  if (scheduledRequest?.threadId === threadId && scheduledRequest.scope === scope) {
-    scheduledRequest.again = true;
+  if (document.hidden || pageLeaving || !connected || threadId !== selectedId || !scheduledMessagesSupported()) return;
+  const scope = scheduledScope();
+  // 同一轮前台恢复、选中会话和连接探测只补读一次；真实变更或写回执仍需要比在途快照更新的列表。
+  if (scheduledRequest?.scope === scope) {
+    if (!onlyIfNeeded) scheduledRequest.again = true;
     return scheduledRequest.promise;
   }
-  const request = { threadId, version, scope, again: false, promise: null };
+  if (onlyIfNeeded && scheduledReadScope === scope) return;
+  retireScheduledMessageRead();
+  const request = { scope, controller: new AbortController(), again: false, promise: null };
+  scheduledReadScope = scope;
   scheduledRequest = request;
+  const current = () => scheduledRequest === request && !document.hidden && !pageLeaving && scope === scheduledScope();
   request.promise = (async () => {
     try {
       do {
         request.again = false;
-        const result = await api("/api/read/scheduledMessages", { threadId });
-        if (scope !== scheduledScope() || selectedId !== threadId) return;
-        scheduledMessages = Array.isArray(result?.messages) ? result.messages : [];
-        scheduledLoadedThread = threadId;
-        scheduledLoadedScope = scope;
-        renderScheduledMessages();
+        try {
+          const result = await api("/api/read/scheduledMessages", { threadId }, undefined, request.controller.signal);
+          if (!current()) return;
+          if (request.again) continue;
+          scheduledMessages = Array.isArray(result?.messages) ? result.messages : [];
+          scheduledLoadedThread = threadId;
+          scheduledLoadedScope = scope;
+          renderScheduledMessages();
+        } catch (error) {
+          if (!current()) return;
+          // 在途期间已收到真实变更时，旧快照及其错误都不展示，改以补读结果为准。
+          if (!request.again) notice(`定时消息读取失败：${error.message}`, true);
+        }
       } while (request.again);
-    } catch (error) {
-      if (scope === scheduledScope() && selectedId === threadId) notice(`定时消息读取失败：${error.message}`, true);
     } finally {
       if (scheduledRequest === request) scheduledRequest = null;
     }

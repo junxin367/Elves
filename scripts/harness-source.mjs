@@ -91,7 +91,7 @@ export async function loadHarnessAppSource(root = defaultRoot) {
       selectedScheduledAt: null, scheduledAtDrafts: new Map(),
       setSelectedScheduledAt: next => context.selectedScheduledAt = next,
       scheduledMessagesSupported: () => false, renderScheduledMessages: () => {},
-      reloadScheduledMessages: async () => {},
+      reloadScheduledMessages: async () => {}, retireScheduledMessageRead: () => {},
     })) if (!Object.hasOwn(context, name)) context[name] = value;
     const missing = name => !Object.hasOwn(context, name) && new RegExp(`\\b${name}\\(`).test(code);
     // 回执测试使用真实的按请求登记、输入锁和页面归属；同一 VM 只装配一次，两个 iframe 分属两个 VM。

@@ -22,6 +22,7 @@ import { resetClaudeUsage } from "../composer/claude-usage.js";
 import { restorePrivateInputs } from "../composer/draft-restore.js";
 import { recoveryGeneration, rememberDraft, restoreSmallInputRecoveries } from "../composer/drafts.js";
 import { closeContextUsageTip, resetComposerMetrics } from "../composer/metrics.js";
+import { retireScheduledMessageRead } from "../composer/scheduled-message.js";
 import { clearPendingFeedbackTimer } from "../composer/send-state.js";
 import { stopCatalogRefresh } from "../composer/skill-catalog.js";
 import { refreshCachedCatalogs, refreshSkillCatalog } from "../composer/skills.js";
@@ -70,6 +71,7 @@ import {
 import { stopClientUnreadBadgePolling } from "../sidebar/list.js";
 
 export function disconnect() {
+  retireScheduledMessageRead();
   stopClientUnreadBadgePolling(true);
   resetClaudeUsage({ clearCache: true });
   resetComposerMetrics();
@@ -202,6 +204,7 @@ export function startConnectionPoll(deviceId) {
   }, 15000);
 }
 export function retireForegroundReads(reason = "页面进入后台") {
+  retireScheduledMessageRead();
   clearPendingFeedbackTimer();
   setForegroundReadGeneration(foregroundReadGeneration + 1);
   setThreadReadVersion(threadReadVersion + 1);

@@ -19797,7 +19797,7 @@ function scheduledMessageHarness(overrides = {}) {
   const find = (node, className) => node.className.split(" ").includes(className)
     ? node : node.children.map(child => find(child, className)).find(Boolean);
   const context = vm.createContext({
-    selectedId: "thread-a", selectionVersion: 1, connected: true, thread: { id: "thread-a" },
+    selectedId: "thread-a", selectionVersion: 1, connected: true, pageLeaving: false, AbortController, thread: { id: "thread-a" },
     nativeConnectionVersion: 1, privateInputScope: value => value?.device?.id || "fixture",
     session: { capabilities: { scheduledMessages: true, scheduledMessageEditing: true } }, selectedGoal: null,
     TextEncoder, queueMicrotask, document: { body: { append() {}, classList: { add() {}, toggle() {} } }, querySelector() {} },
@@ -19809,9 +19809,9 @@ function scheduledMessageHarness(overrides = {}) {
     icon: name => element("span", `ui-icon ${name}`),
     threadReadOnly: () => false, randomId: () => "request-id",
     notice: (message, error) => notices.push({ message, error }),
-    api: (url, payload) => {
+    api: (url, payload, _id, signal) => {
       if (url.startsWith("/api/read/")) {
-        return new Promise(resolve => reads.push({ payload, resolve }));
+        return new Promise((resolve, reject) => reads.push({ payload, signal, resolve, reject }));
       }
       return new Promise(resolve => actions.push({ url, payload, resolve }));
     },
@@ -19966,6 +19966,65 @@ test("服务端未声明定时发送能力时不读取，也不打开时间选�
   h.context.openScheduledMessagePicker();
   assert.equal(h.reads.length, 0);
   assert.equal(h.notices.length, 0);
+});
+
+test("定时消息恢复只读一次，退后台的成功或超时均不抢占当前请求", async () => {
+  for (const oldFails of [false, true]) {
+    const h = scheduledMessageHarness(), { context: page, pendingWrite } = lifecycle();
+    const restore = () => h.context.reloadScheduledMessages("thread-a", { onlyIfNeeded: true });
+    page.retireScheduledMessageRead = h.context.retireScheduledMessageRead;
+    const initial = restore();
+    h.reads[0].resolve({ messages: [scheduledRow("shown", "scheduled")] }); await initial;
+    const obsolete = h.context.reloadScheduledMessages();
+    void h.context.reloadScheduledMessages(); // 真实变更要求补读，但旧请求退役后不能派生新请求。
+    h.context.document.hidden = true; page.retireForegroundReads();
+    assert.equal(h.reads[1].signal.aborted, true);
+    await h.context.reloadScheduledMessages();
+    assert.equal(h.reads.length, 2);
+    assert.equal(pendingWrite.signal.aborted, false);
+    h.context.document.hidden = false;
+    const first = restore(), duplicate = restore();
+    assert.equal(h.reads.length, 3);
+    if (oldFails) h.reads[1].reject(new Error("已过期的超时"));
+    else h.reads[1].resolve({ messages: [] });
+    await obsolete;
+    assert.deepEqual(h.rows().map(row => row.dataset.messageId), ["shown"]);
+    assert.deepEqual(h.notices, []);
+    const another = restore();
+    h.reads[2].resolve({ messages: [scheduledRow("fresh", "scheduled")] });
+    await Promise.all([first, duplicate, another]);
+    await restore();
+    assert.equal(h.reads.length, 3);
+    assert.deepEqual(h.rows().map(row => row.dataset.messageId), ["fresh"]);
+    assert.equal(h.actions.length, 0);
+  }
+});
+
+test("定时消息只提示当前前台的真实读取错误，离线或页面离开不补读", async () => {
+  const h = scheduledMessageHarness();
+  const restore = () => h.context.reloadScheduledMessages("thread-a", { onlyIfNeeded: true });
+  h.context.connected = false; await restore();
+  h.context.connected = true; h.context.pageLeaving = true; await restore();
+  h.context.pageLeaving = false; await h.context.reloadScheduledMessages("already-left");
+  assert.equal(h.reads.length, 0);
+  const first = restore(), duplicate = restore();
+  h.reads[0].reject(new Error("新的读取失败"));
+  await Promise.all([first, duplicate]); await restore();
+  assert.equal(h.reads.length, 1);
+  assert.deepEqual(h.notices, [{ message: "定时消息读取失败：新的读取失败", error: true }]);
+  assert.equal(h.actions.length, 0);
+});
+
+test("定时消息读取期间收到真实变更，第一次超时仍补读且不弹旧错", async () => {
+  const h = scheduledMessageHarness();
+  const first = h.context.reloadScheduledMessages("thread-a", { onlyIfNeeded: true });
+  const changed = h.context.reloadScheduledMessages();
+  h.reads[0].reject(new Error("变更前的读取超时")); await settle();
+  assert.deepEqual(h.notices, []);
+  assert.equal(h.reads.length, 2);
+  h.reads[1].resolve({ messages: [scheduledRow("updated", "scheduled")] });
+  await Promise.all([first, changed]);
+  assert.deepEqual(h.rows().map(row => row.dataset.messageId), ["updated"]);
 });
 
 test("取消定时消息被服务端拒绝时提示原因", async () => {

@@ -22,7 +22,7 @@ import { rememberRemoteFastPreference } from "../composer/model-catalog.js";
 import { rememberPermissionSelection } from "../composer/options-state.js";
 import { sending } from "../composer/send-state.js";
 import { refreshSkillCatalog } from "../composer/skills.js";
-import { reloadScheduledMessages } from "../composer/scheduled-message.js";
+import { reloadScheduledMessages, retireScheduledMessageRead } from "../composer/scheduled-message.js";
 import { receiveCompactionLifecycle, reconcileCompaction } from "./compaction.js";
 import {
   notifiedStatus, scheduleReload, scheduleSidebarRefresh, setNotifiedStatus, setNotifiedTokenUsage,
@@ -224,7 +224,8 @@ export function receive(event) {
       if (rawParams.threadId === selectedId) scheduleReload();
       return;
     }
-    // 服务重启可能保留同一设备授权；全量重同步仍重新读取当前服务状态。
+    // 全量重同步可能漏过定时消息变更，即使授权和会话不变，也要在连接核对后重新读取列表。
+    retireScheduledMessageRead();
     void withRecoveryErrorSilence(() => refreshConnectedSession()).catch(() => {});
     return;
   }
