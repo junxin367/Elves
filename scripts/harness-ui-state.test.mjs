@@ -1679,7 +1679,9 @@ test("最近会话按今天、昨天、前天、近四个星期日历日和历�
 
 test("单会话重同步只补对应正文与列表，不重复刷新整个连接", () => {
   let reloads = 0, sidebars = 0, connections = 0;
+  const workspaceUpdates = [];
   const context = vm.createContext({ nativeConnectionVersion: 1,
+    sessionTools: { workspaceChanged: id => workspaceUpdates.push(id) },
     selectedId: "selected", handleRemoteChannelEvent: () => false, scheduleRelatedMenuRefresh() {},
     sidebarReadRefreshSuppressions: new Set(),
     scheduleReload: () => reloads++, scheduleSidebarRefresh: () => sidebars++,
@@ -1692,6 +1694,12 @@ test("单会话重同步只补对应正文与列表，不重复刷新整个连�
   assert.equal(reloads, 1); assert.equal(sidebars, 2); assert.equal(connections, 0);
   context.receive({ method: "remote/resync", params: {} });
   assert.equal(connections, 1);
+  assert.deepEqual(workspaceUpdates, [undefined]);
+  context.receive({ method: "workspace/changed", params: { watchId: "workspace-a" } });
+  assert.deepEqual(workspaceUpdates, [undefined, "workspace-a"]);
+  assert.equal(connections, 1, "工作区变化不刷新会话连接");
+  context.receive({ method: "workspace/changed", params: {} });
+  assert.equal(workspaceUpdates.length, 2, "无监听身份的通知不能触发全部页面读取");
 });
 
 function localInputFixtures() {
@@ -13429,7 +13437,7 @@ function connectionRecoveryHarness() {
     clearPendingFeedbackTimer() {},
     syncActivityTimer() {}, stopActivityTimer() {}, stopGoalLiveTimer() {}, finishQueueDrag() {},
     closeContextUsageTip() {}, rememberDraft() {}, rememberTranscript() {}, rememberReadingPosition() {},
-    stopRelatedSessionTimers() {}, sessionMenu: null, cancelConnectionProbe() {}, syncHistoryButtons() {},
+    stopRelatedSessionTimers() {}, sessionMenu: null, sessionTools: null, cancelConnectionProbe() {}, syncHistoryButtons() {},
     sidebarRequest: null, sidebarTimer: null, historyController: null,
     handleRemoteChannelEvent: () => false, scheduleRelatedMenuRefresh() {},
     createRemoteEventStream: makeStream, sharedEventsAvailable: () => true,

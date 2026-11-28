@@ -525,6 +525,7 @@ pub struct HarnessController {
     images: RwLock<ImageRegistry>,
     videos: RwLock<video::Registry>,
     workspace_previews: workspace::preview::media::Registry,
+    workspace_changes: workspace::live::Registry,
     workspace_preview_slots: Arc<tokio::sync::Semaphore>,
     image_previews: std::sync::Mutex<image_preview::PreviewCache>,
     image_preview_slots: Arc<tokio::sync::Semaphore>,
@@ -634,6 +635,7 @@ impl HarnessController {
             images: RwLock::new(ImageRegistry::default()),
             videos: RwLock::new(video::Registry::default()),
             workspace_previews: Default::default(),
+            workspace_changes: Default::default(),
             workspace_preview_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             image_previews: std::sync::Mutex::new(image_preview::PreviewCache::default()),
             image_preview_slots: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -4561,6 +4563,7 @@ async fn session(
     response["antigravityAllowApprovals"] = json!(policy.allow_approvals);
     response["capabilities"]["antigravitySessions"] = json!(true);
     response["capabilities"]["workspaceFilePreview"] = json!(true);
+    response["capabilities"]["workspaceChangesLive"] = json!(true);
     // 用户要求 Antigravity 参考 Claude 实例在右下角开放 5h/7d 额度监控与消耗预测，数据经官方 `agy -p "/usage" --output-format json` 获取。
     response["capabilities"]["antigravityUsage"] = json!(true);
     response["capabilities"]["desktopCodexImageInput"] =
@@ -4625,6 +4628,8 @@ fn workspace_identity(payload: &Value) -> Result<Value, ApiError> {
                 | "query"
                 | "allRepositories"
                 | "repository"
+                | "live"
+                | "fresh"
         )
     }) {
         return Err(ApiError::new(400, "只能通过会话或项目标识读取变更"));

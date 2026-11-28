@@ -297,6 +297,8 @@ export function mountSessionTools(options) {
       currentContext.value = value;
       syncLayout();
     } else currentContext.value = value;
+    for (const context of contexts.values()) for (const record of context.tabs.values())
+      record.renderer.setConnection?.(value.connected !== false);
     const active=currentContext.tabs.get(currentContext.active);
     if(active && ["launcher","records","task"].includes(active.item.kind)) active.renderer.updateContext?.();
     mobileTasks?.updateContext();
@@ -593,6 +595,12 @@ export function mountSessionTools(options) {
   return {
     open, openFile, openSideThread, openSubagent, openSideCreation, updateContext,
     openTask,openTaskRecords:()=>taskPageFor({kind:"records"}),
+    workspaceChanged(watchId) {
+      if (disposed) return;
+      for (const context of contexts.values()) for (const record of context.tabs.values())
+        record.renderer.workspaceChanged?.(watchId);
+      mobile?.workspaceChanged?.(watchId);
+    },
     updateThreadTitle(threadId, title, source) {
       if (disposed || authorizationKey !== authorizationIdentity()) return false;
       let changed = false;
@@ -735,6 +743,7 @@ export function mountWorkspacePreview(options, target) {
   const open = () => target.kind === "change"
     ? renderer.openChange({ path: target.path, section: target.section, repository: target.repository || "" })
     : renderer.openFile(target.path, target.line);
+  renderer.setVisible?.(true);
   void open();
   return { dispose: () => renderer.dispose(), refresh: open };
 }
@@ -747,6 +756,9 @@ function mountSessionToolPages({ workspace, trigger, getContext, beforeOpen, onU
   let returnView = null, wrapDiff = false, pageExitTimer = null, detailExitTimer = null;
   let project = null, displayedProject = null, detailRecord = null, authorized = true, projectSequence = 0;
   let legacyChangesUntil = 0;
+  let visible = !embedded, online = getContext()?.connected !== false, suspended = false;
+  let liveTimer = null, liveRunning = false, livePending = false, liveFresh = false, liveVersion = 0;
+  let liveInterval = 5000, watchId = "", deferredList = null, deferredDetail = null;
   const projects = new Map(), cacheReads = new Set(), cacheMutations = new Map();
   const controllers = new Set(), inertState = new Map();
   const navigationOwner = Math.random().toString(36).slice(2);
@@ -764,8 +776,11 @@ function mountSessionToolPages({ workspace, trigger, getContext, beforeOpen, onU
   pageTitle.id = embedded ? `${panel.id}-title` : "session-tools-title";
   const rootLocation = createWorkspaceLocation("当前会话工作目录");
   const backToConversation = control("返回", "返回会话", requestBack, "text-button session-tools-back");
+  // 用户要求第一阶段补充手动刷新；两页只增加同一个刷新动作，不增加审阅或 Git 写操作。
+  const refreshListButton = control("", "刷新变更", () => scheduleLive(0, true), "icon-button session-tools-refresh");
+  refreshListButton.append(icon("retry"));
   headingCopy.append(pageTitle, rootLocation.element);
-  heading.append(headingCopy, backToConversation);
+  heading.append(headingCopy, refreshListButton, backToConversation);
   const pageBodies = new Map();
   for (const [name, label] of [["changes", "变更"]]) {
     const body = node("section", `session-tools-page session-tools-${name}`);
@@ -785,7 +800,9 @@ function mountSessionToolPages({ workspace, trigger, getContext, beforeOpen, onU
   const detailLocation = createWorkspaceLocation();
   detailHeadingCopy.append(detailTitle, detailLocation.element);
   const backToFiles = control("返回", "返回变更列表", requestBack, "text-button session-tools-back");
-  detailHeading.append(detailHeadingCopy, backToFiles);
+  const refreshDetailButton = control("", "刷新当前差异", () => scheduleLive(0, true), "icon-button session-tools-refresh");
+  refreshDetailButton.append(icon("retry"));
+  detailHeading.append(detailHeadingCopy, refreshDetailButton, backToFiles);
   const detail = node("div", "session-tools-detail");
   detail.setAttribute("aria-label", "文件差异");
   const detailControls = node("div", "session-tools-detail-controls");
@@ -818,6 +835,89 @@ function mountSessionToolPages({ workspace, trigger, getContext, beforeOpen, onU
   fileList.addEventListener("scroll", saveListScroll, { passive: true });
   changesPage.append(fileSearch, changesStatus, fileList);
 
+  function liveActive() {
+    return !disposed && authorized && opened && visible && online && !suspended && !document.hidden
+      && globalThis.navigator?.onLine !== false
+      && document.documentElement?.dataset?.workspaceSidePanelVisible !== "false"
+      && isAvailable() && !workspace.closest?.("[hidden],[inert]") && !!project;
+  }
+  function readingSelection(host = detailVisible ? detail : fileList) {
+    const selection = window.getSelection?.();
+    if (!selection || selection.isCollapsed) return false;
+    if (host.contains(selection.anchorNode) || host.contains(selection.focusNode)) return true;
+    try { return selection.rangeCount > 0 && selection.getRangeAt(0).intersectsNode(host); }
+    catch { return false; }
+  }
+  function stopLive() {
+    clearTimeout(liveTimer); liveTimer = null;
+    ++liveVersion; ++changesEpoch; ++detailEpoch;
+    changesController?.abort(); detailController?.abort();
+    changesController = null; detailController = null; changesBusy = false;
+    deferredList = null; deferredDetail = null;
+  }
+  function scheduleLive(delay = 350, fresh = false) {
+    livePending = true; liveFresh ||= fresh;
+    if (!liveActive() || liveRunning) return;
+    clearTimeout(liveTimer);
+    liveTimer = setTimeout(() => { liveTimer = null; void refreshLive(); }, delay);
+  }
+  function observeLive(result) {
+    if (typeof result?.watchId === "string") watchId = result.watchId;
+    if ([5000, 15000].includes(result?.watchIntervalMs)) liveInterval = result.watchIntervalMs;
+    if (result?.watchDirty === true) livePending = true;
+  }
+  function livePayload(fresh = false) {
+    return getContext()?.workspaceChangesLive === true ? { live: true, ...(fresh ? { fresh: true } : {}) } : {};
+  }
+  async function refreshLive() {
+    if (!liveActive() || liveRunning) return;
+    // 正在选中文字时保留原 DOM；选区结束后再更新，不打断复制和阅读。
+    if (readingSelection()) { scheduleLive(liveInterval); return; }
+    const version = liveVersion, p = project, fresh = liveFresh;
+    livePending = false; liveFresh = false; liveRunning = true;
+    for (const button of [refreshListButton, refreshDetailButton]) {
+      button.disabled = true; button.setAttribute("aria-busy", "true");
+    }
+    try {
+      const updated = await refreshChanges({ fresh });
+      if (version !== liveVersion || !liveActive() || project !== p) return;
+      if (readingSelection()) { livePending = true; return; }
+      if (!updated && detailVisible) setDetailNotice(changesStatus.textContent || "未能核对变更，请刷新后重试。", true);
+      // 文件集合与差异正文分别核对版本，不能以列表仍为 M 推定正文未变。
+      if (updated && detailVisible && selectedFile && p.list?.files.some(file => detailKey(file) === detailKey(selectedFile)))
+        await loadDetail(selectedFile, { recordHistory: false, background: true, fresh });
+    } finally {
+      liveRunning = false;
+      for (const button of [refreshListButton, refreshDetailButton]) {
+        button.disabled = false; button.removeAttribute("aria-busy");
+      }
+      if (liveActive()) scheduleLive(livePending ? 350 : liveInterval);
+    }
+  }
+  function resumeLive() {
+    suspended = false;
+    if (liveActive()) scheduleLive(0, true);
+    else stopLive();
+  }
+  function visibilityChanged() { if (document.hidden) stopLive(); else resumeLive(); }
+  function pageHidden() { suspended = true; stopLive(); }
+  function networkOffline() { stopLive(); }
+  function selectionChanged() {
+    if (!liveActive() || readingSelection()) return;
+    if (deferredList) {
+      const pending = deferredList; deferredList = null;
+      if (pending.p === project && pending.generation === project.generation) acceptList(project, pending.response);
+    }
+    if (deferredDetail) {
+      const pending = deferredDetail; deferredDetail = null;
+      if (detailVisible && pending.p === project && selectedFile
+          && detailKey(selectedFile) === detailKey(pending.file)
+          && project.details.get(detailKey(pending.file)) === pending.record) {
+        paintDetail(pending.record, pending.file); setDetailNotice("");
+      }
+    }
+    if (livePending) scheduleLive();
+  }
   function currentContext() {
     const value = getContext() || {};
     return {
@@ -1082,7 +1182,8 @@ function mountSessionToolPages({ workspace, trigger, getContext, beforeOpen, onU
     if (project === p && selectedFile && detailKey(selectedFile) === id) {
       ++detailEpoch; detailController?.abort(); detailController = null;
       detailRecord = null; detail.replaceChildren(); detailControls.hidden = true;
-      setDetailNotice(message || "该文件已不在变更列表中，请返回列表。", true);
+      deferredDetail = null;
+      setDetailNotice(message || "当前范围已无差异。", !!message);
     } else if (detailRecord === record) detailRecord = null;
     p.details.delete(id); p.detailIds.delete(id);
     mutation(p, "workspace-detail", JSON.stringify([p.id, id]), "remove");
@@ -1110,6 +1211,7 @@ function mountSessionToolPages({ workspace, trigger, getContext, beforeOpen, onU
     }
   }
   function forgetAuthorization() {
+    stopLive();
     authorized = false; ++changesEpoch; ++detailEpoch;
     changesController?.abort(); detailController?.abort(); changesBusy = false;
     for (const finish of [...cacheReads]) finish(null);
@@ -1120,10 +1222,16 @@ function mountSessionToolPages({ workspace, trigger, getContext, beforeOpen, onU
   }
   function updateContext() {
     if (disposed) return;
+    const nextOnline = getContext()?.connected !== false;
+    if (nextOnline !== online) {
+      online = nextOnline;
+      if (online) scheduleLive(0, true); else stopLive();
+    }
     projectFiles?.updateContext();
     const value = currentContext(), identity = targetIdentity(value);
     const key = JSON.stringify([value.deviceId, value.cacheScope, identity]);
     if (key === contextKey) return;
+    stopLive(); watchId = ""; liveInterval = 5000;
     saveCurrentView(true);
     if (detailVisible) hideDetail({ focus: false });
     ++changesEpoch; ++detailEpoch; changesController?.abort(); detailController?.abort();
@@ -1149,7 +1257,7 @@ function mountSessionToolPages({ workspace, trigger, getContext, beforeOpen, onU
       status(changesStatus, unavailableChanges());
     }
     trimMemory();
-    if (opened && project) void refreshChanges();
+    if (opened && project) scheduleLive(0, true);
   }
   async function restoreList(p, current) {
     if (!p.allowRestore || p.uiRead || p.list && p.uiReady) return;
@@ -1193,7 +1301,22 @@ function mountSessionToolPages({ workspace, trigger, getContext, beforeOpen, onU
       if (p.networkVersion !== token.networkVersion || p.uiVersion !== token.uiVersion) persistList(p);
     });
   }
+  function missingChangeMessage(response, file) {
+    if (!response) return "未能核对变更列表，请刷新后重试。";
+    const repository = response.repositories?.find(repo => repo.path === (file.repository || ""));
+    if (repository?.error) return repository.error;
+    if (repository?.truncated || !repository && response.truncated)
+      return "变更列表尚未完整读取，请刷新后重试。";
+    if (response.repositories && !repository)
+      return "所属仓库已不在当前工作目录中，请重新打开变更列表。";
+    return "";
+  }
   function acceptList(p, response) {
+    if (project === p && (!p.list || p.list.root === response.root)
+        && (readingSelection(fileList) || detailVisible && readingSelection(detail))) {
+      deferredList = { p, response, generation: p.generation }; return;
+    }
+    deferredList = null;
     const previous = p.list;
     ++p.networkVersion;
     if (previous?.root !== undefined && previous.root !== response.root) {
@@ -1202,9 +1325,12 @@ function mountSessionToolPages({ workspace, trigger, getContext, beforeOpen, onU
       forgetDetails(p, "工作目录已变化，请返回列表后重新打开文件。");
     }
     const ids = new Set(response.files.map(detailKey));
-    for (const id of new Set([...p.detailIds, ...p.details.keys()])) if (!ids.has(id)) forgetDetail(p, id);
+    for (const id of new Set([...p.detailIds, ...p.details.keys()])) if (!ids.has(id)) {
+      const file = previous?.files.find(file => detailKey(file) === id) || selectedFile || {};
+      forgetDetail(p, id, missingChangeMessage(response, file));
+    }
     if (project === p && selectedFile && !ids.has(detailKey(selectedFile)))
-      forgetDetail(p, detailKey(selectedFile));
+      forgetDetail(p, detailKey(selectedFile), missingChangeMessage(response, selectedFile));
     const unchanged = previous?.revision === response.revision && previous.root === response.root;
     p.list = response; p.listBytes = responseBytes(response); p.allowRestore = true;
     if (selectedFile && project === p) selectedFile = response.files.find(file => detailKey(file) === detailKey(selectedFile)) || selectedFile;
@@ -1213,7 +1339,7 @@ function mountSessionToolPages({ workspace, trigger, getContext, beforeOpen, onU
     if (!unchanged) persistList(p);
     trimMemory();
   }
-  async function refreshChanges() {
+  async function refreshChanges({ fresh = false } = {}) {
     const p = project;
     if (disposed || !authorized || !p) { status(changesStatus, unavailableChanges()); return; }
     const epoch = ++changesEpoch, generation = p.generation;
@@ -1227,23 +1353,25 @@ function mountSessionToolPages({ workspace, trigger, getContext, beforeOpen, onU
       await restoreList(p, current);
       if (!current()) return;
       const cached = p.list;
-      const payload = { ...p.target, ...(cached ? { ifRevision: cached.revision } : {}) };
+      const payload = { ...p.target, ...livePayload(fresh), ...(cached ? { ifRevision: cached.revision } : {}) };
       let result = await requestChanges(payload, controller.signal);
       if (!current()) return;
+      observeLive(result);
       if (result?.notModified === true) {
         if (cached && validRoot(result.root) && result.root !== cached.root) {
           invalidateProject(p, "工作目录已变化，正在重新读取变更。");
           void refreshChanges(); return;
         }
         if (cached && result.revision === cached.revision && result.root === cached.root && p.list === cached) {
-          ++p.networkVersion; status(changesStatus, summary(p)); return;
+          ++p.networkVersion; status(changesStatus, summary(p)); return true;
         }
-        result = await requestChanges(p.target, controller.signal);
+        result = await requestChanges({ ...p.target, ...livePayload(fresh) }, controller.signal);
         if (!current()) return;
       }
       const response = listResponse(result);
       if (!response) throw new Error("变更列表响应无效，请重新打开变更页。");
       acceptList(p, response);
+      return true;
     } catch (error) {
       if (error?.name === "AbortError" || !current()) return;
       if ([403, 404, 409, 422].includes(error.code)) invalidateProject(p, `读取变更失败：${error.message}`);
@@ -1276,6 +1404,10 @@ function mountSessionToolPages({ workspace, trigger, getContext, beforeOpen, onU
       return;
     }
     const scrollTop = !restoreScroll && project === p && displayedProject === p ? fileList.scrollTop : p.ui.scrollTop;
+    const focused = [...p.buttons].find(([, button]) => button === document.activeElement)?.[0];
+    const anchor = !restoreScroll && project === p ? [...p.buttons].find(([, button]) =>
+      button.getBoundingClientRect().bottom > fileList.getBoundingClientRect().top) : null;
+    const anchorOffset = anchor ? anchor[1].getBoundingClientRect().top - fileList.getBoundingClientRect().top : 0;
     p.rendered = signature; p.listView.replaceChildren(); p.buttons.clear(); p.groups.clear();
     const source = p.list?.files || [];
     const visible = source.filter(file => !query
@@ -1340,7 +1472,13 @@ function mountSessionToolPages({ workspace, trigger, getContext, beforeOpen, onU
       }
     }
     p.ui.scrollTop = scrollTop;
-    if (project === p) attachList(p);
+    if (project === p) {
+      attachList(p);
+      if (anchor && p.buttons.has(anchor[0]))
+        fileList.scrollTop += p.buttons.get(anchor[0]).getBoundingClientRect().top - fileList.getBoundingClientRect().top - anchorOffset;
+      p.ui.scrollTop = fileList.scrollTop;
+      if (focused) p.buttons.get(focused)?.focus({ preventScroll: true });
+    }
   }
   function fileParts(file) {
     // 与文件树保持一致：先按真实分隔符分层，再还原显示字符，不能把文件名中的映射反斜杠拆成目录。
@@ -1371,7 +1509,12 @@ function mountSessionToolPages({ workspace, trigger, getContext, beforeOpen, onU
     return record;
   }
   function paintDetail(record, file) {
+    const sameFile = detailRecord && detailRecord !== record
+      && detailRecord.response.root === record.response.root
+      && detailKey(detailRecord.response) === detailKey(record.response);
+    const anchor = sameFile ? detailAnchor() : null;
     if (detailRecord !== record) saveDetailScroll();
+    if (sameFile) { record.scrollTop = detailRecord.scrollTop; record.scrollLeft = detailRecord.scrollLeft; }
     record.used = Date.now();
     if (record.response.git) setWorkspaceBranch(detailLocation.branch, record.response.git);
     if (!record.view) {
@@ -1395,11 +1538,26 @@ function mountSessionToolPages({ workspace, trigger, getContext, beforeOpen, onU
       if (output) output.scrollLeft = record.scrollLeft;
       diffStats.replaceChildren(...(record.stats || []));
       detailControls.hidden = !record.stats;
+      if (anchor) restoreDetailAnchor(anchor);
     }
     detailRecord = record;
     trimMemory();
   }
-  async function loadDetail(file, { recordHistory = true } = {}) {
+  function detailAnchor() {
+    const top = detail.getBoundingClientRect().top;
+    const row = [...detail.querySelectorAll(".session-tools-diff-line")]
+      .find(row => row.getBoundingClientRect().bottom > top);
+    return row ? { text: row.querySelector("code")?.textContent, number: Number(row.querySelector(".session-tools-line-number")?.textContent),
+      offset: row.getBoundingClientRect().top - top } : null;
+  }
+  function restoreDetailAnchor(anchor) {
+    const candidates = [...detail.querySelectorAll(".session-tools-diff-line")]
+      .filter(row => row.querySelector("code")?.textContent === anchor.text);
+    candidates.sort((a, b) => Math.abs(Number(a.querySelector(".session-tools-line-number")?.textContent) - anchor.number)
+      - Math.abs(Number(b.querySelector(".session-tools-line-number")?.textContent) - anchor.number));
+    if (candidates[0]) detail.scrollTop += candidates[0].getBoundingClientRect().top - detail.getBoundingClientRect().top - anchor.offset;
+  }
+  async function loadDetail(file, { recordHistory = true, background = false, fresh = false } = {}) {
     const p = project;
     if (disposed || !authorized || !p) return;
     file = p.list?.files.find(entry => detailKey(entry) === detailKey(file));
@@ -1412,6 +1570,7 @@ function mountSessionToolPages({ workspace, trigger, getContext, beforeOpen, onU
     const current = () => !disposed && authorized && opened && detailVisible && ownsProject(p)
       && p.generation === generation && epoch === detailEpoch && !controller.signal.aborted;
     if (!detailVisible || !selectedFile || detailKey(selectedFile) !== id) detailControlsScroll.reset();
+    if (!selectedFile || detailKey(selectedFile) !== id) deferredDetail = null;
     selectedFile = file;
     const parts = fileParts(file);
     detailTitle.textContent = parts.name; detailTitle.title = displayedPath(file);
@@ -1423,12 +1582,12 @@ function mountSessionToolPages({ workspace, trigger, getContext, beforeOpen, onU
       p.details.delete(id); p.detailIds.delete(id);
       mutation(p, "workspace-detail", JSON.stringify([p.id, id]), "remove"); cached = null;
     }
-    if (cached) { paintDetail(cached, file); setDetailNotice(""); }
+    if (cached) { if (!background) paintDetail(cached, file); setDetailNotice(""); }
     else {
       saveDetailScroll(); detailRecord = null;
       detailControls.hidden = true; detail.replaceChildren(); setDetailNotice("正在读取文件差异…");
     }
-    showDetail({ recordHistory });
+    if (!background) showDetail({ recordHistory });
     try {
       if (!cached && p.allowRestore) {
         const saved = await readStore(p, "workspace-detail", JSON.stringify([p.id, id]));
@@ -1439,11 +1598,12 @@ function mountSessionToolPages({ workspace, trigger, getContext, beforeOpen, onU
         } else if (saved) mutation(p, "workspace-detail", JSON.stringify([p.id, id]), "remove");
       }
       if (!current()) return;
-      const payload = { ...p.target, path: file.path, section: file.section,
+      const payload = { ...p.target, ...livePayload(fresh), path: file.path, section: file.section,
         ...(file.repository != null ? { repository: file.repository } : {}) };
       let result = await request("/api/workspace/change",
         { ...payload, ...(cached ? { ifRevision: cached.response.revision } : {}) }, controller.signal);
       if (!current()) return;
+      observeLive(result);
       if (validRoot(result?.root) && result.root !== p.list?.root) {
         invalidateProject(p, "工作目录已变化，请返回列表后重新打开文件。");
         setDetailNotice("工作目录已变化，请返回列表后重新打开文件。", true);
@@ -1469,10 +1629,14 @@ function mountSessionToolPages({ workspace, trigger, getContext, beforeOpen, onU
       }
       saveDetailScroll();
       const record = rememberDetail(p, file, response);
-      paintDetail(record, file); setDetailNotice("");
+      if (readingSelection(detail)) deferredDetail = { p, file, record };
+      else { paintDetail(record, file); setDetailNotice(""); }
     } catch (error) {
       if (error?.name === "AbortError" || !current()) return;
-      if ([403, 404, 409, 422].includes(error.code)) {
+      if (error.code === 409 && error.message === "该文件的变更状态已更新，请刷新变更列表") {
+        if (!readingSelection(detail)) forgetDetail(p, id);
+        scheduleLive(350, true);
+      } else if ([403, 404, 409, 422].includes(error.code)) {
         invalidateProject(p, `读取差异失败：${error.message}`); setDetailNotice(`读取差异失败：${error.message}`, true);
       } else if (cached && p.details.get(id) === cached) {
         setDetailNotice(`正在显示上次缓存：${error.message}`, true);
@@ -1483,6 +1647,7 @@ function mountSessionToolPages({ workspace, trigger, getContext, beforeOpen, onU
       }
     } finally {
       if (detailController === controller) detailController = null;
+      if (!liveRunning && liveActive()) scheduleLive(liveInterval);
     }
   }
   function renderDiff(diff, host) {
@@ -1594,8 +1759,8 @@ function mountSessionToolPages({ workspace, trigger, getContext, beforeOpen, onU
     panel.classList.add("session-tools-visible");
     if (recordHistory) recordRoute(name);
     updateContext();
-    if (refresh && name === "changes" && !changesBusy && changeTarget() && (embedded || enteringChanges || !changesLoaded))
-      void refreshChanges();
+    if (refresh && name === "changes" && changeTarget() && (embedded || enteringChanges || !changesLoaded))
+      scheduleLive(0, true);
     if (!embedded) backToConversation.focus({ preventScroll: true });
   }
   function finishPageExit() {
@@ -1613,6 +1778,7 @@ function mountSessionToolPages({ workspace, trigger, getContext, beforeOpen, onU
     if (disposed || !opened) return;
     saveCurrentView(true);
     opened = false;
+    stopLive();
     if (detailVisible) hideDetail({ focus: false });
     ++changesEpoch; changesBusy = false;
     changesController?.abort(); detailController?.abort();
@@ -1711,6 +1877,25 @@ function mountSessionToolPages({ workspace, trigger, getContext, beforeOpen, onU
   document.addEventListener("keydown", handleKey, true);
   window.addEventListener("popstate", handlePopState, true);
   window.addEventListener("codex-elves-native-back", handleNativeBack);
+  document.addEventListener("visibilitychange", visibilityChanged);
+  document.addEventListener("selectionchange", selectionChanged);
+  window.addEventListener("focus", resumeLive);
+  window.addEventListener("pageshow", resumeLive);
+  window.addEventListener("pagehide", pageHidden);
+  window.addEventListener("offline", networkOffline);
+  window.addEventListener("online", resumeLive);
+  // 主导航隐藏整个工作区时也暂停；返回仍复用原标签，只补读当前可见页。
+  let ancestorVisible = !workspace.closest?.("[hidden],[inert]")
+    && document.documentElement?.dataset?.workspaceSidePanelVisible !== "false";
+  const visibilityObserver = typeof MutationObserver === "function" ? new MutationObserver(() => {
+    const next = !workspace.closest?.("[hidden],[inert]")
+      && document.documentElement?.dataset?.workspaceSidePanelVisible !== "false";
+    if (next === ancestorVisible) return;
+    ancestorVisible = next;
+    if (next) scheduleLive(0, true); else stopLive();
+  }) : null;
+  for (let parent = workspace; parent; parent = parent.parentElement)
+    visibilityObserver?.observe(parent, { attributes: true, attributeFilter: ["hidden", "inert", "data-workspace-side-panel-visible"] });
   if (!embedded) projectFiles = mountSessionFiles({
     workspace, trigger, getContext, beforeOpen, onUnauthorized, openImagePreview, copyText,
     request: transport, isAvailable, onFileContextMenu
@@ -1719,20 +1904,38 @@ function mountSessionToolPages({ workspace, trigger, getContext, beforeOpen, onU
 
   return {
     updateContext,
+    setVisible(value) {
+      if (visible === value) return;
+      visible = value;
+      if (value) scheduleLive(0, true); else stopLive();
+    },
+    setConnection(value) {
+      if (online === value) return;
+      online = value;
+      if (value) scheduleLive(0, true); else stopLive();
+    },
+    workspaceChanged(id) {
+      if (id && id !== watchId) return;
+      scheduleLive();
+    },
     open: name => name === "files" ? projectFiles?.open() : openPage(name),
     openFile: (path, line) => projectFiles?.openFile(path, line),
     async openChange(file, snapshot) {
       showPage("changes", { recordHistory: false, refresh: false });
+      selectedFile = file;
+      detailTitle.textContent = fileParts(file).name;
+      showDetail({ recordHistory: false });
+      if (!detailRecord) setDetailNotice(project ? "正在读取文件差异…" : unavailableChanges(), !project);
       const list = listResponse(snapshot);
       if (list && project) acceptList(project, list);
-      else await refreshChanges();
-      if (disposed) return;
-      if (files.some(entry => detailKey(entry) === detailKey(file))) await loadDetail(file);
+      else await refreshChanges({ fresh: true });
+      if (!liveActive()) return;
+      if (files.some(entry => detailKey(entry) === detailKey(file))) await loadDetail(file, { fresh: true });
       else {
-        detailTitle.textContent = fileParts(file).name;
-        showDetail({ recordHistory: false });
-        setDetailNotice("该文件已不在变更列表中，请重新打开变更列表。", true);
+        const message = missingChangeMessage(project?.list, file);
+        setDetailNotice(message || "当前范围已无差异。", !!message);
       }
+      scheduleLive(liveInterval);
     },
     hide() {
       projectFiles?.close();
@@ -1741,6 +1944,8 @@ function mountSessionToolPages({ workspace, trigger, getContext, beforeOpen, onU
     close: requestBack,
     dispose() {
       if (disposed) return;
+      stopLive();
+      visibilityObserver?.disconnect();
       detailControlsScroll.dispose();
       projectFiles?.dispose();
       saveCurrentView(true);
@@ -1758,6 +1963,13 @@ function mountSessionToolPages({ workspace, trigger, getContext, beforeOpen, onU
       document.removeEventListener("keydown", handleKey, true);
       window.removeEventListener("popstate", handlePopState, true);
       window.removeEventListener("codex-elves-native-back", handleNativeBack);
+      document.removeEventListener("visibilitychange", visibilityChanged);
+      document.removeEventListener("selectionchange", selectionChanged);
+      window.removeEventListener("focus", resumeLive);
+      window.removeEventListener("pageshow", resumeLive);
+      window.removeEventListener("pagehide", pageHidden);
+      window.removeEventListener("offline", networkOffline);
+      window.removeEventListener("online", resumeLive);
       if (history.state?.[historyKey]?.owner === navigationOwner) {
         const state = { ...history.state }; delete state[historyKey];
         history.replaceState(state, "", location.href);

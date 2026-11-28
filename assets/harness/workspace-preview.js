@@ -149,6 +149,7 @@ function startPreviewPage() {
       if (typeof session.device?.id !== "string") throw new Error("远程授权响应无效。");
       activateRemoteChannels(session.device.id); host.replaceChildren();
       const context = { deviceId: session.device.id, workspaceFilePreview: session.capabilities?.workspaceFilePreview === true,
+        workspaceChangesLive: session.capabilities?.workspaceChangesLive === true,
         cacheScope: JSON.stringify([session.device.id, session.device.createdAtMs ?? null]),
         readOnly: !!session.readOnly, ...(target.threadId ? { threadId: target.threadId } : { creating: true, projectId: target.projectId }) };
       // 此页仅执行现有文件读取接口，不启动会话、轮询聊天、恢复输入回执或复制主窗口草稿。

@@ -455,6 +455,7 @@ export function shell() {
     stopTask:payload=>mutate("stopBackgroundTask",payload),
     getContext: () => ({ deviceId: session?.device.id, threadId: selectedId, creating,
       workspaceFilePreview: session?.capabilities?.workspaceFilePreview === true,
+      workspaceChangesLive: session?.capabilities?.workspaceChangesLive === true,
       connected,connectionVersion:nativeConnectionVersion,taskScopeSupported:thread?.viewKind!=="subagent" && thread?.ephemeral!==true,
       canCreateSide:!creating && thread?.id===selectedId && !relatedSessionView && connected && sideThreadsEnabled() && !threadReadOnly(),
       projectId: creationProject, readOnly: threadReadOnly(), cacheScope: privateInputScope(session) }),

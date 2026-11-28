@@ -1757,6 +1757,8 @@ html[data-session-window=true] .workspace>.sidebar,html[data-session-window=true
 .session-tools-heading{display:flex;align-items:center;justify-content:space-between;flex-shrink:0;gap:16px;padding-inline:16px;border-bottom:1px solid var(--line)}
 .session-tools-heading h1{margin:0;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
 .session-tools-heading-copy{display:flex;flex:1;flex-direction:column;min-width:0}
+/* 用户要求变更两页提供紧凑刷新入口，固定占位，刷新不推动路径和返回按钮。 */
+.session-tools-heading>.session-tools-refresh{flex:0 0 32px;width:32px;height:32px}
 .session-tools-heading-path{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 /* 用户要求变更、文件及其详情页顶部栏与会话页等高：桌面最小 52px、上下各 6px，手机最小 48px、上下各 3px，均含原有 1px 底边框；
    标题、路径字号及两行间距共用下列规则，随全局字号放大；手机断点须同步核对，分支标签不能额外撑高路径行。 */

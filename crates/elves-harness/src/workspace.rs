@@ -24,6 +24,7 @@ use tokio::process::Command;
 
 use super::{ApiError, HarnessAuthorization, WebState};
 
+pub(super) mod live;
 pub(super) mod preview;
 
 const MAX_STATUS_BYTES: usize = 2 * 1024 * 1024;
@@ -64,6 +65,7 @@ struct Repository {
     authorization: HarnessAuthorization,
 }
 
+#[derive(Clone)]
 struct WorkspaceRepositories {
     root: PathBuf,
     paths: Vec<String>,
@@ -189,25 +191,84 @@ pub(super) async fn changes(
     };
     let cwd = super::workspace_context(&state, &payload, &authorization).await?;
     let result = tokio::time::timeout(REQUEST_TIMEOUT, async {
-        // 新页面显式请求多仓库；旧页面仍接收单仓库格式，避免同名文件被旧客户端错配预览。
-        if all_repositories {
-            WorkspaceRepositories::discover(cwd, &authorization)
-                .await?
-                .listing(&authorization)
-                .await
-        } else {
-            let repo = Repository::discover(cwd, authorization.clone()).await?;
-            repo.listing().await
+        let (live, fresh) = live_options(&payload)?;
+        if live {
+            let root = resolve_workspace_root(cwd.clone(), &authorization).await?;
+            return state
+                .controller
+                .workspace_changes
+                .read(
+                    root.clone(),
+                    format!("list:{all_repositories}"),
+                    fresh,
+                    std::sync::Arc::downgrade(&state.controller),
+                    || async {
+                        if all_repositories {
+                            state
+                                .controller
+                                .workspace_changes
+                                .repositories(root)
+                                .await?
+                                .listing(&authorization)
+                                .await
+                        } else {
+                            read_changes(cwd, false, &authorization).await
+                        }
+                    },
+                )
+                .await;
         }
+        // 新页面显式请求多仓库；旧页面仍接收单仓库格式，避免同名文件被旧客户端错配预览。
+        read_changes(cwd, all_repositories, &authorization).await
     })
     .await
     .map_err(|_| ApiError::new(504, "读取 Git 变更超时，请稍后刷新"))??;
-    let result = revision_payload(result, if_revision)?;
+    let result = live_revision_payload(result, if_revision)?;
     authorization
         .check()
         .await
         .map_err(super::authorization_error)?;
     Ok(no_store(result))
+}
+
+async fn read_changes(
+    cwd: PathBuf,
+    all: bool,
+    authorization: &HarnessAuthorization,
+) -> Result<Value, ApiError> {
+    if all {
+        WorkspaceRepositories::discover(cwd, authorization)
+            .await?
+            .listing(authorization)
+            .await
+    } else {
+        Repository::discover(cwd, authorization.clone())
+            .await?
+            .listing()
+            .await
+    }
+}
+
+fn live_options(payload: &Value) -> Result<(bool, bool), ApiError> {
+    let flag = |key| match payload.get(key) {
+        None => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        _ => Err(ApiError::new(400, "变更刷新选项无效")),
+    };
+    Ok((flag("live")?, flag("fresh")?))
+}
+
+fn live_revision_payload(mut result: Value, revision: Option<&str>) -> Result<Value, ApiError> {
+    // 监听信息不参与内容版本，监听重建或定时核对不能让相同内容重新渲染。
+    let mut metadata = serde_json::Map::new();
+    for key in ["watchId", "watchVersion", "watchDirty", "watchIntervalMs"] {
+        if let Some(value) = result.as_object_mut().and_then(|o| o.remove(key)) {
+            metadata.insert(key.into(), value);
+        }
+    }
+    let mut result = revision_payload(result, revision)?;
+    result.as_object_mut().unwrap().extend(metadata);
+    Ok(result)
 }
 
 pub(super) async fn change(
@@ -243,33 +304,57 @@ pub(super) async fn change(
         .to_owned();
     let cwd = super::workspace_context(&state, &payload, &authorization).await?;
     let result = tokio::time::timeout(REQUEST_TIMEOUT, async {
-        let workspace_root = if repository.is_some() {
+        let (live, fresh) = live_options(&payload)?;
+        let live_root = if live {
             Some(resolve_workspace_root(cwd.clone(), &authorization).await?)
         } else {
             None
         };
-        let repo = if let (Some(root), Some(path)) = (&workspace_root, &repository) {
-            repository_in_workspace(root, path, &authorization).await?
-        } else {
-            Repository::discover(cwd, authorization.clone()).await?
+        let key = serde_json::to_string(&("detail", &repository, &section, &path)).unwrap();
+        let read = || async {
+            let workspace_root = if repository.is_some() {
+                Some(resolve_workspace_root(cwd.clone(), &authorization).await?)
+            } else {
+                None
+            };
+            let repo = if let (Some(root), Some(path)) = (&workspace_root, &repository) {
+                repository_in_workspace(root, path, &authorization).await?
+            } else {
+                Repository::discover(cwd, authorization.clone()).await?
+            };
+            let snapshot = repo.snapshot().await?;
+            let entry = snapshot
+                .files
+                .into_iter()
+                .find(|entry| entry.path == path && entry.section == section)
+                .ok_or_else(|| ApiError::new(409, "该文件的变更状态已更新，请刷新变更列表"))?;
+            let mut detail = repo.detail(&entry).await?;
+            detail["git"] = branch_metadata(&repo.root, &authorization).await;
+            if let Some(root) = workspace_root {
+                detail["root"] = json!(root.to_string_lossy());
+                detail["repository"] = json!(repository);
+            }
+            Ok::<_, ApiError>(detail)
         };
-        let snapshot = repo.snapshot().await?;
-        let entry = snapshot
-            .files
-            .into_iter()
-            .find(|entry| entry.path == path && entry.section == section)
-            .ok_or_else(|| ApiError::new(409, "该文件的变更状态已更新，请刷新变更列表"))?;
-        let mut detail = repo.detail(&entry).await?;
-        detail["git"] = branch_metadata(&repo.root, &authorization).await;
-        if let Some(root) = workspace_root {
-            detail["root"] = json!(root.to_string_lossy());
-            detail["repository"] = json!(repository);
+        if let Some(root) = live_root {
+            state
+                .controller
+                .workspace_changes
+                .read(
+                    root,
+                    key,
+                    fresh,
+                    std::sync::Arc::downgrade(&state.controller),
+                    read,
+                )
+                .await
+        } else {
+            read().await
         }
-        Ok::<_, ApiError>(detail)
     })
     .await
     .map_err(|_| ApiError::new(504, "读取文件差异超时，请稍后重试"))??;
-    let result = revision_payload(result, if_revision)?;
+    let result = live_revision_payload(result, if_revision)?;
     authorization
         .check()
         .await
@@ -6206,6 +6291,205 @@ mod tests {
         assert!(diff.lines().any(|line| line.starts_with("@@ -")));
         assert!(diff.lines().any(|line| line == "-ours"));
         assert!(!diff.contains("@@@"));
+    }
+
+    #[tokio::test]
+    async fn workspace_live_reads_keep_content_versions_and_recheck_authorization() {
+        let (_fixture, _state_dir, repo) = fixture_repo().await;
+        let (state, headers) = fixture_web_state(&repo);
+        std::fs::write(repo.root.join("live.txt"), b"first\n").unwrap();
+        let query = json!({"threadId":"thread-1","live":true,"fresh":true,"allRepositories":true});
+        let listing = fixture_response_json(
+            changes(State(state.clone()), headers.clone(), Json(query.clone()))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let detail_query = json!({"threadId":"thread-1","live":true,"fresh":true,"path":"live.txt","section":"untracked","repository":""});
+        let before = fixture_response_json(
+            change(
+                State(state.clone()),
+                headers.clone(),
+                Json(detail_query.clone()),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(listing["watchId"], before["watchId"]);
+        std::fs::write(repo.root.join("live.txt"), b"other\n").unwrap();
+        let mut conditional = detail_query.clone();
+        conditional["ifRevision"] = before["revision"].clone();
+        let after = fixture_response_json(
+            change(State(state.clone()), headers.clone(), Json(conditional))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_ne!(before["revision"], after["revision"]);
+        assert!(after["diff"].as_str().unwrap().contains("+other"));
+        let mut list_query = query.clone();
+        list_query["ifRevision"] = listing["revision"].clone();
+        let same = fixture_response_json(
+            changes(State(state.clone()), headers.clone(), Json(list_query))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(same["notModified"], true, "正文改变不伪造列表改变");
+        assert!(same["watchId"].is_string(), "小响应仍续租同一目录监听");
+        assert!(
+            git_unchecked(&repo.root, &["add", "live.txt"], 16 * 1024)
+                .await
+                .unwrap()
+                .success
+        );
+        assert_eq!(
+            change(
+                State(state.clone()),
+                headers.clone(),
+                Json(detail_query.clone())
+            )
+            .await
+            .unwrap_err()
+            .code,
+            409
+        );
+        let moved = fixture_response_json(
+            changes(State(state.clone()), headers.clone(), Json(query))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(moved["files"][0]["section"], "staged");
+        state.controller.auth.lock().await.devices.clear();
+        assert_eq!(
+            change(State(state), headers, Json(detail_query))
+                .await
+                .unwrap_err()
+                .code,
+            401
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_live_native_notifications_invalidate_shared_reads() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let (_fixture, _state_dir, repo) = fixture_repo().await;
+        let controller = &repo.authorization.controller;
+        let registry = &controller.workspace_changes;
+        let mut events = controller.events.subscribe();
+        let file = repo.root.join("live.txt");
+        std::fs::write(&file, b"first\n").unwrap();
+        let calls = AtomicUsize::new(0);
+        let read = || {
+            registry.read(repo.root.clone(), "probe".into(), false, Arc::downgrade(controller), || async {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(json!({"ok":true,"root":repo.root,"text":std::fs::read_to_string(&file).unwrap()}))
+        })
+        };
+        let first = read().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while read().await.unwrap()["watchIntervalMs"] != 15000 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        std::fs::write(&file, b"other\n").unwrap();
+        let after = tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                let value = read().await.unwrap();
+                if value["text"] == "other\n" {
+                    break value;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(after["watchId"], first["watchId"]);
+        assert_ne!(after["watchVersion"], first["watchVersion"]);
+        let notification = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event["method"] == "workspace/changed" {
+                    break event;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(notification["params"]["watchId"], first["watchId"]);
+        assert_eq!(
+            notification["params"].as_object().unwrap().len(),
+            1,
+            "通知不泄漏文件或工作目录"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_live_concurrent_reads_share_work_and_errors_are_not_cached() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let fixture = fixture_dir();
+        let registry = live::Registry::default();
+        let calls = AtomicUsize::new(0);
+        let read = || {
+            registry.read(
+                fixture.path().into(),
+                "same".into(),
+                false,
+                Default::default(),
+                || async {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    Ok(json!({"ok":true,"root":fixture.path(),"files":[]}))
+                },
+            )
+        };
+        let (a, b) = tokio::join!(read(), read());
+        assert_eq!(a.unwrap()["watchId"], b.unwrap()["watchId"]);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(
+            registry
+                .read(
+                    fixture.path().into(),
+                    "same".into(),
+                    true,
+                    Default::default(),
+                    || async { Err(ApiError::new(503, "临时读取失败")) }
+                )
+                .await
+                .is_err()
+        );
+        read().await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "主动核对失败后不复用旧成功缓存"
+        );
+        for _ in 0..2 {
+            assert!(
+                registry
+                    .read(
+                        fixture.path().into(),
+                        "error".into(),
+                        false,
+                        Default::default(),
+                        || async {
+                            calls.fetch_add(1, Ordering::Relaxed);
+                            Err(ApiError::new(403, "已撤销"))
+                        }
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
     }
 
     #[tokio::test]

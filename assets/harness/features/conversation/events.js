@@ -169,6 +169,10 @@ function applyAnchoredCompactions(id, entries) {
 export function receive(event) {
   if (handleRemoteChannelEvent(event)) return;
   const rawParams = event.params || {};
+  if (event.method === "workspace/changed") {
+    if (typeof rawParams.watchId === "string") sessionTools?.workspaceChanged?.(rawParams.watchId);
+    return;
+  }
   if (event.method === "remote/settingsChanged") { receiveSharedSettings(rawParams); return; }
   if (event.method === "remote/managementChanged") {
     window.dispatchEvent(new CustomEvent("codex-elves-management-updated"));
@@ -215,6 +219,7 @@ export function receive(event) {
     return;
   }
   if (event.method === "remote/resync") {
+    if (!rawParams.threadId) sessionTools?.workspaceChanged?.();
     if (typeof rawParams.threadId === "string") {
       if (rawParams.reason === "antigravity_checkpoint" && Array.isArray(rawParams.transcriptUpdates)) {
         if (eventThreadId !== selectedId || applyAnchoredCompactions(eventThreadId, rawParams.transcriptUpdates)) return;
