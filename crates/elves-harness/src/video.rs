@@ -262,7 +262,7 @@ pub(super) async fn content(
     Ok(response)
 }
 
-fn byte_range(value: &str, size: u64) -> Option<(u64, u64)> {
+pub(crate) fn byte_range(value: &str, size: u64) -> Option<(u64, u64)> {
     let (start, end) = value.strip_prefix("bytes=")?.split_once('-')?;
     let decimal = |value: &str| -> Option<u64> {
         if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {

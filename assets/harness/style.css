@@ -2447,3 +2447,9 @@ body{font-weight:var(--ui-font-weight,400)}
   background:var(--notice-error-bg);color:var(--notice-error-text);
   border-color:var(--notice-error-border)
 }
+.file-preview-paging:not([hidden]),.session-files-range:not([hidden]){display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.file-page-picture{display:block;max-width:100%;max-height:75dvh;object-fit:contain;margin:0 auto}
+.file-media-dialog audio{max-width:100%;width:320px}
+.file-archive-list{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 12px}
+.file-archive-list dt{overflow-wrap:anywhere}
+.file-archive-list dd{margin:0;text-align:end;color:var(--muted)}

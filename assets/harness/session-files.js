@@ -1,6 +1,8 @@
 import { requestRemote } from "./channels.js";
 import { bindLocalFileReferences, markdown, releaseMermaidBlocks, renderMermaidBlocks, withStableMessageLayout } from "./markdown.js";
 import { safeInlineImageSource } from "./attachments.js";
+import { validFileWindow, renderTextWindow, virtualSource, validResource, mountFileMedia,
+  validFormat, formatNav, mountPicture, renderArchive } from "./file-preview.js";
 
 const node = (tag, className = "", text = "") => {
   const result = document.createElement(tag);
@@ -659,6 +661,7 @@ export function mountSessionFiles({
   let listResponse = null, contentResponse = null, currentDirectory = "", renderedFile = "";
   let expanded = new Set(), searchMatches = null, searchEpoch = 0, searchController = null;
   let sourceMode = false, wrap = false, richView = {}, returnView = null, exitTimer = null;
+  let releasePreview = null;
   const createScreen = (id, title) => {
     const screen = node("section", "session-tools-screen session-files-screen");
     if (embedded) id = `${embedded.id}-${id}`;
@@ -688,6 +691,7 @@ export function mountSessionFiles({
   const contentControls = node("div", "session-tools-detail-controls");
   const metadata = node("span", "session-files-metadata");
   const richRange = node("div", "session-files-range"); richRange.hidden = true;
+  const pageNav=node("div","file-preview-paging");pageNav.hidden=true;
   const modeButton = control("源码", () => { sourceMode = !sourceMode; renderContent(); });
   modeButton.setAttribute("aria-label", "切换源码和预览");
   const wrapButton = control("自动换行", () => {
@@ -703,7 +707,7 @@ export function mountSessionFiles({
     renderSpreadsheetControlsChange();
   });
   layoutButton.setAttribute("aria-label", "切换原始布局和紧凑布局");
-  contentControls.append(metadata, richRange, wrapButton, layoutButton, modeButton);
+  contentControls.append(metadata, pageNav, richRange, wrapButton, layoutButton, modeButton);
   const fileStatus = node("p", "session-tools-status"); fileStatus.setAttribute("role", "status");
   const body = node("div", "session-tools-detail session-files-content");
   content.screen.append(contentControls, fileStatus, body);
@@ -750,20 +754,22 @@ export function mountSessionFiles({
       if (size > 16 * 1024 * 1024 || ++count > 24) responses.delete(id);
     }
   }
-  async function read(path, kind, controller, query = "") {
+  async function read(path, kind, controller, query = "", windowRequest = null) {
     if (!target) throw new Error("请先选择已有会话，或为新建会话选择项目。");
     const normalizedQuery = query.trim();
     const owner = contextKey, authorization = authorizationKey;
-    const key = `${kind}:${path}:${normalizedQuery}`;
+    const enhanced = kind === "file" && getContext()?.workspaceFilePreview === true;
+    const key = `${kind}:${path}:${normalizedQuery}${windowRequest ? JSON.stringify(windowRequest) : ""}`;
     const cached = responses.get(key);
     controllers.add(controller);
     const timer = setTimeout(() => controller.abort(new DOMException("读取超时", "TimeoutError")), 45000);
     const current = () => !disposed && owner === contextKey && authorization === authorizationKey && !controller.signal.aborted;
     try {
-    const value = await request(`/api/workspace/${kind}`, {
+    const value = await request(`/api/workspace/${enhanced ? "preview" : kind}`, {
         method: "POST", credentials: "same-origin", redirect: "error", signal: controller.signal,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ...target, path,
+          ...(enhanced && windowRequest ? {window:windowRequest} : {}),
           ...(kind === "files" && normalizedQuery ? { query: normalizedQuery } : {}),
           ...(cached ? { ifRevision: cached.revision } : {}) })
       }, async response => {
@@ -782,11 +788,17 @@ export function mountSessionFiles({
           || kind === "files" && (!Array.isArray(value.files) || value.files.length > 2000
             || value.files.some(file => !file || typeof file.name !== "string" || typeof file.path !== "string"
               || !["directory", "file", "unsupported"].includes(file.kind)))
-          || kind === "file" && (!["text", "image", "binary", "unsupported", "spreadsheet", "document"].includes(value.kind)
+          || kind === "file" && (!(["text", "image", "binary", "unsupported", "spreadsheet", "document"].includes(value.kind)
+              || enhanced && revisionValid(value.fileVersion) && (validFormat(value) || value.kind === "textWindow" && validFileWindow(value)
+                || value.kind === "media" && validResource(value) && /^(video|audio)\/[a-z0-9.+-]+$/u.test(value.mime)))
+            || value.paging != null && (!Number.isSafeInteger(value.paging.page) || value.paging.page<0
+              || !Number.isSafeInteger(value.paging.sheet) || typeof value.paging.more!=="boolean"
+              || !Array.isArray(value.paging.names) || value.paging.names.length>20
+              || value.paging.names.some(n=>typeof n!=="string" || n.length>512))
             || value.kind === "text" && (typeof value.text !== "string" || value.text.length > 4 * 1024 * 1024)
             || ["spreadsheet", "document"].includes(value.kind) && !validRichFilePreview(value)
             || value.kind === "image" && !imageValid(value.dataUrl))) throw new Error("文件响应格式无效");
-      retain(key, value); return value;
+      if (!enhanced || !windowRequest) retain(key, value); return value;
     } catch (error) {
       if (current() && error.code === 401 && !error.secondaryChannel) {
         responses.clear(); views.clear(); body.replaceChildren(); list.replaceChildren(); onUnauthorized?.();
@@ -817,7 +829,7 @@ export function mountSessionFiles({
     if (!embedded) screen.querySelector(".session-tools-back").focus({ preventScroll: true });
   }
   function hide(screen) {
-    if (screen === content.screen) releaseMermaidBlocks(body);
+    if (screen === content.screen) { releasePreview?.(); releasePreview=null; releaseMermaidBlocks(body); }
     screen.inert = true; screen.classList.remove("session-tools-visible");
   }
   async function openDirectory(path = "", { recordHistory = true } = {}) {
@@ -967,7 +979,8 @@ export function mountSessionFiles({
     controlsScroll.reset();
     sourceMode = line ? true : saved?.sourceMode ?? !/\.mdx?$/iu.test(path); wrap = saved?.wrap || false;
     richView = { ...saved?.richView };
-    contentResponse = responses.get(`file:${path}`) || null; renderedFile = path;
+    // 只有本目标的已确认预览可在复核期间显示，不能因更换设备或实例借用其他标签的片段。
+    contentResponse = responses.get(`file:${path}:`) || null; renderedFile = path;
     content.location.set(contentResponse ? `${contentResponse.root}/${contentResponse.path}` : path, contentResponse?.git);
     renderContent(); body.scrollTop = saved?.scroll || 0;
     if (!contentResponse) message(fileStatus, "正在读取文件…");
@@ -978,7 +991,8 @@ export function mountSessionFiles({
       const scroll = body.scrollTop;
       if (value !== contentResponse) { contentResponse = value; renderContent(); body.scrollTop = scroll; }
       content.location.set(`${value.root}/${value.path}`, value.git);
-      message(fileStatus, value.message);
+      message(fileStatus, !getContext()?.workspaceFilePreview && value.truncated && value.size>4*1024*1024
+        ? `${value.message || "仅显示部分内容"}；更新 Harness 后可使用分块预览。` : value.message);
       if (line) body.querySelector(`[data-line="${line}"]`)?.scrollIntoView({ block: "center" });
     } catch (error) {
       if (epoch !== fileEpoch || error.name === "AbortError") return;
@@ -1005,9 +1019,11 @@ export function mountSessionFiles({
     return root ? `${root.replace(/[\\/]$/u, "")}/${parts.join("/")}` : parts.join("/");
   }
   function renderContent() {
+    releasePreview?.(); releasePreview=null;
     releaseMermaidBlocks(body);
     body.replaceChildren(); body.classList.toggle("session-files-wrap", wrap);
     richRange.replaceChildren(); richRange.hidden = true;
+    pageNav.replaceChildren();pageNav.hidden=true;
     const value = contentResponse;
     const isSpreadsheet = value?.kind === "spreadsheet", compact = richView.layout !== "original";
     contentControls.classList.toggle("session-files-spreadsheet-controls", isSpreadsheet);
@@ -1021,12 +1037,28 @@ export function mountSessionFiles({
     modeButton.title = sourceMode ? "切换到预览" : "切换到源码";
     wrapButton.setAttribute("aria-pressed", String(isSpreadsheet ? richView.wrap === true : wrap));
     if (!value) return;
-    metadata.textContent = bytesLabel(value.size);
+    metadata.textContent = [bytesLabel(value.size), value.format].filter(Boolean).join(" · ");
     message(fileStatus, value.message);
-    if (["spreadsheet", "document"].includes(value.kind)) {
-      body.append(renderRichFilePreview(value, richView, saveView, {
+    formatNav(value,pageNav,readWindow);
+    if (value.kind === "archive") {
+      renderArchive(value,body);
+    } else if (value.kind === "picture" || value.kind === "pdfPage") {
+      releasePreview=mountPicture(value,body);
+    } else if (value.kind === "media") {
+      releasePreview=mountFileMedia(value,body,richView,status=>{
+        if(contentResponse!==value)return;
+        responses.clear();contentResponse=null;renderContent();
+        message(fileStatus,status===401||status===403?"文件访问授权已失效":"文件已变化或不可用，请重新打开",true);
+        if(status===401)onUnauthorized?.();
+      });
+    } else if (value.kind === "textWindow") {
+      releasePreview = renderTextWindow(value,body,richRange,readWindow,route?.line);
+    } else if (["spreadsheet", "document"].includes(value.kind)) {
+      const rich=renderRichFilePreview(value, richView, saveView, {
         onRange: pagination => { richRange.replaceChildren(pagination); richRange.hidden = false; }
-      }));
+      });
+      if(value.paging) rich.querySelector(".session-files-sheet-tabs")?.remove();
+      body.append(rich);
     } else if (value.kind === "text" && !sourceMode) {
       const document = node("div", "markdown session-files-markdown");
       // 用户此次只限制会话正文；文件预览中的 README.md 等文档相对链接继续按当前文档目录导航。
@@ -1054,6 +1086,11 @@ export function mountSessionFiles({
       body.append(document);
       refreshFileDiagrams();
     } else if (value.kind === "text") {
+      if (value.text.length > 128*1024 || value.text.split("\n",1501).length>1500) {
+        const language=syntaxLanguage(value.path);
+        releasePreview=virtualSource(body,value.text,{absolute:true,wrap,line:route?.line,
+          decorate:(s,state)=>highlightSourceLine(s,language,state)});return;
+      }
       const code = node("div", "session-files-source");
       code.tabIndex = 0; code.setAttribute("aria-label", "文件源码，可横向滚动");
       const fragment = document.createDocumentFragment();
@@ -1079,6 +1116,22 @@ export function mountSessionFiles({
       const image = node("img"); image.src = source; image.alt = displayWorkspaceName(fileName(value.path));
       link.append(image); link.onclick = event => { event.preventDefault(); openImagePreview?.(link, image); };
       body.append(link);
+    }
+  }
+  async function readWindow(options) {
+    const old=contentResponse, path=route?.path, epoch=++fileEpoch;
+    if(!old?.fileVersion || !path) return;
+    fileController?.abort(); fileController=new AbortController();
+    message(fileStatus,"正在读取…");
+    try {
+      const value=await read(path,"file",fileController,"",{...options,version:old.fileVersion});
+      if(disposed || epoch!==fileEpoch || route?.path!==path) return;
+      contentResponse=value;body.scrollTop=0;renderContent();
+    } catch(error) {
+      if(disposed || epoch!==fileEpoch || error.name==="AbortError")return;
+      if([401,403,404,409,422].includes(error.code)){contentResponse=null;responses.clear();renderContent();}
+      message(fileStatus,error.message,true);
+      if(error.code!==401)fileStatus.append(control("重新打开",()=>void openFile(path,null,{recordHistory:false})));
     }
   }
   function renderSpreadsheetControlsChange() {

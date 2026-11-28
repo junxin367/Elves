@@ -209,7 +209,7 @@ export async function requestRemote(path, options, consume, measurements = chann
   const read = options.method === "GET" && (["/api/session", "/api/channels", "/api/channel-events", "/api/settings/shared", "/api/settings/conversation-naming"].includes(pathname)
       || /^\/api\/receipts\/[a-zA-Z0-9-]{1,100}$/.test(pathname))
     || options.method === "POST" && (/^\/api\/read\/[a-zA-Z]+$/.test(pathname)
-      || ["/api/workspace/context", "/api/workspace/changes", "/api/workspace/change", "/api/workspace/files", "/api/workspace/file",
+      || ["/api/workspace/context", "/api/workspace/changes", "/api/workspace/change", "/api/workspace/files", "/api/workspace/file", "/api/workspace/preview",
         "/api/workspace/open-in-targets",
         "/api/settings/environments"].includes(pathname));
   let candidates = orderedRoutes(routes().filter(route => supportsRequest(route, path, options.method)), measurements);

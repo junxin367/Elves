@@ -444,6 +444,7 @@ export function shell() {
     onFileContextMenu: openWorkspaceFileContextMenu,
     createSideThread: createDesktopSideThread,
     getContext: () => ({ deviceId: session?.device.id, threadId: selectedId, creating,
+      workspaceFilePreview: session?.capabilities?.workspaceFilePreview === true,
       projectId: creationProject, readOnly: threadReadOnly(), cacheScope: privateInputScope(session) }),
     cache: workspaceViewCache,
     request: (path, options, consume) => {

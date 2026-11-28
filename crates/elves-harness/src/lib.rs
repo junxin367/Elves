@@ -523,6 +523,8 @@ pub struct HarnessController {
     diagnostics: diagnostics::Diagnostics,
     images: RwLock<ImageRegistry>,
     videos: RwLock<video::Registry>,
+    workspace_previews: workspace::preview::media::Registry,
+    workspace_preview_slots: Arc<tokio::sync::Semaphore>,
     image_previews: std::sync::Mutex<image_preview::PreviewCache>,
     image_preview_slots: Arc<tokio::sync::Semaphore>,
     browser_tunnels: browser::Registry,
@@ -630,6 +632,8 @@ impl HarnessController {
             diagnostics: diagnostics::Diagnostics::default(),
             images: RwLock::new(ImageRegistry::default()),
             videos: RwLock::new(video::Registry::default()),
+            workspace_previews: Default::default(),
+            workspace_preview_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             image_previews: std::sync::Mutex::new(image_preview::PreviewCache::default()),
             image_preview_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             browser_tunnels: browser::Registry::new(),
@@ -3675,6 +3679,8 @@ fn scoped_router(
         .route("/api/workspace/change", post(workspace::change))
         .route("/api/workspace/files", post(workspace::files))
         .route("/api/workspace/file", post(workspace::file))
+        .route("/api/workspace/preview", post(workspace::preview::read))
+        .route("/api/workspace/media/{id}", get(workspace::preview::media::content))
         .route("/api/workspace/open-browser", post(workspace::open_browser))
         .route("/api/workspace/open-in-targets", post(open_in::targets))
         .route("/api/workspace/open-in", post(open_in::open))
@@ -4543,6 +4549,7 @@ async fn session(
         "claudeSessions":true,"claudeProjectTrust":true,"claudeSubscriptionUsage":true}});
     response["antigravityAllowApprovals"] = json!(policy.allow_approvals);
     response["capabilities"]["antigravitySessions"] = json!(true);
+    response["capabilities"]["workspaceFilePreview"] = json!(true);
     // 用户要求 Antigravity 参考 Claude 实例在右下角开放 5h/7d 额度监控与消耗预测，数据经官方 `agy -p "/usage" --output-format json` 获取。
     response["capabilities"]["antigravityUsage"] = json!(true);
     response["capabilities"]["desktopCodexImageInput"] =

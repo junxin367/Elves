@@ -62,35 +62,47 @@ pub(super) fn thumbnail(source: &LoadedImage) -> Option<LoadedImage> {
         || Some(Cursor::new(source.bytes.as_slice())),
         format,
         source.bytes.len() as u64,
+        false,
     )
 }
 
 pub(super) fn file_thumbnail(file: &File, format: ImageFormat, size: u64) -> Option<LoadedImage> {
+    thumbnail_for_file(file, format, size, false)
+}
+
+pub(super) fn workspace_thumbnail(
+    file: &File,
+    format: ImageFormat,
+    size: u64,
+) -> Option<LoadedImage> {
+    thumbnail_for_file(file, format, size, true)
+}
+
+fn thumbnail_for_file(
+    file: &File,
+    format: ImageFormat,
+    size: u64,
+    workspace: bool,
+) -> Option<LoadedImage> {
     // 缩略图与放大预览复用已核验的同一文件句柄，不重新按路径查找，也不把原图读入 Vec。
     let open = || {
         let mut reader = BufReader::new(file.try_clone().ok()?);
         reader.rewind().ok()?;
         Some(reader)
     };
-    thumbnail_from(open, format, size)
+    thumbnail_from(open, format, size, workspace)
 }
 
 fn thumbnail_from<R: BufRead + Seek>(
     open: impl Fn() -> Option<R>,
     format: ImageFormat,
     original_size: u64,
+    workspace: bool,
 ) -> Option<LoadedImage> {
     // 动图继续使用原始内容，避免把 GIF、APNG 或动画 WebP 静默变成首帧。
     if format == ImageFormat::Gif
-        || format == ImageFormat::Png
-            && PngDecoder::new(open()?)
-                .ok()?
-                .is_apng()
-                .ok()?
-        || format == ImageFormat::WebP
-            && WebPDecoder::new(open()?)
-                .ok()?
-                .has_animation()
+        || format == ImageFormat::Png && PngDecoder::new(open()?).ok()?.is_apng().ok()?
+        || format == ImageFormat::WebP && WebPDecoder::new(open()?).ok()?.has_animation()
     {
         return None;
     }
@@ -102,7 +114,7 @@ fn thumbnail_from<R: BufRead + Seek>(
     reader.limits(limits);
     let mut decoder = reader.into_decoder().ok()?;
     let (width, height) = decoder.dimensions();
-    if width <= PREVIEW_EDGE && height <= PREVIEW_EDGE
+    if !workspace && width <= PREVIEW_EDGE && height <= PREVIEW_EDGE
         || u64::from(width) * u64::from(height) > MAX_PREVIEW_PIXELS
     {
         return None;
@@ -114,9 +126,13 @@ fn thumbnail_from<R: BufRead + Seek>(
     let orientation = decoder.orientation().ok()?;
     let mut decoded = DynamicImage::from_decoder(decoder).ok()?;
     decoded.apply_orientation(orientation);
-    let preview = decoded
-        .resize(PREVIEW_EDGE, PREVIEW_EDGE, FilterType::Triangle)
-        .to_rgba8();
+    let preview = if width <= PREVIEW_EDGE && height <= PREVIEW_EDGE {
+        decoded.to_rgba8()
+    } else {
+        decoded
+            .resize(PREVIEW_EDGE, PREVIEW_EDGE, FilterType::Triangle)
+            .to_rgba8()
+    };
     let mut bytes = Vec::new();
     let mut encoder = WebPEncoder::new_lossless(&mut bytes);
     if let Some(profile) = profile {
@@ -131,8 +147,11 @@ fn thumbnail_from<R: BufRead + Seek>(
         )
         .ok()?;
     // 小文件或转换后没有节省流量时保留原图。
-    ((bytes.len() as u64) < original_size).then_some(LoadedImage {
-        bytes,
-        mime: "image/webp",
-    })
+    // 工作区远程预览即使是小图也只传派生图；原图必须由用户显式打开。旧正文仍按体积收益选择。
+    ((bytes.len() as u64) < original_size || workspace && bytes.len() <= 512 * 1024).then_some(
+        LoadedImage {
+            bytes,
+            mime: "image/webp",
+        },
+    )
 }

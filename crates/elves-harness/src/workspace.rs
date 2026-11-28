@@ -24,6 +24,8 @@ use tokio::process::Command;
 
 use super::{ApiError, HarnessAuthorization, WebState};
 
+pub(super) mod preview;
+
 const MAX_STATUS_BYTES: usize = 2 * 1024 * 1024;
 const MAX_FILES: usize = 2_000;
 const MAX_TEXT_BYTES: usize = 4 * 1024 * 1024;
@@ -944,6 +946,15 @@ fn project_file_content(root: &Path, path: &str) -> Result<Value, ApiError> {
         .and_then(|value| value.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("log"));
     let side = read_local_with_prefix(root, path, log)?;
+    file_content_from_side(root, path, log, side)
+}
+
+fn file_content_from_side(
+    root: &Path,
+    path: &str,
+    log: bool,
+    side: Side,
+) -> Result<Value, ApiError> {
     if !side.exists {
         return Err(ApiError::new(404, "文件不存在或已被删除"));
     }
@@ -2797,19 +2808,27 @@ mod tests {
     }
 
     async fn fixture_repo() -> (tempfile::TempDir, tempfile::TempDir, Repository) {
+        fixture_repo_in(fixture_dir(), true).await
+    }
+
+    async fn fixture_repo_in(
+        fixture: tempfile::TempDir,
+        initialize_git: bool,
+    ) -> (tempfile::TempDir, tempfile::TempDir, Repository) {
         use super::super::{
             Device, HarnessController, RemoteAccessSettings, configure_access_key, hash, now_ms,
         };
         use std::sync::Arc;
         use std::sync::atomic::Ordering;
-        let fixture = fixture_dir();
         let root = std::fs::canonicalize(fixture.path()).unwrap();
-        assert!(
-            git_unchecked(&root, &["init", "--quiet"], 16 * 1024)
-                .await
-                .unwrap()
-                .success
-        );
+        if initialize_git {
+            assert!(
+                git_unchecked(&root, &["init", "--quiet"], 16 * 1024)
+                    .await
+                    .unwrap()
+                    .success
+            );
+        }
         let state = fixture_dir();
         configure_access_key(state.path(), "workspace-detail-test-key").unwrap();
         // 这些回归测试已授权设备的文件读取，使用合法的无明文旧格式密钥记录。
@@ -2845,9 +2864,16 @@ mod tests {
             auth.devices.push(device.clone());
             device
         };
-        let repo = Repository::discover(root, controller.authorization(device, None))
-            .await
-            .unwrap();
+        let authorization = controller.authorization(device, None);
+        let repo = if initialize_git {
+            Repository::discover(root, authorization).await.unwrap()
+        } else {
+            Repository {
+                root,
+                authorization,
+                head: None,
+            }
+        };
         (fixture, state, repo)
     }
 
@@ -2886,6 +2912,496 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "显式运行：需要本机已运行的 codex-elves-claude-test WSL 发行版"]
+    async fn workspace_preview_owned_wsl_project_reads_real_file() {
+        let dir = tempfile::Builder::new()
+            .prefix("elves-file-preview-")
+            .tempdir_in(r"\\wsl.localhost\codex-elves-claude-test\tmp")
+            .unwrap();
+        let (_root, _data, repo) = fixture_repo_in(dir, false).await;
+        let (s, h) = fixture_web_state(&repo);
+        // 真实 WSL 文件系统，只在自建临时项目里测试；不读取实例用户配置或登录态。
+        std::fs::write(repo.root.join("wide.txt"), vec![b'A'; 5 * 1024 * 1024]).unwrap();
+        let result = fixture_response_json(
+            preview::read(State(s), h, Json(json!({"threadId":"t","path":"wide.txt"})))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(result["kind"], "textWindow");
+        assert_eq!(result["end"], 256 * 1024);
+        assert!(
+            result["root"]
+                .as_str()
+                .unwrap()
+                .contains("codex-elves-claude-test")
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_preview_windows_read_head_tail_bom_and_replace() {
+        use std::io::{Seek, SeekFrom, Write};
+        let (_root, _data, repo) = fixture_repo().await;
+        let (s, h) = fixture_web_state(&repo);
+        let read = |path: &str, w: Value| {
+            preview::read(
+                State(s.clone()),
+                h.clone(),
+                Json(json!({"threadId":"t","path":path,"window":w})),
+            )
+        };
+        let mut f = File::create(repo.root.join("big.log")).unwrap();
+        f.write_all(b"start").unwrap();
+        f.set_len(200 * 1024 * 1024).unwrap();
+        f.seek(SeekFrom::End(-(256 * 1024i64))).unwrap();
+        f.write_all(&vec![b'z'; 256 * 1024]).unwrap();
+        drop(f);
+        // 稀疏文件头的零字节不是文本，给首部设置合法探测样本；尾部仍只读一个片段。
+        let mut f = OpenOptions::new()
+            .write(true)
+            .open(repo.root.join("big.log"))
+            .unwrap();
+        f.write_all(&[b'a'; 4096]).unwrap();
+        drop(f);
+        let tail = fixture_response_json(read("big.log", json!({})).await.unwrap()).await;
+        assert_eq!(tail["kind"], "textWindow");
+        assert_eq!(tail["end"], 200 * 1024 * 1024);
+        assert_eq!(tail["text"].as_str().unwrap().len(), 256 * 1024);
+        let p = repo.root.join("wide.json");
+        let mut bytes = vec![b'x'; 20 * 1024 * 1024];
+        bytes[262143..262147].copy_from_slice("🙂".as_bytes());
+        std::fs::write(&p, &bytes).unwrap();
+        let first = fixture_response_json(read("wide.json", json!({})).await.unwrap()).await;
+        assert_eq!(first["end"], 262143);
+        let ver = &first["fileVersion"];
+        let second = fixture_response_json(
+            read(
+                "wide.json",
+                json!({"version":ver,"direction":"next","offset":first["end"]}),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert!(second["text"].as_str().unwrap().starts_with("🙂"));
+        assert_eq!(second["start"], first["end"]);
+        let previous = fixture_response_json(
+            read(
+                "wide.json",
+                json!({"version":ver,"direction":"prev","offset":second["start"]}),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(previous["text"], first["text"]);
+        std::fs::rename(&p, repo.root.join("old.json")).unwrap();
+        std::fs::write(&p, &bytes).unwrap();
+        assert_eq!(
+            read("wide.json", json!({"version":ver,"direction":"tail"}))
+                .await
+                .unwrap_err()
+                .code,
+            409
+        );
+        let mut utf = vec![0xff, 0xfe];
+        for _ in 0..131071 {
+            utf.extend_from_slice(&[b'x', 0]);
+        }
+        utf.extend_from_slice(&[0x3d, 0xd8, 0x42, 0xde]);
+        while utf.len() <= 4 * 1024 * 1024 {
+            utf.extend_from_slice(&[b'x', 0]);
+        }
+        std::fs::write(repo.root.join("unicode.txt"), utf).unwrap();
+        let first = fixture_response_json(read("unicode.txt", json!({})).await.unwrap()).await;
+        assert_eq!(first["end"], 262144);
+        let second = fixture_response_json(
+            read(
+                "unicode.txt",
+                json!({"direction":"next","offset":first["end"],"version":first["fileVersion"]}),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert!(second["text"].as_str().unwrap().starts_with("🙂"));
+    }
+
+    #[tokio::test]
+    async fn workspace_preview_expiry_rotation_and_in_place_change_stop_existing_streams() {
+        use axum::http::Method;
+        use std::io::Write;
+        let (_fixture, keys, repo) = fixture_repo().await;
+        let (s, h) = fixture_web_state(&repo);
+        let path = repo.root.join("clip.mp4");
+        let mut f = File::create(&path).unwrap();
+        f.write_all(b"\0\0\0\x18ftypisom").unwrap();
+        f.set_len(1024 * 1024).unwrap();
+        drop(f);
+        let query = json!({"threadId":"t","path":"clip.mp4"});
+        let open = || preview::read(State(s.clone()), h.clone(), Json(query.clone()));
+        let meta = fixture_response_json(open().await.unwrap()).await;
+        let id = meta["resource"]
+            .as_str()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap();
+        let get = || {
+            preview::media::content(
+                State(s.clone()),
+                AxumPath(id.into()),
+                Method::GET,
+                h.clone(),
+            )
+        };
+        let mut stream = get().await.unwrap().into_body().into_data_stream();
+        assert!(stream.next().await.unwrap().is_ok());
+        {
+            let mut a = s.controller.auth.lock().await;
+            a.devices[0].expires_at_ms = crate::now_ms() - 1;
+        }
+        assert!(stream.next().await.unwrap().is_err());
+        assert_eq!(get().await.unwrap_err().code, 401);
+        drop(stream);
+        {
+            let mut a = s.controller.auth.lock().await;
+            a.devices[0].expires_at_ms = crate::now_ms() + 120000;
+        }
+        let mut stream = get().await.unwrap().into_body().into_data_stream();
+        assert!(stream.next().await.unwrap().is_ok());
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(512 * 1024)
+            .unwrap();
+        assert!(stream.next().await.unwrap().is_err());
+        assert_eq!(get().await.unwrap_err().code, 409);
+        drop(stream);
+        let info = fixture_response_json(open().await.unwrap()).await;
+        let id = info["resource"]
+            .as_str()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap();
+        let mut stream = preview::media::content(
+            State(s.clone()),
+            AxumPath(id.into()),
+            Method::GET,
+            h.clone(),
+        )
+        .await
+        .unwrap()
+        .into_body()
+        .into_data_stream();
+        assert!(stream.next().await.unwrap().is_ok());
+        crate::configure_access_key(keys.path(), "rotated-only-for-this-isolated-fixture").unwrap();
+        // 新请求实际刷新密钥及设备清单；旧响应也必须随之失效。
+        assert_eq!(open().await.unwrap_err().code, 401);
+        assert!(stream.next().await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn workspace_preview_remote_http_scope_ranges_and_revocation() {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::sync::atomic::Ordering;
+        let (_root, _data, repo) = fixture_repo().await;
+        let (state, headers) = fixture_web_state(&repo);
+        let mut f = File::create(repo.root.join("sample.mp4")).unwrap();
+        f.write_all(b"\0\0\0\x18ftypisom").unwrap();
+        f.set_len(2u64 << 30).unwrap();
+        f.seek(SeekFrom::End(-4)).unwrap();
+        f.write_all(b"TAIL").unwrap();
+        drop(f);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut settings = state.settings.clone();
+        settings.port = addr.port();
+        settings.enabled = true;
+        let router = crate::web_router(state.controller.clone(), settings);
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap()
+        });
+        let base = format!("http://{addr}");
+        let url = format!("{base}/api/workspace/preview");
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let post = |v: Value| {
+            client
+                .post(&url)
+                .header(header::ORIGIN, &base)
+                .headers(headers.clone())
+                .json(&v)
+                .send()
+        };
+        let query = json!({"projectId":"p","path":"sample.mp4"});
+        assert_eq!(
+            client
+                .post(&url)
+                .json(&query)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+        assert_eq!(
+            client
+                .post(&url)
+                .header(header::ORIGIN, &base)
+                .json(&query)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+        assert_eq!(
+            client
+                .post(&url)
+                .headers(headers.clone())
+                .header(header::ORIGIN, "https://other.invalid")
+                .json(&query)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+        for bad in [
+            json!({"threadId":"t","projectId":"p","path":"sample.mp4"}),
+            json!({"threadId":"t","path":"../outside"}),
+            json!({"threadId":"t","path":"sample.mp4","cwd":"elsewhere"}),
+            json!({"threadId":"t","path":"sample.mp4","download":true}),
+        ] {
+            assert!(post(bad).await.unwrap().status().is_client_error());
+        }
+        let resp = post(query.clone()).await.unwrap();
+        let code = resp.status();
+        let info: Value = resp.json().await.unwrap();
+        assert_eq!(code, 200, "{info}");
+        assert_eq!(info["kind"], "media");
+        assert_eq!(info["size"], 2u64 << 30);
+        let path = info["resource"].as_str().unwrap();
+        let id = path.rsplit('/').next().unwrap();
+        let resource = format!("{base}{path}");
+        let get = || client.get(&resource).headers(headers.clone());
+        let meta = client
+            .head(&resource)
+            .headers(headers.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(meta.status(), 200);
+        assert_eq!(meta.headers()[header::ACCEPT_RANGES], "bytes");
+        assert_eq!(
+            meta.headers()[header::CONTENT_LENGTH],
+            (2u64 << 30).to_string()
+        );
+        assert!(meta.bytes().await.unwrap().is_empty());
+        assert_eq!(client.get(&resource).send().await.unwrap().status(), 401);
+        let mut b = repo.authorization.device.clone();
+        b.id = "second-device".into();
+        b.token_hash = crate::hash("test-second-cookie");
+        state.controller.auth.lock().await.devices.push(b);
+        let mut bh = HeaderMap::new();
+        bh.insert(
+            header::COOKIE,
+            format!("{}=test-second-cookie", crate::COOKIE_NAME)
+                .parse()
+                .unwrap(),
+        );
+        let second_info = fixture_response_json(
+            preview::read(State(state.clone()), bh.clone(), Json(query.clone()))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let second_path = second_info["resource"].as_str().unwrap();
+        assert_ne!(second_path, path);
+        assert_eq!(
+            client
+                .get(&resource)
+                .header(
+                    header::COOKIE,
+                    format!("{}=test-second-cookie", crate::COOKIE_NAME)
+                )
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            404
+        );
+        let tail = get()
+            .header(header::RANGE, "bytes=-4")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(tail.status(), 206);
+        assert_eq!(
+            tail.headers()[header::CONTENT_RANGE],
+            "bytes 2147483644-2147483647/2147483648"
+        );
+        assert_eq!(tail.bytes().await.unwrap().as_ref(), b"TAIL");
+        for bad in [
+            "bytes=2147483648-",
+            "bytes=4-1",
+            "bytes=0-1,5-9",
+            "bytes=-0",
+        ] {
+            assert_eq!(
+                get()
+                    .header(header::RANGE, bad)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                416
+            );
+        }
+        let get_stream = || {
+            preview::media::content(
+                State(state.clone()),
+                AxumPath(id.to_owned()),
+                axum::http::Method::GET,
+                headers.clone(),
+            )
+        };
+        let mut first = get_stream().await.unwrap().into_body().into_data_stream();
+        let second = get_stream().await.unwrap();
+        assert_eq!(get_stream().await.unwrap_err().code, 429);
+        assert_eq!(first.next().await.unwrap().unwrap().len(), 64 * 1024);
+        drop(second);
+        let third = get_stream().await.unwrap();
+        drop(third);
+        let mut local = state.clone();
+        local.desktop = true;
+        state
+            .controller
+            .desktop_running
+            .store(true, Ordering::SeqCst);
+        let connected = crate::desktop::connect(local.clone()).await.unwrap();
+        let cookie = connected.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+        let mut lh = HeaderMap::new();
+        lh.insert(
+            header::HOST,
+            format!("127.0.0.1:{}", local.settings.port)
+                .parse()
+                .unwrap(),
+        );
+        lh.insert(header::COOKIE, cookie.parse().unwrap());
+        assert_eq!(
+            preview::media::content(
+                State(local.clone()),
+                AxumPath(id.into()),
+                axum::http::Method::HEAD,
+                lh.clone()
+            )
+            .await
+            .unwrap_err()
+            .code,
+            404
+        );
+        let local_info = fixture_response_json(
+            preview::read(State(local.clone()), lh.clone(), Json(query.clone()))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let local_id = local_info["resource"]
+            .as_str()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap();
+        assert_ne!(id, local_id);
+        let mut wire = get().send().await.unwrap();
+        assert_eq!(wire.status(), 200);
+        assert!(!wire.chunk().await.unwrap().unwrap().is_empty());
+        state
+            .controller
+            .auth
+            .lock()
+            .await
+            .devices
+            .retain(|d| d.id != repo.authorization.device.id);
+        assert!(first.next().await.unwrap().is_err());
+        drop(first);
+        // TCP 已交给客户端的缓冲不可能撤回；验证撤权后的真实 HTTP 响应不能正常收齐整个 2 GiB 原件。
+        let interrupted = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut pending = 0usize;
+            loop {
+                match wire.chunk().await {
+                    Ok(Some(b)) => {
+                        pending += b.len();
+                        assert!(pending < 64 * 1024 * 1024, "撤权后仍持续发送");
+                    }
+                    Err(_) => return true,
+                    Ok(None) => return false,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(interrupted);
+        assert_eq!(get().send().await.unwrap().status(), 401);
+        assert_eq!(
+            client
+                .head(format!("{base}{second_path}"))
+                .headers(bh)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        state.controller.running.store(false, Ordering::SeqCst);
+        lh.insert(header::RANGE, "bytes=-4".parse().unwrap());
+        let lr = preview::media::content(
+            State(local.clone()),
+            AxumPath(local_id.into()),
+            axum::http::Method::GET,
+            lh.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            axum::body::to_bytes(lr.into_body(), 4)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"TAIL"
+        );
+        std::fs::write(repo.root.join("sample.mp4"), b"replaced").unwrap();
+        assert_eq!(
+            preview::media::content(
+                State(local),
+                AxumPath(local_id.into()),
+                axum::http::Method::GET,
+                lh
+            )
+            .await
+            .unwrap_err()
+            .code,
+            409
+        );
+        server.abort();
+        let _ = server.await;
     }
 
     async fn fixture_child_repo(root: &Path, relative: &str, text: &str) -> PathBuf {
@@ -3930,6 +4446,32 @@ mod tests {
                 r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData/></worksheet>"#,
             ),
         ]);
+        {
+            use std::io::{Cursor, Write};
+            let mut z = zip::ZipWriter::new_append(Cursor::new(archive.clone())).unwrap();
+            for name in ["xl/media/a.bin", "xl/media/b.bin"] {
+                z.start_file(
+                    name,
+                    zip::write::SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Stored),
+                )
+                .unwrap();
+                for _ in 0..160 {
+                    z.write_all(&[0; 65536]).unwrap();
+                }
+            }
+            let bytes = z.finish().unwrap().into_inner();
+            let size = bytes.len() as u64;
+            assert!(size >= 20 * 1024 * 1024);
+            let path = root.join("twenty.xlsx");
+            std::fs::write(&path, bytes).unwrap();
+            let mut f = File::open(path).unwrap();
+            let v = crate::document_preview::file_window(&mut f, size, "xlsx", 1, 0).unwrap();
+            assert_eq!(v["paging"]["names"], json!(["数据", "空表"]));
+            assert_eq!(v["sheets"].as_array().unwrap().len(), 1);
+            assert_eq!(v["sheets"][0]["name"], "空表");
+            assert!(!v.to_string().contains("手机号"));
+        }
         std::fs::write(root.join("report.xlsx"), archive).unwrap();
         let result = project_file_content(&root, "report.xlsx").unwrap();
         assert_eq!(result["kind"], "spreadsheet", "{result}");
@@ -4096,6 +4638,217 @@ mod tests {
             zip.write_all(text.as_bytes()).unwrap();
         }
         zip.finish().unwrap().into_inner()
+    }
+
+    #[tokio::test]
+    async fn workspace_preview_remote_document_archive_and_image_limits() {
+        use std::io::{Cursor, Write};
+        let (_fixture, _dir, repo) = fixture_repo().await;
+        let (s, h) = fixture_web_state(&repo);
+        let get = |path: &str, w: Value| {
+            preview::read(
+                State(s.clone()),
+                h.clone(),
+                Json(json!({"threadId":"t","path":path,"window":w})),
+            )
+        };
+        let zip = office_fixture(&[]);
+        std::fs::write(repo.root.join("empty.zip"), zip).unwrap();
+        let empty = fixture_response_json(get("empty.zip", json!({})).await.unwrap()).await;
+        assert_eq!(empty["kind"], "archive");
+        assert_eq!(empty["count"], 0);
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for i in 0..57 {
+            zip.start_file(
+                format!("item{i}.txt"),
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+            zip.write_all(b"private-entry-content").unwrap();
+        }
+        std::fs::write(
+            repo.root.join("test.zip"),
+            zip.finish().unwrap().into_inner(),
+        )
+        .unwrap();
+        let first = fixture_response_json(get("test.zip", json!({})).await.unwrap()).await;
+        assert_eq!(first["items"].as_array().unwrap().len(), 50);
+        assert!(!first.to_string().contains("private-entry-content"));
+        assert!(first.get("resource").is_none());
+        let second = fixture_response_json(
+            get("test.zip", json!({"version":first["fileVersion"],"page":1}))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(second["items"].as_array().unwrap().len(), 7);
+        let word = (0..54)
+            .map(|i| format!("<p><r><t>paragraph-{i}</t></r></p>"))
+            .collect::<String>();
+        std::fs::write(
+            repo.root.join("text.docx"),
+            office_fixture(&[(
+                "word/document.xml",
+                &format!("<document><body>{word}</body></document>"),
+            )]),
+        )
+        .unwrap();
+        let first = fixture_response_json(get("text.docx", json!({})).await.unwrap()).await;
+        assert_eq!(first["sections"][0]["blocks"].as_array().unwrap().len(), 50);
+        assert_eq!(first["paging"]["more"], true);
+        let next = fixture_response_json(
+            get(
+                "text.docx",
+                json!({"version":first["fileVersion"],"page":1}),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(next["sections"][0]["blocks"][0]["text"], "paragraph-50");
+        std::fs::write(
+            repo.root.join("budget.docx"),
+            office_fixture(&[("word/document.xml", &"x".repeat(16 * 1024 * 1024 + 1))]),
+        )
+        .unwrap();
+        assert_eq!(
+            fixture_response_json(get("budget.docx", json!({})).await.unwrap()).await["kind"],
+            "unsupported"
+        );
+        let mut png = Cursor::new(Vec::new());
+        image::RgbImage::from_pixel(2, 2, image::Rgb([120, 31, 44]))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(repo.root.join("small.png"), png.get_ref()).unwrap();
+        let picture = fixture_response_json(get("small.png", json!({})).await.unwrap()).await;
+        assert_eq!(picture["kind"], "picture");
+        assert_eq!(picture["localOriginal"], false);
+        assert_eq!(picture["width"], 2);
+        assert!(
+            picture["thumbnail"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/webp;base64,")
+        );
+        let mut oversized = png.get_ref().clone();
+        oversized[16..20].copy_from_slice(&16_385_u32.to_be_bytes());
+        let mut crc = flate2::Crc::new();
+        crc.update(&oversized[12..29]);
+        oversized[29..33].copy_from_slice(&crc.sum().to_be_bytes());
+        std::fs::write(repo.root.join("oversize.png"), oversized).unwrap();
+        let large_image =
+            fixture_response_json(get("oversize.png", json!({})).await.unwrap()).await;
+        assert_eq!(large_image["kind"], "unsupported");
+        assert!(large_image.get("resource").is_none());
+        let rows = (0..1101).map(|i| format!("{i},data\n")).collect::<String>();
+        std::fs::write(repo.root.join("many.csv"), rows).unwrap();
+        let limited = fixture_response_json(get("many.csv", json!({})).await.unwrap()).await;
+        assert_eq!(limited["tableTextAvailable"], true);
+        let text = fixture_response_json(
+            get(
+                "many.csv",
+                json!({"version":limited["fileVersion"],"representation":"text"}),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(text["kind"], "textWindow");
+        assert!(text["text"].as_str().unwrap().contains("1100,data"));
+        std::fs::write(
+            repo.root.join("bad.svg"),
+            "<svg><script>alert(1)</script></svg>",
+        )
+        .unwrap();
+        let svg = fixture_response_json(get("bad.svg", json!({})).await.unwrap()).await;
+        assert_eq!(svg["kind"], "unsupported");
+        assert!(svg.get("resource").is_none());
+        std::fs::write(repo.root.join("binary.psd"), b"8BPS\0\0").unwrap();
+        let bin = fixture_response_json(get("binary.psd", json!({})).await.unwrap()).await;
+        assert_eq!(bin["size"], 6);
+        assert!(bin.get("resource").is_none());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn workspace_preview_windows_scan_pdf_returns_raster_not_original() {
+        use pdf_extract::{Dictionary, Document, Object, Stream};
+        let (_fixture, _dir, repo) = fixture_repo().await;
+        let (s, h) = fixture_web_state(&repo);
+        let mut doc = Document::with_version("1.4");
+        let pages = doc.new_object_id();
+        let mut img = Dictionary::new();
+        img.set("Type", "XObject");
+        img.set("Subtype", "Image");
+        img.set("Width", 1);
+        img.set("Height", 1);
+        img.set("ColorSpace", "DeviceRGB");
+        img.set("BitsPerComponent", 8);
+        let img = doc.add_object(Stream::new(img, vec![246, 12, 26]));
+        let mut images = Dictionary::new();
+        images.set("Picture", img);
+        let mut res = Dictionary::new();
+        res.set("XObject", images);
+        let mut kids = Vec::new();
+        for _ in 0..2 {
+            let contents = doc.add_object(Stream::new(
+                Dictionary::new(),
+                b"q 64 0 0 64 0 0 cm /Picture Do Q".to_vec(),
+            ));
+            let mut page = Dictionary::new();
+            page.set("Type", "Page");
+            page.set("Parent", pages);
+            page.set("Resources", res.clone());
+            page.set("MediaBox", vec![0.into(), 0.into(), 64.into(), 64.into()]);
+            page.set("Contents", contents);
+            kids.push(Object::Reference(doc.add_object(page)));
+        }
+        let mut tree = Dictionary::new();
+        tree.set("Type", "Pages");
+        tree.set("Count", 2);
+        tree.set("Kids", kids);
+        doc.objects.insert(pages, tree.into());
+        let mut catalog = Dictionary::new();
+        catalog.set("Type", "Catalog");
+        catalog.set("Pages", pages);
+        let cid = doc.add_object(catalog);
+        doc.trailer.set("Root", cid);
+        doc.save(repo.root.join("scan.pdf")).unwrap();
+        let get = |win: Value| {
+            preview::read(
+                State(s.clone()),
+                h.clone(),
+                Json(json!({"threadId":"t","path":"scan.pdf","window":win})),
+            )
+        };
+        let first = fixture_response_json(get(json!({})).await.unwrap()).await;
+        assert_eq!(first["kind"], "pdfPage", "{}", first["message"]);
+        assert_eq!(first["pages"], 2);
+        assert!(first.get("resource").is_none());
+        let raw = STANDARD
+            .decode(
+                first["dataUrl"]
+                    .as_str()
+                    .unwrap()
+                    .strip_prefix("data:image/png;base64,")
+                    .unwrap(),
+            )
+            .unwrap();
+        let im = image::load_from_memory(&raw).unwrap().to_rgb8();
+        let center = im.get_pixel(im.width() / 2, im.height() / 2).0;
+        assert!(
+            center[0] > 180 && center[1] < 80,
+            "页图不能是空白页: {center:?}"
+        );
+        assert_eq!(
+            fixture_response_json(
+                get(json!({"version":first["fileVersion"],"page":1}))
+                    .await
+                    .unwrap()
+            )
+            .await["page"],
+            1
+        );
     }
 
     #[test]

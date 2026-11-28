@@ -154,6 +154,7 @@ pub(super) fn read_path(method: &Method, path: &str) -> bool {
                         | "/api/workspace/change"
                         | "/api/workspace/files"
                         | "/api/workspace/file"
+                        | "/api/workspace/preview"
                         | "/api/workspace/open-in-targets"
                         | "/api/settings/environments"
                 )

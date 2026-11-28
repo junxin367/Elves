@@ -213,9 +213,12 @@ export function bindMediaPreviewDismiss(dialog, media, viewport = media) {
   };
 }
 
-export function openVideoPreview(trigger, source, poster, name, prepareAccess = () => {}) {
-  if (!remoteVideoPattern.test(source) || poster !== `${source}/poster`) return;
-  if (requestWorkspaceMediaPreview({ kind: "video", source, poster, name })) return;
+export function openVideoPreview(trigger, source, poster, name, prepareAccess = () => {}, fileAccess = null) {
+  // 工作区视频有独立的项目/设备授权：只用受控同源路径，不能借正文媒体凭据或转交其他会话的标识。
+  if (fileAccess ? !/^\/api\/workspace\/media\/[a-f0-9]{64}$/u.test(source) || poster != null
+    : !remoteVideoPattern.test(source) || poster !== `${source}/poster`) return;
+  if (!fileAccess && requestWorkspaceMediaPreview({ kind: "video", source, poster, name })) return;
+  const sourceRoutes = () => fileAccess ? [source] : remoteMediaCandidates(source);
   prepareAccess();
   document.querySelector("#video-preview-dialog")?.close();
   const dialog = document.createElement("dialog");
@@ -235,7 +238,7 @@ export function openVideoPreview(trigger, source, poster, name, prepareAccess = 
   video.preload = "none";
   video.playsInline = true;
   video.crossOrigin = "anonymous";
-  const initialPoster = remoteMediaCandidates(poster)[0];
+  const initialPoster = fileAccess ? null : remoteMediaCandidates(poster)[0];
   if (initialPoster) video.poster = initialPoster;
   // 弹窗打开时仍然没有 src。只有下方播放按钮的点击事件可以设置 src。
   const controls = document.createElement("div");
@@ -274,12 +277,12 @@ export function openVideoPreview(trigger, source, poster, name, prepareAccess = 
     return image?.naturalWidth && image.naturalHeight
       ? { width: image.naturalWidth, height: image.naturalHeight } : { width: 16, height: 9 };
   }, { fillAvailable: true, alignedControls: controls });
-  loadVideoPoster(cover, poster, source => {
+  if (!fileAccess) loadVideoPoster(cover, poster, source => {
     video.poster = source;
     if (thumbnail?.hidden) thumbnail.src = source;
     if (!playbackDimensions) layout.resize();
   });
-  let closed = false, seeking = false, failed = false, pendingSeek = null;
+  let closed = false, seeking = false, failed = false, pendingSeek = fileAccess?.position || null;
   let wantsPlayback = false, recoveryTimer = null, attempt = 0, playRequest = 0;
   let candidates = [], lastMediaTime = 0;
   const attempted = new Set();
@@ -322,6 +325,9 @@ export function openVideoPreview(trigger, source, poster, name, prepareAccess = 
     ++playRequest;
     video.pause();
     status.textContent = message;
+    if (fileAccess) void fileAccess.onFailure?.(video.error?.code).then(reason=>{
+      if (!closed && failed && reason) status.textContent=reason;
+    });
     sync();
   };
   const armRecovery = () => {
@@ -382,7 +388,7 @@ export function openVideoPreview(trigger, source, poster, name, prepareAccess = 
     }
     prepareAccess();
     failed = false;
-    candidates = [...new Set(remoteMediaCandidates(source))];
+    candidates = [...new Set(sourceRoutes())];
     attempted.clear();
     const selectedSource = candidates[0];
     if (!selectedSource) {
@@ -396,9 +402,9 @@ export function openVideoPreview(trigger, source, poster, name, prepareAccess = 
   progress.onchange = () => {
     seeking = false;
     if (!progress.disabled && Number.isFinite(Number(progress.value))) {
-      const target = Number(progress.value), selectedSource = remoteMediaCandidates(source)[0];
+      const target = Number(progress.value), selectedSource = sourceRoutes()[0];
       if (selectedSource && video.getAttribute("src") !== selectedSource) {
-        candidates = [...new Set(remoteMediaCandidates(source))];
+        candidates = [...new Set(sourceRoutes())];
         attempted.clear();
         pendingSeek = target;
         if (wantsPlayback) selectSource(selectedSource, target);
@@ -448,6 +454,7 @@ export function openVideoPreview(trigger, source, poster, name, prepareAccess = 
   dialog.oncancel = event => { event.preventDefault(); dialog.close(); };
   const stop = () => {
     if (closed) return;
+    fileAccess?.onStop?.(video.ended ? 0 : video.currentTime);
     closed = true;
     wantsPlayback = false;
     ++attempt;
@@ -480,6 +487,7 @@ export function openVideoPreview(trigger, source, poster, name, prepareAccess = 
     dialog.remove();
     document.body.classList.toggle("modal-open", !!document.querySelector("dialog[open]"));
     if (trigger?.isConnected) trigger.focus({ preventScroll: true });
+    fileAccess?.onClose?.();
   };
   controls.append(play, progress, time);
   panel.append(close, video, controls, status, title);
@@ -489,7 +497,9 @@ export function openVideoPreview(trigger, source, poster, name, prepareAccess = 
   dialog.showModal();
   layout.resize();
   play.focus();
-  return { close: () => { if (dialog.open) dialog.close(); } };
+  // 文件面板的“播放视频”已是用户点击；正文封面仍需在弹窗中再点播放。
+  if (fileAccess) play.click();
+  return { close: () => { if (dialog.open) { stop(); dialog.close(); } } };
 }
 
 export function bindMessageVideos(root, prepareAccess = () => {}) {

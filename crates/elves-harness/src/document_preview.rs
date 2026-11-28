@@ -1,6 +1,6 @@
 //! 在电脑端提取常见办公文件的只读内容；不执行宏、公式或外部链接。
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{Cursor, Read, Write};
+use std::io::{BufReader, Cursor, Read, Seek, Write};
 use std::path::Path;
 
 use calamine::{
@@ -32,6 +32,8 @@ const DEFAULT_ROW_HEIGHT: u16 = 20;
 const MAX_ROW_HEIGHT: u16 = 2048;
 type PreviewResult<T> = Result<T, &'static str>;
 type OfficeZip<'a> = ZipArchive<Cursor<&'a [u8]>>;
+mod file_views;
+pub(super) use file_views::file_window;
 
 #[derive(Default)]
 struct Budget {
@@ -248,15 +250,17 @@ pub(super) fn preview(path: &str, bytes: &[u8]) -> Option<Value> {
 }
 
 fn office_zip(bytes: &[u8]) -> PreviewResult<OfficeZip<'_>> {
-    let mut zip =
-        ZipArchive::new(Cursor::new(bytes)).map_err(|_| "文件不是有效的办公文档，或已加密")?;
+    checked_zip(Cursor::new(bytes))
+}
+fn checked_zip<R: Read + Seek>(source: R) -> PreviewResult<ZipArchive<R>> {
+    let mut zip = ZipArchive::new(source).map_err(|_| "文件不是有效的办公文档，或已加密")?;
     if zip.len() > 4096 {
         return Err("文档内部文件过多，暂不提供在线预览");
     }
     let mut total = 0_u64;
     for index in 0..zip.len() {
         let file = zip
-            .by_index(index)
+            .by_index_raw(index)
             .map_err(|_| "文档内部文件无法读取，可能已加密")?;
         total = total.saturating_add(file.size());
         if file.encrypted() || file.size() > MAX_XML_BYTES as u64 || total > MAX_ARCHIVE_BYTES {
@@ -266,7 +270,7 @@ fn office_zip(bytes: &[u8]) -> PreviewResult<OfficeZip<'_>> {
     Ok(zip)
 }
 
-fn xml_entry(zip: &mut OfficeZip<'_>, path: &str) -> PreviewResult<String> {
+fn xml_entry<R: Read + Seek>(zip: &mut ZipArchive<R>, path: &str) -> PreviewResult<String> {
     let file = zip
         .by_name(path)
         .map_err(|_| "文档缺少必要内容，可能已损坏")?;
@@ -367,7 +371,10 @@ fn spreadsheet_row_height(value: Option<&str>) -> Option<u16> {
     )
 }
 
-fn spreadsheet_layouts(zip: &mut OfficeZip<'_>) -> PreviewResult<HashMap<String, SheetLayout>> {
+fn spreadsheet_layouts<R: Read + Seek>(
+    zip: &mut ZipArchive<R>,
+    selected: Option<usize>,
+) -> PreviewResult<HashMap<String, SheetLayout>> {
     let root = xml_entry(zip, "_rels/.rels")?;
     let root = xml(&root)?;
     let workbook_path = root
@@ -402,11 +409,15 @@ fn spreadsheet_layouts(zip: &mut OfficeZip<'_>) -> PreviewResult<HashMap<String,
     let workbook = xml_entry(zip, &workbook_path)?;
     let workbook = xml(&workbook)?;
     let mut layouts = HashMap::new();
-    for sheet in workbook
+    for (index, sheet) in workbook
         .descendants()
         .filter(|node| element(*node, "sheet"))
         .take(MAX_SHEETS)
+        .enumerate()
     {
+        if selected.is_some_and(|i| i != index) {
+            continue;
+        }
         let name = sheet.attribute("name").ok_or("Excel 工作表名称无效")?;
         let id = sheet
             .attributes()
@@ -495,6 +506,7 @@ fn apply_sheet_layout(
     sheet: &mut Sheet,
     layout: SheetLayout,
     budget: &mut Budget,
+    page: Option<usize>,
 ) -> PreviewResult<()> {
     let mut rows: BTreeMap<_, _> = std::mem::take(&mut sheet.rows)
         .into_iter()
@@ -505,8 +517,14 @@ fn apply_sheet_layout(
         .map(|(number, _)| *number)
         .unwrap_or(0);
     // 普通小表保留中间空行；巨大稀疏表仍保持真实行号，不能按百万行声明展开。
-    if last_row <= MAX_ROWS as u32 && last_row > 0 {
-        for number in 1..=last_row {
+    let first_row = if page.is_some_and(|p| p > 0) {
+        rows.first_key_value().map_or(1, |(n, _)| *n)
+    } else {
+        1
+    };
+    let limit = if page.is_some() { 50 } else { MAX_ROWS };
+    if last_row >= first_row && last_row - first_row < limit as u32 {
+        for number in first_row..=last_row {
             rows.entry(number).or_default();
         }
     }
@@ -522,7 +540,7 @@ fn apply_sheet_layout(
         let additional = (merge.start_row..=merge.end_row)
             .filter(|number| !rows.contains_key(number))
             .count();
-        if rows.len() + additional > MAX_ROWS {
+        if rows.len() + additional > limit {
             sheet.truncated = true;
             continue;
         }
@@ -566,7 +584,13 @@ fn apply_sheet_layout(
 }
 
 fn spreadsheet(bytes: &[u8]) -> PreviewResult<Value> {
-    let mut zip = office_zip(bytes)?;
+    spreadsheet_from(Cursor::new(bytes), None)
+}
+fn spreadsheet_from<R: Read + Seek>(
+    mut source: R,
+    window: Option<(usize, usize)>,
+) -> PreviewResult<Value> {
+    let mut zip = checked_zip(&mut source)?;
     // 原生读取器会按 sharedStrings 的 uniqueCount 预分配；先校验实际 XML 和声明，
     // 不能让很小的文件仅凭伪造计数申请巨量内存。
     let shared_strings: Vec<_> = zip
@@ -585,19 +609,28 @@ fn spreadsheet(bytes: &[u8]) -> PreviewResult<Value> {
             return Err("Excel 共享文本数量过多或声明无效，暂不提供在线预览");
         }
     }
-    let mut layouts = spreadsheet_layouts(&mut zip)?;
+    let mut layouts = spreadsheet_layouts(&mut zip, window.map(|v| v.0))?;
     drop(zip);
-    let mut workbook: Xlsx<_> = calamine::open_workbook_from_rs(Cursor::new(bytes))
+    source.rewind().map_err(|_| "工作簿无法重新定位")?;
+    let mut workbook: Xlsx<_> = calamine::open_workbook_from_rs(source)
         .map_err(|_| "Excel 文件无法读取，可能已损坏或已加密")?;
     let names = workbook.sheet_names();
+    if window.is_some_and(|(s, _)| s >= names.len().min(MAX_SHEETS)) {
+        return Err("工作表不存在");
+    }
     let mut budget = Budget::default();
     let mut sheets = Vec::new();
-    for name in names.iter().take(MAX_SHEETS) {
+    let mut more = false;
+    for (index, name) in names.iter().take(MAX_SHEETS).enumerate() {
+        if window.is_some_and(|(s, _)| s != index) {
+            continue;
+        }
         let mut reader = workbook
             .worksheet_cells_reader(name)
             .map_err(|_| "Excel 工作表无法读取")?;
         let mut sheet = SheetBuilder::default();
         let mut visited = 0;
+        let (mut last_row, mut ordinal) = (None, 0usize);
         // 用原生逐格流式读取，不能按声明的巨大稀疏区域申请整张矩形表。
         while let Some(cell) = reader.next_cell().map_err(|_| "Excel 单元格内容无效")? {
             visited += 1;
@@ -606,6 +639,19 @@ fn spreadsheet(bytes: &[u8]) -> PreviewResult<Value> {
                 break;
             }
             let (row, column) = cell.get_position();
+            if let Some((_, page)) = window {
+                if last_row != Some(row) {
+                    last_row = Some(row);
+                    ordinal += 1;
+                }
+                if ordinal <= page * 50 {
+                    continue;
+                }
+                if ordinal > (page + 1) * 50 {
+                    more = true;
+                    break;
+                }
+            }
             let text = cell_text(cell.get_value());
             if !sheet.insert(row.saturating_add(1), column as usize, &text, &mut budget)
                 && (sheet.rows.len() >= MAX_ROWS
@@ -622,6 +668,7 @@ fn spreadsheet(bytes: &[u8]) -> PreviewResult<Value> {
             &mut sheet,
             layouts.remove(name).unwrap_or_default(),
             &mut budget,
+            window.map(|(_, p)| p),
         )?;
         // 用户要求保留背景、字号与文字效果；按绝对坐标读取稀疏样式，合并与补空行不能改变样式归属。
         let style_cells = sheet.rows.len().saturating_mul(sheet.column_count);
@@ -664,7 +711,21 @@ fn spreadsheet(bytes: &[u8]) -> PreviewResult<Value> {
         sheets.push(sheet);
     }
     budget.truncated |= names.len() > MAX_SHEETS;
-    Ok(spreadsheet_value(sheets, budget.truncated))
+    let mut value = spreadsheet_value(sheets, budget.truncated);
+    if let Some((sheet, page)) = window {
+        file_views::paging(
+            &mut value,
+            sheet,
+            page,
+            more,
+            names
+                .iter()
+                .take(MAX_SHEETS)
+                .map(|s| s.chars().take(256).collect())
+                .collect(),
+        );
+    }
+    Ok(value)
 }
 
 fn cell_text(value: &DataRef<'_>) -> String {
