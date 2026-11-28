@@ -1,7 +1,7 @@
 // 5h/7d 额度与消耗预测提示：
 // - Claude 实例经所属 WSL Claude CLI 读取 5h/7d 剩余额度、账号、订阅与重置时间，展开时统计该 WSL 本地日志消耗与预估总额度；
 // - Antigravity 实例经目标环境官方 `agy -p "/usage" --output-format json` 读取 `Gemini Models` 与 `Claude and GPT models` 分组额度，
-//   结合本地 `~/.gemini/google_accounts.json` 展示邮箱、ACP 订阅等级与本地转录日志分组统计展示底部 `5h xx% 7d xx%` 及 320px 弹层。
+//   结合所属实例的 AGY 账号和订阅等级缓存及本地转录统计展示底部 `5h xx% 7d xx%` 及 320px 弹层。
 
 import { $, element } from "../../ui/dom.js";
 import { icon } from "../../ui/icons.js";
@@ -58,18 +58,14 @@ function claudeUsageResolveGroup(value, preferred = "") {
   if (!groups.length) return null;
   const modelGroup = claudeUsageCurrentModelGroup();
   return groups.find(group => group.id === preferred)
-    || groups.find(group => group.id === modelGroup)
-    || groups[0];
+    || groups.find(group => group.id === modelGroup) || null;
 }
 // 用户要求打开 Claude 会话时底部额度先显示缓存、数据又要及时刷新：每 60 秒读取一次，电脑端距上次读取超过 60 秒即经 CLI 重新读取；
-// 72 小时只是原采集时间的显示上限，不是刷新周期。电脑端先返回保留结果并在后台刷新（refreshing）时，5 秒后复查以尽快换上新数据。
-// 电脑端 crates/elves-harness/src/claude_usage.rs 的 USAGE_REFRESH / USAGE_RETENTION_MS 须同步核对。
+// 完整额度记录长期保留，不推迟原生查询；72 小时用于资料有效期及陈旧标记，不清空最后一对窗口。
 const claudeUsageRefreshMs = 60000, claudeUsageFollowUpMs = 5000, claudeUsageMaxAgeMs = 72 * 60 * 60 * 1000;
 // 用户要求（临时处理）：官方 `agy -p "/usage"` 频繁调用容易触发风控，Antigravity 额度不再自动轮询，
-// 只在用户手动点击底部额度按钮展开弹窗时读取一次（请求带 manualRefresh，距上次读取不足 60 秒则直接用缓存）。
-// 打开前没有有效缓存时按钮显示“5h --  7d --”，不伪造满额；读取失败后按钮保留，可重新点开重试。
-// 弹窗保持打开期间，仅当电脑端返回 refreshing（后台仍在刷新）时才 5 秒复查，属于同一次手动点击的后续。
-// 官方开放后将 antigravityUsageManualOnly 改为 false 恢复自动刷新；电脑端 antigravity/usage.rs 的 QUOTA_CLI_MANUAL_ONLY 须同步核对。
+// 进入新实例或分组且没有完整缓存时主动查询一次；其余仅手动打开刷新，等待时不显示底部占位。
+// AGY 的一次打开只发一份带本地明细的请求，由服务端复用同账号 60 秒缓存，不排 5 秒复查。
 // Claude 实例不受此开关影响，仍按 60 秒周期刷新。
 const antigravityUsageManualOnly = true;
 function claudeUsageManualOnly(backend) {
@@ -81,16 +77,20 @@ function claudeUsageRefreshDelay(state) {
 const claudeUsageCache = new Map();
 function rememberClaudeUsage(state = claudeUsageState) {
   const owner = privateInputScope(session);
+  // AGY 账号资料独立于额度；查询失败或尚无窗口数据时仍可复用，同一结果重新渲染不延期。
+  const usable = entry => claudeUsageAllWindows(entry.value).length || !!entry.profile?.accountEmail
+    && Number.isFinite(entry.profileCheckedAt) && Date.now() - entry.profileCheckedAt < claudeUsageMaxAgeMs;
   for (const [key, cached] of claudeUsageCache) {
-    if (cached.owner !== owner || !claudeUsageWindows(cached.value).length) claudeUsageCache.delete(key);
+    if (cached.owner !== owner || !usable(cached)) claudeUsageCache.delete(key);
   }
   if (!state) return;
   claudeUsageCache.delete(state.key);
-  if (state.owner === owner && claudeUsageWindows(state.value).length) {
+  if (state.owner === owner && usable(state)) {
     // 用户要求打开时先显示缓存；仅在内存中按授权和实例保存最近有效数据，切会话/前后台不丢失。
     claudeUsageCache.set(state.key, { owner, value: state.value, checkedAt: state.checkedAt,
+      accountScope: state.accountScope, profile: state.profile, profileCheckedAt: state.profileCheckedAt,
       refreshing: state.refreshing === true, details: state.details, detailsRead: state.detailsRead });
-    // 最多保留 16 个最近使用实例，且仍受 72 小时真实采集时间约束，不保存 DOM、请求或凭据。
+    // 网页内存最多保留 16 个实例；淘汰网页副本不删除 Harness 的完整磁盘记录。
     while (claudeUsageCache.size > 16) claudeUsageCache.delete(claudeUsageCache.keys().next().value);
   }
 }
@@ -98,40 +98,35 @@ function claudeUsageWindows(value, now = Date.now(), preferredGroup = "") {
   // 用户要求真实账号额度；缺失、过期或非法字段不能显示成 0%，窗口到期后也不推测已恢复的额度。
   if (!["claude-native-usage", "antigravity-native-usage"].includes(value?.source) || typeof value.observedAtMs !== "number"
       || !Number.isFinite(value.observedAtMs) || value.observedAtMs <= 0
-      || value.observedAtMs > now + 30000 || now - value.observedAtMs >= claudeUsageMaxAgeMs) return [];
+      || value.observedAtMs > now + 30000) return [];
   const activeGroup = claudeUsageResolveGroup(value, preferredGroup);
+  if (value.source === "antigravity-native-usage" && !activeGroup) return [];
   const bucketSource = activeGroup || value;
+  const observedAt = bucketSource.observedAtMs ?? value.observedAtMs;
+  if (!Number.isSafeInteger(observedAt) || observedAt <= 0 || observedAt > now + 30000) return [];
   const groupPrefix = activeGroup ? `${activeGroup.id}:` : "";
-  return [["fiveHour", "5h", "5 小时"], ["sevenDay", "7d", "7 天"]].flatMap(([key, short, label]) => {
+  const rows = [["fiveHour", "5h", "5 小时"], ["sevenDay", "7d", "7 天"]].flatMap(([key, short, label]) => {
     const data = bucketSource[key], used = data?.usedPercentage;
     if (typeof used !== "number" || !Number.isFinite(used) || used < 0 || used > 100) return [];
     const reset = data.resetsAt == null ? null : typeof data.resetsAt === "string" ? Date.parse(data.resetsAt)
       : typeof data.resetsAt === "number" ? data.resetsAt * (data.resetsAt < 1e12 ? 1000 : 1) : NaN;
-    if (reset != null && (!Number.isFinite(reset) || reset <= now || reset > 8640000000000000)) return [];
+    if (reset != null && (!Number.isFinite(reset) || reset <= observedAt || reset > 8640000000000000)) return [];
     // 用户要求底部和账号信息统一显示剩余比例，直接按 100 - 原生已用比例取整；预测仍使用未取整的原生已用值。
     return [{ key, detailKey: `${groupPrefix}${key}`, groupId: activeGroup?.id || "", short, label,
-      used: Math.round(used), remaining: Math.round(100 - used), usedPercentage: used, resetAt: reset }];
+      used: Math.round(used), remaining: Math.round(100 - used), usedPercentage: used, resetAt: reset, observedAt }];
   });
+  // 窗口必须同次成对；5h 已重置时整对作为上次记录，不把旧值冒充当前值。
+  const historical = bucketSource.historical === true || now - observedAt >= claudeUsageMaxAgeMs
+    || rows.some(w => w.resetAt != null && w.resetAt <= now);
+  return rows.length === 2 ? rows.map(w => ({ ...w, historical })) : [];
 }
 function claudeUsageAllWindows(value, now = Date.now()) {
   const groups = claudeUsageGroups(value);
   if (!groups.length) return claudeUsageWindows(value, now);
   return groups.flatMap(group => claudeUsageWindows(value, now, group.id));
 }
-function claudeUsageDefaultWindows() {
-  // 用户要求真实额度返回前先显示满额占位；占位只用于当前可读取实例，不写入缓存或本地统计。
-  return [["fiveHour", "5h", "5 小时"], ["sevenDay", "7d", "7 天"]].map(([key, short, label]) =>
-    ({ key, short, label, used: 0, remaining: 100, usedPercentage: 0, resetAt: null, default: true }));
-}
 function claudeUsageDisplayWindows(state, now = Date.now()) {
-  const windows = claudeUsageWindows(state?.value, now);
-  if (windows.length) return windows;
-  // 手动刷新模式下没有有效额度（未读取、读取中或读取失败）统一显示“--”，保证按钮可点击重试且不显示假满额。
-  if (state && claudeUsageManualOnly(state.backend)) {
-    return claudeUsageDefaultWindows().map(window => ({ ...window, unread: true }));
-  }
-  // 首次查询、缓存刷新在途或会话详情尚未完成时先显示满额；已完成的失败/权限响应不伪造额度。
-  return state && (state.checkedAt === 0 || state.pending) ? claudeUsageDefaultWindows() : [];
+  return claudeUsageWindows(state?.value, now);
 }
 function claudeUsageSubscription(value) {
   const raw = value?.subscriptionType;
@@ -157,6 +152,7 @@ function claudeUsageMaskAccount(account) {
 }
 function claudeUsageResetText(resetAt, now = Date.now()) {
   if (resetAt == null) return "时间未知";
+  if (resetAt <= now) return "已到重置时间";
   const totalMinutes = Math.max(1, Math.ceil(Math.max(0, resetAt - now) / 60000));
   // 用户要求将 Claude 额度重置倒计时从“x天/小时/分钟后”改为紧凑英文单位并固定在统计行右侧：
   // 满 1 天显示“xd xh”（如 1d 2h，整天无剩余小时时显示“xd”）；
@@ -175,6 +171,7 @@ function claudeUsageResetText(resetAt, now = Date.now()) {
 }
 function claudeUsageResetCountdownText(resetAt, now = Date.now()) {
   if (resetAt == null) return "时间未知";
+  if (resetAt <= now) return "已到重置时间";
   const totalMinutes = Math.max(1, Math.ceil(Math.max(0, resetAt - now) / 60000));
   const days = Math.floor(totalMinutes / 1440);
   const hours = Math.floor((totalMinutes % 1440) / 60);
@@ -245,7 +242,7 @@ function claudeUsageEstimatedTotal(used, usedPercentage) {
 function claudeUsageMetricsMatch(metrics, window, now = Date.now()) {
   const duration = window.key === "fiveHour" ? 18000000 : 604800000;
   return ["claude-wsl-local-journal", "antigravity-local-journal"].includes(metrics?.source) && claudeUsageNumber(metrics.observedAtMs)
-    && metrics.observedAtMs > 0 && metrics.observedAtMs <= now + 30000 && now - metrics.observedAtMs < claudeUsageMaxAgeMs
+    && metrics.observedAtMs > 0 && metrics.observedAtMs <= now + 30000
     && window.resetAt != null && metrics.windowEndMs === window.resetAt
     && metrics.windowStartMs === window.resetAt - duration;
 }
@@ -259,7 +256,7 @@ function claudeUsageMetrics(window, now = Date.now()) {
 function claudeUsageMetricValue(metrics, key, timeKey, now = Date.now()) {
   const at = metrics?.[timeKey] ?? metrics?.observedAtMs;
   return claudeUsageNumber(metrics?.[key]) && claudeUsageNumber(at) && at > 0
-    && at <= now + 30000 && now - at < claudeUsageMaxAgeMs ? metrics[key] : null;
+    && at <= now + 30000 ? metrics[key] : null;
 }
 function claudeUsageSignature(windows) {
   return JSON.stringify(windows.map(window => [window.detailKey || window.key, window.resetAt]));
@@ -279,12 +276,15 @@ function rememberClaudeUsageDetails(state, usage, windows) {
     const metrics = { source, windowEndMs: window.resetAt,
       windowStartMs: window.resetAt - (window.key === "fiveHour" ? 18000000 : 604800000) };
     // 用户要求使用和预测先展示缓存：金额与 Token 各自接替，单项缺失不覆盖另一项已有数字，且不延长旧值的采集时间。
-    for (const [key, timeKey] of [["usedCostUsd", "costObservedAtMs"], ["usedTokens", "tokensObservedAtMs"]]) {
+    for (const [key, timeKey, basis] of [["usedCostUsd", "costObservedAtMs", "costUsedPercentage"], ["usedTokens", "tokensObservedAtMs", "tokensUsedPercentage"]]) {
       const old = claudeUsageMetricValue(retained, key, timeKey);
       const oldAt = retained?.[timeKey] ?? retained?.observedAtMs;
-      if (usable && claudeUsageNumber(incoming[key]) && (!claudeUsageNumber(old) || incoming.observedAtMs >= oldAt)) {
-        metrics[key] = incoming[key]; metrics[timeKey] = incoming.observedAtMs; received = true;
-      } else { metrics[key] = old; metrics[timeKey] = claudeUsageNumber(old) ? oldAt : null; }
+      const incomingAt = incoming?.[timeKey] ?? incoming?.observedAtMs;
+      if (usable && claudeUsageNumber(incoming[key]) && claudeUsageNumber(incomingAt) && incomingAt > 0
+          && incomingAt <= Date.now() + 30000 && (!claudeUsageNumber(old) || incomingAt > oldAt)) {
+        metrics[key] = incoming[key]; metrics[timeKey] = incomingAt;
+        metrics[basis] = incoming[basis] ?? window.usedPercentage; received = true;
+      } else { metrics[key] = old; metrics[timeKey] = claudeUsageNumber(old) ? oldAt : null; metrics[basis] = retained?.[basis]; }
     }
     metrics.observedAtMs = Math.max(metrics.costObservedAtMs || 0, metrics.tokensObservedAtMs || 0);
     return [detailKey, metrics.observedAtMs ? metrics : null];
@@ -296,7 +296,9 @@ function rememberClaudeUsageDetails(state, usage, windows) {
 }
 function loadClaudeUsageDetails() {
   const state = claudeUsageState, context = claudeUsageContext();
-  if (!state?.tip || state.key !== context?.key || !context.canRead || state.detailsPending || state.pending) return;
+  if (state?.backend === "antigravity") return; // AGY 在同一次打开请求中返回本地明细；Claude 仍按需分开读取。
+  if (!state?.tip || state.key !== context?.key || !context.canRead || state.detailsPending || state.pending
+      || claudeUsageWindows(state.value)[0]?.historical) return;
   const allWindows = claudeUsageAllWindows(state.value);
   const resettableWindows = allWindows.filter(window => window.resetAt != null);
   const signature = claudeUsageSignature(resettableWindows);
@@ -311,6 +313,7 @@ function loadClaudeUsageDetails() {
       if (claudeUsageState !== state || state.tip !== tip || state.detailsController !== controller) return;
       if (result?.ok !== true || result.backend !== context.backend || result.instanceId !== context.instanceId)
         throw new Error("额度详情响应无效");
+      if (result.accountScope !== state.accountScope || result.invalidate === true) return;
       rememberClaudeUsageDetails(state, result.usage, claudeUsageAllWindows(state.value));
     })
     .catch(error => {
@@ -385,7 +388,8 @@ export function fitClaudeUsageTip() {
 function renderClaudeUsageTip(defaultOrBarWindows) {
   const tip = claudeUsageState?.tip;
   if (!tip) return;
-  const value = claudeUsageState.value;
+  const value = claudeUsageState.backend === "antigravity" && claudeUsageState.profile
+    ? { ...claudeUsageState.value, ...claudeUsageState.profile, source: "antigravity-native-usage" } : claudeUsageState.value;
   const isAntigravityUsage = value?.source === "antigravity-native-usage";
   const groups = claudeUsageGroups(value);
   const activeGroup = groups.length ? claudeUsageResolveGroup(value, tip.selectedGroup) : null;
@@ -432,6 +436,8 @@ function renderClaudeUsageTip(defaultOrBarWindows) {
     badge.setAttribute("aria-label", `订阅等级：${subscription.label}`); title.append(badge);
   }
   const content = [title];
+  if (windows[0]?.historical) content.push(element("div", "claude-usage-reset",
+    `上次记录 · ${new Date(windows[0].observedAt).toLocaleString("zh-CN", { hour12: false })}`));
   if (groups.length > 1 && activeGroup) {
     const tabs = element("div", "claude-usage-groups");
     tabs.setAttribute("role", "tablist");
@@ -457,25 +463,28 @@ function renderClaudeUsageTip(defaultOrBarWindows) {
     const section = element("section", "claude-usage-section");
     const row = element("div", "claude-usage-detail-row");
     row.append(element("span", "", `${window.label}额度`),
-      element("span", "claude-usage-remaining", window.unread ? "剩余 --" : `剩余 ${window.remaining}%`));
+      element("span", "claude-usage-remaining", `剩余 ${window.remaining}%`));
     const track = element("div", "claude-usage-track"), fill = element("div", "claude-usage-fill");
-    track.setAttribute("aria-hidden", "true"); fill.style.width = window.unread ? "0%" : `${window.remaining}%`; track.append(fill);
+    track.setAttribute("aria-hidden", "true"); fill.style.width = `${window.remaining}%`; track.append(fill);
     const metrics = claudeUsageMetrics(window), numbers = element("div", "claude-usage-metrics");
     const stats = element("div", "claude-usage-stats");
     for (const estimated of [false, true]) {
+      const cost = estimated ? claudeUsageEstimatedTotal(metrics?.usedCostUsd, window.usedPercentage > 0 ? metrics?.costUsedPercentage ?? window.usedPercentage : 0) : metrics?.usedCostUsd;
+      const tokens = estimated ? claudeUsageEstimatedTotal(metrics?.usedTokens, window.usedPercentage > 0 ? metrics?.tokensUsedPercentage ?? window.usedPercentage : 0) : metrics?.usedTokens;
+      // 0 是真实数据；缺失字段连同分隔符隐藏，无可计算值时不创建预测行。
+      const parts = [claudeUsageNumber(cost) ? claudeUsageCompact(cost, true) : null,
+        claudeUsageNumber(tokens) ? claudeUsageCompact(tokens) : null].filter(x => x != null);
+      if (!parts.length) continue;
       const item = element("span", `claude-usage-metric ${estimated ? "claude-usage-forecast" : "claude-usage-consumed"}`);
-      const cost = estimated ? claudeUsageEstimatedTotal(metrics?.usedCostUsd, window.usedPercentage) : metrics?.usedCostUsd;
-      const tokens = estimated ? claudeUsageEstimatedTotal(metrics?.usedTokens, window.usedPercentage) : metrics?.usedTokens;
       item.title = `${estimated ? "预估总额度（已消耗 ÷ 原生已用比例）" : "本窗口已消耗"}；${localLabel}；金额按公开模型价格估算`;
-      item.setAttribute("aria-label", `${estimated ? "预估总额度" : "已消耗"} ${claudeUsageCompact(cost, true)} / ${claudeUsageCompact(tokens)} Token`);
-      item.append(icon(estimated ? "usageForecast" : "usageConsumed"),
-        element("span", "", claudeUsageCompact(cost, true)), element("span", "claude-usage-slash", "/"),
-        element("span", "", claudeUsageCompact(tokens)));
+      item.setAttribute("aria-label", `${estimated ? "预估总额度" : "已消耗"} ${parts.join(" / ")}${claudeUsageNumber(tokens) ? " Token" : ""}`);
+      item.append(icon(estimated ? "usageForecast" : "usageConsumed"), element("span", "",
+        parts.length === 1 && claudeUsageNumber(tokens) ? `${parts[0]} Token` : parts[0]));
+      if (parts.length === 2) item.append(element("span", "claude-usage-slash", "/"), element("span", "", parts[1]));
       stats.append(item);
     }
-    const unstarted = isAntigravityUsage && window.resetAt == null && window.usedPercentage === 0 && !window.default;
-    const reset = element("span", "claude-usage-reset", window.unread ? (claudeUsageState?.pending ? "读取中" : "读取失败，可重新点开重试")
-      : unstarted ? "未开始" : claudeUsageResetText(window.resetAt));
+    const unstarted = isAntigravityUsage && window.resetAt == null && window.usedPercentage === 0;
+    const reset = element("span", "claude-usage-reset", unstarted ? "未开始" : claudeUsageResetText(window.resetAt));
     const resetTitle = claudeUsageResetTitle(value, window.resetAt);
     if (resetTitle) {
       reset.title = resetTitle;
@@ -488,7 +497,8 @@ function renderClaudeUsageTip(defaultOrBarWindows) {
       reset.title = "目标 WSL 时区未知";
       reset.setAttribute("aria-label", "重置时间：目标 WSL 时区未知");
     }
-    numbers.append(stats, reset); section.append(row, track, numbers); content.push(section);
+    if (stats.children.length) numbers.append(stats);
+    numbers.append(reset); section.append(row, track, numbers); content.push(section);
   }
   tip.node.replaceChildren(...content);
   fitClaudeUsageTip();
@@ -500,19 +510,22 @@ function renderClaudeUsage() {
   const windows = claudeUsageDisplayWindows(claudeUsageState);
   trigger.hidden = !windows.length;
   fitComposerMetrics();
-  if (!windows.length) { closeClaudeUsageTip(); return; }
-  const isDefault = windows[0]?.default === true;
-  const isUnread = windows[0]?.unread === true;
+  if (!windows.length) {
+    trigger.replaceChildren(); delete trigger.dataset.usage; trigger.removeAttribute("aria-label");
+    closeClaudeUsageTip(); return;
+  }
+  const historical = windows[0].historical;
   const activeGroup = claudeUsageResolveGroup(claudeUsageState?.value);
-  const signature = JSON.stringify([isUnread ? "unread" : isDefault ? "default" : "remaining", activeGroup?.id || "",
-    ...windows.map(window => [window.key, window.remaining])]);
+  const signature = JSON.stringify([historical, activeGroup?.id || "",
+    claudeUsageState?.accountScope || "", ...windows.map(window => [window.key, window.remaining])]);
   if (trigger.dataset.usage !== signature) {
     trigger.dataset.usage = signature;
     // 用户要求底部额度按“5h xx%  7d xx%”紧凑展示，去掉“剩余”前缀和窗口之间的圆点分隔符。
     const nodes = [];
+    if (historical) nodes.push(element("span", "muted", "上次记录"));
     for (const window of windows) {
       const row = element("span", "claude-usage-window");
-      row.append(element("span", "", window.short), element("span", "claude-usage-percent", window.unread ? "--" : `${window.remaining}%`));
+      row.append(element("span", "", window.short), element("span", "claude-usage-percent", `${window.remaining}%`));
       nodes.push(row);
     }
     trigger.replaceChildren(...nodes);
@@ -520,8 +533,7 @@ function renderClaudeUsage() {
     const brandName = context?.backend === "antigravity" ? "Antigravity" : "Claude";
     const groupText = activeGroup ? `${activeGroup.label} 分组，` : "";
     // 用户要求默认脱敏同时覆盖底部按钮的读屏文本，不能只在弹层视觉上隐藏完整邮箱。
-    trigger.setAttribute("aria-label", isUnread ? `${brandName} 额度尚未读取，点击读取`
-      : `${brandName} ${account ? `登录账号 ${claudeUsageMaskAccount(account)}，` : "账号信息，"}${groupText}${isDefault ? "真实额度读取中，当前按满额显示，" : ""}${windows.map(window => `${window.short} ${window.remaining}%`).join("，")}，查看重置时间`);
+    trigger.setAttribute("aria-label", `${brandName} ${account ? `登录账号 ${claudeUsageMaskAccount(account)}，` : "账号信息，"}${groupText}${historical ? "上次记录，" : ""}${windows.map(window => `${window.short} ${window.remaining}%`).join("，")}，查看重置时间`);
   }
   renderClaudeUsageTip(windows);
   fitComposerMetrics();
@@ -539,10 +551,9 @@ function scheduleClaudeUsageUpdate() {
       [metrics?.observedAtMs, metrics?.costObservedAtMs, metrics?.tokensObservedAtMs]) : [])]
     .filter(claudeUsageNumber).map(at => at + claudeUsageMaxAgeMs).filter(at => at > now);
   // 刷新和 72 小时数据失效分别计时；失败退避不能延长真实数据寿命，窗口到期也不能继续显示旧额度。
-  // 手动刷新模式下不排自动刷新；仅弹窗打开且电脑端仍在后台刷新时才复查（见文件顶部 antigravityUsageManualOnly 说明）。
-  const autoRefresh = !claudeUsageManualOnly(state.backend) || (state.refreshing === true && !!state.tip);
+  const autoRefresh = !claudeUsageManualOnly(state.backend);
   const deadlines = [...(context.canRead && !state.pending && autoRefresh ? [state.checkedAt + claudeUsageRefreshDelay(state)] : []), ...expiry,
-    ...windows.filter(window => window.resetAt != null).map(window => window.resetAt)];
+    ...windows.filter(window => window.resetAt > now).map(window => window.resetAt)];
   if (!deadlines.length) { state.timer = null; return; }
   state.timer = setTimeout(() => {
     if (claudeUsageState !== state) return;
@@ -558,6 +569,8 @@ export function syncClaudeUsage({ manual = false } = {}) {
     resetClaudeUsage({ hideTrigger: false });
     const cached = claudeUsageCache.get(context.key);
     claudeUsageState = { key: context.key, owner: context.owner, backend: context.backend, value: cached?.value || null,
+      enteredGroups: new Set(),
+      accountScope: cached?.accountScope, profile: cached?.profile, profileCheckedAt: cached?.profileCheckedAt,
       checkedAt: cached?.checkedAt || 0, refreshing: cached?.refreshing === true, pending: false, controller: null, timer: null, tip: null,
       details: cached?.details || null, detailsRead: cached?.detailsRead || null, detailsPending: false, detailsController: null };
   }
@@ -565,15 +578,19 @@ export function syncClaudeUsage({ manual = false } = {}) {
   if (!context.canRead) pauseClaudeUsage(state);
   renderClaudeUsage();
   if (!context.canRead) { scheduleClaudeUsageUpdate(); return; }
-  // 手动刷新模式：只有用户点击额度按钮（manual）或同一次点击触发的后台刷新复查（refreshing 且弹窗打开）才读取。
+  // 即使浏览器还记得一分钟内的值，也要在点击时核对账号；后台在锁内决定是否需要运行 /usage。
   const manualOnly = claudeUsageManualOnly(context.backend);
-  const mayRead = !manualOnly || manual || (state.refreshing === true && !!state.tip);
-  if (mayRead && !state.pending && Date.now() - state.checkedAt >= claudeUsageRefreshDelay(state)) {
+  const group = manualOnly ? claudeUsageCurrentModelGroup() : "";
+  const bootstrap = manualOnly && !state.enteredGroups.has(group);
+  const mayRead = manualOnly ? manual || bootstrap : Date.now() - state.checkedAt >= claudeUsageRefreshDelay(state);
+  if (mayRead && !state.pending) {
+    if (manualOnly) state.enteredGroups.add(group);
     state.pending = true;
     const controller = new AbortController();
     state.controller = controller;
     // 用户要求额度按账号所属实例显示；授权或实例切换后丢弃迟到响应，后台页不轮询。
-    void api("/api/read/claudeUsage", manualOnly ? { ...context.payload, manualRefresh: true } : context.payload,
+    void api("/api/read/claudeUsage", manualOnly ? { ...context.payload,
+      ...(manual ? { manualRefresh: true, includeLocal: true } : { bootstrapGroup: group }) } : context.payload,
       undefined, controller.signal, { resourcePriority: "background" })
       .then(result => {
         if (claudeUsageState !== state || state.controller !== controller || controller.signal.aborted) return;
@@ -582,16 +599,40 @@ export function syncClaudeUsage({ manual = false } = {}) {
         // 电脑端先返回保留结果并在后台经 CLI 刷新时按 5 秒复查，新结果到达后恢复 60 秒周期。
         state.refreshing = result.refreshing === true;
         const value = result.usage, windows = claudeUsageAllWindows(value);
-        // 读取暂未返回有效窗口时保留该实例仍有效的快照；采集时间不更新，超时/重置仍按原边界失效。
-        if (!windows.length && claudeUsageAllWindows(state.value).length) return;
+        const nextEmail = claudeUsageAccount(result.profile || value), previousEmail = claudeUsageAccount(state.profile || state.value);
+        if (result.invalidate === true || (Object.hasOwn(result, "accountScope") && state.accountScope !== result.accountScope)
+            || (previousEmail && nextEmail && nextEmail !== previousEmail)) {
+          state.value = null; state.details = null; state.detailsRead = null; state.profile = null;
+          state.detailsController?.abort(); state.detailsController = null; state.detailsPending = false;
+          if (state.tip) { state.tip.selectedGroup = ""; state.tip.accountVisible = false; }
+        }
+        state.accountScope = result.accountScope;
+        if (manualOnly) {
+          const profile = result.profile || value;
+          state.profile = { accountEmail: claudeUsageAccount(profile),
+            subscriptionType: claudeUsageSubscription(profile).type };
+          state.profileCheckedAt = Date.now();
+          if (result.bootstrapChanged === true && state.retryScope !== result.accountScope) {
+            state.retryScope = result.accountScope; state.enteredGroups.delete(group);
+          }
+        }
+        // 新响应不完整只能保留同一账号上一次完整记录，绝不拼接两次响应的 5h 与 7d。
+        if (!windows.length && state.value) {
+          state.value = { ...state.value, historical: true,
+            ...(state.value.groups ? { groups: state.value.groups.map(g => ({ ...g, historical: true })) } : {}) };
+          return;
+        }
+        if (!manualOnly && state.value && value?.observedAtMs < state.value.observedAtMs) return;
         const account = claudeUsageAccount(value);
         const timeZone = claudeUsageTimeZone(value);
         const rawGroups = claudeUsageGroups(value);
         const normalizedGroups = rawGroups.map(group => {
           const gWindows = claudeUsageWindows(value, Date.now(), group.id);
           if (!gWindows.length) return null;
+          state.enteredGroups.add(group.id);
           return {
             id: group.id,
+            observedAtMs: gWindows[0].observedAt, historical: gWindows[0].historical,
             label: typeof group.label === "string" ? group.label.slice(0, 32) : group.id,
             name: typeof group.name === "string" ? group.name.slice(0, 64) : "",
             description: typeof group.description === "string" ? group.description.slice(0, 240) : "",
@@ -599,8 +640,16 @@ export function syncClaudeUsage({ manual = false } = {}) {
               { usedPercentage: window.usedPercentage, resetsAt: window.resetAt }]))
           };
         }).filter(Boolean);
+        if (manualOnly) {
+          for (const old of claudeUsageGroups(state.value)) {
+            const i = normalizedGroups.findIndex(g => g.id === old.id);
+            if (i < 0) normalizedGroups.push({ ...old, historical: true });
+            else if (old.observedAtMs > normalizedGroups[i].observedAtMs) normalizedGroups[i] = old;
+          }
+        }
         const primaryWindows = claudeUsageWindows(value);
         state.value = windows.length ? { source: value.source, observedAtMs: value.observedAtMs,
+          historical: value.historical === true,
           ...(value?.hostLocal === true ? { hostLocal: true } : {}),
           ...(timeZone ? { timeZone } : {}),
           ...(account ? { accountEmail: account } : {}),
@@ -608,7 +657,7 @@ export function syncClaudeUsage({ manual = false } = {}) {
           ...(normalizedGroups.length ? { groups: normalizedGroups } : {}),
           ...Object.fromEntries(primaryWindows.map(window => [window.key,
             { usedPercentage: window.usedPercentage, resetsAt: window.resetAt }])) } : null;
-        const resettableWindows = windows.filter(window => window.resetAt != null);
+        const resettableWindows = claudeUsageAllWindows(state.value).filter(window => window.resetAt != null);
         const received = rememberClaudeUsageDetails(state, value, resettableWindows);
         if (received && resettableWindows.length && resettableWindows.every(window =>
             claudeUsageMetricsMatch(state.details?.value?.[window.detailKey || window.key], window))) {
@@ -622,7 +671,10 @@ export function syncClaudeUsage({ manual = false } = {}) {
         // 请求失败或响应无效时不按刷新在途提前复查，回到 60 秒退避。
         state.refreshing = false;
         if ([401, 403].includes(error.code)) {
-          state.value = null; state.details = null; claudeUsageCache.delete(state.key);
+          state.value = null; state.details = null; state.profile = null; state.accountScope = null; claudeUsageCache.delete(state.key);
+        } else if (state.value) {
+          state.value = { ...state.value, historical: true,
+            ...(state.value.groups ? { groups: state.value.groups.map(g => ({ ...g, historical: true })) } : {}) };
         }
       })
       .finally(() => {
@@ -630,6 +682,8 @@ export function syncClaudeUsage({ manual = false } = {}) {
         state.checkedAt = Date.now(); state.pending = false; state.controller = null;
         rememberClaudeUsage(state);
         renderClaudeUsage(); loadClaudeUsageDetails(); scheduleClaudeUsageUpdate();
+        if (manualOnly && !state.enteredGroups.has(claudeUsageCurrentModelGroup()))
+          syncClaudeUsage();
       });
   }
   loadClaudeUsageDetails();

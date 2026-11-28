@@ -614,6 +614,7 @@ pub(super) struct Claude {
     lifecycle_gate: RwLock<()>,
     // 用户要求账号额度按 WSL 实例隔离；只缓存白名单百分比与重置时间，不保存登录凭据。
     subscription_usage_cache: Mutex<HashMap<String, subscription_usage::CachedUsage>>,
+    quota_snapshots: crate::quota_snapshot::Snapshots,
     local_usage_cache: Mutex<HashMap<String, subscription_usage::CachedLocalUsage>>,
     usage_prices: Mutex<subscription_usage::PriceCache>,
     requests: Mutex<HashMap<String, BTreeMap<String, Value>>>,
@@ -730,6 +731,7 @@ impl Claude {
             reconnect_enabled: AtomicBool::new(true),
             lifecycle_gate: RwLock::new(()),
             subscription_usage_cache: Mutex::new(HashMap::new()),
+            quota_snapshots: crate::quota_snapshot::Snapshots::new(directory),
             local_usage_cache: Mutex::new(HashMap::new()),
             usage_prices: Mutex::new(subscription_usage::PriceCache::default()),
             requests: Mutex::new(HashMap::new()),

@@ -791,34 +791,6 @@ fn project_local_tool_call(step_index: u64, idx: usize, call: &Value) -> Option<
     }
 }
 
-/// 读取 `~/.gemini/google_accounts.json` 中记录的当前登录展示邮箱（`active` 字段）。
-///
-/// 安全边界：该文件仅存放账号邮箱文本（`{"active":"...","old":[...]}`），不含任何 OAuth Token 或凭据；
-/// 严格校验非符号链接、文件体积上限及邮箱格式，绝不读取 `oauth_creds.json`。
-pub(crate) fn read_google_account_email(gemini_root: &Path) -> Option<String> {
-    if !gemini_root.is_absolute() {
-        return None;
-    }
-    let path = gemini_root.join("google_accounts.json");
-    let meta = std::fs::symlink_metadata(&path).ok()?;
-    if meta.file_type().is_symlink() || !meta.is_file() || meta.len() > MAX_SKILL_BYTES {
-        return None;
-    }
-    let bytes = std::fs::read(&path).ok()?;
-    let doc: Value = serde_json::from_slice(&bytes).ok()?;
-    let email = doc["active"].as_str()?.trim();
-    if email.is_empty()
-        || email.len() > 320
-        || email.matches('@').count() != 1
-        || email
-            .chars()
-            .any(|ch| ch.is_control() || ch.is_whitespace())
-    {
-        return None;
-    }
-    Some(email.to_owned())
-}
-
 pub(crate) fn valid_slash_command_name(name: &str) -> bool {
     !name.is_empty()
         && name.chars().count() <= 256
@@ -1565,15 +1537,6 @@ mod tests {
         )
         .unwrap();
 
-        std::fs::write(
-            gemini.join("google_accounts.json"),
-            r#"{"active":"demo.user@example.com","old":[]}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            read_google_account_email(&gemini).as_deref(),
-            Some("demo.user@example.com")
-        );
         let slash_skills = scan_slash_skills(&gemini, Some(dir.path()), None);
         assert_eq!(slash_skills.len(), 1);
         assert_eq!(slash_skills[0]["command"], "demo-skill");

@@ -275,6 +275,14 @@ async fn probe_wsl(distribution: String, configured: &Value) -> Environment {
     environment
 }
 
+// 额度读取只复用已经确认的 WSL Home，不为读账号配置触发全机发行版或 CLI 探测。
+pub(super) async fn cached_user_home(directory:&Path,distribution:&str,user:&str)->Option<String> {
+    let cache=ENVIRONMENTS.get()?.lock().await;
+    let (dir,_,envs)=cache.as_ref()?;
+    (dir==directory).then(||envs.iter().find(|e|e.error.is_none() && e.distribution.eq_ignore_ascii_case(distribution) && e.user==user)
+        .map(|e|e.home.clone())).flatten().filter(|s|s.starts_with('/'))
+}
+
 pub(super) async fn detect(directory: &Path, force: bool) -> Vec<Environment> {
     #[cfg(test)]
     if let Some(values) = TEST_ENVIRONMENTS

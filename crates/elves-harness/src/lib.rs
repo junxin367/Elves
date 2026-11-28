@@ -65,6 +65,7 @@ mod channels;
 mod claude;
 mod codex;
 mod compaction_facts;
+mod quota_snapshot;
 mod context_usage;
 mod conversation_naming;
 mod credentials;
@@ -2100,13 +2101,14 @@ impl HarnessController {
                     .subscription_usage(config, allow_probe, include_local)
                     .await
             } else if antigravity_thread {
-                // 用户要求（临时）：Antigravity 额度只在手动点击额度弹窗（manualRefresh）时才调用官方 CLI。
+                // 首次进入且缺少对应分组的完整记录时可主动查询；其余仅手动刷新。是否命中缓存由服务端判定。
                 self.antigravity
-                    .session_subscription_usage(
+                    .session_subscription_usage_for(
                         thread_id.unwrap(),
                         allow_probe,
                         include_local,
                         payload["manualRefresh"] == true,
+                        payload["bootstrapGroup"].as_str(),
                     )
                     .await
                     .map_err(antigravity::api_error)
@@ -2117,11 +2119,12 @@ impl HarnessController {
                     self.antigravity_default_config().await?
                 };
                 self.antigravity
-                    .subscription_usage(
+                    .subscription_usage_for(
                         config,
                         allow_probe,
                         include_local,
                         payload["manualRefresh"] == true,
+                        payload["bootstrapGroup"].as_str(),
                     )
                     .await
                     .map_err(antigravity::api_error)

@@ -93,6 +93,7 @@ pub(crate) struct AcpClient {
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<anyhow::Result<Value>>>>>,
     live: Arc<AtomicBool>,
     stderr_tail: Arc<Mutex<String>>,
+    login_email: Arc<Mutex<Option<String>>>,
     child: Mutex<Option<Child>>,
     pub(crate) initialize_result: Mutex<Value>,
 }
@@ -184,9 +185,15 @@ impl AcpClient {
         let (request_tx, request_rx) = mpsc::unbounded_channel();
 
         let stderr_sink = stderr_tail.clone();
+        let login_email=Arc::new(Mutex::new(None));
+        let login=login_email.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                // 只取本连接官方 CLI 的成功登录展示行；不解析 Token、认证链接或完整日志。
+                if let Some(email)=super::quota_identity::authenticated_email(&line) {
+                    *login.lock().await=Some(email);
+                }
                 let mut tail = stderr_sink.lock().await;
                 if tail.len() < STDERR_TAIL_LIMIT {
                     tail.push_str(&line);
@@ -281,6 +288,7 @@ impl AcpClient {
                 pending,
                 live,
                 stderr_tail,
+                login_email,
                 child: Mutex::new(Some(child)),
                 initialize_result: Mutex::new(Value::Null),
             }),
@@ -295,6 +303,8 @@ impl AcpClient {
         self.live.load(Ordering::Acquire)
     }
 
+    pub(super) async fn login_email(&self)->Option<String>{self.login_email.lock().await.clone()}
+
     #[cfg(test)]
     pub(crate) fn test_closed_writer() -> Arc<Self> {
         // 确定性模拟 stdout 仍在线但写入队列已关闭，不依赖 Windows 管道关闭的调度时序。
@@ -306,6 +316,7 @@ impl AcpClient {
             pending: Arc::new(Mutex::new(HashMap::new())),
             live: Arc::new(AtomicBool::new(true)),
             stderr_tail: Arc::new(Mutex::new(String::new())),
+            login_email: Arc::new(Mutex::new(None)),
             child: Mutex::new(None),
             initialize_result: Mutex::new(Value::Null),
         })
@@ -632,6 +643,11 @@ pub(super) fn turn_error(failure: &anyhow::Error) -> Value {
         value["statusCode"] = json!(native.api.code);
     }
     value
+}
+
+pub(super) fn needs_login(failure:&anyhow::Error)->bool {
+    failure.downcast_ref::<AcpRpcFailure>().is_some_and(|e|e.api.code==401)
+        || failure.downcast_ref::<ApiError>().is_some_and(|e|e.code==401)
 }
 
 fn map_acp_api_error(code: i64, message: &str) -> ApiError {

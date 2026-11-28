@@ -2,7 +2,7 @@
 //!
 //! 边界说明（见 AGENTS.md）：
 //! - 5h/7d 剩余额度比例与重置时间严格通过目标实例（本机或所属 WSL 登录环境）的官方 `agy -p "/usage" --output-format json` 获取；
-//! - 登录展示邮箱从目标实例本地非敏感 `~/.gemini/google_accounts.json`（`active` 字段）只读获取，绝不读取 `oauth_creds.json`；
+//! - 账号和等级优先复用所属实例的 AGY 登录展示缓存和既有 ACP 认证结果，不为弹窗启动 ACP；
 //! - 订阅等级标签复用 ACP 官方返回的 `_meta.antigravity.tier.name`（如 `Google AI Pro`）；
 //! - 窗口已消耗 Token 与公开价格金额估算仅在用户显式展开弹层（`includeLocal: true`）时只读扫描目标实例本地 `transcript[_full].jsonl`。
 
@@ -18,11 +18,9 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use super::acp::EnvConfig;
-use super::{Antigravity, local_store, now_ms};
+use super::{Antigravity, local_store, now_ms, quota_identity::Identity};
 
 const USAGE_REFRESH: Duration = Duration::from_secs(60);
-// 临时开关：true 时 `agy -p "/usage"` 仅在请求带 `manualRefresh`（用户手动点击额度弹窗）时执行，见 subscription_usage。
-const QUOTA_CLI_MANUAL_ONLY: bool = true;
 const USAGE_RETENTION_MS: u64 = 72 * 60 * 60 * 1000;
 const QUERY_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_USAGE_OUTPUT: u64 = 256 * 1024;
@@ -38,12 +36,14 @@ const TIMEZONE_PROBE: &str = r#"printf '__CODEX_ELVES_TZ__%s\n' "${TZ-}"; printf
 
 pub(super) struct CachedQuotaUsage {
     pub(super) config: EnvConfig,
+    scope: String,
     pub(super) checked: Instant,
     pub(super) retained: Option<Value>,
 }
 
 pub(super) struct CachedLocalQuotaMetrics {
     pub(super) config: EnvConfig,
+    scope: String,
     pub(super) checked: Instant,
     pub(super) windows: Value,
     pub(super) retained: Option<(u64, Value)>,
@@ -66,18 +66,26 @@ struct ActiveWindowSpec {
 }
 
 impl Antigravity {
-    pub(crate) async fn session_subscription_usage(
+    pub(crate) async fn session_subscription_usage_for(
         self: &Arc<Self>,
         id: &str,
         allow_probe: bool,
         include_local: bool,
         manual_refresh: bool,
+        bootstrap_group: Option<&str>,
     ) -> anyhow::Result<Value> {
         let c = self.conversation(id).await?;
-        self.subscription_usage(c.config, allow_probe, include_local, manual_refresh)
-            .await
+        self.subscription_usage_for(
+            c.config,
+            allow_probe,
+            include_local,
+            manual_refresh,
+            bootstrap_group,
+        )
+        .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn subscription_usage(
         self: &Arc<Self>,
         config: EnvConfig,
@@ -85,157 +93,183 @@ impl Antigravity {
         include_local: bool,
         manual_refresh: bool,
     ) -> anyhow::Result<Value> {
+        self.subscription_usage_for(config, allow_probe, include_local, manual_refresh, None)
+            .await
+    }
+    pub(crate) async fn subscription_usage_for(
+        self: &Arc<Self>,
+        config: EnvConfig,
+        allow_probe: bool,
+        include_local: bool,
+        manual_refresh: bool,
+        bootstrap_group: Option<&str>,
+    ) -> anyhow::Result<Value> {
         config.validate()?;
-        // 用户要求（临时处理）：避免频繁调用官方 `agy -p "/usage"` 触发风控，额度只在用户手动点击额度弹窗时才读取；
-        // 弹窗展开后的本地统计、后台轮询等未带 `manualRefresh` 的请求只返回已有缓存，不启动 agy 进程。
-        // 官方开放后将 QUOTA_CLI_MANUAL_ONLY 改为 false 即可恢复自动刷新；前端 claude-usage.js 的
-        // antigravityUsageManualOnly 须同步核对。本地转录统计仍沿用 allow_probe，不受此开关影响。
-        let allow_cli = allow_probe && (manual_refresh || !QUOTA_CLI_MANUAL_ONLY);
-        let mut response = self.quota_account_usage(&config, allow_cli).await?;
-        if response["usage"].is_object() {
-            // 若 ACP 目录缓存中已有订阅等级（如 Google AI Pro），实时附带；尚未探测时在后台异步预热，不阻塞额度返回。
-            let inst_id = config.instance_id();
-            let cached_tier = self
-                .catalogs
+        let initial = self.quota_identity(&config).await;
+        let request_scope = initial.scope.clone();
+        let binding = crate::quota_snapshot::binding("antigravity", &config);
+        let disk = self.quota_snapshots.get(&binding, &initial.scope);
+        // 当前可见实例/模型分组首次没有双窗口记录时主动查一次；有旧记录的进入只读缓存，点击仍可到期刷新。
+        let bootstrap = bootstrap_group
+            .filter(|s| matches!(*s, "gemini" | "thirdParty"))
+            .is_some_and(|g| !crate::quota_snapshot::Snapshots::has_group(&disk, g));
+        let owner = if allow_probe && (manual_refresh || bootstrap) {
+            let (service, cfg, request_owner) = (self.clone(), config.clone(), initial.clone());
+            tokio::spawn(
+                async move { service.read_quota_account_usage(&cfg, &request_owner).await },
+            )
+            .await?;
+            self.quota_identities
                 .lock()
                 .await
-                .get(&inst_id)
-                .and_then(|cat| cat.tier.clone());
-            if let Some(tier) = cached_tier {
-                if let Some(name) = sanitize_subscription_type(tier["name"].as_str()) {
-                    response["usage"]["subscriptionType"] = json!(name);
-                }
-            } else if allow_cli {
-                let service = Arc::clone(self);
-                let probe_cfg = config.clone();
-                tokio::spawn(async move {
-                    let _ = service.probe_catalog(&probe_cfg, "", false).await;
-                });
-            }
-
+                .get(&config.instance_id())
+                .cloned()
+                .unwrap_or(initial)
+        } else {
+            initial
+        };
+        let scope = &owner.scope;
+        let mut usage = self.quota_snapshots.get(&binding, scope);
+        if usage.is_object() {
             let metrics = if include_local {
-                self.local_quota_usage(&config, &response["usage"], allow_probe)
+                self.local_quota_usage(&config, &owner, &usage, allow_probe)
                     .await
             } else {
-                self.cached_local_quota_usage(&config, &response["usage"])
+                self.cached_local_quota_usage(&config, &owner, &usage)
                     .await
                     .unwrap_or(Value::Null)
             };
-            attach_group_metrics(&mut response["usage"], &metrics);
-        }
-        Ok(response)
-    }
-
-    async fn quota_account_usage(
-        self: &Arc<Self>,
-        config: &EnvConfig,
-        allow_probe: bool,
-    ) -> anyhow::Result<Value> {
-        let instance = config.instance_id();
-        let (cached, refresh) = cached_quota_usage(
-            self.quota_usage_cache.lock().await.get(&instance),
-            config,
-            allow_probe,
-        );
-        if refresh {
-            let lock = self.lock(&format!("quota-usage:{instance}")).await;
-            if lock.try_lock().is_ok() {
-                let service = Arc::clone(self);
-                let cfg = config.clone();
-                tokio::spawn(async move {
-                    let _ = service.read_quota_account_usage(&cfg).await;
-                });
+            attach_group_metrics(&mut usage, &metrics);
+            if metrics.is_object() {
+                usage = self.quota_snapshots.publish(&binding, scope, &usage, true);
             }
         }
-        match cached {
-            Some(response) => Ok(response),
-            None => self.read_quota_account_usage(config).await,
+        let current = if usage.is_object() {
+            self.quota_identity(&config).await
+        } else {
+            owner.clone()
+        };
+        if scope != &current.scope {
+            usage = Value::Null;
         }
+        let profile = json!({"accountEmail":current.email,"subscriptionType":current.tier()});
+        if usage.is_object() {
+            usage["accountEmail"] = profile["accountEmail"].clone();
+            usage["subscriptionType"] = profile["subscriptionType"].clone();
+        }
+        Ok(
+            json!({"ok":true,"backend":"antigravity","instanceId":config.instance_id(),
+            "accountScope":current.scope,"profile":profile,"usage":usage,
+            "bootstrapChanged":current.scope!=request_scope && !current.signed_out && usage.is_null()}),
+        )
     }
 
-    async fn read_quota_account_usage(self: &Arc<Self>, config: &EnvConfig) -> anyhow::Result<Value> {
+    async fn read_quota_account_usage(&self, config: &EnvConfig, owner: &Identity) -> Value {
         let instance = config.instance_id();
         let lock = self.lock(&format!("quota-usage:{instance}")).await;
         let _guard = lock.lock().await;
-        if let (Some(response), false) = cached_quota_usage(
-            self.quota_usage_cache.lock().await.get(&instance),
-            config,
-            true,
-        ) {
-            return Ok(response);
-        }
-
-        let gemini_root = self.resolve_gemini_root(config).await;
-        let account_email = if let Some(root) = gemini_root {
-            tokio::task::spawn_blocking(move || local_store::read_google_account_email(&root))
-                .await
-                .ok()
-                .flatten()
-        } else {
-            None
-        };
-        let cached_tier_name = self
-            .catalogs
+        let scope = &owner.scope;
+        if self
+            .quota_identities
             .lock()
             .await
             .get(&instance)
-            .and_then(|cat| cat.tier.as_ref())
-            .and_then(|t| sanitize_subscription_type(t["name"].as_str()));
-
+            .is_none_or(|identity| identity.scope != *scope)
+        {
+            return Value::Null;
+        }
+        let (fresh, previous) = cached_quota_usage(
+            self.quota_usage_cache.lock().await.get(&instance),
+            config,
+            scope,
+        );
+        if fresh {
+            return previous;
+        }
+        let mut expected = scope.clone();
+        let mut retain_on_error = true;
         let usage = match native_cli_usage(config).await {
             Ok(raw) => {
-                let mut normalized = normalize_cli_usage(
-                    &raw,
-                    now_ms(),
-                    account_email.as_deref(),
-                    cached_tier_name.as_deref(),
-                    config.is_local(),
-                );
+                let mut normalized = normalize_cli_usage(&raw, now_ms(), config.is_local());
                 if normalized.is_object()
                     && !config.is_local()
                     && let Some(tz) = native_wsl_time_zone(config).await
                 {
                     normalized["timeZone"] = json!(tz);
                 }
+                if owner.signed_out && normalized.is_object() {
+                    let renewed = self
+                        .update_quota_identity(config, Some((scope, None, None, false)))
+                        .await;
+                    // 只有本次凭据状态确实被接替才发布；不能给竞争中切来的另一账号填本次用量。
+                    if renewed.scope != *scope {
+                        return Value::Null;
+                    }
+                }
                 normalized
             }
-            Err(_) => Value::Null,
+            Err(e) => {
+                if e.downcast_ref::<super::ApiError>()
+                    .is_some_and(|e| e.code == 401)
+                {
+                    let out = self
+                        .update_quota_identity(config, Some((scope, None, None, true)))
+                        .await;
+                    if !out.signed_out {
+                        return Value::Null;
+                    }
+                    expected = out.scope;
+                    retain_on_error = false;
+                }
+                Value::Null
+            }
         };
-
-        let response = json!({
-            "ok": true,
-            "backend": "antigravity",
-            "instanceId": instance,
-            "usage": usage,
-        });
-        let mut cache = self.quota_usage_cache.lock().await;
-        let retained = if response["usage"].is_object() {
-            Some(response.clone())
+        if self.quota_identity(config).await.scope != expected {
+            return Value::Null;
+        }
+        self.quota_snapshots.publish(
+            &crate::quota_snapshot::binding("antigravity", config),
+            &expected,
+            &usage,
+            false,
+        );
+        // 失败也从本次尝试起退避 60 秒；只保留同账号上次成功的数据，不重写原采集时间。
+        let retained = if usage.is_object() || !retain_on_error {
+            usage
         } else {
-            cache
-                .get(&instance)
-                .filter(|c| c.config == *config)
-                .and_then(|c| c.retained.clone())
+            previous
         };
-        cache.insert(
+        self.quota_usage_cache.lock().await.insert(
             instance,
             CachedQuotaUsage {
                 config: config.clone(),
                 checked: Instant::now(),
-                retained,
+                scope: expected,
+                retained: retained.is_object().then(|| retained.clone()),
             },
         );
-        Ok(response)
+        retained
     }
 
     async fn local_quota_usage(
         &self,
         config: &EnvConfig,
+        owner: &Identity,
         usage: &Value,
         allow_probe: bool,
     ) -> Value {
         let instance = config.instance_id();
-        let specs = collect_active_windows(usage);
+        let scope = &owner.scope;
+        // AGY 转录未逐调用标注账号；跨越已知换号/退出时间的窗口不拿旧账号消耗推算新账号额度。
+        let specs: Vec<_> = local_windows(usage, owner.changed_at)
+            .into_iter()
+            .filter(|s| {
+                usage["groups"]
+                    .as_array()
+                    .and_then(|gs| gs.iter().find(|g| g["id"] == s.group_id))
+                    .is_some_and(|g| !crate::quota_snapshot::historical(g, now_ms()))
+            })
+            .collect();
         let windows_sig = serialize_window_specs(&specs);
         if specs.is_empty() {
             return Value::Null;
@@ -249,16 +283,17 @@ impl Antigravity {
             .get(&instance)
             .is_some_and(|cached| {
                 cached.config == *config
+                    && &cached.scope == scope
                     && cached.windows == windows_sig
                     && cached.checked.elapsed() < USAGE_REFRESH
             });
         if recent || !allow_probe {
             return self
-                .cached_local_quota_usage(config, usage)
+                .cached_local_quota_usage(config, owner, usage)
                 .await
                 .unwrap_or(Value::Null);
         }
-        let Some(gemini_root) = self.resolve_gemini_root(config).await else {
+        let Some(gemini_root) = self.quota_gemini_root(config).await else {
             return Value::Null;
         };
         let prices = self.quota_public_prices().await;
@@ -268,22 +303,21 @@ impl Antigravity {
         })
         .await
         .unwrap_or(Value::Null);
-        let succeeded = metrics
-            .as_object()
-            .is_some_and(|map| !map.is_empty());
+        let succeeded = metrics.as_object().is_some_and(|map| !map.is_empty());
         let mut cache = self.local_quota_cache.lock().await;
         let retained = if succeeded {
             Some((now_ms(), metrics.clone()))
         } else {
             cache
                 .get(&instance)
-                .filter(|c| c.config == *config && c.windows == windows_sig)
+                .filter(|c| c.config == *config && &c.scope == scope && c.windows == windows_sig)
                 .and_then(|c| c.retained.clone())
         };
         cache.insert(
             instance,
             CachedLocalQuotaMetrics {
                 config: config.clone(),
+                scope: scope.to_owned(),
                 checked: Instant::now(),
                 windows: windows_sig,
                 retained: retained.clone(),
@@ -296,13 +330,19 @@ impl Antigravity {
         }
     }
 
-    async fn cached_local_quota_usage(&self, config: &EnvConfig, usage: &Value) -> Option<Value> {
-        let specs = collect_active_windows(usage);
+    async fn cached_local_quota_usage(
+        &self,
+        config: &EnvConfig,
+        owner: &Identity,
+        usage: &Value,
+    ) -> Option<Value> {
+        let specs = local_windows(usage, owner.changed_at);
         let windows_sig = serialize_window_specs(&specs);
         let cache = self.local_quota_cache.lock().await;
         let cached = cache.get(&config.instance_id())?;
         let (collected, metrics) = cached.retained.as_ref()?;
         (cached.config == *config
+            && cached.scope == owner.scope
             && cached.windows == windows_sig
             && within_retention(Some(*collected)))
         .then(|| metrics.clone())
@@ -471,16 +511,30 @@ async fn native_cli_usage(config: &EnvConfig) -> anyhow::Result<Value> {
             bytes.len() as u64 <= MAX_USAGE_OUTPUT,
             "Antigravity /usage 输出超过限制"
         );
-        anyhow::ensure!(
-            child.wait().await?.success(),
-            "Antigravity /usage 进程未成功结束"
-        );
+        let success = child.wait().await?.success();
         let text = String::from_utf8_lossy(&bytes);
         let json_slice = text
             .find('{')
             .map(|idx| &text[idx..])
             .unwrap_or(text.as_ref());
-        let doc: Value = serde_json::from_str(json_slice.trim())?;
+        let doc = serde_json::from_str::<Value>(json_slice.trim());
+        if let Ok(ref value) = doc
+            && value["status"] != "SUCCESS"
+            && [
+                value.pointer("/error/code"),
+                value.pointer("/error/status"),
+                value.get("status"),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|code| {
+                code == 401 || code == "UNAUTHENTICATED" || code == "AUTHENTICATION_REQUIRED"
+            })
+        {
+            return Err(super::error(401, "Antigravity 当前实例未登录"));
+        }
+        anyhow::ensure!(success, "Antigravity /usage 进程未成功结束");
+        let doc = doc?;
         Ok::<Value, anyhow::Error>(doc)
     })
     .await;
@@ -491,7 +545,7 @@ async fn native_cli_usage(config: &EnvConfig) -> anyhow::Result<Value> {
     outcome.context("Antigravity /usage 读取超时")?
 }
 
-fn sanitize_subscription_type(raw: Option<&str>) -> Option<String> {
+pub(super) fn sanitize_subscription_type(raw: Option<&str>) -> Option<String> {
     let kind = raw?.trim();
     if !kind.is_empty()
         && kind.len() <= 64
@@ -574,8 +628,6 @@ fn normalize_bucket(bucket: &Value) -> Option<(&'static str, Value)> {
 pub(crate) fn normalize_cli_usage(
     raw: &Value,
     observed_at: u64,
-    account_email: Option<&str>,
-    subscription_type: Option<&str>,
     host_local: bool,
 ) -> Value {
     if raw["status"] != "SUCCESS" {
@@ -623,12 +675,8 @@ pub(crate) fn normalize_cli_usage(
         "source": "antigravity-native-usage",
         "observedAtMs": observed_at,
         "hostLocal": host_local,
-        "subscriptionType": sanitize_subscription_type(subscription_type),
         "groups": groups,
     });
-    if let Some(email) = account_email.map(str::trim).filter(|s| !s.is_empty()) {
-        result["accountEmail"] = json!(email);
-    }
     for field in ["fiveHour", "sevenDay"] {
         if primary[field].is_object() {
             result[field] = primary[field].clone();
@@ -640,31 +688,14 @@ pub(crate) fn normalize_cli_usage(
 fn cached_quota_usage(
     cached: Option<&CachedQuotaUsage>,
     config: &EnvConfig,
-    allow_probe: bool,
-) -> (Option<Value>, bool) {
-    let cached = cached.filter(|c| c.config == *config);
+    scope: &str,
+) -> (bool, Value) {
+    let cached = cached.filter(|c| c.config == *config && c.scope == scope);
     let recent = cached.is_some_and(|c| c.checked.elapsed() < USAGE_REFRESH);
     let retained = cached
         .and_then(|c| c.retained.as_ref())
-        .filter(|resp| within_retention(resp["usage"]["observedAtMs"].as_u64()));
-    match retained {
-        Some(resp) if allow_probe && !recent => {
-            let mut next = resp.clone();
-            next["refreshing"] = json!(true);
-            (Some(next), true)
-        }
-        Some(resp) => (Some(resp.clone()), false),
-        None if !allow_probe || recent => (
-            Some(json!({
-                "ok": true,
-                "backend": "antigravity",
-                "instanceId": config.instance_id(),
-                "usage": Value::Null,
-            })),
-            false,
-        ),
-        None => (None, false),
-    }
+        .filter(|usage| within_retention(usage["observedAtMs"].as_u64()));
+    (recent, retained.cloned().unwrap_or(Value::Null))
 }
 
 fn within_retention(observed_at: Option<u64>) -> bool {
@@ -703,6 +734,13 @@ fn collect_active_windows(usage: &Value) -> Vec<ActiveWindowSpec> {
         }
     }
     specs
+}
+
+fn local_windows(usage: &Value, changed_at: u64) -> Vec<ActiveWindowSpec> {
+    collect_active_windows(usage)
+        .into_iter()
+        .filter(|w| w.start_ms >= changed_at)
+        .collect()
 }
 
 fn serialize_window_specs(specs: &[ActiveWindowSpec]) -> Value {
@@ -1065,6 +1103,179 @@ mod tests {
     use super::*;
 
     #[test]
+    fn quota_identity_reads_only_agy_display_and_accepts_only_native_login_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("app_storage.json");
+        std::fs::write(
+            dir.path().join("google_accounts.json"),
+            r#"{"active":"wrong@example.test"}"#,
+        )
+        .unwrap();
+        assert!(super::super::quota_identity::app_email(&app).is_none());
+        std::fs::write(&app,r#"{"agy.onboarding.lastLoginUsername":"Right@example.test","other":{"email":"wrong@example.test"}}"#).unwrap();
+        assert_eq!(
+            super::super::quota_identity::app_email(&app).as_deref(),
+            Some("right@example.test")
+        );
+        let login = super::super::quota_identity::authenticated_email;
+        assert_eq!(login("I1128 11:48:23.781867 52 server_oauth.go:226] OAuth: authenticated successfully as cli@example.test").as_deref(),Some("cli@example.test"));
+        assert!(
+            login("a message] OAuth: authenticated successfully as wrong@example.test").is_none()
+        );
+        assert!(login("I1128 11:48:23.781867 52 other.go:226] OAuth: authenticated successfully as wrong@example.test").is_none());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn quota_clicks_share_one_cli_and_never_reuse_another_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let app = root.join("fixture-agy/app_storage.json");
+        std::fs::create_dir(app.parent().unwrap()).unwrap();
+        let set_user = |who: &str| {
+            std::fs::write(
+                &app,
+                json!({"agy.onboarding.lastLoginUsername":who}).to_string(),
+            )
+            .unwrap()
+        };
+        set_user("first@example.test");
+        let cli = root.join("fake-agy.cmd");
+        // 每个 CLI 进程在夹具目录中计数，同时拒绝 acp/models；不读取本机账号，也不联系上游。
+        std::fs::write(&cli,"@echo off\r\n>>\"%~dp0calls.txt\" echo %*\r\nif not \"%*\"==\"-p /usage --output-format json\" exit /b 9\r\ntype \"%~dp0reply.json\"\r\n").unwrap();
+        let reply = root.join("reply.json");
+        let valid = json!({"status":"SUCCESS","command":{"data":{"groups":[{"name":"Gemini Models","buckets":[
+            {"id":"gemini-5h","window":"5h","remaining_fraction":0.75,"reset_time":"1970-01-01T00:00:00Z"},
+            {"id":"gemini-weekly","window":"weekly","remaining_fraction":0.6,"reset_time":"1970-01-01T00:00:00Z"}]}]}}});
+        std::fs::write(&reply, valid.to_string()).unwrap();
+        let calls = || {
+            std::fs::read_to_string(root.join("calls.txt"))
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        let cfg = EnvConfig {
+            executable: cli.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let service = Antigravity::new(root).unwrap();
+        let wsl = EnvConfig { distribution:"isolated-test".into(), user:"fixture".into(), executable:"/usr/bin/agy".into() };
+        let scoped_root = service.quota_gemini_root(&wsl).await.unwrap();
+        assert!(scoped_root.to_string_lossy().starts_with(r"\\wsl.localhost\isolated-test\home\fixture"));
+        let query = |manual| service.subscription_usage(cfg.clone(), true, true, manual);
+        assert!(query(false).await.unwrap()["usage"].is_null());
+        assert_eq!(calls(), 0);
+        let first_enter=||service.subscription_usage_for(cfg.clone(),true,false,false,Some("gemini"));
+        let (a, b) = tokio::join!(first_enter(), first_enter());
+        let first = a.unwrap();
+        assert_eq!(first, b.unwrap());
+        assert_eq!(calls(), 1,"两个窗口首次自动读取只跑一次 CLI");
+        assert_eq!(first["usage"]["accountEmail"], "first@example.test");
+        assert_eq!(first["usage"]["fiveHour"]["usedPercentage"], 25.0);
+        assert!(first["profile"]["subscriptionType"].is_null());
+        let owner = service.quota_identity(&cfg).await;
+        service
+            .update_quota_identity(
+                &cfg,
+                Some((&owner.scope, None, Some("Google AI Pro"), false)),
+            )
+            .await;
+        assert_eq!(
+            query(true).await.unwrap()["profile"]["subscriptionType"],
+            "Google AI Pro"
+        );
+        assert_eq!(calls(), 1);
+        let reopened = Antigravity::new(root).unwrap();
+        let restored = reopened
+            .subscription_usage_for(cfg.clone(), true, false, false,Some("gemini"))
+            .await
+            .unwrap();
+        assert_eq!(restored["usage"]["groups"][0]["historical"],true);
+        assert_eq!(restored["usage"]["fiveHour"]["usedPercentage"],25.0);
+        assert_eq!(restored["usage"]["sevenDay"]["usedPercentage"],40.0);
+        assert_eq!(restored["profile"]["subscriptionType"], "Google AI Pro");
+        assert_eq!(calls(), 1);
+        // 失败保留同一次成功的采集时间，并复用失败退避；这一步无需等真实 60 秒。
+        service
+            .quota_usage_cache
+            .lock()
+            .await
+            .get_mut(&cfg.instance_id())
+            .unwrap()
+            .checked = Instant::now() - USAGE_REFRESH;
+        std::fs::write(&reply, "error").unwrap();
+        assert_eq!(
+            query(true).await.unwrap()["usage"]["observedAtMs"],
+            first["usage"]["observedAtMs"]
+        );
+        query(true).await.unwrap();
+        assert_eq!(calls(), 2);
+        set_user("second@example.test");
+        let second = query(false).await.unwrap();
+        assert_ne!(second["accountScope"], first["accountScope"]);
+        assert!(second["usage"].is_null() && second["profile"]["subscriptionType"].is_null());
+        assert_eq!(second["profile"]["accountEmail"], "second@example.test");
+        let late = service
+            .update_quota_identity(&cfg, Some((&owner.scope, None, Some("OLD"), false)))
+            .await;
+        assert!(late.tier().is_none());
+        assert!(
+            service
+                .read_quota_account_usage(&cfg, &owner)
+                .await
+                .is_null()
+        );
+        assert_eq!(calls(), 2);
+        std::fs::write(&reply, valid.to_string()).unwrap();
+        assert_eq!(
+            query(true).await.unwrap()["usage"]["accountEmail"],
+            "second@example.test"
+        );
+        assert_eq!(calls(), 3);
+        service
+            .quota_usage_cache
+            .lock()
+            .await
+            .get_mut(&cfg.instance_id())
+            .unwrap()
+            .checked = Instant::now() - USAGE_REFRESH;
+        std::fs::write(&reply, r#"{"status":"ERROR","error":{"code":401}}"#).unwrap();
+        let out = query(true).await.unwrap();
+        assert!(out["profile"]["accountEmail"].is_null() && out["usage"].is_null());
+        assert!(query(false).await.unwrap()["profile"]["accountEmail"].is_null());
+        assert_eq!(calls(), 4);
+        query(true).await.unwrap();
+        assert_eq!(calls(), 4, "退出后的点击也应遵守失败退避");
+        std::fs::write(&reply, valid.to_string()).unwrap();
+        service
+            .quota_usage_cache
+            .lock()
+            .await
+            .get_mut(&cfg.instance_id())
+            .unwrap()
+            .checked = Instant::now() - USAGE_REFRESH;
+        let recovered = query(true).await.unwrap();
+        assert!(recovered["usage"].is_object() && recovered["profile"]["accountEmail"].is_null());
+        assert_eq!(calls(), 5);
+        let after = service.quota_identity(&cfg).await;
+        service
+            .update_quota_identity(
+                &cfg,
+                Some((
+                    &after.scope,
+                    Some("second@example.test".into()),
+                    Some("Google AI Pro"),
+                    false,
+                )),
+            )
+            .await;
+        assert_eq!(
+            query(false).await.unwrap()["profile"]["accountEmail"],
+            "second@example.test"
+        );
+    }
+
+    #[test]
     fn isolated_cli_commands_preserve_program_and_wsl_login_environment() {
         let executable = std::env::current_exe().unwrap();
         let local = EnvConfig {
@@ -1168,13 +1379,11 @@ mod tests {
         let usage = normalize_cli_usage(
             &raw,
             123456,
-            Some("demo.user@example.com"),
-            Some("Google AI Pro"),
             true,
         );
         assert_eq!(usage["source"], "antigravity-native-usage");
-        assert_eq!(usage["accountEmail"], "demo.user@example.com");
-        assert_eq!(usage["subscriptionType"], "Google AI Pro");
+        assert!(usage["accountEmail"].is_null() && usage["subscriptionType"].is_null(),
+            "额度结果不携带或推测身份，统一从当前账号缓存附加");
         assert_eq!(usage["hostLocal"], true);
         let groups = usage["groups"].as_array().unwrap();
         assert_eq!(groups.len(), 2);
@@ -1185,6 +1394,11 @@ mod tests {
         assert_eq!(groups[1]["fiveHour"]["usedPercentage"], 0.0);
         assert!(groups[1]["fiveHour"]["resetsAt"].is_null(), "epoch 0 必须归一化为 null");
         assert!(groups[1]["sevenDay"]["resetsAt"].is_null());
+        let windows = collect_active_windows(&usage);
+        let earliest = windows.iter().map(|s|s.start_ms).min().unwrap();
+        let latest = windows.iter().map(|s|s.start_ms).max().unwrap();
+        assert_eq!(local_windows(&usage, earliest).len(), windows.len());
+        assert!(local_windows(&usage, latest+1).is_empty(), "本实例旧窗口跨换号时间时不能用于预测");
     }
 
     #[test]

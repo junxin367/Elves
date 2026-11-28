@@ -6,6 +6,7 @@ mod checkpoints;
 pub(crate) mod local_store;
 pub(crate) mod projection;
 pub(crate) mod queue;
+mod quota_identity;
 mod task_notices;
 mod transcript_metrics;
 pub(crate) mod usage;
@@ -366,6 +367,8 @@ pub(crate) struct Antigravity {
     discoveries: Mutex<HashMap<String, Instant>>,
     usage_cache: Mutex<HashMap<String, CachedUsage>>,
     quota_usage_cache: Mutex<HashMap<String, usage::CachedQuotaUsage>>,
+    quota_identities: Mutex<HashMap<String, quota_identity::Identity>>,
+    quota_snapshots: crate::quota_snapshot::Snapshots,
     local_quota_cache: Mutex<HashMap<String, usage::CachedLocalQuotaMetrics>>,
     quota_prices: Mutex<usage::QuotaPriceCache>,
     syncing_discovered: Mutex<HashSet<String>>,
@@ -430,6 +433,8 @@ impl Antigravity {
             discoveries: Mutex::new(HashMap::new()),
             usage_cache: Mutex::new(HashMap::new()),
             quota_usage_cache: Mutex::new(HashMap::new()),
+            quota_identities: Mutex::new(HashMap::new()),
+            quota_snapshots: crate::quota_snapshot::Snapshots::new(directory),
             local_quota_cache: Mutex::new(HashMap::new()),
             quota_prices: Mutex::new(usage::QuotaPriceCache::default()),
             syncing_discovered: Mutex::new(HashSet::new()),
@@ -682,6 +687,7 @@ impl Antigravity {
         };
         let (client, _channels) =
             AcpClient::spawn(config, &home_cwd, "~", None, false, None).await?;
+        let tracked_account=self.quota_identities.lock().await.get(&inst_id).cloned();
         let res = async {
             let _init = client.initialize().await?;
             // 先直接调用只读 session/list；未登录时会立即返回 -32000，避免触发 authenticate 阻塞等待浏览器 OAuth。
@@ -689,6 +695,18 @@ impl Antigravity {
         }
         .await;
         client.close().await;
+        if let Some(account)=tracked_account {
+            match &res {
+                Err(e) if acp::needs_login(e) => { self.update_quota_identity(config,Some((&account.scope,None,None,true))).await; }
+                Ok(_) => {
+                    let email=client.login_email().await;
+                    if account.signed_out || email.as_ref().is_some_and(|v|Some(v)!=account.email.as_ref()){
+                        self.update_quota_identity(config,Some((&account.scope,email,None,false))).await;
+                    }
+                }
+                _ => {}
+            }
+        }
         let sessions = res?;
         let mut saved = self.saved.lock().await;
         let mut changed = false;
@@ -882,6 +900,7 @@ impl Antigravity {
             linux_cwd.clone()
         };
 
+        let account=self.quota_identity(config).await;
         let (client, mut channels) =
             AcpClient::spawn(config, &probe_cwd, &linux_cwd, None, false, None).await?;
         let mut temp_session_id: Option<String> = None;
@@ -959,7 +978,11 @@ impl Antigravity {
             .await
             .ok();
         }
+        if outcome.as_ref().is_err_and(acp::needs_login) {
+            self.update_quota_identity(config,Some((&account.scope,None,None,true))).await;
+        }
         let catalog = outcome?;
+        self.remember_quota_login(config, &account.scope, &client, catalog.tier.as_ref()).await;
         self.catalogs
             .lock()
             .await
@@ -1711,6 +1734,10 @@ impl Antigravity {
         } else {
             self.resolve_session_app_data_dir(c).await
         };
+        // /usage 使用默认 CLI 数据目录；桌面或 IDE 专用目录的登录结果不能给 CLI 额度标注账号或等级。
+        let account = if matches!(app_data_dir, None | Some("antigravity-cli")) {
+            Some(self.quota_identity(&c.config).await)
+        } else { None };
         let dangerously_skip_permissions = c.permission_mode.as_deref() == Some("bypassPermissions");
         let auto_compact_override = super::instance_settings::antigravity_auto_compact_override(
             &self.directory,
@@ -1727,7 +1754,7 @@ impl Antigravity {
         .await?;
         let setup_res = async {
             let init = client.initialize().await?;
-            let _auth = client.authenticate("oauth-personal").await?;
+            let auth = client.authenticate("oauth-personal").await?;
             let setup = if create_new || c.native_id.is_empty() {
                 client
                     .session_new(&effective_cwd, system_prompt_append)
@@ -1738,12 +1765,21 @@ impl Antigravity {
                     Err(_) => client.session_load(&c.native_id, &effective_cwd).await?,
                 }
             };
-            Ok::<_, anyhow::Error>((init, setup))
+            let tier=projection::extract_tier(&auth).or_else(||projection::extract_tier(&setup));
+            Ok::<_, anyhow::Error>((init, setup, tier))
         }
         .await;
         let (init, setup) = match setup_res {
-            Ok(pair) => pair,
+            Ok((init,setup,tier)) => {
+                if let Some(account) = &account {
+                    self.remember_quota_login(&c.config,&account.scope,&client,tier.as_ref()).await;
+                }
+                (init,setup)
+            },
             Err(err) => {
+                if let Some(account)=&account && acp::needs_login(&err) {
+                    self.update_quota_identity(&c.config,Some((&account.scope,None,None,true))).await;
+                }
                 client.close().await;
                 return Err(err);
             }

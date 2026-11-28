@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 // 用户要求打开 Claude 会话时编辑区底部额度能立即显示，同时数据要及时刷新（2026-11-15 调整，原为统一缓存 72 小时）：
-// - 最近一次成功读取的 CLI 原始结果按原采集时间保留 72 小时，只用于先行显示，读取失败不覆盖、不延长采集时间；
+// - 只保留同一账号最后一份完整 5h/7d 快照；读取失败或部分响应不覆盖、不延长原采集时间；
 // - 距上次读取超过 60 秒（与网页 claudeUsageRefreshMs 一致）即重新经原生 CLI 读取：已有保留结果时先返回并在后台刷新，
 //   响应带 refreshing 让网页提前复查；没有可显示结果时等待本次读取。失败同样按 60 秒退避，不反复启动 CLI。
 // 本地统计详情同样 60 秒刷新、72 小时保留。网页 features/composer/claude-usage.js 的刷新周期与显示上限须同步核对。
@@ -71,9 +71,15 @@ impl Claude {
         config.validate()?;
         let mut response = self.account_usage(&config, allow_probe).await?;
         if response["usage"].is_object() {
+            let scope = response["accountScope"].as_str().map(str::to_owned);
+            if let Some(s) = &scope {
+                response["usage"]["accountScope"] = json!(s);
+            }
             // 账号百分比经原生 CLI；金额、Token、预测仅覆盖对应 WSL 的本地数值账本。
             // 用户要求弹窗缓存优先：普通轮询也附带已有新鲜详情，只有显式展开才允许扫描日志或更新价格。
-            let metrics = if include_local {
+            let metrics = if include_local
+                && !crate::quota_snapshot::historical(&response["usage"], now_ms())
+            {
                 self.local_usage(&config, &response["usage"], allow_probe)
                     .await
             } else {
@@ -84,6 +90,18 @@ impl Claude {
             for key in ["fiveHour", "sevenDay"] {
                 if response["usage"][key].is_object() && metrics[key].is_object() {
                     response["usage"][key]["metrics"] = metrics[key].clone();
+                }
+            }
+            if let Some(scope) = scope {
+                let b = crate::quota_snapshot::binding("claude", &config);
+                response["usage"] = if metrics.is_object() {
+                    self.quota_snapshots
+                        .publish(&b, &scope, &response["usage"], true)
+                } else {
+                    self.quota_snapshots.get(&b, &scope)
+                };
+                if !self.quota_snapshots.matches(&b, &scope) {
+                    response["invalidate"] = json!(true);
                 }
             }
         }
@@ -109,17 +127,28 @@ impl Claude {
                 let claude = Arc::clone(self);
                 let config = config.clone();
                 tokio::spawn(async move {
-                    let _ = claude.read_account_usage(&config).await;
+                    let _ = claude.read_account_usage(&config, None).await;
                 });
             }
         }
         match cached {
             Some(response) => Ok(response),
-            None => self.read_account_usage(config).await,
+            None => {
+                // 重启后用同一个原生进程的 initialize 核对账号，一旦命中磁盘就先回显，get_usage 继续完成。
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let (claude, cfg) = (self.clone(), config.clone());
+                let mut job =
+                    tokio::spawn(async move { claude.read_account_usage(&cfg, Some(tx)).await });
+                tokio::select! {early=rx=>match early {Ok(v)=>Ok(v),Err(_)=>job.await?},done=&mut job=>done?}
+            }
         }
     }
 
-    async fn read_account_usage(&self, config: &WslConfig) -> anyhow::Result<Value> {
+    async fn read_account_usage(
+        &self,
+        config: &WslConfig,
+        early: Option<tokio::sync::oneshot::Sender<Value>>,
+    ) -> anyhow::Result<Value> {
         let instance = config.instance_id();
         let lock = self.lock(&format!("subscription-usage:{instance}")).await;
         let _guard = lock.lock().await;
@@ -131,8 +160,16 @@ impl Claude {
         ) {
             return Ok(response);
         }
-        let usage = match native_usage(config).await {
+        let binding = crate::quota_snapshot::binding("claude", config);
+        let mut scope = None;
+        let mut unavailable = false;
+        let usage = match native_usage(config, |account| {
+            scope = Some(self.bind_quota_account(config, account, early));
+        })
+        .await
+        {
             Ok((value, account_email)) => {
+                unavailable = value["rate_limits_available"] == false;
                 let mut usage =
                     normalize_usage_with_account(&value, now_ms(), account_email.as_deref());
                 if usage.is_object()
@@ -147,17 +184,29 @@ impl Claude {
             // 旧 CLI、不适用的认证或读取失败均保持未知；不回退到凭据读取、HTTP 或第三方服务。
             Err(_) => Value::Null,
         };
-        let response = json!({"ok":true,"backend":"claude","instanceId":instance,"usage":usage});
         let mut cache = self.subscription_usage_cache.lock().await;
-        // 读取失败不覆盖同一实例仍保留的有效结果，也不刷新它的采集时间。
-        let retained = if response["usage"].is_object() {
-            Some(response.clone())
-        } else {
+        let scope = scope.or_else(|| {
             cache
                 .get(&instance)
-                .filter(|cached| cached.config == *config)
-                .and_then(|cached| cached.retained.clone())
+                .filter(|e| e.config == *config)
+                .and_then(|e| {
+                    e.retained.as_ref()?["accountScope"]
+                        .as_str()
+                        .map(str::to_owned)
+                })
+        });
+        let usage = if let Some(key) = scope.as_deref() {
+            if unavailable {
+                self.quota_snapshots.clear(&binding, key);
+                Value::Null
+            } else {
+                self.quota_snapshots.publish(&binding, key, &usage, false)
+            }
+        } else {
+            Value::Null
         };
+        let response = json!({"ok":true,"backend":"claude","instanceId":instance,"accountScope":scope,"usage":usage,"invalidate":unavailable});
+        let retained = Some(response.clone());
         cache.insert(
             instance,
             CachedUsage {
@@ -169,9 +218,46 @@ impl Claude {
         Ok(response)
     }
 
+    fn bind_quota_account(
+        &self,
+        config: &WslConfig,
+        account: &Value,
+        early: Option<tokio::sync::oneshot::Sender<Value>>,
+    ) -> String {
+        // 只取该 WSL CLI 自己确认的身份字段；未知身份不能恢复磁盘，不保存 CLI 的原始账号对象。
+        let email = normalize_account_email(account["email"].as_str()).map(|s| s.to_lowercase());
+        let scope = email
+            .as_ref()
+            .map(|e| {
+                crate::hash(
+                    &json!([
+                        e,
+                        account["organizationUuid"].as_str(),
+                        account["organizationId"].as_str(),
+                        account["organization"].as_str(),
+                        account["apiKeySource"].as_str()
+                    ])
+                    .to_string(),
+                )
+            })
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let cached = self.quota_snapshots.bind(
+            &crate::quota_snapshot::binding("claude", config),
+            &scope,
+            email.is_some(),
+        );
+        if let Some(tx) = early
+            && cached.is_object()
+        {
+            let _=tx.send(json!({"ok":true,"backend":"claude","instanceId":config.instance_id(),"accountScope":scope,"usage":cached,"refreshing":true}));
+        }
+        scope
+    }
+
     async fn local_usage(&self, config: &WslConfig, usage: &Value, allow_probe: bool) -> Value {
         let instance = config.instance_id();
         let windows = local_windows(usage);
+        let cache_key=metrics_scope(usage,&windows);
         if windows.as_array().is_none_or(Vec::is_empty) {
             return Value::Null;
         }
@@ -185,7 +271,7 @@ impl Claude {
             .get(&instance)
             .is_some_and(|cached| {
                 cached.config == *config
-                    && cached.windows == windows
+                    && cached.windows == cache_key
                     && cached.checked.elapsed() < USAGE_REFRESH
             });
         if recent || !allow_probe {
@@ -208,7 +294,7 @@ impl Claude {
         } else {
             cache
                 .get(&instance)
-                .filter(|cached| cached.config == *config && cached.windows == windows)
+                .filter(|cached| cached.config == *config && cached.windows == cache_key)
                 .and_then(|cached| cached.retained.clone())
         };
         cache.insert(
@@ -216,7 +302,7 @@ impl Claude {
             CachedLocalUsage {
                 config: config.clone(),
                 checked: Instant::now(),
-                windows,
+                windows:cache_key,
                 retained: retained.clone(),
             },
         );
@@ -232,7 +318,7 @@ impl Claude {
         let cached = cache.get(&config.instance_id())?;
         let (collected, metrics) = cached.retained.as_ref()?;
         (cached.config == *config
-            && cached.windows == local_windows(usage)
+            && cached.windows == metrics_scope(usage,&local_windows(usage))
             && within_retention(Some(*collected)))
         .then(|| metrics.clone())
     }
@@ -285,7 +371,9 @@ fn cached_usage(
     let recent = cached.is_some_and(|cached| cached.checked.elapsed() < USAGE_REFRESH);
     let retained = cached
         .and_then(|cached| cached.retained.as_ref())
-        .filter(|response| within_retention(response["usage"]["observedAtMs"].as_u64()));
+        .filter(|response| {
+            response["usage"].is_object() || recent && response.get("accountScope").is_some()
+        });
     match retained {
         // 超过刷新周期：先返回保留结果供底部立即显示，后台经 CLI 刷新，网页据 refreshing 提前复查。
         Some(response) if allow_probe && !recent => {
@@ -321,6 +409,14 @@ fn local_windows(usage: &Value) -> Value {
             .map(|(key, duration)| json!({"key":key,"durationMs":duration,"resetsAt":usage[key]["resetsAt"]}))
             .collect::<Vec<_>>()
     )
+}
+
+fn metrics_scope(usage: &Value, windows: &Value) -> Value {
+    // 两个账号哪怕重置时间完全相同，也不能共用本地统计或把迟到详情写回新账号。
+    usage["accountScope"]
+        .as_str()
+        .map(|s| json!([s, windows]))
+        .unwrap_or_else(|| windows.clone())
 }
 
 fn normalize_prices(value: &Value) -> Option<Value> {
@@ -418,7 +514,7 @@ async fn local_metrics(config: &WslConfig, windows: Value, prices: Value) -> any
     Ok(value)
 }
 
-async fn native_usage(config: &WslConfig) -> anyhow::Result<(Value, Option<String>)> {
+async fn native_usage(config: &WslConfig,on_identity:impl FnOnce(&Value)) -> anyhow::Result<(Value, Option<String>)> {
     let mut command = Claude::wsl(config)?;
     // 用户要求所有额度读取经过原 WSL 的 Claude：仅初始化与 get_usage，不发送 user 帧、不恢复任务。
     // 此专用元数据进程不持久化会话；只在本进程关闭 Hooks/MCP，原实例设置及正常执行能力保持原样。
@@ -455,6 +551,7 @@ async fn native_usage(config: &WslConfig) -> anyhow::Result<(Value, Option<Strin
         .await?;
         // 用户要求弹窗显示已登录账号；邮箱只来自对应 WSL Claude CLI 的 initialize.account.email。
         let account_email = normalize_account_email(initialization["account"]["email"].as_str());
+        on_identity(&initialization["account"]);
         // 原生 get_usage 支持跳过行为分析；额度读取不得扫描近七天的全部会话正文。
         let usage = control(
             &mut reader,
@@ -651,6 +748,38 @@ fn normalize_usage_with_account(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn quota_disk_reopens_after_native_claude_identity_without_waiting_for_get_usage() {
+        let directory = tempfile::tempdir().unwrap();
+        let cfg = WslConfig::default();
+        let binding = crate::quota_snapshot::binding("claude", &cfg);
+        let account =
+            json!({"email":"user@example.test","organizationUuid":"A","opaque":"not-for-storage"});
+        let first = Claude::new(directory.path()).unwrap();
+        let scope = first.bind_quota_account(&cfg, &account, None);
+        let at = now_ms() - 86_400_000 * 8;
+        first.quota_snapshots.publish(&binding,&scope,&json!({"source":"claude-native-usage","observedAtMs":at,
+            "fiveHour":{"usedPercentage":23,"resetsAt":null},"sevenDay":{"usedPercentage":8,"resetsAt":null}}),false);
+        drop(first);
+        let reopened = Claude::new(directory.path()).unwrap();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        reopened.bind_quota_account(&cfg, &account, Some(tx));
+        let response = rx.try_recv().unwrap();
+        assert_eq!(response["usage"]["historical"], true);
+        assert_eq!(response["usage"]["observedAtMs"], at);
+        assert_eq!(response["refreshing"], true);
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let new_scope = reopened.bind_quota_account(
+            &cfg,
+            &json!({"email":"user@example.test","organizationUuid":"B"}),
+            Some(tx),
+        );
+        assert_ne!(scope, new_scope);
+        assert!(
+            rx.try_recv().is_err() && reopened.quota_snapshots.get(&binding, &new_scope).is_null()
+        );
+    }
+
     #[test]
     fn account_email_is_exported_without_private_account_fields() {
         let raw = json!({"rate_limits_available":true,"subscription_type":"max",
@@ -829,7 +958,7 @@ mod tests {
         let config = WslConfig::default();
         let response = json!({"ok":true,"backend":"claude","instanceId":config.instance_id(),
             "usage":{"source":"claude-native-usage","observedAtMs":now_ms(),
-                "fiveHour":{"usedPercentage":24,"resetsAt":null}}});
+                "fiveHour":{"usedPercentage":24,"resetsAt":null},"sevenDay":{"usedPercentage":0,"resetsAt":null}}});
         claude.subscription_usage_cache.lock().await.insert(
             config.instance_id(),
             CachedUsage {
@@ -867,7 +996,7 @@ mod tests {
                     .is_null()
             );
         }
-        // 保留期按原采集时间计算：超过 72 小时不能再显示（用毫秒时间模拟，避免 Instant 回拨超过开机时长而溢出）。
+        // 旧日期不清空最后一对真实窗口；界面按原采集时间显示“上次记录”。
         claude
             .subscription_usage_cache
             .lock()
@@ -877,13 +1006,7 @@ mod tests {
             .retained
             .as_mut()
             .unwrap()["usage"]["observedAtMs"] = json!(now_ms() - USAGE_RETENTION_MS);
-        assert!(
-            claude
-                .subscription_usage(config, false, false)
-                .await
-                .unwrap()["usage"]
-                .is_null()
-        );
+        assert_eq!(claude.subscription_usage(config,false,false).await.unwrap()["usage"]["fiveHour"]["usedPercentage"],24);
     }
 
     #[test]
@@ -892,7 +1015,7 @@ mod tests {
         let response = |observed: u64| {
             json!({"ok":true,"backend":"claude","instanceId":config.instance_id(),
                 "usage":{"source":"claude-native-usage","observedAtMs":observed,
-                    "fiveHour":{"usedPercentage":24,"resetsAt":null}}})
+                    "fiveHour":{"usedPercentage":24,"resetsAt":null},"sevenDay":{"usedPercentage":0,"resetsAt":null}}})
         };
         let empty =
             json!({"ok":true,"backend":"claude","instanceId":config.instance_id(),"usage":null});
@@ -943,15 +1066,9 @@ mod tests {
             "没有可显示结果时等待本次读取"
         );
         let outdated = entry(stale, Some(response(now_ms() - USAGE_RETENTION_MS)));
-        assert_eq!(
-            cached_usage(Some(&outdated), &config, true),
-            (None, false),
-            "超过 72 小时的结果不能再显示"
-        );
-        assert_eq!(
-            cached_usage(Some(&outdated), &config, false),
-            (Some(empty.clone()), false)
-        );
+        let (saved,refresh)=cached_usage(Some(&outdated),&config,true);
+        assert!(refresh && saved.unwrap()["usage"]["sevenDay"].is_object(),"长期保留不推迟正常刷新");
+        assert_eq!(cached_usage(Some(&outdated),&config,false),(outdated.retained.clone(),false));
         let other = WslConfig {
             user: "another-user".into(),
             ..config.clone()
