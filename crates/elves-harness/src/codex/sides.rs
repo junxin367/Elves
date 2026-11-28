@@ -962,7 +962,7 @@ impl CodexHarness {
             }
         }
         let collaboration_mode = self
-            .side_collaboration_mode(parent, &identity["thread"])
+            .side_collaboration_mode(parent, &identity["thread"], &connection.generation)
             .await?;
         // 与 App 一样把侧边规则追加到当前项目的开发者指令，不能覆盖用户已有的配置要求。
         let config = self

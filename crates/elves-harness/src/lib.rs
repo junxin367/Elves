@@ -12598,6 +12598,47 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     }
 
     #[tokio::test]
+    async fn harness_service_side_mode_reports_only_the_matching_running_compaction() {
+        let (directory, auth) = harness_fixture().await;
+        let controller = &auth.controller;
+        let main = controller.call_authorized("create",
+            json!({"projectId":"project-a","prompt":"wait parent"}), &auth).await.unwrap();
+        let parent = main["threadId"].as_str().unwrap();
+        let compact = "compact-in-progress";
+        let event = |method: &str| json!({"method":method,"params":{"threadId":parent,
+            "turnId":compact,"item":{"type":"contextCompaction","id":"cut"}}});
+        let create = || controller.call_authorized("createSideThread", json!({"threadId":parent}), &auth);
+        // 摘要列表尚无条目，turn_context 也未落盘；最近的旧轮次即使有模式也不能据此猜测。
+        for (turn, events, code, text) in [
+            (compact, json!([event("item/started")]), 409, "主会话正在压缩上下文，请在压缩完成后再创建侧边会话。"),
+            ("different-turn", json!([]), 503, "尚未取得主会话最近轮次的原生协作模式，请稍后重试"),
+            (compact, json!([event("item/completed")]), 503, "尚未取得主会话最近轮次的原生协作模式，请稍后重试"),
+        ] {
+            controller.harness.seed_test_history(json!({"threadId":parent,"events":events,
+                "turns":[{"id":turn,"status":"inProgress","items":[]}]})).await.unwrap();
+            let failure = create().await.unwrap_err();
+            let failure = failure.downcast_ref::<ApiError>().unwrap();
+            assert_eq!((failure.code, failure.message.as_str()), (code, text));
+        }
+        assert!(!harness_engine_requests(directory.path()).iter().any(|c| c["method"] == "thread/fork"));
+        for (next, mode) in [("bad-context", "unsupported"), ("ready-context", "plan")] {
+            let running = json!({"method":"item/started","params":{"threadId":parent,"turnId":next,
+                "item":{"type":"contextCompaction","id":next}}});
+            controller.harness.seed_test_history(json!({"threadId":parent,"events":[running],
+                "turns":[{"id":next,"status":"inProgress","items":[]}],
+                "contexts":[{"turn_id":next,"collaboration_mode":{"mode":mode}}]})).await.unwrap();
+            let result = create().await;
+            if mode == "unsupported" {
+                assert_eq!(result.unwrap_err().downcast_ref::<ApiError>().unwrap().message,
+                    "无法识别主会话的原生协作模式");
+            } else {
+                assert!(result.unwrap()["threadId"].is_string(), "同轮模式已就绪时仍可创建");
+            }
+        }
+        controller.harness.release().await;
+    }
+
+    #[tokio::test]
     async fn harness_service_side_preserves_native_profiles_and_custom_permission_boundaries() {
         for named in [false, true] {
             let (directory, authorization) = harness_fixture().await;

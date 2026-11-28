@@ -30,7 +30,7 @@ fn mode_from_context(context: &Value) -> anyhow::Result<Value> {
     Ok(json!({"mode":context["mode"],"settings":{"developer_instructions":instructions}}))
 }
 
-fn read_mode(path: &Path, turn_id: &str) -> anyhow::Result<Value> {
+fn read_mode(path: &Path, turn_id: &str) -> anyhow::Result<Option<Value>> {
     if !path.is_absolute() {
         return Err(error(503, "主会话缺少有效的原生协作模式记录路径"));
     }
@@ -49,7 +49,7 @@ fn read_mode(path: &Path, turn_id: &str) -> anyhow::Result<Value> {
             mode = Some(mode_from_context(&record["payload"]["collaboration_mode"])?);
         }
     }
-    mode.ok_or_else(|| error(503, "尚未取得主会话最近轮次的原生协作模式，请稍后重试"))
+    Ok(mode)
 }
 
 impl CodexHarness {
@@ -57,6 +57,7 @@ impl CodexHarness {
         &self,
         parent: &str,
         source: &Value,
+        generation: &str,
     ) -> anyhow::Result<Value> {
         let mut cursor = Value::Null;
         let mut seen = HashSet::new();
@@ -80,17 +81,39 @@ impl CodexHarness {
                 });
                 // 独立压缩不产生新的模式选择；沿用它之前最近一个实际轮次的原生设置。
                 if !compaction_only {
-                    let turn_id = required(turn, "id")?.to_owned();
+                    let turn_id = required(turn, "id")?;
+                    let lookup_id = turn_id.to_owned();
                     let path = source["path"]
                         .as_str()
                         .filter(|path| !path.is_empty())
                         .ok_or_else(|| error(503, "主会话缺少原生协作模式记录路径"))?
                         .to_owned();
-                    return tokio::task::spawn_blocking(move || {
-                        read_mode(Path::new(&path), &turn_id)
+                    let mode = tokio::task::spawn_blocking(move || {
+                        read_mode(Path::new(&path), &lookup_id)
                     })
                     .await
-                    .context("读取主会话原生协作模式的任务失败")?;
+                    .context("读取主会话原生协作模式的任务失败")??;
+                    if let Some(mode) = mode {
+                        return Ok(mode);
+                    }
+                    // 压缩轮次可能先开始、结束时才写 turn_context。仅在确实缺记录且同一连接、
+                    // 主会话和轮次仍有原生压缩开始事件时提示等待，不把其他读取错误或排队压缩误报为正在压缩。
+                    let projection = self.projection.lock().await;
+                    if projection.generation == generation
+                        && projection
+                            .compactions
+                            .get(parent)
+                            .is_some_and(|op| op["state"] == "running" && op["turnId"] == turn_id)
+                    {
+                        return Err(error(
+                            409,
+                            "主会话正在压缩上下文，请在压缩完成后再创建侧边会话。",
+                        ));
+                    }
+                    return Err(error(
+                        503,
+                        "尚未取得主会话最近轮次的原生协作模式，请稍后重试",
+                    ));
                 }
             }
             let Some(next) = page["nextCursor"]
