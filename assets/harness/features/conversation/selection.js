@@ -205,7 +205,7 @@ export async function selectThread(id, { closeSidebar = true, force = false, rel
   syncRelatedSessionLayout();
   sessionTools?.updateContext();
   restoreDraft(id); resetComposerOptions(); restoreQueuedMessageEdit();
-  void reloadScheduledMessages(id);
+  void reloadScheduledMessages(id, { onlyIfNeeded: true });
   setNotifiedTokenUsage(null); setNotifiedGoal(null);
   setNotifiedQuestions(null);
   const read = setThreadReadVersion(threadReadVersion + 1), usageVersion = tokenUsageVersion, fastReadVersion = fastModeVersion,

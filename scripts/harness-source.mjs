@@ -91,7 +91,7 @@ export async function loadHarnessAppSource(root = defaultRoot) {
       selectedScheduledAt: null, scheduledAtDrafts: new Map(),
       setSelectedScheduledAt: next => context.selectedScheduledAt = next,
       scheduledMessagesSupported: () => false, renderScheduledMessages: () => {},
-      reloadScheduledMessages: async () => {},
+      reloadScheduledMessages: async () => {}, retireScheduledMessageRead: () => {},
     })) if (!Object.hasOwn(context, name)) context[name] = value;
     const missing = name => !Object.hasOwn(context, name) && new RegExp(`\\b${name}\\(`).test(code);
     // 菜单渲染片段复用真实公共内容组件；显式注入的用例桩优先，DOM/图标依赖沿用当前 VM 的提供者。

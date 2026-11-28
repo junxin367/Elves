@@ -160,6 +160,8 @@ fn path(value: &str) -> Option<String> {
                 | "sendState"
                 | "promptOptimization"
                 | "notifications"
+                // 定时消息读取故障需要区分接口；只保留固定路径，不记录查询参数、请求体或消息正文。
+                | "scheduledMessages"
                 | "relatedThreads"
         )
     {
@@ -1056,6 +1058,18 @@ mod tests {
         assert_eq!(clean["app"]["originHost"], "mobile.example");
         assert_eq!(clean["events"][0]["fields"]["host"], "mobile.example");
         assert_eq!(clean["events"][0]["fields"]["path"], "/api/read/history");
+        let mut scheduled = bundle();
+        scheduled["events"][0]["fields"]["path"] =
+            json!("/api/read/scheduledMessages?prompt=private#secret");
+        scheduled["events"][0]["fields"]["prompt"] = json!("private");
+        let scheduled = sanitize_bundle(&scheduled).unwrap();
+        let fields = &scheduled["events"][0]["fields"];
+        assert_eq!(fields["path"], "/api/read/scheduledMessages");
+        assert!(
+            fields.get("body").is_none()
+                && fields.get("prompt").is_none()
+                && fields.get("message").is_none()
+        );
         assert_eq!(clean["events"][0]["fields"]["durationMs"], 1.25);
         assert_eq!(clean["events"][0]["fields"]["width"], 50);
         for key in [

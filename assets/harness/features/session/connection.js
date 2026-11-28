@@ -10,7 +10,7 @@ import {
 import { recoveryStore } from "../../core/stores.js";
 import { api, promoteReadPriority } from "../api.js";
 import { recoveryGeneration } from "../composer/drafts.js";
-import { reloadScheduledMessages } from "../composer/scheduled-message.js";
+import { reloadScheduledMessages, retireScheduledMessageRead } from "../composer/scheduled-message.js";
 import {
   messageSkillLoadScope, setMessageSkillLoadScope, skillLoading, skillScope
 } from "../composer/skill-catalog.js";
@@ -122,15 +122,18 @@ export async function refreshConnectedSession(source = stream) {
   const applied = await syncConnectionState(source);
   if (!applied) return false;
   await refreshAll({ fresh: true });
-  // 断线或后台期间可能错过定时消息的变更事件（发出、失败、取消），恢复时补读当前会话的列表。
-  if (selectedId) void reloadScheduledMessages(selectedId);
   return true;
 }
 export function setConnection(value) {
   const changed = connected !== value;
   const restored = !connected && value;
-  if (connected && !value) setConnectionCycleVersion(connectionCycleVersion + 1);
+  if (connected && !value) {
+    setConnectionCycleVersion(connectionCycleVersion + 1);
+    retireScheduledMessageRead();
+  }
   setConnected(value);
+  // 复用同一前台、会话的读取；即使返回时 WebSocket 未断开，也要补上后台错过的定时消息变化。
+  if (value && selectedId) void reloadScheduledMessages(selectedId, { onlyIfNeeded: true });
   if (changed) recordRuntimeDiagnostic("connection.state");
   if (!value) stopRelatedSessionTimers();
   else scheduleRelatedOperationCheck();
